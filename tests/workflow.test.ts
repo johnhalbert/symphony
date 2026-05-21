@@ -36,7 +36,7 @@ Work on {{ issue.identifier }}.`,
     expect(config.tracker.assignee).toBe("me");
     expect(config.agent.harness).toBe("cursor");
     expect(config.cursor.model).toBe("gpt-5.5");
-    expect(config.cursor.modelParams).toEqual([{ id: "thinking", value: "xhigh" }]);
+    expect(config.cursor.modelParams).toEqual([{ id: "reasoning", value: "extra-high" }]);
     expect(config.cursor.settingSources).toEqual(["project", "user"]);
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
   });
@@ -90,7 +90,7 @@ Work on {{ issue.identifier }}.`,
     const configured = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
-        cursor: { model: "composer-2.5", model_params: { thinking: "high" } },
+        cursor: { model: "composer-2.5", model_params: { reasoning: "high" } },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
@@ -105,7 +105,7 @@ Work on {{ issue.identifier }}.`,
     );
 
     expect(configured.cursor.model).toBe("composer-2.5");
-    expect(configured.cursor.modelParams).toEqual([{ id: "thinking", value: "high" }]);
+    expect(configured.cursor.modelParams).toEqual([{ id: "reasoning", value: "high" }]);
     expect(disabled.cursor.modelParams).toEqual([]);
   });
 

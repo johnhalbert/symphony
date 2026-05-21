@@ -52,7 +52,7 @@ agent:
 cursor:
   model: gpt-5.5
   model_params:
-    thinking: xhigh
+    reasoning: extra-high
   setting_sources:
     - project
     - user

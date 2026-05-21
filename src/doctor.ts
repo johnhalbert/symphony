@@ -94,7 +94,7 @@ export function formatDoctorResult(result: DoctorResult): string {
 }
 
 function hasBaselineCursorModel(model: string, modelParams: Array<{ id: string; value: string }>): boolean {
-  return model === "gpt-5.5" && modelParams.some((param) => param.id === "thinking" && param.value === "xhigh");
+  return model === "gpt-5.5" && modelParams.some((param) => param.id === "reasoning" && param.value === "extra-high");
 }
 
 function formatModelParams(modelParams: Array<{ id: string; value: string }>): string {

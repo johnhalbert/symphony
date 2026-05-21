@@ -18,7 +18,7 @@ import { Command } from "commander";
 const VALID_SETTING_SOURCES = new Set<SettingSource>(["project", "user", "team", "mdm", "plugins", "all"]);
 const DEFAULT_EXPECTED_TEXT = "Symphony local SDK smoke OK";
 const DEFAULT_MODEL = "gpt-5.5";
-const DEFAULT_MODEL_VARIANT = "extra high";
+const DEFAULT_MODEL_PARAMS = "reasoning=extra-high";
 
 class SmokeOptionError extends Error {}
 
@@ -54,12 +54,12 @@ const program = new Command()
   .option(
     "--model-variant <name>",
     "Cursor model variant display name to copy params from; use 'none' to disable",
-    process.env.SYMPHONY_SDK_SMOKE_MODEL_VARIANT ?? DEFAULT_MODEL_VARIANT,
+    process.env.SYMPHONY_SDK_SMOKE_MODEL_VARIANT ?? "none",
   )
   .option(
     "--model-params <pairs>",
-    "comma-separated model params that override variant lookup, for example thinking=xhigh",
-    process.env.SYMPHONY_SDK_SMOKE_MODEL_PARAMS,
+    "comma-separated model params that override variant lookup, for example reasoning=extra-high",
+    process.env.SYMPHONY_SDK_SMOKE_MODEL_PARAMS ?? DEFAULT_MODEL_PARAMS,
   )
   .option(
     "--name <name>",
@@ -205,7 +205,7 @@ async function normalizeOptions(raw: RawOptions): Promise<SmokeOptions> {
   const settingSources = parseSettingSources(raw.settingSources ?? "project,user");
   const expectedText = raw.expect === "none" ? null : (raw.expect ?? DEFAULT_EXPECTED_TEXT);
   const modelParams = raw.modelParams === undefined ? null : parseModelParams(raw.modelParams);
-  const modelVariant = raw.modelVariant === "none" ? null : (raw.modelVariant ?? DEFAULT_MODEL_VARIANT);
+  const modelVariant = raw.modelVariant === "none" ? null : (raw.modelVariant ?? null);
   return {
     cwd,
     model: raw.model ?? DEFAULT_MODEL,
@@ -382,7 +382,7 @@ function printUsageNotes(options: SmokeOptions): void {
 - This is local runtime only: the script passes local.cwd and never passes cloud/repo options.
 - It still uses CURSOR_API_KEY for SDK authentication and may use network-backed Cursor services.
 - It creates a persisted local SDK agent/run for cwd: ${options.cwd}
-- Default model baseline is ${DEFAULT_MODEL} with the "${DEFAULT_MODEL_VARIANT}" variant resolved from Cursor.models.list().
+- Default model baseline is ${DEFAULT_MODEL} with ${DEFAULT_MODEL_PARAMS}.
 - Default setting sources are project,user to resemble Symphony; use --setting-sources none for an isolated probe.
 - By default it will not force-expire an active local run; pass --force only if you need that recovery path.
 `);

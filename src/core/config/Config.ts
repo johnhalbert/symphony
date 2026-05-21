@@ -193,7 +193,7 @@ const VALID_CURSOR_SETTING_SOURCES = new Set<CursorSettingSource>([
 ]);
 const VALID_AGENT_HARNESSES = new Set<AgentHarnessKind>(["cursor"]);
 const DEFAULT_CURSOR_MODEL = "gpt-5.5";
-const DEFAULT_CURSOR_MODEL_PARAMS: CursorModelParameter[] = [{ id: "thinking", value: "xhigh" }];
+const DEFAULT_CURSOR_MODEL_PARAMS: CursorModelParameter[] = [{ id: "reasoning", value: "extra-high" }];
 
 export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
