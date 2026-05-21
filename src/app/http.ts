@@ -76,6 +76,33 @@ export class StatusServer {
         return;
       }
 
+      const pauseMatch = /^\/api\/v1\/issues\/([^/]+)\/pause$/.exec(url.pathname);
+      if (request.method === "POST" && pauseMatch) {
+        this.requireMutationToken(request);
+        const issueId = decodeURIComponent(pauseMatch[1] ?? "");
+        this.options.orchestrator.pauseIssue(issueId);
+        sendJson(response, 202, { paused: true, issue: issueId });
+        return;
+      }
+
+      const resumeMatch = /^\/api\/v1\/issues\/([^/]+)\/resume$/.exec(url.pathname);
+      if (request.method === "POST" && resumeMatch) {
+        this.requireMutationToken(request);
+        const issueId = decodeURIComponent(resumeMatch[1] ?? "");
+        this.options.orchestrator.resumeIssue(issueId);
+        sendJson(response, 202, { paused: false, issue: issueId });
+        return;
+      }
+
+      const cancelMatch = /^\/api\/v1\/issues\/([^/]+)\/cancel$/.exec(url.pathname);
+      if (request.method === "POST" && cancelMatch) {
+        this.requireMutationToken(request);
+        const issueId = decodeURIComponent(cancelMatch[1] ?? "");
+        await this.options.orchestrator.cancelIssue(issueId);
+        sendJson(response, 202, { cancelled: true, issue: issueId });
+        return;
+      }
+
       const issueRunsMatch = /^\/api\/v1\/issues\/([^/]+)\/runs$/.exec(url.pathname);
       if (request.method === "GET" && issueRunsMatch) {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
@@ -136,7 +163,7 @@ export class StatusServer {
 
       const openMatch = /^\/api\/v1\/issues\/([^/]+)\/open-workspace$/.exec(url.pathname);
       if (request.method === "POST" && openMatch) {
-        this.requireOpenWorkspaceToken(request);
+        this.requireMutationToken(request);
         const issueId = decodeURIComponent(openMatch[1] ?? "");
         const details = this.options.orchestrator.getIssueDetails(issueId);
         const workspace = await this.options.runStore?.findWorkspace(issueId);
@@ -167,7 +194,7 @@ export class StatusServer {
     }
   }
 
-  private requireOpenWorkspaceToken(request: IncomingMessage): void {
+  private requireMutationToken(request: IncomingMessage): void {
     const expected = this.options.openWorkspaceToken;
     if (!expected) return;
     const provided = request.headers["x-symphony-token"];

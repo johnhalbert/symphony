@@ -18,6 +18,9 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 - `GET /api/v1/workspaces` returns known durable workspace records.
 - `GET /api/v1/workspaces/:key` returns a workspace record by key, issue id, or issue identifier.
 - `POST /api/v1/issues/:id/open-workspace` opens the associated workspace in Cursor.
+- `POST /api/v1/issues/:id/pause` prevents new dispatch for that issue and clears pending retries.
+- `POST /api/v1/issues/:id/resume` allows dispatch for that issue again and schedules a refresh.
+- `POST /api/v1/issues/:id/cancel` aborts an in-flight worker for that issue and clears pending retries.
 
 ## MVP Extension Shape
 
@@ -25,6 +28,7 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 - Workspace action: call `open-workspace` rather than constructing editor commands itself.
 - Transcript webview: render persisted transcript events from Symphony's store.
 - Status surface: show live running/retrying state and durable run terminal state.
+- Operator controls: expose pause, resume, cancel, and open-workspace only when a mutation token is configured.
 
 ## Non-Goals
 

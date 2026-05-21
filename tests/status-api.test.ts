@@ -74,6 +74,11 @@ describe("StatusServer durable API", () => {
       const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/run-1/transcript?limit=1`);
       const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/TEST-1`);
       const openResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/open-workspace`, { method: "POST" });
+      const pauseWithoutTokenResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/pause`, { method: "POST" });
+      const pauseResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
       const issueBody = (await issueResponse.json()) as {
         latestRun: { runId: string };
         capabilities: { openWorkspace: boolean };
@@ -89,6 +94,8 @@ describe("StatusServer durable API", () => {
       expect(transcriptBody.events[0]?.message).toBe("hello");
       expect(workspaceBody.gitBranchName).toBe("symphony/TEST-1");
       expect(openResponse.status).toBe(401);
+      expect(pauseWithoutTokenResponse.status).toBe(401);
+      expect(pauseResponse.status).toBe(202);
     } finally {
       await server.stop();
     }
@@ -100,9 +107,10 @@ function fakeOrchestrator(): Orchestrator {
     snapshot() {
       return {
         generatedAt: new Date(0).toISOString(),
-        counts: { running: 0, retrying: 0 },
+        counts: { running: 0, retrying: 0, paused: 0 },
         running: [],
         retrying: [],
+        paused: [],
         totals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, secondsRunning: 0 },
         rateLimits: null,
       };
@@ -111,6 +119,15 @@ function fakeOrchestrator(): Orchestrator {
       return null;
     },
     async refreshNow() {
+      return undefined;
+    },
+    pauseIssue() {
+      return undefined;
+    },
+    resumeIssue() {
+      return undefined;
+    },
+    async cancelIssue() {
       return undefined;
     },
   } as unknown as Orchestrator;

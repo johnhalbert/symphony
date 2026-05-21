@@ -15,6 +15,7 @@ const rawConfigSchema = z
         project_slug: z.string().optional(),
         assignee: z.string().optional(),
         active_states: stringArray.optional(),
+        handoff_states: stringArray.optional(),
         terminal_states: stringArray.optional(),
       })
       .passthrough()
@@ -62,6 +63,9 @@ const rawConfigSchema = z
         max_turns: z.number().int().positive().optional(),
         max_retry_backoff_ms: z.number().int().positive().optional(),
         max_concurrent_agents_by_state: z.record(z.string(), z.number()).optional(),
+        require_labels: stringArray.optional(),
+        exclude_labels: stringArray.optional(),
+        protected_paths: stringArray.optional(),
       })
       .passthrough()
       .optional(),
@@ -94,6 +98,7 @@ export interface TrackerConfig {
   projectSlug: string;
   assignee: string | null;
   activeStates: string[];
+  handoffStates: string[];
   terminalStates: string[];
 }
 
@@ -128,6 +133,9 @@ export interface AgentConfig {
   maxTurns: number;
   maxRetryBackoffMs: number;
   maxConcurrentAgentsByState: Map<string, number>;
+  requireLabels: string[];
+  excludeLabels: string[];
+  protectedPaths: string[];
 }
 
 export type AgentHarnessKind = "cursor";
@@ -206,7 +214,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     throw new SymphonyError("missing_tracker_api_key", "Linear API key is required");
   }
 
-  const projectSlug = raw.tracker?.project_slug ?? "";
+  const projectSlug = resolveConfigString(raw.tracker?.project_slug, env) ?? "";
   if (projectSlug.length === 0) {
     throw new SymphonyError("missing_tracker_project_slug", "Linear project slug is required");
   }
@@ -253,6 +261,10 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
 
   const agentHarness = normalizeAgentHarness(raw.agent?.harness);
   const agentMaxTurns = raw.agent?.max_turns ?? 20;
+  const activeStates = raw.tracker?.active_states ?? DEFAULT_ACTIVE_STATES;
+  const handoffStates = raw.tracker?.handoff_states ?? [];
+  const terminalStates = raw.tracker?.terminal_states ?? DEFAULT_TERMINAL_STATES;
+  validateStateBuckets(activeStates, handoffStates, terminalStates);
 
   return {
     workflowPath: path.resolve(workflowPath),
@@ -263,8 +275,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       apiKey: trackerApiKey,
       projectSlug,
       assignee: trackerAssignee.length === 0 ? null : trackerAssignee,
-      activeStates: raw.tracker?.active_states ?? DEFAULT_ACTIVE_STATES,
-      terminalStates: raw.tracker?.terminal_states ?? DEFAULT_TERMINAL_STATES,
+      activeStates,
+      handoffStates,
+      terminalStates,
     },
     polling: {
       intervalMs: raw.polling?.interval_ms ?? 30_000,
@@ -287,6 +300,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       maxTurns: agentMaxTurns,
       maxRetryBackoffMs: raw.agent?.max_retry_backoff_ms ?? 300_000,
       maxConcurrentAgentsByState: normalizeStateLimitMap(raw.agent?.max_concurrent_agents_by_state),
+      requireLabels: normalizeLabels(raw.agent?.require_labels),
+      excludeLabels: normalizeLabels(raw.agent?.exclude_labels),
+      protectedPaths: raw.agent?.protected_paths ?? [],
     },
     cursor: {
       model: raw.cursor?.model ?? DEFAULT_CURSOR_MODEL,
@@ -297,7 +313,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     server: {
       port: raw.server?.port ?? null,
       host: raw.server?.host ?? "127.0.0.1",
-      openWorkspaceToken: raw.server?.open_workspace_token ?? null,
+      openWorkspaceToken: resolveConfigString(raw.server?.open_workspace_token, env) ?? null,
     },
     raw,
   };
@@ -327,6 +343,32 @@ function normalizeStateLimitMap(input: Record<string, number> | undefined): Map<
     }
   }
   return result;
+}
+
+function normalizeLabels(input: string[] | undefined): string[] {
+  return [...new Set((input ?? []).map((label) => label.trim().toLowerCase()).filter((label) => label.length > 0))];
+}
+
+function validateStateBuckets(activeStates: string[], handoffStates: string[], terminalStates: string[]): void {
+  const activeHandoffOverlap = overlappingStates(activeStates, handoffStates);
+  if (activeHandoffOverlap.length > 0) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `tracker.handoff_states must not overlap tracker.active_states: ${activeHandoffOverlap.join(", ")}`,
+    );
+  }
+  const terminalHandoffOverlap = overlappingStates(terminalStates, handoffStates);
+  if (terminalHandoffOverlap.length > 0) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `tracker.handoff_states must not overlap tracker.terminal_states: ${terminalHandoffOverlap.join(", ")}`,
+    );
+  }
+}
+
+function overlappingStates(left: string[], right: string[]): string[] {
+  const rightSet = new Set(right.map((state) => state.toLowerCase()));
+  return left.filter((state) => rightSet.has(state.toLowerCase()));
 }
 
 function normalizeCursorSettingSources(values: string[] | undefined): CursorSettingSource[] {

@@ -168,6 +168,116 @@ describe("Orchestrator", () => {
     expect(harness.runs).toHaveLength(0);
   });
 
+  it("skips issues without required dispatch labels", async () => {
+    const config = testConfig(root);
+    config.agent.requireLabels = ["dogfood-ready"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood"] });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+  });
+
+  it("does not retry after a handoff state", async () => {
+    const config = testConfig(root);
+    config.tracker.handoffStates = ["In Review"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let refreshes = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        refreshes += 1;
+        return [refreshes === 1 ? candidate : { ...candidate, state: "In Review" }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(1);
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("pauses and resumes issue dispatch", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    orchestrator.pauseIssue(candidate.id);
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(harness.runs).toHaveLength(0);
+
+    orchestrator.resumeIssue(candidate.id);
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(1);
+  });
+
   it("passes emitted run ids to harness stop", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -199,6 +309,42 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.stoppedRunIds).toEqual(["run-123"]);
+  });
+
+  it("cancels an active issue without retrying it", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new BlockingHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.cancelIssue(candidate.id);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.stoppedRunIds).toEqual(["run-123"]);
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
   it("blocks continuation turns for non-resumable harnesses", async () => {

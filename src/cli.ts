@@ -10,12 +10,31 @@ import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { LinearTrackerClient } from "./integrations/linear/LinearTrackerClient.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
+import { formatDoctorResult, runDoctor } from "./doctor.js";
 
 const program = new Command();
 
 program
   .name("symphony")
-  .description("Run Symphony coding-agent orchestration")
+  .description("Run Symphony coding-agent orchestration");
+
+program
+  .command("doctor")
+  .description("Run Symphony dogfood preflight checks")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .option("--json", "print JSON output")
+  .option("--strict", "treat warnings as failures")
+  .action(async (workflow: string, options: { json?: boolean; strict?: boolean }) => {
+    const result = await runDoctor({ workflowPath: path.resolve(process.cwd(), workflow), strict: options.strict });
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(formatDoctorResult(result));
+    }
+    if (!result.ok) process.exitCode = 2;
+  });
+
+program
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .option("--port <port>", "enable local HTTP status server on this port")
   .option("--host <host>", "HTTP bind host")

@@ -35,6 +35,7 @@ export interface RunningEntry {
   retryAttempt: number;
   tokens: TokenCounts;
   cleanupWorkspaceOnExit: boolean;
+  suppressRetryOnExit: boolean;
 }
 
 export interface RetryEntry {
@@ -51,6 +52,7 @@ export interface RuntimeSnapshot {
   counts: {
     running: number;
     retrying: number;
+    paused: number;
   };
   running: Array<{
     issueId: string;
@@ -73,6 +75,7 @@ export interface RuntimeSnapshot {
     dueAt: string;
     error: string | null;
   }>;
+  paused: string[];
   totals: RuntimeTotals;
   rateLimits: unknown;
 }
@@ -88,6 +91,7 @@ export class Orchestrator {
   private readonly running = new Map<string, RunningEntry>();
   private readonly claimed = new Set<string>();
   private readonly completed = new Set<string>();
+  private readonly pausedIssues = new Set<string>();
   private readonly retryAttempts = new Map<string, RetryEntry>();
   private readonly totals: TokenCounts = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   private rateLimits: unknown = null;
@@ -123,6 +127,26 @@ export class Orchestrator {
     await this.tick();
   }
 
+  pauseIssue(issueId: string): void {
+    this.pausedIssues.add(issueId);
+    this.clearRetry(issueId);
+  }
+
+  resumeIssue(issueId: string): void {
+    this.pausedIssues.delete(issueId);
+    this.scheduleTick(0);
+  }
+
+  async cancelIssue(issueId: string): Promise<void> {
+    this.clearRetry(issueId);
+    this.claimed.delete(issueId);
+    const running = this.running.get(issueId);
+    if (!running) return;
+    running.suppressRetryOnExit = true;
+    running.abortController.abort();
+    await this.options.harness.stop?.(running.runId ?? issueId);
+  }
+
   snapshot(): RuntimeSnapshot {
     const now = Date.now();
     return {
@@ -130,6 +154,7 @@ export class Orchestrator {
       counts: {
         running: this.running.size,
         retrying: this.retryAttempts.size,
+        paused: this.pausedIssues.size,
       },
       running: [...this.running.entries()].map(([issueId, entry]) => ({
         issueId,
@@ -152,6 +177,7 @@ export class Orchestrator {
         dueAt: new Date(entry.dueAtMs).toISOString(),
         error: entry.error,
       })),
+      paused: [...this.pausedIssues],
       totals: {
         ...this.totals,
         secondsRunning: this.endedRuntimeSeconds + this.activeRuntimeSeconds(now),
@@ -225,6 +251,8 @@ export class Orchestrator {
       entry.issue = latest;
       if (isStateIn(latest.state, this.config.tracker.terminalStates)) {
         await this.terminateRunningIssue(issueId, true, "terminal state");
+      } else if (isStateIn(latest.state, this.config.tracker.handoffStates)) {
+        await this.terminateRunningIssue(issueId, false, "handoff state");
       } else if (!latest.assignedToWorker) {
         await this.terminateRunningIssue(issueId, false, "assignee route changed");
       } else if (!isStateIn(latest.state, this.config.tracker.activeStates)) {
@@ -253,6 +281,7 @@ export class Orchestrator {
   private async terminateRunningIssue(issueId: string, cleanupWorkspace: boolean, reason: string): Promise<void> {
     const entry = this.running.get(issueId);
     if (!entry) return;
+    entry.suppressRetryOnExit = true;
     entry.abortController.abort();
     if (cleanupWorkspace) {
       entry.cleanupWorkspaceOnExit = true;
@@ -267,10 +296,13 @@ export class Orchestrator {
 
   private shouldDispatch(issue: Issue, allowExistingClaim = false): boolean {
     if (this.running.has(issue.id)) return false;
+    if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
     if (!issue.assignedToWorker) return false;
+    if (isStateIn(issue.state, this.config.tracker.handoffStates)) return false;
     if (!isStateIn(issue.state, this.config.tracker.activeStates)) return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
+    if (!this.passesLabelGuardrails(issue)) return false;
     if (issue.state.toLowerCase() === "todo") {
       const hasOpenBlocker = issue.blockedBy.some(
         (blocker) => blocker.state === null || !isStateIn(blocker.state, this.config.tracker.terminalStates),
@@ -278,6 +310,13 @@ export class Orchestrator {
       if (hasOpenBlocker) return false;
     }
     return this.hasStateSlot(issue.state);
+  }
+
+  private passesLabelGuardrails(issue: Issue): boolean {
+    const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
+    if (this.config.agent.requireLabels.some((label) => !labels.has(label))) return false;
+    if (this.config.agent.excludeLabels.some((label) => labels.has(label))) return false;
+    return true;
   }
 
   private async tryDispatchIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
@@ -324,6 +363,7 @@ export class Orchestrator {
       retryAttempt,
       tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       cleanupWorkspaceOnExit: false,
+      suppressRetryOnExit: false,
     };
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
@@ -366,7 +406,13 @@ export class Orchestrator {
         const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
         const latest = refreshed[0];
         if (latest) entry.issue = latest;
-        if (!entry.issue.assignedToWorker || !isStateIn(entry.issue.state, this.config.tracker.activeStates)) break;
+        if (
+          !entry.issue.assignedToWorker ||
+          isStateIn(entry.issue.state, this.config.tracker.handoffStates) ||
+          !isStateIn(entry.issue.state, this.config.tracker.activeStates)
+        ) {
+          break;
+        }
       }
     } finally {
       if (workspace) {
@@ -450,7 +496,21 @@ export class Orchestrator {
         });
       }
       this.completed.add(issueId);
-      this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null);
+      if (await this.shouldScheduleContinuation(entry)) {
+        this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null);
+      } else {
+        this.claimed.delete(issueId);
+      }
+    } else if (entry.suppressRetryOnExit) {
+      if (entry.runId) {
+        await this.options.runStore?.updateRun(entry.runId, {
+          status: "cancelled",
+          completedAt: new Date().toISOString(),
+          error,
+          tokens: entry.tokens,
+        });
+      }
+      this.claimed.delete(issueId);
     } else {
       if (entry.runId) {
         await this.options.runStore?.updateRun(entry.runId, {
@@ -464,6 +524,24 @@ export class Orchestrator {
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
       this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error);
     }
+  }
+
+  private async shouldScheduleContinuation(entry: RunningEntry): Promise<boolean> {
+    let refreshed: Issue[];
+    try {
+      refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
+    } catch (error) {
+      this.options.logger.warn("post-run issue refresh failed", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        error: errorMessage(error),
+      });
+      return true;
+    }
+    const latest = refreshed[0];
+    if (!latest) return false;
+    entry.issue = latest;
+    return this.shouldDispatch(latest, true);
   }
 
   private scheduleRetry(issueId: string, identifier: string, attempt: number, delayMs: number, error: string | null): void {
