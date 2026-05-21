@@ -1,0 +1,374 @@
+import { constants as fsConstants, promises as fs } from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { Liquid } from "liquidjs";
+import type { HookConfig, WorkspaceConfig } from "../config/Config.js";
+import { SymphonyError, errorMessage } from "../errors.js";
+import type { Issue, Workspace } from "../types.js";
+import type { Logger } from "../logging/StructuredLogger.js";
+import { createGitWorktree, removeGitWorktree } from "./GitWorktreeManager.js";
+import { FileRunTranscriptStore, type WorkspaceRecord } from "../persistence/RunTranscriptStore.js";
+
+export interface WorkspaceManagerOptions {
+  workspace: WorkspaceConfig;
+  hooks: HookConfig;
+  logger: Logger;
+}
+
+export interface WorkspaceMetadata {
+  workspaceKey: string;
+  issueId: string | null;
+  issueIdentifier: string;
+  path: string;
+  createdAt: string;
+  updatedAt: string;
+  sourceKind: string;
+  repoPath?: string;
+  baseRef?: string;
+  gitBranchName?: string;
+}
+
+export class WorkspaceManager {
+  private readonly branchRenderer = new Liquid({ strictVariables: true });
+  private readonly store: FileRunTranscriptStore;
+
+  constructor(private readonly options: WorkspaceManagerOptions) {
+    this.store = new FileRunTranscriptStore(options.workspace.stateDir);
+  }
+
+  async createForIssue(issueInput: WorkspaceIssueInput): Promise<Workspace> {
+    const issue = normalizeIssueInput(issueInput);
+    const issueIdentifier = issue.identifier;
+    const workspaceKey = sanitizeWorkspaceKey(issueIdentifier);
+    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    assertPathInsideRoot(workspacePath, this.options.workspace.root);
+
+    await fs.mkdir(this.options.workspace.root, { recursive: true });
+    await fs.mkdir(this.options.workspace.stateDir, { recursive: true });
+    await assertWorkspaceParentInsideRoot(workspacePath, this.options.workspace.root);
+    const createdNow = !(await pathExists(workspacePath));
+    if (createdNow && this.options.workspace.source.kind === "git_worktree") {
+      const branchName = await this.resolveBranchName(issue);
+      const result = await createGitWorktree({
+        source: this.options.workspace.source,
+        stateDir: this.options.workspace.stateDir,
+        workspacePath,
+        branchName,
+        timeoutMs: this.options.hooks.timeoutMs,
+        logger: this.options.logger,
+      });
+      await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+      await this.writeMetadata({
+        workspaceKey,
+        issueId: issue.id,
+        issueIdentifier,
+        path: workspacePath,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        sourceKind: this.options.workspace.source.kind,
+        repoPath: result.repoPath,
+        baseRef: result.baseRef,
+        gitBranchName: result.branchName,
+      });
+      await this.runHook("after_create", this.options.hooks.afterCreate, workspacePath, true);
+    } else if (!createdNow && this.options.workspace.source.kind === "git_worktree") {
+      await this.assertExistingWorktree(workspaceKey, workspacePath);
+    } else {
+      await ensureDirectory(workspacePath);
+      await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+
+      if (createdNow) {
+        await this.bootstrapWorkspace(workspacePath);
+        await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+        await this.runHook("after_create", this.options.hooks.afterCreate, workspacePath, true);
+      }
+    }
+
+    await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+    const existing = await this.store.getWorkspace(workspaceKey);
+    const metadata: WorkspaceMetadata = {
+      workspaceKey,
+      issueId: issue.id,
+      issueIdentifier,
+      path: workspacePath,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      sourceKind: this.options.workspace.source.kind,
+      ...(existing?.repoPath === undefined ? {} : { repoPath: existing.repoPath }),
+      ...(existing?.baseRef === undefined ? {} : { baseRef: existing.baseRef }),
+      ...(existing?.gitBranchName === undefined ? {} : { gitBranchName: existing.gitBranchName }),
+    };
+    await this.writeMetadata(metadata);
+
+    return {
+      path: workspacePath,
+      workspaceKey,
+      createdNow,
+      issueIdentifier,
+      sourceKind: metadata.sourceKind,
+      ...(issue.id === null ? {} : { issueId: issue.id }),
+      ...(metadata.gitBranchName === undefined ? {} : { gitBranchName: metadata.gitBranchName }),
+      ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
+      ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),
+    };
+  }
+
+  async beforeRun(workspacePath: string): Promise<void> {
+    assertPathInsideRoot(workspacePath, this.options.workspace.root);
+    await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+    await this.runHook("before_run", this.options.hooks.beforeRun, workspacePath, true);
+  }
+
+  async afterRun(workspacePath: string): Promise<void> {
+    assertPathInsideRoot(workspacePath, this.options.workspace.root);
+    await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+    await this.runHook("after_run", this.options.hooks.afterRun, workspacePath, false);
+  }
+
+  async removeForIssue(issueInput: WorkspaceIssueInput): Promise<void> {
+    const issue = normalizeIssueInput(issueInput);
+    const issueIdentifier = issue.identifier;
+    const workspaceKey = sanitizeWorkspaceKey(issueIdentifier);
+    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    assertPathInsideRoot(workspacePath, this.options.workspace.root);
+
+    if (!(await pathExists(workspacePath))) {
+      await this.store.deleteWorkspace(workspaceKey);
+      return;
+    }
+    await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+    await this.runHook("before_remove", this.options.hooks.beforeRemove, workspacePath, false);
+    const metadata = await this.store.getWorkspace(workspaceKey);
+    if (metadata?.sourceKind === "git_worktree" && metadata.repoPath) {
+      await removeGitWorktree({
+        repoPath: metadata.repoPath,
+        workspacePath,
+        cleanup: this.options.workspace.source.cleanup ?? "refuse_dirty",
+        timeoutMs: this.options.hooks.timeoutMs,
+        logger: this.options.logger,
+      });
+    } else if (this.options.workspace.source.kind === "git_worktree") {
+      if ((this.options.workspace.source.cleanup ?? "refuse_dirty") === "refuse_dirty") {
+        throw new SymphonyError("workspace_error", `Refusing to remove worktree without metadata: ${workspacePath}`);
+      }
+      this.options.logger.warn("worktree metadata missing; removing workspace directory directly", {
+        issue_identifier: issueIdentifier,
+        workspace_path: workspacePath,
+      });
+      await fs.rm(workspacePath, { recursive: true, force: true });
+    } else {
+      await fs.rm(workspacePath, { recursive: true, force: true });
+    }
+    await this.store.deleteWorkspace(workspaceKey);
+    this.options.logger.info("workspace removed", {
+      issue_identifier: issueIdentifier,
+      workspace_path: workspacePath,
+    });
+  }
+
+  getPathForIssue(issueIdentifier: string): string {
+    const workspacePath = path.resolve(this.options.workspace.root, sanitizeWorkspaceKey(issueIdentifier));
+    assertPathInsideRoot(workspacePath, this.options.workspace.root);
+    return workspacePath;
+  }
+
+  async getWorkspaceRecord(workspaceKeyOrIssue: string): Promise<WorkspaceRecord | null> {
+    return this.store.findWorkspace(workspaceKeyOrIssue);
+  }
+
+  isInsideRoot(workspacePath: string): boolean {
+    try {
+      assertPathInsideRoot(workspacePath, this.options.workspace.root);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async bootstrapWorkspace(workspacePath: string): Promise<void> {
+    const source = this.options.workspace.source;
+    if (source.kind === "none") return;
+
+    if (source.kind === "copy") {
+      if (!source.path) {
+        throw new SymphonyError("workspace_error", "workspace.source.path is required for copy bootstrap");
+      }
+      await fs.cp(source.path, workspacePath, {
+        recursive: true,
+        force: false,
+        errorOnExist: false,
+      });
+      return;
+    }
+
+    if (source.kind === "git") {
+      if (!source.repository) {
+        throw new SymphonyError("workspace_error", "workspace.source.repository is required for git bootstrap");
+      }
+      const args = ["clone", source.repository, workspacePath];
+      if (source.ref) args.splice(1, 0, "--branch", source.ref);
+      await runCommand("git", args, path.dirname(workspacePath), this.options.hooks.timeoutMs);
+    }
+  }
+
+  private async runHook(
+    hookName: string,
+    script: string | null,
+    workspacePath: string,
+    fatal: boolean,
+  ): Promise<void> {
+    if (!script) return;
+    this.options.logger.info("hook started", { hook: hookName, workspace_path: workspacePath });
+    try {
+      await runShellScript(script, workspacePath, this.options.hooks.timeoutMs);
+      this.options.logger.info("hook completed", { hook: hookName, workspace_path: workspacePath });
+    } catch (error) {
+      this.options.logger.warn("hook failed", {
+        hook: hookName,
+        workspace_path: workspacePath,
+        error: errorMessage(error),
+      });
+      if (fatal) {
+        throw new SymphonyError("hook_error", `${hookName} hook failed: ${errorMessage(error)}`, error);
+      }
+    }
+  }
+
+  private async writeMetadata(metadata: WorkspaceMetadata): Promise<void> {
+    await this.store.upsertWorkspace(metadata);
+  }
+
+  private async resolveBranchName(issue: WorkspaceIssue): Promise<string> {
+    const source = this.options.workspace.source;
+    const template = source.branchTemplate ?? "symphony/{{ issue.identifier }}";
+    const branchName =
+      issue.branchName ??
+      (await this.branchRenderer.parseAndRender(template, {
+        issue: {
+          id: issue.id,
+          identifier: issue.identifier,
+          branchName: issue.branchName,
+        },
+      }));
+    const trimmed = String(branchName).trim();
+    if (trimmed.length === 0) throw new SymphonyError("workspace_error", "Resolved git branch name is empty");
+    return trimmed;
+  }
+
+  private async assertExistingWorktree(workspaceKey: string, workspacePath: string): Promise<void> {
+    await ensureDirectory(workspacePath);
+    await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+    const metadata = await this.store.getWorkspace(workspaceKey);
+    if (metadata?.sourceKind !== "git_worktree" || !metadata.repoPath || !metadata.gitBranchName) {
+      throw new SymphonyError("workspace_error", `Existing workspace is not a managed git worktree: ${workspacePath}`);
+    }
+    if (!(await pathExists(path.join(workspacePath, ".git")))) {
+      throw new SymphonyError("workspace_error", `Existing workspace is missing git worktree metadata: ${workspacePath}`);
+    }
+  }
+}
+
+export interface WorkspaceIssue {
+  id: string | null;
+  identifier: string;
+  branchName: string | null;
+}
+
+export type WorkspaceIssueInput = string | Pick<Issue, "id" | "identifier" | "branchName">;
+
+function normalizeIssueInput(input: WorkspaceIssueInput): WorkspaceIssue {
+  if (typeof input === "string") return { id: null, identifier: input, branchName: null };
+  return { id: input.id, identifier: input.identifier, branchName: input.branchName };
+}
+
+export function sanitizeWorkspaceKey(identifier: string): string {
+  const sanitized = identifier.replace(/[^A-Za-z0-9._-]/g, "_");
+  return sanitized.length > 0 ? sanitized : "issue";
+}
+
+export function assertPathInsideRoot(workspacePath: string, workspaceRoot: string): void {
+  const root = path.resolve(workspaceRoot);
+  const target = path.resolve(workspacePath);
+  const relative = path.relative(root, target);
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) return;
+  throw new SymphonyError("workspace_error", `Workspace path escapes workspace root: ${target}`);
+}
+
+export async function assertRealPathInsideRoot(workspacePath: string, workspaceRoot: string): Promise<void> {
+  assertPathInsideRoot(workspacePath, workspaceRoot);
+  const root = await fs.realpath(workspaceRoot);
+  const target = await fs.realpath(workspacePath);
+  assertPathInsideRoot(target, root);
+}
+
+async function assertWorkspaceParentInsideRoot(workspacePath: string, workspaceRoot: string): Promise<void> {
+  assertPathInsideRoot(workspacePath, workspaceRoot);
+  const root = await fs.realpath(workspaceRoot);
+  const parent = await fs.realpath(path.dirname(workspacePath));
+  assertPathInsideRoot(parent, root);
+}
+
+async function ensureDirectory(directoryPath: string): Promise<void> {
+  try {
+    const stats = await fs.stat(directoryPath);
+    if (!stats.isDirectory()) {
+      throw new SymphonyError("workspace_error", `Workspace path exists but is not a directory: ${directoryPath}`);
+    }
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      await fs.mkdir(directoryPath, { recursive: true });
+      return;
+    }
+    throw error;
+  }
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath, fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runShellScript(script: string, cwd: string, timeoutMs: number): Promise<void> {
+  if (process.platform === "win32") {
+    return runCommand("cmd.exe", ["/d", "/s", "/c", script], cwd, timeoutMs);
+  }
+  return runCommand("sh", ["-lc", script], cwd, timeoutMs);
+}
+
+function runCommand(command: string, args: string[], cwd: string, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let settled = false;
+    let stderr = "";
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGTERM");
+      reject(new Error(`command timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8").slice(0, 8_000);
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`command exited with ${code}: ${stderr}`));
+      }
+    });
+  });
+}
