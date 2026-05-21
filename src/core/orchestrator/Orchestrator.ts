@@ -33,6 +33,18 @@ export interface OrchestratorOptions {
   runStore?: RunTranscriptStore;
   lifecycleStore?: IssueLifecycleStore;
   writeback?: WritebackProcessor;
+  pullRequestClient?: PullRequestDiscoveryClient;
+}
+
+export interface PullRequestDiscoveryClient {
+  findOpenPullRequestByBranch(input: { branchName: string }): Promise<DiscoveredPullRequest | null>;
+}
+
+export interface DiscoveredPullRequest {
+  url: string;
+  number: number;
+  headBranch: string;
+  lastPushedAt: string | null;
 }
 
 export interface RunningEntry {
@@ -509,6 +521,7 @@ export class Orchestrator {
           ...(context.workspace.repoPath === undefined ? {} : { repoPath: context.workspace.repoPath }),
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
         });
+        await this.discoverPullRequestForEntry(entry, context.workspace);
         await this.applyWriteback(
           planRunStartedComment(
             {
@@ -533,6 +546,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           tokens: entry.tokens,
         });
+        await this.discoverPullRequestForEntry(entry, context.workspace);
         await this.recordIncompleteTurn(entry);
       }
       if (event.type === "failed") {
@@ -786,6 +800,67 @@ export class Orchestrator {
     const store = this.options.lifecycleStore;
     if (!store) return;
     entry.lifecycle = await store.updateIssue(entry.issue, patch);
+  }
+
+  private async discoverPullRequestForEntry(entry: RunningEntry, workspace: Workspace): Promise<void> {
+    const client = this.options.pullRequestClient;
+    const branchName = workspace.gitBranchName ?? entry.issue.branchName;
+    if (!client || !branchName) return;
+
+    let pullRequest: DiscoveredPullRequest | null;
+    try {
+      pullRequest = await client.findOpenPullRequestByBranch({ branchName });
+    } catch (error) {
+      this.options.logger.warn("pull request discovery failed", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        branch_name: branchName,
+        error: errorMessage(error),
+      });
+      return;
+    }
+    if (!pullRequest) return;
+
+    const metadata = {
+      prUrl: pullRequest.url,
+      prNumber: pullRequest.number,
+      lastPushedAt: pullRequest.lastPushedAt,
+      gitBranchName: branchName,
+      repoPath: workspace.repoPath ?? null,
+      baseRef: workspace.baseRef ?? null,
+    };
+    await this.updateLifecycle(entry, {
+      summaryPointers: {
+        prUrl: metadata.prUrl,
+        prNumber: metadata.prNumber,
+        lastPushedAt: metadata.lastPushedAt,
+        gitBranchName: metadata.gitBranchName,
+        branchName: metadata.gitBranchName,
+        repoPath: metadata.repoPath,
+        baseRef: metadata.baseRef,
+      },
+    });
+
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!runId || !this.options.runStore) return;
+    const existing = await this.options.runStore.getRun(runId);
+    if (
+      existing?.prUrl === metadata.prUrl &&
+      existing.prNumber === metadata.prNumber &&
+      (existing.lastPushedAt ?? null) === metadata.lastPushedAt
+    ) {
+      return;
+    }
+    await this.options.runStore.recordPullRequestEvent({
+      runId,
+      action: existing?.prUrl ? "updated" : "opened",
+      prUrl: metadata.prUrl,
+      prNumber: metadata.prNumber,
+      lastPushedAt: metadata.lastPushedAt,
+      gitBranchName: metadata.gitBranchName,
+      repoPath: metadata.repoPath,
+      baseRef: metadata.baseRef,
+    });
   }
 
   private availableSlots(): number {

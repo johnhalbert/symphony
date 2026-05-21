@@ -15,4 +15,5 @@ export * from "./core/writeback/WritebackOutbox.js";
 export * from "./core/workflow/PromptRenderer.js";
 export * from "./core/workflow/WorkflowLoader.js";
 export * from "./core/workspace/WorkspaceManager.js";
+export * from "./integrations/github/GitHubPullRequestClient.js";
 export * from "./integrations/linear/LinearTrackerClient.js";
