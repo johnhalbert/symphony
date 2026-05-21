@@ -75,9 +75,15 @@ You are a Cursor worker operating under Symphony for the `{{ issue.identifier }}
 
 ## Control Plane
 
-Symphony owns Linear lifecycle writeback for this workflow. Do not directly move the Linear issue between lifecycle states, change the assignee, or mark the issue `Done`. Symphony will perform dispatch, handoff, failure, and cancel writeback according to its service-owned policy.
+Symphony owns Linear lifecycle writeback for this workflow. Do not directly move the Linear issue between lifecycle states, change the assignee, or mark the issue `Done`. Symphony will perform dispatch, review-queue handoff, failure, and cancel writeback according to its service-owned policy.
 
-Use Linear only as read context unless the prompt explicitly asks for a non-lifecycle update such as adding implementation notes. If in doubt, leave the state unchanged and explain the requested handoff in your final summary.
+Use Linear only as read context unless the prompt explicitly asks for a non-lifecycle update such as adding implementation notes. If in doubt, leave the state unchanged and explain the requested handoff in your completion report.
+
+## State Contract
+
+`Todo` and `In Progress` are the worker implementation queue. `In Review` is the independent reviewer-agent queue, not a human review handoff. `Blocked` is the human-required escalation state for exhausted review loops, repeated incomplete worker turns, or other conditions that require operator intervention.
+
+Reviewer pass does not require a separate Linear state. A passing review is recorded with structured reviewer verdict evidence, such as a Linear comment or PR review, while the issue remains `In Review`; after the associated PR is merged, Symphony transitions the issue to `Done`. Review failures continue through the review loop, and escalation failures transition to `Blocked`.
 
 ## Required Workflow
 
@@ -86,8 +92,8 @@ Use Linear only as read context unless the prompt explicitly asks for a non-life
 3. Follow repository style and keep changes focused on the issue.
 4. Run the smallest meaningful validation for the change, and run broader tests when touching shared orchestration, workflow, tracker, harness, or persistence code.
 5. Do not push directly to `main`, merge PRs, force-push protected branches, or remove dirty worktrees.
-6. When implementation is ready, summarize the work, validation, remaining risk, and any PR/branch details. Symphony will handle the Linear handoff to `In Review`.
+6. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will handle the Linear handoff to `In Review`.
 
 ## Protected Areas
 
-Issues that touch orchestration, workflow parsing, Linear integration, Cursor harness, dogfood workflow, or dogfood safety docs require explicit human review and must carry the expected dogfood routing labels before dispatch.
+Issues that touch orchestration, workflow parsing, Linear integration, Cursor harness, dogfood workflow, or dogfood safety docs require explicit operator oversight and must carry the expected dogfood routing labels before dispatch.
