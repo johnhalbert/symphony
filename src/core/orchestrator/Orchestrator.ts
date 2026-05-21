@@ -86,6 +86,7 @@ export interface RuntimeSnapshot {
     lastEventAt: string | null;
     tokens: TokenCounts;
     lifecycle: IssueLifecycleRecord | null;
+    metadata: IssueRunMetadata;
   }>;
   retrying: Array<{
     issueId: string;
@@ -97,6 +98,17 @@ export interface RuntimeSnapshot {
   paused: string[];
   totals: RuntimeTotals;
   rateLimits: unknown;
+}
+
+export interface IssueRunMetadata {
+  prUrl: string | null;
+  prNumber: number | null;
+  ciStatus: string | null;
+  lastPushedAt: string | null;
+  branchName: string | null;
+  gitBranchName: string | null;
+  repoPath: string | null;
+  baseRef: string | null;
 }
 
 export class Orchestrator {
@@ -190,6 +202,7 @@ export class Orchestrator {
         lastEventAt: entry.lastEventAt?.toISOString() ?? null,
         tokens: entry.tokens,
         lifecycle: entry.lifecycle,
+        metadata: metadataForRunningEntry(entry),
       })),
       retrying: [...this.retryAttempts.values()].map((entry) => ({
         issueId: entry.issueId,
@@ -416,6 +429,9 @@ export class Orchestrator {
           workspaceKey: workspace.workspaceKey,
           workspacePath: workspace.path,
           branchName: workspace.gitBranchName ?? null,
+          gitBranchName: workspace.gitBranchName ?? null,
+          repoPath: workspace.repoPath ?? null,
+          baseRef: workspace.baseRef ?? null,
         },
       });
       await this.options.workspaceManager.beforeRun(workspace.path);
@@ -804,4 +820,18 @@ export function sortIssuesForDispatch(issues: Issue[]): Issue[] {
 
 function isStateIn(state: string, states: string[]): boolean {
   return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
+}
+
+function metadataForRunningEntry(entry: RunningEntry): IssueRunMetadata {
+  const pointers = entry.lifecycle?.summaryPointers;
+  return {
+    prUrl: pointers?.prUrl ?? null,
+    prNumber: pointers?.prNumber ?? null,
+    ciStatus: pointers?.ciStatus ?? null,
+    lastPushedAt: pointers?.lastPushedAt ?? null,
+    branchName: pointers?.branchName ?? entry.workspace?.gitBranchName ?? entry.issue.branchName ?? null,
+    gitBranchName: pointers?.gitBranchName ?? entry.workspace?.gitBranchName ?? entry.issue.branchName ?? null,
+    repoPath: pointers?.repoPath ?? entry.workspace?.repoPath ?? null,
+    baseRef: pointers?.baseRef ?? entry.workspace?.baseRef ?? null,
+  };
 }

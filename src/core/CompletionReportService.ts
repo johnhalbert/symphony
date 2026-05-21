@@ -91,7 +91,12 @@ export class CompletionReportService {
       summaryPointers: {
         workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
         branchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
+        gitBranchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
+        repoPath: context.workspace?.repoPath ?? null,
+        baseRef: context.workspace?.baseRef ?? null,
         lastRunId: context.activeRunId,
+        prUrl: report.pullRequest?.url ?? null,
+        prNumber: report.pullRequest?.number ?? null,
       },
     });
 
@@ -149,7 +154,12 @@ export class CompletionReportService {
       summaryPointers: {
         workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
         branchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
+        gitBranchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
+        repoPath: context.workspace?.repoPath ?? null,
+        baseRef: context.workspace?.baseRef ?? null,
         lastRunId: context.activeRunId,
+        prUrl: report.pullRequest?.url ?? null,
+        prNumber: report.pullRequest?.number ?? null,
       },
     });
 

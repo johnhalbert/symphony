@@ -28,7 +28,14 @@ describe("FileIssueLifecycleStore", () => {
         workspaceKey: "TEST-1",
         workspacePath: "/tmp/TEST-1",
         branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "origin/main",
         lastRunId: "run-1",
+        prUrl: "https://github.com/acme/repo/pull/7",
+        prNumber: 7,
+        ciStatus: "pending",
+        lastPushedAt: "2026-01-01T00:00:00.000Z",
       },
     });
 
@@ -50,7 +57,14 @@ describe("FileIssueLifecycleStore", () => {
         workspaceKey: "TEST-1",
         workspacePath: "/tmp/TEST-1",
         branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "origin/main",
         lastRunId: "run-1",
+        prUrl: "https://github.com/acme/repo/pull/7",
+        prNumber: 7,
+        ciStatus: "pending",
+        lastPushedAt: "2026-01-01T00:00:00.000Z",
       },
     });
   });

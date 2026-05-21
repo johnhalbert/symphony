@@ -28,18 +28,57 @@ describe("FileRunTranscriptStore", () => {
       prompt: "work",
       workspaceKey: "TEST-1",
       workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "origin/main",
     });
     await store.appendEvent({ runId: "run-1", at: "2026-01-01T00:00:00.000Z", source: "harness", eventType: "progress", message: "one" });
     await store.appendEvent({ runId: "run-1", at: "2026-01-01T00:00:01.000Z", source: "harness", eventType: "completed" });
+    await store.recordPullRequestEvent({
+      runId: "run-1",
+      action: "opened",
+      at: "2026-01-01T00:00:01.500Z",
+      prUrl: "https://github.com/acme/repo/pull/7",
+      prNumber: 7,
+      lastPushedAt: "2026-01-01T00:00:01.250Z",
+    });
+    await store.recordPullRequestEvent({
+      runId: "run-1",
+      action: "updated",
+      at: "2026-01-01T00:00:01.600Z",
+      prUrl: "https://github.com/acme/repo/pull/7",
+      prNumber: 7,
+      lastPushedAt: "2026-01-01T00:00:01.500Z",
+    });
+    await store.recordCiStatusEvent({
+      runId: "run-1",
+      at: "2026-01-01T00:00:01.750Z",
+      ciStatus: "success",
+    });
     await store.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:02.000Z" });
 
     const reloaded = new FileRunTranscriptStore(root);
     const run = await reloaded.getRun("run-1");
-    const page = await reloaded.readTranscript("run-1", { offset: 0, limit: 1 });
+    const page = await reloaded.readTranscript("run-1", { offset: 0, limit: 10 });
 
-    expect(run?.status).toBe("succeeded");
+    expect(run).toMatchObject({
+      status: "succeeded",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+      prUrl: "https://github.com/acme/repo/pull/7",
+      prNumber: 7,
+      ciStatus: "success",
+      lastPushedAt: "2026-01-01T00:00:01.500Z",
+    });
     expect(await reloaded.listRunsForIssue("TEST-1")).toHaveLength(1);
-    expect(page.events).toHaveLength(1);
-    expect(page.nextOffset).toBe(1);
+    expect(page.events.map((event) => event.eventType)).toEqual([
+      "progress",
+      "completed",
+      "pr_opened",
+      "pr_updated",
+      "ci_status_changed",
+    ]);
+    expect(page.nextOffset).toBeNull();
   });
 });
