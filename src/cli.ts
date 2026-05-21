@@ -10,6 +10,7 @@ import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { LinearTrackerClient } from "./integrations/linear/LinearTrackerClient.js";
+import { GitHubPullRequestClient } from "./integrations/github/GitHubPullRequestClient.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "./core/writeback/WritebackOutbox.js";
@@ -71,6 +72,7 @@ program
       logger,
     });
     const harness = createAgentHarness(config, { runStore });
+    const pullRequestClient = new GitHubPullRequestClient(config.github);
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -81,6 +83,7 @@ program
       runStore,
       lifecycleStore,
       ...(writeback === undefined ? {} : { writeback }),
+      pullRequestClient,
     });
 
     loader.watch((event) => {

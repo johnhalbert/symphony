@@ -38,6 +38,13 @@ Work on {{ issue.identifier }}.`,
     expect(config.cursor.model).toBe("gpt-5.5");
     expect(config.cursor.modelParams).toEqual([{ id: "reasoning", value: "extra-high" }]);
     expect(config.cursor.settingSources).toEqual(["project", "user"]);
+    expect(config.github).toEqual({
+      owner: null,
+      repo: null,
+      token: null,
+      headOwner: null,
+      apiBaseUrl: "https://api.github.com",
+    });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
   });
 
@@ -207,6 +214,54 @@ Work on {{ issue.identifier }}.`,
       cleanup: "force",
     });
     expect(config.workspace.source.repository?.replace(/\\/g, "/")).toMatch(/\/repo\/repo$/);
+  });
+
+  it("parses GitHub PR discovery config with env indirection", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "octo-org",
+          repo: "symphony",
+          token: "$GITHUB_TOKEN",
+          head_owner: "fork-owner",
+          api_base_url: "https://github.example/api/v3",
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret", GITHUB_TOKEN: "github-secret" },
+    );
+
+    expect(config.github).toEqual({
+      owner: "octo-org",
+      repo: "symphony",
+      token: "github-secret",
+      headOwner: "fork-owner",
+      apiBaseUrl: "https://github.example/api/v3",
+    });
+  });
+
+  it("leaves GitHub PR discovery disabled when token or repo config is missing", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "octo-org",
+          repo: "symphony",
+          token: "$GITHUB_TOKEN",
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.github).toMatchObject({
+      owner: "octo-org",
+      repo: "symphony",
+      token: null,
+      headOwner: "octo-org",
+      apiBaseUrl: "https://api.github.com",
+    });
   });
 
   it("ignores obsolete Hermes blocks and rejects Hermes harness selection", () => {

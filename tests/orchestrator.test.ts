@@ -5,8 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import { Orchestrator, sortIssuesForDispatch } from "../src/core/orchestrator/Orchestrator.js";
+import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
@@ -65,7 +66,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await new Promise((resolve) => setTimeout(resolve, 100));
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toBe("Work on TEST-1");
@@ -482,6 +483,69 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("discovers and links open pull requests by worktree branch idempotently", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const stateDir = path.join(root, "state");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const pullRequestClient = new FakePullRequestDiscoveryClient({
+      url: "https://github.com/octo-org/symphony/pull/12",
+      number: 12,
+      headBranch: "symphony/TEST-1",
+      lastPushedAt: "2026-01-01T00:01:00Z",
+    });
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+      pullRequestClient,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await orchestrator.stop();
+
+    const run = await runStore.latestRunForIssue(candidate.identifier);
+    const transcript = await runStore.readTranscript(run?.runId ?? "");
+    const lifecycle = await lifecycleStore.get(candidate.identifier);
+
+    expect(pullRequestClient.branches).toEqual(["symphony/TEST-1", "symphony/TEST-1"]);
+    expect(run).toMatchObject({
+      prUrl: "https://github.com/octo-org/symphony/pull/12",
+      prNumber: 12,
+      lastPushedAt: "2026-01-01T00:01:00Z",
+      gitBranchName: "symphony/TEST-1",
+    });
+    expect(transcript.events.filter((event) => event.eventType === "pr_opened")).toHaveLength(1);
+    expect(lifecycle?.summaryPointers).toMatchObject({
+      prUrl: "https://github.com/octo-org/symphony/pull/12",
+      prNumber: 12,
+      lastPushedAt: "2026-01-01T00:01:00Z",
+      branchName: "symphony/TEST-1",
+      gitBranchName: "symphony/TEST-1",
+    });
+  });
+
   it("cancels an active issue without retrying it", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -577,6 +641,24 @@ class NonResumableHarness implements AgentHarness {
     this.prompts.push(prompt);
     yield { type: "session_started", sessionId: "session-1", runId: "run-1" };
     yield { type: "completed" };
+  }
+}
+
+class FakePullRequestDiscoveryClient implements PullRequestDiscoveryClient {
+  readonly branches: string[] = [];
+
+  constructor(
+    private readonly pullRequest: {
+      url: string;
+      number: number;
+      headBranch: string;
+      lastPushedAt: string | null;
+    } | null,
+  ) {}
+
+  async findOpenPullRequestByBranch(input: { branchName: string }) {
+    this.branches.push(input.branchName);
+    return this.pullRequest;
   }
 }
 

@@ -106,6 +106,16 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    github: z
+      .object({
+        owner: z.string().optional(),
+        repo: z.string().optional(),
+        token: z.string().optional(),
+        head_owner: z.string().optional(),
+        api_base_url: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
   })
   .passthrough();
 
@@ -193,6 +203,14 @@ export interface WritebackConfig {
   maxBackoffMs: number;
 }
 
+export interface GitHubConfig {
+  owner: string | null;
+  repo: string | null;
+  token: string | null;
+  headOwner: string | null;
+  apiBaseUrl: string;
+}
+
 export interface ReviewLoopConfig {
   reviewStates: string[];
   blockedStates: string[];
@@ -215,6 +233,7 @@ export interface ServiceConfig {
   cursor: CursorConfig;
   server: ServerConfig;
   writeback: WritebackConfig;
+  github: GitHubConfig;
   reviewLoop: ReviewLoopConfig;
   raw: RawWorkflowConfig;
 }
@@ -302,6 +321,12 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const activeStates = raw.tracker?.active_states ?? DEFAULT_ACTIVE_STATES;
   const handoffStates = raw.tracker?.handoff_states ?? [];
   const terminalStates = raw.tracker?.terminal_states ?? DEFAULT_TERMINAL_STATES;
+  const githubOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.owner, env));
+  const githubRepo = normalizeOptionalConfigString(resolveConfigString(raw.github?.repo, env));
+  const githubToken = normalizeOptionalConfigString(
+    resolveConfigString(raw.github?.token, env) ?? resolveConfigString("$GITHUB_TOKEN", env),
+  );
+  const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
   const reviewStates = raw.review_loop?.review_states ?? handoffStates;
   const blockedStates = raw.review_loop?.blocked_states ?? [];
   const reviewPassState = raw.review_loop?.review_pass_state ?? null;
@@ -369,6 +394,13 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       dispatchState: raw.writeback?.dispatch_state ?? "In Progress",
       maxBackoffMs: raw.writeback?.max_backoff_ms ?? 300_000,
     },
+    github: {
+      owner: githubOwner,
+      repo: githubRepo,
+      token: githubToken,
+      headOwner: githubHeadOwner,
+      apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
+    },
     reviewLoop: {
       reviewStates,
       blockedStates,
@@ -409,6 +441,11 @@ function normalizeStateLimitMap(input: Record<string, number> | undefined): Map<
 
 function normalizeLabels(input: string[] | undefined): string[] {
   return [...new Set((input ?? []).map((label) => label.trim().toLowerCase()).filter((label) => label.length > 0))];
+}
+
+function normalizeOptionalConfigString(value: string | undefined): string | null {
+  const trimmed = value?.trim() ?? "";
+  return trimmed.length === 0 ? null : trimmed;
 }
 
 function validateStateBuckets(input: {

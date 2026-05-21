@@ -76,6 +76,12 @@ writeback:
   mode: live
   dispatch_state: In Progress
   max_backoff_ms: 300000
+
+github:
+  owner: johnhalbert
+  repo: symphony
+  token: $GITHUB_TOKEN
+  head_owner: johnhalbert
 ---
 
 # Symphony Dogfood Worker
