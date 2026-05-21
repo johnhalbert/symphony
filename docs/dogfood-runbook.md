@@ -6,6 +6,8 @@ This runbook describes how to move the Engineering Linear backlog from planning 
 
 Keep `ENG-*` child issues in `Backlog` until their blockers clear and an operator intentionally promotes them.
 
+All child issues in this epic remain `Backlog` with `dogfood-blocked` until manually promoted. Remove `dogfood-blocked` and add `dogfood-ready` only as part of an intentional operator promotion.
+
 Do not run Symphony against the Engineering project before the gate work lands.
 
 ## 2. Verify The Linear Contract
@@ -15,14 +17,23 @@ Confirm:
 - Project: `Symphony`
 - Team: `Engineering`
 - Key: `ENG`
-- Parent: `ENG-28`
+- Parent: `ENG-29`
 - Active states: `Todo`, `In Progress`
-- Handoff state: `In Review`
+- Reviewer queue state: `In Review`
+- Escalation state: `Blocked`
 - Terminal states: `Done`, `Closed`, `Cancelled`, `Canceled`, `Duplicate`
 - Required dispatch label: `dogfood-ready`
 - Deny labels: `dogfood-blocked`, `safety-blocked`
 
 Confirm there are zero issues in `Todo` or `In Progress` before connectivity smoke.
+
+State semantics:
+
+- `Todo` and `In Progress` are the worker implementation queue.
+- `In Review` means awaiting independent reviewer-agent review, not human review.
+- `Blocked` means human-required escalation, including max review loops or max incomplete worker turns.
+- A passing review is recorded through structured reviewer verdict evidence, such as a Linear comment or PR review, while the issue remains `In Review`.
+- Do not add a `Ready` or `Ready for Human` state for the current dogfood loop; after merge, Symphony transitions the issue to `Done`.
 
 ## 3. Baseline Checks
 
@@ -73,9 +84,10 @@ Expected result:
 - Symphony dispatches exactly one worker.
 - A git worktree is created.
 - The run transcript is persisted.
-- The issue reaches `In Review` through service-owned writeback.
+- The worker returns a structured completion report.
+- The issue reaches `In Review` through service-owned writeback for reviewer-agent review.
 - Symphony records zero redispatch after handoff.
-- The workspace remains available for human review.
+- The workspace remains available for review-loop evidence and operator inspection.
 
 ## 7. Recovery
 

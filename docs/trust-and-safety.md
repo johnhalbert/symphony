@@ -19,7 +19,8 @@ Symphony may write:
 - Dispatch transition, such as `Todo` to `In Progress`, when policy allows.
 - Run-start and run-end comments.
 - Failure and cancellation comments.
-- Verified handoff transition, such as `In Progress` to `In Review`.
+- Verified completion handoff transition, such as `In Progress` to `In Review`.
+- Escalation transition to `Blocked` when review loops, incomplete turns, or other operator-required failures exceed policy limits.
 
 Symphony must not write:
 
@@ -32,6 +33,8 @@ Linear writeback should be idempotent and should re-check current Linear state b
 ## Dispatch Guardrails
 
 Dogfood dispatch is opt-in. The reference `WORKFLOW.md` requires `dogfood-ready` and excludes `dogfood-blocked` and `safety-blocked`.
+
+All issues in the dogfood epic remain `Backlog` with `dogfood-blocked` until an operator manually promotes exactly the next issue intended for dispatch.
 
 Protected areas require human implementation until guardrails and the smoke checkpoint are proven:
 
@@ -48,13 +51,18 @@ Gate issues that touch those areas should be implemented manually through Cursor
 
 ## State Model
 
-Dogfood uses three state groups:
+Dogfood uses these state groups:
 
-- Active: `Todo`, `In Progress`
-- Handoff: `In Review`
+- Worker implementation queue: `Todo`, `In Progress`
+- Reviewer-agent queue: `In Review`
+- Human-required escalation: `Blocked`
 - Terminal: `Done`, `Closed`, `Cancelled`, `Canceled`, `Duplicate`
 
-Handoff states are not active and not terminal. Reaching handoff stops dispatch and preserves the workspace for human review.
+`In Review` is not active and not terminal. Reaching `In Review` stops worker dispatch and queues the work for independent reviewer-agent review.
+
+Reviewer pass does not use a separate `Ready` or `Ready for Human` Linear state in the current dogfood loop. The reviewer records a structured pass verdict with supporting evidence, such as a Linear comment or PR review, while the issue remains `In Review`; after the PR is merged, Symphony transitions the issue to `Done`.
+
+Review failures continue through the review loop. Policy exhaustion, repeated incomplete worker turns, or other human-required escalation moves the issue to `Blocked`.
 
 ## Workspace Safety
 
