@@ -1,0 +1,243 @@
+import { describe, expect, it } from "vitest";
+import type { ServiceConfig } from "../src/core/config/Config.js";
+import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
+import {
+  planBlockedEscalationWritebacks,
+  planCompletionReportAcceptedWritebacks,
+  planReviewFailWritebacks,
+  planReviewPassWritebacks,
+} from "../src/core/writeback/TransitionPolicy.js";
+import { issue, testConfig } from "./helpers.js";
+
+type NewCommentOperation = NewWritebackOperation & {
+  kind: "comment";
+  payload: { body: string; dedupeKey: string };
+};
+
+describe("TransitionPolicy review-loop planners", () => {
+  it("plans completion report accepted comment and In Progress to review transition", () => {
+    const config = reviewLoopConfig();
+    const operations = planCompletionReportAcceptedWritebacks(
+      {
+        issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+        runId: "run-1",
+        sessionId: "session-1",
+        workspacePath: "/tmp/workspace",
+      },
+      config,
+      "Implemented the requested policy planners.",
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:run-1:completion-report-accepted",
+      kind: "comment",
+      payload: {
+        dedupeKey: "run-1:completion-report-accepted",
+      },
+    });
+    expect(commentBody(operations, 0)).toContain("accepted the worker completion report");
+    expect(operations[1]).toMatchObject({
+      idempotencyKey: "transition:issue-1:run-1:completion-report-accepted:In Review",
+      kind: "transition",
+      payload: {
+        fromStates: ["In Progress"],
+        toState: "In Review",
+      },
+    });
+  });
+
+  it("does not plan completion report accepted writebacks outside the active implementation state", () => {
+    const config = reviewLoopConfig();
+
+    expect(
+      planCompletionReportAcceptedWritebacks(
+        {
+          issue: issue({ state: "In Review" }),
+          runId: "run-1",
+          sessionId: "session-1",
+          workspacePath: "/tmp/workspace",
+        },
+        config,
+      ),
+    ).toEqual([]);
+  });
+
+  it("plans review fail comment with requested revisions and review to active transition", () => {
+    const config = reviewLoopConfig();
+    const operations = planReviewFailWritebacks(
+      { issue: issue({ state: "In Review" }), runId: "review-run-1", reviewer: "reviewer-1" },
+      config,
+      ["Add tests for the blocked fallback.", "Clarify idempotency keys."],
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:review-run-1:review-verdict-fail",
+      kind: "comment",
+      payload: {
+        dedupeKey: "review-run-1:review-verdict-fail",
+      },
+    });
+    expect(commentBody(operations, 0)).toContain("- Add tests for the blocked fallback.");
+    expect(commentBody(operations, 0)).toContain("- Clarify idempotency keys.");
+    expect(operations[1]).toMatchObject({
+      idempotencyKey: "transition:issue-1:review-run-1:review-verdict-fail:In Progress",
+      kind: "transition",
+      payload: {
+        fromStates: ["In Review"],
+        toState: "In Progress",
+      },
+    });
+  });
+
+  it("does not plan review fail writebacks outside review states", () => {
+    const config = reviewLoopConfig();
+
+    expect(
+      planReviewFailWritebacks(
+        { issue: issue({ state: "In Progress" }), runId: "review-run-1", reviewer: null },
+        config,
+        ["Make a change."],
+      ),
+    ).toEqual([]);
+  });
+
+  it("plans review pass comment and configured pass transition", () => {
+    const config = reviewLoopConfig();
+    const operations = planReviewPassWritebacks(
+      { issue: issue({ state: "In Review" }), runId: "review-run-2", reviewer: "reviewer-1" },
+      config,
+      "Looks good.",
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:review-run-2:review-verdict-pass",
+      kind: "comment",
+      payload: {
+        dedupeKey: "review-run-2:review-verdict-pass",
+      },
+    });
+    expect(commentBody(operations, 0)).toContain("Review pass state: Ready to Merge");
+    expect(operations[1]).toMatchObject({
+      idempotencyKey: "transition:issue-1:review-run-2:review-verdict-pass:Ready to Merge",
+      kind: "transition",
+      payload: {
+        fromStates: ["In Review"],
+        toState: "Ready to Merge",
+      },
+    });
+  });
+
+  it("plans review pass marker comment without transition when no pass state is configured", () => {
+    const config = reviewLoopConfig();
+    config.reviewLoop.reviewPassState = null;
+
+    const operations = planReviewPassWritebacks(
+      { issue: issue({ state: "In Review" }), runId: "review-run-2", reviewer: null },
+      config,
+    );
+
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:review-run-2:review-verdict-pass",
+      kind: "comment",
+    });
+    expect(commentBody(operations, 0)).toContain("Review passed marker: review-passed");
+  });
+
+  it("does not plan review pass writebacks outside review states", () => {
+    const config = reviewLoopConfig();
+
+    expect(
+      planReviewPassWritebacks(
+        { issue: issue({ state: "In Progress" }), runId: "review-run-2", reviewer: null },
+        config,
+      ),
+    ).toEqual([]);
+  });
+
+  it("plans blocked escalation comment and transition from active or review states", () => {
+    const config = reviewLoopConfig();
+    const operations = planBlockedEscalationWritebacks(
+      {
+        issue: issue({ state: "In Review" }),
+        runId: "run-blocked-1",
+        reason: "review loop ceiling reached",
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:run-blocked-1:blocked-escalation",
+      kind: "comment",
+      payload: {
+        dedupeKey: "run-blocked-1:blocked-escalation",
+      },
+    });
+    expect(commentBody(operations, 0)).toContain("Ceiling reason: review loop ceiling reached");
+    expect(operations[1]).toMatchObject({
+      idempotencyKey: "transition:issue-1:run-blocked-1:blocked-escalation:Blocked",
+      kind: "transition",
+      payload: {
+        fromStates: ["Todo", "In Progress", "In Review"],
+        toState: "Blocked",
+      },
+    });
+  });
+
+  it("plans blocked fallback comment only when no blocked state is configured", () => {
+    const config = reviewLoopConfig();
+    config.reviewLoop.blockedStates = [];
+
+    const operations = planBlockedEscalationWritebacks(
+      {
+        issue: issue({ state: "In Progress" }),
+        runId: "run-blocked-1",
+        reason: "max incomplete turns reached",
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:run-blocked-1:blocked-escalation",
+      kind: "comment",
+    });
+    expect(commentBody(operations, 0)).toContain("left the issue state unchanged");
+  });
+
+  it("does not plan blocked escalation writebacks outside active or review states", () => {
+    const config = reviewLoopConfig();
+
+    expect(
+      planBlockedEscalationWritebacks(
+        {
+          issue: issue({ state: "Done" }),
+          runId: "run-blocked-1",
+          reason: "max incomplete turns reached",
+        },
+        config,
+      ),
+    ).toEqual([]);
+  });
+});
+
+function reviewLoopConfig(): ServiceConfig {
+  const config = testConfig("/tmp/symphony-transition-policy");
+  config.writeback.enabled = true;
+  config.writeback.dispatchState = "In Progress";
+  config.reviewLoop.reviewStates = ["In Review"];
+  config.reviewLoop.blockedStates = ["Blocked"];
+  config.reviewLoop.reviewPassState = "Ready to Merge";
+  return config;
+}
+
+function commentBody(operations: NewWritebackOperation[], index: number): string {
+  const operation = operations[index] as NewCommentOperation | undefined;
+  expect(operation?.kind).toBe("comment");
+  if (operation?.kind !== "comment") throw new Error(`Expected operation ${index} to be a comment`);
+  return operation.payload.body;
+}
