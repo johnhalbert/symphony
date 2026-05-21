@@ -517,6 +517,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           tokens: entry.tokens,
         });
+        await this.recordIncompleteTurn(entry);
       }
       if (event.type === "failed") {
         await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
@@ -565,7 +566,7 @@ export class Orchestrator {
             },
             this.config,
           ),
-          "run succeeded",
+          "turn completed",
         );
         this.claimed.delete(issueId);
         return;
@@ -756,6 +757,13 @@ export class Orchestrator {
     if (event.type === "tokens") {
       await this.options.runStore?.updateRun(runId, { tokens: entry.tokens });
     }
+  }
+
+  private async recordIncompleteTurn(entry: RunningEntry): Promise<void> {
+    const store = this.options.lifecycleStore;
+    if (!store) return;
+    const incompleteTurnCount = (entry.lifecycle?.incompleteTurnCount ?? 0) + 1;
+    await this.updateLifecycle(entry, { incompleteTurnCount });
   }
 
   private async updateLifecycle(entry: RunningEntry, patch: IssueLifecyclePatch): Promise<void> {

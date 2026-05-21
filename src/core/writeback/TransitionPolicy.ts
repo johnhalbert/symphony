@@ -47,7 +47,7 @@ export function planRunStartedComment(context: RunWritebackContext, config: Serv
 
 export function planRunSucceededWritebacks(context: RunWritebackContext, config: ServiceConfig): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
-  const operations: NewWritebackOperation[] = [
+  return [
     {
       idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-succeeded`,
       kind: "comment",
@@ -55,25 +55,15 @@ export function planRunSucceededWritebacks(context: RunWritebackContext, config:
       runId: context.runId,
       payload: {
         dedupeKey: `${context.runId}:run-succeeded`,
-        body: [`Symphony worker run completed successfully.`, "", `Run: ${context.runId}`].join("\n"),
+        body: [
+          `Symphony worker turn completed without an accepted completion report.`,
+          `The issue has not been marked ready for review.`,
+          "",
+          `Run: ${context.runId}`,
+        ].join("\n"),
       },
     },
   ];
-  const handoffState = config.tracker.handoffStates[0];
-  if (handoffState) {
-    operations.push({
-      idempotencyKey: `transition:${context.issue.id}:handoff:${handoffState}:${context.runId}`,
-      kind: "transition",
-      issueId: context.issue.id,
-      runId: context.runId,
-      payload: {
-        fromStates: config.tracker.activeStates,
-        toState: handoffState,
-        reason: "Symphony successful run handoff",
-      },
-    });
-  }
-  return operations;
 }
 
 export function planRunFailedComment(context: RunWritebackContext, config: ServiceConfig, error: string | null): NewWritebackOperation | null {

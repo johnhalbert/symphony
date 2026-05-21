@@ -242,7 +242,7 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
-  it("uses service-owned writeback for dispatch comments and handoff", async () => {
+  it("uses service-owned writeback for dispatch and turn-completed comments without handoff", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.mode = "live";
@@ -271,6 +271,7 @@ describe("Orchestrator", () => {
       300_000,
     );
     const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
@@ -280,6 +281,7 @@ describe("Orchestrator", () => {
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
       writeback,
+      lifecycleStore,
     });
 
     await orchestrator.refreshNow();
@@ -287,13 +289,73 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(1);
-    expect(currentState).toBe("In Review");
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
+    expect(currentState).toBe("In Progress");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "fake-issue-1-1:run-started",
       "fake-issue-1-1:run-succeeded",
     ]);
+    expect(writer.comments[1]?.body).toContain("worker turn completed");
+    expect(writer.comments[1]?.body).toContain("not been marked ready for review");
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      incompleteTurnCount: 1,
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("records max-turn exhaustion as incomplete turns instead of handoff", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(path.join(root, "state")),
+      writer,
+      logger,
+      300_000,
+    );
+    const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(2);
+    expect(currentState).toBe("In Progress");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      incompleteTurnCount: 2,
+    });
   });
 
   it("pauses and resumes issue dispatch", async () => {
