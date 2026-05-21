@@ -11,6 +11,7 @@ import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { LinearTrackerClient } from "./integrations/linear/LinearTrackerClient.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
+import { FileWritebackOutboxStore, WritebackProcessor } from "./core/writeback/WritebackOutbox.js";
 
 const program = new Command();
 
@@ -54,6 +55,14 @@ program
 
     const tracker = new LinearTrackerClient(config.tracker);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const writeback = config.writeback.enabled
+      ? new WritebackProcessor(
+          new FileWritebackOutboxStore(config.workspace.stateDir),
+          tracker,
+          logger,
+          config.writeback.maxBackoffMs,
+        )
+      : undefined;
     const workspaceManager = new WorkspaceManager({
       workspace: config.workspace,
       hooks: config.hooks,
@@ -68,6 +77,7 @@ program
       logger,
       promptTemplate: loaded.definition.promptTemplate,
       runStore,
+      ...(writeback === undefined ? {} : { writeback }),
     });
 
     loader.watch((event) => {

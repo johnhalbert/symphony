@@ -8,6 +8,14 @@ import type { Issue, RuntimeTotals, TokenCounts, Workspace } from "../types.js";
 import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import type { RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
+import type { WritebackProcessor } from "../writeback/WritebackOutbox.js";
+import {
+  planDispatchWriteback,
+  planRunCancelledComment,
+  planRunFailedComment,
+  planRunStartedComment,
+  planRunSucceededWritebacks,
+} from "../writeback/TransitionPolicy.js";
 
 export interface OrchestratorOptions {
   config: ServiceConfig;
@@ -17,11 +25,13 @@ export interface OrchestratorOptions {
   logger: Logger;
   promptTemplate: string;
   runStore?: RunTranscriptStore;
+  writeback?: WritebackProcessor;
 }
 
 export interface RunningEntry {
   issue: Issue;
   workspacePath: string | null;
+  workspace: Workspace | null;
   sessionId: string | null;
   runId: string | null;
   activeRunId: string | null;
@@ -103,6 +113,7 @@ export class Orchestrator {
 
   async start(): Promise<void> {
     this.stopped = false;
+    await this.options.writeback?.processDue();
     await this.startupCleanup();
     this.scheduleTick(0);
   }
@@ -340,7 +351,15 @@ export class Orchestrator {
     if (this.availableSlots() <= 0) return false;
     if (!this.shouldDispatch(latest, allowExistingClaim)) return false;
 
-    this.dispatchIssue(latest, attempt);
+    const dispatchWriteback = planDispatchWriteback(latest, this.config);
+    if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
+    const afterWriteback = dispatchWriteback
+      ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0]
+      : latest;
+    if (!afterWriteback) return false;
+    if (!this.shouldDispatch(afterWriteback, allowExistingClaim)) return false;
+
+    this.dispatchIssue(afterWriteback, attempt);
     return true;
   }
 
@@ -350,6 +369,7 @@ export class Orchestrator {
     const entry: RunningEntry = {
       issue,
       workspacePath: null,
+      workspace: null,
       sessionId: null,
       runId: null,
       activeRunId: null,
@@ -378,6 +398,7 @@ export class Orchestrator {
     try {
       workspace = await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
+      entry.workspace = workspace;
       await this.options.workspaceManager.beforeRun(workspace.path);
       await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, 1));
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, 1));
@@ -449,6 +470,19 @@ export class Orchestrator {
           ...(context.workspace.repoPath === undefined ? {} : { repoPath: context.workspace.repoPath }),
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
         });
+        await this.applyWriteback(
+          planRunStartedComment(
+            {
+              issue: entry.issue,
+              runId: entry.runId,
+              sessionId: entry.sessionId,
+              workspacePath: entry.workspacePath,
+              workspace: context.workspace,
+            },
+            this.config,
+          ),
+          "run start comment",
+        );
       }
       if (event.type === "progress") entry.lastMessage = event.message;
       if (event.type === "tokens") this.applyTokenUpdate(entry, event.tokens);
@@ -496,6 +530,23 @@ export class Orchestrator {
         });
       }
       this.completed.add(issueId);
+      if (this.config.writeback.enabled) {
+        await this.applyWritebacks(
+          planRunSucceededWritebacks(
+            {
+              issue: entry.issue,
+              runId: entry.runId ?? issueId,
+              sessionId: entry.sessionId,
+              workspacePath: entry.workspacePath,
+              workspace: entry.workspace,
+            },
+            this.config,
+          ),
+          "run succeeded",
+        );
+        this.claimed.delete(issueId);
+        return;
+      }
       if (await this.shouldScheduleContinuation(entry)) {
         this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null);
       } else {
@@ -510,6 +561,20 @@ export class Orchestrator {
           tokens: entry.tokens,
         });
       }
+      await this.applyWriteback(
+        planRunCancelledComment(
+          {
+            issue: entry.issue,
+            runId: entry.runId ?? issueId,
+            sessionId: entry.sessionId,
+            workspacePath: entry.workspacePath,
+            workspace: entry.workspace,
+          },
+          this.config,
+          error,
+        ),
+        "run cancelled",
+      );
       this.claimed.delete(issueId);
     } else {
       if (entry.runId) {
@@ -520,10 +585,52 @@ export class Orchestrator {
           tokens: entry.tokens,
         });
       }
+      await this.applyWriteback(
+        planRunFailedComment(
+          {
+            issue: entry.issue,
+            runId: entry.runId ?? issueId,
+            sessionId: entry.sessionId,
+            workspacePath: entry.workspacePath,
+            workspace: entry.workspace,
+          },
+          this.config,
+          error,
+        ),
+        "run failed",
+      );
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
       this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error);
     }
+  }
+
+  private async applyWritebacks(
+    operations: Array<Parameters<WritebackProcessor["enqueueAndProcess"]>[0]>,
+    reason: string,
+  ): Promise<boolean> {
+    let ok = true;
+    for (const operation of operations) {
+      ok = (await this.applyWriteback(operation, reason)) && ok;
+    }
+    return ok;
+  }
+
+  private async applyWriteback(
+    operation: Parameters<WritebackProcessor["enqueueAndProcess"]>[0] | null,
+    reason: string,
+  ): Promise<boolean> {
+    if (!operation) return true;
+    if (!this.options.writeback) {
+      this.options.logger.warn("writeback operation skipped because no processor is configured", {
+        issue_id: operation.issueId,
+        kind: operation.kind,
+        reason,
+      });
+      return !this.config.writeback.enabled;
+    }
+    const result = await this.options.writeback.enqueueAndProcess(operation);
+    return result.status === "succeeded";
   }
 
   private async shouldScheduleContinuation(entry: RunningEntry): Promise<boolean> {

@@ -61,6 +61,12 @@ server:
   host: 127.0.0.1
   port: 7331
   open_workspace_token: $SYMPHONY_OPEN_WORKSPACE_TOKEN
+
+writeback:
+  enabled: true
+  mode: live
+  dispatch_state: In Progress
+  max_backoff_ms: 300000
 ---
 
 # Symphony Dogfood Worker

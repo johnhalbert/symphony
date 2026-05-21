@@ -6,7 +6,9 @@ import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch } from "../src/core/orchestrator/Orchestrator.js";
+import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
+import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { issue, testConfig } from "./helpers.js";
 
@@ -232,10 +234,64 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(1);
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("uses service-owned writeback for dispatch comments and handoff", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(path.join(root, "state")),
+      writer,
+      logger,
+      300_000,
+    );
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(1);
+    expect(currentState).toBe("In Review");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
+      "fake-issue-1-1:run-started",
+      "fake-issue-1-1:run-succeeded",
+    ]);
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -406,5 +462,23 @@ class NonResumableHarness implements AgentHarness {
     this.prompts.push(prompt);
     yield { type: "session_started", sessionId: "session-1", runId: "run-1" };
     yield { type: "completed" };
+  }
+}
+
+class StateChangingWriter implements TrackerWriter {
+  readonly transitions: TrackerTransitionInput[] = [];
+  readonly comments: TrackerCommentInput[] = [];
+
+  constructor(private readonly setState: (state: string) => void) {}
+
+  async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+    this.transitions.push(input);
+    this.setState(input.toState);
+    return { status: "applied" };
+  }
+
+  async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    this.comments.push(input);
+    return { status: "applied" };
   }
 }

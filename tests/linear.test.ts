@@ -83,4 +83,66 @@ describe("LinearTrackerClient", () => {
 
     expect(issues.map((item) => item.identifier)).toEqual(["T-1", "T-2"]);
   });
+
+  it("transitions issue state by resolving Linear state ids", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: unknown[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      if (requests.length === 1) {
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "issue-1",
+              identifier: "T-1",
+              state: { id: "todo", name: "Todo" },
+              team: { states: { nodes: [{ id: "progress", name: "In Progress" }] } },
+              comments: { nodes: [] },
+            },
+          },
+        });
+      }
+      return jsonResponse({ data: { issueUpdate: { success: true } } });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.transitionIssueState({
+      issueId: "issue-1",
+      fromStates: ["Todo"],
+      toState: "In Progress",
+    });
+
+    expect(result.status).toBe("applied");
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toMatchObject({ variables: { id: "issue-1", stateId: "progress" } });
+  });
+
+  it("deduplicates comments with hidden writeback markers", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        data: {
+          issue: {
+            id: "issue-1",
+            identifier: "T-1",
+            state: { id: "todo", name: "Todo" },
+            team: { states: { nodes: [] } },
+            comments: { nodes: [{ id: "comment-1", body: "<!-- symphony-writeback:run-1:run-started -->" }] },
+          },
+        },
+      });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.createIssueComment({
+      issueId: "issue-1",
+      body: "Run started",
+      dedupeKey: "run-1:run-started",
+    });
+
+    expect(result.status).toBe("skipped");
+  });
 });
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), { status: 200 });
+}

@@ -1,6 +1,7 @@
 import type { TrackerConfig } from "../../core/config/Config.js";
 import { SymphonyError } from "../../core/errors.js";
 import type { TrackerClient } from "../../core/tracker/TrackerClient.js";
+import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../../core/tracker/TrackerWriter.js";
 import type { Issue, IssueBlockerRef } from "../../core/types.js";
 
 type FetchLike = typeof fetch;
@@ -46,6 +47,19 @@ interface LinearIssueNode {
   inverseRelations?: {
     nodes?: LinearRelationNode[];
   } | null;
+}
+
+interface LinearWorkflowStateNode {
+  id?: unknown;
+  name?: unknown;
+}
+
+interface LinearIssueWriteContext {
+  id?: unknown;
+  identifier?: unknown;
+  state?: { id?: unknown; name?: unknown } | null;
+  team?: { states?: { nodes?: LinearWorkflowStateNode[] } } | null;
+  comments?: { nodes?: Array<{ id?: unknown; body?: unknown }> } | null;
 }
 
 export interface AssigneeFilter {
@@ -128,7 +142,37 @@ const ISSUE_STATES_QUERY = `
   }
 `;
 
-export class LinearTrackerClient implements TrackerClient {
+const ISSUE_WRITE_CONTEXT_QUERY = `
+  query SymphonyIssueWriteContext($id: String!) {
+    issue(id: $id) {
+      id
+      identifier
+      state { id name }
+      team { states { nodes { id name } } }
+      comments(first: 50) { nodes { id body } }
+    }
+  }
+`;
+
+const ISSUE_UPDATE_MUTATION = `
+  mutation SymphonyIssueUpdate($id: String!, $stateId: String!) {
+    issueUpdate(id: $id, input: { stateId: $stateId }) {
+      success
+      issue { id identifier state { id name } updatedAt }
+    }
+  }
+`;
+
+const COMMENT_CREATE_MUTATION = `
+  mutation SymphonyCommentCreate($input: CommentCreateInput!) {
+    commentCreate(input: $input) {
+      success
+      comment { id body createdAt }
+    }
+  }
+`;
+
+export class LinearTrackerClient implements TrackerClient, TrackerWriter {
   constructor(
     private readonly config: TrackerConfig,
     private readonly fetchImpl: FetchLike = fetch,
@@ -163,6 +207,51 @@ export class LinearTrackerClient implements TrackerClient {
     return response.issues.nodes
       .map((node) => normalizeIssue(node, assigneeFilter))
       .filter((issue): issue is Issue => issue !== null);
+  }
+
+  async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+    const context = await this.fetchIssueWriteContext(input.issueId);
+    const currentState = asString(context.state?.name);
+    if (!currentState) throw new SymphonyError("tracker_error", `Linear issue ${input.issueId} is missing state`);
+    if (sameName(currentState, input.toState)) {
+      return { status: "skipped", message: `Issue is already in ${input.toState}` };
+    }
+    if (input.fromStates && input.fromStates.length > 0 && !input.fromStates.some((state) => sameName(state, currentState))) {
+      return {
+        status: "skipped",
+        message: `Current state ${currentState} is outside allowed sources: ${input.fromStates.join(", ")}`,
+      };
+    }
+    const targetState = context.team?.states?.nodes?.find((state) => sameName(asString(state.name) ?? "", input.toState));
+    const stateId = asString(targetState?.id);
+    if (!stateId) throw new SymphonyError("tracker_error", `Linear state not found: ${input.toState}`);
+    const response = await this.graphql<{ issueUpdate: { success?: unknown } }>(ISSUE_UPDATE_MUTATION, {
+      id: input.issueId,
+      stateId,
+    });
+    if (response.issueUpdate.success !== true) {
+      throw new SymphonyError("tracker_error", `Linear issueUpdate did not report success for ${input.issueId}`);
+    }
+    return input.reason === undefined ? { status: "applied" } : { status: "applied", message: input.reason };
+  }
+
+  async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    const marker = commentMarker(input.dedupeKey);
+    const context = await this.fetchIssueWriteContext(input.issueId);
+    if ((context.comments?.nodes ?? []).some((comment) => asString(comment.body)?.includes(marker))) {
+      return { status: "skipped", message: `Comment already exists for ${input.dedupeKey}` };
+    }
+    const response = await this.graphql<{ commentCreate: { success?: unknown } }>(COMMENT_CREATE_MUTATION, {
+      input: {
+        issueId: input.issueId,
+        body: `${input.body}\n\n${marker}`,
+        doNotSubscribeToIssue: true,
+      },
+    });
+    if (response.commentCreate.success !== true) {
+      throw new SymphonyError("tracker_error", `Linear commentCreate did not report success for ${input.issueId}`);
+    }
+    return { status: "applied" };
   }
 
   private async fetchPagedIssues(
@@ -208,6 +297,14 @@ export class LinearTrackerClient implements TrackerClient {
       throw new SymphonyError("tracker_error", "Linear viewer identity is missing");
     }
     return { matchValues: new Set([viewerId]) };
+  }
+
+  private async fetchIssueWriteContext(issueId: string): Promise<LinearIssueWriteContext> {
+    const response = await this.graphql<{ issue?: LinearIssueWriteContext | null }>(ISSUE_WRITE_CONTEXT_QUERY, {
+      id: issueId,
+    });
+    if (!response.issue) throw new SymphonyError("tracker_error", `Linear issue not found: ${issueId}`);
+    return response.issue;
   }
 
   private async graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
@@ -287,4 +384,12 @@ function asString(value: unknown): string | null {
 
 function asNullableString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+function sameName(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+function commentMarker(dedupeKey: string): string {
+  return `<!-- symphony-writeback:${dedupeKey} -->`;
 }

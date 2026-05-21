@@ -86,6 +86,15 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    writeback: z
+      .object({
+        enabled: z.boolean().optional(),
+        mode: z.enum(["live", "dry_run"]).optional(),
+        dispatch_state: z.string().optional(),
+        max_backoff_ms: z.number().int().positive().optional(),
+      })
+      .passthrough()
+      .optional(),
   })
   .passthrough();
 
@@ -166,6 +175,13 @@ export interface ServerConfig {
   openWorkspaceToken: string | null;
 }
 
+export interface WritebackConfig {
+  enabled: boolean;
+  mode: "live" | "dry_run";
+  dispatchState: string;
+  maxBackoffMs: number;
+}
+
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
@@ -178,6 +194,7 @@ export interface ServiceConfig {
   agent: AgentConfig;
   cursor: CursorConfig;
   server: ServerConfig;
+  writeback: WritebackConfig;
   raw: RawWorkflowConfig;
 }
 
@@ -314,6 +331,12 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       port: raw.server?.port ?? null,
       host: raw.server?.host ?? "127.0.0.1",
       openWorkspaceToken: resolveConfigString(raw.server?.open_workspace_token, env) ?? null,
+    },
+    writeback: {
+      enabled: raw.writeback?.enabled ?? false,
+      mode: raw.writeback?.mode ?? "dry_run",
+      dispatchState: raw.writeback?.dispatch_state ?? "In Progress",
+      maxBackoffMs: raw.writeback?.max_backoff_ms ?? 300_000,
     },
     raw,
   };

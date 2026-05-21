@@ -57,6 +57,12 @@ Work on {{ issue.identifier }}.`,
           exclude_labels: ["Safety-Blocked"],
           protected_paths: ["src/core/orchestrator/**"],
         },
+        writeback: {
+          enabled: true,
+          mode: "live",
+          dispatch_state: "In Progress",
+          max_backoff_ms: 60_000,
+        },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
@@ -66,6 +72,12 @@ Work on {{ issue.identifier }}.`,
     expect(config.agent.requireLabels).toEqual(["dogfood-ready"]);
     expect(config.agent.excludeLabels).toEqual(["safety-blocked"]);
     expect(config.agent.protectedPaths).toEqual(["src/core/orchestrator/**"]);
+    expect(config.writeback).toMatchObject({
+      enabled: true,
+      mode: "live",
+      dispatchState: "In Progress",
+      maxBackoffMs: 60_000,
+    });
   });
 
   it("rejects handoff states that overlap active or terminal states", () => {
