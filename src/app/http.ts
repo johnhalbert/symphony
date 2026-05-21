@@ -4,8 +4,8 @@ import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { CursorWorkspaceOpener } from "../../cursor/src/CursorWorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
-import type { IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
-import type { RunTranscriptStore } from "../core/persistence/RunTranscriptStore.js";
+import type { IssueLifecycleRecord, IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
+import type { RunRecord, RunTranscriptStore, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
@@ -130,6 +130,7 @@ export class StatusServer {
           workspace,
           latestRun,
           lifecycle,
+          metadata: statusMetadata({ live, workspace, latestRun, lifecycle }),
           capabilities: {
             transcript: Boolean(latestRun),
             openWorkspace: workspacePath === null ? false : await pathExists(workspacePath),
@@ -245,6 +246,44 @@ function parsePagination(url: URL): { offset: number; limit: number } {
     offset: Number.isFinite(offset) ? Math.max(Math.floor(offset), 0) : 0,
     limit: Number.isFinite(limit) ? Math.max(Math.floor(limit), 1) : 100,
   };
+}
+
+function statusMetadata(input: {
+  live: ReturnType<Orchestrator["getIssueDetails"]>;
+  workspace: WorkspaceRecord | null | undefined;
+  latestRun: RunRecord | null | undefined;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+}) {
+  const pointers = input.lifecycle?.summaryPointers;
+  return {
+    prUrl: metadataValue(input.latestRun, "prUrl", pointers?.prUrl ?? null),
+    prNumber: metadataValue(input.latestRun, "prNumber", pointers?.prNumber ?? null),
+    ciStatus: metadataValue(input.latestRun, "ciStatus", pointers?.ciStatus ?? null),
+    lastPushedAt: metadataValue(input.latestRun, "lastPushedAt", pointers?.lastPushedAt ?? null),
+    branchName:
+      input.live?.metadata?.branchName ??
+      pointers?.branchName ??
+      input.latestRun?.gitBranchName ??
+      input.workspace?.gitBranchName ??
+      null,
+    gitBranchName:
+      input.live?.metadata?.gitBranchName ??
+      pointers?.gitBranchName ??
+      input.latestRun?.gitBranchName ??
+      input.workspace?.gitBranchName ??
+      null,
+    repoPath: input.live?.metadata?.repoPath ?? pointers?.repoPath ?? input.latestRun?.repoPath ?? input.workspace?.repoPath ?? null,
+    baseRef: input.live?.metadata?.baseRef ?? pointers?.baseRef ?? input.latestRun?.baseRef ?? input.workspace?.baseRef ?? null,
+  };
+}
+
+function metadataValue<K extends "prUrl" | "prNumber" | "ciStatus" | "lastPushedAt">(
+  run: RunRecord | null | undefined,
+  key: K,
+  fallback: NonNullable<RunRecord[K]> | null,
+): RunRecord[K] | null {
+  if (run && Object.prototype.hasOwnProperty.call(run, key)) return run[key] ?? null;
+  return fallback;
 }
 
 async function pathExists(targetPath: string): Promise<boolean> {

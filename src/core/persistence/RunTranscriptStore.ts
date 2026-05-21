@@ -17,6 +17,16 @@ export interface WorkspaceRecord {
   updatedAt: string;
 }
 
+export interface RunMetadata {
+  prUrl?: string | null;
+  prNumber?: number | null;
+  ciStatus?: string | null;
+  lastPushedAt?: string | null;
+  gitBranchName?: string | null;
+  repoPath?: string | null;
+  baseRef?: string | null;
+}
+
 export interface RunRecord {
   runId: string;
   sessionId: string | null;
@@ -28,15 +38,19 @@ export interface RunRecord {
   prompt: string;
   workspaceKey: string;
   workspacePath: string;
-  gitBranchName?: string;
-  repoPath?: string;
-  baseRef?: string;
+  gitBranchName?: string | null;
+  repoPath?: string | null;
+  baseRef?: string | null;
   status: RunStatus;
   startedAt: string;
   updatedAt: string;
   completedAt: string | null;
   error: string | null;
   tokens: TokenCounts;
+  prUrl?: string | null;
+  prNumber?: number | null;
+  ciStatus?: string | null;
+  lastPushedAt?: string | null;
 }
 
 export interface TranscriptEvent {
@@ -80,6 +94,19 @@ export interface UpdateRunInput {
   completedAt?: string | null;
   error?: string | null;
   tokens?: TokenCounts;
+  metadata?: RunMetadata;
+}
+
+export interface PullRequestTranscriptInput extends RunMetadata {
+  runId: string;
+  action: "opened" | "updated";
+  at?: string;
+}
+
+export interface CiStatusTranscriptInput extends RunMetadata {
+  runId: string;
+  ciStatus: string | null;
+  at?: string;
 }
 
 export class FileRunTranscriptStore {
@@ -166,10 +193,37 @@ export class FileRunTranscriptStore {
       ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
       ...(input.error === undefined ? {} : { error: input.error }),
       ...(input.tokens === undefined ? {} : { tokens: input.tokens }),
+      ...metadataPatch(input.metadata),
       updatedAt: new Date().toISOString(),
     };
     await this.writeRun(updated);
     return updated;
+  }
+
+  async recordPullRequestEvent(input: PullRequestTranscriptInput): Promise<TranscriptEvent | null> {
+    const updated = await this.updateRun(input.runId, { metadata: input });
+    if (!updated) return null;
+    return this.appendEvent({
+      runId: input.runId,
+      at: input.at ?? new Date().toISOString(),
+      source: "orchestrator",
+      eventType: input.action === "opened" ? "pr_opened" : "pr_updated",
+      message: formatPullRequestMessage(input),
+      payload: metadataPayload(input),
+    });
+  }
+
+  async recordCiStatusEvent(input: CiStatusTranscriptInput): Promise<TranscriptEvent | null> {
+    const updated = await this.updateRun(input.runId, { metadata: input });
+    if (!updated) return null;
+    return this.appendEvent({
+      runId: input.runId,
+      at: input.at ?? new Date().toISOString(),
+      source: "orchestrator",
+      eventType: "ci_status_changed",
+      message: input.ciStatus === null ? "CI status cleared" : `CI status changed to ${input.ciStatus}`,
+      payload: metadataPayload(input),
+    });
   }
 
   async appendEvent(input: Omit<TranscriptEvent, "sequence"> & { sequence?: number }): Promise<TranscriptEvent> {
@@ -257,6 +311,32 @@ export type RunTranscriptStore = FileRunTranscriptStore;
 
 function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "record";
+}
+
+function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
+  if (!metadata) return {};
+  return {
+    ...(metadata.prUrl === undefined ? {} : { prUrl: metadata.prUrl }),
+    ...(metadata.prNumber === undefined ? {} : { prNumber: metadata.prNumber }),
+    ...(metadata.ciStatus === undefined ? {} : { ciStatus: metadata.ciStatus }),
+    ...(metadata.lastPushedAt === undefined ? {} : { lastPushedAt: metadata.lastPushedAt }),
+    ...(metadata.gitBranchName === undefined ? {} : { gitBranchName: metadata.gitBranchName }),
+    ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
+    ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),
+  };
+}
+
+function metadataPayload(metadata: RunMetadata): RunMetadata {
+  return metadataPatch(metadata);
+}
+
+function formatPullRequestMessage(input: PullRequestTranscriptInput): string {
+  const label = input.action === "opened" ? "opened" : "updated";
+  const parts = [
+    input.prNumber === undefined || input.prNumber === null ? null : `#${input.prNumber}`,
+    input.prUrl === undefined || input.prUrl === null ? null : input.prUrl,
+  ].filter((value): value is string => value !== null);
+  return parts.length === 0 ? `PR ${label}` : `PR ${label}: ${parts.join(" ")}`;
 }
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {

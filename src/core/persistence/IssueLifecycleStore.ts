@@ -10,7 +10,14 @@ export interface IssueLifecycleSummaryPointers {
   workspaceKey: string | null;
   workspacePath: string | null;
   branchName: string | null;
+  gitBranchName: string | null;
+  repoPath: string | null;
+  baseRef: string | null;
   lastRunId: string | null;
+  prUrl: string | null;
+  prNumber: number | null;
+  ciStatus: string | null;
+  lastPushedAt: string | null;
 }
 
 export interface CompletionReportChecklistItem {
@@ -160,7 +167,14 @@ function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
     workspaceKey: null,
     workspacePath: null,
     branchName: null,
+    gitBranchName: null,
+    repoPath: null,
+    baseRef: null,
     lastRunId: null,
+    prUrl: null,
+    prNumber: null,
+    ciStatus: null,
+    lastPushedAt: null,
   };
 }
 
@@ -223,7 +237,14 @@ function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecy
     workspaceKey: nullableString(value.workspaceKey, filePath, "summaryPointers.workspaceKey"),
     workspacePath: nullableString(value.workspacePath, filePath, "summaryPointers.workspacePath"),
     branchName: nullableString(value.branchName, filePath, "summaryPointers.branchName"),
+    gitBranchName: optionalNullableString(value.gitBranchName, filePath, "summaryPointers.gitBranchName"),
+    repoPath: optionalNullableString(value.repoPath, filePath, "summaryPointers.repoPath"),
+    baseRef: optionalNullableString(value.baseRef, filePath, "summaryPointers.baseRef"),
     lastRunId: nullableString(value.lastRunId, filePath, "summaryPointers.lastRunId"),
+    prUrl: optionalNullableString(value.prUrl, filePath, "summaryPointers.prUrl"),
+    prNumber: optionalNullableNumber(value.prNumber, filePath, "summaryPointers.prNumber"),
+    ciStatus: optionalNullableString(value.ciStatus, filePath, "summaryPointers.ciStatus"),
+    lastPushedAt: optionalNullableString(value.lastPushedAt, filePath, "summaryPointers.lastPushedAt"),
   };
 }
 
@@ -292,10 +313,20 @@ function nullableString(value: unknown, filePath: string, field: string): string
   throw corruptLifecycle(filePath, `${field} is invalid`);
 }
 
+function optionalNullableString(value: unknown, filePath: string, field: string): string | null {
+  if (value === undefined) return null;
+  return nullableString(value, filePath, field);
+}
+
 function nullableNumber(value: unknown, filePath: string, field: string): number | null {
   if (value === null) return null;
   if (typeof value === "number" && Number.isFinite(value)) return value;
   throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function optionalNullableNumber(value: unknown, filePath: string, field: string): number | null {
+  if (value === undefined) return null;
+  return nullableNumber(value, filePath, field);
 }
 
 function requiredStringArray(value: unknown, filePath: string, field: string): string[] {
