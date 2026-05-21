@@ -45,6 +45,7 @@ describe("FileIssueLifecycleStore", () => {
       lastCompletionReportId: "report-1",
       lastReviewVerdictId: null,
       blockedReason: null,
+      completionReports: [],
       summaryPointers: {
         workspaceKey: "TEST-1",
         workspacePath: "/tmp/TEST-1",
