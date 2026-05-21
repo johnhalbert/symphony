@@ -6,6 +6,7 @@ import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch } from "../src/core/orchestrator/Orchestrator.js";
+import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
@@ -365,6 +366,58 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.stoppedRunIds).toEqual(["run-123"]);
+  });
+
+  it("loads and exposes issue lifecycle records during dispatch", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new BlockingHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
+    await lifecycleStore.ensureIssue(candidate, { reviewRound: 1, incompleteTurnCount: 2 });
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const lifecycle = orchestrator.snapshot().running[0]?.lifecycle;
+    await orchestrator.stop();
+
+    expect(lifecycle).toMatchObject({
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      phase: "implementation",
+      reviewRound: 1,
+      incompleteTurnCount: 2,
+      summaryPointers: {
+        workspaceKey: "TEST-1",
+        lastRunId: "run-123",
+      },
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      reviewRound: 1,
+      incompleteTurnCount: 2,
+    });
   });
 
   it("cancels an active issue without retrying it", async () => {

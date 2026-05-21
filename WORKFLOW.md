@@ -16,6 +16,15 @@ tracker:
     - Canceled
     - Duplicate
 
+review_loop:
+  review_states:
+    - In Review
+  blocked_states:
+    - Blocked
+  max_review_rounds: 3
+  max_incomplete_turns: 3
+  continuation_history_threshold: 5
+
 polling:
   interval_ms: 30000
 

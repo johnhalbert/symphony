@@ -20,6 +20,17 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    review_loop: z
+      .object({
+        review_states: stringArray.optional(),
+        blocked_states: stringArray.optional(),
+        review_pass_state: z.string().optional(),
+        max_review_rounds: z.number().int().positive().optional(),
+        max_incomplete_turns: z.number().int().positive().optional(),
+        continuation_history_threshold: z.number().int().nonnegative().optional(),
+      })
+      .passthrough()
+      .optional(),
     polling: z
       .object({
         interval_ms: z.number().int().positive().optional(),
@@ -182,6 +193,15 @@ export interface WritebackConfig {
   maxBackoffMs: number;
 }
 
+export interface ReviewLoopConfig {
+  reviewStates: string[];
+  blockedStates: string[];
+  reviewPassState: string | null;
+  maxReviewRounds: number;
+  maxIncompleteTurns: number;
+  continuationHistoryThreshold: number;
+}
+
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
@@ -195,6 +215,7 @@ export interface ServiceConfig {
   cursor: CursorConfig;
   server: ServerConfig;
   writeback: WritebackConfig;
+  reviewLoop: ReviewLoopConfig;
   raw: RawWorkflowConfig;
 }
 
@@ -281,7 +302,17 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const activeStates = raw.tracker?.active_states ?? DEFAULT_ACTIVE_STATES;
   const handoffStates = raw.tracker?.handoff_states ?? [];
   const terminalStates = raw.tracker?.terminal_states ?? DEFAULT_TERMINAL_STATES;
-  validateStateBuckets(activeStates, handoffStates, terminalStates);
+  const reviewStates = raw.review_loop?.review_states ?? handoffStates;
+  const blockedStates = raw.review_loop?.blocked_states ?? [];
+  const reviewPassState = raw.review_loop?.review_pass_state ?? null;
+  validateStateBuckets({
+    activeStates,
+    handoffStates,
+    terminalStates,
+    reviewStates,
+    blockedStates,
+    reviewPassState,
+  });
 
   return {
     workflowPath: path.resolve(workflowPath),
@@ -338,6 +369,14 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       dispatchState: raw.writeback?.dispatch_state ?? "In Progress",
       maxBackoffMs: raw.writeback?.max_backoff_ms ?? 300_000,
     },
+    reviewLoop: {
+      reviewStates,
+      blockedStates,
+      reviewPassState,
+      maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
+      maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
+      continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
+    },
     raw,
   };
 }
@@ -372,7 +411,15 @@ function normalizeLabels(input: string[] | undefined): string[] {
   return [...new Set((input ?? []).map((label) => label.trim().toLowerCase()).filter((label) => label.length > 0))];
 }
 
-function validateStateBuckets(activeStates: string[], handoffStates: string[], terminalStates: string[]): void {
+function validateStateBuckets(input: {
+  activeStates: string[];
+  handoffStates: string[];
+  terminalStates: string[];
+  reviewStates: string[];
+  blockedStates: string[];
+  reviewPassState: string | null;
+}): void {
+  const { activeStates, handoffStates, terminalStates, reviewStates, blockedStates, reviewPassState } = input;
   const activeHandoffOverlap = overlappingStates(activeStates, handoffStates);
   if (activeHandoffOverlap.length > 0) {
     throw new SymphonyError(
@@ -386,6 +433,29 @@ function validateStateBuckets(activeStates: string[], handoffStates: string[], t
       "config_validation_error",
       `tracker.handoff_states must not overlap tracker.terminal_states: ${terminalHandoffOverlap.join(", ")}`,
     );
+  }
+
+  const passStates = reviewPassState === null ? [] : [reviewPassState];
+  const buckets = [
+    ["tracker.active_states", activeStates],
+    ["tracker.terminal_states", terminalStates],
+    ["review_loop.blocked_states", blockedStates],
+    ["review_loop.review_states", reviewStates],
+    ["review_loop.review_pass_state", passStates],
+  ] as const;
+
+  for (let leftIndex = 0; leftIndex < buckets.length; leftIndex += 1) {
+    const [leftName, leftStates] = buckets[leftIndex] ?? ["", []];
+    for (let rightIndex = leftIndex + 1; rightIndex < buckets.length; rightIndex += 1) {
+      const [rightName, rightStates] = buckets[rightIndex] ?? ["", []];
+      const overlap = overlappingStates(leftStates, rightStates);
+      if (overlap.length > 0) {
+        throw new SymphonyError(
+          "config_validation_error",
+          `${leftName} must not overlap ${rightName}: ${overlap.join(", ")}`,
+        );
+      }
+    }
   }
 }
 
