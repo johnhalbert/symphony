@@ -4,6 +4,7 @@ import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { CursorWorkspaceOpener } from "../../cursor/src/CursorWorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
+import type { IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import type { RunTranscriptStore } from "../core/persistence/RunTranscriptStore.js";
 
 export interface StatusServerOptions {
@@ -11,6 +12,7 @@ export interface StatusServerOptions {
   workspaceManager: WorkspaceManager;
   workspaceOpener: CursorWorkspaceOpener;
   runStore?: RunTranscriptStore;
+  lifecycleStore?: IssueLifecycleStore;
   host: string;
   port: number;
   openWorkspaceToken: string | null;
@@ -119,13 +121,15 @@ export class StatusServer {
         const live = this.options.orchestrator.getIssueDetails(issueId);
         const workspace = await this.options.runStore?.findWorkspace(issueId);
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
-        if (!live && !workspace && !latestRun) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
+        const lifecycle = await this.options.lifecycleStore?.get(issueId);
+        if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
         sendJson(response, 200, {
           issue: issueId,
           live,
           workspace,
           latestRun,
+          lifecycle,
           capabilities: {
             transcript: Boolean(latestRun),
             openWorkspace: workspacePath === null ? false : await pathExists(workspacePath),

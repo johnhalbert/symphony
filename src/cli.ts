@@ -5,6 +5,7 @@ import { StatusServer } from "./app/http.js";
 import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
 import { Orchestrator } from "./core/orchestrator/Orchestrator.js";
+import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
@@ -55,6 +56,7 @@ program
 
     const tracker = new LinearTrackerClient(config.tracker);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const writeback = config.writeback.enabled
       ? new WritebackProcessor(
           new FileWritebackOutboxStore(config.workspace.stateDir),
@@ -77,6 +79,7 @@ program
       logger,
       promptTemplate: loaded.definition.promptTemplate,
       runStore,
+      lifecycleStore,
       ...(writeback === undefined ? {} : { writeback }),
     });
 
@@ -101,6 +104,7 @@ program
             workspaceManager,
             workspaceOpener: opener,
             runStore,
+            lifecycleStore,
             host: config.server.host,
             port: config.server.port,
             openWorkspaceToken: config.server.openWorkspaceToken,

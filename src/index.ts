@@ -5,6 +5,7 @@ export * from "./core/harness/FakeHarness.js";
 export * from "./core/harness/HarnessFactory.js";
 export * from "./core/logging/StructuredLogger.js";
 export * from "./core/orchestrator/Orchestrator.js";
+export * from "./core/persistence/IssueLifecycleStore.js";
 export * from "./core/tracker/TrackerClient.js";
 export * from "./core/tracker/TrackerWriter.js";
 export * from "./core/types.js";

@@ -8,6 +8,12 @@ import type { Issue, RuntimeTotals, TokenCounts, Workspace } from "../types.js";
 import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import type { RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
+import {
+  phaseForIssueState,
+  type IssueLifecyclePatch,
+  type IssueLifecycleRecord,
+  type IssueLifecycleStore,
+} from "../persistence/IssueLifecycleStore.js";
 import type { WritebackProcessor } from "../writeback/WritebackOutbox.js";
 import {
   planDispatchWriteback,
@@ -25,6 +31,7 @@ export interface OrchestratorOptions {
   logger: Logger;
   promptTemplate: string;
   runStore?: RunTranscriptStore;
+  lifecycleStore?: IssueLifecycleStore;
   writeback?: WritebackProcessor;
 }
 
@@ -35,6 +42,7 @@ export interface RunningEntry {
   sessionId: string | null;
   runId: string | null;
   activeRunId: string | null;
+  lifecycle: IssueLifecycleRecord | null;
   worker: Promise<void>;
   abortController: AbortController;
   startedAt: Date;
@@ -77,6 +85,7 @@ export interface RuntimeSnapshot {
     startedAt: string;
     lastEventAt: string | null;
     tokens: TokenCounts;
+    lifecycle: IssueLifecycleRecord | null;
   }>;
   retrying: Array<{
     issueId: string;
@@ -180,6 +189,7 @@ export class Orchestrator {
         startedAt: entry.startedAt.toISOString(),
         lastEventAt: entry.lastEventAt?.toISOString() ?? null,
         tokens: entry.tokens,
+        lifecycle: entry.lifecycle,
       })),
       retrying: [...this.retryAttempts.values()].map((entry) => ({
         issueId: entry.issueId,
@@ -373,6 +383,7 @@ export class Orchestrator {
       sessionId: null,
       runId: null,
       activeRunId: null,
+      lifecycle: null,
       worker: Promise.resolve(),
       abortController,
       startedAt: new Date(),
@@ -399,6 +410,14 @@ export class Orchestrator {
       workspace = await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
+      await this.updateLifecycle(entry, {
+        phase: phaseForIssueState(entry.issue.state, this.config),
+        summaryPointers: {
+          workspaceKey: workspace.workspaceKey,
+          workspacePath: workspace.path,
+          branchName: workspace.gitBranchName ?? null,
+        },
+      });
       await this.options.workspaceManager.beforeRun(workspace.path);
       await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, 1));
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, 1));
@@ -426,7 +445,10 @@ export class Orchestrator {
 
         const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
         const latest = refreshed[0];
-        if (latest) entry.issue = latest;
+        if (latest) {
+          entry.issue = latest;
+          await this.updateLifecycle(entry, { phase: phaseForIssueState(entry.issue.state, this.config) });
+        }
         if (
           !entry.issue.assignedToWorker ||
           isStateIn(entry.issue.state, this.config.tracker.handoffStates) ||
@@ -455,6 +477,7 @@ export class Orchestrator {
         entry.sessionId = event.sessionId;
         entry.runId = event.runId ?? event.sessionId;
         entry.activeRunId = entry.runId;
+        await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
         await this.options.runStore?.startRun({
           runId: entry.runId,
           sessionId: event.sessionId,
@@ -733,6 +756,12 @@ export class Orchestrator {
     if (event.type === "tokens") {
       await this.options.runStore?.updateRun(runId, { tokens: entry.tokens });
     }
+  }
+
+  private async updateLifecycle(entry: RunningEntry, patch: IssueLifecyclePatch): Promise<void> {
+    const store = this.options.lifecycleStore;
+    if (!store) return;
+    entry.lifecycle = await store.updateIssue(entry.issue, patch);
   }
 
   private availableSlots(): number {

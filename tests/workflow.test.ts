@@ -63,6 +63,14 @@ Work on {{ issue.identifier }}.`,
           dispatch_state: "In Progress",
           max_backoff_ms: 60_000,
         },
+        review_loop: {
+          review_states: ["In Review"],
+          blocked_states: ["Blocked"],
+          review_pass_state: "Review Passed",
+          max_review_rounds: 4,
+          max_incomplete_turns: 2,
+          continuation_history_threshold: 7,
+        },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
@@ -78,6 +86,14 @@ Work on {{ issue.identifier }}.`,
       dispatchState: "In Progress",
       maxBackoffMs: 60_000,
     });
+    expect(config.reviewLoop).toEqual({
+      reviewStates: ["In Review"],
+      blockedStates: ["Blocked"],
+      reviewPassState: "Review Passed",
+      maxReviewRounds: 4,
+      maxIncompleteTurns: 2,
+      continuationHistoryThreshold: 7,
+    });
   });
 
   it("rejects handoff states that overlap active or terminal states", () => {
@@ -90,6 +106,47 @@ Work on {{ issue.identifier }}.`,
             project_slug: "TEST",
             active_states: ["Todo", "In Review"],
             handoff_states: ["In Review"],
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow(SymphonyError);
+  });
+
+  it("rejects review-loop state bucket overlaps", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            active_states: ["Todo", "In Progress"],
+            terminal_states: ["Done"],
+          },
+          review_loop: {
+            review_states: ["In Review"],
+            blocked_states: ["Blocked"],
+            review_pass_state: "Done",
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow(SymphonyError);
+
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            active_states: ["Todo", "Blocked"],
+          },
+          review_loop: {
+            blocked_states: ["Blocked"],
           },
         },
         "/repo/WORKFLOW.md",

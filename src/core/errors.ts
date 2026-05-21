@@ -10,6 +10,7 @@ export type SymphonyErrorCode =
   | "missing_tracker_project_slug"
   | "workspace_error"
   | "hook_error"
+  | "lifecycle_store_corrupt"
   | "tracker_error"
   | "agent_error"
   | "not_found"
