@@ -13,6 +13,34 @@ export interface IssueLifecycleSummaryPointers {
   lastRunId: string | null;
 }
 
+export interface CompletionReportChecklistItem {
+  text: string;
+  satisfied: boolean;
+  evidence: string | null;
+}
+
+export interface CompletionReportPullRequestRef {
+  url: string | null;
+  number: number | null;
+}
+
+export interface IssueCompletionReportRecord {
+  id: string;
+  idempotencyKey: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  summary: string;
+  validationEvidence: string[];
+  acceptanceChecklist: CompletionReportChecklistItem[];
+  changedFiles: string[];
+  branchName: string | null;
+  pullRequest: CompletionReportPullRequestRef | null;
+  risks: string[];
+  acceptedAt: string;
+  writebackOperationKeys: string[];
+}
+
 export interface IssueLifecycleRecord {
   issueId: string;
   issueIdentifier: string;
@@ -23,6 +51,7 @@ export interface IssueLifecycleRecord {
   lastReviewVerdictId: string | null;
   blockedReason: string | null;
   summaryPointers: IssueLifecycleSummaryPointers;
+  completionReports: IssueCompletionReportRecord[];
   createdAt: string;
   updatedAt: string;
 }
@@ -35,6 +64,7 @@ export interface IssueLifecyclePatch {
   lastReviewVerdictId?: string | null;
   blockedReason?: string | null;
   summaryPointers?: Partial<IssueLifecycleSummaryPointers>;
+  completionReports?: IssueCompletionReportRecord[];
 }
 
 export type IssueLifecycleStore = FileIssueLifecycleStore;
@@ -59,6 +89,7 @@ export class FileIssueLifecycleStore {
         ...existing?.summaryPointers,
         ...patch.summaryPointers,
       },
+      completionReports: patch.completionReports ?? existing?.completionReports ?? [],
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
@@ -180,6 +211,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
+    completionReports: normalizeCompletionReports(value.completionReports, filePath),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
   };
@@ -195,6 +227,60 @@ function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecy
   };
 }
 
+function normalizeCompletionReports(value: unknown, filePath: string): IssueCompletionReportRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "completionReports is invalid");
+  return value.map((item, index) => normalizeCompletionReport(item, filePath, index));
+}
+
+function normalizeCompletionReport(value: unknown, filePath: string, index: number): IssueCompletionReportRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `completionReports[${index}] is invalid`);
+  return {
+    id: requiredString(value.id, filePath, `completionReports[${index}].id`),
+    idempotencyKey: requiredString(value.idempotencyKey, filePath, `completionReports[${index}].idempotencyKey`),
+    runId: requiredString(value.runId, filePath, `completionReports[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `completionReports[${index}].issueId`),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, `completionReports[${index}].issueIdentifier`),
+    summary: requiredString(value.summary, filePath, `completionReports[${index}].summary`),
+    validationEvidence: requiredStringArray(value.validationEvidence, filePath, `completionReports[${index}].validationEvidence`),
+    acceptanceChecklist: normalizeChecklist(value.acceptanceChecklist, filePath, index),
+    changedFiles: requiredStringArray(value.changedFiles, filePath, `completionReports[${index}].changedFiles`),
+    branchName: nullableString(value.branchName, filePath, `completionReports[${index}].branchName`),
+    pullRequest: normalizePullRequest(value.pullRequest, filePath, index),
+    risks: requiredStringArray(value.risks, filePath, `completionReports[${index}].risks`),
+    acceptedAt: requiredString(value.acceptedAt, filePath, `completionReports[${index}].acceptedAt`),
+    writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `completionReports[${index}].writebackOperationKeys`),
+  };
+}
+
+function normalizeChecklist(value: unknown, filePath: string, reportIndex: number): CompletionReportChecklistItem[] {
+  if (!Array.isArray(value)) {
+    throw corruptLifecycle(filePath, `completionReports[${reportIndex}].acceptanceChecklist is invalid`);
+  }
+  return value.map((item, itemIndex) => {
+    if (!isRecord(item)) {
+      throw corruptLifecycle(filePath, `completionReports[${reportIndex}].acceptanceChecklist[${itemIndex}] is invalid`);
+    }
+    if (typeof item.satisfied !== "boolean") {
+      throw corruptLifecycle(filePath, `completionReports[${reportIndex}].acceptanceChecklist[${itemIndex}].satisfied is invalid`);
+    }
+    return {
+      text: requiredString(item.text, filePath, `completionReports[${reportIndex}].acceptanceChecklist[${itemIndex}].text`),
+      satisfied: item.satisfied,
+      evidence: nullableString(item.evidence, filePath, `completionReports[${reportIndex}].acceptanceChecklist[${itemIndex}].evidence`),
+    };
+  });
+}
+
+function normalizePullRequest(value: unknown, filePath: string, reportIndex: number): CompletionReportPullRequestRef | null {
+  if (value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `completionReports[${reportIndex}].pullRequest is invalid`);
+  return {
+    url: nullableString(value.url, filePath, `completionReports[${reportIndex}].pullRequest.url`),
+    number: nullableNumber(value.number, filePath, `completionReports[${reportIndex}].pullRequest.number`),
+  };
+}
+
 function nonNegativeInteger(value: unknown, filePath: string, field: string): number {
   if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
   throw corruptLifecycle(filePath, `${field} is invalid`);
@@ -203,6 +289,17 @@ function nonNegativeInteger(value: unknown, filePath: string, field: string): nu
 function nullableString(value: unknown, filePath: string, field: string): string | null {
   if (value === null) return null;
   if (typeof value === "string") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function nullableNumber(value: unknown, filePath: string, field: string): number | null {
+  if (value === null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function requiredStringArray(value: unknown, filePath: string, field: string): string[] {
+  if (Array.isArray(value) && value.every((item) => typeof item === "string")) return value;
   throw corruptLifecycle(filePath, `${field} is invalid`);
 }
 

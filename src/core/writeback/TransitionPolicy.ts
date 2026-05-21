@@ -22,6 +22,18 @@ export interface BlockedEscalationWritebackContext {
   reason: string;
 }
 
+export interface CompletionReportWritebackDetails {
+  reportId: string;
+  idempotencyKey: string;
+  summary: string;
+  validationEvidence: string[];
+  acceptanceChecklist: Array<{ text: string; satisfied: boolean; evidence: string | null }>;
+  changedFiles: string[];
+  branchName: string | null;
+  pullRequest: { url: string | null; number: number | null } | null;
+  risks: string[];
+}
+
 export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewWritebackOperation | null {
   if (!config.writeback.enabled || !sameName(issue.state, "Todo")) return null;
   return {
@@ -81,14 +93,17 @@ export function planRunSucceededWritebacks(context: RunWritebackContext, config:
 export function planCompletionReportAcceptedWritebacks(
   context: RunWritebackContext,
   config: ServiceConfig,
-  summary: string | null = null,
+  report: string | CompletionReportWritebackDetails | null = null,
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled || !isStateIn(context.issue.state, [config.writeback.dispatchState])) return [];
 
   const reviewState = config.reviewLoop.reviewStates[0];
   if (!reviewState) return [];
 
-  const eventKey = `${context.runId}:completion-report-accepted`;
+  const eventKey =
+    typeof report === "object" && report !== null
+      ? `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}`
+      : `${context.runId}:completion-report-accepted`;
   return [
     {
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
@@ -104,7 +119,7 @@ export function planCompletionReportAcceptedWritebacks(
           `Session: ${context.sessionId ?? "n/a"}`,
           `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
           `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? "n/a"}`,
-          ...(summary === null || summary.trim().length === 0 ? [] : ["", "Summary:", summary.trim()]),
+          ...formatCompletionReportForComment(report),
         ].join("\n"),
       },
     },
@@ -307,4 +322,57 @@ function uniqueStates(states: string[]): string[] {
     result.push(state);
   }
   return result;
+}
+
+function formatCompletionReportForComment(report: string | CompletionReportWritebackDetails | null): string[] {
+  if (typeof report === "string") {
+    return report.trim().length === 0 ? [] : ["", "Summary:", report.trim()];
+  }
+  if (report === null) return [];
+
+  return [
+    "",
+    "Completion report:",
+    `Report: ${report.reportId}`,
+    `Idempotency key: ${report.idempotencyKey}`,
+    "",
+    "Summary:",
+    report.summary.trim(),
+    "",
+    "Acceptance checklist:",
+    ...report.acceptanceChecklist.map(
+      (item) => `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
+    ),
+    "",
+    "Validation evidence:",
+    ...listOrFallback(report.validationEvidence, "No validation evidence supplied."),
+    "",
+    "Changed files:",
+    ...listOrFallback(report.changedFiles, "No changed files supplied."),
+    "",
+    "Branch / PR:",
+    `- Branch: ${report.branchName ?? "n/a"}`,
+    `- PR: ${formatPullRequest(report.pullRequest)}`,
+    "",
+    "Risks / follow-ups:",
+    ...listOrFallback(report.risks, "No known risks or follow-ups."),
+  ];
+}
+
+function listOrFallback(values: string[], fallback: string): string[] {
+  const items = values.map((value) => value.trim()).filter((value) => value.length > 0);
+  return items.length === 0 ? [`- ${fallback}`] : items.map((value) => `- ${value}`);
+}
+
+function formatPullRequest(pullRequest: CompletionReportWritebackDetails["pullRequest"]): string {
+  if (pullRequest === null) return "n/a";
+  const parts = [
+    pullRequest.number === null ? null : `#${pullRequest.number}`,
+    pullRequest.url === null ? null : pullRequest.url,
+  ].filter((value): value is string => value !== null);
+  return parts.length === 0 ? "n/a" : parts.join(" ");
+}
+
+function safeKeySegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, "_") || "report";
 }
