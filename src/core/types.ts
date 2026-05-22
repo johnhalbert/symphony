@@ -37,6 +37,8 @@ export interface Workspace {
   baseRef?: string;
 }
 
+export type AgentRunRole = "worker" | "reviewer";
+
 export type RunAttempt = number | null;
 
 export interface TokenCounts {

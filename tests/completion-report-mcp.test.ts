@@ -37,6 +37,7 @@ describe("completion report MCP handoff", () => {
       runId: "run-1",
       sessionId: "agent-1:run-1",
       agentId: "agent-1",
+      role: "worker",
       issueId: "issue-1",
       issueIdentifier: "TEST-1",
       attempt: null,

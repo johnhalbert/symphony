@@ -4,12 +4,13 @@ import { SymphonyError, errorMessage } from "../errors.js";
 import type { AgentEvent, AgentHarness } from "../harness/AgentHarness.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
-import type { Issue, RuntimeTotals, TokenCounts, Workspace } from "../types.js";
+import type { AgentRunRole, Issue, RuntimeTotals, TokenCounts, Workspace } from "../types.js";
 import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
-import type { RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
+import type { RunRecord, RunTranscriptStore, TranscriptEvent } from "../persistence/RunTranscriptStore.js";
 import {
   phaseForIssueState,
+  type IssueCompletionReportRecord,
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
   type IssueLifecycleStore,
@@ -50,6 +51,7 @@ export interface DiscoveredPullRequest {
 
 export interface RunningEntry {
   issue: Issue;
+  role: AgentRunRole;
   workspacePath: string | null;
   workspace: Workspace | null;
   sessionId: string | null;
@@ -68,6 +70,14 @@ export interface RunningEntry {
   cleanupWorkspaceOnExit: boolean;
   suppressRetryOnExit: boolean;
   completionReportAccepted: boolean;
+  reviewEvidence: ReviewerDispatchEvidence | null;
+}
+
+interface ReviewerDispatchEvidence {
+  lifecycle: IssueLifecycleRecord;
+  completionReport: IssueCompletionReportRecord;
+  workerRun: RunRecord | null;
+  runDigest: string[];
 }
 
 export interface RetryEntry {
@@ -89,6 +99,7 @@ export interface RuntimeSnapshot {
   running: Array<{
     issueId: string;
     issueIdentifier: string;
+    role: AgentRunRole;
     state: string;
     workspacePath: string | null;
     sessionId: string | null;
@@ -127,6 +138,59 @@ export interface IssueRunMetadata {
   repoPath: string | null;
   baseRef: string | null;
 }
+
+const DEFAULT_REVIEWER_PROMPT_TEMPLATE = `
+You are a Symphony reviewer agent for {{ issue.identifier }}.
+
+Inspect only. Do not modify files, create commits, push branches, comment on Linear, transition Linear state, or otherwise change workspace or lifecycle state directly.
+
+Report a verdict in this format:
+VERDICT: pass | fail | blocked
+SUMMARY:
+EVIDENCE:
+REQUESTED REVISIONS:
+
+Original issue:
+{{ issue.identifier }} - {{ issue.title }}
+State: {{ issue.state }}
+URL: {{ issue.url }}
+
+Description:
+{{ issue.description }}
+
+Acceptance criteria:
+{% for item in acceptanceCriteria %}- {{ item }}
+{% else %}- No acceptance criteria were supplied.
+{% endfor %}
+
+Worker completion report:
+Report: {{ completionReport.id }}
+Worker run: {{ completionReport.runId }}
+Summary: {{ completionReport.summary }}
+Changed files:
+{% for file in completionReport.changedFiles %}- {{ file }}
+{% else %}- No changed files supplied.
+{% endfor %}
+Risks:
+{% for risk in completionReport.risks %}- {{ risk }}
+{% else %}- No known risks supplied.
+{% endfor %}
+
+Validation evidence:
+{% for item in validationEvidence %}- {{ item }}
+{% else %}- No validation evidence supplied.
+{% endfor %}
+
+Git and workspace evidence:
+{% for item in workspaceEvidence %}- {{ item }}
+{% else %}- No workspace evidence supplied.
+{% endfor %}
+
+Relevant worker run digest:
+{% for item in runDigest %}- {{ item }}
+{% else %}- No run digest is available.
+{% endfor %}
+`;
 
 export class Orchestrator {
   private config: ServiceConfig;
@@ -208,6 +272,7 @@ export class Orchestrator {
       running: [...this.running.entries()].map(([issueId, entry]) => ({
         issueId,
         issueIdentifier: entry.issue.identifier,
+        role: entry.role,
         state: entry.issue.state,
         workspacePath: entry.workspacePath,
         sessionId: entry.sessionId,
@@ -259,10 +324,15 @@ export class Orchestrator {
     this.ticking = true;
     try {
       await this.reconcileRunningIssues();
-      const candidates = await this.options.tracker.fetchCandidateIssues();
-      for (const issue of sortIssuesForDispatch(candidates)) {
+      const workerCandidates = await this.options.tracker.fetchCandidateIssues();
+      for (const issue of sortIssuesForDispatch(workerCandidates)) {
         if (this.availableSlots() <= 0) break;
-        await this.tryDispatchIssue(issue, null);
+        await this.tryDispatchWorkerIssue(issue, null);
+      }
+      const reviewerCandidates = await this.options.tracker.fetchIssuesByStates(this.config.reviewLoop.reviewStates);
+      for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
+        if (this.availableSlots() <= 0) break;
+        await this.tryDispatchReviewerIssue(issue);
       }
     } catch (error) {
       this.options.logger.warn("orchestrator tick failed", { error: errorMessage(error) });
@@ -302,12 +372,16 @@ export class Orchestrator {
       entry.issue = latest;
       if (isStateIn(latest.state, this.config.tracker.terminalStates)) {
         await this.terminateRunningIssue(issueId, true, "terminal state");
-      } else if (isStateIn(latest.state, this.config.tracker.handoffStates)) {
+      } else if (entry.role === "worker" && isStateIn(latest.state, this.config.tracker.handoffStates)) {
         await this.terminateRunningIssue(issueId, false, "handoff state");
-      } else if (!latest.assignedToWorker) {
+      } else if (entry.role === "worker" && !latest.assignedToWorker) {
         await this.terminateRunningIssue(issueId, false, "assignee route changed");
-      } else if (!isStateIn(latest.state, this.config.tracker.activeStates)) {
+      } else if (entry.role === "worker" && !isStateIn(latest.state, this.config.tracker.activeStates)) {
         await this.terminateRunningIssue(issueId, false, "non-active state");
+      } else if (entry.role === "reviewer" && isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
+        await this.terminateRunningIssue(issueId, false, "blocked state");
+      } else if (entry.role === "reviewer" && !isStateIn(latest.state, this.config.reviewLoop.reviewStates)) {
+        await this.terminateRunningIssue(issueId, false, "non-review state");
       }
     }
   }
@@ -345,21 +419,31 @@ export class Orchestrator {
     });
   }
 
-  private shouldDispatch(issue: Issue, allowExistingClaim = false): boolean {
+  private shouldDispatchWorker(issue: Issue, allowExistingClaim = false): boolean {
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
     if (!issue.assignedToWorker) return false;
     if (isStateIn(issue.state, this.config.tracker.handoffStates)) return false;
+    if (isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
     if (!isStateIn(issue.state, this.config.tracker.activeStates)) return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
     if (!this.passesLabelGuardrails(issue)) return false;
     if (issue.state.toLowerCase() === "todo") {
-      const hasOpenBlocker = issue.blockedBy.some(
-        (blocker) => blocker.state === null || !isStateIn(blocker.state, this.config.tracker.terminalStates),
-      );
-      if (hasOpenBlocker) return false;
+      if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
     }
+    return this.hasStateSlot(issue.state);
+  }
+
+  private shouldDispatchReviewer(issue: Issue, allowExistingClaim = false): boolean {
+    if (this.running.has(issue.id)) return false;
+    if (this.pausedIssues.has(issue.id)) return false;
+    if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
+    if (!isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
+    if (!this.passesLabelGuardrails(issue)) return false;
+    if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
     return this.hasStateSlot(issue.state);
   }
 
@@ -370,9 +454,9 @@ export class Orchestrator {
     return true;
   }
 
-  private async tryDispatchIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
+  private async tryDispatchWorkerIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
-    if (!this.shouldDispatch(issue, allowExistingClaim)) return false;
+    if (!this.shouldDispatchWorker(issue, allowExistingClaim)) return false;
 
     let refreshed: Issue[];
     try {
@@ -389,7 +473,7 @@ export class Orchestrator {
     const latest = refreshed[0];
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
-    if (!this.shouldDispatch(latest, allowExistingClaim)) return false;
+    if (!this.shouldDispatchWorker(latest, allowExistingClaim)) return false;
 
     const dispatchWriteback = planDispatchWriteback(latest, this.config);
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
@@ -397,17 +481,51 @@ export class Orchestrator {
       ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0]
       : latest;
     if (!afterWriteback) return false;
-    if (!this.shouldDispatch(afterWriteback, allowExistingClaim)) return false;
+    if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim)) return false;
 
-    this.dispatchIssue(afterWriteback, attempt);
+    this.dispatchIssue(afterWriteback, attempt, "worker", null);
     return true;
   }
 
-  private dispatchIssue(issue: Issue, attempt: number | null): void {
+  private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
+    if (this.availableSlots() <= 0) return false;
+    if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
+
+    let refreshed: Issue[];
+    try {
+      refreshed = await this.options.tracker.fetchIssueStatesByIds([issue.id]);
+    } catch (error) {
+      this.options.logger.warn("pre-review issue refresh failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        error: errorMessage(error),
+      });
+      return false;
+    }
+
+    const latest = refreshed[0];
+    if (!latest) return false;
+    if (this.availableSlots() <= 0) return false;
+    if (!this.shouldDispatchReviewer(latest, allowExistingClaim)) return false;
+
+    const reviewEvidence = await this.loadReviewerDispatchEvidence(latest);
+    if (!reviewEvidence) return false;
+
+    this.dispatchIssue(latest, null, "reviewer", reviewEvidence);
+    return true;
+  }
+
+  private dispatchIssue(
+    issue: Issue,
+    attempt: number | null,
+    role: AgentRunRole,
+    reviewEvidence: ReviewerDispatchEvidence | null,
+  ): void {
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
     const entry: RunningEntry = {
       issue,
+      role,
       workspacePath: null,
       workspace: null,
       sessionId: null,
@@ -426,11 +544,13 @@ export class Orchestrator {
       cleanupWorkspaceOnExit: false,
       suppressRetryOnExit: false,
       completionReportAccepted: false,
+      reviewEvidence,
     };
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
     this.clearRetry(issue.id);
-    entry.worker = this.runWorker(entry, attempt)
+    const run = role === "reviewer" ? this.runReviewer(entry) : this.runWorker(entry, attempt);
+    entry.worker = run
       .then(() => this.onWorkerExit(issue.id, "normal", null))
       .catch((error: unknown) => this.onWorkerExit(issue.id, "abnormal", errorMessage(error)));
   }
@@ -500,6 +620,62 @@ export class Orchestrator {
     }
   }
 
+  private async runReviewer(entry: RunningEntry): Promise<void> {
+    let workspace: Workspace | null = null;
+    try {
+      const evidence = entry.reviewEvidence ?? (await this.loadReviewerDispatchEvidence(entry.issue));
+      if (!evidence) {
+        this.options.logger.warn("reviewer dispatch skipped because no completion report is available", {
+          issue_id: entry.issue.id,
+          issue_identifier: entry.issue.identifier,
+        });
+        return;
+      }
+      entry.lifecycle = evidence.lifecycle;
+      workspace = await this.options.workspaceManager.createForIssue(entry.issue);
+      entry.workspacePath = workspace.path;
+      entry.workspace = workspace;
+      await this.updateLifecycle(entry, {
+        phase: "review",
+        reviewRound: evidence.lifecycle.reviewRound + 1,
+        summaryPointers: {
+          workspaceKey: workspace.workspaceKey,
+          workspacePath: workspace.path,
+          branchName: workspace.gitBranchName ?? entry.issue.branchName ?? evidence.lifecycle.summaryPointers.branchName,
+          gitBranchName:
+            workspace.gitBranchName ?? entry.issue.branchName ?? evidence.lifecycle.summaryPointers.gitBranchName,
+          repoPath: workspace.repoPath ?? evidence.lifecycle.summaryPointers.repoPath,
+          baseRef: workspace.baseRef ?? evidence.lifecycle.summaryPointers.baseRef,
+        },
+      });
+      await this.options.workspaceManager.beforeRun(workspace.path);
+      await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, null, 1));
+      await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
+
+      entry.turnCount = 1;
+      const prompt = await this.promptRenderer.render(this.reviewerPromptTemplate(), {
+        issue: entry.issue,
+        attempt: null,
+        role: "reviewer",
+        completionReport: evidence.completionReport,
+        acceptanceCriteria: acceptanceCriteriaForReport(evidence.completionReport),
+        workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
+        validationEvidence: evidence.completionReport.validationEvidence,
+        runDigest: evidence.runDigest,
+      });
+      await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
+        workspace,
+        prompt,
+        attempt: null,
+        turnNumber: 1,
+      });
+    } finally {
+      if (workspace) {
+        await this.options.workspaceManager.afterRun(workspace.path);
+      }
+    }
+  }
+
   private async consumeHarnessEvents(
     entry: RunningEntry,
     events: AsyncIterable<AgentEvent>,
@@ -517,6 +693,7 @@ export class Orchestrator {
           runId: entry.runId,
           sessionId: event.sessionId,
           agentId: event.threadId ?? null,
+          role: entry.role,
           issueId: entry.issue.id,
           issueIdentifier: entry.issue.identifier,
           attempt: context.attempt,
@@ -529,19 +706,21 @@ export class Orchestrator {
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
         });
         await this.discoverPullRequestForEntry(entry, context.workspace);
-        await this.applyWriteback(
-          planRunStartedComment(
-            {
-              issue: entry.issue,
-              runId: entry.runId,
-              sessionId: entry.sessionId,
-              workspacePath: entry.workspacePath,
-              workspace: context.workspace,
-            },
-            this.config,
-          ),
-          "run start comment",
-        );
+        if (entry.role === "worker") {
+          await this.applyWriteback(
+            planRunStartedComment(
+              {
+                issue: entry.issue,
+                runId: entry.runId,
+                sessionId: entry.sessionId,
+                workspacePath: entry.workspacePath,
+                workspace: context.workspace,
+              },
+              this.config,
+            ),
+            "run start comment",
+          );
+        }
       }
       if (event.type === "progress") entry.lastMessage = event.message;
       if (event.type === "tokens") this.applyTokenUpdate(entry, event.tokens);
@@ -554,7 +733,7 @@ export class Orchestrator {
           tokens: entry.tokens,
         });
         await this.discoverPullRequestForEntry(entry, context.workspace);
-        if (!(await this.reconcileCompletionReportHandoff(entry))) {
+        if (entry.role === "worker" && !(await this.reconcileCompletionReportHandoff(entry))) {
           await this.recordIncompleteTurn(entry);
         }
       }
@@ -593,6 +772,10 @@ export class Orchestrator {
         });
       }
       this.completed.add(issueId);
+      if (entry.role === "reviewer") {
+        this.claimed.delete(issueId);
+        return;
+      }
       if (await this.reconcileCompletionReportHandoff(entry)) {
         this.claimed.delete(issueId);
         return;
@@ -619,6 +802,16 @@ export class Orchestrator {
       } else {
         this.claimed.delete(issueId);
       }
+    } else if (entry.role === "reviewer") {
+      if (entry.runId) {
+        await this.options.runStore?.updateRun(entry.runId, {
+          status: entry.suppressRetryOnExit ? "cancelled" : "failed",
+          completedAt: new Date().toISOString(),
+          error,
+          tokens: entry.tokens,
+        });
+      }
+      this.claimed.delete(issueId);
     } else if (entry.suppressRetryOnExit) {
       if (entry.runId) {
         await this.options.runStore?.updateRun(entry.runId, {
@@ -715,7 +908,7 @@ export class Orchestrator {
     const latest = refreshed[0];
     if (!latest) return false;
     entry.issue = latest;
-    return this.shouldDispatch(latest, true);
+    return this.shouldDispatchWorker(latest, true);
   }
 
   private scheduleRetry(issueId: string, identifier: string, attempt: number, delayMs: number, error: string | null): void {
@@ -742,7 +935,7 @@ export class Orchestrator {
         this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, "no available orchestrator slots");
         return;
       }
-      const dispatched = await this.tryDispatchIssue(issue, retry.attempt, true);
+      const dispatched = await this.tryDispatchWorkerIssue(issue, retry.attempt, true);
       if (!dispatched) this.claimed.delete(issueId);
     } catch (error) {
       this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, errorMessage(error));
@@ -764,6 +957,7 @@ export class Orchestrator {
   ) {
     return {
       issue: entry.issue,
+      role: entry.role,
       attempt,
       workspace,
       config: this.config,
@@ -910,6 +1104,27 @@ export class Orchestrator {
     });
   }
 
+  private async loadReviewerDispatchEvidence(issue: Issue): Promise<ReviewerDispatchEvidence | null> {
+    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    const completionReport = lifecycle ? latestCompletionReport(lifecycle) : null;
+    if (!lifecycle || !completionReport) return null;
+    const workerRun = (await this.options.runStore?.getRun(completionReport.runId)) ?? null;
+    const transcript = this.options.runStore
+      ? await this.options.runStore.readTranscript(completionReport.runId, { limit: 50 })
+      : null;
+    return {
+      lifecycle,
+      completionReport,
+      workerRun,
+      runDigest: digestTranscript(workerRun, transcript?.events ?? []),
+    };
+  }
+
+  private reviewerPromptTemplate(): string {
+    const configured = this.config.reviewLoop.reviewerPromptTemplate;
+    return configured === null || configured.trim().length === 0 ? DEFAULT_REVIEWER_PROMPT_TEMPLATE : configured;
+  }
+
   private availableSlots(): number {
     return Math.max(this.config.agent.maxConcurrentAgents - this.running.size, 0);
   }
@@ -942,6 +1157,67 @@ export function sortIssuesForDispatch(issues: Issue[]): Issue[] {
 
 function isStateIn(state: string, states: string[]): boolean {
   return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
+}
+
+function hasOpenBlocker(issue: Issue, terminalStates: string[]): boolean {
+  return issue.blockedBy.some((blocker) => blocker.state === null || !isStateIn(blocker.state, terminalStates));
+}
+
+function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {
+  if (lifecycle.lastCompletionReportId) {
+    const exact = lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
+    if (exact) return exact;
+  }
+  return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
+}
+
+function acceptanceCriteriaForReport(report: IssueCompletionReportRecord): string[] {
+  return report.acceptanceChecklist.map((item) => {
+    const status = item.satisfied ? "satisfied" : "not satisfied";
+    return `${item.text} (${status}${item.evidence === null ? "" : `; evidence: ${item.evidence}`})`;
+  });
+}
+
+function workspaceEvidenceForReview(
+  issue: Issue,
+  workspace: Workspace,
+  evidence: ReviewerDispatchEvidence,
+): string[] {
+  const pointers = evidence.lifecycle.summaryPointers;
+  const report = evidence.completionReport;
+  const workerRun = evidence.workerRun;
+  return [
+    `Workspace path: ${workspace.path}`,
+    `Workspace key: ${workspace.workspaceKey}`,
+    `Workspace branch: ${workspace.gitBranchName ?? issue.branchName ?? pointers.gitBranchName ?? pointers.branchName ?? "n/a"}`,
+    `Repository path: ${workspace.repoPath ?? pointers.repoPath ?? workerRun?.repoPath ?? "n/a"}`,
+    `Base ref: ${workspace.baseRef ?? pointers.baseRef ?? workerRun?.baseRef ?? "n/a"}`,
+    `Completion report branch: ${report.branchName ?? "n/a"}`,
+    `Pull request: ${report.pullRequest?.url ?? pointers.prUrl ?? workerRun?.prUrl ?? "n/a"}`,
+    `Pull request number: ${report.pullRequest?.number ?? pointers.prNumber ?? workerRun?.prNumber ?? "n/a"}`,
+    `Pull request head SHA: ${report.pullRequest?.headSha ?? pointers.prHeadSha ?? workerRun?.prHeadSha ?? "n/a"}`,
+    `Last pushed at: ${pointers.lastPushedAt ?? workerRun?.lastPushedAt ?? "n/a"}`,
+    `Changed files: ${report.changedFiles.length === 0 ? "n/a" : report.changedFiles.join(", ")}`,
+  ];
+}
+
+function digestTranscript(workerRun: RunRecord | null, events: TranscriptEvent[]): string[] {
+  const summary = workerRun
+    ? [
+        `Worker run ${workerRun.runId} status ${workerRun.status}`,
+        `Worker agent ${workerRun.agentId ?? "n/a"} session ${workerRun.sessionId ?? "n/a"}`,
+        `Worker prompt: ${oneLine(workerRun.prompt).slice(0, 240)}`,
+      ]
+    : ["Worker run metadata is unavailable."];
+  const eventDigest = events
+    .filter((event) => event.message !== undefined && event.message.trim().length > 0)
+    .slice(-12)
+    .map((event) => `#${event.sequence} ${event.eventType}: ${oneLine(event.message ?? "").slice(0, 240)}`);
+  return eventDigest.length === 0 ? summary : [...summary, ...eventDigest];
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function metadataForRunningEntry(entry: RunningEntry): IssueRunMetadata {

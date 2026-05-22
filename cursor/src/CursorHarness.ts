@@ -31,27 +31,35 @@ export class CursorHarness implements AgentHarness {
     const agent = await this.getOrCreateAgent(ctx);
     const deltaEvents: AgentEvent[] = [];
     const completionReportContextFile = completionReportContextFilePath(ctx);
-    await writeCompletionReportMcpContext(completionReportContextFile, {
-      issue: ctx.issue,
-      activeRunId: null,
-      role: "worker",
-      token: null,
-      expectedToken: null,
-      sessionId: null,
-      workspacePath: ctx.workspace.path,
-      workspace: ctx.workspace,
-      phase: "implementation",
-    });
-    const run = await agent.send(prompt, {
+    const isWorker = ctx.role === "worker";
+    if (isWorker) {
+      await writeCompletionReportMcpContext(completionReportContextFile, {
+        issue: ctx.issue,
+        activeRunId: null,
+        role: "worker",
+        token: null,
+        expectedToken: null,
+        sessionId: null,
+        workspacePath: ctx.workspace.path,
+        workspace: ctx.workspace,
+        phase: "implementation",
+      });
+    }
+    const runOptions: NonNullable<Parameters<SDKAgent["send"]>[1]> = {
       model: cursorModelSelection(ctx),
       local: { force: true },
-      mcpServers: {
-        symphony: completionReportMcpServerConfig(ctx, completionReportContextFile),
-      },
       onDelta: ({ update }) => {
         deltaEvents.push(...mapCursorDelta(update));
       },
-    });
+      ...(isWorker
+        ? {
+            mcpServers: {
+              symphony: completionReportMcpServerConfig(ctx, completionReportContextFile),
+            },
+          }
+        : {}),
+    };
+    const run = await agent.send(prompt, runOptions);
 
     this.activeRuns.set(run.id, run);
     const abort = () => {
@@ -65,17 +73,19 @@ export class CursorHarness implements AgentHarness {
       threadId: agent.agentId,
       runId: run.id,
     };
-    await writeCompletionReportMcpContext(completionReportContextFile, {
-      issue: ctx.issue,
-      activeRunId: run.id,
-      role: "worker",
-      token: null,
-      expectedToken: null,
-      sessionId: `${agent.agentId}:${run.id}`,
-      workspacePath: ctx.workspace.path,
-      workspace: ctx.workspace,
-      phase: "implementation",
-    });
+    if (isWorker) {
+      await writeCompletionReportMcpContext(completionReportContextFile, {
+        issue: ctx.issue,
+        activeRunId: run.id,
+        role: "worker",
+        token: null,
+        expectedToken: null,
+        sessionId: `${agent.agentId}:${run.id}`,
+        workspacePath: ctx.workspace.path,
+        workspace: ctx.workspace,
+        phase: "implementation",
+      });
+    }
     await this.options.runStore?.updateRun(run.id, {
       sessionId: `${agent.agentId}:${run.id}`,
       agentId: agent.agentId,
@@ -110,6 +120,10 @@ export class CursorHarness implements AgentHarness {
     } finally {
       ctx.abortSignal.removeEventListener("abort", abort);
       this.activeRuns.delete(run.id);
+      if (ctx.role === "reviewer") {
+        this.agents.delete(agentKey(ctx));
+        await agent[Symbol.asyncDispose]();
+      }
     }
   }
 
@@ -124,7 +138,7 @@ export class CursorHarness implements AgentHarness {
   }
 
   private async getOrCreateAgent(ctx: AgentRunContext): Promise<SDKAgent> {
-    const key = ctx.workspace.path;
+    const key = agentKey(ctx);
     const existing = this.agents.get(key);
     if (existing) return existing;
 
@@ -136,10 +150,10 @@ export class CursorHarness implements AgentHarness {
         cwd: ctx.workspace.path,
         settingSources: ctx.config.cursor.settingSources as SettingSource[],
       },
-      name: `Symphony ${ctx.issue.identifier}`,
+      name: ctx.role === "reviewer" ? `Symphony reviewer ${ctx.issue.identifier}` : `Symphony ${ctx.issue.identifier}`,
       ...(apiKey ? { apiKey } : {}),
     };
-    const latestRun = await this.options.runStore?.latestRunForIssue(ctx.issue.id);
+    const latestRun = ctx.role === "worker" ? await this.options.runStore?.latestRunForIssue(ctx.issue.id) : null;
     let agent: SDKAgent;
     if (latestRun?.agentId) {
       try {
@@ -200,6 +214,10 @@ function completionReportContextFilePath(ctx: AgentRunContext): string {
     "completion-report-mcp",
     `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
   );
+}
+
+function agentKey(ctx: AgentRunContext): string {
+  return ctx.role === "reviewer" ? `${ctx.workspace.path}:reviewer` : `${ctx.workspace.path}:worker`;
 }
 
 function safeFileName(value: string): string {

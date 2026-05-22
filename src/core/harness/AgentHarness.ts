@@ -1,9 +1,10 @@
 import type { ServiceConfig } from "../config/Config.js";
 import type { Logger } from "../logging/StructuredLogger.js";
-import type { Issue, TokenCounts, Workspace } from "../types.js";
+import type { AgentRunRole, Issue, TokenCounts, Workspace } from "../types.js";
 
 export interface AgentRunContext {
   issue: Issue;
+  role: AgentRunRole;
   attempt: number | null;
   workspace: Workspace;
   config: ServiceConfig;

@@ -1,10 +1,16 @@
 import { Liquid } from "liquidjs";
 import { SymphonyError, errorMessage } from "../errors.js";
-import type { Issue, RunAttempt } from "../types.js";
+import type { AgentRunRole, Issue, RunAttempt } from "../types.js";
 
 export interface PromptRenderInput {
   issue: Issue;
   attempt: RunAttempt;
+  role?: AgentRunRole;
+  completionReport?: unknown;
+  acceptanceCriteria?: string[];
+  workspaceEvidence?: string[];
+  validationEvidence?: string[];
+  runDigest?: string[];
 }
 
 export class PromptRenderer {
@@ -26,6 +32,12 @@ export class PromptRenderer {
       const rendered = await this.engine.render(parsed, {
         issue: input.issue,
         attempt: input.attempt,
+        role: input.role ?? "worker",
+        completionReport: input.completionReport ?? null,
+        acceptanceCriteria: input.acceptanceCriteria ?? [],
+        workspaceEvidence: input.workspaceEvidence ?? [],
+        validationEvidence: input.validationEvidence ?? [],
+        runDigest: input.runDigest ?? [],
       });
       return rendered.trim();
     } catch (error) {

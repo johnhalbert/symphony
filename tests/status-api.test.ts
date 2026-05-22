@@ -39,6 +39,7 @@ describe("StatusServer durable API", () => {
       runId: "run-1",
       sessionId: "session-1",
       agentId: "agent-1",
+      role: "worker",
       issueId: "issue-1",
       issueIdentifier: "TEST-1",
       attempt: null,
