@@ -2,6 +2,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  CompletionReportService,
+  type CompletionReportPullRequestPublication,
+  type CompletionReportPullRequestPublicationInput,
+  type CompletionReportPullRequestPublisher,
+} from "../src/core/CompletionReportService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
@@ -66,7 +72,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toBe("Work on TEST-1");
@@ -359,6 +365,98 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("treats accepted completion reports as live handoff and suppresses continuation/no-report writeback", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 3;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const harness = new ReportingHarness(lifecycleStore, outboxStore, runStore, publisher);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.prompts).toEqual(["Work on TEST-1"]);
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
+      "report-run-1:run-started",
+      "report-run-1:completion-report:idem-1",
+    ]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
+    expect(currentState).toBe("In Review");
+    expect(writer.comments[1]?.body).toContain("https://github.com/acme/symphony/pull/42");
+    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
+    expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
+    await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "review",
+      incompleteTurnCount: 0,
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+        lastEvidenceCursor: "idem-1",
+      },
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
   it("pauses and resumes issue dispatch", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -506,6 +604,7 @@ describe("Orchestrator", () => {
       url: "https://github.com/octo-org/symphony/pull/12",
       number: 12,
       headBranch: "symphony/TEST-1",
+      headSha: "abc123",
       lastPushedAt: "2026-01-01T00:01:00Z",
     });
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
@@ -623,7 +722,9 @@ class BlockingHarness implements AgentHarness {
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
     yield { type: "session_started", sessionId: "session-123", runId: "run-123" };
-    await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+    if (!ctx.abortSignal.aborted) {
+      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+    }
     yield { type: "cancelled" };
   }
 
@@ -644,6 +745,72 @@ class NonResumableHarness implements AgentHarness {
   }
 }
 
+class ReportingHarness implements AgentHarness {
+  readonly id = "reporting";
+  readonly prompts: string[] = [];
+
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly outboxStore: FileWritebackOutboxStore,
+    private readonly runStore: FileRunTranscriptStore,
+    private readonly publisher: CompletionReportPullRequestPublisher,
+  ) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.prompts.push(prompt);
+    yield { type: "session_started", sessionId: "report-session-1", runId: "report-run-1" };
+    await new CompletionReportService({
+      config: ctx.config,
+      lifecycleStore: this.lifecycleStore,
+      writebackOutbox: this.outboxStore,
+      runStore: this.runStore,
+      pullRequestPublisher: this.publisher,
+    }).submitCompletionReport(
+      {
+        runId: "report-run-1",
+        issueId: ctx.issue.id,
+        summary: "Implemented the requested handoff.",
+        validationEvidence: ["npm test"],
+        acceptanceChecklist: [
+          {
+            text: "Completion report handoff is live.",
+            satisfied: true,
+            evidence: "Orchestrator test",
+          },
+        ],
+        changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
+        branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
+        pullRequest: null,
+        risks: [],
+        idempotencyKey: "idem-1",
+      },
+      {
+        issue: ctx.issue,
+        activeRunId: "report-run-1",
+        role: "worker",
+        sessionId: "report-session-1",
+        workspacePath: ctx.workspace.path,
+        workspace: ctx.workspace,
+        phase: "implementation",
+      },
+    );
+    yield { type: "completed" };
+  }
+}
+
+class FakeCompletionReportPublisher implements CompletionReportPullRequestPublisher {
+  readonly inputs: CompletionReportPullRequestPublicationInput[] = [];
+
+  constructor(private readonly publication: CompletionReportPullRequestPublication) {}
+
+  async publishPullRequest(
+    input: CompletionReportPullRequestPublicationInput,
+  ): Promise<CompletionReportPullRequestPublication> {
+    this.inputs.push(input);
+    return this.publication;
+  }
+}
+
 class FakePullRequestDiscoveryClient implements PullRequestDiscoveryClient {
   readonly branches: string[] = [];
 
@@ -652,6 +819,7 @@ class FakePullRequestDiscoveryClient implements PullRequestDiscoveryClient {
       url: string;
       number: number;
       headBranch: string;
+      headSha: string | null;
       lastPushedAt: string | null;
     } | null,
   ) {}

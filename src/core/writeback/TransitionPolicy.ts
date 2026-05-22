@@ -30,7 +30,7 @@ export interface CompletionReportWritebackDetails {
   acceptanceChecklist: Array<{ text: string; satisfied: boolean; evidence: string | null }>;
   changedFiles: string[];
   branchName: string | null;
-  pullRequest: { url: string | null; number: number | null } | null;
+  pullRequest: { url: string | null; number: number | null; headSha?: string | null; branch?: string | null } | null;
   risks: string[];
 }
 
@@ -353,6 +353,7 @@ function formatCompletionReportForComment(report: string | CompletionReportWrite
     "Branch / PR:",
     `- Branch: ${report.branchName ?? "n/a"}`,
     `- PR: ${formatPullRequest(report.pullRequest)}`,
+    ...(report.pullRequest?.headSha ? [`- PR head SHA: ${report.pullRequest.headSha}`] : []),
     "",
     "Risks / follow-ups:",
     ...listOrFallback(report.risks, "No known risks or follow-ups."),

@@ -1,6 +1,8 @@
 import { Agent, type Run, type SDKAgent, type SettingSource } from "@cursor/sdk";
+import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
+import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { mapCursorDelta, mapCursorMessage } from "./CursorEventMapper.js";
@@ -28,9 +30,24 @@ export class CursorHarness implements AgentHarness {
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     const agent = await this.getOrCreateAgent(ctx);
     const deltaEvents: AgentEvent[] = [];
+    const completionReportContextFile = completionReportContextFilePath(ctx);
+    await writeCompletionReportMcpContext(completionReportContextFile, {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: null,
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "implementation",
+    });
     const run = await agent.send(prompt, {
       model: cursorModelSelection(ctx),
       local: { force: true },
+      mcpServers: {
+        symphony: completionReportMcpServerConfig(ctx, completionReportContextFile),
+      },
       onDelta: ({ update }) => {
         deltaEvents.push(...mapCursorDelta(update));
       },
@@ -48,6 +65,17 @@ export class CursorHarness implements AgentHarness {
       threadId: agent.agentId,
       runId: run.id,
     };
+    await writeCompletionReportMcpContext(completionReportContextFile, {
+      issue: ctx.issue,
+      activeRunId: run.id,
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: `${agent.agentId}:${run.id}`,
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "implementation",
+    });
     await this.options.runStore?.updateRun(run.id, {
       sessionId: `${agent.agentId}:${run.id}`,
       agentId: agent.agentId,
@@ -140,4 +168,46 @@ function cursorModelSelection(ctx: AgentRunContext): ModelSelection {
   return ctx.config.cursor.modelParams.length === 0
     ? { id: ctx.config.cursor.model }
     : { id: ctx.config.cursor.model, params: ctx.config.cursor.modelParams };
+}
+
+export function completionReportMcpServerConfig(ctx: AgentRunContext, contextFile: string): {
+  type: "stdio";
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+} {
+  return {
+    type: "stdio",
+    command: process.execPath,
+    args: [
+      ...process.execArgv,
+      process.argv[1] ?? "dist/cli.js",
+      "completion-report-mcp",
+      "--workflow",
+      ctx.config.workflowPath,
+      "--context-file",
+      contextFile,
+    ],
+    cwd: ctx.config.workflowDir,
+    env: stringEnvironment(process.env),
+  };
+}
+
+function completionReportContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "completion-report-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
+function safeFileName(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, "_") || "context";
+}
+
+function stringEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
 }

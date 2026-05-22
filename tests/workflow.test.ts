@@ -44,6 +44,7 @@ Work on {{ issue.identifier }}.`,
       token: null,
       headOwner: null,
       apiBaseUrl: "https://api.github.com",
+      publishPullRequests: false,
     });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
   });
@@ -238,6 +239,7 @@ Work on {{ issue.identifier }}.`,
       token: "github-secret",
       headOwner: "fork-owner",
       apiBaseUrl: "https://github.example/api/v3",
+      publishPullRequests: false,
     });
   });
 

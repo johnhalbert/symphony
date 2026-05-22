@@ -44,6 +44,7 @@ export interface DiscoveredPullRequest {
   url: string;
   number: number;
   headBranch: string;
+  headSha: string | null;
   lastPushedAt: string | null;
 }
 
@@ -66,6 +67,7 @@ export interface RunningEntry {
   tokens: TokenCounts;
   cleanupWorkspaceOnExit: boolean;
   suppressRetryOnExit: boolean;
+  completionReportAccepted: boolean;
 }
 
 export interface RetryEntry {
@@ -115,8 +117,11 @@ export interface RuntimeSnapshot {
 export interface IssueRunMetadata {
   prUrl: string | null;
   prNumber: number | null;
+  prHeadSha: string | null;
+  prBranch: string | null;
   ciStatus: string | null;
   lastPushedAt: string | null;
+  lastEvidenceCursor: string | null;
   branchName: string | null;
   gitBranchName: string | null;
   repoPath: string | null;
@@ -420,6 +425,7 @@ export class Orchestrator {
       tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       cleanupWorkspaceOnExit: false,
       suppressRetryOnExit: false,
+      completionReportAccepted: false,
     };
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
@@ -470,6 +476,7 @@ export class Orchestrator {
           attempt,
           turnNumber,
         });
+        if (entry.completionReportAccepted) break;
 
         const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
         const latest = refreshed[0];
@@ -547,7 +554,9 @@ export class Orchestrator {
           tokens: entry.tokens,
         });
         await this.discoverPullRequestForEntry(entry, context.workspace);
-        await this.recordIncompleteTurn(entry);
+        if (!(await this.reconcileCompletionReportHandoff(entry))) {
+          await this.recordIncompleteTurn(entry);
+        }
       }
       if (event.type === "failed") {
         await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
@@ -584,6 +593,10 @@ export class Orchestrator {
         });
       }
       this.completed.add(issueId);
+      if (await this.reconcileCompletionReportHandoff(entry)) {
+        this.claimed.delete(issueId);
+        return;
+      }
       if (this.config.writeback.enabled) {
         await this.applyWritebacks(
           planRunSucceededWritebacks(
@@ -796,6 +809,32 @@ export class Orchestrator {
     await this.updateLifecycle(entry, { incompleteTurnCount });
   }
 
+  private async reconcileCompletionReportHandoff(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return entry.completionReportAccepted;
+
+    const lifecycle = await store.get(entry.issue.id);
+    const report = lifecycle?.completionReports.find((item) => item.runId === runId) ?? null;
+    if (!lifecycle || !report) return entry.completionReportAccepted;
+
+    entry.lifecycle = lifecycle;
+    entry.completionReportAccepted = true;
+
+    if (this.options.writeback) {
+      await this.options.writeback.processDue();
+    } else if (this.config.writeback.enabled) {
+      this.options.logger.warn("completion report accepted but writeback processor is not configured", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        run_id: runId,
+        report_id: report.id,
+      });
+    }
+
+    return true;
+  }
+
   private async updateLifecycle(entry: RunningEntry, patch: IssueLifecyclePatch): Promise<void> {
     const store = this.options.lifecycleStore;
     if (!store) return;
@@ -824,6 +863,8 @@ export class Orchestrator {
     const metadata = {
       prUrl: pullRequest.url,
       prNumber: pullRequest.number,
+      prHeadSha: pullRequest.headSha,
+      prBranch: pullRequest.headBranch,
       lastPushedAt: pullRequest.lastPushedAt,
       gitBranchName: branchName,
       repoPath: workspace.repoPath ?? null,
@@ -833,6 +874,8 @@ export class Orchestrator {
       summaryPointers: {
         prUrl: metadata.prUrl,
         prNumber: metadata.prNumber,
+        prHeadSha: metadata.prHeadSha,
+        prBranch: metadata.prBranch,
         lastPushedAt: metadata.lastPushedAt,
         gitBranchName: metadata.gitBranchName,
         branchName: metadata.gitBranchName,
@@ -847,6 +890,8 @@ export class Orchestrator {
     if (
       existing?.prUrl === metadata.prUrl &&
       existing.prNumber === metadata.prNumber &&
+      existing.prHeadSha === metadata.prHeadSha &&
+      existing.prBranch === metadata.prBranch &&
       (existing.lastPushedAt ?? null) === metadata.lastPushedAt
     ) {
       return;
@@ -856,6 +901,8 @@ export class Orchestrator {
       action: existing?.prUrl ? "updated" : "opened",
       prUrl: metadata.prUrl,
       prNumber: metadata.prNumber,
+      prHeadSha: metadata.prHeadSha,
+      prBranch: metadata.prBranch,
       lastPushedAt: metadata.lastPushedAt,
       gitBranchName: metadata.gitBranchName,
       repoPath: metadata.repoPath,
@@ -902,8 +949,11 @@ function metadataForRunningEntry(entry: RunningEntry): IssueRunMetadata {
   return {
     prUrl: pointers?.prUrl ?? null,
     prNumber: pointers?.prNumber ?? null,
+    prHeadSha: pointers?.prHeadSha ?? null,
+    prBranch: pointers?.prBranch ?? null,
     ciStatus: pointers?.ciStatus ?? null,
     lastPushedAt: pointers?.lastPushedAt ?? null,
+    lastEvidenceCursor: pointers?.lastEvidenceCursor ?? null,
     branchName: pointers?.branchName ?? entry.workspace?.gitBranchName ?? entry.issue.branchName ?? null,
     gitBranchName: pointers?.gitBranchName ?? entry.workspace?.gitBranchName ?? entry.issue.branchName ?? null,
     repoPath: pointers?.repoPath ?? entry.workspace?.repoPath ?? null,

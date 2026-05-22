@@ -113,6 +113,7 @@ const rawConfigSchema = z
         token: z.string().optional(),
         head_owner: z.string().optional(),
         api_base_url: z.string().optional(),
+        publish_pull_requests: z.boolean().optional(),
       })
       .passthrough()
       .optional(),
@@ -209,6 +210,7 @@ export interface GitHubConfig {
   token: string | null;
   headOwner: string | null;
   apiBaseUrl: string;
+  publishPullRequests: boolean;
 }
 
 export interface ReviewLoopConfig {
@@ -327,6 +329,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     resolveConfigString(raw.github?.token, env) ?? resolveConfigString("$GITHUB_TOKEN", env),
   );
   const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
+  const publishPullRequests = raw.github?.publish_pull_requests ?? false;
   const reviewStates = raw.review_loop?.review_states ?? handoffStates;
   const blockedStates = raw.review_loop?.blocked_states ?? [];
   const reviewPassState = raw.review_loop?.review_pass_state ?? null;
@@ -400,6 +403,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       token: githubToken,
       headOwner: githubHeadOwner,
       apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
+      publishPullRequests,
     },
     reviewLoop: {
       reviewStates,

@@ -5,8 +5,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CompletionReportService, type CompletionReportActiveContext, type CompletionReportInput } from "../src/core/CompletionReportService.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
+import type {
+  CompletionReportPullRequestPublication,
+  CompletionReportPullRequestPublicationInput,
+  CompletionReportPullRequestPublisher,
+} from "../src/core/CompletionReportService.js";
 
 describe("CompletionReportService", () => {
   let root: string;
@@ -81,6 +87,92 @@ describe("CompletionReportService", () => {
     expect(await outbox.list()).toHaveLength(2);
   });
 
+  it("publishes a new service-owned PR before accepting a completion report", async () => {
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const { service, lifecycleStore, outbox, runStore } = fixture({ publisher });
+    await startRun(runStore);
+
+    const result = await service.submitCompletionReport(report(), contextWithWorkspace());
+
+    expect(result.report.pullRequest).toEqual({
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      branch: "symphony/TEST-1",
+    });
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      workspacePath: "/tmp/workspace",
+      branchName: "symphony/TEST-1",
+      baseBranch: "main",
+      evidenceCursor: "idem-1",
+    });
+    const comment = (await outbox.list()).find((operation) => operation.kind === "comment");
+    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("https://github.com/acme/symphony/pull/42");
+    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("PR head SHA: abc123");
+    await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+        lastEvidenceCursor: "idem-1",
+      },
+    });
+  });
+
+  it("reuses a service-discovered PR and prevents duplicate publication on replay", async () => {
+    const publisher = new FakePublisher({
+      action: "reused",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const { service, runStore, outbox } = fixture({ publisher });
+    await startRun(runStore);
+
+    const first = await service.submitCompletionReport(report(), contextWithWorkspace());
+    const second = await service.submitCompletionReport(report({ summary: "Changed on replay." }), contextWithWorkspace());
+    const transcript = await runStore.readTranscript("run-1");
+
+    expect(first.replayed).toBe(false);
+    expect(second.replayed).toBe(true);
+    expect(publisher.inputs).toHaveLength(1);
+    expect(await outbox.list()).toHaveLength(2);
+    expect(transcript.events.filter((event) => event.eventType === "pr_opened")).toHaveLength(1);
+  });
+
+  it("rejects completion handoff when service-owned PR publication fails", async () => {
+    const publisher = new FakePublisher(null, new SymphonyError("tracker_error", "GitHub branch push failed"));
+    const { service, lifecycleStore, outbox } = fixture({ publisher });
+
+    await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
+      code: "tracker_error",
+    });
+
+    expect(await lifecycleStore.get("issue-1")).toBeNull();
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
   it("does not durably accept a report when enqueueing writebacks fails", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -147,15 +239,28 @@ describe("CompletionReportService", () => {
     });
   });
 
-  function fixture() {
+  function fixture(options: { publisher?: CompletionReportPullRequestPublisher } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.reviewStates = ["In Review"];
+    if (options.publisher) {
+      config.github.publishPullRequests = true;
+      config.github.owner = "acme";
+      config.github.repo = "symphony";
+      config.github.token = "github-token";
+    }
     const lifecycleStore = new FileIssueLifecycleStore(root);
+    const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
-    const service = new CompletionReportService({ config, lifecycleStore, writebackOutbox: outbox });
-    return { service, lifecycleStore, outbox };
+    const service = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: outbox,
+      runStore,
+      ...(options.publisher === undefined ? {} : { pullRequestPublisher: options.publisher }),
+    });
+    return { service, lifecycleStore, outbox, runStore };
   }
 });
 
@@ -195,11 +300,63 @@ function context(overrides: Partial<CompletionReportActiveContext> = {}): Comple
   };
 }
 
+function contextWithWorkspace(overrides: Partial<CompletionReportActiveContext> = {}): CompletionReportActiveContext {
+  return context({
+    workspace: {
+      path: "/tmp/workspace",
+      workspaceKey: "TEST-1",
+      createdNow: false,
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    },
+    ...overrides,
+  });
+}
+
+async function startRun(runStore: FileRunTranscriptStore): Promise<void> {
+  await runStore.startRun({
+    runId: "run-1",
+    sessionId: "session-1",
+    agentId: "agent-1",
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    attempt: null,
+    turnNumber: 1,
+    prompt: "work",
+    workspaceKey: "TEST-1",
+    workspacePath: "/tmp/workspace",
+    gitBranchName: "symphony/TEST-1",
+    repoPath: "/repo",
+    baseRef: "main",
+  });
+}
+
 class FailingOutbox {
   attempted = 0;
 
   async enqueueOnce(_operation: NewWritebackOperation): Promise<WritebackOperation> {
     this.attempted += 1;
     throw new Error("enqueue failed");
+  }
+}
+
+class FakePublisher implements CompletionReportPullRequestPublisher {
+  readonly inputs: CompletionReportPullRequestPublicationInput[] = [];
+
+  constructor(
+    private readonly publication: CompletionReportPullRequestPublication | null,
+    private readonly failure: Error | null = null,
+  ) {}
+
+  async publishPullRequest(
+    input: CompletionReportPullRequestPublicationInput,
+  ): Promise<CompletionReportPullRequestPublication> {
+    this.inputs.push(input);
+    if (this.failure) throw this.failure;
+    if (!this.publication) throw new Error("missing fake publication");
+    return this.publication;
   }
 }

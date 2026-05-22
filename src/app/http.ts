@@ -258,8 +258,11 @@ function statusMetadata(input: {
   return {
     prUrl: metadataValue(input.latestRun, "prUrl", pointers?.prUrl ?? null),
     prNumber: metadataValue(input.latestRun, "prNumber", pointers?.prNumber ?? null),
+          prHeadSha: metadataValue(input.latestRun, "prHeadSha", pointers?.prHeadSha ?? null),
+          prBranch: metadataValue(input.latestRun, "prBranch", pointers?.prBranch ?? null),
     ciStatus: metadataValue(input.latestRun, "ciStatus", pointers?.ciStatus ?? null),
     lastPushedAt: metadataValue(input.latestRun, "lastPushedAt", pointers?.lastPushedAt ?? null),
+          lastEvidenceCursor: metadataValue(input.latestRun, "lastEvidenceCursor", pointers?.lastEvidenceCursor ?? null),
     branchName:
       input.live?.metadata?.branchName ??
       pointers?.branchName ??
@@ -277,7 +280,7 @@ function statusMetadata(input: {
   };
 }
 
-function metadataValue<K extends "prUrl" | "prNumber" | "ciStatus" | "lastPushedAt">(
+function metadataValue<K extends "prUrl" | "prNumber" | "prHeadSha" | "prBranch" | "ciStatus" | "lastPushedAt" | "lastEvidenceCursor">(
   run: RunRecord | null | undefined,
   key: K,
   fallback: NonNullable<RunRecord[K]> | null,

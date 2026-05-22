@@ -14,6 +14,7 @@ import { GitHubPullRequestClient } from "./integrations/github/GitHubPullRequest
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "./core/writeback/WritebackOutbox.js";
+import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
 
 const program = new Command();
 
@@ -35,6 +36,18 @@ program
       console.log(formatDoctorResult(result));
     }
     if (!result.ok) process.exitCode = 2;
+  });
+
+program
+  .command("completion-report-mcp")
+  .description("Run the internal Symphony completion-report MCP server")
+  .requiredOption("--workflow <path>", "path to WORKFLOW.md")
+  .requiredOption("--context-file <path>", "path to the active worker context file")
+  .action(async (options: { workflow: string; contextFile: string }) => {
+    await runCompletionReportMcpServer({
+      workflowPath: path.resolve(process.cwd(), options.workflow),
+      contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
   });
 
 program

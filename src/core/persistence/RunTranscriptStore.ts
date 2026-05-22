@@ -20,8 +20,11 @@ export interface WorkspaceRecord {
 export interface RunMetadata {
   prUrl?: string | null;
   prNumber?: number | null;
+  prHeadSha?: string | null;
+  prBranch?: string | null;
   ciStatus?: string | null;
   lastPushedAt?: string | null;
+  lastEvidenceCursor?: string | null;
   gitBranchName?: string | null;
   repoPath?: string | null;
   baseRef?: string | null;
@@ -49,8 +52,11 @@ export interface RunRecord {
   tokens: TokenCounts;
   prUrl?: string | null;
   prNumber?: number | null;
+  prHeadSha?: string | null;
+  prBranch?: string | null;
   ciStatus?: string | null;
   lastPushedAt?: string | null;
+  lastEvidenceCursor?: string | null;
 }
 
 export interface TranscriptEvent {
@@ -318,8 +324,11 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
   return {
     ...(metadata.prUrl === undefined ? {} : { prUrl: metadata.prUrl }),
     ...(metadata.prNumber === undefined ? {} : { prNumber: metadata.prNumber }),
+    ...(metadata.prHeadSha === undefined ? {} : { prHeadSha: metadata.prHeadSha }),
+    ...(metadata.prBranch === undefined ? {} : { prBranch: metadata.prBranch }),
     ...(metadata.ciStatus === undefined ? {} : { ciStatus: metadata.ciStatus }),
     ...(metadata.lastPushedAt === undefined ? {} : { lastPushedAt: metadata.lastPushedAt }),
+    ...(metadata.lastEvidenceCursor === undefined ? {} : { lastEvidenceCursor: metadata.lastEvidenceCursor }),
     ...(metadata.gitBranchName === undefined ? {} : { gitBranchName: metadata.gitBranchName }),
     ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
     ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),

@@ -16,8 +16,11 @@ export interface IssueLifecycleSummaryPointers {
   lastRunId: string | null;
   prUrl: string | null;
   prNumber: number | null;
+  prHeadSha: string | null;
+  prBranch: string | null;
   ciStatus: string | null;
   lastPushedAt: string | null;
+  lastEvidenceCursor: string | null;
 }
 
 export interface CompletionReportChecklistItem {
@@ -29,6 +32,8 @@ export interface CompletionReportChecklistItem {
 export interface CompletionReportPullRequestRef {
   url: string | null;
   number: number | null;
+  headSha: string | null;
+  branch: string | null;
 }
 
 export interface IssueCompletionReportRecord {
@@ -173,8 +178,11 @@ function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
     lastRunId: null,
     prUrl: null,
     prNumber: null,
+    prHeadSha: null,
+    prBranch: null,
     ciStatus: null,
     lastPushedAt: null,
+    lastEvidenceCursor: null,
   };
 }
 
@@ -243,8 +251,11 @@ function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecy
     lastRunId: nullableString(value.lastRunId, filePath, "summaryPointers.lastRunId"),
     prUrl: optionalNullableString(value.prUrl, filePath, "summaryPointers.prUrl"),
     prNumber: optionalNullableNumber(value.prNumber, filePath, "summaryPointers.prNumber"),
+    prHeadSha: optionalNullableString(value.prHeadSha, filePath, "summaryPointers.prHeadSha"),
+    prBranch: optionalNullableString(value.prBranch, filePath, "summaryPointers.prBranch"),
     ciStatus: optionalNullableString(value.ciStatus, filePath, "summaryPointers.ciStatus"),
     lastPushedAt: optionalNullableString(value.lastPushedAt, filePath, "summaryPointers.lastPushedAt"),
+    lastEvidenceCursor: optionalNullableString(value.lastEvidenceCursor, filePath, "summaryPointers.lastEvidenceCursor"),
   };
 }
 
@@ -299,6 +310,8 @@ function normalizePullRequest(value: unknown, filePath: string, reportIndex: num
   return {
     url: nullableString(value.url, filePath, `completionReports[${reportIndex}].pullRequest.url`),
     number: nullableNumber(value.number, filePath, `completionReports[${reportIndex}].pullRequest.number`),
+    headSha: optionalNullableString(value.headSha, filePath, `completionReports[${reportIndex}].pullRequest.headSha`),
+    branch: optionalNullableString(value.branch, filePath, `completionReports[${reportIndex}].pullRequest.branch`),
   };
 }
 

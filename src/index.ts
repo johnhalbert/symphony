@@ -2,6 +2,7 @@ export * from "./core/config/Config.js";
 export * from "./core/CompletionReportService.js";
 export * from "./core/errors.js";
 export * from "./core/harness/AgentHarness.js";
+export * from "./core/harness/CompletionReportMcpServer.js";
 export * from "./core/harness/FakeHarness.js";
 export * from "./core/harness/HarnessFactory.js";
 export * from "./core/logging/StructuredLogger.js";
