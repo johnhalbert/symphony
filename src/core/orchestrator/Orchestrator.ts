@@ -23,6 +23,10 @@ import {
   type PullRequestReviewEvidenceClient,
 } from "../review/PullRequestReviewEvidenceService.js";
 import { formatWorkerReviewVerdictPrompt } from "../ReviewVerdictService.js";
+import {
+  PlaceholderContinuationSummarizer,
+  type ContinuationSummarizer,
+} from "../summarization/ContinuationSummarizer.js";
 import type { WritebackProcessor } from "../writeback/WritebackOutbox.js";
 import {
   planBlockedEscalationWritebacks,
@@ -57,6 +61,11 @@ export interface DiscoveredPullRequest {
   headBranch: string;
   headSha: string | null;
   lastPushedAt: string | null;
+}
+
+export interface ContinuationSummaryCreationResult {
+  summaryReference: IssueLifecycleSummaryReference;
+  lifecycle: IssueLifecycleRecord;
 }
 
 export interface RunningEntry {
@@ -279,6 +288,42 @@ export class Orchestrator {
     running.suppressRetryOnExit = true;
     running.abortController.abort();
     await this.options.harness.stop?.(running.runId ?? issueId);
+  }
+
+  async createContinuationSummary(
+    issueOrId: Pick<Issue, "id" | "identifier" | "title"> | string,
+    summarizer: ContinuationSummarizer = new PlaceholderContinuationSummarizer(),
+  ): Promise<ContinuationSummaryCreationResult> {
+    const lifecycleStore = this.options.lifecycleStore;
+    const runStore = this.options.runStore;
+    if (!lifecycleStore || !runStore) {
+      throw new SymphonyError("invalid_request", "Continuation summaries require lifecycle and transcript stores");
+    }
+
+    const lifecycle =
+      typeof issueOrId === "string"
+        ? await lifecycleStore.get(issueOrId)
+        : await lifecycleStore.ensureIssue(issueOrId);
+    if (!lifecycle) throw new SymphonyError("not_found", `Issue lifecycle not found: ${issueOrId}`);
+
+    const issue =
+      typeof issueOrId === "string"
+        ? { id: lifecycle.issueId, identifier: lifecycle.issueIdentifier, title: lifecycle.issueIdentifier }
+        : issueOrId;
+    const runs = await listRunsForLifecycle(runStore, lifecycle);
+    const transcriptEvents = await readContinuationTranscriptEvents(runStore, runs);
+    const summaryReference = await summarizer.summarizeContinuationHistory({
+      issue,
+      runs,
+      transcriptEvents,
+      transcriptPointers: transcriptPointersForRuns(runs),
+      statusApiPointers: statusApiPointersForIssue(lifecycle.issueIdentifier, runs),
+    });
+    const updated = await lifecycleStore.updateIssue(
+      { id: lifecycle.issueId, identifier: lifecycle.issueIdentifier },
+      { summaryReferences: upsertSummaryReference(lifecycle.summaryReferences, summaryReference) },
+    );
+    return { summaryReference, lifecycle: updated };
   }
 
   snapshot(): RuntimeSnapshot {
@@ -1570,6 +1615,46 @@ function latestContinuationSummaryReference(
       summaries.length - 1
     ] ?? null
   );
+}
+
+async function listRunsForLifecycle(
+  runStore: RunTranscriptStore,
+  lifecycle: IssueLifecycleRecord,
+): Promise<RunRecord[]> {
+  const byId = new Map<string, RunRecord>();
+  for (const key of new Set([lifecycle.issueId, lifecycle.issueIdentifier])) {
+    for (const run of await runStore.listRunsForIssue(key)) {
+      byId.set(run.runId, run);
+    }
+  }
+  return [...byId.values()].sort((left, right) => Date.parse(left.startedAt) - Date.parse(right.startedAt));
+}
+
+async function readContinuationTranscriptEvents(
+  runStore: RunTranscriptStore,
+  runs: RunRecord[],
+): Promise<TranscriptEvent[]> {
+  const events: TranscriptEvent[] = [];
+  for (const run of runs) {
+    let offset = 0;
+    do {
+      const page = await runStore.readTranscript(run.runId, { offset, limit: 1_000 });
+      events.push(...page.events);
+      if (page.nextOffset === null) break;
+      offset = page.nextOffset;
+    } while (true);
+  }
+  return events;
+}
+
+function upsertSummaryReference(
+  existing: IssueLifecycleSummaryReference[],
+  summaryReference: IssueLifecycleSummaryReference,
+): IssueLifecycleSummaryReference[] {
+  return [
+    ...existing.filter((item) => item.id !== summaryReference.id),
+    summaryReference,
+  ];
 }
 
 function transcriptPointersForRuns(runs: RunRecord[]): string[] {

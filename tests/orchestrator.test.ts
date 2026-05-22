@@ -1580,19 +1580,35 @@ describe("Orchestrator", () => {
     const stateDir = path.join(root, "state");
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
-    await lifecycleStore.ensureIssue(candidate, {
-      summaryReferences: [
-        {
-          id: "continuation-summary:issue-1:stored",
-          kind: "continuation_history",
-          summary: "Stored summary: prior run created the workspace and started the implementation.",
-          runIds: ["fake-issue-1-1"],
-          transcriptEventCount: 12,
-          transcriptPointers: ["/api/v1/runs/fake-issue-1-1/transcript"],
-          statusApiPointers: ["/api/v1/issues/TEST-1", "/api/v1/issues/TEST-1/runs"],
-          createdAt: "2026-01-01T00:00:00Z",
-        },
-      ],
+    await runStore.startRun({
+      runId: "prior-run-1",
+      sessionId: "prior-session-1",
+      agentId: "prior-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Prior worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: "prior-run-1",
+      at: "2026-01-01T00:00:01Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Prior run gathered context.",
+    });
+    await runStore.appendEvent({
+      runId: "prior-run-1",
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "completed",
+      message: "Prior run stopped before handoff.",
     });
     const harness = new FakeHarness();
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
@@ -1606,17 +1622,30 @@ describe("Orchestrator", () => {
       runStore,
       lifecycleStore,
     });
+    const createdSummary = await orchestrator.createContinuationSummary(candidate);
+    const storedLifecycle = await lifecycleStore.get(candidate.identifier);
 
     await orchestrator.refreshNow();
     await new Promise((resolve) => setTimeout(resolve, 100));
     await orchestrator.stop();
 
+    expect(createdSummary.summaryReference.id).toContain("continuation-summary:issue-1:");
+    expect(createdSummary.summaryReference.runIds).toEqual(["prior-run-1"]);
+    expect(createdSummary.summaryReference.transcriptEventCount).toBe(2);
+    expect(createdSummary.summaryReference.transcriptPointers).toEqual(["/api/v1/runs/prior-run-1/transcript"]);
+    expect(createdSummary.summaryReference.statusApiPointers).toEqual([
+      "/api/v1/issues/TEST-1",
+      "/api/v1/issues/TEST-1/runs",
+      "/api/v1/runs/prior-run-1",
+    ]);
+    expect(storedLifecycle?.summaryReferences).toEqual([createdSummary.summaryReference]);
     expect(harness.runs).toHaveLength(2);
     expect(harness.runs[1]?.prompt).toContain("Mode: summary");
-    expect(harness.runs[1]?.prompt).toContain("Reference: continuation-summary:issue-1:stored");
-    expect(harness.runs[1]?.prompt).toContain("Stored summary: prior run created the workspace");
-    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/fake-issue-1-1/transcript");
+    expect(harness.runs[1]?.prompt).toContain(`Reference: ${createdSummary.summaryReference.id}`);
+    expect(harness.runs[1]?.prompt).toContain("Continuation history summarization is not automated yet.");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1/transcript");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/TEST-1");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1");
     expect(harness.runs[1]?.prompt).not.toContain("Full relevant history:");
   });
 });
