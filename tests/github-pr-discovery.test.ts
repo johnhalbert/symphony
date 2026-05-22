@@ -129,7 +129,7 @@ describe("GitHub pull request discovery", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
     const run = await runStore.getRun("fake-issue-1-1");
