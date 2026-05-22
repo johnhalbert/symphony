@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { LinearTrackerClient } from "./integrations/linear/LinearTrackerClient.js";
+import { GitHubPullRequestClient } from "./integrations/github/GitHubPullRequestClient.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { errorMessage } from "./core/errors.js";
 
@@ -58,6 +59,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
     await checkWritable(checks, "workspace.root", config.workspace.root);
     await checkWritable(checks, "workspace.state_dir", config.workspace.stateDir);
     await checkGit(checks);
+    await checkGitHubPublication(checks, config.github);
 
     if (process.env.CURSOR_API_KEY) {
       checks.push({ id: "env.cursor", status: "ok", message: "CURSOR_API_KEY is set" });
@@ -120,5 +122,30 @@ async function checkGit(checks: DoctorCheck[]): Promise<void> {
     checks.push({ id: "git.binary", status: "ok", message: result.stdout.trim() });
   } catch (error) {
     checks.push({ id: "git.binary", status: "error", message: errorMessage(error) });
+  }
+}
+
+async function checkGitHubPublication(checks: DoctorCheck[], github: { publishPullRequests: boolean; owner: string | null; repo: string | null; token: string | null; apiBaseUrl: string; headOwner: string | null }): Promise<void> {
+  if (!github.publishPullRequests) {
+    checks.push({ id: "github.pr_publication", status: "ok", message: "PR publication is disabled" });
+    return;
+  }
+  if (!github.owner || !github.repo || !github.token) {
+    checks.push({
+      id: "github.pr_publication",
+      status: "error",
+      message: "GitHub owner, repo, and token are required when PR publication is enabled",
+    });
+    return;
+  }
+  try {
+    await new GitHubPullRequestClient(github).checkRepositoryAccess();
+    checks.push({
+      id: "github.pr_publication",
+      status: "ok",
+      message: `GitHub PR publication can access ${github.owner}/${github.repo}`,
+    });
+  } catch (error) {
+    checks.push({ id: "github.pr_publication", status: "error", message: errorMessage(error) });
   }
 }

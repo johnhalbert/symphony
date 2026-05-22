@@ -44,6 +44,7 @@ export interface DiscoveredPullRequest {
   url: string;
   number: number;
   headBranch: string;
+  headSha: string | null;
   lastPushedAt: string | null;
 }
 
@@ -115,8 +116,11 @@ export interface RuntimeSnapshot {
 export interface IssueRunMetadata {
   prUrl: string | null;
   prNumber: number | null;
+  prHeadSha: string | null;
+  prBranch: string | null;
   ciStatus: string | null;
   lastPushedAt: string | null;
+  lastEvidenceCursor: string | null;
   branchName: string | null;
   gitBranchName: string | null;
   repoPath: string | null;
@@ -824,6 +828,8 @@ export class Orchestrator {
     const metadata = {
       prUrl: pullRequest.url,
       prNumber: pullRequest.number,
+      prHeadSha: pullRequest.headSha,
+      prBranch: pullRequest.headBranch,
       lastPushedAt: pullRequest.lastPushedAt,
       gitBranchName: branchName,
       repoPath: workspace.repoPath ?? null,
@@ -833,6 +839,8 @@ export class Orchestrator {
       summaryPointers: {
         prUrl: metadata.prUrl,
         prNumber: metadata.prNumber,
+        prHeadSha: metadata.prHeadSha,
+        prBranch: metadata.prBranch,
         lastPushedAt: metadata.lastPushedAt,
         gitBranchName: metadata.gitBranchName,
         branchName: metadata.gitBranchName,
@@ -847,6 +855,8 @@ export class Orchestrator {
     if (
       existing?.prUrl === metadata.prUrl &&
       existing.prNumber === metadata.prNumber &&
+      existing.prHeadSha === metadata.prHeadSha &&
+      existing.prBranch === metadata.prBranch &&
       (existing.lastPushedAt ?? null) === metadata.lastPushedAt
     ) {
       return;
@@ -856,6 +866,8 @@ export class Orchestrator {
       action: existing?.prUrl ? "updated" : "opened",
       prUrl: metadata.prUrl,
       prNumber: metadata.prNumber,
+      prHeadSha: metadata.prHeadSha,
+      prBranch: metadata.prBranch,
       lastPushedAt: metadata.lastPushedAt,
       gitBranchName: metadata.gitBranchName,
       repoPath: metadata.repoPath,
@@ -902,8 +914,11 @@ function metadataForRunningEntry(entry: RunningEntry): IssueRunMetadata {
   return {
     prUrl: pointers?.prUrl ?? null,
     prNumber: pointers?.prNumber ?? null,
+    prHeadSha: pointers?.prHeadSha ?? null,
+    prBranch: pointers?.prBranch ?? null,
     ciStatus: pointers?.ciStatus ?? null,
     lastPushedAt: pointers?.lastPushedAt ?? null,
+    lastEvidenceCursor: pointers?.lastEvidenceCursor ?? null,
     branchName: pointers?.branchName ?? entry.workspace?.gitBranchName ?? entry.issue.branchName ?? null,
     gitBranchName: pointers?.gitBranchName ?? entry.workspace?.gitBranchName ?? entry.issue.branchName ?? null,
     repoPath: pointers?.repoPath ?? entry.workspace?.repoPath ?? null,

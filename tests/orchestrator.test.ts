@@ -66,7 +66,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toBe("Work on TEST-1");
@@ -506,6 +506,7 @@ describe("Orchestrator", () => {
       url: "https://github.com/octo-org/symphony/pull/12",
       number: 12,
       headBranch: "symphony/TEST-1",
+      headSha: "abc123",
       lastPushedAt: "2026-01-01T00:01:00Z",
     });
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
@@ -623,7 +624,9 @@ class BlockingHarness implements AgentHarness {
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
     yield { type: "session_started", sessionId: "session-123", runId: "run-123" };
-    await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+    if (!ctx.abortSignal.aborted) {
+      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+    }
     yield { type: "cancelled" };
   }
 
@@ -652,6 +655,7 @@ class FakePullRequestDiscoveryClient implements PullRequestDiscoveryClient {
       url: string;
       number: number;
       headBranch: string;
+      headSha: string | null;
       lastPushedAt: string | null;
     } | null,
   ) {}

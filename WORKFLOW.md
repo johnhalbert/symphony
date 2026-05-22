@@ -82,6 +82,7 @@ github:
   repo: symphony
   token: $GITHUB_TOKEN
   head_owner: johnhalbert
+  publish_pull_requests: true
 ---
 
 # Symphony Dogfood Worker

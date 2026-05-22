@@ -35,6 +35,7 @@ describe("GitHub pull request discovery", () => {
         token: "github-token",
         headOwner: "octo",
         apiBaseUrl: "https://github.internal/api/v3",
+        publishPullRequests: false,
       },
       async (input, init) => {
         const url = new URL(String(input));
@@ -51,6 +52,7 @@ describe("GitHub pull request discovery", () => {
               updated_at: "2026-01-01T00:00:02Z",
               head: {
                 ref: "symphony/TEST-1",
+                sha: "abc123",
                 repo: { pushed_at: "2026-01-01T00:00:01Z" },
               },
             },
@@ -64,6 +66,7 @@ describe("GitHub pull request discovery", () => {
       url: "https://github.com/acme/symphony/pull/42",
       number: 42,
       headBranch: "symphony/TEST-1",
+      headSha: "abc123",
       lastPushedAt: "2026-01-01T00:00:01Z",
     });
     expect(requestedPathname).toBe("/api/v3/repos/acme/symphony/pulls");
@@ -81,6 +84,7 @@ describe("GitHub pull request discovery", () => {
         token: null,
         headOwner: "acme",
         apiBaseUrl: "https://api.github.test",
+        publishPullRequests: false,
       },
       async () => {
         fetchCount += 1;
@@ -158,6 +162,7 @@ class RecordingPullRequestClient implements PullRequestDiscoveryClient {
       url: "https://github.com/acme/symphony/pull/42",
       number: 42,
       headBranch: input.branchName,
+      headSha: "abc123",
       lastPushedAt: "2026-01-01T00:00:01Z",
     };
   }
