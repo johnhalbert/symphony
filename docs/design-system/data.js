@@ -91,7 +91,7 @@ window.SYM_DATA = (() => {
     { id:'SYM-58', title:'Per-workflow concurrency limit override',
       status:'backlog', priority:1, labels:['orchestrator','feature'],
       assignee:'unassigned', project:'Reliability', cycle:'Cycle 15' },
-    { id:'SYM-61', title:'Handoff state recognition (Human Review = success)',
+    { id:'SYM-61', title:'Handoff state recognition (In Review = agent review queue)',
       status:'review', priority:2, labels:['orchestrator','feature'],
       assignee:'sherwinwu', agent:'codex-05', project:'Workflow', cycle:'Cycle 14',
       pr:'#1260', ci:'pending' },
@@ -124,8 +124,8 @@ window.SYM_DATA = (() => {
     { t:'4m ago',   who:'codex-03', verb:'opened',         id:'PR #1255', extra:'for SYM-37' },
     { t:'8m ago',   who:'orchestrator', verb:'dispatched', id:'SYM-42', extra:'→ codex-08' },
     { t:'14m ago',  who:'orchestrator', verb:'dispatched', id:'SYM-12', extra:'→ codex-04' },
-    { t:'21m ago',  who:'codex-02', verb:'reached', id:'Human Review', extra:'on SYM-15' },
-    { t:'32m ago',  who:'codex-05', verb:'reached', id:'Human Review', extra:'on SYM-61' },
+    { t:'21m ago',  who:'codex-02', verb:'submitted report', id:'In Review', extra:'agent review queue on SYM-15' },
+    { t:'32m ago',  who:'codex-05', verb:'submitted report', id:'In Review', extra:'agent review queue on SYM-61' },
     { t:'48m ago',  who:'orchestrator', verb:'retry', id:'SYM-25', extra:'(attempt 2/3, backoff 8s)' },
     { t:'1h ago',   who:'codex-06', verb:'finished', id:'SYM-52', extra:'merged #1190' },
     { t:'2h ago',   who:'orchestrator', verb:'poll tick', id:'42 candidates', extra:'2 dispatched' },
@@ -183,7 +183,7 @@ window.SYM_DATA = (() => {
     { kind:'user', ts:'14:02:13',
       from:'orchestrator',
       issue:'SYM-12',
-      text:'Issue: Add exponential backoff to retry queue with jitter\n\nThe dispatcher currently retries failed issue runs on a fixed 30s interval. This causes thundering-herd behavior when the Linear API rate-limits us.\n\nImplement exponential backoff (base=4s, factor=2, max=5min) with full jitter. Update tests. Open a PR targeting `main` and move to Human Review.'
+      text:'Issue: Add exponential backoff to retry queue with jitter\n\nThe dispatcher currently retries failed issue runs on a fixed 30s interval. This causes thundering-herd behavior when the Linear API rate-limits us.\n\nImplement exponential backoff (base=4s, factor=2, max=5min) with full jitter. Update tests. Submit a completion report so Symphony can move the issue to In Review for agent review.'
     },
     { kind:'thinking', ts:'14:02:14',
       text:'Reading the existing dispatcher to understand the retry queue shape. I expect a GenServer holding a map of issue_id → retry_state with a fixed sleep before re-enqueueing. I should preserve the existing public API and only change the wait-computation function. Tests likely live in test/symphony/dispatcher_test.exs.' },
@@ -222,7 +222,7 @@ window.SYM_DATA = (() => {
 
   // Dashboard chat messages with primary orchestration agent
   const dashChat = [
-    { who:'agent', text:'Good morning. 4 agents running, 11 issues open in this cycle, 3 issues currently in Human Review.' },
+    { who:'agent', text:'Good morning. 4 agents running, 11 issues open in this cycle, 3 issues currently in In Review for agent review.' },
     { who:'agent', text:'**SYM-42** has been waiting 22m on a tool response from the app-server — that\'s above the median (3m). Likely stalled.',
       suggestions:['Restart SYM-42', 'Show SYM-42 transcript', 'Acknowledge'] },
     { who:'user',  text:'Why did SYM-25 retry?' },

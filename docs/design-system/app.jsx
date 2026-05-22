@@ -188,10 +188,10 @@ function App() {
               agent={null} step="Waiting for concurrency slot" duration="—" />
           </div></ThemeFrame>
         </DCArtboard>
-        <DCArtboard id="state-review"    label="HUMAN REVIEW" width={320} height={170}>
+        <DCArtboard id="state-review"    label="IN REVIEW" width={320} height={170}>
           <ThemeFrame theme="amber"><div style={{ padding:14, background:'var(--bg)', height:'100%' }}>
             <AgentStateCard state="review" issue="SYM-15" title="Workspace cleanup hook for terminal-state issues"
-              agent="codex-02" step="PR #1248 awaiting review" duration="24m" />
+              agent="codex-02" step="Agent review queue · PR #1248" duration="24m" />
           </div></ThemeFrame>
         </DCArtboard>
         <DCArtboard id="state-finished"  label="FINISHED"  width={320} height={170}>

@@ -49,7 +49,7 @@ describe("ReviewVerdictService", () => {
     const operations = await outbox.list();
     const comment = operations.find((operation) => operation.kind === "comment");
     const transition = operations.find((operation) => operation.kind === "transition");
-    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("Symphony review failed");
+    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("## Symphony Review Verdict: Fail");
     expect(comment?.kind === "comment" ? comment.payload.body : "").toContain(
       "Add a regression test for duplicate verdict handling.",
     );

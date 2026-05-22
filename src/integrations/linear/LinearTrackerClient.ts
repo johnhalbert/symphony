@@ -154,6 +154,20 @@ const ISSUE_WRITE_CONTEXT_QUERY = `
   }
 `;
 
+const PROJECT_WORKFLOW_STATES_QUERY = `
+  query SymphonyProjectWorkflowStates($projectSlug: String!) {
+    projects(filter: { slugId: { eq: $projectSlug } }) {
+      nodes {
+        teams {
+          nodes {
+            states { nodes { id name } }
+          }
+        }
+      }
+    }
+  }
+`;
+
 const ISSUE_UPDATE_MUTATION = `
   mutation SymphonyIssueUpdate($id: String!, $stateId: String!) {
     issueUpdate(id: $id, input: { stateId: $stateId }) {
@@ -207,6 +221,22 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     return response.issues.nodes
       .map((node) => normalizeIssue(node, assigneeFilter))
       .filter((issue): issue is Issue => issue !== null);
+  }
+
+  async fetchWorkflowStateNames(): Promise<string[]> {
+    const response = await this.graphql<{
+      projects: {
+        nodes: Array<{
+          teams?: { nodes?: Array<{ states?: { nodes?: LinearWorkflowStateNode[] } }> } | null;
+        }>;
+      };
+    }>(PROJECT_WORKFLOW_STATES_QUERY, {
+      projectSlug: this.config.projectSlug,
+    });
+    const states = response.projects.nodes.flatMap((project) =>
+      (project.teams?.nodes ?? []).flatMap((team) => (team.states?.nodes ?? []).map((state) => asString(state.name))),
+    );
+    return uniqueStrings(states.filter((state): state is string => state !== null));
   }
 
   async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
@@ -388,6 +418,18 @@ function asNullableString(value: unknown): string | null {
 
 function sameName(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
 }
 
 function commentMarker(dedupeKey: string): string {

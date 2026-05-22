@@ -84,6 +84,55 @@ describe("LinearTrackerClient", () => {
     expect(issues.map((item) => item.identifier)).toEqual(["T-1", "T-2"]);
   });
 
+  it("fetches unique project workflow state names for doctor validation", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: unknown[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return jsonResponse({
+        data: {
+          projects: {
+            nodes: [
+              {
+                teams: {
+                  nodes: [
+                    {
+                      states: {
+                        nodes: [
+                          { id: "todo", name: "Todo" },
+                          { id: "review", name: "In Review" },
+                        ],
+                      },
+                    },
+                    {
+                      states: {
+                        nodes: [
+                          { id: "review-duplicate", name: "In Review" },
+                          { id: "blocked", name: "Blocked" },
+                          { id: "pass", name: "Ready to Merge" },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchWorkflowStateNames()).resolves.toEqual([
+      "Todo",
+      "In Review",
+      "Blocked",
+      "Ready to Merge",
+    ]);
+    expect(requests[0]).toMatchObject({ variables: { projectSlug: "TEST" } });
+  });
+
   it("transitions issue state by resolving Linear state ids", async () => {
     const config = testConfig("/tmp/symphony");
     const requests: unknown[] = [];
