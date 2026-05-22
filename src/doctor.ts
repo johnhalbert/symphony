@@ -3,7 +3,7 @@ import { execFile, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { LinearTrackerClient } from "./integrations/linear/LinearTrackerClient.js";
+import { LinearTrackerClient, type LinearWorkflowTeamStates } from "./integrations/linear/LinearTrackerClient.js";
 import { createGitHubPullRequestClientForCapability } from "./integrations/github/GitHubCredentialResolver.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { errorMessage } from "./core/errors.js";
@@ -48,7 +48,7 @@ export type McpToolLister = (input: {
   workflowPath: string;
 }) => Promise<string[]>;
 
-export type LinearStateLister = (input: { config: ServiceConfig }) => Promise<string[]>;
+export type LinearStateLister = (input: { config: ServiceConfig }) => Promise<LinearWorkflowTeamStates[]>;
 
 export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
@@ -218,26 +218,46 @@ async function linearStateAvailabilityCheck(
     };
   }
 
-  const lister = options.linearStateLister ?? ((input) => new LinearTrackerClient(input.config.tracker).fetchWorkflowStateNames());
+  const lister = options.linearStateLister ?? ((input) => new LinearTrackerClient(input.config.tracker).fetchWorkflowStatesByTeam());
   try {
-    const availableStates = await lister({ config });
-    const missing = requiredStates.filter((state) => !stateIn(state, availableStates));
-    if (missing.length > 0) {
+    const teamStates = await lister({ config });
+    if (teamStates.length === 0) {
       return {
         id: "review_loop.linear_states",
         status: "error",
-        message: `Linear team is missing configured review-loop states: ${missing.join(", ")}. Available states: ${formatStateList(availableStates)}`,
+        message: "Linear project did not return any teams to verify review-loop states",
+      };
+    }
+
+    const missingByTeam = teamStates
+      .map((team) => ({
+        team,
+        missing: requiredStates.filter((state) => !stateIn(state, team.states)),
+      }))
+      .filter((item) => item.missing.length > 0);
+    if (missingByTeam.length > 0) {
+      return {
+        id: "review_loop.linear_states",
+        status: "error",
+        message: `Linear teams are missing configured review-loop states: ${missingByTeam
+          .map(
+            (item) =>
+              `${formatTeamStateLabel(item.team)} missing ${item.missing.join(", ")} (available: ${formatStateList(item.team.states)})`,
+          )
+          .join("; ")}`,
       };
     }
     return {
       id: "review_loop.linear_states",
       status: "ok",
-      message: `Linear team has configured review-loop states: ${requiredStates.join(", ")}`,
+      message: `Linear project teams have configured review-loop states: ${requiredStates.join(", ")} (${teamStates
+        .map(formatTeamStateLabel)
+        .join("; ")})`,
     };
   } catch (error) {
     return {
       id: "review_loop.linear_states",
-      status: "warn",
+      status: "error",
       message: `Could not verify Linear review-loop state availability: ${errorMessage(error)}`,
     };
   }
@@ -337,6 +357,10 @@ function uniqueStates(states: string[]): string[] {
 
 function formatStateList(states: string[]): string {
   return states.length === 0 ? "none" : states.join(", ");
+}
+
+function formatTeamStateLabel(team: LinearWorkflowTeamStates): string {
+  return team.teamName ? `${team.teamName} (${team.teamKey})` : team.teamKey;
 }
 
 function stateIn(state: string, states: string[]): boolean {
