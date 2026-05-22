@@ -1,8 +1,9 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   CompletionReportPullRequestPublication,
   CompletionReportPullRequestPublicationInput,
@@ -27,6 +28,9 @@ describe("completion report MCP handoff", () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -132,6 +136,90 @@ describe("completion report MCP handoff", () => {
       prBranch: "symphony/TEST-1",
       lastEvidenceCursor: "idem-1",
     });
+  });
+
+  it("uses worker GitHub publication profile for default PR publication", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    const workspace = await initPublishRepo(root, { remote: true });
+    await writeFile(path.join(workspace, "feature.txt"), "changed\n", "utf8");
+    await writeFile(workflowPath, workflowWithPublicationProfile(stateDir), "utf8");
+    vi.stubEnv("GITHUB_PUBLICATION_TOKEN", "publication-token");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-publication-profile",
+      sessionId: "agent-1:run-publication-profile",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: workspace,
+      gitBranchName: "symphony/TEST-1",
+      repoPath: workspace,
+      baseRef: "main",
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      activeRunId: "run-publication-profile",
+      role: "worker",
+      token: "handoff-token",
+      expectedToken: "handoff-token",
+      sessionId: "agent-1:run-publication-profile",
+      workspacePath: workspace,
+      workspace: {
+        path: workspace,
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: workspace,
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      const url = new URL(String(input));
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      if (init?.method === "POST") {
+        return jsonResponse(
+          {
+            html_url: "https://github.com/acme/symphony/pull/43",
+            number: 43,
+            head: {
+              ref: "symphony/TEST-1",
+              sha: "remote-created-sha",
+              repo: { pushed_at: "2026-01-01T00:00:01Z" },
+            },
+          },
+          201,
+        );
+      }
+      expect(url.pathname).toBe("/repos/acme/symphony/pulls");
+      return jsonResponse([]);
+    });
+
+    const result = await submitCompletionReportFromMcp(report("publication-profile-idem"), {
+      workflowPath,
+      contextFile,
+    });
+
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/43",
+        number: 43,
+        branch: "symphony/TEST-1",
+      },
+    });
+    expect(authorizations).toEqual(["Bearer publication-token", "Bearer publication-token"]);
   });
 
   it("exposes a documented stdio MCP tool and submits without caller-supplied run identity", async () => {
@@ -276,6 +364,47 @@ Work on {{ issue.identifier }}.
 `;
 }
 
+function workflowWithPublicationProfile(stateDir: string): string {
+  return `---
+tracker:
+  kind: linear
+  api_key: linear-test-key
+  project_slug: TEST
+  active_states:
+    - Todo
+    - In Progress
+  handoff_states:
+    - In Review
+writeback:
+  enabled: true
+  mode: dry_run
+  dispatch_state: In Progress
+review_loop:
+  review_states:
+    - In Review
+workspace:
+  root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  state_dir: "${slash(stateDir)}"
+github:
+  owner: acme
+  repo: symphony
+  token: legacy-github-token
+  api_base_url: https://api.github.test
+  publish_pull_requests: true
+credential_profiles:
+  profiles:
+    publication:
+      value: $GITHUB_PUBLICATION_TOKEN
+      capabilities:
+        - github.publication
+  roles:
+    worker:
+      github.publication: publication
+---
+Work on {{ issue.identifier }}.
+`;
+}
+
 function report(idempotencyKey = "idem-1") {
   return {
     summary: "Implemented the service contract.",
@@ -297,6 +426,52 @@ function report(idempotencyKey = "idem-1") {
 
 function slash(value: string): string {
   return value.replace(/\\/g, "/");
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function initPublishRepo(root: string, options: { remote?: boolean } = {}): Promise<string> {
+  const workspace = path.join(root, "workspace");
+  await mkdir(workspace, { recursive: true });
+  await git(["init"], workspace);
+  await git(["checkout", "-b", "main"], workspace);
+  await writeFile(path.join(workspace, "README.md"), "hello\n", "utf8");
+  await git(["add", "README.md"], workspace);
+  await git(["-c", "user.name=Symphony Test", "-c", "user.email=symphony@example.com", "commit", "-m", "initial"], workspace);
+  if (options.remote) {
+    const remote = path.join(root, "remote.git");
+    await git(["init", "--bare", remote], root);
+    await git(["remote", "add", "origin", remote], workspace);
+  }
+  await git(["checkout", "-b", "symphony/TEST-1"], workspace);
+  return workspace;
+}
+
+function git(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`git exited with ${code}: ${stderr}`));
+    });
+  });
 }
 
 class FakePublisher implements CompletionReportPullRequestPublisher {

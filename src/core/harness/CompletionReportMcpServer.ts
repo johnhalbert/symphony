@@ -11,7 +11,7 @@ import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
-import { GitHubPullRequestClient } from "../../integrations/github/GitHubPullRequestClient.js";
+import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
 import { errorMessage, SymphonyError } from "../errors.js";
 
 export const COMPLETION_REPORT_TOOL_NAME = "submit_completion_report";
@@ -51,12 +51,17 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const pullRequestPublisher =
+      options.pullRequestPublisher ??
+      (config.github.publishPullRequests
+        ? createGitHubPullRequestClientForCapability(config, "github.publication")
+        : undefined);
     const service = new CompletionReportService({
       config,
       lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
       writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
       runStore,
-      pullRequestPublisher: options.pullRequestPublisher ?? new GitHubPullRequestClient(config.github),
+      ...(pullRequestPublisher === undefined ? {} : { pullRequestPublisher }),
     });
     const context: CompletionReportActiveContext = {
       issue: loadedContext.issue,

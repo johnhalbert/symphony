@@ -208,7 +208,7 @@ export class GitHubPullRequestClient {
   }
 
   async listPullRequestReviewEvidence(input: PullRequestReviewEvidenceLookup): Promise<GitHubPullRequestReviewEvidence[]> {
-    this.assertConfiguredForPublication();
+    this.assertConfiguredForReviewEvidenceRead();
     if (!Number.isInteger(input.pullRequestNumber) || input.pullRequestNumber <= 0) {
       throw new SymphonyError("invalid_request", "A valid pull request number is required for review evidence ingestion");
     }
@@ -322,6 +322,15 @@ export class GitHubPullRequestClient {
       throw new SymphonyError(
         "invalid_request",
         "GitHub owner, repo, and token are required when PR publication is enabled",
+      );
+    }
+  }
+
+  private assertConfiguredForReviewEvidenceRead(): void {
+    if (!this.config.owner || !this.config.repo || !this.config.token) {
+      throw new SymphonyError(
+        "invalid_request",
+        "GitHub owner, repo, and token are required for PR review evidence ingestion",
       );
     }
   }

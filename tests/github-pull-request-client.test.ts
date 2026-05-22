@@ -451,6 +451,21 @@ describe("GitHubPullRequestClient", () => {
       code: "invalid_request",
     });
   });
+
+  it("uses review-evidence wording when PR review evidence credentials are missing", async () => {
+    const client = new GitHubPullRequestClient({
+      owner: "octo-org",
+      repo: "symphony",
+      token: null,
+      headOwner: "octo-org",
+      apiBaseUrl: "https://api.github.com",
+      publishPullRequests: false,
+    });
+
+    await expect(client.listPullRequestReviewEvidence({ pullRequestNumber: 42 })).rejects.toThrow(
+      /PR review evidence ingestion/,
+    );
+  });
 });
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
