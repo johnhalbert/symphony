@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
+import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { mapCursorDelta, mapCursorMessage } from "./CursorEventMapper.js";
@@ -32,6 +33,8 @@ export class CursorHarness implements AgentHarness {
     const deltaEvents: AgentEvent[] = [];
     const completionReportContextFile = completionReportContextFilePath(ctx);
     const isWorker = ctx.role === "worker";
+    const reviewVerdictContextFile = reviewVerdictContextFilePath(ctx);
+    const isReviewer = ctx.role === "reviewer";
     if (isWorker) {
       await writeCompletionReportMcpContext(completionReportContextFile, {
         issue: ctx.issue,
@@ -43,6 +46,17 @@ export class CursorHarness implements AgentHarness {
         workspacePath: ctx.workspace.path,
         workspace: ctx.workspace,
         phase: "implementation",
+      });
+    }
+    if (isReviewer) {
+      await writeReviewVerdictMcpContext(reviewVerdictContextFile, {
+        issue: ctx.issue,
+        activeRunId: null,
+        role: "reviewer",
+        token: null,
+        expectedToken: null,
+        reviewer: null,
+        phase: "review",
       });
     }
     const runOptions: NonNullable<Parameters<SDKAgent["send"]>[1]> = {
@@ -57,6 +71,12 @@ export class CursorHarness implements AgentHarness {
               symphony: completionReportMcpServerConfig(ctx, completionReportContextFile),
             },
           }
+        : isReviewer
+          ? {
+              mcpServers: {
+                symphony: reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFile),
+              },
+            }
         : {}),
     };
     const run = await agent.send(prompt, runOptions);
@@ -84,6 +104,17 @@ export class CursorHarness implements AgentHarness {
         workspacePath: ctx.workspace.path,
         workspace: ctx.workspace,
         phase: "implementation",
+      });
+    }
+    if (isReviewer) {
+      await writeReviewVerdictMcpContext(reviewVerdictContextFile, {
+        issue: ctx.issue,
+        activeRunId: run.id,
+        role: "reviewer",
+        token: null,
+        expectedToken: null,
+        reviewer: `${agent.agentId}:${run.id}`,
+        phase: "review",
       });
     }
     await this.options.runStore?.updateRun(run.id, {
@@ -208,10 +239,42 @@ export function completionReportMcpServerConfig(ctx: AgentRunContext, contextFil
   };
 }
 
+export function reviewVerdictMcpServerConfig(ctx: AgentRunContext, contextFile: string): {
+  type: "stdio";
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+} {
+  return {
+    type: "stdio",
+    command: process.execPath,
+    args: [
+      ...process.execArgv,
+      process.argv[1] ?? "dist/cli.js",
+      "review-verdict-mcp",
+      "--workflow",
+      ctx.config.workflowPath,
+      "--context-file",
+      contextFile,
+    ],
+    cwd: ctx.config.workflowDir,
+    env: stringEnvironment(process.env),
+  };
+}
+
 function completionReportContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
     "completion-report-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
+function reviewVerdictContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "review-verdict-mcp",
     `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
   );
 }

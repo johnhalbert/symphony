@@ -15,6 +15,7 @@ import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "./core/writeback/WritebackOutbox.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
+import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
 
 const program = new Command();
 
@@ -45,6 +46,18 @@ program
   .requiredOption("--context-file <path>", "path to the active worker context file")
   .action(async (options: { workflow: string; contextFile: string }) => {
     await runCompletionReportMcpServer({
+      workflowPath: path.resolve(process.cwd(), options.workflow),
+      contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
+  });
+
+program
+  .command("review-verdict-mcp")
+  .description("Run the internal Symphony review-verdict MCP server")
+  .requiredOption("--workflow <path>", "path to WORKFLOW.md")
+  .requiredOption("--context-file <path>", "path to the active reviewer context file")
+  .action(async (options: { workflow: string; contextFile: string }) => {
+    await runReviewVerdictMcpServer({
       workflowPath: path.resolve(process.cwd(), options.workflow),
       contextFile: path.resolve(process.cwd(), options.contextFile),
     });

@@ -8,6 +8,7 @@ import {
   type CompletionReportPullRequestPublicationInput,
   type CompletionReportPullRequestPublisher,
 } from "../src/core/CompletionReportService.js";
+import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
@@ -553,6 +554,161 @@ describe("Orchestrator", () => {
     const runs = await runStore.listRunsForIssue(candidate.identifier);
     expect(runs.find((run) => run.runId === "fake-issue-1-1")).toMatchObject({ role: "reviewer" });
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 1 });
+  });
+
+  it("processes a live fail verdict submitted by a reviewer harness run", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    let currentState = "In Review";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: {
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+      },
+    });
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    const harness = new ReviewVerdictSubmittingHarness("fail", lifecycleStore, outboxStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs).toEqual([{ role: "reviewer", runId: "review-run-1" }]);
+    expect(currentState).toBe("In Progress");
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual(["review-run-1:review-verdict-fail"]);
+    expect(writer.comments[0]?.body).toContain("Symphony review failed");
+    expect(writer.comments[0]?.body).toContain("Add reviewer MCP integration.");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "implementation",
+      reviewRound: 1,
+      lastReviewVerdictId: "review-verdict:issue-1:review-verdict-fail-1",
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("processes a live pass verdict submitted by a reviewer harness run", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    let currentState = "In Review";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    const harness = new ReviewVerdictSubmittingHarness("pass", lifecycleStore, outboxStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs).toEqual([{ role: "reviewer", runId: "review-run-1" }]);
+    expect(currentState).toBe("Ready to Merge");
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual(["review-run-1:review-verdict-pass"]);
+    expect(writer.comments[0]?.body).toContain("Symphony review passed");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Ready to Merge"]);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "passed",
+      reviewRound: 1,
+      lastReviewVerdictId: "review-verdict:issue-1:review-verdict-pass-1",
+    });
   });
 
   it("does not treat review-state issues as worker candidates", async () => {
@@ -1174,6 +1330,68 @@ class ReportingHarness implements AgentHarness {
         workspacePath: ctx.workspace.path,
         workspace: ctx.workspace,
         phase: "implementation",
+      },
+    );
+    yield { type: "completed" };
+  }
+}
+
+class ReviewVerdictSubmittingHarness implements AgentHarness {
+  readonly id = "review-verdict-submitting";
+  readonly runs: Array<{ role: string; runId: string }> = [];
+
+  constructor(
+    private readonly verdict: "fail" | "pass",
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly outboxStore: FileWritebackOutboxStore,
+  ) {}
+
+  async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+    const runId = "review-run-1";
+    this.runs.push({ role: ctx.role, runId });
+    yield { type: "session_started", sessionId: "review-session-1", runId };
+    await new ReviewVerdictService({
+      config: ctx.config,
+      lifecycleStore: this.lifecycleStore,
+      writebackOutbox: this.outboxStore,
+    }).submitReviewVerdict(
+      this.verdict === "fail"
+        ? {
+            runId,
+            issueId: ctx.issue.id,
+            verdict: "fail",
+            acceptanceResults: [
+              {
+                text: "Reviewer verdict submissions are wired through the reviewer harness.",
+                satisfied: false,
+                evidence: "Reviewer MCP path was missing.",
+              },
+            ],
+            findings: ["Add reviewer MCP integration."],
+            evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-1"],
+            idempotencyKey: "review-verdict-fail-1",
+          }
+        : {
+            runId,
+            issueId: ctx.issue.id,
+            verdict: "pass",
+            acceptanceResults: [
+              {
+                text: "Reviewer verdict submissions are wired through the reviewer harness.",
+                satisfied: true,
+                evidence: "Reviewer MCP path is present.",
+              },
+            ],
+            findings: [],
+            evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-2"],
+            idempotencyKey: "review-verdict-pass-1",
+          },
+      {
+        issue: ctx.issue,
+        activeRunId: runId,
+        role: "reviewer",
+        reviewer: "reviewer-agent",
+        phase: "review",
       },
     );
     yield { type: "completed" };
