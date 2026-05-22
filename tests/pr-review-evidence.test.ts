@@ -21,7 +21,7 @@ describe("PullRequestReviewEvidenceService", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("ingests and dedupes PR review evidence while excluding resolved and outdated feedback from worker prompts", async () => {
+  it("ingests and dedupes PR review evidence while retaining fail verdict across repeat prompts", async () => {
     const candidate = issue({ branchName: "symphony/TEST-1" });
     const store = new FileIssueLifecycleStore(root);
     await store.ensureIssue(candidate, {
@@ -82,7 +82,11 @@ describe("PullRequestReviewEvidenceService", () => {
     expect(firstPrompt).toContain("Criterion still missing");
     expect(firstPrompt).not.toContain("Already fixed.");
     expect(firstPrompt).not.toContain("Old diff hunk.");
+    expect(secondContext?.verdict).toBe("fail");
     expect(secondContext?.evidence.map((item) => item.githubId)).toEqual(["comment-1"]);
+    expect(secondContext ? formatWorkerReviewEvidencePrompt(secondContext) : "").toContain(
+      "Reviewer verdict: fail / requested changes",
+    );
     await expect(store.get(candidate.identifier)).resolves.toMatchObject({
       reviewEvidence: {
         lastIngestedCursor: "2026-01-01T00:00:04Z",

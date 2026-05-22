@@ -123,9 +123,10 @@ export function buildWorkerReviewEvidencePromptContext(
   if (!pullRequest) return null;
   const visibleEvidence = selectEvidenceForWorker(lifecycle.reviewEvidence, fullHistoryThreshold);
   if (visibleEvidence.length === 0) return null;
+  const activeEvidence = activeReviewEvidence(lifecycle.reviewEvidence);
   return {
     pullRequest,
-    verdict: visibleEvidence.some((item) => item.state === "CHANGES_REQUESTED") ? "fail" : "feedback",
+    verdict: activeEvidence.some((item) => item.state === "CHANGES_REQUESTED") ? "fail" : "feedback",
     acceptanceCriteriaGaps: acceptanceCriteriaGaps(latestCompletionReport(lifecycle)),
     evidence: visibleEvidence,
   };
@@ -135,11 +136,15 @@ export function selectEvidenceForWorker(
   state: PullRequestReviewEvidenceState,
   fullHistoryThreshold: number,
 ): PullRequestReviewEvidenceItem[] {
-  const active = state.items.filter((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true);
+  const active = activeReviewEvidence(state);
   if (active.length <= fullHistoryThreshold) return active;
   const cursor = state.lastWorkerEvidenceCursor;
   if (!cursor) return active;
   return active.filter((item) => compareCursor(item.cursor, cursor) > 0 || item.isResolved === false);
+}
+
+function activeReviewEvidence(state: PullRequestReviewEvidenceState): PullRequestReviewEvidenceItem[] {
+  return state.items.filter((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true);
 }
 
 export function formatWorkerReviewEvidencePrompt(context: WorkerReviewEvidencePromptContext): string {
