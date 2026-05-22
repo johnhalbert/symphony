@@ -17,6 +17,13 @@ export interface ReviewVerdictWritebackContext {
   reviewer: string | null;
 }
 
+export interface ReviewVerdictWritebackDetails {
+  idempotencyKey: string;
+  acceptanceResults: Array<{ text: string; satisfied: boolean; evidence: string | null }>;
+  findings: string[];
+  evidence: string[];
+}
+
 export interface BlockedEscalationWritebackContext {
   issue: Issue;
   runId: string;
@@ -141,12 +148,13 @@ export function planCompletionReportAcceptedWritebacks(
 export function planReviewFailWritebacks(
   context: ReviewVerdictWritebackContext,
   config: ServiceConfig,
-  requestedRevisions: string[],
+  requestedRevisions: string[] | ReviewVerdictWritebackDetails,
   reviewEvidence: PullRequestReviewEvidenceItem[] = [],
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
 
-  const revisions = requestedRevisions.map((revision) => revision.trim()).filter((revision) => revision.length > 0);
+  const details = reviewVerdictDetailsFromInput(requestedRevisions);
+  const revisions = details.findings.map((revision) => revision.trim()).filter((revision) => revision.length > 0);
   const eventKey = `${context.runId}:review-verdict-fail`;
   return [
     {
@@ -165,6 +173,7 @@ export function planReviewFailWritebacks(
           "",
           `Run: ${context.runId}`,
           `Reviewer: ${context.reviewer ?? "n/a"}`,
+          ...formatReviewVerdictDetails(details),
           ...formatReviewEvidenceForLinearComment(reviewEvidence),
         ].join("\n"),
       },
@@ -186,11 +195,13 @@ export function planReviewFailWritebacks(
 export function planReviewPassWritebacks(
   context: ReviewVerdictWritebackContext,
   config: ServiceConfig,
-  summary: string | null = null,
+  summary: string | ReviewVerdictWritebackDetails | null = null,
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
 
   const eventKey = `${context.runId}:review-verdict-pass`;
+  const details = typeof summary === "object" && summary !== null ? summary : null;
+  const summaryText = typeof summary === "string" ? summary : null;
   const operations: NewWritebackOperation[] = [
     {
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
@@ -207,7 +218,8 @@ export function planReviewPassWritebacks(
           config.reviewLoop.reviewPassState === null
             ? "Review passed marker: review-passed"
             : `Review pass state: ${config.reviewLoop.reviewPassState}`,
-          ...(summary === null || summary.trim().length === 0 ? [] : ["", "Summary:", summary.trim()]),
+          ...(summaryText === null || summaryText.trim().length === 0 ? [] : ["", "Summary:", summaryText.trim()]),
+          ...(details === null ? [] : formatReviewVerdictDetails(details)),
         ].join("\n"),
       },
     },
@@ -366,6 +378,34 @@ function formatCompletionReportForComment(report: string | CompletionReportWrite
 function listOrFallback(values: string[], fallback: string): string[] {
   const items = values.map((value) => value.trim()).filter((value) => value.length > 0);
   return items.length === 0 ? [`- ${fallback}`] : items.map((value) => `- ${value}`);
+}
+
+function reviewVerdictDetailsFromInput(input: string[] | ReviewVerdictWritebackDetails): ReviewVerdictWritebackDetails {
+  if (Array.isArray(input)) {
+    return {
+      idempotencyKey: "n/a",
+      acceptanceResults: [],
+      findings: input,
+      evidence: [],
+    };
+  }
+  return input;
+}
+
+function formatReviewVerdictDetails(details: ReviewVerdictWritebackDetails): string[] {
+  return [
+    "",
+    "Acceptance results:",
+    ...(details.acceptanceResults.length === 0
+      ? ["- No acceptance results supplied."]
+      : details.acceptanceResults.map(
+          (item) => `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
+        )),
+    "",
+    "Review evidence:",
+    ...listOrFallback(details.evidence, "No review evidence supplied."),
+    ...(details.idempotencyKey === "n/a" ? [] : ["", `Idempotency key: ${details.idempotencyKey}`]),
+  ];
 }
 
 function formatPullRequest(pullRequest: CompletionReportWritebackDetails["pullRequest"]): string {

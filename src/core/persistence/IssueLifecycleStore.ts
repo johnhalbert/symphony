@@ -87,6 +87,29 @@ export interface IssueCompletionReportRecord {
   writebackOperationKeys: string[];
 }
 
+export type IssueReviewVerdict = "pass" | "fail";
+
+export interface ReviewVerdictAcceptanceResult {
+  text: string;
+  satisfied: boolean;
+  evidence: string | null;
+}
+
+export interface IssueReviewVerdictRecord {
+  id: string;
+  idempotencyKey: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  verdict: IssueReviewVerdict;
+  acceptanceResults: ReviewVerdictAcceptanceResult[];
+  findings: string[];
+  evidence: string[];
+  reviewer: string | null;
+  submittedAt: string;
+  writebackOperationKeys: string[];
+}
+
 export interface IssueLifecycleRecord {
   issueId: string;
   issueIdentifier: string;
@@ -98,6 +121,7 @@ export interface IssueLifecycleRecord {
   blockedReason: string | null;
   summaryPointers: IssueLifecycleSummaryPointers;
   completionReports: IssueCompletionReportRecord[];
+  reviewVerdicts: IssueReviewVerdictRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
   createdAt: string;
   updatedAt: string;
@@ -112,6 +136,7 @@ export interface IssueLifecyclePatch {
   blockedReason?: string | null;
   summaryPointers?: Partial<IssueLifecycleSummaryPointers>;
   completionReports?: IssueCompletionReportRecord[];
+  reviewVerdicts?: IssueReviewVerdictRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
 }
 
@@ -138,6 +163,7 @@ export class FileIssueLifecycleStore {
         ...patch.summaryPointers,
       },
       completionReports: patch.completionReports ?? existing?.completionReports ?? [],
+      reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -271,6 +297,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
     completionReports: normalizeCompletionReports(value.completionReports, filePath),
+    reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
@@ -301,6 +328,12 @@ function normalizeCompletionReports(value: unknown, filePath: string): IssueComp
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "completionReports is invalid");
   return value.map((item, index) => normalizeCompletionReport(item, filePath, index));
+}
+
+function normalizeReviewVerdicts(value: unknown, filePath: string): IssueReviewVerdictRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewVerdicts is invalid");
+  return value.map((item, index) => normalizeReviewVerdict(item, filePath, index));
 }
 
 function defaultReviewEvidence(): PullRequestReviewEvidenceState {
@@ -397,6 +430,27 @@ function normalizeCompletionReport(value: unknown, filePath: string, index: numb
   };
 }
 
+function normalizeReviewVerdict(value: unknown, filePath: string, index: number): IssueReviewVerdictRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `reviewVerdicts[${index}] is invalid`);
+  if (value.verdict !== "pass" && value.verdict !== "fail") {
+    throw corruptLifecycle(filePath, `reviewVerdicts[${index}].verdict is invalid`);
+  }
+  return {
+    id: requiredString(value.id, filePath, `reviewVerdicts[${index}].id`),
+    idempotencyKey: requiredString(value.idempotencyKey, filePath, `reviewVerdicts[${index}].idempotencyKey`),
+    runId: requiredString(value.runId, filePath, `reviewVerdicts[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `reviewVerdicts[${index}].issueId`),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, `reviewVerdicts[${index}].issueIdentifier`),
+    verdict: value.verdict,
+    acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, index),
+    findings: requiredStringArray(value.findings, filePath, `reviewVerdicts[${index}].findings`),
+    evidence: requiredStringArray(value.evidence, filePath, `reviewVerdicts[${index}].evidence`),
+    reviewer: nullableString(value.reviewer, filePath, `reviewVerdicts[${index}].reviewer`),
+    submittedAt: requiredString(value.submittedAt, filePath, `reviewVerdicts[${index}].submittedAt`),
+    writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `reviewVerdicts[${index}].writebackOperationKeys`),
+  };
+}
+
 function normalizeChecklist(value: unknown, filePath: string, reportIndex: number): CompletionReportChecklistItem[] {
   if (!Array.isArray(value)) {
     throw corruptLifecycle(filePath, `completionReports[${reportIndex}].acceptanceChecklist is invalid`);
@@ -412,6 +466,36 @@ function normalizeChecklist(value: unknown, filePath: string, reportIndex: numbe
       text: requiredString(item.text, filePath, `completionReports[${reportIndex}].acceptanceChecklist[${itemIndex}].text`),
       satisfied: item.satisfied,
       evidence: nullableString(item.evidence, filePath, `completionReports[${reportIndex}].acceptanceChecklist[${itemIndex}].evidence`),
+    };
+  });
+}
+
+function normalizeReviewVerdictAcceptanceResults(
+  value: unknown,
+  filePath: string,
+  verdictIndex: number,
+): ReviewVerdictAcceptanceResult[] {
+  if (!Array.isArray(value)) {
+    throw corruptLifecycle(filePath, `reviewVerdicts[${verdictIndex}].acceptanceResults is invalid`);
+  }
+  return value.map((item, itemIndex) => {
+    if (!isRecord(item)) {
+      throw corruptLifecycle(filePath, `reviewVerdicts[${verdictIndex}].acceptanceResults[${itemIndex}] is invalid`);
+    }
+    if (typeof item.satisfied !== "boolean") {
+      throw corruptLifecycle(
+        filePath,
+        `reviewVerdicts[${verdictIndex}].acceptanceResults[${itemIndex}].satisfied is invalid`,
+      );
+    }
+    return {
+      text: requiredString(item.text, filePath, `reviewVerdicts[${verdictIndex}].acceptanceResults[${itemIndex}].text`),
+      satisfied: item.satisfied,
+      evidence: nullableString(
+        item.evidence,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].acceptanceResults[${itemIndex}].evidence`,
+      ),
     };
   });
 }

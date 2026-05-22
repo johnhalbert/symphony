@@ -12,7 +12,11 @@ import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
-import { FileIssueLifecycleStore, type IssueCompletionReportRecord } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileIssueLifecycleStore,
+  type IssueCompletionReportRecord,
+  type IssueReviewVerdictRecord,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import type {
   PullRequestReviewEvidenceClient,
   RemotePullRequestReviewEvidence,
@@ -912,6 +916,64 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42");
   });
 
+  it("injects the latest fail verdict findings and workspace context into the next worker prompt", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "implementation",
+      lastCompletionReportId: report.id,
+      lastReviewVerdictId: "review-verdict:issue-1:verdict-1",
+      completionReports: [report],
+      reviewVerdicts: [reviewVerdictRecord(candidate)],
+      summaryPointers: {
+        workspacePath: "/tmp/old-workspace",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+      },
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
+    expect(harness.runs[0]?.prompt).toContain("Reviewer findings to address");
+    expect(harness.runs[0]?.prompt).toContain("Current workspace context:");
+    expect(harness.runs[0]?.prompt).toContain("Branch: symphony/TEST-1");
+    expect(harness.runs[0]?.prompt).toContain("Pull request: #42 https://github.com/acme/symphony/pull/42");
+    expect(harness.runs[0]?.prompt).toContain("Add regression coverage for duplicate verdict submissions.");
+    expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42#discussion_r1");
+  });
+
   it("cancels an active issue without retrying it", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -1009,6 +1071,29 @@ function completionReportRecord(candidate = issue()): IssueCompletionReportRecor
     },
     risks: [],
     acceptedAt: "2026-01-01T00:00:01Z",
+    writebackOperationKeys: [],
+  };
+}
+
+function reviewVerdictRecord(candidate = issue()): IssueReviewVerdictRecord {
+  return {
+    id: `review-verdict:${candidate.id}:verdict-1`,
+    idempotencyKey: "verdict-1",
+    runId: "review-run-1",
+    issueId: candidate.id,
+    issueIdentifier: candidate.identifier,
+    verdict: "fail",
+    acceptanceResults: [
+      {
+        text: "Duplicate verdicts are idempotent",
+        satisfied: false,
+        evidence: "Reviewer could not find a regression test.",
+      },
+    ],
+    findings: ["Add regression coverage for duplicate verdict submissions."],
+    evidence: ["https://github.com/acme/symphony/pull/42#discussion_r1"],
+    reviewer: "reviewer-a",
+    submittedAt: "2026-01-01T00:00:02Z",
     writebackOperationKeys: [],
   };
 }

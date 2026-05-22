@@ -20,6 +20,7 @@ import {
   PullRequestReviewEvidenceService,
   type PullRequestReviewEvidenceClient,
 } from "../review/PullRequestReviewEvidenceService.js";
+import { formatWorkerReviewVerdictPrompt } from "../ReviewVerdictService.js";
 import type { WritebackProcessor } from "../writeback/WritebackOutbox.js";
 import {
   planDispatchWriteback,
@@ -1135,8 +1136,14 @@ export class Orchestrator {
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
     const basePrompt = await this.promptRenderer.render(this.promptTemplate, { issue: entry.issue, attempt });
+    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
-    return reviewEvidence === null ? basePrompt : `${basePrompt}\n${reviewEvidence}`;
+    return [basePrompt, reviewVerdict, reviewEvidence].filter((item): item is string => item !== null).join("\n");
+  }
+
+  private async loadWorkerReviewVerdictPrompt(entry: RunningEntry): Promise<string | null> {
+    const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+    return lifecycle === undefined || lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
   }
 
   private async loadWorkerReviewEvidencePrompt(entry: RunningEntry): Promise<string | null> {
