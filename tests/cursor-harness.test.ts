@@ -35,6 +35,7 @@ describe("Cursor event mapping", () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     const ctx: AgentRunContext = {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      role: "worker",
       attempt: null,
       workspace: {
         path: "/tmp/workspace",

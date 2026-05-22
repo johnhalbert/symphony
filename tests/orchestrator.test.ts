@@ -12,7 +12,7 @@ import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
-import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileIssueLifecycleStore, type IssueCompletionReportRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
@@ -76,6 +76,7 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toBe("Work on TEST-1");
+    expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
   });
 
@@ -457,6 +458,174 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
+  it("dispatches reviewer runs from configured review states with reviewer evidence", async () => {
+    const config = testConfig(root);
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptTemplate =
+      "Review {{ issue.identifier }} as {{ role }}: {{ completionReport.summary }}\n{% for item in workspaceEvidence %}{{ item }}\n{% endfor %}{% for item in runDigest %}{{ item }}\n{% endfor %}";
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const fetchedReviewStates: string[][] = [];
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        fetchedReviewStates.push(states);
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: {
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+      },
+    });
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: report.runId,
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Implemented the reviewer dispatch lane.",
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(fetchedReviewStates).toEqual([["In Review"]]);
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.role).toBe("reviewer");
+    expect(harness.runs[0]?.prompt).toContain("Review TEST-1 as reviewer");
+    expect(harness.runs[0]?.prompt).toContain("Implemented the requested change.");
+    expect(harness.runs[0]?.prompt).toContain("Pull request: https://github.com/acme/symphony/pull/42");
+    expect(harness.runs[0]?.prompt).toContain("Implemented the reviewer dispatch lane.");
+    const runs = await runStore.listRunsForIssue(candidate.identifier);
+    expect(runs.find((run) => run.runId === "fake-issue-1-1")).toMatchObject({ role: "reviewer" });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 1 });
+  });
+
+  it("does not treat review-state issues as worker candidates", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    const candidate = issue({ state: "In Review" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+  });
+
+  it("does not dispatch reviewers for blocked review issues", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    const candidate = issue({
+      state: "In Review",
+      blockedBy: [{ id: "blocker", identifier: "TEST-0", state: "Todo" }],
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [candidate];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+  });
+
   it("pauses and resumes issue dispatch", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -715,6 +884,36 @@ describe("Orchestrator", () => {
     expect(harness.prompts).toEqual(["Work on TEST-1"]);
   });
 });
+
+function completionReportRecord(candidate = issue()): IssueCompletionReportRecord {
+  return {
+    id: `completion-report:${candidate.id}:idem-1`,
+    idempotencyKey: "idem-1",
+    runId: "worker-run-1",
+    issueId: candidate.id,
+    issueIdentifier: candidate.identifier,
+    summary: "Implemented the requested change.",
+    validationEvidence: ["npm test -- orchestrator"],
+    acceptanceChecklist: [
+      {
+        text: "Reviewer dispatch is covered.",
+        satisfied: true,
+        evidence: "orchestrator test",
+      },
+    ],
+    changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
+    branchName: candidate.branchName,
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      branch: candidate.branchName,
+    },
+    risks: [],
+    acceptedAt: "2026-01-01T00:00:01Z",
+    writebackOperationKeys: [],
+  };
+}
 
 class BlockingHarness implements AgentHarness {
   readonly id = "blocking";

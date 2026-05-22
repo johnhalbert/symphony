@@ -25,6 +25,7 @@ const rawConfigSchema = z
         review_states: stringArray.optional(),
         blocked_states: stringArray.optional(),
         review_pass_state: z.string().optional(),
+        reviewer_prompt: z.string().optional(),
         max_review_rounds: z.number().int().positive().optional(),
         max_incomplete_turns: z.number().int().positive().optional(),
         continuation_history_threshold: z.number().int().nonnegative().optional(),
@@ -217,6 +218,7 @@ export interface ReviewLoopConfig {
   reviewStates: string[];
   blockedStates: string[];
   reviewPassState: string | null;
+  reviewerPromptTemplate: string | null;
   maxReviewRounds: number;
   maxIncompleteTurns: number;
   continuationHistoryThreshold: number;
@@ -409,6 +411,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       reviewStates,
       blockedStates,
       reviewPassState,
+      reviewerPromptTemplate: raw.review_loop?.reviewer_prompt ?? null,
       maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
       maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
       continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,

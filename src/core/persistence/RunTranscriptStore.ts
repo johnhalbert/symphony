@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { TokenCounts } from "../types.js";
+import type { AgentRunRole, TokenCounts } from "../types.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 
@@ -34,6 +34,7 @@ export interface RunRecord {
   runId: string;
   sessionId: string | null;
   agentId: string | null;
+  role: AgentRunRole;
   issueId: string;
   issueIdentifier: string;
   attempt: number | null;
@@ -81,6 +82,7 @@ export interface StartRunInput {
   runId: string;
   sessionId?: string | null;
   agentId?: string | null;
+  role: AgentRunRole;
   issueId: string;
   issueIdentifier: string;
   attempt: number | null;
@@ -167,6 +169,7 @@ export class FileRunTranscriptStore {
       runId: input.runId,
       sessionId: input.sessionId ?? existing?.sessionId ?? null,
       agentId: input.agentId ?? existing?.agentId ?? null,
+      role: input.role,
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
       attempt: input.attempt,
