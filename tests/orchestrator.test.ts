@@ -979,6 +979,44 @@ describe("Orchestrator", () => {
     expect(harness.runs).toHaveLength(0);
   });
 
+  it("does not dispatch worker runs for blocked states even when they are active states", async () => {
+    const config = testConfig(root);
+    config.tracker.activeStates = ["Todo", "In Progress", "Blocked"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Blocked" });
+    let refreshes = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        refreshes += 1;
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+    expect(refreshes).toBe(0);
+  });
+
   it("does not dispatch reviewers for blocked review issues", async () => {
     const config = testConfig(root);
     config.reviewLoop.reviewStates = ["In Review"];

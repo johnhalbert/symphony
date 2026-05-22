@@ -446,6 +446,7 @@ export class Orchestrator {
     if (!issue.assignedToWorker) return false;
     if (isStateIn(issue.state, this.config.tracker.handoffStates)) return false;
     if (isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
     if (!isStateIn(issue.state, this.config.tracker.activeStates)) return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
     if (!this.passesLabelGuardrails(issue)) return false;
