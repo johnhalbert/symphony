@@ -67,6 +67,7 @@ export interface RunningEntry {
   tokens: TokenCounts;
   cleanupWorkspaceOnExit: boolean;
   suppressRetryOnExit: boolean;
+  completionReportAccepted: boolean;
 }
 
 export interface RetryEntry {
@@ -424,6 +425,7 @@ export class Orchestrator {
       tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       cleanupWorkspaceOnExit: false,
       suppressRetryOnExit: false,
+      completionReportAccepted: false,
     };
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
@@ -474,6 +476,7 @@ export class Orchestrator {
           attempt,
           turnNumber,
         });
+        if (entry.completionReportAccepted) break;
 
         const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
         const latest = refreshed[0];
@@ -551,7 +554,9 @@ export class Orchestrator {
           tokens: entry.tokens,
         });
         await this.discoverPullRequestForEntry(entry, context.workspace);
-        await this.recordIncompleteTurn(entry);
+        if (!(await this.reconcileCompletionReportHandoff(entry))) {
+          await this.recordIncompleteTurn(entry);
+        }
       }
       if (event.type === "failed") {
         await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
@@ -588,6 +593,10 @@ export class Orchestrator {
         });
       }
       this.completed.add(issueId);
+      if (await this.reconcileCompletionReportHandoff(entry)) {
+        this.claimed.delete(issueId);
+        return;
+      }
       if (this.config.writeback.enabled) {
         await this.applyWritebacks(
           planRunSucceededWritebacks(
@@ -798,6 +807,32 @@ export class Orchestrator {
     if (!store) return;
     const incompleteTurnCount = (entry.lifecycle?.incompleteTurnCount ?? 0) + 1;
     await this.updateLifecycle(entry, { incompleteTurnCount });
+  }
+
+  private async reconcileCompletionReportHandoff(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return entry.completionReportAccepted;
+
+    const lifecycle = await store.get(entry.issue.id);
+    const report = lifecycle?.completionReports.find((item) => item.runId === runId) ?? null;
+    if (!lifecycle || !report) return entry.completionReportAccepted;
+
+    entry.lifecycle = lifecycle;
+    entry.completionReportAccepted = true;
+
+    if (this.options.writeback) {
+      await this.options.writeback.processDue();
+    } else if (this.config.writeback.enabled) {
+      this.options.logger.warn("completion report accepted but writeback processor is not configured", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        run_id: runId,
+        report_id: report.id,
+      });
+    }
+
+    return true;
   }
 
   private async updateLifecycle(entry: RunningEntry, patch: IssueLifecyclePatch): Promise<void> {
