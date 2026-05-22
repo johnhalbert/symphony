@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
-import { continuationContextDoctorChecks, githubPublicationDoctorCheck, reviewLoopDoctorChecks } from "../src/doctor.js";
+import {
+  continuationContextDoctorChecks,
+  githubPublicationDoctorCheck,
+  githubReviewFeedbackDoctorCheck,
+  reviewLoopDoctorChecks,
+} from "../src/doctor.js";
 import { testConfig } from "./helpers.js";
 
 describe("doctor review-loop checks", () => {
@@ -21,8 +26,7 @@ describe("doctor review-loop checks", () => {
     await expect(
       reviewLoopDoctorChecks(config, {
         workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
-        mcpToolLister: async ({ command }) =>
-          command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+        mcpToolLister: async ({ command }) => mcpToolsFor(command),
         linearStateLister: async () => ["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"],
       }),
     ).resolves.toEqual([
@@ -44,7 +48,8 @@ describe("doctor review-loop checks", () => {
       {
         id: "review_loop.mcp_tools",
         status: "ok",
-        message: "Configured Cursor CLI lists MCP tools: submit_completion_report, submit_review_verdict",
+        message:
+          "Configured Cursor CLI lists MCP tools: submit_completion_report, submit_review_verdict, submit_pull_request_review_feedback",
       },
       {
         id: "review_loop.candidate_isolation",
@@ -67,8 +72,7 @@ describe("doctor review-loop checks", () => {
 
     const checks = await reviewLoopDoctorChecks(config, {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
-      mcpToolLister: async ({ command }) =>
-        command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+      mcpToolLister: async ({ command }) => mcpToolsFor(command),
       linearStateLister: async () => ["Todo", "In Progress", "In Review", "Ready to Merge", "Done"],
     });
 
@@ -92,8 +96,7 @@ describe("doctor review-loop checks", () => {
 
     const checks = await reviewLoopDoctorChecks(config, {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
-      mcpToolLister: async ({ command }) =>
-        command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+      mcpToolLister: async ({ command }) => mcpToolsFor(command),
       linearStateLister: async () => ["Todo", "In Progress", "In Review", "Blocked", "Done"],
     });
 
@@ -113,7 +116,7 @@ describe("doctor review-loop checks", () => {
     const checks = await reviewLoopDoctorChecks(config, {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
       mcpToolLister: async ({ command }) =>
-        command === "completion-report-mcp" ? ["submit_completion_report"] : ["unexpected_tool"],
+        command === "review-verdict-mcp" ? ["unexpected_tool"] : mcpToolsFor(command),
       linearStateLister: async () => ["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"],
     });
 
@@ -133,8 +136,7 @@ describe("doctor review-loop checks", () => {
 
     const checks = await reviewLoopDoctorChecks(config, {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
-      mcpToolLister: async ({ command }) =>
-        command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+      mcpToolLister: async ({ command }) => mcpToolsFor(command),
       linearStateLister: async () => ["Blocked", "Todo", "Duplicate", "Canceled", "Backlog", "In Progress", "Done", "In Review"],
     });
 
@@ -155,8 +157,7 @@ describe("doctor review-loop checks", () => {
 
     const checks = await reviewLoopDoctorChecks(config, {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
-      mcpToolLister: async ({ command }) =>
-        command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+      mcpToolLister: async ({ command }) => mcpToolsFor(command),
       linearStateLister: async () => {
         throw new Error("Linear API unavailable");
       },
@@ -275,4 +276,52 @@ describe("doctor review-loop checks", () => {
       message: expect.stringContaining("credential_profiles.roles.worker.github.publication"),
     });
   });
+
+  it("validates GitHub review feedback with the resolved reviewer feedback profile", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "legacy-github-token",
+          api_base_url: "https://api.github.test",
+        },
+        credential_profiles: {
+          profiles: {
+            feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+          },
+          roles: {
+            reviewer: {
+              "github.review_feedback_write": "feedback",
+            },
+          },
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+      },
+    );
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (_input: unknown, init?: RequestInit) => {
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      return new Response(JSON.stringify({ id: 1 }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
+      id: "github.review_feedback_write",
+      status: "ok",
+      message: "GitHub PR review feedback can access acme/symphony",
+    });
+    expect(authorizations).toEqual(["Bearer feedback-secret"]);
+  });
 });
+
+function mcpToolsFor(command: string): string[] {
+  if (command === "completion-report-mcp") return ["submit_completion_report"];
+  if (command === "review-verdict-mcp") return ["submit_review_verdict"];
+  if (command === "review-feedback-mcp") return ["submit_pull_request_review_feedback"];
+  return [];
+}

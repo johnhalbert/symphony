@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { mapCursorDelta, mapCursorMessage } from "../cursor/src/CursorEventMapper.js";
-import { completionReportMcpServerConfig, reviewVerdictMcpServerConfig } from "../cursor/src/CursorHarness.js";
+import {
+  completionReportMcpServerConfig,
+  reviewFeedbackMcpServerConfig,
+  reviewVerdictMcpServerConfig,
+} from "../cursor/src/CursorHarness.js";
 import { issue, testConfig } from "./helpers.js";
 
 describe("Cursor event mapping", () => {
@@ -106,6 +110,50 @@ describe("Cursor event mapping", () => {
     );
     expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key" });
     expect(server.env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
+  });
+
+  it("wires the Symphony review feedback MCP server separately for reviewer Cursor runs", () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "feedback-secret";
+    const ctx: AgentRunContext = {
+      issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      role: "reviewer",
+      attempt: null,
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      config,
+      turnNumber: 1,
+      abortSignal: new AbortController().signal,
+      logger: new StructuredLogger(() => undefined),
+    };
+
+    const server = reviewFeedbackMcpServerConfig(ctx, "/tmp/review-feedback-context.json");
+    const args = server.args as string[];
+
+    expect(server).toMatchObject({
+      type: "stdio",
+      command: process.execPath,
+      cwd: config.workflowDir,
+    });
+    expect(args).toEqual(
+      expect.arrayContaining([
+        "review-feedback-mcp",
+        "--workflow",
+        config.workflowPath,
+        "--context-file",
+        "/tmp/review-feedback-context.json",
+      ]),
+    );
+    expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key", GITHUB_TOKEN: "feedback-secret" });
     expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
   });
 });

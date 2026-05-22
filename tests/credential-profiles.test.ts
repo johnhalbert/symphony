@@ -94,10 +94,10 @@ describe("credential profile config", () => {
     });
     expect(config.credentialProfiles.capabilitiesForRole("reviewer")).toEqual([
       "github.review_evidence_read",
+      "github.review_feedback_write",
       "linear.tracker",
       "linear.writeback",
       "cursor.runtime",
-      "github.review_feedback_write",
     ]);
 
     const serialized = JSON.stringify(config.credentialProfiles);

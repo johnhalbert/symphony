@@ -61,6 +61,45 @@ export interface PullRequestReviewEvidenceLookup {
   pullRequestNumber: number;
 }
 
+export type GitHubPullRequestReviewFeedbackEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+
+export interface PullRequestReviewInlineFeedbackInput {
+  path: string;
+  body: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+  startLine?: number | null;
+  startSide?: "LEFT" | "RIGHT" | null;
+}
+
+export interface PullRequestReviewFeedbackInput {
+  pullRequestNumber: number;
+  headSha: string;
+  event: GitHubPullRequestReviewFeedbackEvent;
+  body: string;
+  comments?: PullRequestReviewInlineFeedbackInput[];
+}
+
+export interface PullRequestReviewCommentFeedbackInput {
+  pullRequestNumber: number;
+  headSha: string | null;
+  body: string;
+  path?: string | null;
+  line?: number | null;
+  side?: "LEFT" | "RIGHT" | null;
+  inReplyToId?: number | null;
+}
+
+export interface PullRequestIssueCommentFeedbackInput {
+  pullRequestNumber: number;
+  body: string;
+}
+
+export interface PullRequestReviewFeedbackResult {
+  reviewUrl: string | null;
+  commentUrls: string[];
+}
+
 interface GitHubPullRequestNode {
   html_url?: unknown;
   number?: unknown;
@@ -115,6 +154,10 @@ interface GitHubIssueCommentNode {
   user?: GitHubUserNode | null;
   created_at?: unknown;
   updated_at?: unknown;
+}
+
+interface GitHubReviewFeedbackNode extends GitHubReviewNode {
+  comments?: unknown;
 }
 
 interface GraphQlPageInfoNode {
@@ -233,6 +276,101 @@ export class GitHubPullRequestClient {
     ].sort(compareEvidence);
   }
 
+  async submitPullRequestReviewFeedback(
+    input: PullRequestReviewFeedbackInput,
+  ): Promise<PullRequestReviewFeedbackResult> {
+    this.assertConfiguredForReviewFeedbackWrite();
+    assertPullRequestNumber(input.pullRequestNumber, "PR review feedback");
+    const headSha = requireNonEmpty(input.headSha, "A pull request head SHA is required for PR review feedback");
+    const body = requireNonEmpty(input.body, "A review body is required for PR review feedback");
+    const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}/reviews`), {
+      method: "POST",
+      headers: {
+        ...requestHeaders(this.config.token ?? ""),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        commit_id: headSha,
+        event: input.event,
+        body,
+        comments: (input.comments ?? []).map((comment) => ({
+          path: requireNonEmpty(comment.path, "Inline review comments require a path"),
+          body: requireNonEmpty(comment.body, "Inline review comments require a body"),
+          line: comment.line,
+          side: comment.side,
+          ...(comment.startLine === undefined || comment.startLine === null ? {} : { start_line: comment.startLine }),
+          ...(comment.startSide === undefined || comment.startSide === null ? {} : { start_side: comment.startSide }),
+        })),
+      }),
+    });
+    if (!response.ok) {
+      throw new SymphonyError("tracker_error", await this.githubWriteError(response, "GitHub PR review feedback"));
+    }
+
+    const bodyJson = (await response.json()) as GitHubReviewFeedbackNode;
+    return {
+      reviewUrl: asNullableString(bodyJson.html_url),
+      commentUrls: asRecordArray(bodyJson.comments)
+        .map((comment) => asNullableString(comment.html_url))
+        .filter((url): url is string => url !== null),
+    };
+  }
+
+  async submitPullRequestReviewCommentFeedback(
+    input: PullRequestReviewCommentFeedbackInput,
+  ): Promise<PullRequestReviewFeedbackResult> {
+    this.assertConfiguredForReviewFeedbackWrite();
+    assertPullRequestNumber(input.pullRequestNumber, "PR review comment feedback");
+    const body = requireNonEmpty(input.body, "A review comment body is required for PR feedback");
+    const payload =
+      input.inReplyToId !== undefined && input.inReplyToId !== null
+        ? { body, in_reply_to: input.inReplyToId }
+        : {
+            body,
+            commit_id: requireNonEmpty(input.headSha ?? "", "A pull request head SHA is required for inline PR feedback"),
+            path: requireNonEmpty(input.path ?? "", "Inline PR feedback requires a path"),
+            line: input.line,
+            side: input.side,
+          };
+    const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}/comments`), {
+      method: "POST",
+      headers: {
+        ...requestHeaders(this.config.token ?? ""),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      throw new SymphonyError("tracker_error", await this.githubWriteError(response, "GitHub PR review comment feedback"));
+    }
+
+    const comment = (await response.json()) as GitHubReviewCommentNode;
+    const url = asNullableString(comment.html_url);
+    return { reviewUrl: null, commentUrls: url === null ? [] : [url] };
+  }
+
+  async submitPullRequestIssueCommentFeedback(
+    input: PullRequestIssueCommentFeedbackInput,
+  ): Promise<PullRequestReviewFeedbackResult> {
+    this.assertConfiguredForReviewFeedbackWrite();
+    assertPullRequestNumber(input.pullRequestNumber, "PR issue comment feedback");
+    const response = await this.fetchImpl(this.repoUrl(`issues/${input.pullRequestNumber}/comments`), {
+      method: "POST",
+      headers: {
+        ...requestHeaders(this.config.token ?? ""),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ body: requireNonEmpty(input.body, "An issue comment body is required for PR feedback") }),
+    });
+    if (!response.ok) {
+      throw new SymphonyError("tracker_error", await this.githubWriteError(response, "GitHub PR issue comment feedback"));
+    }
+
+    const comment = (await response.json()) as GitHubIssueCommentNode;
+    const url = asNullableString(comment.html_url);
+    return { reviewUrl: null, commentUrls: url === null ? [] : [url] };
+  }
+
   async publishPullRequest(input: PullRequestPublicationInput): Promise<PullRequestPublicationResult> {
     this.assertConfiguredForPublication();
     const token = this.config.token ?? "";
@@ -297,12 +435,9 @@ export class GitHubPullRequestClient {
   }
 
   async checkRepositoryAccess(): Promise<void> {
-    this.assertConfiguredForPublication();
+    this.assertConfiguredForRepositoryAccess();
     const response = await this.fetchImpl(
-      new URL(
-        `repos/${encodeURIComponent(this.config.owner ?? "")}/${encodeURIComponent(this.config.repo ?? "")}`,
-        normalizedApiBaseUrl(this.config.apiBaseUrl),
-      ),
+      this.repoUrl(""),
       {
         method: "GET",
         headers: requestHeaders(this.config.token ?? ""),
@@ -333,6 +468,37 @@ export class GitHubPullRequestClient {
         "GitHub owner, repo, and token are required for PR review evidence ingestion",
       );
     }
+  }
+
+  private assertConfiguredForReviewFeedbackWrite(): void {
+    if (!this.config.owner || !this.config.repo || !this.config.token) {
+      throw new SymphonyError(
+        "invalid_request",
+        "GitHub owner, repo, and token are required for PR review feedback",
+      );
+    }
+  }
+
+  private assertConfiguredForRepositoryAccess(): void {
+    if (!this.config.owner || !this.config.repo || !this.config.token) {
+      throw new SymphonyError(
+        "invalid_request",
+        "GitHub owner, repo, and token are required for repository access",
+      );
+    }
+  }
+
+  private repoUrl(repoPath: string): URL {
+    const suffix = repoPath.length === 0 ? "" : `/${repoPath}`;
+    return new URL(
+      `repos/${encodeURIComponent(this.config.owner ?? "")}/${encodeURIComponent(this.config.repo ?? "")}${suffix}`,
+      normalizedApiBaseUrl(this.config.apiBaseUrl),
+    );
+  }
+
+  private async githubWriteError(response: Response, action: string): Promise<string> {
+    const detail = await githubErrorDetail(response, this.config.token);
+    return detail.length === 0 ? `${action} returned HTTP ${response.status}` : `${action} returned HTTP ${response.status}: ${detail}`;
   }
 
   private async createPullRequest(input: {
@@ -508,6 +674,11 @@ function asNumberString(value: unknown): string | null {
   return null;
 }
 
+function asRecordArray(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value) && value.every((item) => isRecord(item))) return value as Array<Record<string, unknown>>;
+  return [];
+}
+
 function asNullableNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -671,6 +842,46 @@ function requestHeaders(token: string): Record<string, string> {
     "user-agent": "symphony",
     "x-github-api-version": "2022-11-28",
   };
+}
+
+function assertPullRequestNumber(value: number, description: string): void {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new SymphonyError("invalid_request", `A valid pull request number is required for ${description}`);
+  }
+}
+
+function requireNonEmpty(value: string, message: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) throw new SymphonyError("invalid_request", message);
+  return trimmed;
+}
+
+async function githubErrorDetail(response: Response, token: string | null): Promise<string> {
+  let text = "";
+  try {
+    const body = (await response.clone().json()) as unknown;
+    if (isRecord(body)) {
+      const message = asNullableString(body.message);
+      const errors = Array.isArray(body.errors)
+        ? body.errors
+            .map((error) => (isRecord(error) ? asNullableString(error.message) : null))
+            .filter((item): item is string => item !== null)
+        : [];
+      text = [message, ...errors].filter((item): item is string => item !== null && item.length > 0).join("; ");
+    }
+  } catch {
+    try {
+      text = await response.text();
+    } catch {
+      text = "";
+    }
+  }
+  return sanitizeSecret(text, token).slice(0, 500);
+}
+
+function sanitizeSecret(value: string, secret: string | null): string {
+  if (!secret || secret.length === 0) return value;
+  return value.split(secret).join("[redacted]");
 }
 
 function normalizeBranchName(value: string): string {
