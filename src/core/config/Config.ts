@@ -32,6 +32,13 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    continuation_context: z
+      .object({
+        search_enabled: z.boolean().optional(),
+        summarization_enabled: z.boolean().optional(),
+      })
+      .passthrough()
+      .optional(),
     polling: z
       .object({
         interval_ms: z.number().int().positive().optional(),
@@ -224,6 +231,11 @@ export interface ReviewLoopConfig {
   continuationHistoryThreshold: number;
 }
 
+export interface ContinuationContextConfig {
+  searchEnabled: boolean;
+  summarizationEnabled: boolean;
+}
+
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
@@ -239,6 +251,7 @@ export interface ServiceConfig {
   writeback: WritebackConfig;
   github: GitHubConfig;
   reviewLoop: ReviewLoopConfig;
+  continuationContext: ContinuationContextConfig;
   raw: RawWorkflowConfig;
 }
 
@@ -415,6 +428,10 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
       maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
       continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
+    },
+    continuationContext: {
+      searchEnabled: raw.continuation_context?.search_enabled ?? false,
+      summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
     },
     raw,
   };

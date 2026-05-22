@@ -36,6 +36,8 @@ Dogfood dispatch is opt-in. The reference `WORKFLOW.md` requires `dogfood-ready`
 
 All issues in the dogfood epic remain `Backlog` with `dogfood-blocked` until an operator manually promotes exactly the next issue intended for dispatch.
 
+Continuation search and richer summarization are roadmap placeholders only. Their feature flags default off, doctor warns if an operator enables them before implementation, and their placeholder Linear issues stay `Backlog` with `dogfood-blocked` and without `dogfood-ready`.
+
 Protected areas require human implementation until guardrails and the smoke checkpoint are proven:
 
 - `WORKFLOW.md`

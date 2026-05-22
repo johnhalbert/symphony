@@ -8,6 +8,8 @@ Keep `ENG-*` child issues in `Backlog` until their blockers clear and an operato
 
 All child issues in this epic remain `Backlog` with `dogfood-blocked` until manually promoted. Remove `dogfood-blocked` and add `dogfood-ready` only as part of an intentional operator promotion.
 
+Roadmap placeholder issues for continuation search or richer summarization stay `Backlog` with `dogfood-blocked`. Do not add `dogfood-ready` to those placeholders until the issue includes a concrete implementation path beyond interfaces, configuration flags, or docs.
+
 Do not run Symphony against the Engineering project before the gate work lands.
 
 ## 2. Verify The Linear Contract
@@ -63,6 +65,8 @@ Set `LINEAR_API_KEY`, `CURSOR_API_KEY`, and `SYMPHONY_OPEN_WORKSPACE_TOKEN` as n
 
 Doctor verifies workflow parsing, writable workspace paths, git availability, Cursor baseline model configuration, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, completion-report/review-verdict MCP tool availability, candidate isolation, and current Linear candidates.
 
+Doctor also warns when `continuation_context.search_enabled` or `continuation_context.summarization_enabled` is enabled while those capabilities remain roadmap placeholders. The warning is intentional and does not imply Symphony can search, summarize, poll, or dispatch placeholder work.
+
 ## 5. Promotion Policy
 
 Promote through `Backlog -> Todo`. Do not move issues directly to `In Progress` for dispatch, because `Todo` preserves blocker checks.
@@ -74,6 +78,7 @@ Before promotion, verify:
 - The issue has `dogfood-ready`.
 - The issue does not have `dogfood-blocked` or `safety-blocked`.
 - The issue does not touch protected paths unless a human is implementing it manually.
+- The issue is not a continuation search or richer summarization placeholder that should remain `Backlog` with `dogfood-blocked`.
 
 Gate issues such as orchestrator, config, workflow, Linear integration, and dogfood safety docs remain human-implemented until the smoke checkpoint passes.
 

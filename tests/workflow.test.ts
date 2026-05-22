@@ -46,6 +46,10 @@ Work on {{ issue.identifier }}.`,
       apiBaseUrl: "https://api.github.com",
       publishPullRequests: false,
     });
+    expect(config.continuationContext).toEqual({
+      searchEnabled: false,
+      summarizationEnabled: false,
+    });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
   });
 
@@ -80,6 +84,10 @@ Work on {{ issue.identifier }}.`,
           max_incomplete_turns: 2,
           continuation_history_threshold: 7,
         },
+        continuation_context: {
+          search_enabled: true,
+          summarization_enabled: true,
+        },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
@@ -103,6 +111,10 @@ Work on {{ issue.identifier }}.`,
       maxReviewRounds: 4,
       maxIncompleteTurns: 2,
       continuationHistoryThreshold: 7,
+    });
+    expect(config.continuationContext).toEqual({
+      searchEnabled: true,
+      summarizationEnabled: true,
     });
   });
 

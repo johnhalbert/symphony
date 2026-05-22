@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { reviewLoopDoctorChecks } from "../src/doctor.js";
+import { continuationContextDoctorChecks, reviewLoopDoctorChecks } from "../src/doctor.js";
 import { testConfig } from "./helpers.js";
 
 describe("doctor review-loop checks", () => {
@@ -161,5 +161,32 @@ describe("doctor review-loop checks", () => {
       status: "warn",
       message: "Could not verify Linear review-loop state availability: Linear API unavailable",
     });
+  });
+
+  it("warns when continuation context placeholder flags are enabled", () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.continuationContext.searchEnabled = true;
+    config.continuationContext.summarizationEnabled = true;
+
+    expect(continuationContextDoctorChecks(config)).toEqual([
+      {
+        id: "continuation_context.search",
+        status: "warn",
+        message:
+          "continuation_context.search_enabled is enabled, but search is not_implemented; keep roadmap issues in Backlog with dogfood-blocked and without dogfood-ready until a concrete implementation lands",
+      },
+      {
+        id: "continuation_context.summarization",
+        status: "warn",
+        message:
+          "continuation_context.summarization_enabled is enabled, but summarization is not_implemented; keep roadmap issues in Backlog with dogfood-blocked and without dogfood-ready until a concrete implementation lands",
+      },
+    ]);
+  });
+
+  it("does not warn for default-off continuation context placeholder flags", () => {
+    const config = testConfig("/tmp/symphony-doctor");
+
+    expect(continuationContextDoctorChecks(config)).toEqual([]);
   });
 });
