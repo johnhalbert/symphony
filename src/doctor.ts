@@ -10,6 +10,7 @@ import { errorMessage } from "./core/errors.js";
 import type { ServiceConfig } from "./core/config/Config.js";
 import { COMPLETION_REPORT_TOOL_NAME } from "./core/harness/CompletionReportMcpServer.js";
 import { REVIEW_VERDICT_TOOL_NAME } from "./core/harness/ReviewVerdictMcpServer.js";
+import { CONTINUATION_CONTEXT_ROADMAP } from "./core/summarization/ContinuationContextRoadmap.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -75,6 +76,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
           : "No handoff_states configured",
     });
     checks.push(...(await reviewLoopDoctorChecks(config, { workflowPath })));
+    checks.push(...continuationContextDoctorChecks(config));
 
     await checkWritable(checks, "workspace.root", config.workspace.root);
     await checkWritable(checks, "workspace.state_dir", config.workspace.stateDir);
@@ -113,6 +115,27 @@ export function formatDoctorResult(result: DoctorResult): string {
   return result.checks
     .map((check) => `[${check.status.toUpperCase()}] ${check.id}: ${check.message}`)
     .join("\n");
+}
+
+export function continuationContextDoctorChecks(config: ServiceConfig): DoctorCheck[] {
+  const checks: DoctorCheck[] = [];
+  const enabled = [
+    { configKey: "searchEnabled" as const, roadmap: CONTINUATION_CONTEXT_ROADMAP.search },
+    { configKey: "summarizationEnabled" as const, roadmap: CONTINUATION_CONTEXT_ROADMAP.summarization },
+  ];
+
+  for (const item of enabled) {
+    if (!config.continuationContext[item.configKey]) continue;
+    checks.push({
+      id: `continuation_context.${item.roadmap.capability}`,
+      status: "warn",
+      message:
+        `${item.roadmap.flag} is enabled, but ${item.roadmap.capability} is ${item.roadmap.implementationStatus}; ` +
+        "keep roadmap issues in Backlog with dogfood-blocked and without dogfood-ready until a concrete implementation lands",
+    });
+  }
+
+  return checks;
 }
 
 function hasBaselineCursorModel(model: string, modelParams: Array<{ id: string; value: string }>): boolean {
