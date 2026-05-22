@@ -1,8 +1,89 @@
 import { describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
-import { buildMcpSubprocessEnvironment } from "../src/core/harness/McpSubprocessEnvironment.js";
+import {
+  buildMcpCliSpawnArgs,
+  buildMcpSubprocessEnvironment,
+  buildMcpSubprocessServerConfig,
+  shouldIncludeNodeExecArgv,
+} from "../src/core/harness/McpSubprocessEnvironment.js";
 
 describe("MCP subprocess environment", () => {
+  it("includes Node execArgv for TypeScript CLI entrypoints only", () => {
+    expect(shouldIncludeNodeExecArgv("/repo/src/cli.ts")).toBe(true);
+    expect(shouldIncludeNodeExecArgv("/repo/src/cli.tsx")).toBe(true);
+    expect(shouldIncludeNodeExecArgv("/repo/dist/cli.js")).toBe(false);
+
+    expect(
+      buildMcpCliSpawnArgs({
+        cliPath: "/repo/src/cli.ts",
+        command: "completion-report-mcp",
+        workflowPath: "/repo/WORKFLOW.md",
+        contextFile: "/tmp/context.json",
+        execArgv: ["--import", "tsx"],
+      }),
+    ).toEqual([
+      "--import",
+      "tsx",
+      "/repo/src/cli.ts",
+      "completion-report-mcp",
+      "--workflow",
+      "/repo/WORKFLOW.md",
+      "--context-file",
+      "/tmp/context.json",
+    ]);
+    expect(
+      buildMcpCliSpawnArgs({
+        cliPath: "/repo/dist/cli.js",
+        command: "completion-report-mcp",
+        workflowPath: "/repo/WORKFLOW.md",
+        contextFile: "/tmp/context.json",
+        execArgv: ["--import", "tsx"],
+      }),
+    ).toEqual([
+      "/repo/dist/cli.js",
+      "completion-report-mcp",
+      "--workflow",
+      "/repo/WORKFLOW.md",
+      "--context-file",
+      "/tmp/context.json",
+    ]);
+  });
+
+  it("builds MCP server configs with an explicit cliPath and env key slice", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        workspace: { root: "/workspaces" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+
+    const server = buildMcpSubprocessServerConfig({
+      config,
+      command: "review-verdict-mcp",
+      cliPath: "/repo/dist/cli.js",
+      workflowPath: "/repo/WORKFLOW.md",
+      contextFile: "/tmp/review-context.json",
+      execArgv: ["--import", "tsx"],
+    });
+
+    expect(server).toMatchObject({
+      type: "stdio",
+      command: process.execPath,
+      env: { LINEAR_API_KEY: "linear-secret" },
+    });
+    expect(server.cwd).toBe(config.workflowDir);
+    expect(server.args).toEqual([
+      "/repo/dist/cli.js",
+      "review-verdict-mcp",
+      "--workflow",
+      "/repo/WORKFLOW.md",
+      "--context-file",
+      "/tmp/review-context.json",
+    ]);
+  });
+
   it("keeps worker publication disabled env to runtime baseline and closed parse dependencies", () => {
     const config = parseServiceConfig(
       {

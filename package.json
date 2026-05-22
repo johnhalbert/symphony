@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "doctor": "tsx src/cli.ts doctor",
     "dev": "tsx src/cli.ts",
+    "smoke:mcp-exposure": "tsx scripts/mcp-tool-exposure-probe.ts",
     "smoke:sdk-local": "tsx scripts/sdk-local-smoke.ts",
     "test": "vitest run",
     "test:watch": "vitest",

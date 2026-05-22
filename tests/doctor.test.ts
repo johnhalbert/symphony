@@ -127,6 +127,24 @@ describe("doctor review-loop checks", () => {
     });
   });
 
+  it("reports missing explicit cliPath for default MCP exposure checks", async () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+
+    const checks = await reviewLoopDoctorChecks(config, {
+      workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
+      linearStateLister: async () => [linearTeam(["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"])],
+    });
+
+    expect(checks).toContainEqual({
+      id: "review_loop.mcp_tools",
+      status: "error",
+      message: "Configured Cursor CLI could not list review-loop MCP tools: missing explicit cliPath",
+    });
+  });
+
   it("errors when configured review pass state is absent from Linear workflow states", async () => {
     const config = testConfig("/tmp/symphony-doctor");
     config.tracker.handoffStates = ["In Review"];

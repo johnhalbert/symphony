@@ -3,6 +3,29 @@ import type { AgentRunRole } from "../types.js";
 
 export type McpSubprocessCommand = "completion-report-mcp" | "review-verdict-mcp" | "review-feedback-mcp";
 
+export interface McpCliSpawnArgsInput {
+  cliPath: string;
+  command: McpSubprocessCommand;
+  workflowPath: string;
+  contextFile: string;
+  execArgv?: string[];
+}
+
+export interface McpSubprocessServerConfigInput extends McpSubprocessEnvironmentInput {
+  cliPath: string;
+  workflowPath: string;
+  contextFile: string;
+  execArgv?: string[];
+}
+
+export interface McpSubprocessServerConfig {
+  type: "stdio";
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+}
+
 export interface McpSubprocessEnvironmentInput {
   config: ServiceConfig;
   command: McpSubprocessCommand;
@@ -36,6 +59,33 @@ export function buildMcpSubprocessEnvironment(input: McpSubprocessEnvironmentInp
   addRequiredParseDependencies(env, input.config);
   addCommandCapabilitySlice(env, input.config, input.command);
   return env;
+}
+
+export function buildMcpCliSpawnArgs(input: McpCliSpawnArgsInput): string[] {
+  const execArgv = shouldIncludeNodeExecArgv(input.cliPath) ? (input.execArgv ?? process.execArgv) : [];
+  return [
+    ...execArgv,
+    input.cliPath,
+    input.command,
+    "--workflow",
+    input.workflowPath,
+    "--context-file",
+    input.contextFile,
+  ];
+}
+
+export function buildMcpSubprocessServerConfig(input: McpSubprocessServerConfigInput): McpSubprocessServerConfig {
+  return {
+    type: "stdio",
+    command: process.execPath,
+    args: buildMcpCliSpawnArgs(input),
+    cwd: input.config.workflowDir,
+    env: buildMcpSubprocessEnvironment(input),
+  };
+}
+
+export function shouldIncludeNodeExecArgv(cliPath: string): boolean {
+  return /\.(?:c|m)?tsx?$/i.test(cliPath);
 }
 
 function addRuntimeBaseline(env: Record<string, string>, parentEnv: NodeJS.ProcessEnv): void {
