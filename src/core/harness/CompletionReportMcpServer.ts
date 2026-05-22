@@ -69,7 +69,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       workspace: loadedContext.workspace,
       phase: loadedContext.phase,
     };
-    const result = await service.submit_completion_report(input, context);
+    const result = await service.submit_completion_report(completionReportInputFromMcp(input, context), context);
     return {
       accepted: result.accepted,
       replayed: result.replayed,
@@ -145,8 +145,6 @@ function completionReportInputSchema(): Record<string, unknown> {
     type: "object",
     additionalProperties: false,
     required: [
-      "runId",
-      "issueId",
       "summary",
       "validationEvidence",
       "acceptanceChecklist",
@@ -157,27 +155,46 @@ function completionReportInputSchema(): Record<string, unknown> {
       "idempotencyKey",
     ],
     properties: {
-      runId: { type: "string", minLength: 1 },
-      issueId: { type: "string", minLength: 1 },
-      summary: { type: "string", minLength: 1 },
-      validationEvidence: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+      summary: {
+        type: "string",
+        minLength: 1,
+        description: "Concise summary of the implementation completed in the active worker run.",
+      },
+      validationEvidence: {
+        type: "array",
+        minItems: 1,
+        description: "Commands, checks, or manual verification performed before handoff.",
+        items: { type: "string", minLength: 1 },
+      },
       acceptanceChecklist: {
         type: "array",
         minItems: 1,
+        description: "One item per acceptance criterion, including whether it is satisfied and the supporting evidence.",
         items: {
           type: "object",
           additionalProperties: false,
           required: ["text", "satisfied", "evidence"],
           properties: {
-            text: { type: "string", minLength: 1 },
-            satisfied: { type: "boolean" },
-            evidence: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
+            text: { type: "string", minLength: 1, description: "Acceptance criterion text." },
+            satisfied: { type: "boolean", description: "Whether the implementation satisfies this criterion." },
+            evidence: {
+              description: "Specific proof for the status, or null when no durable evidence is available.",
+              anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+            },
           },
         },
       },
-      changedFiles: { type: "array", items: { type: "string", minLength: 1 } },
-      branchName: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
+      changedFiles: {
+        type: "array",
+        description: "Files materially changed by the worker run.",
+        items: { type: "string", minLength: 1 },
+      },
+      branchName: {
+        description: "Current implementation branch, or null if no branch is available.",
+        anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+      },
       pullRequest: {
+        description: "Existing pull request reference if one is already known; otherwise null.",
         anyOf: [
           { type: "null" },
           {
@@ -185,17 +202,46 @@ function completionReportInputSchema(): Record<string, unknown> {
             additionalProperties: false,
             required: ["url", "number"],
             properties: {
-              url: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
-              number: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
-              headSha: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
-              branch: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
+              url: {
+                description: "Pull request URL, or null when absent.",
+                anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+              },
+              number: {
+                description: "Pull request number, or null when absent.",
+                anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }],
+              },
+              headSha: {
+                description: "Current pull request head SHA, or null when unknown.",
+                anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+              },
+              branch: {
+                description: "Pull request head branch, or null when unknown.",
+                anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+              },
             },
           },
         ],
       },
-      risks: { type: "array", items: { type: "string", minLength: 1 } },
-      idempotencyKey: { type: "string", minLength: 1 },
+      risks: {
+        type: "array",
+        description: "Known risks, limitations, or follow-up concerns; use an empty array when none are known.",
+        items: { type: "string", minLength: 1 },
+      },
+      idempotencyKey: {
+        type: "string",
+        minLength: 1,
+        description: "Stable unique key for this completion report so retries are safe.",
+      },
     },
+  };
+}
+
+function completionReportInputFromMcp(input: unknown, context: CompletionReportActiveContext): unknown {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return input;
+  return {
+    ...input,
+    runId: context.activeRunId,
+    issueId: context.issue.id,
   };
 }
 
