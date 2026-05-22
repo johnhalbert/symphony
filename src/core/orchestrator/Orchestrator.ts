@@ -14,6 +14,7 @@ import {
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
   type IssueLifecycleStore,
+  type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import {
   formatWorkerReviewEvidencePrompt,
@@ -23,6 +24,7 @@ import {
 import { formatWorkerReviewVerdictPrompt } from "../ReviewVerdictService.js";
 import type { WritebackProcessor } from "../writeback/WritebackOutbox.js";
 import {
+  planBlockedEscalationWritebacks,
   planDispatchWriteback,
   planRunCancelledComment,
   planRunFailedComment,
@@ -444,6 +446,7 @@ export class Orchestrator {
     if (!issue.assignedToWorker) return false;
     if (isStateIn(issue.state, this.config.tracker.handoffStates)) return false;
     if (isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
     if (!isStateIn(issue.state, this.config.tracker.activeStates)) return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
     if (!this.passesLabelGuardrails(issue)) return false;
@@ -465,6 +468,49 @@ export class Orchestrator {
     return this.hasStateSlot(issue.state);
   }
 
+  private async lifecycleAllowsDispatch(issue: Issue, role: AgentRunRole): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    if (!store) return true;
+    const lifecycle = await store.get(issue.id);
+    if (!lifecycle) return true;
+
+    const phase = phaseForIssueState(issue.state, this.config);
+    const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
+    if (blockedByLifecycle) {
+      if (this.config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
+        return false;
+      }
+      await store.updateIssue(issue, {
+        phase,
+        reviewRound: 0,
+        incompleteTurnCount: 0,
+        blockedReason: null,
+      });
+      return true;
+    }
+
+    if (role === "worker" && lifecycle.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns) {
+      await this.escalateLifecycleBlocked(
+        issue,
+        lifecycle,
+        lifecycle.summaryPointers.lastRunId ?? issue.id,
+        `max incomplete turns reached (${lifecycle.incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
+      );
+      return false;
+    }
+    if (role === "reviewer" && lifecycle.reviewRound >= this.config.reviewLoop.maxReviewRounds) {
+      await this.escalateLifecycleBlocked(
+        issue,
+        lifecycle,
+        lifecycle.summaryPointers.lastRunId ?? issue.id,
+        `max review rounds reached (${lifecycle.reviewRound}/${this.config.reviewLoop.maxReviewRounds})`,
+      );
+      return false;
+    }
+
+    return true;
+  }
+
   private passesLabelGuardrails(issue: Issue): boolean {
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
     if (this.config.agent.requireLabels.some((label) => !labels.has(label))) return false;
@@ -475,6 +521,7 @@ export class Orchestrator {
   private async tryDispatchWorkerIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (!this.shouldDispatchWorker(issue, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(issue, "worker"))) return false;
 
     let refreshed: Issue[];
     try {
@@ -492,6 +539,7 @@ export class Orchestrator {
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
     if (!this.shouldDispatchWorker(latest, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(latest, "worker"))) return false;
 
     const dispatchWriteback = planDispatchWriteback(latest, this.config);
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
@@ -500,6 +548,7 @@ export class Orchestrator {
       : latest;
     if (!afterWriteback) return false;
     if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker"))) return false;
 
     this.dispatchIssue(afterWriteback, attempt, "worker", null);
     return true;
@@ -508,6 +557,7 @@ export class Orchestrator {
   private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(issue, "reviewer"))) return false;
 
     let refreshed: Issue[];
     try {
@@ -525,6 +575,7 @@ export class Orchestrator {
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
     if (!this.shouldDispatchReviewer(latest, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(latest, "reviewer"))) return false;
 
     const reviewEvidence = await this.loadReviewerDispatchEvidence(latest);
     if (!reviewEvidence) return false;
@@ -616,6 +667,7 @@ export class Orchestrator {
           turnNumber,
         });
         if (entry.completionReportAccepted) break;
+        if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) break;
 
         const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
         const latest = refreshed[0];
@@ -656,7 +708,6 @@ export class Orchestrator {
       entry.workspace = workspace;
       await this.updateLifecycle(entry, {
         phase: "review",
-        reviewRound: evidence.lifecycle.reviewRound + 1,
         summaryPointers: {
           workspaceKey: workspace.workspaceKey,
           workspacePath: workspace.path,
@@ -800,6 +851,10 @@ export class Orchestrator {
         return;
       }
       if (await this.reconcileCompletionReportHandoff(entry)) {
+        this.claimed.delete(issueId);
+        return;
+      }
+      if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) {
         this.claimed.delete(issueId);
         return;
       }
@@ -1022,8 +1077,97 @@ export class Orchestrator {
   private async recordIncompleteTurn(entry: RunningEntry): Promise<void> {
     const store = this.options.lifecycleStore;
     if (!store) return;
+    const refreshed = await this.refreshEntryIssue(entry, "incomplete turn refresh");
+    if (!refreshed || !this.isImplementationActive(entry.issue)) {
+      await this.updateLifecycle(entry, { phase: phaseForIssueState(entry.issue.state, this.config) });
+      return;
+    }
+
     const incompleteTurnCount = (entry.lifecycle?.incompleteTurnCount ?? 0) + 1;
-    await this.updateLifecycle(entry, { incompleteTurnCount });
+    await this.updateLifecycle(entry, {
+      phase: "implementation",
+      incompleteTurnCount,
+    });
+    if (incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns && entry.lifecycle) {
+      await this.escalateEntryBlocked(
+        entry,
+        `max incomplete turns reached (${incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
+      );
+    }
+  }
+
+  private async refreshEntryIssue(entry: RunningEntry, reason: string): Promise<boolean> {
+    try {
+      const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
+      const latest = refreshed[0];
+      if (!latest) return false;
+      entry.issue = latest;
+      return true;
+    } catch (error) {
+      this.options.logger.warn(reason, {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        error: errorMessage(error),
+      });
+      return true;
+    }
+  }
+
+  private isImplementationActive(issue: Issue): boolean {
+    return (
+      issue.assignedToWorker &&
+      isStateIn(issue.state, this.config.tracker.activeStates) &&
+      !isStateIn(issue.state, this.config.tracker.handoffStates) &&
+      !isStateIn(issue.state, this.config.reviewLoop.reviewStates) &&
+      !isStateIn(issue.state, this.config.reviewLoop.blockedStates) &&
+      !isStateIn(issue.state, this.config.tracker.terminalStates)
+    );
+  }
+
+  private async escalateEntryBlocked(entry: RunningEntry, reason: string): Promise<void> {
+    const lifecycle = entry.lifecycle ?? (await this.options.lifecycleStore?.get(entry.issue.id));
+    if (!lifecycle) return;
+    entry.lifecycle = await this.escalateLifecycleBlocked(
+      entry.issue,
+      lifecycle,
+      entry.activeRunId ?? entry.runId ?? entry.issue.id,
+      reason,
+    );
+  }
+
+  private async escalateLifecycleBlocked(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    runId: string,
+    reason: string,
+  ): Promise<IssueLifecycleRecord> {
+    const store = this.options.lifecycleStore;
+    const blockedLifecycle = store
+      ? await store.updateIssue(issue, {
+          phase: "blocked",
+          blockedReason: reason,
+        })
+      : lifecycle;
+    await this.applyWritebacks(
+      planBlockedEscalationWritebacks(
+        {
+          issue,
+          runId,
+          reason,
+          incompleteTurnCount: blockedLifecycle.incompleteTurnCount,
+          maxIncompleteTurns: this.config.reviewLoop.maxIncompleteTurns,
+          reviewRound: blockedLifecycle.reviewRound,
+          maxReviewRounds: this.config.reviewLoop.maxReviewRounds,
+          lastCompletionReport: latestCompletionReport(blockedLifecycle),
+          lastReviewVerdict: latestReviewVerdict(blockedLifecycle),
+          requiredAction:
+            "Inspect the latest run output and reviewer feedback, then move the issue out of the blocked state when Symphony should try again.",
+        },
+        this.config,
+      ),
+      "blocked escalation",
+    );
+    return blockedLifecycle;
   }
 
   private async reconcileCompletionReportHandoff(entry: RunningEntry): Promise<boolean> {
@@ -1251,6 +1395,14 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletio
     if (exact) return exact;
   }
   return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
+}
+
+function latestReviewVerdict(lifecycle: IssueLifecycleRecord): IssueReviewVerdictRecord | null {
+  if (lifecycle.lastReviewVerdictId) {
+    const exact = lifecycle.reviewVerdicts.find((verdict) => verdict.id === lifecycle.lastReviewVerdictId);
+    if (exact) return exact;
+  }
+  return lifecycle.reviewVerdicts[lifecycle.reviewVerdicts.length - 1] ?? null;
 }
 
 function acceptanceCriteriaForReport(report: IssueCompletionReportRecord): string[] {
