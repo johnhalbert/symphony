@@ -78,6 +78,36 @@ The status API exposes token-protected workspace opening, pause, resume, and can
 
 During early dogfood, run a single Symphony process and keep `max_concurrent_agents: 1`.
 
+## Credential Profiles
+
+Symphony supports optional named credential profiles as a config-only foundation for future least-privilege execution. Profiles must point at environment variables; do not put secret material directly in workflow config.
+
+```yaml
+credential_profiles:
+  profiles:
+    github-read:
+      value: $GITHUB_READ_TOKEN
+      capabilities:
+        - github.discovery
+        - github.review_evidence_read
+    github-publish:
+      value: $GITHUB_PUBLISH_TOKEN
+      capabilities:
+        - github.publication
+  roles:
+    worker:
+      github.discovery: github-read
+      github.publication: github-publish
+    reviewer:
+      github.review_evidence_read: github-read
+```
+
+The closed capability inventory is `github.discovery`, `github.publication`, `github.review_evidence_read`, `github.review_feedback_write`, `linear.tracker`, `linear.writeback`, `cursor.runtime`, and `server.open_workspace`. `github.review_feedback_write` is reserved for a future reviewer feedback implementation and has no current consumer.
+
+When `credential_profiles` is absent, current behavior is unchanged. GitHub capabilities fall back to `github.token` or `GITHUB_TOKEN`; both Linear capabilities fall back to `tracker.api_key` or `LINEAR_API_KEY`; `cursor.runtime` falls back to env-only `CURSOR_API_KEY`; and `server.open_workspace` falls back only to `server.open_workspace_token`. Workflow config may still point `server.open_workspace_token` at `SYMPHONY_OPEN_WORKSPACE_TOKEN`.
+
+Default role capability sets are intentionally narrow: workers use GitHub discovery/publication, Linear tracker/writeback, Cursor runtime, and workspace-open credentials; reviewers use GitHub review-evidence read, Linear tracker/writeback, and Cursor runtime. MCP context `token` and `expectedToken` fields in completion-report and review-verdict handoff files are local handoff authentication, not GitHub, Linear, Cursor, or server credentials, and must not be modeled as credential profiles.
+
 ## Cursor Runtime
 
 The current baseline model is `gpt-5.5` with thinking effort `xhigh`. This applies to direct Cursor work now and Symphony-managed workers later.
