@@ -29,4 +29,24 @@ realSmoke("real integration smoke tests", () => {
     const client = new LinearTrackerClient(config.tracker);
     await expect(client.fetchCandidateIssues()).resolves.toEqual(expect.any(Array));
   });
+
+  it("can fetch Linear project workflow states with LINEAR_API_KEY and LINEAR_PROJECT_SLUG", async () => {
+    expect(process.env.LINEAR_API_KEY, "LINEAR_API_KEY is required").toBeTruthy();
+    expect(process.env.LINEAR_PROJECT_SLUG, "LINEAR_PROJECT_SLUG is required").toBeTruthy();
+    const config = parseServiceConfig(
+      {
+        tracker: {
+          kind: "linear",
+          api_key: "$LINEAR_API_KEY",
+          project_slug: process.env.LINEAR_PROJECT_SLUG,
+        },
+      },
+      `${process.cwd()}/WORKFLOW.md`,
+    );
+    const client = new LinearTrackerClient(config.tracker);
+    const teams = await client.fetchWorkflowStatesByTeam();
+    expect(teams.length).toBeGreaterThan(0);
+    expect(teams[0]?.teamKey).toEqual(expect.any(String));
+    await expect(client.fetchWorkflowStateNames()).resolves.toEqual(expect.any(Array));
+  });
 });

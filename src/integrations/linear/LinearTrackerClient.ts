@@ -16,6 +16,16 @@ interface LinearPageInfo {
   endCursor: string | null;
 }
 
+interface LinearPageInfoNode {
+  hasNextPage?: unknown;
+  endCursor?: unknown;
+}
+
+interface LinearConnection<T> {
+  nodes?: T[];
+  pageInfo?: LinearPageInfoNode | null;
+}
+
 interface LinearRelationNode {
   type?: unknown;
   issue?: {
@@ -54,6 +64,19 @@ interface LinearWorkflowStateNode {
   name?: unknown;
 }
 
+interface LinearWorkflowTeamNode {
+  id?: unknown;
+  key?: unknown;
+  name?: unknown;
+  states?: LinearConnection<LinearWorkflowStateNode> | null;
+}
+
+interface LinearWorkflowTeamDescriptor {
+  teamId: string;
+  teamKey: string;
+  teamName: string | null;
+}
+
 interface LinearIssueWriteContext {
   id?: unknown;
   identifier?: unknown;
@@ -64,6 +87,13 @@ interface LinearIssueWriteContext {
 
 export interface AssigneeFilter {
   matchValues: Set<string>;
+}
+
+export interface LinearWorkflowTeamStates {
+  teamId: string;
+  teamKey: string;
+  teamName: string | null;
+  states: string[];
 }
 
 const ISSUE_FIELDS = `
@@ -155,14 +185,43 @@ const ISSUE_WRITE_CONTEXT_QUERY = `
 `;
 
 const PROJECT_WORKFLOW_STATES_QUERY = `
-  query SymphonyProjectWorkflowStates($projectSlug: String!) {
-    projects(filter: { slugId: { eq: $projectSlug } }) {
+  query SymphonyProjectWorkflowStates($projectSlug: String!, $teamsAfter: String) {
+    projects(first: 1, filter: { slugId: { eq: $projectSlug } }) {
       nodes {
-        teams {
+        id
+        name
+        teams(first: 25, after: $teamsAfter) {
           nodes {
-            states { nodes { id name } }
+            id
+            key
+            name
+            states(first: 100) {
+              nodes {
+                id
+                name
+              }
+              pageInfo { hasNextPage endCursor }
+            }
           }
+          pageInfo { hasNextPage endCursor }
         }
+      }
+    }
+  }
+`;
+
+const TEAM_WORKFLOW_STATES_QUERY = `
+  query SymphonyTeamWorkflowStates($teamId: String!, $statesAfter: String) {
+    team(id: $teamId) {
+      id
+      key
+      name
+      states(first: 100, after: $statesAfter) {
+        nodes {
+          id
+          name
+        }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
@@ -223,20 +282,57 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       .filter((issue): issue is Issue => issue !== null);
   }
 
+  async fetchWorkflowStatesByTeam(): Promise<LinearWorkflowTeamStates[]> {
+    const results: LinearWorkflowTeamStates[] = [];
+    let teamsAfter: string | null = null;
+
+    do {
+      const response = await this.graphql<{
+        projects: {
+          nodes: Array<{
+            id?: unknown;
+            name?: unknown;
+            teams?: LinearConnection<LinearWorkflowTeamNode> | null;
+          }>;
+        };
+      }>(PROJECT_WORKFLOW_STATES_QUERY, {
+        projectSlug: this.config.projectSlug,
+        teamsAfter,
+      });
+      const projects = response.projects.nodes;
+      if (projects.length === 0) {
+        throw new SymphonyError("tracker_error", `Linear project not found for slug ${this.config.projectSlug}`);
+      }
+
+      const project = projects[0];
+      const teamConnection = project?.teams;
+      const teams = teamConnection?.nodes;
+      if (!Array.isArray(teams)) {
+        throw new SymphonyError("tracker_error", `Linear project ${this.config.projectSlug} teams are missing from response`);
+      }
+
+      for (const teamNode of teams) {
+        const team = this.normalizeWorkflowTeam(teamNode);
+        results.push({
+          ...team,
+          states: await this.fetchCompleteWorkflowStateNamesForTeam(team, teamNode.states),
+        });
+      }
+
+      const pageInfo = normalizePageInfo(teamConnection?.pageInfo, `Linear project ${this.config.projectSlug} teams`);
+      teamsAfter = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+    } while (teamsAfter);
+
+    if (results.length === 0) {
+      throw new SymphonyError("tracker_error", `Linear project ${this.config.projectSlug} has no teams`);
+    }
+
+    return results;
+  }
+
   async fetchWorkflowStateNames(): Promise<string[]> {
-    const response = await this.graphql<{
-      projects: {
-        nodes: Array<{
-          teams?: { nodes?: Array<{ states?: { nodes?: LinearWorkflowStateNode[] } }> } | null;
-        }>;
-      };
-    }>(PROJECT_WORKFLOW_STATES_QUERY, {
-      projectSlug: this.config.projectSlug,
-    });
-    const states = response.projects.nodes.flatMap((project) =>
-      (project.teams?.nodes ?? []).flatMap((team) => (team.states?.nodes ?? []).map((state) => asString(state.name))),
-    );
-    return uniqueStrings(states.filter((state): state is string => state !== null));
+    const teams = await this.fetchWorkflowStatesByTeam();
+    return uniqueStrings(teams.flatMap((team) => team.states));
   }
 
   async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
@@ -337,6 +433,52 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     return response.issue;
   }
 
+  private normalizeWorkflowTeam(team: LinearWorkflowTeamNode): LinearWorkflowTeamDescriptor {
+    const teamId = asString(team.id);
+    const teamKey = asString(team.key);
+    const teamName = asNullableString(team.name);
+    if (!teamId || !teamKey) {
+      throw new SymphonyError("tracker_error", `Linear project ${this.config.projectSlug} includes a team without id/key`);
+    }
+    return { teamId, teamKey, teamName };
+  }
+
+  private async fetchCompleteWorkflowStateNamesForTeam(
+    team: LinearWorkflowTeamDescriptor,
+    initialConnection: LinearConnection<LinearWorkflowStateNode> | null | undefined,
+  ): Promise<string[]> {
+    const states: string[] = [];
+    let connection = initialConnection;
+    let statesAfter: string | null = null;
+
+    do {
+      const stateNodes = connection?.nodes;
+      if (!Array.isArray(stateNodes)) {
+        throw new SymphonyError("tracker_error", `Linear team ${formatTeam(team.teamKey, team.teamName)} workflow states are missing from response`);
+      }
+
+      states.push(...stateNodes.map((state) => asString(state.name)).filter((state): state is string => state !== null));
+      const pageInfo = normalizePageInfo(connection?.pageInfo, `Linear team ${formatTeam(team.teamKey, team.teamName)} workflow states`);
+      statesAfter = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+      if (statesAfter) {
+        const response = await this.graphql<{ team?: LinearWorkflowTeamNode | null }>(TEAM_WORKFLOW_STATES_QUERY, {
+          teamId: team.teamId,
+          statesAfter,
+        });
+        if (!response.team) {
+          throw new SymphonyError("tracker_error", `Linear team ${formatTeam(team.teamKey, team.teamName)} not found while paginating workflow states`);
+        }
+        connection = response.team.states;
+      }
+    } while (statesAfter);
+
+    const uniqueStates = uniqueStrings(states);
+    if (uniqueStates.length === 0) {
+      throw new SymphonyError("tracker_error", `Linear team ${formatTeam(team.teamKey, team.teamName)} has no workflow states`);
+    }
+    return uniqueStates;
+  }
+
   private async graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
     const response = await this.fetchImpl(this.config.endpoint, {
       method: "POST",
@@ -418,6 +560,24 @@ function asNullableString(value: unknown): string | null {
 
 function sameName(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function formatTeam(teamKey: string, teamName: string | null): string {
+  return teamName ? `${teamName} (${teamKey})` : teamKey;
+}
+
+function normalizePageInfo(pageInfo: LinearPageInfoNode | null | undefined, subject: string): LinearPageInfo {
+  if (
+    !pageInfo ||
+    typeof pageInfo.hasNextPage !== "boolean" ||
+    !(typeof pageInfo.endCursor === "string" || pageInfo.endCursor === null)
+  ) {
+    throw new SymphonyError("tracker_error", `${subject} pagination metadata is missing from response`);
+  }
+  if (pageInfo.hasNextPage && !pageInfo.endCursor) {
+    throw new SymphonyError("tracker_error", `${subject} pagination reported next page without endCursor`);
+  }
+  return { hasNextPage: pageInfo.hasNextPage, endCursor: pageInfo.endCursor };
 }
 
 function uniqueStrings(values: string[]): string[] {

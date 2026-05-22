@@ -84,7 +84,7 @@ describe("LinearTrackerClient", () => {
     expect(issues.map((item) => item.identifier)).toEqual(["T-1", "T-2"]);
   });
 
-  it("fetches unique project workflow state names for doctor validation", async () => {
+  it("fetches bounded project workflow states with team identity", async () => {
     const config = testConfig("/tmp/symphony");
     const requests: unknown[] = [];
     const fetchImpl: typeof fetch = async (_url, init) => {
@@ -94,26 +94,37 @@ describe("LinearTrackerClient", () => {
           projects: {
             nodes: [
               {
+                id: "project-1",
+                name: "Test Project",
                 teams: {
                   nodes: [
                     {
+                      id: "team-eng",
+                      key: "ENG",
+                      name: "Engineering",
                       states: {
                         nodes: [
                           { id: "todo", name: "Todo" },
                           { id: "review", name: "In Review" },
+                          { id: "review-duplicate", name: "In Review" },
                         ],
+                        pageInfo: pageInfo(),
                       },
                     },
                     {
+                      id: "team-ops",
+                      key: "OPS",
+                      name: null,
                       states: {
                         nodes: [
-                          { id: "review-duplicate", name: "In Review" },
                           { id: "blocked", name: "Blocked" },
                           { id: "pass", name: "Ready to Merge" },
                         ],
+                        pageInfo: pageInfo(),
                       },
                     },
                   ],
+                  pageInfo: pageInfo(),
                 },
               },
             ],
@@ -124,13 +135,294 @@ describe("LinearTrackerClient", () => {
 
     const client = new LinearTrackerClient(config.tracker, fetchImpl);
 
-    await expect(client.fetchWorkflowStateNames()).resolves.toEqual([
-      "Todo",
-      "In Review",
-      "Blocked",
-      "Ready to Merge",
+    await expect(client.fetchWorkflowStatesByTeam()).resolves.toEqual([
+      {
+        teamId: "team-eng",
+        teamKey: "ENG",
+        teamName: "Engineering",
+        states: ["Todo", "In Review"],
+      },
+      {
+        teamId: "team-ops",
+        teamKey: "OPS",
+        teamName: null,
+        states: ["Blocked", "Ready to Merge"],
+      },
     ]);
+    await expect(client.fetchWorkflowStateNames()).resolves.toEqual(["Todo", "In Review", "Blocked", "Ready to Merge"]);
     expect(requests[0]).toMatchObject({ variables: { projectSlug: "TEST" } });
+    expect(JSON.stringify(requests[0])).toContain("projects(first: 1");
+    expect(JSON.stringify(requests[0])).toContain("teams(first: 25, after: $teamsAfter)");
+    expect(JSON.stringify(requests[0])).toContain("after: $teamsAfter");
+    expect(JSON.stringify(requests[0])).toContain("states(first: 100)");
+    expect(JSON.stringify(requests[0])).toContain("pageInfo { hasNextPage endCursor }");
+    expect(JSON.stringify(requests[0])).toContain("id\\n            key\\n            name");
+  });
+
+  it("paginates project teams and team workflow states to exhaustion", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      requests.push(request);
+
+      if (request.query.includes("SymphonyTeamWorkflowStates")) {
+        return jsonResponse({
+          data: {
+            team: {
+              id: "team-eng",
+              key: "ENG",
+              name: "Engineering",
+              states: {
+                nodes: [{ id: "pass", name: "Ready to Merge" }],
+                pageInfo: pageInfo(),
+              },
+            },
+          },
+        });
+      }
+
+      if (request.variables.teamsAfter === "teams-page-2") {
+        return jsonResponse({
+          data: {
+            projects: {
+              nodes: [
+                {
+                  id: "project-1",
+                  name: "Test Project",
+                  teams: {
+                    nodes: [
+                      {
+                        id: "team-ops",
+                        key: "OPS",
+                        name: "Operations",
+                        states: {
+                          nodes: [{ id: "blocked", name: "Blocked" }],
+                          pageInfo: pageInfo(),
+                        },
+                      },
+                    ],
+                    pageInfo: pageInfo(),
+                  },
+                },
+              ],
+            },
+          },
+        });
+      }
+
+      return jsonResponse({
+        data: {
+          projects: {
+            nodes: [
+              {
+                id: "project-1",
+                name: "Test Project",
+                teams: {
+                  nodes: [
+                    {
+                      id: "team-eng",
+                      key: "ENG",
+                      name: "Engineering",
+                      states: {
+                        nodes: [
+                          { id: "todo", name: "Todo" },
+                          { id: "review", name: "In Review" },
+                        ],
+                        pageInfo: pageInfo(true, "states-page-2"),
+                      },
+                    },
+                  ],
+                  pageInfo: pageInfo(true, "teams-page-2"),
+                },
+              },
+            ],
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchWorkflowStatesByTeam()).resolves.toEqual([
+      {
+        teamId: "team-eng",
+        teamKey: "ENG",
+        teamName: "Engineering",
+        states: ["Todo", "In Review", "Ready to Merge"],
+      },
+      {
+        teamId: "team-ops",
+        teamKey: "OPS",
+        teamName: "Operations",
+        states: ["Blocked"],
+      },
+    ]);
+    expect(requests.map((request) => request.variables)).toEqual([
+      { projectSlug: "TEST", teamsAfter: null },
+      { teamId: "team-eng", statesAfter: "states-page-2" },
+      { projectSlug: "TEST", teamsAfter: "teams-page-2" },
+    ]);
+  });
+
+  it("throws when project team pagination is inconclusive", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        data: {
+          projects: {
+            nodes: [
+              {
+                id: "project-1",
+                name: "Test Project",
+                teams: {
+                  nodes: [
+                    {
+                      id: "team-eng",
+                      key: "ENG",
+                      name: "Engineering",
+                      states: {
+                        nodes: [{ id: "review", name: "In Review" }],
+                        pageInfo: pageInfo(),
+                      },
+                    },
+                  ],
+                  pageInfo: { hasNextPage: true, endCursor: null },
+                },
+              },
+            ],
+          },
+        },
+      });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchWorkflowStatesByTeam()).rejects.toThrow(
+      "Linear project TEST teams pagination reported next page without endCursor",
+    );
+  });
+
+  it("throws when team workflow state pagination is inconclusive", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        data: {
+          projects: {
+            nodes: [
+              {
+                id: "project-1",
+                name: "Test Project",
+                teams: {
+                  nodes: [
+                    {
+                      id: "team-eng",
+                      key: "ENG",
+                      name: "Engineering",
+                      states: {
+                        nodes: [{ id: "review", name: "In Review" }],
+                        pageInfo: { hasNextPage: true, endCursor: null },
+                      },
+                    },
+                  ],
+                  pageInfo: pageInfo(),
+                },
+              },
+            ],
+          },
+        },
+      });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchWorkflowStatesByTeam()).rejects.toThrow(
+      "Linear team Engineering (ENG) workflow states pagination reported next page without endCursor",
+    );
+  });
+
+  it("throws when the project workflow state query fails", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () => jsonResponse({ errors: [{ message: "Query too complex" }] });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchWorkflowStatesByTeam()).rejects.toThrow("Linear GraphQL errors");
+  });
+
+  it("throws when the Linear project is missing", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () => jsonResponse({ data: { projects: { nodes: [] } } });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchWorkflowStatesByTeam()).rejects.toThrow("Linear project not found for slug TEST");
+  });
+
+  it("throws when the Linear project has no teams", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        data: {
+          projects: {
+            nodes: [{ id: "project-1", name: "Test Project", teams: { nodes: [], pageInfo: pageInfo() } }],
+          },
+        },
+      });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchWorkflowStatesByTeam()).rejects.toThrow("Linear project TEST has no teams");
+  });
+
+  it("throws when a Linear team has no workflow states", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        data: {
+          projects: {
+            nodes: [
+              {
+                id: "project-1",
+                name: "Test Project",
+                teams: {
+                  nodes: [{ id: "team-eng", key: "ENG", name: "Engineering", states: { nodes: [], pageInfo: pageInfo() } }],
+                  pageInfo: pageInfo(),
+                },
+              },
+            ],
+          },
+        },
+      });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchWorkflowStatesByTeam()).rejects.toThrow("Linear team Engineering (ENG) has no workflow states");
+  });
+
+  it("throws when a Linear team state response is malformed", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        data: {
+          projects: {
+            nodes: [
+              {
+                id: "project-1",
+                name: "Test Project",
+                teams: {
+                  nodes: [{ id: "team-eng", key: "ENG", name: "Engineering", states: null }],
+                  pageInfo: pageInfo(),
+                },
+              },
+            ],
+          },
+        },
+      });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+
+    await expect(client.fetchWorkflowStatesByTeam()).rejects.toThrow(
+      "Linear team Engineering (ENG) workflow states are missing from response",
+    );
   });
 
   it("transitions issue state by resolving Linear state ids", async () => {
@@ -194,4 +486,8 @@ describe("LinearTrackerClient", () => {
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), { status: 200 });
+}
+
+function pageInfo(hasNextPage = false, endCursor: string | null = null): { hasNextPage: boolean; endCursor: string | null } {
+  return { hasNextPage, endCursor };
 }

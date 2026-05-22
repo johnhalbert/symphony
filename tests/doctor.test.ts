@@ -27,7 +27,7 @@ describe("doctor review-loop checks", () => {
       reviewLoopDoctorChecks(config, {
         workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
         mcpToolLister: async ({ command }) => mcpToolsFor(command),
-        linearStateLister: async () => ["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"],
+        linearStateLister: async () => [linearTeam(["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"])],
       }),
     ).resolves.toEqual([
       {
@@ -38,7 +38,7 @@ describe("doctor review-loop checks", () => {
       {
         id: "review_loop.linear_states",
         status: "ok",
-        message: "Linear team has configured review-loop states: In Review, Blocked, Ready to Merge",
+        message: "Linear project teams have configured review-loop states: In Review, Blocked, Ready to Merge (Engineering (ENG))",
       },
       {
         id: "review_loop.blocked_state",
@@ -73,7 +73,7 @@ describe("doctor review-loop checks", () => {
     const checks = await reviewLoopDoctorChecks(config, {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
       mcpToolLister: async ({ command }) => mcpToolsFor(command),
-      linearStateLister: async () => ["Todo", "In Progress", "In Review", "Ready to Merge", "Done"],
+      linearStateLister: async () => [linearTeam(["Todo", "In Progress", "In Review", "Ready to Merge", "Done"])],
     });
 
     expect(checks).toContainEqual({
@@ -97,7 +97,7 @@ describe("doctor review-loop checks", () => {
     const checks = await reviewLoopDoctorChecks(config, {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
       mcpToolLister: async ({ command }) => mcpToolsFor(command),
-      linearStateLister: async () => ["Todo", "In Progress", "In Review", "Blocked", "Done"],
+      linearStateLister: async () => [linearTeam(["Todo", "In Progress", "In Review", "Blocked", "Done"])],
     });
 
     expect(checks).toContainEqual({
@@ -117,7 +117,7 @@ describe("doctor review-loop checks", () => {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
       mcpToolLister: async ({ command }) =>
         command === "review-verdict-mcp" ? ["unexpected_tool"] : mcpToolsFor(command),
-      linearStateLister: async () => ["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"],
+      linearStateLister: async () => [linearTeam(["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"])],
     });
 
     expect(checks).toContainEqual({
@@ -137,18 +137,42 @@ describe("doctor review-loop checks", () => {
     const checks = await reviewLoopDoctorChecks(config, {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
       mcpToolLister: async ({ command }) => mcpToolsFor(command),
-      linearStateLister: async () => ["Blocked", "Todo", "Duplicate", "Canceled", "Backlog", "In Progress", "Done", "In Review"],
+      linearStateLister: async () => [linearTeam(["Blocked", "Todo", "Duplicate", "Canceled", "Backlog", "In Progress", "Done", "In Review"])],
     });
 
     expect(checks).toContainEqual({
       id: "review_loop.linear_states",
       status: "error",
       message:
-        "Linear team is missing configured review-loop states: Ready to Merge. Available states: Blocked, Todo, Duplicate, Canceled, Backlog, In Progress, Done, In Review",
+        "Linear teams are missing configured review-loop states: Engineering (ENG) missing Ready to Merge (available: Blocked, Todo, Duplicate, Canceled, Backlog, In Progress, Done, In Review)",
     });
   });
 
-  it("warns when Linear state availability cannot be checked", async () => {
+  it("errors when one project team is missing configured review-loop states", async () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+
+    const checks = await reviewLoopDoctorChecks(config, {
+      workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
+      mcpToolLister: async ({ command }) => mcpToolsFor(command),
+      linearStateLister: async () => [
+        linearTeam(["In Review", "Blocked", "Ready to Merge"], { teamKey: "ENG", teamName: "Engineering" }),
+        linearTeam(["In Review", "Blocked"], { teamKey: "OPS", teamName: "Operations" }),
+      ],
+    });
+
+    expect(checks).toContainEqual({
+      id: "review_loop.linear_states",
+      status: "error",
+      message:
+        "Linear teams are missing configured review-loop states: Operations (OPS) missing Ready to Merge (available: In Review, Blocked)",
+    });
+  });
+
+  it("errors when Linear state availability cannot be checked", async () => {
     const config = testConfig("/tmp/symphony-doctor");
     config.tracker.handoffStates = ["In Review"];
     config.reviewLoop.reviewStates = ["In Review"];
@@ -165,8 +189,53 @@ describe("doctor review-loop checks", () => {
 
     expect(checks).toContainEqual({
       id: "review_loop.linear_states",
-      status: "warn",
+      status: "error",
       message: "Could not verify Linear review-loop state availability: Linear API unavailable",
+    });
+  });
+
+  it("errors when Linear pagination makes state availability inconclusive", async () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+
+    const checks = await reviewLoopDoctorChecks(config, {
+      workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
+      mcpToolLister: async ({ command }) => mcpToolsFor(command),
+      linearStateLister: async () => {
+        throw new Error("Linear project TEST teams pagination reported next page without endCursor");
+      },
+    });
+
+    expect(checks).toContainEqual({
+      id: "review_loop.linear_states",
+      status: "error",
+      message:
+        "Could not verify Linear review-loop state availability: Linear project TEST teams pagination reported next page without endCursor",
+    });
+  });
+
+  it("warns when no review-loop Linear states are configured to verify", async () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.tracker.handoffStates = [];
+    config.reviewLoop.reviewStates = [];
+    config.reviewLoop.blockedStates = [];
+    config.reviewLoop.reviewPassState = null;
+
+    const checks = await reviewLoopDoctorChecks(config, {
+      workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
+      mcpToolLister: async ({ command }) => mcpToolsFor(command),
+      linearStateLister: async () => {
+        throw new Error("should not verify when no states are configured");
+      },
+    });
+
+    expect(checks).toContainEqual({
+      id: "review_loop.linear_states",
+      status: "warn",
+      message: "No review-loop Linear states are configured to verify",
     });
   });
 
@@ -324,4 +393,16 @@ function mcpToolsFor(command: string): string[] {
   if (command === "review-verdict-mcp") return ["submit_review_verdict"];
   if (command === "review-feedback-mcp") return ["submit_pull_request_review_feedback"];
   return [];
+}
+
+function linearTeam(
+  states: string[],
+  overrides: { teamId?: string; teamKey?: string; teamName?: string | null } = {},
+): { teamId: string; teamKey: string; teamName: string | null; states: string[] } {
+  return {
+    teamId: overrides.teamId ?? "team-eng",
+    teamKey: overrides.teamKey ?? "ENG",
+    teamName: overrides.teamName ?? "Engineering",
+    states,
+  };
 }
