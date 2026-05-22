@@ -375,6 +375,240 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("blocks a worker after the max incomplete turn ceiling", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 5;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.maxIncompleteTurns = 2;
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const stateDir = config.workspace.stateDir;
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 300_000);
+    const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(2);
+    expect(currentState).toBe("Blocked");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Blocked"]);
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
+      "fake-issue-1-1:run-started",
+      "fake-issue-1-2:run-started",
+      "fake-issue-1-2:blocked-escalation",
+    ]);
+    expect(writer.comments[2]?.body).toContain("max incomplete turns reached (2/2)");
+    expect(writer.comments[2]?.body).toContain("Incomplete turns: 2 / 2");
+    expect(writer.comments[2]?.body).toContain("Last completion report:");
+    expect(writer.comments[2]?.body).toContain("Required human action:");
+    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "blocked",
+      incompleteTurnCount: 2,
+      blockedReason: "max incomplete turns reached (2/2)",
+    });
+  });
+
+  it("blocks a reviewer fail verdict at the max review round ceiling", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.maxReviewRounds = 1;
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    let currentState = "In Review";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    const harness = new ReviewVerdictSubmittingHarness("fail", lifecycleStore, outboxStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs).toEqual([{ role: "reviewer", runId: "review-run-1" }]);
+    expect(currentState).toBe("Blocked");
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual(["review-run-1:blocked-escalation"]);
+    expect(writer.comments[0]?.body).toContain("max review rounds reached (1/1)");
+    expect(writer.comments[0]?.body).toContain("Review rounds: 1 / 1");
+    expect(writer.comments[0]?.body).toContain("Last completion report:");
+    expect(writer.comments[0]?.body).toContain("Last review verdict:");
+    expect(writer.comments[0]?.body).toContain("Add reviewer MCP integration.");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Blocked"]);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "blocked",
+      reviewRound: 1,
+      incompleteTurnCount: 0,
+      blockedReason: "max review rounds reached (1/1)",
+      lastReviewVerdictId: "review-verdict:issue-1:review-verdict-fail-1",
+    });
+  });
+
+  it("does not redispatch persisted fallback-blocked issues after restart", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.blockedStates = [];
+    config.reviewLoop.maxIncompleteTurns = 2;
+    const candidate = issue({ state: "In Progress" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      incompleteTurnCount: 2,
+      blockedReason: "max incomplete turns reached (2/2)",
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "max incomplete turns reached (2/2)",
+    });
+  });
+
+  it("clears blocked lifecycle counters after a human unblock transition", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "In Progress" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      incompleteTurnCount: 2,
+      blockedReason: "max review rounds reached (3/3)",
+    });
+    const harness = new BlockingHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const lifecycle = orchestrator.snapshot().running[0]?.lifecycle;
+    await orchestrator.stop();
+
+    expect(harness.stoppedRunIds).toEqual(["run-123"]);
+    expect(lifecycle).toMatchObject({
+      phase: "implementation",
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+    });
+  });
+
   it("treats accepted completion reports as live handoff and suppresses continuation/no-report writeback", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 3;
@@ -553,7 +787,7 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Implemented the reviewer dispatch lane.");
     const runs = await runStore.listRunsForIssue(candidate.identifier);
     expect(runs.find((run) => run.runId === "fake-issue-1-1")).toMatchObject({ role: "reviewer" });
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 1 });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 0 });
   });
 
   it("processes a live fail verdict submitted by a reviewer harness run", async () => {
@@ -706,7 +940,7 @@ describe("Orchestrator", () => {
     expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Ready to Merge"]);
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
       phase: "passed",
-      reviewRound: 1,
+      reviewRound: 0,
       lastReviewVerdictId: "review-verdict:issue-1:review-verdict-pass-1",
     });
   });

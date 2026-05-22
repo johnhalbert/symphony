@@ -67,7 +67,7 @@ describe("review verdict MCP handoff", () => {
     });
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
       phase: "implementation",
-      reviewRound: 0,
+      reviewRound: 1,
       lastReviewVerdictId: "review-verdict:issue-1:review-verdict-1",
       reviewVerdicts: [
         {

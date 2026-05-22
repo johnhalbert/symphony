@@ -1,5 +1,9 @@
 import type { ServiceConfig } from "../config/Config.js";
-import type { PullRequestReviewEvidenceItem } from "../persistence/IssueLifecycleStore.js";
+import type {
+  IssueCompletionReportRecord,
+  IssueReviewVerdictRecord,
+  PullRequestReviewEvidenceItem,
+} from "../persistence/IssueLifecycleStore.js";
 import type { Issue, Workspace } from "../types.js";
 import type { NewWritebackOperation } from "./WritebackOutbox.js";
 
@@ -28,6 +32,13 @@ export interface BlockedEscalationWritebackContext {
   issue: Issue;
   runId: string;
   reason: string;
+  incompleteTurnCount?: number;
+  maxIncompleteTurns?: number;
+  reviewRound?: number;
+  maxReviewRounds?: number;
+  lastCompletionReport?: IssueCompletionReportRecord | null;
+  lastReviewVerdict?: IssueReviewVerdictRecord | null;
+  requiredAction?: string;
 }
 
 export interface CompletionReportWritebackDetails {
@@ -266,6 +277,21 @@ export function planBlockedEscalationWritebacks(
           "",
           `Run: ${context.runId}`,
           `Ceiling reason: ${context.reason}`,
+          "",
+          "Counts:",
+          `- Incomplete turns: ${formatCount(context.incompleteTurnCount, context.maxIncompleteTurns)}`,
+          `- Review rounds: ${formatCount(context.reviewRound, context.maxReviewRounds)}`,
+          "",
+          "Last completion report:",
+          ...formatCompletionReportSummary(context.lastCompletionReport ?? null),
+          "",
+          "Last review verdict:",
+          ...formatReviewVerdictSummary(context.lastReviewVerdict ?? null),
+          "",
+          "Required human action:",
+          context.requiredAction ??
+            "Inspect the latest worker output and reviewer feedback, then move the issue out of the blocked state when it is safe for Symphony to continue.",
+          "",
           blockedState === null
             ? "No blocked state is configured, so Symphony left the issue state unchanged and automation should remain paused."
             : `Transitioning to blocked state: ${blockedState}`,
@@ -378,6 +404,31 @@ function formatCompletionReportForComment(report: string | CompletionReportWrite
 function listOrFallback(values: string[], fallback: string): string[] {
   const items = values.map((value) => value.trim()).filter((value) => value.length > 0);
   return items.length === 0 ? [`- ${fallback}`] : items.map((value) => `- ${value}`);
+}
+
+function formatCount(count: number | undefined, max: number | undefined): string {
+  if (count === undefined) return "n/a";
+  return max === undefined ? `${count}` : `${count} / ${max}`;
+}
+
+function formatCompletionReportSummary(report: IssueCompletionReportRecord | null): string[] {
+  if (report === null) return ["- n/a"];
+  return [
+    `- Report: ${report.id}`,
+    `- Run: ${report.runId}`,
+    `- Summary: ${oneLine(report.summary).slice(0, 240)}`,
+    `- Changed files: ${report.changedFiles.length === 0 ? "n/a" : report.changedFiles.join(", ")}`,
+  ];
+}
+
+function formatReviewVerdictSummary(verdict: IssueReviewVerdictRecord | null): string[] {
+  if (verdict === null) return ["- n/a"];
+  return [
+    `- Verdict: ${verdict.verdict}`,
+    `- Verdict record: ${verdict.id}`,
+    `- Run: ${verdict.runId}`,
+    ...listOrFallback(verdict.findings, "No findings supplied.").map((item) => `- Finding ${item.slice(2)}`),
+  ];
 }
 
 function reviewVerdictDetailsFromInput(input: string[] | ReviewVerdictWritebackDetails): ReviewVerdictWritebackDetails {

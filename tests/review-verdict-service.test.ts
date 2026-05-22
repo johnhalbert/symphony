@@ -67,7 +67,7 @@ describe("ReviewVerdictService", () => {
     });
   });
 
-  it("does not double count a fail verdict for a reviewer run already recorded by dispatch", async () => {
+  it("increments review rounds on each accepted fail verdict", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
       phase: "review",
@@ -78,7 +78,7 @@ describe("ReviewVerdictService", () => {
     await service.submitReviewVerdict(failVerdict(), context());
 
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      reviewRound: 1,
+      reviewRound: 2,
     });
   });
 
