@@ -5,7 +5,10 @@ import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/h
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
 import { writeReviewFeedbackMcpContext } from "../../src/core/harness/ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
-import { buildMcpSubprocessEnvironment } from "../../src/core/harness/McpSubprocessEnvironment.js";
+import {
+  buildMcpSubprocessServerConfig,
+  type McpSubprocessServerConfig,
+} from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { mapCursorDelta, mapCursorMessage } from "./CursorEventMapper.js";
@@ -38,6 +41,7 @@ export class CursorHarness implements AgentHarness {
     const reviewVerdictContextFile = reviewVerdictContextFilePath(ctx);
     const reviewFeedbackContextFile = reviewFeedbackContextFilePath(ctx);
     const isReviewer = ctx.role === "reviewer";
+    const cliPath = currentSymphonyCliPath();
     if (isWorker) {
       await writeCompletionReportMcpContext(completionReportContextFile, {
         issue: ctx.issue,
@@ -80,14 +84,14 @@ export class CursorHarness implements AgentHarness {
       ...(isWorker
         ? {
             mcpServers: {
-              symphony: completionReportMcpServerConfig(ctx, completionReportContextFile),
+              symphony: completionReportMcpServerConfig(ctx, completionReportContextFile, { cliPath }),
             },
           }
         : isReviewer
           ? {
               mcpServers: {
-                symphony_review_verdict: reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFile),
-                symphony_review_feedback: reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFile),
+                symphony_review_verdict: reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFile, { cliPath }),
+                symphony_review_feedback: reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFile, { cliPath }),
               },
             }
         : {}),
@@ -195,17 +199,7 @@ export class CursorHarness implements AgentHarness {
     const existing = this.agents.get(key);
     if (existing) return existing;
 
-    const apiKey = process.env.CURSOR_API_KEY;
-    const model = cursorModelSelection(ctx);
-    const agentOptions = {
-      model,
-      local: {
-        cwd: ctx.workspace.path,
-        settingSources: ctx.config.cursor.settingSources as SettingSource[],
-      },
-      name: ctx.role === "reviewer" ? `Symphony reviewer ${ctx.issue.identifier}` : `Symphony ${ctx.issue.identifier}`,
-      ...(apiKey ? { apiKey } : {}),
-    };
+    const agentOptions = cursorAgentCreateOptions(ctx);
     const latestRun = ctx.role === "worker" ? await this.options.runStore?.latestRunForIssue(ctx.issue.id) : null;
     let agent: SDKAgent;
     if (latestRun?.agentId) {
@@ -231,85 +225,71 @@ function flush(events: AgentEvent[]): AgentEvent[] {
   return events.splice(0, events.length);
 }
 
-function cursorModelSelection(ctx: AgentRunContext): ModelSelection {
+export function cursorAgentCreateOptions(ctx: AgentRunContext, apiKey = process.env.CURSOR_API_KEY): Parameters<typeof Agent.create>[0] {
+  return {
+    model: cursorModelSelection(ctx),
+    local: {
+      cwd: ctx.workspace.path,
+      settingSources: ctx.config.cursor.settingSources as SettingSource[],
+    },
+    name: cursorAgentName(ctx),
+    ...(apiKey ? { apiKey } : {}),
+  };
+}
+
+export function cursorAgentName(ctx: AgentRunContext): string {
+  return ctx.role === "reviewer" ? `Symphony reviewer ${ctx.issue.identifier}` : `Symphony ${ctx.issue.identifier}`;
+}
+
+export function cursorModelSelection(ctx: AgentRunContext): ModelSelection {
   return ctx.config.cursor.modelParams.length === 0
     ? { id: ctx.config.cursor.model }
     : { id: ctx.config.cursor.model, params: ctx.config.cursor.modelParams };
 }
 
-export function completionReportMcpServerConfig(ctx: AgentRunContext, contextFile: string): {
-  type: "stdio";
-  command: string;
-  args: string[];
-  cwd: string;
-  env: Record<string, string>;
-} {
-  return {
-    type: "stdio",
-    command: process.execPath,
-    args: [
-      ...process.execArgv,
-      process.argv[1] ?? "dist/cli.js",
-      "completion-report-mcp",
-      "--workflow",
-      ctx.config.workflowPath,
-      "--context-file",
-      contextFile,
-    ],
-    cwd: ctx.config.workflowDir,
-    env: buildMcpSubprocessEnvironment({ config: ctx.config, command: "completion-report-mcp" }),
-  };
+export function completionReportMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "completion-report-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
 }
 
-export function reviewVerdictMcpServerConfig(ctx: AgentRunContext, contextFile: string): {
-  type: "stdio";
-  command: string;
-  args: string[];
-  cwd: string;
-  env: Record<string, string>;
-} {
-  return {
-    type: "stdio",
-    command: process.execPath,
-    args: [
-      ...process.execArgv,
-      process.argv[1] ?? "dist/cli.js",
-      "review-verdict-mcp",
-      "--workflow",
-      ctx.config.workflowPath,
-      "--context-file",
-      contextFile,
-    ],
-    cwd: ctx.config.workflowDir,
-    env: buildMcpSubprocessEnvironment({ config: ctx.config, command: "review-verdict-mcp" }),
-  };
+export function reviewVerdictMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "review-verdict-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
 }
 
-export function reviewFeedbackMcpServerConfig(ctx: AgentRunContext, contextFile: string): {
-  type: "stdio";
-  command: string;
-  args: string[];
-  cwd: string;
-  env: Record<string, string>;
-} {
-  return {
-    type: "stdio",
-    command: process.execPath,
-    args: [
-      ...process.execArgv,
-      process.argv[1] ?? "dist/cli.js",
-      "review-feedback-mcp",
-      "--workflow",
-      ctx.config.workflowPath,
-      "--context-file",
-      contextFile,
-    ],
-    cwd: ctx.config.workflowDir,
-    env: buildMcpSubprocessEnvironment({ config: ctx.config, command: "review-feedback-mcp" }),
-  };
+export function reviewFeedbackMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "review-feedback-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
 }
 
-function completionReportContextFilePath(ctx: AgentRunContext): string {
+export function completionReportContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
     "completion-report-mcp",
@@ -317,7 +297,7 @@ function completionReportContextFilePath(ctx: AgentRunContext): string {
   );
 }
 
-function reviewVerdictContextFilePath(ctx: AgentRunContext): string {
+export function reviewVerdictContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
     "review-verdict-mcp",
@@ -325,7 +305,7 @@ function reviewVerdictContextFilePath(ctx: AgentRunContext): string {
   );
 }
 
-function reviewFeedbackContextFilePath(ctx: AgentRunContext): string {
+export function reviewFeedbackContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
     "review-feedback-mcp",
@@ -339,5 +319,9 @@ function agentKey(ctx: AgentRunContext): string {
 
 function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "context";
+}
+
+function currentSymphonyCliPath(): string {
+  return process.argv[1] ?? path.resolve("dist/cli.js");
 }
 

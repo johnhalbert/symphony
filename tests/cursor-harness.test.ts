@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
+import path from "node:path";
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { mapCursorDelta, mapCursorMessage } from "../cursor/src/CursorEventMapper.js";
 import {
+  completionReportContextFilePath,
   completionReportMcpServerConfig,
+  reviewFeedbackContextFilePath,
   reviewFeedbackMcpServerConfig,
+  reviewVerdictContextFilePath,
   reviewVerdictMcpServerConfig,
 } from "../cursor/src/CursorHarness.js";
 import { issue, testConfig } from "./helpers.js";
@@ -55,7 +59,7 @@ describe("Cursor event mapping", () => {
       logger: new StructuredLogger(() => undefined),
     };
 
-    const server = completionReportMcpServerConfig(ctx, "/tmp/context.json");
+    const server = completionReportMcpServerConfig(ctx, "/tmp/context.json", { cliPath: "/repo/src/cli.ts" });
     const args = server.args as string[];
 
     expect(server).toMatchObject({
@@ -66,6 +70,8 @@ describe("Cursor event mapping", () => {
     expect(args).toEqual(
       expect.arrayContaining(["completion-report-mcp", "--workflow", config.workflowPath, "--context-file", "/tmp/context.json"]),
     );
+    expect(args).toContain("/repo/src/cli.ts");
+    expect(completionReportContextFilePath(ctx)).toBe(path.join(config.workspace.stateDir, "completion-report-mcp", "issue-1-1.json"));
     expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key" });
     expect(server.env).not.toHaveProperty("GITHUB_TOKEN");
     expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
@@ -91,7 +97,7 @@ describe("Cursor event mapping", () => {
       logger: new StructuredLogger(() => undefined),
     };
 
-    const server = reviewVerdictMcpServerConfig(ctx, "/tmp/review-context.json");
+    const server = reviewVerdictMcpServerConfig(ctx, "/tmp/review-context.json", { cliPath: "/repo/src/cli.ts" });
     const args = server.args as string[];
 
     expect(server).toMatchObject({
@@ -108,6 +114,8 @@ describe("Cursor event mapping", () => {
         "/tmp/review-context.json",
       ]),
     );
+    expect(args).toContain("/repo/src/cli.ts");
+    expect(reviewVerdictContextFilePath(ctx)).toBe(path.join(config.workspace.stateDir, "review-verdict-mcp", "issue-1-1.json"));
     expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key" });
     expect(server.env).not.toHaveProperty("GITHUB_TOKEN");
     expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
@@ -136,7 +144,7 @@ describe("Cursor event mapping", () => {
       logger: new StructuredLogger(() => undefined),
     };
 
-    const server = reviewFeedbackMcpServerConfig(ctx, "/tmp/review-feedback-context.json");
+    const server = reviewFeedbackMcpServerConfig(ctx, "/tmp/review-feedback-context.json", { cliPath: "/repo/src/cli.ts" });
     const args = server.args as string[];
 
     expect(server).toMatchObject({
@@ -153,6 +161,8 @@ describe("Cursor event mapping", () => {
         "/tmp/review-feedback-context.json",
       ]),
     );
+    expect(args).toContain("/repo/src/cli.ts");
+    expect(reviewFeedbackContextFilePath(ctx)).toBe(path.join(config.workspace.stateDir, "review-feedback-mcp", "issue-1-1.json"));
     expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key", GITHUB_TOKEN: "feedback-secret" });
     expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
   });

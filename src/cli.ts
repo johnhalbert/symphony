@@ -6,6 +6,7 @@ import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
 import { Orchestrator } from "./core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
+import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureDiagnosticsStore.js";
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
@@ -30,7 +31,11 @@ program
   .option("--json", "print JSON output")
   .option("--strict", "treat warnings as failures")
   .action(async (workflow: string, options: { json?: boolean; strict?: boolean }) => {
-    const result = await runDoctor({ workflowPath: path.resolve(process.cwd(), workflow), strict: options.strict });
+    const result = await runDoctor({
+      workflowPath: path.resolve(process.cwd(), workflow),
+      strict: options.strict,
+      cliPath: currentCliPath(),
+    });
     if (options.json) {
       console.log(JSON.stringify(result, null, 2));
     } else {
@@ -96,6 +101,7 @@ program
     const tracker = new LinearTrackerClient(config.tracker);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
     const writeback = config.writeback.enabled
       ? new WritebackProcessor(
           new FileWritebackOutboxStore(config.workspace.stateDir),
@@ -144,6 +150,7 @@ program
             workspaceOpener: opener,
             runStore,
             lifecycleStore,
+            mcpExposureDiagnosticsStore,
             host: config.server.host,
             port: config.server.port,
             openWorkspaceToken: config.server.openWorkspaceToken,
@@ -173,3 +180,7 @@ program.parseAsync().catch((error) => {
   console.error(error);
   process.exit(1);
 });
+
+function currentCliPath(): string {
+  return path.resolve(process.argv[1] ?? "dist/cli.js");
+}

@@ -10,6 +10,7 @@ import type {
   IssueLifecycleStore,
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
+import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
 import type { RunRecord, RunTranscriptStore, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 
 export interface StatusServerOptions {
@@ -18,6 +19,7 @@ export interface StatusServerOptions {
   workspaceOpener: CursorWorkspaceOpener;
   runStore?: RunTranscriptStore;
   lifecycleStore?: IssueLifecycleStore;
+  mcpExposureDiagnosticsStore?: FileMcpExposureDiagnosticsStore;
   host: string;
   port: number;
   openWorkspaceToken: string | null;
@@ -69,6 +71,12 @@ export class StatusServer {
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
         sendJson(response, 200, {
           workspaces: (await this.options.runStore?.listWorkspaces()) ?? [],
+        });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/diagnostics/mcp-tool-exposure") {
+        sendJson(response, 200, {
+          latest: (await this.options.mcpExposureDiagnosticsStore?.latest()) ?? null,
         });
         return;
       }
@@ -150,6 +158,9 @@ export class StatusServer {
           lifecycle,
           reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
           metadata: statusMetadata({ live, workspace, latestRun, lifecycle }),
+          diagnostics: {
+            mcpToolExposure: (await this.options.mcpExposureDiagnosticsStore?.latest()) ?? null,
+          },
           capabilities: {
             transcript: Boolean(latestRun),
             openWorkspace: workspacePath === null ? false : await pathExists(workspacePath),

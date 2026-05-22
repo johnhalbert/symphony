@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileMcpExposureDiagnosticsStore } from "../src/core/persistence/McpExposureDiagnosticsStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -130,6 +131,37 @@ describe("StatusServer durable API", () => {
         ],
       },
     );
+    const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
+    await mcpExposureDiagnosticsStore.writeLatest({
+      version: 1,
+      generatedAt: "2026-01-01T00:00:05.000Z",
+      workflowPath: config.workflowPath,
+      cliPath: "/repo/src/cli.ts",
+      liveSmokeEnabled: true,
+      ok: false,
+      stages: [
+        {
+          stage: "sdk",
+          status: "failure",
+          failureCode: "sdk_init_timeout_no_tools_empty_tools_name_mismatch",
+          message: "Cursor SDK did not expose submit_completion_report",
+          results: [
+            {
+              role: "worker",
+              serverKey: "symphony",
+              command: "completion-report-mcp",
+              expectedTool: "submit_completion_report",
+              status: "failure",
+              failureCode: "sdk_init_timeout_no_tools_empty_tools_name_mismatch",
+              message: "Cursor SDK did not expose submit_completion_report",
+              rawToolNames: ["read_file"],
+              normalizedToolNames: [],
+              envKeyNames: ["LINEAR_API_KEY"],
+            },
+          ],
+        },
+      ],
+    });
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
       workspaceManager: new WorkspaceManager({
@@ -140,6 +172,7 @@ describe("StatusServer durable API", () => {
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
       runStore,
       lifecycleStore,
+      mcpExposureDiagnosticsStore,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -152,6 +185,7 @@ describe("StatusServer durable API", () => {
       const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-1`);
       const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/run-1/transcript?limit=1`);
       const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/TEST-1`);
+      const diagnosticsResponse = await fetch(`${baseUrl}/api/v1/diagnostics/mcp-tool-exposure`);
       const openResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/open-workspace`, { method: "POST" });
       const pauseWithoutTokenResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/pause`, { method: "POST" });
       const pauseResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/pause`, {
@@ -183,6 +217,7 @@ describe("StatusServer durable API", () => {
           baseRef: string | null;
         };
         capabilities: { openWorkspace: boolean };
+        diagnostics: { mcpToolExposure: { ok: boolean; stages: Array<{ failureCode: string | null }> } | null };
       };
       const runsBody = (await runsResponse.json()) as { runs: unknown[] };
       const runBody = (await runResponse.json()) as {
@@ -196,6 +231,7 @@ describe("StatusServer durable API", () => {
       };
       const transcriptBody = (await transcriptResponse.json()) as { events: Array<{ message?: string }> };
       const workspaceBody = (await workspaceResponse.json()) as { gitBranchName?: string };
+      const diagnosticsBody = (await diagnosticsResponse.json()) as { latest: { ok: boolean } | null };
 
       expect(issueResponse.status).toBe(200);
       expect(issueBody.latestRun.runId).toBe("run-1");
@@ -225,6 +261,10 @@ describe("StatusServer durable API", () => {
         baseRef: "origin/main",
       });
       expect(issueBody.capabilities.openWorkspace).toBe(false);
+      expect(issueBody.diagnostics.mcpToolExposure).toMatchObject({
+        ok: false,
+        stages: [{ failureCode: "sdk_init_timeout_no_tools_empty_tools_name_mismatch" }],
+      });
       expect(runsBody.runs).toHaveLength(1);
       expect(runResponse.status).toBe(200);
       expect(runBody).toMatchObject({
@@ -235,6 +275,8 @@ describe("StatusServer durable API", () => {
       });
       expect(transcriptBody.events[0]?.message).toBe("hello");
       expect(workspaceBody.gitBranchName).toBe("symphony/TEST-1");
+      expect(diagnosticsResponse.status).toBe(200);
+      expect(diagnosticsBody.latest).toMatchObject({ ok: false });
       expect(openResponse.status).toBe(401);
       expect(pauseWithoutTokenResponse.status).toBe(401);
       expect(pauseResponse.status).toBe(202);
