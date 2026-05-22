@@ -21,6 +21,7 @@ review_loop:
     - In Review
   blocked_states:
     - Blocked
+  review_pass_state: Ready to Merge
   max_review_rounds: 3
   max_incomplete_turns: 3
   continuation_history_threshold: 5
@@ -99,7 +100,7 @@ Use Linear only as read context unless the prompt explicitly asks for a non-life
 
 `Todo` and `In Progress` are the worker implementation queue. `In Review` is the independent reviewer-agent queue, not a human review handoff. `Blocked` is the human-required escalation state for exhausted review loops, repeated incomplete worker turns, or other conditions that require operator intervention.
 
-Reviewer pass does not require a separate Linear state. A passing review is recorded with structured reviewer verdict evidence, such as a Linear comment or PR review, while the issue remains `In Review`; after the associated PR is merged, Symphony transitions the issue to `Done`. Review failures continue through the review loop, and escalation failures transition to `Blocked`.
+A passing review is recorded with structured reviewer verdict evidence, such as a Linear comment or PR review, and Symphony transitions the issue from `In Review` to `Ready to Merge`. Review failures continue through the review loop, and escalation failures transition to `Blocked`.
 
 ## Required Workflow
 

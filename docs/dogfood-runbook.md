@@ -20,6 +20,7 @@ Confirm:
 - Parent: `ENG-29`
 - Active states: `Todo`, `In Progress`
 - Reviewer queue state: `In Review`
+- Review pass destination: `Ready to Merge`
 - Escalation state: `Blocked`
 - Terminal states: `Done`, `Closed`, `Cancelled`, `Canceled`, `Duplicate`
 - Required dispatch label: `dogfood-ready`
@@ -31,9 +32,10 @@ State semantics:
 
 - `Todo` and `In Progress` are the worker implementation queue.
 - `In Review` means awaiting independent reviewer-agent review, not human review.
+- `Ready to Merge` means the reviewer-agent pass was accepted and the issue is ready for human merge/release action.
 - `Blocked` means human-required escalation, including max review loops or max incomplete worker turns.
-- A passing review is recorded through structured reviewer verdict evidence, such as a Linear comment or PR review, while the issue remains `In Review`.
-- Do not add a `Ready` or `Ready for Human` state for the current dogfood loop; after merge, Symphony transitions the issue to `Done`.
+- A passing review is recorded through structured reviewer verdict evidence, such as a Linear comment or PR review, before the issue leaves `In Review`.
+- Do not add a separate `Ready` or `Ready for Human` state for the current dogfood loop; use the configured `Ready to Merge` pass destination.
 
 ## 3. Baseline Checks
 
@@ -90,7 +92,7 @@ Expected result:
 - Symphony transitions the issue back to `In Progress` and the next worker turn addresses the requested revisions.
 - The worker submits a new completion report before any second handoff.
 - The reviewer records a pass verdict.
-- Symphony applies the configured pass destination, or records the structured pass marker when no pass state is configured.
+- Symphony applies the configured `Ready to Merge` pass destination.
 - The workspace remains available for review-loop evidence and operator inspection until the pass path is complete.
 
 ## 7. Manual Dogfood Checklist
@@ -100,6 +102,7 @@ Before the smoke:
 - [ ] `npm run doctor -- --strict` has no errors and only understood warnings.
 - [ ] There are zero current `Todo` or `In Progress` candidates before intentional promotion.
 - [ ] The target issue is the only issue with `dogfood-ready` and no `dogfood-blocked` or `safety-blocked` label.
+- [ ] `Ready to Merge` exists in Linear and is not listed as an active, review, blocked, or terminal state.
 - [ ] `Blocked` exists in Linear and is not listed as an active or review state.
 - [ ] `In Review` is understood as the agent review queue, not human review.
 
