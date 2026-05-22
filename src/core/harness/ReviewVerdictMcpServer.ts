@@ -1,0 +1,258 @@
+import { EventEmitter } from "node:events";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import {
+  ReviewVerdictService,
+  type ReviewVerdictActiveContext,
+} from "../ReviewVerdictService.js";
+import { errorMessage, SymphonyError } from "../errors.js";
+import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
+import type { Issue } from "../types.js";
+import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
+import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
+
+export const REVIEW_VERDICT_TOOL_NAME = "submit_review_verdict";
+
+export interface ReviewVerdictMcpContextFile {
+  issue: Issue;
+  activeRunId: string | null;
+  role: "reviewer";
+  token?: string | null;
+  expectedToken?: string | null;
+  reviewer?: string | null;
+  phase: "review";
+}
+
+export async function writeReviewVerdictMcpContext(
+  filePath: string,
+  context: ReviewVerdictMcpContextFile,
+): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, `${JSON.stringify(context, null, 2)}\n`, "utf8");
+}
+
+export async function submitReviewVerdictFromMcp(input: unknown, options: {
+  workflowPath: string;
+  contextFile: string;
+}): Promise<unknown> {
+  const loadedContext = await readReviewVerdictContext(options.contextFile);
+  if (!loadedContext.activeRunId) {
+    throw new SymphonyError("invalid_request", "Review verdict context is not ready for the active run");
+  }
+
+  const loader = new WorkflowLoader(options.workflowPath);
+  try {
+    const loaded = await loader.load();
+    const config = loaded.serviceConfig;
+    const service = new ReviewVerdictService({
+      config,
+      lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+    });
+    const context: ReviewVerdictActiveContext = {
+      issue: loadedContext.issue,
+      activeRunId: loadedContext.activeRunId,
+      role: loadedContext.role,
+      token: loadedContext.token ?? null,
+      expectedToken: loadedContext.expectedToken ?? null,
+      reviewer: loadedContext.reviewer ?? null,
+      phase: loadedContext.phase,
+    };
+    const result = await service.submit_review_verdict(reviewVerdictInputFromMcp(input, context), context);
+    return {
+      accepted: result.accepted,
+      replayed: result.replayed,
+      verdictId: result.verdict.id,
+      verdict: result.verdict.verdict,
+      writebackOperationKeys: result.verdict.writebackOperationKeys,
+    };
+  } finally {
+    await loader.close();
+  }
+}
+
+export async function runReviewVerdictMcpServer(options: {
+  workflowPath: string;
+  contextFile: string;
+  input?: NodeJS.ReadStream;
+  output?: NodeJS.WriteStream;
+}): Promise<void> {
+  const input = options.input ?? process.stdin;
+  const output = options.output ?? process.stdout;
+  const server = new JsonRpcStdioServer(input, output);
+  server.onRequest(async (request) => handleMcpRequest(request, options));
+  await server.start();
+}
+
+async function handleMcpRequest(
+  request: JsonRpcRequest,
+  options: { workflowPath: string; contextFile: string },
+): Promise<unknown> {
+  if (request.method === "initialize") {
+    return {
+      protocolVersion: "2024-11-05",
+      capabilities: { tools: {} },
+      serverInfo: { name: "symphony-review-verdict", version: "0.1.0" },
+    };
+  }
+  if (request.method === "tools/list") {
+    return {
+      tools: [
+        {
+          name: REVIEW_VERDICT_TOOL_NAME,
+          description: "Submit a Symphony reviewer pass/fail verdict for the active review run.",
+          inputSchema: reviewVerdictInputSchema(),
+        },
+      ],
+    };
+  }
+  if (request.method === "tools/call") {
+    const params = asRecord(request.params);
+    if (params.name !== REVIEW_VERDICT_TOOL_NAME) {
+      throw new SymphonyError("invalid_request", `Unknown tool: ${String(params.name)}`);
+    }
+    const result = await submitReviewVerdictFromMcp(params.arguments, options);
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    };
+  }
+  if (request.method.startsWith("notifications/")) return null;
+  throw new SymphonyError("invalid_request", `Unsupported MCP method: ${request.method}`);
+}
+
+async function readReviewVerdictContext(filePath: string): Promise<ReviewVerdictMcpContextFile> {
+  const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as ReviewVerdictMcpContextFile;
+  if (!parsed.issue || parsed.role !== "reviewer") {
+    throw new SymphonyError("invalid_request", "Review verdict MCP context is invalid");
+  }
+  return parsed;
+}
+
+function reviewVerdictInputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["verdict", "acceptanceResults", "findings", "evidence", "idempotencyKey"],
+    properties: {
+      runId: { type: "string", minLength: 1 },
+      issueId: { type: "string", minLength: 1 },
+      verdict: { enum: ["pass", "fail"] },
+      acceptanceResults: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["text", "satisfied", "evidence"],
+          properties: {
+            text: { type: "string", minLength: 1 },
+            satisfied: { type: "boolean" },
+            evidence: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
+          },
+        },
+      },
+      findings: { type: "array", items: { type: "string", minLength: 1 } },
+      evidence: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+      idempotencyKey: { type: "string", minLength: 1 },
+    },
+  };
+}
+
+function reviewVerdictInputFromMcp(input: unknown, context: ReviewVerdictActiveContext): unknown {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return input;
+  return {
+    runId: context.activeRunId,
+    issueId: context.issue.id,
+    ...input,
+  };
+}
+
+interface JsonRpcRequest {
+  jsonrpc?: "2.0";
+  id?: string | number | null;
+  method: string;
+  params?: unknown;
+}
+
+class JsonRpcStdioServer {
+  private readonly emitter = new EventEmitter();
+  private buffer = Buffer.alloc(0);
+
+  constructor(
+    private readonly input: NodeJS.ReadStream,
+    private readonly output: NodeJS.WriteStream,
+  ) {}
+
+  onRequest(handler: (request: JsonRpcRequest) => Promise<unknown>): void {
+    this.emitter.on("request", (request: JsonRpcRequest) => {
+      void this.respond(request, handler);
+    });
+  }
+
+  async start(): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      this.input.on("data", (chunk: Buffer) => {
+        try {
+          this.buffer = Buffer.concat([this.buffer, chunk]);
+          this.drainMessages();
+        } catch (error) {
+          reject(error);
+        }
+      });
+      this.input.on("end", resolve);
+      this.input.on("error", reject);
+    });
+  }
+
+  private drainMessages(): void {
+    while (true) {
+      const headerEnd = this.buffer.indexOf("\r\n\r\n");
+      if (headerEnd < 0) return;
+      const header = this.buffer.subarray(0, headerEnd).toString("utf8");
+      const contentLength = parseContentLength(header);
+      const bodyStart = headerEnd + 4;
+      const bodyEnd = bodyStart + contentLength;
+      if (this.buffer.length < bodyEnd) return;
+      const body = this.buffer.subarray(bodyStart, bodyEnd).toString("utf8");
+      this.buffer = this.buffer.subarray(bodyEnd);
+      const request = JSON.parse(body) as JsonRpcRequest;
+      if (request.id === undefined && request.method.startsWith("notifications/")) continue;
+      this.emitter.emit("request", request);
+    }
+  }
+
+  private async respond(request: JsonRpcRequest, handler: (request: JsonRpcRequest) => Promise<unknown>): Promise<void> {
+    if (request.id === undefined) return;
+    try {
+      const result = await handler(request);
+      this.write({ jsonrpc: "2.0", id: request.id, result });
+    } catch (error) {
+      this.write({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: {
+          code: -32000,
+          message: errorMessage(error),
+        },
+      });
+    }
+  }
+
+  private write(message: unknown): void {
+    const body = JSON.stringify(message);
+    this.output.write(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`);
+  }
+}
+
+function parseContentLength(header: string): number {
+  const line = header.split(/\r?\n/).find((item) => item.toLowerCase().startsWith("content-length:"));
+  const value = Number(line?.split(":")[1]?.trim());
+  if (!Number.isInteger(value) || value < 0) throw new Error("Invalid MCP Content-Length header");
+  return value;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>;
+  return {};
+}

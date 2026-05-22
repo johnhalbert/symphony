@@ -20,6 +20,7 @@ import {
   PullRequestReviewEvidenceService,
   type PullRequestReviewEvidenceClient,
 } from "../review/PullRequestReviewEvidenceService.js";
+import { formatWorkerReviewVerdictPrompt } from "../ReviewVerdictService.js";
 import type { WritebackProcessor } from "../writeback/WritebackOutbox.js";
 import {
   planDispatchWriteback,
@@ -76,6 +77,7 @@ export interface RunningEntry {
   cleanupWorkspaceOnExit: boolean;
   suppressRetryOnExit: boolean;
   completionReportAccepted: boolean;
+  reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
 }
 
@@ -151,6 +153,14 @@ You are a Symphony reviewer agent for {{ issue.identifier }}.
 Inspect only. Do not modify files, create commits, push branches, comment on Linear, transition Linear state, or otherwise change workspace or lifecycle state directly.
 
 Use the linked GitHub pull request as the primary detailed review surface. Before calling submit_review_verdict, leave concrete feedback directly on the PR by submitting a GitHub PR review and/or posting PR review comments. Requested changes must point to the relevant files, lines, or threads on GitHub; a pass verdict should also leave a concise approving or summary review/comment on the PR. In submit_review_verdict, reference the PR review/comment URLs you used as evidence.
+
+Call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" for requested changes and "pass" only when all acceptance criteria are satisfied. The MCP server supplies the active run and issue context; include runId or issueId only if the tool asks for them.
+
+Tool payload guidance:
+- acceptanceResults: one entry per acceptance criterion with satisfied true/false and concrete evidence.
+- findings: required for fail verdicts, empty for pass verdicts.
+- evidence: PR review/comment URLs or other durable review evidence.
+- idempotencyKey: a stable unique key for this reviewer verdict.
 
 Report a verdict in this format:
 VERDICT: pass | fail | blocked
@@ -552,6 +562,7 @@ export class Orchestrator {
       cleanupWorkspaceOnExit: false,
       suppressRetryOnExit: false,
       completionReportAccepted: false,
+      reviewVerdictAccepted: false,
       reviewEvidence,
     };
     this.running.set(issue.id, entry);
@@ -744,6 +755,9 @@ export class Orchestrator {
         if (entry.role === "worker" && !(await this.reconcileCompletionReportHandoff(entry))) {
           await this.recordIncompleteTurn(entry);
         }
+        if (entry.role === "reviewer") {
+          await this.reconcileReviewVerdictHandoff(entry);
+        }
       }
       if (event.type === "failed") {
         await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
@@ -781,6 +795,7 @@ export class Orchestrator {
       }
       this.completed.add(issueId);
       if (entry.role === "reviewer") {
+        await this.reconcileReviewVerdictHandoff(entry);
         this.claimed.delete(issueId);
         return;
       }
@@ -1037,6 +1052,33 @@ export class Orchestrator {
     return true;
   }
 
+  private async reconcileReviewVerdictHandoff(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return entry.reviewVerdictAccepted;
+
+    const lifecycle = await store.get(entry.issue.id);
+    const verdict = lifecycle?.reviewVerdicts.find((item) => item.runId === runId) ?? null;
+    if (!lifecycle || !verdict) return entry.reviewVerdictAccepted;
+
+    entry.lifecycle = lifecycle;
+    entry.reviewVerdictAccepted = true;
+
+    if (this.options.writeback) {
+      await this.options.writeback.processDue();
+    } else if (this.config.writeback.enabled) {
+      this.options.logger.warn("review verdict accepted but writeback processor is not configured", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        run_id: runId,
+        verdict_id: verdict.id,
+        verdict: verdict.verdict,
+      });
+    }
+
+    return true;
+  }
+
   private async updateLifecycle(entry: RunningEntry, patch: IssueLifecyclePatch): Promise<void> {
     const store = this.options.lifecycleStore;
     if (!store) return;
@@ -1135,8 +1177,14 @@ export class Orchestrator {
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
     const basePrompt = await this.promptRenderer.render(this.promptTemplate, { issue: entry.issue, attempt });
+    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
-    return reviewEvidence === null ? basePrompt : `${basePrompt}\n${reviewEvidence}`;
+    return [basePrompt, reviewVerdict, reviewEvidence].filter((item): item is string => item !== null).join("\n");
+  }
+
+  private async loadWorkerReviewVerdictPrompt(entry: RunningEntry): Promise<string | null> {
+    const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+    return lifecycle === undefined || lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
   }
 
   private async loadWorkerReviewEvidencePrompt(entry: RunningEntry): Promise<string | null> {
