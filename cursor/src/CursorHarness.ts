@@ -4,6 +4,7 @@ import type { ModelSelection } from "@cursor/sdk";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
 import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
+import { buildMcpSubprocessEnvironment } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { mapCursorDelta, mapCursorMessage } from "./CursorEventMapper.js";
@@ -235,7 +236,7 @@ export function completionReportMcpServerConfig(ctx: AgentRunContext, contextFil
       contextFile,
     ],
     cwd: ctx.config.workflowDir,
-    env: stringEnvironment(process.env),
+    env: buildMcpSubprocessEnvironment({ config: ctx.config, command: "completion-report-mcp" }),
   };
 }
 
@@ -259,7 +260,7 @@ export function reviewVerdictMcpServerConfig(ctx: AgentRunContext, contextFile: 
       contextFile,
     ],
     cwd: ctx.config.workflowDir,
-    env: stringEnvironment(process.env),
+    env: buildMcpSubprocessEnvironment({ config: ctx.config, command: "review-verdict-mcp" }),
   };
 }
 
@@ -287,8 +288,3 @@ function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "context";
 }
 
-function stringEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
-  );
-}

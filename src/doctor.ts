@@ -9,6 +9,7 @@ import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { errorMessage } from "./core/errors.js";
 import type { ServiceConfig } from "./core/config/Config.js";
 import { COMPLETION_REPORT_TOOL_NAME } from "./core/harness/CompletionReportMcpServer.js";
+import { buildMcpSubprocessEnvironment } from "./core/harness/McpSubprocessEnvironment.js";
 import { REVIEW_VERDICT_TOOL_NAME } from "./core/harness/ReviewVerdictMcpServer.js";
 import { CONTINUATION_CONTEXT_ROADMAP } from "./core/summarization/ContinuationContextRoadmap.js";
 
@@ -386,6 +387,8 @@ async function listMcpToolsViaConfiguredCli(input: {
     command: process.execPath,
     args,
     cwd: input.config.workflowDir,
+    // tools/list proves the MCP command can expose its schema; submit-time publication credentials are validated separately.
+    env: buildMcpSubprocessEnvironment({ config: input.config, command: input.command }),
   });
 }
 
@@ -393,10 +396,11 @@ async function listMcpToolsViaCommand(input: {
   command: string;
   args: string[];
   cwd: string;
+  env: Record<string, string>;
 }): Promise<string[]> {
   const child = spawn(input.command, input.args, {
     cwd: input.cwd,
-    env: process.env,
+    env: input.env,
     stdio: ["pipe", "pipe", "pipe"],
   });
   const stdout: Buffer[] = [];
