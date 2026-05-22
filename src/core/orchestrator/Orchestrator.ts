@@ -13,6 +13,7 @@ import {
   type IssueCompletionReportRecord,
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
+  type IssueLifecycleSummaryReference,
   type IssueLifecycleStore,
   type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
@@ -658,7 +659,7 @@ export class Orchestrator {
         const prompt =
           turnNumber === 1
             ? await this.renderWorkerPrompt(entry, attempt)
-            : this.renderWorkerContinuationPrompt(entry);
+            : await this.renderWorkerContinuationPrompt(entry);
         const context = this.buildRunContext(entry, workspace, attempt, turnNumber);
         await this.consumeHarnessEvents(entry, this.options.harness.run(context, prompt), {
           workspace,
@@ -1328,13 +1329,93 @@ export class Orchestrator {
       .join("\n");
   }
 
-  private renderWorkerContinuationPrompt(entry: RunningEntry): string {
+  private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
+    const continuationBrief = await this.renderContinuationBrief(entry);
+    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
+    const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     return [
-      "Continue working on the issue. Check current issue state and proceed according to the workflow.",
+      continuationBrief,
+      reviewVerdict,
+      reviewEvidence,
       this.cursorWorkerMcpPrompt(entry),
     ]
       .filter((item): item is string => item !== null)
       .join("\n");
+  }
+
+  private async renderContinuationBrief(entry: RunningEntry): Promise<string> {
+    const lifecycle = entry.lifecycle ?? (await this.options.lifecycleStore?.get(entry.issue.id)) ?? null;
+    const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id)) ?? [];
+    const history = await this.loadContinuationHistory(runs);
+    const threshold = this.config.reviewLoop.continuationHistoryThreshold;
+    const historyMode = history.eventCount <= threshold ? "full" : "summary";
+    const summaryReference = latestContinuationSummaryReference(lifecycle);
+    const workspace = entry.workspace;
+    const pointers = lifecycle?.summaryPointers;
+    const latestRun = runs[runs.length - 1] ?? null;
+    const transcriptPointers = transcriptPointersForRuns(runs);
+    const statusApiPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
+
+    return [
+      "Structured continuation brief:",
+      "",
+      "Objective:",
+      `- Continue implementation for ${entry.issue.identifier}: ${entry.issue.title}`,
+      "- Reuse the history below before rediscovering prior context.",
+      "",
+      "Lifecycle counters:",
+      `- Phase: ${lifecycle?.phase ?? phaseForIssueState(entry.issue.state, this.config)}`,
+      `- Review rounds: ${lifecycle?.reviewRound ?? 0} / ${this.config.reviewLoop.maxReviewRounds}`,
+      `- Incomplete worker turns: ${lifecycle?.incompleteTurnCount ?? 0} / ${this.config.reviewLoop.maxIncompleteTurns}`,
+      `- Last completion report: ${lifecycle?.lastCompletionReportId ?? "n/a"}`,
+      `- Last review verdict: ${lifecycle?.lastReviewVerdictId ?? "n/a"}`,
+      "",
+      "Latest workspace/git evidence:",
+      `- Workspace path: ${workspace?.path ?? pointers?.workspacePath ?? latestRun?.workspacePath ?? entry.workspacePath ?? "n/a"}`,
+      `- Workspace key: ${workspace?.workspaceKey ?? pointers?.workspaceKey ?? latestRun?.workspaceKey ?? "n/a"}`,
+      `- Branch: ${workspace?.gitBranchName ?? pointers?.gitBranchName ?? pointers?.branchName ?? latestRun?.gitBranchName ?? entry.issue.branchName ?? "n/a"}`,
+      `- Repository path: ${workspace?.repoPath ?? pointers?.repoPath ?? latestRun?.repoPath ?? "n/a"}`,
+      `- Base ref: ${workspace?.baseRef ?? pointers?.baseRef ?? latestRun?.baseRef ?? "n/a"}`,
+      `- Pull request: ${formatPullRequest(pointers?.prNumber ?? latestRun?.prNumber ?? null, pointers?.prUrl ?? latestRun?.prUrl ?? null)}`,
+      `- PR head SHA: ${pointers?.prHeadSha ?? latestRun?.prHeadSha ?? "n/a"}`,
+      `- Last pushed at: ${pointers?.lastPushedAt ?? latestRun?.lastPushedAt ?? "n/a"}`,
+      `- CI status: ${pointers?.ciStatus ?? latestRun?.ciStatus ?? "n/a"}`,
+      "",
+      "History selection:",
+      `- Mode: ${historyMode}`,
+      `- Transcript events considered: ${history.eventCount}`,
+      `- Configured full-history threshold: ${threshold}`,
+      ...(historyMode === "full"
+        ? ["", "Full relevant history:", ...formatFullHistory(history.runs)]
+        : [
+            "",
+            "Stored continuation summary:",
+            `- Reference: ${summaryReference?.id ?? "n/a"}`,
+            `- Created at: ${summaryReference?.createdAt ?? "n/a"}`,
+            `- Summary: ${summaryReference?.summary ?? "No stored continuation history summary is available yet."}`,
+            "",
+            "Transcript/status pointers:",
+            ...formatPointerList(summaryReference?.transcriptPointers ?? transcriptPointers),
+            ...formatPointerList(summaryReference?.statusApiPointers ?? statusApiPointers),
+          ]),
+    ].join("\n");
+  }
+
+  private async loadContinuationHistory(runs: RunRecord[]): Promise<{
+    eventCount: number;
+    runs: Array<{ run: RunRecord; events: TranscriptEvent[]; truncated: boolean }>;
+  }> {
+    const threshold = this.config.reviewLoop.continuationHistoryThreshold;
+    let eventCount = 0;
+    const history: Array<{ run: RunRecord; events: TranscriptEvent[]; truncated: boolean }> = [];
+    for (const run of runs) {
+      if (!this.options.runStore) break;
+      const page = await this.options.runStore.readTranscript(run.runId, { limit: threshold + 1 });
+      const truncated = page.nextOffset !== null;
+      eventCount += page.events.length + (truncated ? 1 : 0);
+      history.push({ run, events: page.events, truncated });
+    }
+    return { eventCount, runs: history };
   }
 
   private cursorWorkerMcpPrompt(entry: RunningEntry): string | null {
@@ -1477,6 +1558,53 @@ function digestTranscript(workerRun: RunRecord | null, events: TranscriptEvent[]
     .slice(-12)
     .map((event) => `#${event.sequence} ${event.eventType}: ${oneLine(event.message ?? "").slice(0, 240)}`);
   return eventDigest.length === 0 ? summary : [...summary, ...eventDigest];
+}
+
+function latestContinuationSummaryReference(
+  lifecycle: IssueLifecycleRecord | null,
+): IssueLifecycleSummaryReference | null {
+  const summaries =
+    lifecycle?.summaryReferences.filter((summary) => summary.kind === "continuation_history") ?? [];
+  return (
+    [...summaries].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))[
+      summaries.length - 1
+    ] ?? null
+  );
+}
+
+function transcriptPointersForRuns(runs: RunRecord[]): string[] {
+  return runs.map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript`);
+}
+
+function statusApiPointersForIssue(issueIdentifier: string, runs: RunRecord[]): string[] {
+  return [
+    `/api/v1/issues/${encodeURIComponent(issueIdentifier)}`,
+    `/api/v1/issues/${encodeURIComponent(issueIdentifier)}/runs`,
+    ...runs.map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}`),
+  ];
+}
+
+function formatFullHistory(history: Array<{ run: RunRecord; events: TranscriptEvent[]; truncated: boolean }>): string[] {
+  if (history.length === 0) return ["- No prior run history is available."];
+  return history.flatMap(({ run, events, truncated }) => [
+    `- Run ${run.runId} (${run.role}, turn ${run.turnNumber}, status ${run.status})`,
+    `  Prompt: ${oneLine(run.prompt).slice(0, 240) || "n/a"}`,
+    `  Workspace: ${run.workspacePath}`,
+    `  Branch: ${run.gitBranchName ?? "n/a"}; base: ${run.baseRef ?? "n/a"}`,
+    ...(events.length === 0
+      ? ["  Transcript events: none"]
+      : events.map((event) => `  #${event.sequence} ${event.eventType}: ${oneLine(event.message ?? "").slice(0, 240) || "n/a"}`)),
+    ...(truncated ? ["  Transcript truncated; inspect the transcript API pointer for the remaining events."] : []),
+  ]);
+}
+
+function formatPointerList(pointers: string[]): string[] {
+  return pointers.length === 0 ? ["- n/a"] : pointers.map((pointer) => `- ${pointer}`);
+}
+
+function formatPullRequest(number: number | null, url: string | null): string {
+  const parts = [number === null ? null : `#${number}`, url].filter((value): value is string => value !== null);
+  return parts.length === 0 ? "n/a" : parts.join(" ");
 }
 
 function oneLine(value: string): string {

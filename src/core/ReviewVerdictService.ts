@@ -196,12 +196,20 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
     "Reviewer verdict: fail / requested changes",
     `Review run: ${verdict.runId}`,
     "",
-    "Current workspace context:",
+    "Lifecycle counters:",
+    `- Review rounds: ${lifecycle.reviewRound}`,
+    `- Incomplete worker turns: ${lifecycle.incompleteTurnCount}`,
+    `- Lifecycle phase: ${lifecycle.phase}`,
+    "",
+    "Latest workspace/git evidence:",
     `- Workspace path: ${pointers.workspacePath ?? "n/a"}`,
     `- Branch: ${pointers.gitBranchName ?? pointers.branchName ?? latestReport?.branchName ?? "n/a"}`,
     `- Repository path: ${pointers.repoPath ?? "n/a"}`,
     `- Base ref: ${pointers.baseRef ?? "n/a"}`,
     `- Pull request: ${formatPullRequest(pointers.prNumber, pointers.prUrl)}`,
+    "",
+    "Acceptance criteria gaps:",
+    ...formatAcceptanceGaps(verdict.acceptanceResults),
     "",
     "Acceptance results:",
     ...verdict.acceptanceResults.map(
@@ -267,6 +275,12 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord) {
 function formatPullRequest(number: number | null, url: string | null): string {
   const parts = [number === null ? null : `#${number}`, url].filter((value): value is string => value !== null);
   return parts.length === 0 ? "n/a" : parts.join(" ");
+}
+
+function formatAcceptanceGaps(results: ReviewVerdictAcceptanceResult[]): string[] {
+  const gaps = results.filter((item) => !item.satisfied);
+  if (gaps.length === 0) return ["- No explicit acceptance criteria gaps were recorded."];
+  return gaps.map((item) => `- ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`);
 }
 
 function sameStateIn(state: string, states: string[]): boolean {

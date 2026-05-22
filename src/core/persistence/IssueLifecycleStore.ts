@@ -23,6 +23,19 @@ export interface IssueLifecycleSummaryPointers {
   lastEvidenceCursor: string | null;
 }
 
+export type IssueLifecycleSummaryReferenceKind = "continuation_history";
+
+export interface IssueLifecycleSummaryReference {
+  id: string;
+  kind: IssueLifecycleSummaryReferenceKind;
+  summary: string;
+  runIds: string[];
+  transcriptEventCount: number;
+  transcriptPointers: string[];
+  statusApiPointers: string[];
+  createdAt: string;
+}
+
 export interface CompletionReportChecklistItem {
   text: string;
   satisfied: boolean;
@@ -120,6 +133,7 @@ export interface IssueLifecycleRecord {
   lastReviewVerdictId: string | null;
   blockedReason: string | null;
   summaryPointers: IssueLifecycleSummaryPointers;
+  summaryReferences: IssueLifecycleSummaryReference[];
   completionReports: IssueCompletionReportRecord[];
   reviewVerdicts: IssueReviewVerdictRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
@@ -135,6 +149,7 @@ export interface IssueLifecyclePatch {
   lastReviewVerdictId?: string | null;
   blockedReason?: string | null;
   summaryPointers?: Partial<IssueLifecycleSummaryPointers>;
+  summaryReferences?: IssueLifecycleSummaryReference[];
   completionReports?: IssueCompletionReportRecord[];
   reviewVerdicts?: IssueReviewVerdictRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
@@ -162,6 +177,7 @@ export class FileIssueLifecycleStore {
         ...existing?.summaryPointers,
         ...patch.summaryPointers,
       },
+      summaryReferences: patch.summaryReferences ?? existing?.summaryReferences ?? [],
       completionReports: patch.completionReports ?? existing?.completionReports ?? [],
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
@@ -296,6 +312,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
+    summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
     completionReports: normalizeCompletionReports(value.completionReports, filePath),
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
@@ -321,6 +338,41 @@ function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecy
     ciStatus: optionalNullableString(value.ciStatus, filePath, "summaryPointers.ciStatus"),
     lastPushedAt: optionalNullableString(value.lastPushedAt, filePath, "summaryPointers.lastPushedAt"),
     lastEvidenceCursor: optionalNullableString(value.lastEvidenceCursor, filePath, "summaryPointers.lastEvidenceCursor"),
+  };
+}
+
+function normalizeSummaryReferences(value: unknown, filePath: string): IssueLifecycleSummaryReference[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "summaryReferences is invalid");
+  return value.map((item, index) => normalizeSummaryReference(item, filePath, index));
+}
+
+function normalizeSummaryReference(value: unknown, filePath: string, index: number): IssueLifecycleSummaryReference {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `summaryReferences[${index}] is invalid`);
+  if (value.kind !== "continuation_history") {
+    throw corruptLifecycle(filePath, `summaryReferences[${index}].kind is invalid`);
+  }
+  return {
+    id: requiredString(value.id, filePath, `summaryReferences[${index}].id`),
+    kind: value.kind,
+    summary: requiredString(value.summary, filePath, `summaryReferences[${index}].summary`),
+    runIds: requiredStringArray(value.runIds, filePath, `summaryReferences[${index}].runIds`),
+    transcriptEventCount: nonNegativeInteger(
+      value.transcriptEventCount,
+      filePath,
+      `summaryReferences[${index}].transcriptEventCount`,
+    ),
+    transcriptPointers: requiredStringArray(
+      value.transcriptPointers,
+      filePath,
+      `summaryReferences[${index}].transcriptPointers`,
+    ),
+    statusApiPointers: requiredStringArray(
+      value.statusApiPointers,
+      filePath,
+      `summaryReferences[${index}].statusApiPointers`,
+    ),
+    createdAt: requiredString(value.createdAt, filePath, `summaryReferences[${index}].createdAt`),
   };
 }
 

@@ -1433,9 +1433,13 @@ describe("Orchestrator", () => {
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Reviewer findings to address");
-    expect(harness.runs[0]?.prompt).toContain("Current workspace context:");
+    expect(harness.runs[0]?.prompt).toContain("Lifecycle counters:");
+    expect(harness.runs[0]?.prompt).toContain("Review rounds: 0");
+    expect(harness.runs[0]?.prompt).toContain("Latest workspace/git evidence:");
     expect(harness.runs[0]?.prompt).toContain("Branch: symphony/TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Pull request: #42 https://github.com/acme/symphony/pull/42");
+    expect(harness.runs[0]?.prompt).toContain("Acceptance criteria gaps:");
+    expect(harness.runs[0]?.prompt).toContain("Duplicate verdicts are idempotent");
     expect(harness.runs[0]?.prompt).toContain("Add regression coverage for duplicate verdict submissions.");
     expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42#discussion_r1");
   });
@@ -1508,6 +1512,112 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.prompts).toEqual(["Work on TEST-1"]);
+  });
+
+  it("includes full relevant run history in continuation prompts below the event threshold", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.reviewLoop.continuationHistoryThreshold = 5;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(2);
+    expect(harness.runs[1]?.prompt).toContain("Structured continuation brief:");
+    expect(harness.runs[1]?.prompt).toContain("Mode: full");
+    expect(harness.runs[1]?.prompt).toContain("Full relevant history:");
+    expect(harness.runs[1]?.prompt).toContain("Run fake-issue-1-1");
+    expect(harness.runs[1]?.prompt).toContain("#2 completed: fake completed");
+    expect(harness.runs[1]?.prompt).not.toContain("Continue working on the issue. Check current issue state");
+  });
+
+  it("uses stored summaries and API pointers in continuation prompts above the event threshold", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.reviewLoop.continuationHistoryThreshold = 1;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      summaryReferences: [
+        {
+          id: "continuation-summary:issue-1:stored",
+          kind: "continuation_history",
+          summary: "Stored summary: prior run created the workspace and started the implementation.",
+          runIds: ["fake-issue-1-1"],
+          transcriptEventCount: 12,
+          transcriptPointers: ["/api/v1/runs/fake-issue-1-1/transcript"],
+          statusApiPointers: ["/api/v1/issues/TEST-1", "/api/v1/issues/TEST-1/runs"],
+          createdAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(2);
+    expect(harness.runs[1]?.prompt).toContain("Mode: summary");
+    expect(harness.runs[1]?.prompt).toContain("Reference: continuation-summary:issue-1:stored");
+    expect(harness.runs[1]?.prompt).toContain("Stored summary: prior run created the workspace");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/fake-issue-1-1/transcript");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/TEST-1");
+    expect(harness.runs[1]?.prompt).not.toContain("Full relevant history:");
   });
 });
 
