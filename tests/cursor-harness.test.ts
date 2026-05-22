@@ -62,6 +62,9 @@ describe("Cursor event mapping", () => {
     expect(args).toEqual(
       expect.arrayContaining(["completion-report-mcp", "--workflow", config.workflowPath, "--context-file", "/tmp/context.json"]),
     );
+    expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key" });
+    expect(server.env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
   });
 
   it("wires the Symphony review verdict MCP server into reviewer Cursor runs", () => {
@@ -101,5 +104,8 @@ describe("Cursor event mapping", () => {
         "/tmp/review-context.json",
       ]),
     );
+    expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key" });
+    expect(server.env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
   });
 });
