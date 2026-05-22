@@ -72,7 +72,13 @@ export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<AgentRunRole,
     "cursor.runtime",
     "server.open_workspace",
   ],
-  reviewer: ["github.review_evidence_read", "linear.tracker", "linear.writeback", "cursor.runtime"],
+  reviewer: [
+    "github.review_evidence_read",
+    "github.review_feedback_write",
+    "linear.tracker",
+    "linear.writeback",
+    "cursor.runtime",
+  ],
 };
 
 const ROLE_NAMES: readonly AgentRunRole[] = ["worker", "reviewer"];

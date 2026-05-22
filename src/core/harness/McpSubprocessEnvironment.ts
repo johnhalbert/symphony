@@ -1,6 +1,7 @@
 import type { ServiceConfig } from "../config/Config.js";
+import type { AgentRunRole } from "../types.js";
 
-export type McpSubprocessCommand = "completion-report-mcp" | "review-verdict-mcp";
+export type McpSubprocessCommand = "completion-report-mcp" | "review-verdict-mcp" | "review-feedback-mcp";
 
 export interface McpSubprocessEnvironmentInput {
   config: ServiceConfig;
@@ -79,13 +80,17 @@ function addCommandCapabilitySlice(
   config: ServiceConfig,
   command: McpSubprocessCommand,
 ): void {
-  if (command !== "completion-report-mcp") return;
-  if (!config.github.publishPullRequests) return;
-  addGitHubPublicationParseRefs(env, config);
-  addGitHubPublicationEnvironment(env, config);
+  if (command === "completion-report-mcp" && config.github.publishPullRequests) {
+    addGitHubParseRefs(env, config);
+    addGitHubCapabilityEnvironment(env, config, "worker", "github.publication");
+  }
+  if (command === "review-feedback-mcp") {
+    addGitHubParseRefs(env, config);
+    addGitHubCapabilityEnvironment(env, config, "reviewer", "github.review_feedback_write");
+  }
 }
 
-function addGitHubPublicationParseRefs(env: Record<string, string>, config: ServiceConfig): void {
+function addGitHubParseRefs(env: Record<string, string>, config: ServiceConfig): void {
   const rawGithub = config.raw.github;
 
   const ownerRef = envReference(rawGithub?.owner);
@@ -101,14 +106,19 @@ function addGitHubPublicationParseRefs(env: Record<string, string>, config: Serv
   if (apiBaseUrlRef) env[apiBaseUrlRef] = config.github.apiBaseUrl;
 }
 
-function addGitHubPublicationEnvironment(env: Record<string, string>, config: ServiceConfig): void {
-  if (config.credentialProfiles.hasAssignment("worker", "github.publication")) {
-    const credential = config.credentialProfiles.resolveForRole("worker", "github.publication");
+function addGitHubCapabilityEnvironment(
+  env: Record<string, string>,
+  config: ServiceConfig,
+  role: AgentRunRole,
+  capability: "github.publication" | "github.review_feedback_write",
+): void {
+  if (config.credentialProfiles.hasAssignment(role, capability)) {
+    const credential = config.credentialProfiles.resolveForRole(role, capability);
     const profileName = credential?.profileName;
     const serialized = config.credentialProfiles.toJSON();
     const envVar = profileName === undefined || profileName === null ? undefined : serialized.profiles[profileName]?.source.name;
     if (envVar === undefined || credential?.source !== "profile") {
-      throw new Error("Worker github.publication profile assignment could not be resolved");
+      throw new Error(`${role} ${capability} profile assignment could not be resolved`);
     }
     env[envVar] = credential.value;
     return;

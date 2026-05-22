@@ -10,6 +10,7 @@ import { errorMessage } from "./core/errors.js";
 import type { ServiceConfig } from "./core/config/Config.js";
 import { COMPLETION_REPORT_TOOL_NAME } from "./core/harness/CompletionReportMcpServer.js";
 import { buildMcpSubprocessEnvironment } from "./core/harness/McpSubprocessEnvironment.js";
+import { REVIEW_FEEDBACK_TOOL_NAME } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { REVIEW_VERDICT_TOOL_NAME } from "./core/harness/ReviewVerdictMcpServer.js";
 import { CONTINUATION_CONTEXT_ROADMAP } from "./core/summarization/ContinuationContextRoadmap.js";
 
@@ -39,7 +40,7 @@ export interface ReviewLoopDoctorCheckOptions {
   linearStateLister?: LinearStateLister;
 }
 
-export type McpToolServerCommand = "completion-report-mcp" | "review-verdict-mcp";
+export type McpToolServerCommand = "completion-report-mcp" | "review-verdict-mcp" | "review-feedback-mcp";
 
 export type McpToolLister = (input: {
   command: McpToolServerCommand;
@@ -83,6 +84,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
     await checkWritable(checks, "workspace.state_dir", config.workspace.stateDir);
     await checkGit(checks);
     checks.push(await githubPublicationDoctorCheck(config));
+    checks.push(await githubReviewFeedbackDoctorCheck(config));
 
     if (process.env.CURSOR_API_KEY) {
       checks.push({ id: "env.cursor", status: "ok", message: "CURSOR_API_KEY is set" });
@@ -264,6 +266,7 @@ async function mcpToolAvailabilityCheck(
   const expected = [
     { command: "completion-report-mcp" as const, tool: COMPLETION_REPORT_TOOL_NAME },
     { command: "review-verdict-mcp" as const, tool: REVIEW_VERDICT_TOOL_NAME },
+      { command: "review-feedback-mcp" as const, tool: REVIEW_FEEDBACK_TOOL_NAME },
   ];
   try {
     const missing: string[] = [];
@@ -363,6 +366,20 @@ export async function githubPublicationDoctorCheck(config: ServiceConfig): Promi
     };
   } catch (error) {
     return { id: "github.pr_publication", status: "error", message: `github.publication: ${errorMessage(error)}` };
+  }
+}
+
+export async function githubReviewFeedbackDoctorCheck(config: ServiceConfig): Promise<DoctorCheck> {
+  try {
+    const github = createGitHubPullRequestClientForCapability(config, "github.review_feedback_write");
+    await github.checkRepositoryAccess();
+    return {
+      id: "github.review_feedback_write",
+      status: "ok",
+      message: `GitHub PR review feedback can access ${config.github.owner}/${config.github.repo}`,
+    };
+  } catch (error) {
+    return { id: "github.review_feedback_write", status: "error", message: `github.review_feedback_write: ${errorMessage(error)}` };
   }
 }
 

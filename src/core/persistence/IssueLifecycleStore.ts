@@ -123,6 +123,26 @@ export interface IssueReviewVerdictRecord {
   writebackOperationKeys: string[];
 }
 
+export type PullRequestReviewFeedbackKind = "review" | "review_comment" | "issue_comment";
+export type PullRequestReviewFeedbackEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+
+export interface IssueReviewFeedbackRecord {
+  id: string;
+  idempotencyKey: string;
+  requestHash: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  kind: PullRequestReviewFeedbackKind;
+  event: PullRequestReviewFeedbackEvent | null;
+  body: string;
+  pullRequest: CompletionReportPullRequestRef;
+  reviewer: string | null;
+  reviewUrl: string | null;
+  commentUrls: string[];
+  submittedAt: string;
+}
+
 export interface IssueLifecycleRecord {
   issueId: string;
   issueIdentifier: string;
@@ -136,6 +156,7 @@ export interface IssueLifecycleRecord {
   summaryReferences: IssueLifecycleSummaryReference[];
   completionReports: IssueCompletionReportRecord[];
   reviewVerdicts: IssueReviewVerdictRecord[];
+  reviewFeedback: IssueReviewFeedbackRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
   createdAt: string;
   updatedAt: string;
@@ -152,6 +173,7 @@ export interface IssueLifecyclePatch {
   summaryReferences?: IssueLifecycleSummaryReference[];
   completionReports?: IssueCompletionReportRecord[];
   reviewVerdicts?: IssueReviewVerdictRecord[];
+  reviewFeedback?: IssueReviewFeedbackRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
 }
 
@@ -180,6 +202,7 @@ export class FileIssueLifecycleStore {
       summaryReferences: patch.summaryReferences ?? existing?.summaryReferences ?? [],
       completionReports: patch.completionReports ?? existing?.completionReports ?? [],
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
+      reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -315,6 +338,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
     completionReports: normalizeCompletionReports(value.completionReports, filePath),
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
+    reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
@@ -386,6 +410,12 @@ function normalizeReviewVerdicts(value: unknown, filePath: string): IssueReviewV
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewVerdicts is invalid");
   return value.map((item, index) => normalizeReviewVerdict(item, filePath, index));
+}
+
+function normalizeReviewFeedback(value: unknown, filePath: string): IssueReviewFeedbackRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewFeedback is invalid");
+  return value.map((item, index) => normalizeReviewFeedbackRecord(item, filePath, index));
 }
 
 function defaultReviewEvidence(): PullRequestReviewEvidenceState {
@@ -500,6 +530,48 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
     reviewer: nullableString(value.reviewer, filePath, `reviewVerdicts[${index}].reviewer`),
     submittedAt: requiredString(value.submittedAt, filePath, `reviewVerdicts[${index}].submittedAt`),
     writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `reviewVerdicts[${index}].writebackOperationKeys`),
+  };
+}
+
+function normalizeReviewFeedbackRecord(value: unknown, filePath: string, index: number): IssueReviewFeedbackRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `reviewFeedback[${index}] is invalid`);
+  const kind = value.kind;
+  if (kind !== "review" && kind !== "review_comment" && kind !== "issue_comment") {
+    throw corruptLifecycle(filePath, `reviewFeedback[${index}].kind is invalid`);
+  }
+  const event = optionalNullableString(value.event, filePath, `reviewFeedback[${index}].event`);
+  if (event !== null && event !== "APPROVE" && event !== "REQUEST_CHANGES" && event !== "COMMENT") {
+    throw corruptLifecycle(filePath, `reviewFeedback[${index}].event is invalid`);
+  }
+  return {
+    id: requiredString(value.id, filePath, `reviewFeedback[${index}].id`),
+    idempotencyKey: requiredString(value.idempotencyKey, filePath, `reviewFeedback[${index}].idempotencyKey`),
+    requestHash: requiredString(value.requestHash, filePath, `reviewFeedback[${index}].requestHash`),
+    runId: requiredString(value.runId, filePath, `reviewFeedback[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `reviewFeedback[${index}].issueId`),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, `reviewFeedback[${index}].issueIdentifier`),
+    kind,
+    event,
+    body: requiredString(value.body, filePath, `reviewFeedback[${index}].body`),
+    pullRequest: normalizeReviewFeedbackPullRequest(value.pullRequest, filePath, index),
+    reviewer: optionalNullableString(value.reviewer, filePath, `reviewFeedback[${index}].reviewer`),
+    reviewUrl: optionalNullableString(value.reviewUrl, filePath, `reviewFeedback[${index}].reviewUrl`),
+    commentUrls: requiredStringArray(value.commentUrls, filePath, `reviewFeedback[${index}].commentUrls`),
+    submittedAt: requiredString(value.submittedAt, filePath, `reviewFeedback[${index}].submittedAt`),
+  };
+}
+
+function normalizeReviewFeedbackPullRequest(
+  value: unknown,
+  filePath: string,
+  index: number,
+): CompletionReportPullRequestRef {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `reviewFeedback[${index}].pullRequest is invalid`);
+  return {
+    url: nullableString(value.url, filePath, `reviewFeedback[${index}].pullRequest.url`),
+    number: nullableNumber(value.number, filePath, `reviewFeedback[${index}].pullRequest.number`),
+    headSha: optionalNullableString(value.headSha, filePath, `reviewFeedback[${index}].pullRequest.headSha`),
+    branch: optionalNullableString(value.branch, filePath, `reviewFeedback[${index}].pullRequest.branch`),
   };
 }
 

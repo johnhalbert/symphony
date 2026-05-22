@@ -315,6 +315,73 @@ describe("MCP subprocess environment", () => {
     expect(githubEnvKeys(env)).toEqual([]);
   });
 
+  it("injects reviewer feedback profile credentials and metadata only for review feedback MCP", () => {
+    const rawConfig = {
+      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      github: {
+        owner: "$GITHUB_OWNER",
+        repo: "$GITHUB_REPO",
+        head_owner: "$GITHUB_HEAD_OWNER",
+        api_base_url: "$GITHUB_API_BASE_URL",
+        token: "$PUBLICATION_TOKEN_REF",
+        publish_pull_requests: true,
+      },
+      credential_profiles: {
+        profiles: {
+          publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+          feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+          reviewRead: { value: "$GITHUB_REVIEW_READ_TOKEN", capabilities: ["github.review_evidence_read"] },
+        },
+        roles: {
+          worker: {
+            "github.publication": "publication",
+          },
+          reviewer: {
+            "github.review_feedback_write": "feedback",
+            "github.review_evidence_read": "reviewRead",
+          },
+        },
+      },
+    } as const;
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", {
+      LINEAR_API_KEY: "linear-secret",
+      GITHUB_OWNER: "acme",
+      GITHUB_REPO: "symphony",
+      GITHUB_HEAD_OWNER: "john",
+      GITHUB_API_BASE_URL: "https://api.github.test",
+      PUBLICATION_TOKEN_REF: "publication-ref-secret",
+      GITHUB_PUBLICATION_TOKEN: "publication-secret",
+      GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+      GITHUB_REVIEW_READ_TOKEN: "review-read-secret",
+      GITHUB_TOKEN: "decoy-github-secret",
+    });
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-feedback-mcp",
+      parentEnv: { PATH: "/bin", GITHUB_TOKEN: "decoy-parent-github-secret" },
+    });
+
+    expect(env).toMatchObject({
+      GITHUB_OWNER: "acme",
+      GITHUB_REPO: "symphony",
+      GITHUB_HEAD_OWNER: "john",
+      GITHUB_API_BASE_URL: "https://api.github.test",
+      GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+    });
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_PUBLICATION_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_REVIEW_READ_TOKEN");
+    expect(env).not.toHaveProperty("PUBLICATION_TOKEN_REF");
+    expect(githubEnvKeys(env)).toEqual([
+      "GITHUB_API_BASE_URL",
+      "GITHUB_FEEDBACK_TOKEN",
+      "GITHUB_HEAD_OWNER",
+      "GITHUB_OWNER",
+      "GITHUB_REPO",
+    ]);
+  });
+
   it("carries the closed parse dependencies needed for child config parsing", () => {
     const rawConfig = {
       tracker: {

@@ -291,6 +291,114 @@ describe("GitHubPullRequestClient", () => {
     });
   });
 
+  it("submits comment, request-changes, and approve PR review feedback with the bound head SHA", async () => {
+    const calls: Array<{ method: string; pathname: string; body: unknown; authorization: string | undefined }> = [];
+    const client = new GitHubPullRequestClient(config(), async (input, init) => {
+      const url = new URL(String(input));
+      calls.push({
+        method: init?.method ?? "GET",
+        pathname: url.pathname,
+        body: init?.body === undefined ? null : JSON.parse(String(init.body)),
+        authorization: (init?.headers as Record<string, string> | undefined)?.authorization,
+      });
+      return jsonResponse(
+        {
+          id: 9001 + calls.length,
+          html_url: `https://github.com/octo-org/symphony/pull/42#pullrequestreview-${9001 + calls.length}`,
+          comments: [{ html_url: `https://github.com/octo-org/symphony/pull/42#discussion_r${9001 + calls.length}` }],
+        },
+        200,
+      );
+    });
+
+    await client.submitPullRequestReviewFeedback({
+      pullRequestNumber: 42,
+      headSha: "abc123",
+      event: "COMMENT",
+      body: "Comment review.",
+    });
+    await client.submitPullRequestReviewFeedback({
+      pullRequestNumber: 42,
+      headSha: "abc123",
+      event: "REQUEST_CHANGES",
+      body: "Please revise.",
+      comments: [{ path: "src/index.ts", body: "Inline note.", line: 7, side: "RIGHT" }],
+    });
+    const approved = await client.submitPullRequestReviewFeedback({
+      pullRequestNumber: 42,
+      headSha: "abc123",
+      event: "APPROVE",
+      body: "Looks good.",
+    });
+
+    expect(calls.map((call) => `${call.method} ${call.pathname}`)).toEqual([
+      "POST /repos/octo-org/symphony/pulls/42/reviews",
+      "POST /repos/octo-org/symphony/pulls/42/reviews",
+      "POST /repos/octo-org/symphony/pulls/42/reviews",
+    ]);
+    expect(calls.map((call) => (call.body as { event: string }).event)).toEqual(["COMMENT", "REQUEST_CHANGES", "APPROVE"]);
+    expect(calls[1]?.body).toMatchObject({
+      commit_id: "abc123",
+      comments: [{ path: "src/index.ts", body: "Inline note.", line: 7, side: "RIGHT" }],
+    });
+    expect(calls.every((call) => call.authorization === "Bearer github-secret")).toBe(true);
+    expect(approved.reviewUrl).toContain("pullrequestreview");
+    expect(approved.commentUrls).toHaveLength(1);
+  });
+
+  it("submits standalone review comments and PR issue comments", async () => {
+    const calls: Array<{ pathname: string; body: unknown }> = [];
+    const client = new GitHubPullRequestClient(config(), async (input, init) => {
+      const url = new URL(String(input));
+      calls.push({ pathname: url.pathname, body: init?.body === undefined ? null : JSON.parse(String(init.body)) });
+      return jsonResponse({ id: 9001, html_url: `https://github.com/octo-org/symphony/pull/42#comment-${calls.length}` });
+    });
+
+    const inline = await client.submitPullRequestReviewCommentFeedback({
+      pullRequestNumber: 42,
+      headSha: "abc123",
+      body: "Inline note.",
+      path: "src/index.ts",
+      line: 7,
+      side: "RIGHT",
+    });
+    const highLevel = await client.submitPullRequestIssueCommentFeedback({
+      pullRequestNumber: 42,
+      body: "High-level note.",
+    });
+
+    expect(calls).toEqual([
+      {
+        pathname: "/repos/octo-org/symphony/pulls/42/comments",
+        body: { body: "Inline note.", commit_id: "abc123", path: "src/index.ts", line: 7, side: "RIGHT" },
+      },
+      {
+        pathname: "/repos/octo-org/symphony/issues/42/comments",
+        body: { body: "High-level note." },
+      },
+    ]);
+    expect(inline.commentUrls).toEqual(["https://github.com/octo-org/symphony/pull/42#comment-1"]);
+    expect(highLevel.commentUrls).toEqual(["https://github.com/octo-org/symphony/pull/42#comment-2"]);
+  });
+
+  it("surfaces GitHub self-approval failures without exposing tokens", async () => {
+    const client = new GitHubPullRequestClient(config(), async () =>
+      jsonResponse(
+        { message: "Can not approve your own pull request with github-secret" },
+        422,
+      ),
+    );
+
+    await expect(
+      client.submitPullRequestReviewFeedback({
+        pullRequestNumber: 42,
+        headSha: "abc123",
+        event: "APPROVE",
+        body: "Looks good.",
+      }),
+    ).rejects.toThrow(/Can not approve your own pull request with \[redacted\]/);
+  });
+
   it("reuses an existing open pull request without creating a duplicate", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-reuse-"));
     try {

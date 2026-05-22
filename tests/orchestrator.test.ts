@@ -831,6 +831,63 @@ describe("Orchestrator", () => {
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 0 });
   });
 
+  it("instructs default reviewer prompts to leave PR feedback before verdict submission", async () => {
+    const config = testConfig(root);
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: {
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+      },
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    const prompt = harness.runs[0]?.prompt ?? "";
+    expect(prompt).toContain("submit_pull_request_review_feedback");
+    expect(prompt).toContain("submit_review_verdict.evidence");
+    expect(prompt.indexOf("submit_pull_request_review_feedback")).toBeLessThan(prompt.indexOf("submit_review_verdict"));
+    expect(prompt).toContain("PR number, repository, token, or commit identity");
+  });
+
   it("processes a live fail verdict submitted by a reviewer harness run", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;

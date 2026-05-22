@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
+import { writeReviewFeedbackMcpContext } from "../../src/core/harness/ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
 import { buildMcpSubprocessEnvironment } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
@@ -35,6 +36,7 @@ export class CursorHarness implements AgentHarness {
     const completionReportContextFile = completionReportContextFilePath(ctx);
     const isWorker = ctx.role === "worker";
     const reviewVerdictContextFile = reviewVerdictContextFilePath(ctx);
+    const reviewFeedbackContextFile = reviewFeedbackContextFilePath(ctx);
     const isReviewer = ctx.role === "reviewer";
     if (isWorker) {
       await writeCompletionReportMcpContext(completionReportContextFile, {
@@ -59,6 +61,15 @@ export class CursorHarness implements AgentHarness {
         reviewer: null,
         phase: "review",
       });
+      await writeReviewFeedbackMcpContext(reviewFeedbackContextFile, {
+        issue: ctx.issue,
+        activeRunId: null,
+        role: "reviewer",
+        token: null,
+        expectedToken: null,
+        reviewer: null,
+        phase: "review",
+      });
     }
     const runOptions: NonNullable<Parameters<SDKAgent["send"]>[1]> = {
       model: cursorModelSelection(ctx),
@@ -75,7 +86,8 @@ export class CursorHarness implements AgentHarness {
         : isReviewer
           ? {
               mcpServers: {
-                symphony: reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFile),
+                symphony_review_verdict: reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFile),
+                symphony_review_feedback: reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFile),
               },
             }
         : {}),
@@ -109,6 +121,15 @@ export class CursorHarness implements AgentHarness {
     }
     if (isReviewer) {
       await writeReviewVerdictMcpContext(reviewVerdictContextFile, {
+        issue: ctx.issue,
+        activeRunId: run.id,
+        role: "reviewer",
+        token: null,
+        expectedToken: null,
+        reviewer: `${agent.agentId}:${run.id}`,
+        phase: "review",
+      });
+      await writeReviewFeedbackMcpContext(reviewFeedbackContextFile, {
         issue: ctx.issue,
         activeRunId: run.id,
         role: "reviewer",
@@ -264,6 +285,30 @@ export function reviewVerdictMcpServerConfig(ctx: AgentRunContext, contextFile: 
   };
 }
 
+export function reviewFeedbackMcpServerConfig(ctx: AgentRunContext, contextFile: string): {
+  type: "stdio";
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+} {
+  return {
+    type: "stdio",
+    command: process.execPath,
+    args: [
+      ...process.execArgv,
+      process.argv[1] ?? "dist/cli.js",
+      "review-feedback-mcp",
+      "--workflow",
+      ctx.config.workflowPath,
+      "--context-file",
+      contextFile,
+    ],
+    cwd: ctx.config.workflowDir,
+    env: buildMcpSubprocessEnvironment({ config: ctx.config, command: "review-feedback-mcp" }),
+  };
+}
+
 function completionReportContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
@@ -276,6 +321,14 @@ function reviewVerdictContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
     "review-verdict-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
+function reviewFeedbackContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "review-feedback-mcp",
     `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
   );
 }

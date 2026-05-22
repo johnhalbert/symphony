@@ -66,6 +66,14 @@ Reviewer pass does not use a separate `Ready` or `Ready for Human` Linear state 
 
 Review failures continue through the review loop. Policy exhaustion, repeated incomplete worker turns, or other human-required escalation moves the issue to `Blocked`.
 
+## GitHub PR Review Feedback
+
+Reviewer agents do not receive raw GitHub write credentials directly in their prompts or lifecycle context files. When a reviewer needs to leave PR feedback, Cursor mounts a separate Symphony-owned `review-feedback-mcp` server alongside the GitHub-free `review-verdict-mcp` server. The reviewer first calls `submit_pull_request_review_feedback`; Symphony resolves the lifecycle-bound PR and head SHA service-side, writes feedback through a scoped GitHub client, and returns durable PR review/comment URLs. The reviewer then passes those returned URLs to `submit_review_verdict.evidence`.
+
+The feedback context file contains only local reviewer handoff identity: issue, active run id, reviewer role, reviewer identity, review phase, and optional local handoff token fields. It must not contain PR number, PR URL, head SHA, GitHub token, repository owner/name, or other GitHub credential material.
+
+The feedback MCP service fails closed unless the caller is an active reviewer, the lifecycle is in review, the active run matches the lifecycle summary, and a lifecycle-bound PR exists. Inline review feedback and PR reviews use the lifecycle-bound head SHA; if the head SHA is absent, Symphony rejects the request instead of letting the reviewer supply commit identity. Feedback writes are idempotent by issue, run, and idempotency key, so retries replay stored URLs without duplicate GitHub writes.
+
 ## Workspace Safety
 
 Dogfood uses `git_worktree` workspaces and `cleanup: refuse_dirty`.
@@ -94,19 +102,24 @@ credential_profiles:
       value: $GITHUB_PUBLISH_TOKEN
       capabilities:
         - github.publication
+    github-feedback:
+      value: $GITHUB_FEEDBACK_TOKEN
+      capabilities:
+        - github.review_feedback_write
   roles:
     worker:
       github.discovery: github-read
       github.publication: github-publish
     reviewer:
       github.review_evidence_read: github-read
+      github.review_feedback_write: github-feedback
 ```
 
-The closed capability inventory is `github.discovery`, `github.publication`, `github.review_evidence_read`, `github.review_feedback_write`, `linear.tracker`, `linear.writeback`, `cursor.runtime`, and `server.open_workspace`. `github.review_feedback_write` is reserved for a future reviewer feedback implementation and has no current consumer.
+The closed capability inventory is `github.discovery`, `github.publication`, `github.review_evidence_read`, `github.review_feedback_write`, `linear.tracker`, `linear.writeback`, `cursor.runtime`, and `server.open_workspace`. `github.review_feedback_write` is consumed only by the reviewer feedback MCP server.
 
 When `credential_profiles` is absent, current behavior is unchanged. GitHub capabilities fall back to `github.token` or `GITHUB_TOKEN`; both Linear capabilities fall back to `tracker.api_key` or `LINEAR_API_KEY`; `cursor.runtime` falls back to env-only `CURSOR_API_KEY`; and `server.open_workspace` falls back only to `server.open_workspace_token`. Workflow config may still point `server.open_workspace_token` at `SYMPHONY_OPEN_WORKSPACE_TOKEN`.
 
-Default role capability sets are intentionally narrow: workers use GitHub discovery/publication, Linear tracker/writeback, Cursor runtime, and workspace-open credentials; reviewers use GitHub review-evidence read, Linear tracker/writeback, and Cursor runtime. MCP context `token` and `expectedToken` fields in completion-report and review-verdict handoff files are local handoff authentication, not GitHub, Linear, Cursor, or server credentials, and must not be modeled as credential profiles.
+Default role capability sets are intentionally narrow: workers use GitHub discovery/publication, Linear tracker/writeback, Cursor runtime, and workspace-open credentials; reviewers use GitHub review-evidence read, GitHub review-feedback write, Linear tracker/writeback, and Cursor runtime. MCP context `token` and `expectedToken` fields in completion-report, review-feedback, and review-verdict handoff files are local handoff authentication, not GitHub, Linear, Cursor, or server credentials, and must not be modeled as credential profiles.
 
 ## Cursor Runtime
 
