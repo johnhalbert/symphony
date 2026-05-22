@@ -89,6 +89,44 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.running).toBe(0);
   });
 
+  it("adds scoped Symphony MCP completion instructions to Cursor worker prompts", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new CursorPromptHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.prompts[0]).toContain("Work on TEST-1");
+    expect(harness.prompts[0]).toContain("Symphony MCP completion handoff");
+    expect(harness.prompts[0]).toContain("Active issue: TEST-1 (issue-1)");
+    expect(harness.prompts[0]).toContain("call the submit_completion_report MCP tool");
+    expect(harness.prompts[0]).toContain("Symphony injects runId and issueId");
+    expect(harness.prompts[0]).toContain("Do not comment on Linear");
+  });
+
   it("revalidates issue state before dispatch", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -1551,6 +1589,17 @@ class NonResumableHarness implements AgentHarness {
   async *run(_ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.prompts.push(prompt);
     yield { type: "session_started", sessionId: "session-1", runId: "run-1" };
+    yield { type: "completed" };
+  }
+}
+
+class CursorPromptHarness implements AgentHarness {
+  readonly id = "cursor";
+  readonly prompts: string[] = [];
+
+  async *run(_ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.prompts.push(prompt);
+    yield { type: "session_started", sessionId: "cursor-session-1", runId: "cursor-run-1" };
     yield { type: "completed" };
   }
 }

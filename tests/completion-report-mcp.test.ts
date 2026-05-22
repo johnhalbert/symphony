@@ -1,6 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type {
   CompletionReportPullRequestPublication,
@@ -8,6 +9,8 @@ import type {
   CompletionReportPullRequestPublisher,
 } from "../src/core/CompletionReportService.js";
 import {
+  COMPLETION_REPORT_TOOL_NAME,
+  runCompletionReportMcpServer,
   submitCompletionReportFromMcp,
   writeCompletionReportMcpContext,
 } from "../src/core/harness/CompletionReportMcpServer.js";
@@ -130,9 +133,119 @@ describe("completion report MCP handoff", () => {
       lastEvidenceCursor: "idem-1",
     });
   });
+
+  it("exposes a documented stdio MCP tool and submits without caller-supplied run identity", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir, false), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-stdio-1",
+      sessionId: "agent-stdio:run-stdio-1",
+      agentId: "agent-stdio",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      activeRunId: "run-stdio-1",
+      role: "worker",
+      sessionId: "agent-stdio:run-stdio-1",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const responses = collectJsonRpcResponses(output);
+    const server = runCompletionReportMcpServer({
+      workflowPath,
+      contextFile,
+      input: input as unknown as NodeJS.ReadStream,
+      output: output as unknown as NodeJS.WriteStream,
+    });
+
+    writeJsonRpc(input, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    writeJsonRpc(input, { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+    writeJsonRpc(input, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    const toolsList = await waitForResponse(responses, 2);
+    const tool = asRecordArray(asRecord(toolsList.result).tools)[0];
+    if (!tool) throw new Error("Expected completion report MCP tool");
+    const schema = asRecord(tool.inputSchema);
+    expect(tool.name).toBe(COMPLETION_REPORT_TOOL_NAME);
+    expect(tool.description).toContain("completion report");
+    expect(schema.required).toEqual([
+      "summary",
+      "validationEvidence",
+      "acceptanceChecklist",
+      "changedFiles",
+      "branchName",
+      "pullRequest",
+      "risks",
+      "idempotencyKey",
+    ]);
+    expect(asRecord(asRecord(schema.properties).summary).description).toContain("implementation");
+
+    writeJsonRpc(input, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: COMPLETION_REPORT_TOOL_NAME, arguments: { idempotencyKey: "missing-summary" } },
+    });
+    await expect(waitForResponse(responses, 3)).resolves.toMatchObject({
+      error: { message: expect.stringContaining("Completion report is invalid") },
+    });
+
+    writeJsonRpc(input, {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: COMPLETION_REPORT_TOOL_NAME, arguments: report("stdio-idem-1") },
+    });
+    await expect(waitForResponse(responses, 4)).resolves.toMatchObject({
+      result: {
+        structuredContent: {
+          accepted: true,
+          replayed: false,
+          reportId: "completion-report:issue-1:stdio-idem-1",
+        },
+      },
+    });
+    input.end();
+    await server;
+    await expect(new FileIssueLifecycleStore(stateDir).get("TEST-1")).resolves.toMatchObject({
+      phase: "review",
+      lastCompletionReportId: "completion-report:issue-1:stdio-idem-1",
+      completionReports: [
+        {
+          runId: "run-stdio-1",
+          issueId: "issue-1",
+        },
+      ],
+    });
+  });
 });
 
-function workflow(stateDir: string): string {
+function workflow(stateDir: string, publishPullRequests = true): string {
   return `---
 tracker:
   kind: linear
@@ -157,16 +270,14 @@ github:
   owner: acme
   repo: symphony
   token: github-token
-  publish_pull_requests: true
+  publish_pull_requests: ${publishPullRequests}
 ---
 Work on {{ issue.identifier }}.
 `;
 }
 
-function report() {
+function report(idempotencyKey = "idem-1") {
   return {
-    runId: "run-1",
-    issueId: "issue-1",
     summary: "Implemented the service contract.",
     validationEvidence: ["npm test"],
     acceptanceChecklist: [
@@ -180,7 +291,7 @@ function report() {
     branchName: "symphony/TEST-1",
     pullRequest: null,
     risks: [],
-    idempotencyKey: "idem-1",
+    idempotencyKey,
   };
 }
 
@@ -199,4 +310,60 @@ class FakePublisher implements CompletionReportPullRequestPublisher {
     this.inputs.push(input);
     return this.publication;
   }
+}
+
+interface JsonRpcResponse {
+  id?: string | number | null;
+  result?: unknown;
+  error?: {
+    message: string;
+  };
+}
+
+function writeJsonRpc(input: PassThrough, message: unknown): void {
+  const body = JSON.stringify(message);
+  input.write(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`);
+}
+
+function collectJsonRpcResponses(output: PassThrough): JsonRpcResponse[] {
+  const responses: JsonRpcResponse[] = [];
+  let buffer = Buffer.alloc(0);
+  output.on("data", (chunk: Buffer) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (true) {
+      const headerEnd = buffer.indexOf("\r\n\r\n");
+      if (headerEnd < 0) return;
+      const header = buffer.subarray(0, headerEnd).toString("utf8");
+      const contentLength = Number(header.match(/content-length:\s*(\d+)/i)?.[1]);
+      const bodyStart = headerEnd + 4;
+      const bodyEnd = bodyStart + contentLength;
+      if (!Number.isInteger(contentLength) || buffer.length < bodyEnd) return;
+      const body = buffer.subarray(bodyStart, bodyEnd).toString("utf8");
+      buffer = buffer.subarray(bodyEnd);
+      responses.push(JSON.parse(body) as JsonRpcResponse);
+    }
+  });
+  return responses;
+}
+
+async function waitForResponse(responses: JsonRpcResponse[], id: string | number): Promise<JsonRpcResponse> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const response = responses.find((item) => item.id === id);
+    if (response) return response;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for JSON-RPC response ${id}`);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>;
+  throw new Error("Expected JSON-RPC record");
+}
+
+function asRecordArray(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value) && value.every((item) => typeof item === "object" && item !== null && !Array.isArray(item))) {
+    return value as Array<Record<string, unknown>>;
+  }
+  throw new Error("Expected JSON-RPC record array");
 }

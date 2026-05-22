@@ -658,7 +658,7 @@ export class Orchestrator {
         const prompt =
           turnNumber === 1
             ? await this.renderWorkerPrompt(entry, attempt)
-            : "Continue working on the issue. Check current issue state and proceed according to the workflow.";
+            : this.renderWorkerContinuationPrompt(entry);
         const context = this.buildRunContext(entry, workspace, attempt, turnNumber);
         await this.consumeHarnessEvents(entry, this.options.harness.run(context, prompt), {
           workspace,
@@ -1323,7 +1323,36 @@ export class Orchestrator {
     const basePrompt = await this.promptRenderer.render(this.promptTemplate, { issue: entry.issue, attempt });
     const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
-    return [basePrompt, reviewVerdict, reviewEvidence].filter((item): item is string => item !== null).join("\n");
+    return [basePrompt, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
+      .filter((item): item is string => item !== null)
+      .join("\n");
+  }
+
+  private renderWorkerContinuationPrompt(entry: RunningEntry): string {
+    return [
+      "Continue working on the issue. Check current issue state and proceed according to the workflow.",
+      this.cursorWorkerMcpPrompt(entry),
+    ]
+      .filter((item): item is string => item !== null)
+      .join("\n");
+  }
+
+  private cursorWorkerMcpPrompt(entry: RunningEntry): string | null {
+    if (this.options.harness.id !== "cursor") return null;
+    const workspace = entry.workspace;
+    return [
+      "",
+      "Symphony MCP completion handoff:",
+      `- Active issue: ${entry.issue.identifier} (${entry.issue.id})`,
+      `- Active role: ${entry.role}`,
+      `- Workspace path: ${workspace?.path ?? entry.workspacePath ?? "n/a"}`,
+      `- Branch: ${workspace?.gitBranchName ?? entry.issue.branchName ?? "n/a"}`,
+      `- Repository path: ${workspace?.repoPath ?? "n/a"}`,
+      `- Base ref: ${workspace?.baseRef ?? "n/a"}`,
+      "- Before ending the run, call the submit_completion_report MCP tool with summary, validationEvidence, acceptanceChecklist, changedFiles, branchName, pullRequest, risks, and idempotencyKey.",
+      "- The MCP server is scoped to this issue and the current Cursor run; Symphony injects runId and issueId for you.",
+      "- Do not comment on Linear, transition Linear state, or request broad Linear write credentials. Symphony handles writeback after the tool accepts the report.",
+    ].join("\n");
   }
 
   private async loadWorkerReviewVerdictPrompt(entry: RunningEntry): Promise<string | null> {

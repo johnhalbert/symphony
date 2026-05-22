@@ -135,26 +135,44 @@ function reviewVerdictInputSchema(): Record<string, unknown> {
     additionalProperties: false,
     required: ["verdict", "acceptanceResults", "findings", "evidence", "idempotencyKey"],
     properties: {
-      runId: { type: "string", minLength: 1 },
-      issueId: { type: "string", minLength: 1 },
-      verdict: { enum: ["pass", "fail"] },
+      verdict: {
+        enum: ["pass", "fail"],
+        description: "Use fail for requested changes and pass only when all acceptance criteria are satisfied.",
+      },
       acceptanceResults: {
         type: "array",
         minItems: 1,
+        description: "One item per acceptance criterion, including whether it passed and the supporting evidence.",
         items: {
           type: "object",
           additionalProperties: false,
           required: ["text", "satisfied", "evidence"],
           properties: {
-            text: { type: "string", minLength: 1 },
-            satisfied: { type: "boolean" },
-            evidence: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
+            text: { type: "string", minLength: 1, description: "Acceptance criterion text." },
+            satisfied: { type: "boolean", description: "Whether the implementation satisfies this criterion." },
+            evidence: {
+              description: "Specific review evidence for the status, or null when unavailable.",
+              anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+            },
           },
         },
       },
-      findings: { type: "array", items: { type: "string", minLength: 1 } },
-      evidence: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
-      idempotencyKey: { type: "string", minLength: 1 },
+      findings: {
+        type: "array",
+        description: "Concrete requested changes for fail verdicts; use an empty array for pass verdicts.",
+        items: { type: "string", minLength: 1 },
+      },
+      evidence: {
+        type: "array",
+        minItems: 1,
+        description: "Durable review evidence, such as PR review or comment URLs.",
+        items: { type: "string", minLength: 1 },
+      },
+      idempotencyKey: {
+        type: "string",
+        minLength: 1,
+        description: "Stable unique key for this review verdict so retries are safe.",
+      },
     },
   };
 }
@@ -162,9 +180,9 @@ function reviewVerdictInputSchema(): Record<string, unknown> {
 function reviewVerdictInputFromMcp(input: unknown, context: ReviewVerdictActiveContext): unknown {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return input;
   return {
+    ...input,
     runId: context.activeRunId,
     issueId: context.issue.id,
-    ...input,
   };
 }
 
