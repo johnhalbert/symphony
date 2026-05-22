@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ServiceConfig } from "../src/core/config/Config.js";
+import type { PullRequestReviewEvidenceItem } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import {
   planBlockedEscalationWritebacks,
@@ -69,6 +70,7 @@ describe("TransitionPolicy review-loop planners", () => {
       { issue: issue({ state: "In Review" }), runId: "review-run-1", reviewer: "reviewer-1" },
       config,
       ["Add tests for the blocked fallback.", "Clarify idempotency keys."],
+      [reviewEvidence()],
     );
 
     expect(operations).toHaveLength(2);
@@ -81,6 +83,10 @@ describe("TransitionPolicy review-loop planners", () => {
     });
     expect(commentBody(operations, 0)).toContain("- Add tests for the blocked fallback.");
     expect(commentBody(operations, 0)).toContain("- Clarify idempotency keys.");
+    expect(commentBody(operations, 0)).toContain("PR review evidence:");
+    expect(commentBody(operations, 0)).toContain("Pull request: https://github.com/acme/symphony/pull/42");
+    expect(commentBody(operations, 0)).toContain("src/core/review/PullRequestReviewEvidenceService.ts:72");
+    expect(commentBody(operations, 0)).toContain("GitHub PR reviews and comments are the primary detailed review surface.");
     expect(operations[1]).toMatchObject({
       idempotencyKey: "transition:issue-1:review-run-1:review-verdict-fail:In Progress",
       kind: "transition",
@@ -240,4 +246,30 @@ function commentBody(operations: NewWritebackOperation[], index: number): string
   expect(operation?.kind).toBe("comment");
   if (operation?.kind !== "comment") throw new Error(`Expected operation ${index} to be a comment`);
   return operation.payload.body;
+}
+
+function reviewEvidence(): PullRequestReviewEvidenceItem {
+  return {
+    id: "review_comment:42:comment-1",
+    source: "review_comment",
+    githubId: "comment-1",
+    pullRequestNumber: 42,
+    pullRequestUrl: "https://github.com/acme/symphony/pull/42",
+    url: "https://github.com/acme/symphony/pull/42#discussion_r1",
+    reviewer: "reviewer-a",
+    body: "Add coverage for the dedupe path.",
+    state: null,
+    path: "src/core/review/PullRequestReviewEvidenceService.ts",
+    line: 72,
+    originalLine: 70,
+    side: "RIGHT",
+    threadId: "thread-1",
+    inReplyToId: null,
+    isResolved: false,
+    isOutdated: false,
+    createdAt: "2026-01-01T00:00:01Z",
+    updatedAt: "2026-01-01T00:00:02Z",
+    submittedAt: null,
+    cursor: "2026-01-01T00:00:02Z",
+  };
 }

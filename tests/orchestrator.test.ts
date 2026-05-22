@@ -13,6 +13,10 @@ import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harn
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore, type IssueCompletionReportRecord } from "../src/core/persistence/IssueLifecycleStore.js";
+import type {
+  PullRequestReviewEvidenceClient,
+  RemotePullRequestReviewEvidence,
+} from "../src/core/review/PullRequestReviewEvidenceService.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
@@ -814,6 +818,100 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("injects PR review evidence into the next worker prompt after requested changes", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.continuationHistoryThreshold = 5;
+    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "implementation",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [completionReportRecord(candidate)],
+    });
+    const pullRequestReviewClient = new FakePullRequestReviewEvidenceClient([
+      {
+        source: "review",
+        githubId: "review-1",
+        pullRequestNumber: 42,
+        pullRequestUrl: "https://api.github.test/repos/acme/symphony/pulls/42",
+        url: "https://github.com/acme/symphony/pull/42#pullrequestreview-1",
+        reviewer: "reviewer-a",
+        body: "Please address the inline comments.",
+        state: "CHANGES_REQUESTED",
+        path: null,
+        line: null,
+        originalLine: null,
+        side: null,
+        threadId: null,
+        inReplyToId: null,
+        isResolved: null,
+        isOutdated: null,
+        createdAt: "2026-01-01T00:00:01Z",
+        updatedAt: "2026-01-01T00:00:01Z",
+        submittedAt: "2026-01-01T00:00:01Z",
+      },
+      {
+        source: "review_comment",
+        githubId: "comment-1",
+        pullRequestNumber: 42,
+        pullRequestUrl: "https://api.github.test/repos/acme/symphony/pulls/42",
+        url: "https://github.com/acme/symphony/pull/42#discussion_r1",
+        reviewer: "reviewer-a",
+        body: "Add coverage for the dedupe path.",
+        state: null,
+        path: "src/core/review/PullRequestReviewEvidenceService.ts",
+        line: 72,
+        originalLine: 70,
+        side: "RIGHT",
+        threadId: "thread-1",
+        inReplyToId: null,
+        isResolved: false,
+        isOutdated: false,
+        createdAt: "2026-01-01T00:00:02Z",
+        updatedAt: "2026-01-01T00:00:02Z",
+        submittedAt: null,
+      },
+    ]);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      pullRequestReviewClient,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(pullRequestReviewClient.calls).toEqual([42]);
+    expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
+    expect(harness.runs[0]?.prompt).toContain("PR review feedback to address");
+    expect(harness.runs[0]?.prompt).toContain("Reviewer verdict: fail / requested changes");
+    expect(harness.runs[0]?.prompt).toContain("src/core/review/PullRequestReviewEvidenceService.ts:72");
+    expect(harness.runs[0]?.prompt).toContain("thread: thread-1");
+    expect(harness.runs[0]?.prompt).toContain("Add coverage for the dedupe path.");
+    expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42");
+  });
+
   it("cancels an active issue without retrying it", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -1026,6 +1124,17 @@ class FakePullRequestDiscoveryClient implements PullRequestDiscoveryClient {
   async findOpenPullRequestByBranch(input: { branchName: string }) {
     this.branches.push(input.branchName);
     return this.pullRequest;
+  }
+}
+
+class FakePullRequestReviewEvidenceClient implements PullRequestReviewEvidenceClient {
+  readonly calls: number[] = [];
+
+  constructor(private readonly evidence: RemotePullRequestReviewEvidence[]) {}
+
+  async listPullRequestReviewEvidence(input: { pullRequestNumber: number }): Promise<RemotePullRequestReviewEvidence[]> {
+    this.calls.push(input.pullRequestNumber);
+    return this.evidence.filter((item) => item.pullRequestNumber === input.pullRequestNumber);
   }
 }
 

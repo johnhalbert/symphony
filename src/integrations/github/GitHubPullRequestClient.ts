@@ -33,6 +33,34 @@ export interface PullRequestPublicationResult extends PullRequestMetadata {
   evidenceCursor: string;
 }
 
+export type GitHubPullRequestReviewEvidenceSource = "review" | "review_comment" | "issue_comment";
+
+export interface GitHubPullRequestReviewEvidence {
+  source: GitHubPullRequestReviewEvidenceSource;
+  githubId: string;
+  pullRequestNumber: number;
+  pullRequestUrl: string | null;
+  url: string | null;
+  reviewer: string | null;
+  body: string;
+  state: string | null;
+  path: string | null;
+  line: number | null;
+  originalLine: number | null;
+  side: string | null;
+  threadId: string | null;
+  inReplyToId: string | null;
+  isResolved: boolean | null;
+  isOutdated: boolean | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  submittedAt: string | null;
+}
+
+export interface PullRequestReviewEvidenceLookup {
+  pullRequestNumber: number;
+}
+
 interface GitHubPullRequestNode {
   html_url?: unknown;
   number?: unknown;
@@ -44,6 +72,92 @@ interface GitHubPullRequestNode {
       pushed_at?: unknown;
     } | null;
   } | null;
+}
+
+interface GitHubUserNode {
+  login?: unknown;
+}
+
+interface GitHubReviewNode {
+  id?: unknown;
+  node_id?: unknown;
+  html_url?: unknown;
+  pull_request_url?: unknown;
+  body?: unknown;
+  state?: unknown;
+  user?: GitHubUserNode | null;
+  submitted_at?: unknown;
+  updated_at?: unknown;
+}
+
+interface GitHubReviewCommentNode {
+  id?: unknown;
+  node_id?: unknown;
+  html_url?: unknown;
+  pull_request_url?: unknown;
+  pull_request_review_id?: unknown;
+  body?: unknown;
+  path?: unknown;
+  line?: unknown;
+  original_line?: unknown;
+  side?: unknown;
+  in_reply_to_id?: unknown;
+  user?: GitHubUserNode | null;
+  created_at?: unknown;
+  updated_at?: unknown;
+}
+
+interface GitHubIssueCommentNode {
+  id?: unknown;
+  node_id?: unknown;
+  html_url?: unknown;
+  body?: unknown;
+  user?: GitHubUserNode | null;
+  created_at?: unknown;
+  updated_at?: unknown;
+}
+
+interface GraphQlPageInfoNode {
+  hasNextPage?: unknown;
+  endCursor?: unknown;
+}
+
+interface GraphQlReviewThreadCommentNode {
+  databaseId?: unknown;
+}
+
+interface GraphQlReviewThreadNode {
+  id?: unknown;
+  isResolved?: unknown;
+  isOutdated?: unknown;
+  path?: unknown;
+  line?: unknown;
+  comments?: {
+    nodes?: unknown;
+  } | null;
+}
+
+interface GraphQlReviewThreadResponse {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviewThreads?: {
+          pageInfo?: GraphQlPageInfoNode | null;
+          nodes?: unknown;
+        } | null;
+      } | null;
+    } | null;
+  } | null;
+  errors?: unknown;
+}
+
+interface PullRequestReviewThreadMetadata {
+  threadId: string;
+  isResolved: boolean | null;
+  isOutdated: boolean | null;
+  path: string | null;
+  line: number | null;
+  commentDatabaseIds: string[];
 }
 
 export class GitHubPullRequestClient {
@@ -91,6 +205,32 @@ export class GitHubPullRequestClient {
     }
 
     return body.map(normalizePullRequest).find((pr): pr is PullRequestMetadata => pr !== null) ?? null;
+  }
+
+  async listPullRequestReviewEvidence(input: PullRequestReviewEvidenceLookup): Promise<GitHubPullRequestReviewEvidence[]> {
+    this.assertConfiguredForPublication();
+    if (!Number.isInteger(input.pullRequestNumber) || input.pullRequestNumber <= 0) {
+      throw new SymphonyError("invalid_request", "A valid pull request number is required for review evidence ingestion");
+    }
+
+    const [reviews, reviewComments, issueComments, reviewThreads] = await Promise.all([
+      this.fetchPaginatedJsonArray<GitHubReviewNode>(`pulls/${input.pullRequestNumber}/reviews`),
+      this.fetchPaginatedJsonArray<GitHubReviewCommentNode>(`pulls/${input.pullRequestNumber}/comments`),
+      this.fetchPaginatedJsonArray<GitHubIssueCommentNode>(`issues/${input.pullRequestNumber}/comments`),
+      this.fetchReviewThreadMetadata(input.pullRequestNumber),
+    ]);
+    const threadByCommentId = reviewThreadMetadataByCommentId(reviewThreads);
+    return [
+      ...reviews
+        .map((review) => normalizeReview(review, input.pullRequestNumber))
+        .filter((item): item is GitHubPullRequestReviewEvidence => item !== null),
+      ...reviewComments
+        .map((comment) => normalizeReviewComment(comment, input.pullRequestNumber, threadByCommentId.get(asNumberString(comment.id) ?? "")))
+        .filter((item): item is GitHubPullRequestReviewEvidence => item !== null),
+      ...issueComments
+        .map((comment) => normalizeIssueComment(comment, input.pullRequestNumber))
+        .filter((item): item is GitHubPullRequestReviewEvidence => item !== null),
+    ].sort(compareEvidence);
   }
 
   async publishPullRequest(input: PullRequestPublicationInput): Promise<PullRequestPublicationResult> {
@@ -228,7 +368,99 @@ export class GitHubPullRequestClient {
     if (!pullRequest) throw new SymphonyError("tracker_error", "GitHub PR creation response is invalid");
     return pullRequest;
   }
+
+  private async fetchPaginatedJsonArray<T>(repoPath: string): Promise<T[]> {
+    const firstUrl = new URL(
+      `repos/${encodeURIComponent(this.config.owner ?? "")}/${encodeURIComponent(this.config.repo ?? "")}/${repoPath}`,
+      normalizedApiBaseUrl(this.config.apiBaseUrl),
+    );
+    firstUrl.searchParams.set("per_page", "100");
+    const items: T[] = [];
+    let nextUrl: URL | null = firstUrl;
+    while (nextUrl) {
+      const response = await this.fetchImpl(nextUrl, {
+        method: "GET",
+        headers: requestHeaders(this.config.token ?? ""),
+      });
+      if (!response.ok) {
+        throw new SymphonyError("tracker_error", `GitHub PR review evidence returned HTTP ${response.status}`);
+      }
+      const body = (await response.json()) as unknown;
+      if (!Array.isArray(body)) {
+        throw new SymphonyError("tracker_error", "GitHub PR review evidence response is invalid");
+      }
+      items.push(...(body as T[]));
+      nextUrl = nextLinkUrl(response.headers.get("link"));
+    }
+    return items;
+  }
+
+  private async fetchReviewThreadMetadata(pullRequestNumber: number): Promise<PullRequestReviewThreadMetadata[]> {
+    const threads: PullRequestReviewThreadMetadata[] = [];
+    let after: string | null = null;
+    while (true) {
+      const response = await this.fetchImpl(graphQlApiUrl(this.config.apiBaseUrl), {
+        method: "POST",
+        headers: {
+          ...requestHeaders(this.config.token ?? ""),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          query: REVIEW_THREADS_QUERY,
+          variables: {
+            owner: this.config.owner,
+            repo: this.config.repo,
+            number: pullRequestNumber,
+            after,
+          },
+        }),
+      });
+      if (!response.ok) {
+        throw new SymphonyError("tracker_error", `GitHub PR review thread evidence returned HTTP ${response.status}`);
+      }
+      const body = (await response.json()) as GraphQlReviewThreadResponse;
+      if (body.errors !== undefined) {
+        throw new SymphonyError("tracker_error", "GitHub PR review thread evidence response contains GraphQL errors");
+      }
+      const reviewThreads = body.data?.repository?.pullRequest?.reviewThreads;
+      if (!reviewThreads || !Array.isArray(reviewThreads.nodes)) {
+        throw new SymphonyError("tracker_error", "GitHub PR review thread evidence response is invalid");
+      }
+      threads.push(...reviewThreads.nodes.map(normalizeReviewThreadMetadata).filter((item): item is PullRequestReviewThreadMetadata => item !== null));
+      const pageInfo = reviewThreads.pageInfo;
+      if (pageInfo?.hasNextPage !== true) return threads;
+      after = asNullableString(pageInfo.endCursor);
+      if (!after) throw new SymphonyError("tracker_error", "GitHub PR review thread evidence pagination cursor is missing");
+    }
+  }
 }
+
+const REVIEW_THREADS_QUERY = `
+query SymphonyPullRequestReviewThreads($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          comments(first: 100) {
+            nodes {
+              databaseId
+            }
+          }
+        }
+      }
+    }
+  }
+}
+`;
 
 function normalizePullRequest(node: GitHubPullRequestNode): PullRequestMetadata | null {
   const url = asString(node.html_url);
@@ -255,6 +487,172 @@ function asString(value: unknown): string | null {
 
 function asNullableString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+function asNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function asNumberString(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "string" && value.length > 0) return value;
+  return null;
+}
+
+function asNullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function normalizeReview(node: GitHubReviewNode, pullRequestNumber: number): GitHubPullRequestReviewEvidence | null {
+  const githubId = asNumberString(node.id) ?? asString(node.node_id);
+  const body = asNonEmptyString(node.body);
+  const state = asNullableString(node.state);
+  if (!githubId || !body) return null;
+  return {
+    source: "review",
+    githubId,
+    pullRequestNumber,
+    pullRequestUrl: asNullableString(node.pull_request_url),
+    url: asNullableString(node.html_url),
+    reviewer: asNullableString(node.user?.login),
+    body,
+    state,
+    path: null,
+    line: null,
+    originalLine: null,
+    side: null,
+    threadId: null,
+    inReplyToId: null,
+    isResolved: null,
+    isOutdated: null,
+    createdAt: asNullableString(node.submitted_at),
+    updatedAt: asNullableString(node.updated_at) ?? asNullableString(node.submitted_at),
+    submittedAt: asNullableString(node.submitted_at),
+  };
+}
+
+function normalizeReviewComment(
+  node: GitHubReviewCommentNode,
+  pullRequestNumber: number,
+  thread: PullRequestReviewThreadMetadata | undefined,
+): GitHubPullRequestReviewEvidence | null {
+  const githubId = asNumberString(node.id) ?? asString(node.node_id);
+  const body = asNonEmptyString(node.body);
+  if (!githubId || !body) return null;
+  const reviewId = asNumberString(node.pull_request_review_id);
+  const path = asNullableString(node.path);
+  return {
+    source: "review_comment",
+    githubId,
+    pullRequestNumber,
+    pullRequestUrl: asNullableString(node.pull_request_url),
+    url: asNullableString(node.html_url),
+    reviewer: asNullableString(node.user?.login),
+    body,
+    state: null,
+    path,
+    line: asNullableNumber(node.line),
+    originalLine: asNullableNumber(node.original_line),
+    side: asNullableString(node.side),
+    threadId: thread?.threadId ?? (reviewId && path ? `${reviewId}:${path}:${asNullableNumber(node.original_line) ?? asNullableNumber(node.line) ?? githubId}` : null),
+    inReplyToId: asNumberString(node.in_reply_to_id),
+    isResolved: thread?.isResolved ?? null,
+    isOutdated: thread?.isOutdated ?? null,
+    createdAt: asNullableString(node.created_at),
+    updatedAt: asNullableString(node.updated_at) ?? asNullableString(node.created_at),
+    submittedAt: null,
+  };
+}
+
+function normalizeIssueComment(
+  node: GitHubIssueCommentNode,
+  pullRequestNumber: number,
+): GitHubPullRequestReviewEvidence | null {
+  const githubId = asNumberString(node.id) ?? asString(node.node_id);
+  const body = asNonEmptyString(node.body);
+  if (!githubId || !body) return null;
+  return {
+    source: "issue_comment",
+    githubId,
+    pullRequestNumber,
+    pullRequestUrl: null,
+    url: asNullableString(node.html_url),
+    reviewer: asNullableString(node.user?.login),
+    body,
+    state: null,
+    path: null,
+    line: null,
+    originalLine: null,
+    side: null,
+    threadId: null,
+    inReplyToId: null,
+    isResolved: null,
+    isOutdated: null,
+    createdAt: asNullableString(node.created_at),
+    updatedAt: asNullableString(node.updated_at) ?? asNullableString(node.created_at),
+    submittedAt: null,
+  };
+}
+
+function compareEvidence(left: GitHubPullRequestReviewEvidence, right: GitHubPullRequestReviewEvidence): number {
+  return evidenceTimestamp(left).localeCompare(evidenceTimestamp(right)) || left.source.localeCompare(right.source) || left.githubId.localeCompare(right.githubId);
+}
+
+function evidenceTimestamp(item: GitHubPullRequestReviewEvidence): string {
+  return item.updatedAt ?? item.submittedAt ?? item.createdAt ?? "";
+}
+
+function normalizeReviewThreadMetadata(value: unknown): PullRequestReviewThreadMetadata | null {
+  if (!isRecord(value)) return null;
+  const threadId = asString(value.id);
+  if (!threadId) return null;
+  const comments = isRecord(value.comments) && Array.isArray(value.comments.nodes) ? value.comments.nodes : [];
+  const commentDatabaseIds = comments
+    .map((comment) => (isRecord(comment) ? asNumberString(comment.databaseId) : null))
+    .filter((item): item is string => item !== null);
+  return {
+    threadId,
+    isResolved: typeof value.isResolved === "boolean" ? value.isResolved : null,
+    isOutdated: typeof value.isOutdated === "boolean" ? value.isOutdated : null,
+    path: asNullableString(value.path),
+    line: asNullableNumber(value.line),
+    commentDatabaseIds,
+  };
+}
+
+function reviewThreadMetadataByCommentId(
+  threads: PullRequestReviewThreadMetadata[],
+): Map<string, PullRequestReviewThreadMetadata> {
+  const byCommentId = new Map<string, PullRequestReviewThreadMetadata>();
+  for (const thread of threads) {
+    for (const commentId of thread.commentDatabaseIds) byCommentId.set(commentId, thread);
+  }
+  return byCommentId;
+}
+
+function nextLinkUrl(linkHeader: string | null): URL | null {
+  if (!linkHeader) return null;
+  for (const segment of linkHeader.split(",")) {
+    const match = /<([^>]+)>;\s*rel="next"/.exec(segment.trim());
+    if (match?.[1]) return new URL(match[1]);
+  }
+  return null;
+}
+
+function graphQlApiUrl(apiBaseUrl: string): URL {
+  const base = new URL(normalizedApiBaseUrl(apiBaseUrl));
+  if (base.pathname.replace(/\/$/, "") === "/api/v3") {
+    base.pathname = "/api/graphql";
+    return base;
+  }
+  base.pathname = "/graphql";
+  base.search = "";
+  base.hash = "";
+  return base;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function requestHeaders(token: string): Record<string, string> {

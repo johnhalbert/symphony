@@ -97,6 +97,7 @@ program
       lifecycleStore,
       ...(writeback === undefined ? {} : { writeback }),
       pullRequestClient,
+      pullRequestReviewClient: pullRequestClient,
     });
 
     loader.watch((event) => {

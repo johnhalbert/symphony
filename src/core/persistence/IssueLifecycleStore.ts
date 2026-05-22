@@ -36,6 +36,40 @@ export interface CompletionReportPullRequestRef {
   branch: string | null;
 }
 
+export type PullRequestReviewEvidenceSource = "review" | "review_comment" | "issue_comment";
+
+export interface PullRequestReviewEvidenceItem {
+  id: string;
+  source: PullRequestReviewEvidenceSource;
+  githubId: string;
+  pullRequestNumber: number;
+  pullRequestUrl: string | null;
+  url: string | null;
+  reviewer: string | null;
+  body: string;
+  state: string | null;
+  path: string | null;
+  line: number | null;
+  originalLine: number | null;
+  side: string | null;
+  threadId: string | null;
+  inReplyToId: string | null;
+  isResolved: boolean | null;
+  isOutdated: boolean | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  submittedAt: string | null;
+  cursor: string;
+}
+
+export interface PullRequestReviewEvidenceState {
+  pullRequest: CompletionReportPullRequestRef | null;
+  lastIngestedCursor: string | null;
+  lastWorkerEvidenceCursor: string | null;
+  items: PullRequestReviewEvidenceItem[];
+  updatedAt: string | null;
+}
+
 export interface IssueCompletionReportRecord {
   id: string;
   idempotencyKey: string;
@@ -64,6 +98,7 @@ export interface IssueLifecycleRecord {
   blockedReason: string | null;
   summaryPointers: IssueLifecycleSummaryPointers;
   completionReports: IssueCompletionReportRecord[];
+  reviewEvidence: PullRequestReviewEvidenceState;
   createdAt: string;
   updatedAt: string;
 }
@@ -77,6 +112,7 @@ export interface IssueLifecyclePatch {
   blockedReason?: string | null;
   summaryPointers?: Partial<IssueLifecycleSummaryPointers>;
   completionReports?: IssueCompletionReportRecord[];
+  reviewEvidence?: PullRequestReviewEvidenceState;
 }
 
 export type IssueLifecycleStore = FileIssueLifecycleStore;
@@ -102,6 +138,7 @@ export class FileIssueLifecycleStore {
         ...patch.summaryPointers,
       },
       completionReports: patch.completionReports ?? existing?.completionReports ?? [],
+      reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
@@ -234,6 +271,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
     completionReports: normalizeCompletionReports(value.completionReports, filePath),
+    reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
   };
@@ -263,6 +301,80 @@ function normalizeCompletionReports(value: unknown, filePath: string): IssueComp
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "completionReports is invalid");
   return value.map((item, index) => normalizeCompletionReport(item, filePath, index));
+}
+
+function defaultReviewEvidence(): PullRequestReviewEvidenceState {
+  return {
+    pullRequest: null,
+    lastIngestedCursor: null,
+    lastWorkerEvidenceCursor: null,
+    items: [],
+    updatedAt: null,
+  };
+}
+
+function normalizeReviewEvidence(value: unknown, filePath: string): PullRequestReviewEvidenceState {
+  if (value === undefined) return defaultReviewEvidence();
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "reviewEvidence is invalid");
+  return {
+    pullRequest: normalizeReviewEvidencePullRequest(value.pullRequest, filePath),
+    lastIngestedCursor: optionalNullableString(value.lastIngestedCursor, filePath, "reviewEvidence.lastIngestedCursor"),
+    lastWorkerEvidenceCursor: optionalNullableString(
+      value.lastWorkerEvidenceCursor,
+      filePath,
+      "reviewEvidence.lastWorkerEvidenceCursor",
+    ),
+    items: normalizeReviewEvidenceItems(value.items, filePath),
+    updatedAt: optionalNullableString(value.updatedAt, filePath, "reviewEvidence.updatedAt"),
+  };
+}
+
+function normalizeReviewEvidencePullRequest(value: unknown, filePath: string): CompletionReportPullRequestRef | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "reviewEvidence.pullRequest is invalid");
+  return {
+    url: nullableString(value.url, filePath, "reviewEvidence.pullRequest.url"),
+    number: nullableNumber(value.number, filePath, "reviewEvidence.pullRequest.number"),
+    headSha: optionalNullableString(value.headSha, filePath, "reviewEvidence.pullRequest.headSha"),
+    branch: optionalNullableString(value.branch, filePath, "reviewEvidence.pullRequest.branch"),
+  };
+}
+
+function normalizeReviewEvidenceItems(value: unknown, filePath: string): PullRequestReviewEvidenceItem[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewEvidence.items is invalid");
+  return value.map((item, index) => normalizeReviewEvidenceItem(item, filePath, index));
+}
+
+function normalizeReviewEvidenceItem(value: unknown, filePath: string, index: number): PullRequestReviewEvidenceItem {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `reviewEvidence.items[${index}] is invalid`);
+  const source = value.source;
+  if (source !== "review" && source !== "review_comment" && source !== "issue_comment") {
+    throw corruptLifecycle(filePath, `reviewEvidence.items[${index}].source is invalid`);
+  }
+  return {
+    id: requiredString(value.id, filePath, `reviewEvidence.items[${index}].id`),
+    source,
+    githubId: requiredString(value.githubId, filePath, `reviewEvidence.items[${index}].githubId`),
+    pullRequestNumber: nonNegativeInteger(value.pullRequestNumber, filePath, `reviewEvidence.items[${index}].pullRequestNumber`),
+    pullRequestUrl: optionalNullableString(value.pullRequestUrl, filePath, `reviewEvidence.items[${index}].pullRequestUrl`),
+    url: optionalNullableString(value.url, filePath, `reviewEvidence.items[${index}].url`),
+    reviewer: optionalNullableString(value.reviewer, filePath, `reviewEvidence.items[${index}].reviewer`),
+    body: requiredString(value.body, filePath, `reviewEvidence.items[${index}].body`),
+    state: optionalNullableString(value.state, filePath, `reviewEvidence.items[${index}].state`),
+    path: optionalNullableString(value.path, filePath, `reviewEvidence.items[${index}].path`),
+    line: optionalNullableNumber(value.line, filePath, `reviewEvidence.items[${index}].line`),
+    originalLine: optionalNullableNumber(value.originalLine, filePath, `reviewEvidence.items[${index}].originalLine`),
+    side: optionalNullableString(value.side, filePath, `reviewEvidence.items[${index}].side`),
+    threadId: optionalNullableString(value.threadId, filePath, `reviewEvidence.items[${index}].threadId`),
+    inReplyToId: optionalNullableString(value.inReplyToId, filePath, `reviewEvidence.items[${index}].inReplyToId`),
+    isResolved: optionalNullableBoolean(value.isResolved, filePath, `reviewEvidence.items[${index}].isResolved`),
+    isOutdated: optionalNullableBoolean(value.isOutdated, filePath, `reviewEvidence.items[${index}].isOutdated`),
+    createdAt: optionalNullableString(value.createdAt, filePath, `reviewEvidence.items[${index}].createdAt`),
+    updatedAt: optionalNullableString(value.updatedAt, filePath, `reviewEvidence.items[${index}].updatedAt`),
+    submittedAt: optionalNullableString(value.submittedAt, filePath, `reviewEvidence.items[${index}].submittedAt`),
+    cursor: requiredString(value.cursor, filePath, `reviewEvidence.items[${index}].cursor`),
+  };
 }
 
 function normalizeCompletionReport(value: unknown, filePath: string, index: number): IssueCompletionReportRecord {
@@ -340,6 +452,12 @@ function nullableNumber(value: unknown, filePath: string, field: string): number
 function optionalNullableNumber(value: unknown, filePath: string, field: string): number | null {
   if (value === undefined) return null;
   return nullableNumber(value, filePath, field);
+}
+
+function optionalNullableBoolean(value: unknown, filePath: string, field: string): boolean | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "boolean") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
 }
 
 function requiredStringArray(value: unknown, filePath: string, field: string): string[] {
