@@ -37,6 +37,18 @@ describe("FileIssueLifecycleStore", () => {
         ciStatus: "pending",
         lastPushedAt: "2026-01-01T00:00:00.000Z",
       },
+      summaryReferences: [
+        {
+          id: "continuation-summary:issue-1:run-1",
+          kind: "continuation_history",
+          summary: "The worker inspected the issue and started implementation.",
+          runIds: ["run-1"],
+          transcriptEventCount: 3,
+          transcriptPointers: ["/api/v1/runs/run-1/transcript"],
+          statusApiPointers: ["/api/v1/issues/TEST-1"],
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
     });
 
     const reloaded = new FileIssueLifecycleStore(root);
@@ -53,6 +65,14 @@ describe("FileIssueLifecycleStore", () => {
       lastReviewVerdictId: null,
       blockedReason: null,
       completionReports: [],
+      summaryReferences: [
+        {
+          id: "continuation-summary:issue-1:run-1",
+          summary: "The worker inspected the issue and started implementation.",
+          transcriptPointers: ["/api/v1/runs/run-1/transcript"],
+          statusApiPointers: ["/api/v1/issues/TEST-1"],
+        },
+      ],
       summaryPointers: {
         workspaceKey: "TEST-1",
         workspacePath: "/tmp/TEST-1",

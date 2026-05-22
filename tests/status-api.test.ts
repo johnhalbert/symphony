@@ -118,6 +118,10 @@ describe("StatusServer durable API", () => {
         method: "POST",
         headers: { "x-symphony-token": "secret" },
       });
+      const continuationSummaryResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/continuation-summary`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
       const issueBody = (await issueResponse.json()) as {
         latestRun: { runId: string };
         metadata: {
@@ -137,6 +141,9 @@ describe("StatusServer durable API", () => {
         prNumber: number | null;
         ciStatus: string | null;
         lastPushedAt: string | null;
+      };
+      const continuationSummaryBody = (await continuationSummaryResponse.json()) as {
+        summaryReference: { id: string; transcriptPointers: string[]; statusApiPointers: string[] };
       };
       const transcriptBody = (await transcriptResponse.json()) as { events: Array<{ message?: string }> };
       const workspaceBody = (await workspaceResponse.json()) as { gitBranchName?: string };
@@ -166,6 +173,12 @@ describe("StatusServer durable API", () => {
       expect(openResponse.status).toBe(401);
       expect(pauseWithoutTokenResponse.status).toBe(401);
       expect(pauseResponse.status).toBe(202);
+      expect(continuationSummaryResponse.status).toBe(201);
+      expect(continuationSummaryBody.summaryReference).toMatchObject({
+        id: "fake-summary:TEST-1",
+        transcriptPointers: ["/api/v1/runs/run-1/transcript"],
+        statusApiPointers: ["/api/v1/issues/TEST-1"],
+      });
     } finally {
       await server.stop();
     }
@@ -199,6 +212,23 @@ function fakeOrchestrator(): Orchestrator {
     },
     async cancelIssue() {
       return undefined;
+    },
+    async createContinuationSummary(issueId: string) {
+      return {
+        summaryReference: {
+          id: `fake-summary:${issueId}`,
+          kind: "continuation_history",
+          summary: "fake summary",
+          runIds: ["run-1"],
+          transcriptEventCount: 1,
+          transcriptPointers: ["/api/v1/runs/run-1/transcript"],
+          statusApiPointers: ["/api/v1/issues/TEST-1"],
+          createdAt: "2026-01-01T00:00:00Z",
+        },
+        lifecycle: {
+          summaryReferences: [],
+        },
+      };
     },
   } as unknown as Orchestrator;
 }

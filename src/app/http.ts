@@ -115,6 +115,19 @@ export class StatusServer {
         return;
       }
 
+      const continuationSummaryMatch = /^\/api\/v1\/issues\/([^/]+)\/continuation-summary$/.exec(url.pathname);
+      if (request.method === "POST" && continuationSummaryMatch) {
+        this.requireMutationToken(request);
+        const issueId = decodeURIComponent(continuationSummaryMatch[1] ?? "");
+        const result = await this.options.orchestrator.createContinuationSummary(issueId);
+        sendJson(response, 201, {
+          issue: issueId,
+          summaryReference: result.summaryReference,
+          lifecycle: result.lifecycle,
+        });
+        return;
+      }
+
       const issueMatch = /^\/api\/v1\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && issueMatch) {
         const issueId = decodeURIComponent(issueMatch[1] ?? "");

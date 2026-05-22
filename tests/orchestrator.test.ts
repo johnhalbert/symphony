@@ -1433,9 +1433,13 @@ describe("Orchestrator", () => {
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Reviewer findings to address");
-    expect(harness.runs[0]?.prompt).toContain("Current workspace context:");
+    expect(harness.runs[0]?.prompt).toContain("Lifecycle counters:");
+    expect(harness.runs[0]?.prompt).toContain("Review rounds: 0");
+    expect(harness.runs[0]?.prompt).toContain("Latest workspace/git evidence:");
     expect(harness.runs[0]?.prompt).toContain("Branch: symphony/TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Pull request: #42 https://github.com/acme/symphony/pull/42");
+    expect(harness.runs[0]?.prompt).toContain("Acceptance criteria gaps:");
+    expect(harness.runs[0]?.prompt).toContain("Duplicate verdicts are idempotent");
     expect(harness.runs[0]?.prompt).toContain("Add regression coverage for duplicate verdict submissions.");
     expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42#discussion_r1");
   });
@@ -1508,6 +1512,141 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.prompts).toEqual(["Work on TEST-1"]);
+  });
+
+  it("includes full relevant run history in continuation prompts below the event threshold", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.reviewLoop.continuationHistoryThreshold = 5;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(2);
+    expect(harness.runs[1]?.prompt).toContain("Structured continuation brief:");
+    expect(harness.runs[1]?.prompt).toContain("Mode: full");
+    expect(harness.runs[1]?.prompt).toContain("Full relevant history:");
+    expect(harness.runs[1]?.prompt).toContain("Run fake-issue-1-1");
+    expect(harness.runs[1]?.prompt).toContain("#2 completed: fake completed");
+    expect(harness.runs[1]?.prompt).not.toContain("Continue working on the issue. Check current issue state");
+  });
+
+  it("uses stored summaries and API pointers in continuation prompts above the event threshold", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.reviewLoop.continuationHistoryThreshold = 1;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await runStore.startRun({
+      runId: "prior-run-1",
+      sessionId: "prior-session-1",
+      agentId: "prior-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Prior worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: "prior-run-1",
+      at: "2026-01-01T00:00:01Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Prior run gathered context.",
+    });
+    await runStore.appendEvent({
+      runId: "prior-run-1",
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "completed",
+      message: "Prior run stopped before handoff.",
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+    const createdSummary = await orchestrator.createContinuationSummary(candidate);
+    const storedLifecycle = await lifecycleStore.get(candidate.identifier);
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(createdSummary.summaryReference.id).toContain("continuation-summary:issue-1:");
+    expect(createdSummary.summaryReference.runIds).toEqual(["prior-run-1"]);
+    expect(createdSummary.summaryReference.transcriptEventCount).toBe(2);
+    expect(createdSummary.summaryReference.transcriptPointers).toEqual(["/api/v1/runs/prior-run-1/transcript"]);
+    expect(createdSummary.summaryReference.statusApiPointers).toEqual([
+      "/api/v1/issues/TEST-1",
+      "/api/v1/issues/TEST-1/runs",
+      "/api/v1/runs/prior-run-1",
+    ]);
+    expect(storedLifecycle?.summaryReferences).toEqual([createdSummary.summaryReference]);
+    expect(harness.runs).toHaveLength(2);
+    expect(harness.runs[1]?.prompt).toContain("Mode: summary");
+    expect(harness.runs[1]?.prompt).toContain(`Reference: ${createdSummary.summaryReference.id}`);
+    expect(harness.runs[1]?.prompt).toContain("Continuation history summarization is not automated yet.");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1/transcript");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/TEST-1");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1");
+    expect(harness.runs[1]?.prompt).not.toContain("Full relevant history:");
   });
 });
 
