@@ -4,7 +4,12 @@ import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { CursorWorkspaceOpener } from "../../cursor/src/CursorWorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
-import type { IssueLifecycleRecord, IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
+import type {
+  IssueCompletionReportRecord,
+  IssueLifecycleRecord,
+  IssueLifecycleStore,
+  IssueReviewVerdictRecord,
+} from "../core/persistence/IssueLifecycleStore.js";
 import type { RunRecord, RunTranscriptStore, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 
 export interface StatusServerOptions {
@@ -143,6 +148,7 @@ export class StatusServer {
           workspace,
           latestRun,
           lifecycle,
+          reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
           metadata: statusMetadata({ live, workspace, latestRun, lifecycle }),
           capabilities: {
             transcript: Boolean(latestRun),
@@ -271,11 +277,11 @@ function statusMetadata(input: {
   return {
     prUrl: metadataValue(input.latestRun, "prUrl", pointers?.prUrl ?? null),
     prNumber: metadataValue(input.latestRun, "prNumber", pointers?.prNumber ?? null),
-          prHeadSha: metadataValue(input.latestRun, "prHeadSha", pointers?.prHeadSha ?? null),
-          prBranch: metadataValue(input.latestRun, "prBranch", pointers?.prBranch ?? null),
+    prHeadSha: metadataValue(input.latestRun, "prHeadSha", pointers?.prHeadSha ?? null),
+    prBranch: metadataValue(input.latestRun, "prBranch", pointers?.prBranch ?? null),
     ciStatus: metadataValue(input.latestRun, "ciStatus", pointers?.ciStatus ?? null),
     lastPushedAt: metadataValue(input.latestRun, "lastPushedAt", pointers?.lastPushedAt ?? null),
-          lastEvidenceCursor: metadataValue(input.latestRun, "lastEvidenceCursor", pointers?.lastEvidenceCursor ?? null),
+    lastEvidenceCursor: metadataValue(input.latestRun, "lastEvidenceCursor", pointers?.lastEvidenceCursor ?? null),
     branchName:
       input.live?.metadata?.branchName ??
       pointers?.branchName ??
@@ -291,6 +297,41 @@ function statusMetadata(input: {
     repoPath: input.live?.metadata?.repoPath ?? pointers?.repoPath ?? input.latestRun?.repoPath ?? input.workspace?.repoPath ?? null,
     baseRef: input.live?.metadata?.baseRef ?? pointers?.baseRef ?? input.latestRun?.baseRef ?? input.workspace?.baseRef ?? null,
   };
+}
+
+function reviewLoopStatus(input: {
+  live: ReturnType<Orchestrator["getIssueDetails"]>;
+  latestRun: RunRecord | null | undefined;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+}) {
+  const lifecycle = input.lifecycle ?? null;
+  return {
+    phase: lifecycle?.phase ?? null,
+    role: input.live?.role ?? input.latestRun?.role ?? null,
+    reviewRound: lifecycle?.reviewRound ?? null,
+    incompleteTurnCount: lifecycle?.incompleteTurnCount ?? null,
+    lastCompletionReport: latestCompletionReport(lifecycle),
+    lastReviewVerdict: latestReviewVerdict(lifecycle),
+    blockedReason: lifecycle?.blockedReason ?? null,
+  };
+}
+
+function latestCompletionReport(lifecycle: IssueLifecycleRecord | null): IssueCompletionReportRecord | null {
+  if (!lifecycle) return null;
+  if (lifecycle.lastCompletionReportId) {
+    const exact = lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
+    if (exact) return exact;
+  }
+  return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
+}
+
+function latestReviewVerdict(lifecycle: IssueLifecycleRecord | null): IssueReviewVerdictRecord | null {
+  if (!lifecycle) return null;
+  if (lifecycle.lastReviewVerdictId) {
+    const exact = lifecycle.reviewVerdicts.find((verdict) => verdict.id === lifecycle.lastReviewVerdictId);
+    if (exact) return exact;
+  }
+  return lifecycle.reviewVerdicts[lifecycle.reviewVerdicts.length - 1] ?? null;
 }
 
 function metadataValue<K extends "prUrl" | "prNumber" | "prHeadSha" | "prBranch" | "ciStatus" | "lastPushedAt" | "lastEvidenceCursor">(

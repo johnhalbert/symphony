@@ -149,7 +149,7 @@ function FlatTimeline() {
     { t:'12m ago',  sess:'SYM-25', kind:'tool_call', text:'apply_patch · lib/symphony/dispatcher.ex', state:'finished' },
     { t:'14m ago',  sess:'SYM-12', kind:'status',    text:'CREATING → RUNNING' },
     { t:'14m ago',  sess:'SYM-12', kind:'user',      text:'Issue: Add exponential backoff to retry queue with jitter…' },
-    { t:'18m ago',  sess:'SYM-15', kind:'task',      text:'Reached Human Review — PR #1248' },
+    { t:'18m ago',  sess:'SYM-15', kind:'task',      text:'Entered In Review agent queue — PR #1248' },
     { t:'22m ago',  sess:'SYM-42', kind:'status',    text:'CREATING → RUNNING' },
     { t:'48m ago',  sess:'SYM-25', kind:'status',    text:'RETRY (attempt 2/3, backoff 8s)' },
   ];
@@ -599,7 +599,7 @@ function StatsGridDense({ totals }) {
   return (
     <div className="stats" style={{ gridTemplateColumns:'repeat(6, 1fr)' }}>
       <DenseStat label="Done" value={totals.done} sub="this cycle" color="var(--st-done)" />
-      <DenseStat label="In Review" value={totals.review} sub="awaiting" color="var(--st-review)" />
+      <DenseStat label="In Review" value={totals.review} sub="agent review" color="var(--st-review)" />
       <DenseStat label="In Progress" value={totals.progress} sub="running" color="var(--st-progress)" />
       <DenseStat label="Todo" value={totals.todo} sub="dispatchable" color="var(--st-todo)" />
       <DenseStat label="Backlog" value={totals.backlog} sub="" color="var(--st-backlog)" />
@@ -654,7 +654,7 @@ function BurndownCommandCenter({ totals }) {
         <div><span style={{color:'var(--text-3)'}}>completion </span> <span style={{color:'var(--st-done)'}}>{totals.completeness}%</span> ({totals.done}/{totals.all}) · projected <span style={{color:'var(--st-done)'}}>96%</span></div>
         <div><span style={{color:'var(--text-3)'}}>velocity   </span> <span style={{color:'var(--accent)'}}>3.2 PR/day</span> · 7d avg · 14d trend ↑</div>
         <div><span style={{color:'var(--text-3)'}}>agents     </span> <span style={{color:'var(--accent)'}}>4 running</span> / 6 cap · 0 queued · 0 retrying</div>
-        <div><span style={{color:'var(--text-3)'}}>review     </span> 3 PRs in Human Review · oldest 24m</div>
+        <div><span style={{color:'var(--text-3)'}}>review     </span> 3 issues in In Review agent queue · oldest 24m</div>
         <div><span style={{color:'var(--text-3)'}}>health     </span> <span style={{color:'var(--st-done)'}}>nominal</span> · last poll 8s ago · 0 errors in 24h</div>
       </div>
     </div>

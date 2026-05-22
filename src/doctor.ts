@@ -7,6 +7,9 @@ import { LinearTrackerClient } from "./integrations/linear/LinearTrackerClient.j
 import { GitHubPullRequestClient } from "./integrations/github/GitHubPullRequestClient.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { errorMessage } from "./core/errors.js";
+import type { ServiceConfig } from "./core/config/Config.js";
+import { COMPLETION_REPORT_TOOL_NAME } from "./core/harness/CompletionReportMcpServer.js";
+import { REVIEW_VERDICT_TOOL_NAME } from "./core/harness/ReviewVerdictMcpServer.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -55,6 +58,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
           ? `handoff_states: ${config.tracker.handoffStates.join(", ")}`
           : "No handoff_states configured",
     });
+    checks.push(...reviewLoopDoctorChecks(config));
 
     await checkWritable(checks, "workspace.root", config.workspace.root);
     await checkWritable(checks, "workspace.state_dir", config.workspace.stateDir);
@@ -114,6 +118,90 @@ async function checkWritable(checks: DoctorCheck[], id: string, directory: strin
   } catch (error) {
     checks.push({ id, status: "error", message: errorMessage(error) });
   }
+}
+
+export function reviewLoopDoctorChecks(config: ServiceConfig): DoctorCheck[] {
+  return [
+    reviewLoopStateCheck(config),
+    blockedAvailabilityCheck(config),
+    mcpToolAvailabilityCheck(config),
+    candidateIsolationCheck(config),
+  ];
+}
+
+function reviewLoopStateCheck(config: ServiceConfig): DoctorCheck {
+  if (config.reviewLoop.reviewStates.length === 0) {
+    return { id: "review_loop.states", status: "error", message: "review_loop.review_states must include an agent review queue state" };
+  }
+  const missingHandoff = config.reviewLoop.reviewStates.filter((state) => !stateIn(state, config.tracker.handoffStates));
+  if (missingHandoff.length > 0) {
+    return {
+      id: "review_loop.states",
+      status: "warn",
+      message: `review states are not tracker handoff states: ${missingHandoff.join(", ")}`,
+    };
+  }
+  return {
+    id: "review_loop.states",
+    status: "ok",
+    message: `review_states: ${config.reviewLoop.reviewStates.join(", ")}; pass destination: ${config.reviewLoop.reviewPassState ?? "structured pass marker only"}`,
+  };
+}
+
+function blockedAvailabilityCheck(config: ServiceConfig): DoctorCheck {
+  if (config.reviewLoop.blockedStates.length === 0) {
+    return {
+      id: "review_loop.blocked_state",
+      status: "warn",
+      message: "No review_loop.blocked_states configured; blocked escalations will comment but leave Linear state unchanged",
+    };
+  }
+  return {
+    id: "review_loop.blocked_state",
+    status: "ok",
+    message: `blocked_states: ${config.reviewLoop.blockedStates.join(", ")}`,
+  };
+}
+
+function mcpToolAvailabilityCheck(config: ServiceConfig): DoctorCheck {
+  const toolNames = [COMPLETION_REPORT_TOOL_NAME, REVIEW_VERDICT_TOOL_NAME].filter((name) => name.length > 0);
+  return {
+    id: "review_loop.mcp_tools",
+    status: toolNames.length === 2 ? "ok" : "error",
+    message: `Cursor harness exposes MCP tools: ${toolNames.join(", ") || "none"}`,
+  };
+}
+
+function candidateIsolationCheck(config: ServiceConfig): DoctorCheck {
+  const reviewActiveOverlap = overlappingStates(config.reviewLoop.reviewStates, config.tracker.activeStates);
+  const blockedActiveOverlap = overlappingStates(config.reviewLoop.blockedStates, config.tracker.activeStates);
+  if (reviewActiveOverlap.length > 0 || blockedActiveOverlap.length > 0) {
+    return {
+      id: "review_loop.candidate_isolation",
+      status: "error",
+      message: `Review-loop states overlap worker candidates: ${[...reviewActiveOverlap, ...blockedActiveOverlap].join(", ")}`,
+    };
+  }
+  if (config.agent.requireLabels.length === 0) {
+    return {
+      id: "review_loop.candidate_isolation",
+      status: "warn",
+      message: "No required dispatch labels configured; any routed active-state issue can become a candidate",
+    };
+  }
+  return {
+    id: "review_loop.candidate_isolation",
+    status: "ok",
+    message: `worker candidates require labels: ${config.agent.requireLabels.join(", ")}; review/blocked states are isolated from active states`,
+  };
+}
+
+function overlappingStates(left: string[], right: string[]): string[] {
+  return left.filter((state) => stateIn(state, right));
+}
+
+function stateIn(state: string, states: string[]): boolean {
+  return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
 }
 
 async function checkGit(checks: DoctorCheck[]): Promise<void> {

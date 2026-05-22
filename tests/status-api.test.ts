@@ -75,6 +75,12 @@ describe("StatusServer durable API", () => {
     await lifecycleStore.ensureIssue(
       { id: "issue-1", identifier: "TEST-1" },
       {
+        phase: "review",
+        reviewRound: 1,
+        incompleteTurnCount: 0,
+        lastCompletionReportId: "completion-report:issue-1:report-1",
+        lastReviewVerdictId: "review-verdict:issue-1:verdict-1",
+        blockedReason: null,
         summaryPointers: {
           workspaceKey: "TEST-1",
           workspacePath: path.join(config.workspace.root, "TEST-1"),
@@ -88,6 +94,40 @@ describe("StatusServer durable API", () => {
           ciStatus: "success",
           lastPushedAt: "2026-01-01T00:00:00.500Z",
         },
+        completionReports: [
+          {
+            id: "completion-report:issue-1:report-1",
+            idempotencyKey: "report-1",
+            runId: "run-1",
+            issueId: "issue-1",
+            issueIdentifier: "TEST-1",
+            summary: "Implemented the status surface.",
+            validationEvidence: ["npm test -- tests/status-api.test.ts"],
+            acceptanceChecklist: [{ text: "Status exposes review-loop fields.", satisfied: true, evidence: "API response" }],
+            changedFiles: ["src/app/http.ts"],
+            branchName: "symphony/TEST-1",
+            pullRequest: null,
+            risks: [],
+            acceptedAt: "2026-01-01T00:00:03.000Z",
+            writebackOperationKeys: [],
+          },
+        ],
+        reviewVerdicts: [
+          {
+            id: "review-verdict:issue-1:verdict-1",
+            idempotencyKey: "verdict-1",
+            runId: "review-run-1",
+            issueId: "issue-1",
+            issueIdentifier: "TEST-1",
+            verdict: "fail",
+            acceptanceResults: [{ text: "Reviewer pass is present.", satisfied: false, evidence: "No pass yet." }],
+            findings: ["Add reviewer pass evidence."],
+            evidence: ["https://github.com/acme/repo/pull/7#discussion_r1"],
+            reviewer: "reviewer-1",
+            submittedAt: "2026-01-01T00:00:04.000Z",
+            writebackOperationKeys: [],
+          },
+        ],
       },
     );
     const server = new StatusServer({
@@ -124,6 +164,15 @@ describe("StatusServer durable API", () => {
       });
       const issueBody = (await issueResponse.json()) as {
         latestRun: { runId: string };
+        reviewLoop: {
+          phase: string | null;
+          role: string | null;
+          reviewRound: number | null;
+          incompleteTurnCount: number | null;
+          blockedReason: string | null;
+          lastCompletionReport: { id: string; summary: string } | null;
+          lastReviewVerdict: { id: string; verdict: string; findings: string[] } | null;
+        };
         metadata: {
           prUrl: string | null;
           prNumber: number | null;
@@ -150,6 +199,22 @@ describe("StatusServer durable API", () => {
 
       expect(issueResponse.status).toBe(200);
       expect(issueBody.latestRun.runId).toBe("run-1");
+      expect(issueBody.reviewLoop).toMatchObject({
+        phase: "review",
+        role: "worker",
+        reviewRound: 1,
+        incompleteTurnCount: 0,
+        blockedReason: null,
+        lastCompletionReport: {
+          id: "completion-report:issue-1:report-1",
+          summary: "Implemented the status surface.",
+        },
+        lastReviewVerdict: {
+          id: "review-verdict:issue-1:verdict-1",
+          verdict: "fail",
+          findings: ["Add reviewer pass evidence."],
+        },
+      });
       expect(issueBody.metadata).toMatchObject({
         prUrl: "https://github.com/acme/repo/pull/7",
         prNumber: 7,

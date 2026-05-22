@@ -132,7 +132,11 @@ export function planCompletionReportAcceptedWritebacks(
       payload: {
         dedupeKey: eventKey,
         body: [
+          "## Symphony Completion Report",
+          "",
+          "Status: accepted",
           "Symphony accepted the worker completion report.",
+          `Next state: ${reviewState} (agent review queue)`,
           "",
           `Run: ${context.runId}`,
           `Session: ${context.sessionId ?? "n/a"}`,
@@ -176,7 +180,13 @@ export function planReviewFailWritebacks(
       payload: {
         dedupeKey: eventKey,
         body: [
-          "Symphony review failed. Requested revisions:",
+          "## Symphony Review Verdict: Fail",
+          "",
+          "Status: requested revisions",
+          "Symphony review failed.",
+          `Next state: ${config.writeback.dispatchState}`,
+          "",
+          "Revision request:",
           "",
           ...(revisions.length === 0
             ? ["- Reviewer did not provide concrete requested revisions."]
@@ -222,6 +232,9 @@ export function planReviewPassWritebacks(
       payload: {
         dedupeKey: eventKey,
         body: [
+          "## Symphony Review Verdict: Pass",
+          "",
+          "Status: passed",
           "Symphony review passed.",
           "",
           `Run: ${context.runId}`,
@@ -273,7 +286,9 @@ export function planBlockedEscalationWritebacks(
       payload: {
         dedupeKey: eventKey,
         body: [
-          "Symphony requires human help before continuing.",
+          "## Symphony Blocked Escalation",
+          "",
+          "Status: blocked, human action required",
           "",
           `Run: ${context.runId}`,
           `Ceiling reason: ${context.reason}`,

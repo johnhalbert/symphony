@@ -67,7 +67,7 @@ function SidebarPrimary() {
           ))}
         </SidebarSection>
 
-        <SidebarSection title="Awaiting review" count="3">
+        <SidebarSection title="Agent review queue" count="3">
           {data.issues.filter(i => i.status === 'review').slice(0,3).map(i => (
             <div key={i.id} style={{
               display:'grid', gridTemplateColumns:'13px 1fr auto',
@@ -300,7 +300,7 @@ function AgentStateCard({ state, title, sub, issue, agent, step, duration }) {
     running:   { dot:'var(--run-active)',  pulseShadow:'0 0 0 3px rgba(240,184,108,0.18)', label:'RUNNING',   labelBg:'var(--accent-soft)',                labelFg:'var(--accent)' },
     queued:    { dot:'var(--run-queued)',  pulseShadow:'none',                              label:'QUEUED',    labelBg:'var(--link-soft)',                  labelFg:'var(--link)' },
     creating:  { dot:'var(--run-queued)',  pulseShadow:'0 0 0 3px rgba(122,167,255,0.16)',  label:'CREATING',  labelBg:'var(--link-soft)',                  labelFg:'var(--link)' },
-    review:    { dot:'var(--st-review)',   pulseShadow:'none',                              label:'HUMAN REVIEW', labelBg:'var(--link-soft)',               labelFg:'var(--link)' },
+    review:    { dot:'var(--st-review)',   pulseShadow:'none',                              label:'IN REVIEW', labelBg:'var(--link-soft)',                  labelFg:'var(--link)' },
     finished:  { dot:'var(--run-done)',    pulseShadow:'none',                              label:'FINISHED',  labelBg:'rgba(127,194,139,0.10)',            labelFg:'var(--st-done)' },
     error:     { dot:'var(--run-error)',   pulseShadow:'0 0 0 3px rgba(226,106,106,0.16)',  label:'ERROR',     labelBg:'rgba(226,106,106,0.10)',            labelFg:'var(--pri-urgent)' },
     cancelled: { dot:'var(--text-3)',      pulseShadow:'none',                              label:'CANCELLED', labelBg:'var(--elevated)',                   labelFg:'var(--text-3)' },
@@ -371,7 +371,7 @@ function AgentStateCard({ state, title, sub, issue, agent, step, duration }) {
           {state==='cancelled' && <span style={{ color:'var(--text-3)' }}>○</span>}
           {state==='expired' && <span style={{ color:'var(--text-3)' }}>◌</span>}
           {state==='queued' && <span style={{ color:'var(--link)' }}>⏳</span>}
-          {state==='review' && <span style={{ color:'var(--link)' }}>👤</span>}
+          {state==='review' && <span style={{ color:'var(--link)' }}>✓</span>}
           <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{step}</span>
         </span>
         <div style={{ flex:1 }} />

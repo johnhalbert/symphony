@@ -37,7 +37,9 @@ describe("TransitionPolicy review-loop planners", () => {
         dedupeKey: "run-1:completion-report-accepted",
       },
     });
-    expect(commentBody(operations, 0)).toContain("accepted the worker completion report");
+    expect(commentBody(operations, 0)).toContain("## Symphony Completion Report");
+    expect(commentBody(operations, 0)).toContain("Status: accepted");
+    expect(commentBody(operations, 0)).toContain("Next state: In Review (agent review queue)");
     expect(operations[1]).toMatchObject({
       idempotencyKey: "transition:issue-1:run-1:completion-report-accepted:In Review",
       kind: "transition",
@@ -81,6 +83,8 @@ describe("TransitionPolicy review-loop planners", () => {
         dedupeKey: "review-run-1:review-verdict-fail",
       },
     });
+    expect(commentBody(operations, 0)).toContain("## Symphony Review Verdict: Fail");
+    expect(commentBody(operations, 0)).toContain("Revision request:");
     expect(commentBody(operations, 0)).toContain("- Add tests for the blocked fallback.");
     expect(commentBody(operations, 0)).toContain("- Clarify idempotency keys.");
     expect(commentBody(operations, 0)).toContain("PR review evidence:");
@@ -125,6 +129,7 @@ describe("TransitionPolicy review-loop planners", () => {
         dedupeKey: "review-run-2:review-verdict-pass",
       },
     });
+    expect(commentBody(operations, 0)).toContain("## Symphony Review Verdict: Pass");
     expect(commentBody(operations, 0)).toContain("Review pass state: Ready to Merge");
     expect(operations[1]).toMatchObject({
       idempotencyKey: "transition:issue-1:review-run-2:review-verdict-pass:Ready to Merge",
@@ -183,6 +188,7 @@ describe("TransitionPolicy review-loop planners", () => {
         dedupeKey: "run-blocked-1:blocked-escalation",
       },
     });
+    expect(commentBody(operations, 0)).toContain("## Symphony Blocked Escalation");
     expect(commentBody(operations, 0)).toContain("Ceiling reason: review loop ceiling reached");
     expect(operations[1]).toMatchObject({
       idempotencyKey: "transition:issue-1:run-blocked-1:blocked-escalation:Blocked",
