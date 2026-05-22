@@ -61,7 +61,7 @@ npm run doctor
 
 Set `LINEAR_API_KEY`, `CURSOR_API_KEY`, and `SYMPHONY_OPEN_WORKSPACE_TOKEN` as needed.
 
-Doctor verifies workflow parsing, writable workspace paths, git availability, Cursor baseline model configuration, review-loop state configuration, `Blocked` availability, completion-report/review-verdict MCP tool availability, candidate isolation, and current Linear candidates.
+Doctor verifies workflow parsing, writable workspace paths, git availability, Cursor baseline model configuration, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, completion-report/review-verdict MCP tool availability, candidate isolation, and current Linear candidates.
 
 ## 5. Promotion Policy
 

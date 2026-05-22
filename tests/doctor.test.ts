@@ -17,12 +17,18 @@ describe("doctor review-loop checks", () => {
         workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
         mcpToolLister: async ({ command }) =>
           command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+        linearStateLister: async () => ["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"],
       }),
     ).resolves.toEqual([
       {
         id: "review_loop.states",
         status: "ok",
         message: "review_states: In Review; pass destination: Ready to Merge",
+      },
+      {
+        id: "review_loop.linear_states",
+        status: "ok",
+        message: "Linear team has configured review-loop states: In Review, Blocked, Ready to Merge",
       },
       {
         id: "review_loop.blocked_state",
@@ -57,6 +63,7 @@ describe("doctor review-loop checks", () => {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
       mcpToolLister: async ({ command }) =>
         command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+      linearStateLister: async () => ["Todo", "In Progress", "In Review", "Ready to Merge", "Done"],
     });
 
     expect(checks).toContainEqual({
@@ -81,6 +88,7 @@ describe("doctor review-loop checks", () => {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
       mcpToolLister: async ({ command }) =>
         command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+      linearStateLister: async () => ["Todo", "In Progress", "In Review", "Blocked", "Done"],
     });
 
     expect(checks).toContainEqual({
@@ -100,12 +108,58 @@ describe("doctor review-loop checks", () => {
       workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
       mcpToolLister: async ({ command }) =>
         command === "completion-report-mcp" ? ["submit_completion_report"] : ["unexpected_tool"],
+      linearStateLister: async () => ["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"],
     });
 
     expect(checks).toContainEqual({
       id: "review_loop.mcp_tools",
       status: "error",
       message: "Configured Cursor CLI did not list required MCP tools: review-verdict-mcp:submit_review_verdict",
+    });
+  });
+
+  it("errors when configured review pass state is absent from Linear workflow states", async () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+
+    const checks = await reviewLoopDoctorChecks(config, {
+      workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
+      mcpToolLister: async ({ command }) =>
+        command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+      linearStateLister: async () => ["Blocked", "Todo", "Duplicate", "Canceled", "Backlog", "In Progress", "Done", "In Review"],
+    });
+
+    expect(checks).toContainEqual({
+      id: "review_loop.linear_states",
+      status: "error",
+      message:
+        "Linear team is missing configured review-loop states: Ready to Merge. Available states: Blocked, Todo, Duplicate, Canceled, Backlog, In Progress, Done, In Review",
+    });
+  });
+
+  it("warns when Linear state availability cannot be checked", async () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+
+    const checks = await reviewLoopDoctorChecks(config, {
+      workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
+      mcpToolLister: async ({ command }) =>
+        command === "completion-report-mcp" ? ["submit_completion_report"] : ["submit_review_verdict"],
+      linearStateLister: async () => {
+        throw new Error("Linear API unavailable");
+      },
+    });
+
+    expect(checks).toContainEqual({
+      id: "review_loop.linear_states",
+      status: "warn",
+      message: "Could not verify Linear review-loop state availability: Linear API unavailable",
     });
   });
 });

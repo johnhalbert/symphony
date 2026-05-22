@@ -34,6 +34,7 @@ export interface DoctorOptions {
 export interface ReviewLoopDoctorCheckOptions {
   workflowPath: string;
   mcpToolLister?: McpToolLister;
+  linearStateLister?: LinearStateLister;
 }
 
 export type McpToolServerCommand = "completion-report-mcp" | "review-verdict-mcp";
@@ -43,6 +44,8 @@ export type McpToolLister = (input: {
   config: ServiceConfig;
   workflowPath: string;
 }) => Promise<string[]>;
+
+export type LinearStateLister = (input: { config: ServiceConfig }) => Promise<string[]>;
 
 export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
@@ -139,6 +142,7 @@ export async function reviewLoopDoctorChecks(
 ): Promise<DoctorCheck[]> {
   return [
     reviewLoopStateCheck(config),
+    await linearStateAvailabilityCheck(config, options),
     blockedAvailabilityCheck(config),
     await mcpToolAvailabilityCheck(config, options),
     candidateIsolationCheck(config),
@@ -169,6 +173,48 @@ function reviewLoopStateCheck(config: ServiceConfig): DoctorCheck {
     status: "ok",
     message: `review_states: ${config.reviewLoop.reviewStates.join(", ")}; pass destination: ${config.reviewLoop.reviewPassState}`,
   };
+}
+
+async function linearStateAvailabilityCheck(
+  config: ServiceConfig,
+  options: ReviewLoopDoctorCheckOptions,
+): Promise<DoctorCheck> {
+  const requiredStates = uniqueStates([
+    ...config.reviewLoop.reviewStates,
+    ...config.reviewLoop.blockedStates,
+    ...(config.reviewLoop.reviewPassState === null ? [] : [config.reviewLoop.reviewPassState]),
+  ]);
+  if (requiredStates.length === 0) {
+    return {
+      id: "review_loop.linear_states",
+      status: "warn",
+      message: "No review-loop Linear states are configured to verify",
+    };
+  }
+
+  const lister = options.linearStateLister ?? ((input) => new LinearTrackerClient(input.config.tracker).fetchWorkflowStateNames());
+  try {
+    const availableStates = await lister({ config });
+    const missing = requiredStates.filter((state) => !stateIn(state, availableStates));
+    if (missing.length > 0) {
+      return {
+        id: "review_loop.linear_states",
+        status: "error",
+        message: `Linear team is missing configured review-loop states: ${missing.join(", ")}. Available states: ${formatStateList(availableStates)}`,
+      };
+    }
+    return {
+      id: "review_loop.linear_states",
+      status: "ok",
+      message: `Linear team has configured review-loop states: ${requiredStates.join(", ")}`,
+    };
+  } catch (error) {
+    return {
+      id: "review_loop.linear_states",
+      status: "warn",
+      message: `Could not verify Linear review-loop state availability: ${errorMessage(error)}`,
+    };
+  }
 }
 
 function blockedAvailabilityCheck(config: ServiceConfig): DoctorCheck {
@@ -248,6 +294,22 @@ function candidateIsolationCheck(config: ServiceConfig): DoctorCheck {
 
 function overlappingStates(left: string[], right: string[]): string[] {
   return left.filter((state) => stateIn(state, right));
+}
+
+function uniqueStates(states: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const state of states) {
+    const key = state.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(state);
+  }
+  return result;
+}
+
+function formatStateList(states: string[]): string {
+  return states.length === 0 ? "none" : states.join(", ");
 }
 
 function stateIn(state: string, states: string[]): boolean {
