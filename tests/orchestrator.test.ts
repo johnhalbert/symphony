@@ -1,13 +1,14 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CompletionReportService,
   type CompletionReportPullRequestPublication,
   type CompletionReportPullRequestPublicationInput,
   type CompletionReportPullRequestPublisher,
 } from "../src/core/CompletionReportService.js";
+import { parseServiceConfig } from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
@@ -37,6 +38,8 @@ describe("Orchestrator", () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -1288,10 +1291,71 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("lazy-resolves worker GitHub discovery credentials when no discovery client override is injected", async () => {
+    const config = githubProfileConfig(root, {
+      profiles: {
+        discovery: { value: "$GITHUB_DISCOVERY_TOKEN", capabilities: ["github.discovery"] },
+      },
+      roles: {
+        worker: {
+          "github.discovery": "discovery",
+        },
+      },
+      env: {
+        GITHUB_DISCOVERY_TOKEN: "discovery-secret",
+      },
+    });
+    const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      const url = new URL(String(input));
+      expect(url.pathname).toBe("/repos/acme/symphony/pulls");
+      return new Response(
+        JSON.stringify([
+          {
+            html_url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            head: { ref: "symphony/TEST-1", sha: "abc123", repo: { pushed_at: "2026-01-01T00:00:01Z" } },
+          },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(authorizations).toEqual(["Bearer discovery-secret", "Bearer discovery-secret"]);
+  });
+
   it("injects PR review evidence into the next worker prompt after requested changes", async () => {
     const config = testConfig(root);
     config.reviewLoop.continuationHistoryThreshold = 5;
-    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const candidate = issue({ state: "In Progress", branchName: null });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -1380,6 +1444,106 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("thread: thread-1");
     expect(harness.runs[0]?.prompt).toContain("Add coverage for the dedupe path.");
     expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42");
+  });
+
+  it("lazy-resolves reviewer GitHub review-evidence credentials for worker feedback prompts", async () => {
+    const config = githubProfileConfig(root, {
+      profiles: {
+        "review-read": {
+          value: "$GITHUB_REVIEW_READ_TOKEN",
+          capabilities: ["github.review_evidence_read"],
+        },
+      },
+      roles: {
+        reviewer: {
+          "github.review_evidence_read": "review-read",
+        },
+      },
+      env: {
+        GITHUB_REVIEW_READ_TOKEN: "review-read-secret",
+      },
+    });
+    config.reviewLoop.continuationHistoryThreshold = 5;
+    const candidate = issue({ state: "In Progress", branchName: null });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "implementation",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [completionReportRecord(candidate)],
+    });
+    const calls: Array<{ pathname: string; authorization: string }> = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      const url = new URL(String(input));
+      calls.push({
+        pathname: url.pathname,
+        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+      });
+      if (url.pathname === "/graphql") {
+        return jsonResponse({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [],
+                },
+              },
+            },
+          },
+        });
+      }
+      if (url.pathname.endsWith("/pulls/42/reviews")) {
+        return jsonResponse([
+          {
+            id: 1001,
+            html_url: "https://github.com/acme/symphony/pull/42#pullrequestreview-1001",
+            state: "CHANGES_REQUESTED",
+            body: "Please address the reviewer-owned evidence path.",
+            user: { login: "reviewer-a" },
+            submitted_at: "2026-01-01T00:00:01Z",
+            updated_at: "2026-01-01T00:00:01Z",
+          },
+        ]);
+      }
+      return jsonResponse([]);
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(calls.map((call) => call.authorization)).toEqual([
+      "Bearer review-read-secret",
+      "Bearer review-read-secret",
+      "Bearer review-read-secret",
+      "Bearer review-read-secret",
+    ]);
+    expect(harness.runs[0]?.prompt).toContain("PR review feedback to address");
+    expect(harness.runs[0]?.prompt).toContain("Please address the reviewer-owned evidence path.");
   });
 
   it("injects the latest fail verdict findings and workspace context into the next worker prompt", async () => {
@@ -1701,6 +1865,57 @@ function reviewVerdictRecord(candidate = issue()): IssueReviewVerdictRecord {
     submittedAt: "2026-01-01T00:00:02Z",
     writebackOperationKeys: [],
   };
+}
+
+function githubProfileConfig(
+  workspaceRoot: string,
+  input: {
+    profiles: Record<string, { value: string; capabilities: string[] }>;
+    roles: { worker?: Record<string, string>; reviewer?: Record<string, string> };
+    env: Record<string, string>;
+  },
+) {
+  return parseServiceConfig(
+    {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_API_KEY",
+        project_slug: "TEST",
+      },
+      workspace: {
+        root: workspaceRoot,
+      },
+      polling: {
+        interval_ms: 60_000,
+      },
+      agent: {
+        max_concurrent_agents: 2,
+        max_turns: 1,
+      },
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        token: "legacy-github-token",
+        api_base_url: "https://api.github.test",
+      },
+      credential_profiles: {
+        profiles: input.profiles,
+        roles: input.roles,
+      },
+    },
+    path.join(workspaceRoot, "WORKFLOW.md"),
+    {
+      LINEAR_API_KEY: "linear-test-key",
+      ...input.env,
+    },
+  );
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 class BlockingHarness implements AgentHarness {

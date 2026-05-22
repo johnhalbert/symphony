@@ -119,6 +119,14 @@ export class CredentialProfileRegistry {
     return { role, capability, value: fallbackValue, source: "legacy", profileName: null };
   }
 
+  hasAssignment(role: AgentRunRole, capability: CredentialCapability): boolean {
+    return this.#roleAssignments.get(role)?.has(capability) ?? false;
+  }
+
+  assignmentRolesFor(capability: CredentialCapability): AgentRunRole[] {
+    return ROLE_NAMES.filter((role) => this.hasAssignment(role, capability));
+  }
+
   capabilitiesForRole(role: AgentRunRole): CredentialCapability[] {
     const defaults = DEFAULT_ROLE_CREDENTIAL_CAPABILITIES[role] ?? [];
     return [

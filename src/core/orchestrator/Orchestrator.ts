@@ -36,6 +36,7 @@ import {
   planRunStartedComment,
   planRunSucceededWritebacks,
 } from "../writeback/TransitionPolicy.js";
+import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
 
 export interface OrchestratorOptions {
   config: ServiceConfig;
@@ -1276,12 +1277,14 @@ export class Orchestrator {
   }
 
   private async discoverPullRequestForEntry(entry: RunningEntry, workspace: Workspace): Promise<void> {
-    const client = this.options.pullRequestClient;
     const branchName = workspace.gitBranchName ?? entry.issue.branchName;
-    if (!client || !branchName) return;
+    if (!branchName) return;
 
     let pullRequest: DiscoveredPullRequest | null;
     try {
+      const client =
+        this.options.pullRequestClient ??
+        createGitHubPullRequestClientForCapability(this.config, "github.discovery");
       pullRequest = await client.findOpenPullRequestByBranch({ branchName });
     } catch (error) {
       this.options.logger.warn("pull request discovery failed", {
@@ -1487,13 +1490,16 @@ export class Orchestrator {
   }
 
   private async loadWorkerReviewEvidencePrompt(entry: RunningEntry): Promise<string | null> {
-    if (!this.options.lifecycleStore || !this.options.pullRequestReviewClient) return null;
-    const service = new PullRequestReviewEvidenceService({
-      lifecycleStore: this.options.lifecycleStore,
-      client: this.options.pullRequestReviewClient,
-      fullHistoryThreshold: this.config.reviewLoop.continuationHistoryThreshold,
-    });
+    if (!this.options.lifecycleStore) return null;
     try {
+      const client =
+        this.options.pullRequestReviewClient ??
+        createGitHubPullRequestClientForCapability(this.config, "github.review_evidence_read");
+      const service = new PullRequestReviewEvidenceService({
+        lifecycleStore: this.options.lifecycleStore,
+        client,
+        fullHistoryThreshold: this.config.reviewLoop.continuationHistoryThreshold,
+      });
       const context = await service.prepareWorkerPromptContext(entry.issue);
       return context === null ? null : formatWorkerReviewEvidencePrompt(context);
     } catch (error) {

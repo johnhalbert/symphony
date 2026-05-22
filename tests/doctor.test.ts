@@ -1,8 +1,14 @@
-import { describe, expect, it } from "vitest";
-import { continuationContextDoctorChecks, reviewLoopDoctorChecks } from "../src/doctor.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseServiceConfig } from "../src/core/config/Config.js";
+import { continuationContextDoctorChecks, githubPublicationDoctorCheck, reviewLoopDoctorChecks } from "../src/doctor.js";
 import { testConfig } from "./helpers.js";
 
 describe("doctor review-loop checks", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
   it("validates review state, blocked state, MCP tools, and candidate isolation", async () => {
     const config = testConfig("/tmp/symphony-doctor");
     config.tracker.activeStates = ["Todo", "In Progress"];
@@ -188,5 +194,85 @@ describe("doctor review-loop checks", () => {
     const config = testConfig("/tmp/symphony-doctor");
 
     expect(continuationContextDoctorChecks(config)).toEqual([]);
+  });
+
+  it("validates GitHub publication with the resolved worker publication profile", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "legacy-github-token",
+          api_base_url: "https://api.github.test",
+          publish_pull_requests: true,
+        },
+        credential_profiles: {
+          profiles: {
+            publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+          },
+          roles: {
+            worker: {
+              "github.publication": "publication",
+            },
+          },
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_PUBLICATION_TOKEN: "publication-secret",
+      },
+    );
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (_input: unknown, init?: RequestInit) => {
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      return new Response(JSON.stringify({ id: 1 }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
+      id: "github.pr_publication",
+      status: "ok",
+      message: "GitHub PR publication can access acme/symphony",
+    });
+    expect(authorizations).toEqual(["Bearer publication-secret"]);
+  });
+
+  it("reports publication capability assignment failures", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "legacy-github-token",
+          publish_pull_requests: true,
+        },
+        credential_profiles: {
+          profiles: {
+            publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+          },
+          roles: {
+            reviewer: {
+              "github.publication": "publication",
+            },
+          },
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_PUBLICATION_TOKEN: "publication-secret",
+      },
+    );
+
+    await expect(githubPublicationDoctorCheck(config)).resolves.toMatchObject({
+      id: "github.pr_publication",
+      status: "error",
+      message: expect.stringContaining("github.publication"),
+    });
+    await expect(githubPublicationDoctorCheck(config)).resolves.toMatchObject({
+      message: expect.stringContaining("credential_profiles.roles.worker.github.publication"),
+    });
   });
 });

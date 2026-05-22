@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { LinearTrackerClient } from "./integrations/linear/LinearTrackerClient.js";
-import { GitHubPullRequestClient } from "./integrations/github/GitHubPullRequestClient.js";
+import { createGitHubPullRequestClientForCapability } from "./integrations/github/GitHubCredentialResolver.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { errorMessage } from "./core/errors.js";
 import type { ServiceConfig } from "./core/config/Config.js";
@@ -81,7 +81,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
     await checkWritable(checks, "workspace.root", config.workspace.root);
     await checkWritable(checks, "workspace.state_dir", config.workspace.stateDir);
     await checkGit(checks);
-    await checkGitHubPublication(checks, config.github);
+    checks.push(await githubPublicationDoctorCheck(config));
 
     if (process.env.CURSOR_API_KEY) {
       checks.push({ id: "env.cursor", status: "ok", message: "CURSOR_API_KEY is set" });
@@ -348,6 +348,23 @@ async function checkGit(checks: DoctorCheck[]): Promise<void> {
   }
 }
 
+export async function githubPublicationDoctorCheck(config: ServiceConfig): Promise<DoctorCheck> {
+  if (!config.github.publishPullRequests) {
+    return { id: "github.pr_publication", status: "ok", message: "PR publication is disabled" };
+  }
+  try {
+    const github = createGitHubPullRequestClientForCapability(config, "github.publication");
+    await github.checkRepositoryAccess();
+    return {
+      id: "github.pr_publication",
+      status: "ok",
+      message: `GitHub PR publication can access ${config.github.owner}/${config.github.repo}`,
+    };
+  } catch (error) {
+    return { id: "github.pr_publication", status: "error", message: `github.publication: ${errorMessage(error)}` };
+  }
+}
+
 async function listMcpToolsViaConfiguredCli(input: {
   command: McpToolServerCommand;
   config: ServiceConfig;
@@ -464,27 +481,3 @@ function asRecordArray(value: unknown): Array<Record<string, unknown>> {
   throw new Error("Expected JSON-RPC record array");
 }
 
-async function checkGitHubPublication(checks: DoctorCheck[], github: { publishPullRequests: boolean; owner: string | null; repo: string | null; token: string | null; apiBaseUrl: string; headOwner: string | null }): Promise<void> {
-  if (!github.publishPullRequests) {
-    checks.push({ id: "github.pr_publication", status: "ok", message: "PR publication is disabled" });
-    return;
-  }
-  if (!github.owner || !github.repo || !github.token) {
-    checks.push({
-      id: "github.pr_publication",
-      status: "error",
-      message: "GitHub owner, repo, and token are required when PR publication is enabled",
-    });
-    return;
-  }
-  try {
-    await new GitHubPullRequestClient(github).checkRepositoryAccess();
-    checks.push({
-      id: "github.pr_publication",
-      status: "ok",
-      message: `GitHub PR publication can access ${github.owner}/${github.repo}`,
-    });
-  } catch (error) {
-    checks.push({ id: "github.pr_publication", status: "error", message: errorMessage(error) });
-  }
-}
