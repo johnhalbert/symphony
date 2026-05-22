@@ -15,6 +15,11 @@ import {
   type IssueLifecycleRecord,
   type IssueLifecycleStore,
 } from "../persistence/IssueLifecycleStore.js";
+import {
+  formatWorkerReviewEvidencePrompt,
+  PullRequestReviewEvidenceService,
+  type PullRequestReviewEvidenceClient,
+} from "../review/PullRequestReviewEvidenceService.js";
 import type { WritebackProcessor } from "../writeback/WritebackOutbox.js";
 import {
   planDispatchWriteback,
@@ -35,6 +40,7 @@ export interface OrchestratorOptions {
   lifecycleStore?: IssueLifecycleStore;
   writeback?: WritebackProcessor;
   pullRequestClient?: PullRequestDiscoveryClient;
+  pullRequestReviewClient?: PullRequestReviewEvidenceClient;
 }
 
 export interface PullRequestDiscoveryClient {
@@ -143,6 +149,8 @@ const DEFAULT_REVIEWER_PROMPT_TEMPLATE = `
 You are a Symphony reviewer agent for {{ issue.identifier }}.
 
 Inspect only. Do not modify files, create commits, push branches, comment on Linear, transition Linear state, or otherwise change workspace or lifecycle state directly.
+
+Use the linked GitHub pull request as the primary detailed review surface. Before calling submit_review_verdict, leave concrete feedback directly on the PR by submitting a GitHub PR review and/or posting PR review comments. Requested changes must point to the relevant files, lines, or threads on GitHub; a pass verdict should also leave a concise approving or summary review/comment on the PR. In submit_review_verdict, reference the PR review/comment URLs you used as evidence.
 
 Report a verdict in this format:
 VERDICT: pass | fail | blocked
@@ -587,7 +595,7 @@ export class Orchestrator {
         entry.turnCount = turnNumber;
         const prompt =
           turnNumber === 1
-            ? await this.promptRenderer.render(this.promptTemplate, { issue: entry.issue, attempt })
+            ? await this.renderWorkerPrompt(entry, attempt)
             : "Continue working on the issue. Check current issue state and proceed according to the workflow.";
         const context = this.buildRunContext(entry, workspace, attempt, turnNumber);
         await this.consumeHarnessEvents(entry, this.options.harness.run(context, prompt), {
@@ -1123,6 +1131,32 @@ export class Orchestrator {
   private reviewerPromptTemplate(): string {
     const configured = this.config.reviewLoop.reviewerPromptTemplate;
     return configured === null || configured.trim().length === 0 ? DEFAULT_REVIEWER_PROMPT_TEMPLATE : configured;
+  }
+
+  private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
+    const basePrompt = await this.promptRenderer.render(this.promptTemplate, { issue: entry.issue, attempt });
+    const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
+    return reviewEvidence === null ? basePrompt : `${basePrompt}\n${reviewEvidence}`;
+  }
+
+  private async loadWorkerReviewEvidencePrompt(entry: RunningEntry): Promise<string | null> {
+    if (!this.options.lifecycleStore || !this.options.pullRequestReviewClient) return null;
+    const service = new PullRequestReviewEvidenceService({
+      lifecycleStore: this.options.lifecycleStore,
+      client: this.options.pullRequestReviewClient,
+      fullHistoryThreshold: this.config.reviewLoop.continuationHistoryThreshold,
+    });
+    try {
+      const context = await service.prepareWorkerPromptContext(entry.issue);
+      return context === null ? null : formatWorkerReviewEvidencePrompt(context);
+    } catch (error) {
+      this.options.logger.warn("pull request review evidence ingestion failed", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        error: errorMessage(error),
+      });
+      return null;
+    }
   }
 
   private availableSlots(): number {

@@ -1,4 +1,5 @@
 import type { ServiceConfig } from "../config/Config.js";
+import type { PullRequestReviewEvidenceItem } from "../persistence/IssueLifecycleStore.js";
 import type { Issue, Workspace } from "../types.js";
 import type { NewWritebackOperation } from "./WritebackOutbox.js";
 
@@ -141,6 +142,7 @@ export function planReviewFailWritebacks(
   context: ReviewVerdictWritebackContext,
   config: ServiceConfig,
   requestedRevisions: string[],
+  reviewEvidence: PullRequestReviewEvidenceItem[] = [],
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
 
@@ -163,6 +165,7 @@ export function planReviewFailWritebacks(
           "",
           `Run: ${context.runId}`,
           `Reviewer: ${context.reviewer ?? "n/a"}`,
+          ...formatReviewEvidenceForLinearComment(reviewEvidence),
         ].join("\n"),
       },
     },
@@ -374,6 +377,31 @@ function formatPullRequest(pullRequest: CompletionReportWritebackDetails["pullRe
   return parts.length === 0 ? "n/a" : parts.join(" ");
 }
 
+function formatReviewEvidenceForLinearComment(evidence: PullRequestReviewEvidenceItem[]): string[] {
+  const active = evidence.filter((item) => item.isResolved !== true && item.isOutdated !== true);
+  if (active.length === 0) return [];
+  const pullRequestUrl = active.find((item) => item.pullRequestUrl !== null)?.pullRequestUrl ?? null;
+  return [
+    "",
+    "PR review evidence:",
+    ...(pullRequestUrl === null ? [] : [`Pull request: ${pullRequestUrl}`]),
+    ...active.map((item) => `- ${formatReviewEvidenceSummary(item)}`),
+    "",
+    "GitHub PR reviews and comments are the primary detailed review surface.",
+  ];
+}
+
+function formatReviewEvidenceSummary(item: PullRequestReviewEvidenceItem): string {
+  const location = item.path === null ? "PR" : `${item.path}${item.line === null ? "" : `:${item.line}`}`;
+  const link = item.url ?? item.pullRequestUrl ?? "n/a";
+  const state = item.state === null ? "" : `${item.state} `;
+  return `${state}${location}: ${oneLine(item.body).slice(0, 180)} (${link})`;
+}
+
 function safeKeySegment(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "report";
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
