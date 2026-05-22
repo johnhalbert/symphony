@@ -2,6 +2,11 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { SymphonyError } from "../errors.js";
+import {
+  createCredentialProfileRegistry,
+  rawCredentialProfilesSchema,
+  type CredentialProfileRegistry,
+} from "./CredentialProfiles.js";
 
 const stringArray = z.array(z.string());
 
@@ -125,6 +130,7 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    credential_profiles: rawCredentialProfilesSchema.optional(),
   })
   .passthrough();
 
@@ -250,6 +256,7 @@ export interface ServiceConfig {
   server: ServerConfig;
   writeback: WritebackConfig;
   github: GitHubConfig;
+  credentialProfiles: CredentialProfileRegistry;
   reviewLoop: ReviewLoopConfig;
   continuationContext: ContinuationContextConfig;
   raw: RawWorkflowConfig;
@@ -345,6 +352,18 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   );
   const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
   const publishPullRequests = raw.github?.publish_pull_requests ?? false;
+  const cursorRuntimeApiKey = normalizeOptionalConfigString(resolveConfigString("$CURSOR_API_KEY", env));
+  const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
+  const credentialProfiles = createCredentialProfileRegistry({
+    raw: raw.credential_profiles,
+    env,
+    fallbacks: {
+      githubToken,
+      linearApiKey: trackerApiKey,
+      cursorRuntimeApiKey,
+      openWorkspaceToken: serverOpenWorkspaceToken,
+    },
+  });
   const reviewStates = raw.review_loop?.review_states ?? handoffStates;
   const blockedStates = raw.review_loop?.blocked_states ?? [];
   const reviewPassState = raw.review_loop?.review_pass_state ?? null;
@@ -404,7 +423,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     server: {
       port: raw.server?.port ?? null,
       host: raw.server?.host ?? "127.0.0.1",
-      openWorkspaceToken: resolveConfigString(raw.server?.open_workspace_token, env) ?? null,
+      openWorkspaceToken: serverOpenWorkspaceToken,
     },
     writeback: {
       enabled: raw.writeback?.enabled ?? false,
@@ -420,6 +439,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
       publishPullRequests,
     },
+    credentialProfiles,
     reviewLoop: {
       reviewStates,
       blockedStates,
