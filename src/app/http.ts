@@ -161,6 +161,7 @@ export class StatusServer {
         const live = this.options.orchestrator.getIssueDetails(issueId);
         const workspace = await this.options.runStore?.findWorkspace(issueId);
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
         const lifecycle = await this.options.lifecycleStore?.get(issueId);
         const enrichedRuns = await Promise.all(
@@ -180,6 +181,7 @@ export class StatusServer {
             live,
             workspace,
             latestRun,
+            summaryRun,
             lifecycle,
           }),
           runs: enrichedRuns,
@@ -216,6 +218,7 @@ export class StatusServer {
         const live = this.options.orchestrator.getIssueDetails(issueId);
         const workspace = await this.options.runStore?.findWorkspace(issueId);
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const lifecycle = await this.options.lifecycleStore?.get(issueId);
         if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
@@ -247,6 +250,7 @@ export class StatusServer {
             live,
             workspace,
             latestRun,
+            summaryRun,
             lifecycle,
           }),
           live: live ? liveIssueResponse(live, operatorLiveness) : null,
@@ -561,6 +565,7 @@ async function operatorSnapshotView(
       const workspace = (await runStore?.findWorkspace(row.issueId)) ?? (await runStore?.findWorkspace(row.issueIdentifier));
       const latestRun =
         (await runStore?.latestRunForIssue(row.issueId)) ?? (await runStore?.latestRunForIssue(row.issueIdentifier));
+      const summaryRun = await resolveIssueDetailsSummaryRun(row, latestRun, runStore);
       const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
       const affordances = operatorAffordances({
         issueKey: row.issueIdentifier,
@@ -584,6 +589,7 @@ async function operatorSnapshotView(
           live: row,
           workspace,
           latestRun,
+          summaryRun,
           lifecycle: row.lifecycle,
         }),
         liveness: runningOperatorLiveness(row, paused, row.lifecycle, agentId),
@@ -671,6 +677,7 @@ async function pausedOperatorViews(
       const workspace = await runStore?.findWorkspace(pausedKey);
       const latestRun = await runStore?.latestRunForIssue(pausedKey);
       const live = running.find((row) => row.issueId === pausedKey || row.issueIdentifier === pausedKey) ?? null;
+      const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, runStore);
       const issueIdentifier = lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? pausedKey;
       const controls = operatorControls({ issueKnown: true, live: null, paused: true, mutationsConfigured });
       return {
@@ -687,6 +694,7 @@ async function pausedOperatorViews(
           live,
           workspace,
           latestRun,
+          summaryRun,
           lifecycle,
         }),
         ...operatorAffordances({
@@ -1084,8 +1092,7 @@ function isLifecycleBlocked(lifecycle: IssueLifecycleRecord | null | undefined):
 }
 
 function liveIssueResponse(live: RunningRow, operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>) {
-  const { issueDetails: _issueDetails, ...liveWithoutIssueDetails } = live;
-  return { ...liveWithoutIssueDetails, operatorLiveness };
+  return { ...live, operatorLiveness };
 }
 
 function buildIssueDetailsEnvelope(input: {
@@ -1095,6 +1102,7 @@ function buildIssueDetailsEnvelope(input: {
   staleThresholdMs: number;
   live: RunningRow | null;
   latestRun: RunRecord | null | undefined;
+  summaryRun: RunRecord | null | undefined;
   lifecycle: IssueLifecycleRecord | null | undefined;
   workspace: WorkspaceRecord | null | undefined;
 }): IssueDetailsEnvelope {
@@ -1108,7 +1116,7 @@ function buildIssueDetailsEnvelope(input: {
       blockers: buildIssueBlockerSummary(input.live.issueDetails.blockedBy, input.trackerStateLists.terminalStates, input.lifecycle),
       workspace: buildIssueWorkspaceSummary(input, metadata),
       pullRequest: buildIssuePullRequestSummary(metadata),
-      latestRun: buildIssueLatestRunSummary(input.latestRun),
+      latestRun: buildIssueLatestRunSummary(input.summaryRun),
     };
   }
 
@@ -1120,8 +1128,22 @@ function buildIssueDetailsEnvelope(input: {
     blockers: buildIssueBlockerSummary(null, input.trackerStateLists.terminalStates, input.lifecycle),
     workspace: buildIssueWorkspaceSummary(input, metadata),
     pullRequest: buildIssuePullRequestSummary(metadata),
-    latestRun: buildIssueLatestRunSummary(input.latestRun),
+    latestRun: buildIssueLatestRunSummary(input.summaryRun),
   };
+}
+
+async function resolveIssueDetailsSummaryRun(
+  live: RunningRow | null,
+  issueWideLatestRun: RunRecord | null | undefined,
+  runStore?: RunTranscriptStore,
+): Promise<RunRecord | null> {
+  if (!live) return issueWideLatestRun ?? null;
+  const activeRunId = live.liveness.activeRunId ?? live.runId;
+  if (activeRunId && runStore) {
+    const activeRun = await runStore.getRun(activeRunId);
+    if (runMatchesLiveRow(live, activeRun)) return activeRun;
+  }
+  return runMatchesLiveRow(live, issueWideLatestRun ?? null) ? (issueWideLatestRun ?? null) : null;
 }
 
 function durableIssueStatusView(input: {

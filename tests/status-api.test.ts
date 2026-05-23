@@ -529,6 +529,52 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("classifies live tracker states and marks recent records as not stale", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const cases: Array<{ identifier: string; state: string; classification: string }> = [
+      { identifier: "TEST-HANDOFF", state: "In Review", classification: "handoff" },
+      { identifier: "TEST-TERMINAL", state: "Done", classification: "terminal" },
+      { identifier: "TEST-BLOCKED-STATE", state: "Blocked", classification: "blocked" },
+    ];
+    const running = cases.map(({ identifier, state }) => liveRunningFixture(config, identifier, state));
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(running),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      for (const item of cases) {
+        const response = await fetch(`${baseUrl}/api/v1/issues/${item.identifier}`);
+        const body = (await response.json()) as { issueDetails: IssueDetailsEnvelope };
+        expect(response.status).toBe(200);
+        expect(body.issueDetails).toMatchObject({
+          tracker: {
+            classification: item.classification,
+            generatedAt: "2026-01-01T00:10:00.000Z",
+            updatedAt: "2026-01-01T00:08:30.000Z",
+            ageMs: 90_000,
+            stale: false,
+          },
+          pullRequest: { url: null, number: null, headSha: null, branch: null, ciStatus: null, lastPushedAt: null },
+          workspace: { workspaceKey: null, path: null, sourceKind: null },
+        });
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves live liveness and cancellation state from the orchestrator snapshot", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
@@ -669,7 +715,7 @@ describe("StatusServer durable API", () => {
       const issueBody = (await issueResponse.json()) as {
         issueDetails: IssueDetailsEnvelope;
         live: {
-          issueDetails?: IssueStatusView;
+          issueDetails: IssueStatusView;
           liveness: unknown;
           cancellation: unknown;
           operatorLiveness: {
@@ -725,14 +771,16 @@ describe("StatusServer durable API", () => {
           source: "operator",
         },
       });
-      expect(issueBody.live).not.toHaveProperty("issueDetails");
+      expect(issueBody.live.issueDetails).toEqual(stateBody.running[0]?.issueDetails);
       expect(issueBody.issueDetails).toMatchObject({
         source: "live",
         completeness: "full",
         issue: stateBody.running[0]?.issueDetails,
         tracker: { generatedAt: "2026-01-01T00:10:00.000Z", classification: "active", stale: true },
         blockers: { available: true, totalCount: 1, openCount: 1, blocked: true },
-        latestRun: { runId: "run-reviewer", status: "running", terminalReason: null },
+        latestRun: { runId: "run-1", status: "running", terminalReason: null },
+        pullRequest: { url: null, number: null, headSha: null, branch: null, ciStatus: null, lastPushedAt: null },
+        workspace: { workspaceKey: "TEST-1", sourceKind: null },
       });
       expect(runsBody.issueDetails).toMatchObject(issueBody.issueDetails);
       expect(stateBody.operatorView.running[0]).toMatchObject({
@@ -1410,6 +1458,67 @@ function durableIssueDetails(overrides: Partial<IssueDetailsEnvelope["issue"]> =
       error: null,
       completedAt: null,
     },
+  };
+}
+
+function liveRunningFixture(
+  config: ReturnType<typeof testConfig>,
+  identifier: string,
+  state: string,
+): ReturnType<Orchestrator["snapshot"]>["running"][number] {
+  const id = `issue-${identifier.toLowerCase()}`;
+  const runId = `run-${identifier.toLowerCase()}`;
+  return {
+    issueId: id,
+    issueIdentifier: identifier,
+    role: "worker",
+    state,
+    workspacePath: null,
+    sessionId: null,
+    runId,
+    turnCount: 1,
+    lastEvent: null,
+    lastMessage: null,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    lastEventAt: null,
+    liveness: {
+      status: "active",
+      activeRunId: runId,
+      lastActivityAt: "2026-01-01T00:10:00.000Z",
+      secondsSinceLastActivity: 0,
+      stallTimeoutMs: 300_000,
+    },
+    cancellation: {
+      requested: false,
+      requestedAt: null,
+      source: null,
+      reason: null,
+      abortSignalled: false,
+      harnessStopRequestedAt: null,
+      suppressRetryOnExit: false,
+    },
+    tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    lifecycle: null,
+    metadata: {
+      prUrl: null,
+      prNumber: null,
+      prHeadSha: null,
+      prBranch: null,
+      ciStatus: null,
+      lastPushedAt: null,
+      lastEvidenceCursor: null,
+      branchName: null,
+      gitBranchName: null,
+      repoPath: null,
+      baseRef: null,
+    },
+    issueDetails: issueDetailsFixture({
+      id,
+      identifier,
+      title: `${identifier} title`,
+      state,
+      updatedAt: "2026-01-01T00:08:30.000Z",
+    }),
   };
 }
 

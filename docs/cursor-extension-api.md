@@ -37,13 +37,15 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 - `source`: `live` when the envelope was built from an active orchestrator tracker row, otherwise `durable`.
 - `completeness`: `full` for live tracker data and `partial` for durable store synthesis.
 - `issue`: tracker-shaped fields (`id`, `identifier`, title, state, labels, blockers, Linear URL, timestamps). Durable partial responses leave unavailable tracker fields null or empty. `issue.id` is null unless a persisted lifecycle, run, workspace, or live tracker row provides a real Linear issue id; Symphony does not copy the route key into `issue.id`.
-- `tracker`: freshness and classification metadata for tracker-derived fields. Live rows include `generatedAt`, tracker `updatedAt`, `ageMs`, `stale`, `staleThresholdMs`, raw `state`, and a config-driven `classification` (`active`, `handoff`, `blocked`, `terminal`, or `unknown`). Durable partial rows set tracker timestamps, staleness, and classification to null.
+- `tracker`: Linear record-age and classification metadata for tracker-derived fields. Live rows include `generatedAt` (the Symphony snapshot time), tracker `updatedAt` (Linear issue `updatedAt`), `ageMs = max(generatedAt - updatedAt, 0)`, `stale = ageMs > staleThresholdMs`, `staleThresholdMs` (currently the polling interval), raw `state`, and a config-driven `classification` (`active`, `handoff`, `blocked`, `terminal`, or `unknown`). This is not a tracker-cache fetch timestamp. Durable partial rows set tracker timestamps, staleness, and classification to null.
 - `blockers`: summary of live Linear `blockedBy` data plus lifecycle human block state. `available` is false for durable partial rows. `openCount` uses the configured terminal states to distinguish open blockers from completed blockers.
 - `workspace`: workspace and git hints (`workspaceKey`, `path`, `sourceKind`, `branchName`, `gitBranchName`, `repoPath`, `baseRef`) resolved with the same precedence as legacy status metadata.
 - `pullRequest`: GitHub PR hints (`url`, `number`, `headSha`, `branch`, `ciStatus`, `lastPushedAt`) when known.
-- `latestRun`: latest persisted run summary (`runId`, `status`, `terminalReason`, `error`, `completedAt`). `terminalReason` is normalized from persisted run status; `timed_out` is reserved until a durable timeout signal exists.
+- `latestRun`: run summary (`runId`, `status`, `terminalReason`, `error`, `completedAt`). Live envelopes prefer the active run (`activeRunId` or live `runId`) so issue cards describe the running agent. Durable envelopes use the issue-wide latest persisted run. `terminalReason` is normalized from persisted run status; `timed_out` is reserved until a durable timeout signal exists.
 
 `GET /api/v1/state` also exposes raw `running[].issueDetails` directly from the orchestrator snapshot. That raw field is the bare tracker-shaped `issue` view, not the envelope. Use `operatorView.running[].issueDetails` when the extension needs the enriched envelope.
+
+`GET /api/v1/issues/:id` also keeps `live.issueDetails` as a deprecated raw tracker-view mirror for compatibility with older clients. Prefer the top-level `issueDetails` envelope and `issueDetails.issue` for new code.
 
 On `GET /api/v1/issues/:id/runs`, the top-level `enrichment` object describes run-list liveness/timeline enrichment. It is separate from `issueDetails` and should not be confused with the issue details envelope.
 
