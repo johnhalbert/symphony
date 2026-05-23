@@ -2375,6 +2375,63 @@ describe("Orchestrator", () => {
     await stopPromise;
   });
 
+  it("treats service stop aborts as terminal cancelled without retrying", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new ServiceStopAbortHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-service-stop", "service-stop run to start");
+    const stopPromise = orchestrator.stop();
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.cancellation.source === "service_stop",
+      "service stop cancellation to be recorded",
+    );
+    expect(orchestrator.snapshot().running[0]).toMatchObject({
+      liveness: { status: "cancelling", activeRunId: "run-service-stop" },
+      cancellation: {
+        requested: true,
+        source: "service_stop",
+        reason: "orchestrator stop",
+        abortSignalled: true,
+        suppressRetryOnExit: true,
+      },
+    });
+    expect(harness.stoppedRunIds).toEqual(["run-service-stop"]);
+
+    harness.release();
+    await stopPromise;
+
+    await expect(runStore.getRun("run-service-stop")).resolves.toMatchObject({
+      status: "cancelled",
+      error: "service stop abort",
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
   it("blocks continuation turns for non-resumable harnesses", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
@@ -2740,6 +2797,32 @@ class PreSessionCancellationHarness implements AgentHarness {
     await this.released;
     yield { type: "session_started", sessionId: "session-pre", runId: "run-pre" };
     yield { type: "cancelled" };
+  }
+
+  async stop(runId: string): Promise<void> {
+    this.stoppedRunIds.push(runId);
+  }
+
+  release(): void {
+    this.releaseRun();
+  }
+}
+
+class ServiceStopAbortHarness implements AgentHarness {
+  readonly id = "service-stop-abort";
+  readonly stoppedRunIds: string[] = [];
+  private releaseRun: () => void = () => undefined;
+  private readonly released = new Promise<void>((resolve) => {
+    this.releaseRun = resolve;
+  });
+
+  async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+    yield { type: "session_started", sessionId: "session-service-stop", runId: "run-service-stop" };
+    if (!ctx.abortSignal.aborted) {
+      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+    }
+    await this.released;
+    throw new Error("service stop abort");
   }
 
   async stop(runId: string): Promise<void> {

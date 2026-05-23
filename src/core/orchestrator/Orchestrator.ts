@@ -297,6 +297,7 @@ export class Orchestrator {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     for (const retry of this.retryAttempts.values()) clearTimeout(retry.timer);
     for (const [issueId, running] of this.running) {
+      running.suppressRetryOnExit = true;
       const stopRunId = this.harnessStopRunId(running);
       this.markCancellationRequested(running, {
         source: "service_stop",
