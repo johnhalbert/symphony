@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
-import type { AgentEvent, AgentHarness } from "../harness/AgentHarness.js";
+import type { AgentActivitySource, AgentEvent, AgentHarness } from "../harness/AgentHarness.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { AgentRunRole, Issue, RuntimeTotals, TokenCounts, Workspace } from "../types.js";
@@ -9,6 +9,8 @@ import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
   compareRunChronology,
+  type RunActivitySnapshot,
+  type RunMetadata,
   type RunRecord,
   type RunTranscriptStore,
   type TranscriptEvent,
@@ -104,6 +106,11 @@ export interface RunningEntry {
   cancellationReason: string | null;
   abortSignalledAt: Date | null;
   harnessStopRequestedAt: Date | null;
+  harnessStopFailedAt: Date | null;
+  harnessStopFailedReason: string | null;
+  lastStreamActivityAt: Date | null;
+  lastDeltaOrToolActivityAt: Date | null;
+  lastToolActivityAt: Date | null;
 }
 
 interface ReviewerDispatchEvidence {
@@ -144,6 +151,7 @@ export interface RuntimeSnapshot {
     lastEventAt: string | null;
     liveness: RunLivenessState;
     cancellation: RunCancellationState;
+    activity?: RunActivityState;
     tokens: TokenCounts;
     lifecycle: IssueLifecycleRecord | null;
     metadata: IssueRunMetadata;
@@ -179,7 +187,23 @@ export interface RunCancellationState {
   reason: string | null;
   abortSignalled: boolean;
   harnessStopRequestedAt: string | null;
+  harnessStopFailedAt?: string | null;
+  harnessStopFailedReason?: string | null;
+  cancelFailed?: CancelFailedState;
   suppressRetryOnExit: boolean;
+}
+
+export interface RunActivityState extends RunActivitySnapshot {
+  unavailable: string[];
+}
+
+export interface CancelFailedState {
+  tracked: true;
+  active: boolean;
+  phase: "none" | "requested" | "failed" | "resolved_cancelled" | "resolved_failed";
+  at: string | null;
+  reason: string | null;
+  source: "harness_stop" | "cancel_ignored" | null;
 }
 
 export interface IssueRunMetadata {
@@ -306,7 +330,7 @@ export class Orchestrator {
         harnessStopRequested: stopRunId !== null,
       });
       running.abortController.abort();
-      if (stopRunId !== null) await this.options.harness.stop?.(stopRunId);
+      if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
     }
     await Promise.allSettled([...this.running.values()].map((entry) => entry.worker));
   }
@@ -344,7 +368,7 @@ export class Orchestrator {
       harnessStopRequested: stopRunId !== null,
     });
     running.abortController.abort();
-    if (stopRunId !== null) await this.options.harness.stop?.(stopRunId);
+    if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
   }
 
   async createContinuationSummary(
@@ -407,6 +431,7 @@ export class Orchestrator {
         lastEventAt: entry.lastEventAt?.toISOString() ?? null,
         liveness: this.livenessForEntry(entry, now),
         cancellation: cancellationForEntry(entry),
+        activity: activityForEntry(entry),
         tokens: entry.tokens,
         lifecycle: entry.lifecycle,
         metadata: metadataForRunningEntry(entry),
@@ -736,6 +761,11 @@ export class Orchestrator {
       cancellationReason: null,
       abortSignalledAt: null,
       harnessStopRequestedAt: null,
+      harnessStopFailedAt: null,
+      harnessStopFailedReason: null,
+      lastStreamActivityAt: null,
+      lastDeltaOrToolActivityAt: null,
+      lastToolActivityAt: null,
     };
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
@@ -897,6 +927,9 @@ export class Orchestrator {
     for await (const event of events) {
       entry.lastEvent = event.type;
       entry.lastEventAt = new Date(event.at ?? Date.now());
+      if (event.type === "progress") {
+        recordActivitySource(entry, event.activitySource ?? "stream", entry.lastEventAt);
+      }
       if (event.type === "session_started") {
         entry.sessionId = event.sessionId;
         entry.runId = event.runId ?? event.sessionId;
@@ -944,6 +977,7 @@ export class Orchestrator {
           status: "succeeded",
           completedAt: new Date().toISOString(),
           tokens: entry.tokens,
+          metadata: terminalRunMetadata(entry, "succeeded"),
         });
         await this.discoverPullRequestForEntry(entry, context.workspace);
         if (entry.role === "worker" && !(await this.reconcileCompletionReportHandoff(entry))) {
@@ -959,6 +993,7 @@ export class Orchestrator {
             status: "succeeded",
             completedAt: new Date().toISOString(),
             tokens: entry.tokens,
+            metadata: terminalRunMetadata(entry, "succeeded"),
           });
           return;
         }
@@ -967,6 +1002,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           error: event.error,
           tokens: entry.tokens,
+          metadata: terminalRunMetadata(entry, "failed"),
         });
         throw new SymphonyError("agent_error", event.error);
       }
@@ -976,6 +1012,7 @@ export class Orchestrator {
             status: "succeeded",
             completedAt: new Date().toISOString(),
             tokens: entry.tokens,
+            metadata: terminalRunMetadata(entry, "succeeded"),
           });
           return;
         }
@@ -983,6 +1020,7 @@ export class Orchestrator {
           status: "cancelled",
           completedAt: new Date().toISOString(),
           tokens: entry.tokens,
+          metadata: terminalRunMetadata(entry, "cancelled"),
         });
         throw new SymphonyError("agent_error", "Run was cancelled");
       }
@@ -1001,6 +1039,7 @@ export class Orchestrator {
           status: "succeeded",
           completedAt: new Date().toISOString(),
           tokens: entry.tokens,
+          metadata: terminalRunMetadata(entry, "succeeded"),
         });
       }
       this.completed.add(issueId);
@@ -1014,6 +1053,7 @@ export class Orchestrator {
           status: "succeeded",
           completedAt: new Date().toISOString(),
           tokens: entry.tokens,
+          metadata: terminalRunMetadata(entry, "succeeded"),
         });
       }
       this.completed.add(issueId);
@@ -1055,6 +1095,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           error,
           tokens: entry.tokens,
+          metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
         });
       }
       this.claimed.delete(issueId);
@@ -1065,6 +1106,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           error,
           tokens: entry.tokens,
+          metadata: terminalRunMetadata(entry, "cancelled"),
         });
       }
       await this.applyWriteback(
@@ -1089,6 +1131,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           error,
           tokens: entry.tokens,
+          metadata: terminalRunMetadata(entry, "failed"),
         });
       }
       await this.applyWriteback(
@@ -1751,6 +1794,23 @@ export class Orchestrator {
     if (typeof this.options.harness.stop !== "function") return null;
     return entry.activeRunId ?? entry.runId;
   }
+
+  private async requestHarnessStop(entry: RunningEntry, runId: string): Promise<void> {
+    try {
+      await this.options.harness.stop?.(runId);
+    } catch (error) {
+      const at = new Date();
+      entry.harnessStopFailedAt = entry.harnessStopFailedAt ?? at;
+      entry.harnessStopFailedReason = entry.harnessStopFailedReason ?? errorMessage(error);
+      this.options.logger.warn("harness stop failed", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        run_id: runId,
+        source: entry.cancellationSource,
+        error: errorMessage(error),
+      });
+    }
+  }
 }
 
 export function sortIssuesForDispatch(issues: Issue[]): Issue[] {
@@ -1942,6 +2002,78 @@ function metadataForRunningEntry(entry: RunningEntry): IssueRunMetadata {
   };
 }
 
+function recordActivitySource(entry: RunningEntry, source: AgentActivitySource, at: Date): void {
+  if (source === "stream") {
+    entry.lastStreamActivityAt = at;
+  }
+  if (source === "delta" || source === "tool") {
+    entry.lastDeltaOrToolActivityAt = at;
+  }
+  if (source === "tool") {
+    entry.lastToolActivityAt = at;
+  }
+}
+
+function activityForEntry(entry: RunningEntry): RunActivityState {
+  return {
+    lastHarnessActivityAt: (entry.lastEventAt ?? entry.startedAt).toISOString(),
+    lastStreamActivityAt: entry.lastStreamActivityAt?.toISOString() ?? null,
+    lastDeltaOrToolActivityAt: entry.lastDeltaOrToolActivityAt?.toISOString() ?? null,
+    lastToolActivityAt: entry.lastToolActivityAt?.toISOString() ?? null,
+    unavailable: [],
+  };
+}
+
+function terminalActivitySnapshot(entry: RunningEntry): RunActivitySnapshot {
+  const activity = activityForEntry(entry);
+  return {
+    lastHarnessActivityAt: activity.lastHarnessActivityAt,
+    lastStreamActivityAt: activity.lastStreamActivityAt,
+    lastDeltaOrToolActivityAt: activity.lastDeltaOrToolActivityAt,
+    lastToolActivityAt: activity.lastToolActivityAt,
+  };
+}
+
+function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | "failed" | "cancelled"): RunMetadata {
+  const cancellationRequested = entry.cancellationRequestedAt !== null;
+  const cancelIgnored = cancellationRequested && terminalStatus === "succeeded";
+  const harnessStopFailed = cancellationRequested && terminalStatus === "failed" && entry.harnessStopFailedAt !== null;
+  const cancelFailed = cancelIgnored || harnessStopFailed;
+  const cancelFailedSource = cancelIgnored ? "cancel_ignored" : harnessStopFailed ? "harness_stop" : null;
+  const cancelFailedAt = cancelIgnored
+    ? (entry.lastEventAt ?? new Date()).toISOString()
+    : harnessStopFailed
+      ? entry.harnessStopFailedAt?.toISOString() ?? null
+      : null;
+  const cancelFailedReason = cancelIgnored
+    ? "run completed after cancellation was requested"
+    : harnessStopFailed
+      ? entry.harnessStopFailedReason
+      : null;
+  return {
+    cancellationRequestedAt: entry.cancellationRequestedAt?.toISOString() ?? null,
+    cancellationSource: entry.cancellationSource,
+    cancellationReason: entry.cancellationReason,
+    harnessStopRequestedAt: entry.harnessStopRequestedAt?.toISOString() ?? null,
+    harnessStopFailedAt: entry.harnessStopFailedAt?.toISOString() ?? null,
+    harnessStopFailedReason: entry.harnessStopFailedReason,
+    cancellationOutcome: !cancellationRequested
+      ? "none"
+      : cancelIgnored
+        ? "cancel_ignored"
+        : harnessStopFailed
+          ? "harness_stop_failed"
+          : terminalStatus === "cancelled"
+            ? "cancelled"
+            : "requested",
+    cancelFailed,
+    cancelFailedAt,
+    cancelFailedReason,
+    cancelFailedSource,
+    activitySnapshot: terminalActivitySnapshot(entry),
+  };
+}
+
 function cancellationForEntry(entry: RunningEntry): RunCancellationState {
   return {
     requested: entry.cancellationRequestedAt !== null,
@@ -1950,6 +2082,30 @@ function cancellationForEntry(entry: RunningEntry): RunCancellationState {
     reason: entry.cancellationReason,
     abortSignalled: entry.abortSignalledAt !== null || entry.abortController.signal.aborted,
     harnessStopRequestedAt: entry.harnessStopRequestedAt?.toISOString() ?? null,
+    harnessStopFailedAt: entry.harnessStopFailedAt?.toISOString() ?? null,
+    harnessStopFailedReason: entry.harnessStopFailedReason,
+    cancelFailed: liveCancelFailedForEntry(entry),
     suppressRetryOnExit: entry.suppressRetryOnExit,
+  };
+}
+
+function liveCancelFailedForEntry(entry: RunningEntry): CancelFailedState {
+  if (entry.harnessStopFailedAt) {
+    return {
+      tracked: true,
+      active: true,
+      phase: "failed",
+      at: entry.harnessStopFailedAt.toISOString(),
+      reason: entry.harnessStopFailedReason,
+      source: "harness_stop",
+    };
+  }
+  return {
+    tracked: true,
+    active: false,
+    phase: entry.cancellationRequestedAt ? "requested" : "none",
+    at: null,
+    reason: null,
+    source: null,
   };
 }

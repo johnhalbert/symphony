@@ -13,6 +13,8 @@ export interface AgentRunContext {
   logger: Logger;
 }
 
+export type AgentActivitySource = "stream" | "delta" | "tool";
+
 export type AgentEvent =
   | {
       type: "session_started";
@@ -24,6 +26,7 @@ export type AgentEvent =
   | {
       type: "progress";
       message: string;
+      activitySource?: AgentActivitySource;
       at?: string;
     }
   | {

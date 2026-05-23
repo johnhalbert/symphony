@@ -514,7 +514,24 @@ describe("StatusServer durable API", () => {
         reason: "operator request",
         abortSignalled: true,
         harnessStopRequestedAt: "2026-01-01T00:00:02.000Z",
+        harnessStopFailedAt: null,
+        harnessStopFailedReason: null,
+        cancelFailed: {
+          tracked: true,
+          active: false,
+          phase: "requested",
+          at: null,
+          reason: null,
+          source: null,
+        },
         suppressRetryOnExit: true,
+      },
+      activity: {
+        lastHarnessActivityAt: "2026-01-01T00:00:01.000Z",
+        lastStreamActivityAt: "2026-01-01T00:00:01.000Z",
+        lastDeltaOrToolActivityAt: null,
+        lastToolActivityAt: null,
+        unavailable: [],
       },
       tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
       lifecycle: null,
@@ -561,11 +578,25 @@ describe("StatusServer durable API", () => {
             continuationSummary: { available: boolean };
           }>;
         };
-        operatorLivenessContract: { deferred: { cancelFailed: { tracked: boolean } } };
+        operatorLivenessContract: { cancelFailed: { tracked: boolean }; deferred: Record<string, unknown> };
       };
       const issueBody = (await issueResponse.json()) as {
-        live: { liveness: unknown; cancellation: unknown; operatorLiveness: { status: string; agentId: string | null; cancelFailed: { tracked: boolean } } };
-        operatorLiveness: { status: string; agentId: string | null; cancelFailed: { tracked: boolean } };
+        live: {
+          liveness: unknown;
+          cancellation: unknown;
+          operatorLiveness: {
+            status: string;
+            agentId: string | null;
+            cancelFailed: { tracked: boolean; active: boolean };
+            activity: { lastStreamActivityAt: string | null };
+          };
+        };
+        operatorLiveness: {
+          status: string;
+          agentId: string | null;
+          cancelFailed: { tracked: boolean; active: boolean };
+          activity: { lastStreamActivityAt: string | null };
+        };
         capabilities: {
           cancel: boolean;
           pause: boolean;
@@ -609,8 +640,10 @@ describe("StatusServer durable API", () => {
       expect(issueBody.live.operatorLiveness).toMatchObject({ status: "cancelling" });
       expect(issueBody.operatorLiveness.agentId).toBe("agent-1");
       expect(issueBody.live.operatorLiveness.agentId).toBe("agent-1");
-      expect(issueBody.operatorLiveness.cancelFailed).toMatchObject({ tracked: false });
-      expect(stateBody.operatorLivenessContract.deferred.cancelFailed).toMatchObject({ tracked: false });
+      expect(issueBody.operatorLiveness.cancelFailed).toMatchObject({ tracked: true, active: false });
+      expect(issueBody.operatorLiveness.activity).toMatchObject({ lastStreamActivityAt: "2026-01-01T00:00:01.000Z" });
+      expect(stateBody.operatorLivenessContract.cancelFailed).toMatchObject({ tracked: true });
+      expect(stateBody.operatorLivenessContract.deferred).not.toHaveProperty("cancelFailed");
       expect(issueBody.capabilities).toMatchObject({
         cancel: false,
         pause: true,
