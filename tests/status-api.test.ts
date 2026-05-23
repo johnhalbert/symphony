@@ -138,13 +138,63 @@ describe("StatusServer durable API", () => {
       workflowPath: config.workflowPath,
       cliPath: "/repo/src/cli.ts",
       liveSmokeEnabled: true,
+      probeConfig: {
+        cliPath: "/repo/src/cli.ts",
+        liveSmokeEnabled: true,
+        roles: ["worker", "reviewer"],
+        sdkTimeoutMs: 45_000,
+        waitTimeoutMs: 5_000,
+        postCancelWaitMs: 1_500,
+        agentCwd: "/repo",
+        mcpCwd: "/repo",
+        settingSources: ["project", "user"],
+      },
       ok: false,
       stages: [
         {
           stage: "sdk",
           status: "failure",
-          failureCode: "sdk_init_timeout_no_tools_empty_tools_name_mismatch",
+          failureCode: "sdk_system_tools_name_mismatch",
           message: "Cursor SDK did not expose submit_completion_report",
+          sdkRoleRuns: [
+            {
+              role: "worker",
+              agentId: "agent-1",
+              runId: "run-1",
+              primaryFailureCode: "sdk_system_tools_name_mismatch",
+              roleStatus: "failure",
+              sdkObservation: {
+                role: "worker",
+                agentCwd: "/repo",
+                mcpCwd: "/repo",
+                settingSources: ["project", "user"],
+                sdkTimeoutMs: 45_000,
+                waitTimeoutMs: 5_000,
+                postCancelWaitMs: 1_500,
+                supportsStream: true,
+                supportsWait: true,
+                streamStatus: "drained",
+                waitStatus: "finished",
+                waitError: null,
+                timedOut: false,
+                cancelledAfterTimeout: false,
+                startupSendError: null,
+                unexpectedToolCall: null,
+                systemMessageCount: 1,
+                systemToolPayloadCount: 1,
+                systemToolsCount: 1,
+                namedToolCount: 1,
+                unnamedToolObjectCount: 0,
+                malformedToolObjectCount: 0,
+                rawSystemToolPayloads: [[{ name: "read_file" }]],
+                rawToolNames: ["read_file"],
+                normalizedToolNames: [],
+                observedMessageTypes: ["system"],
+                messageTypeCounts: { system: 1 },
+                streamError: null,
+              },
+            },
+          ],
           results: [
             {
               role: "worker",
@@ -152,11 +202,13 @@ describe("StatusServer durable API", () => {
               command: "completion-report-mcp",
               expectedTool: "submit_completion_report",
               status: "failure",
-              failureCode: "sdk_init_timeout_no_tools_empty_tools_name_mismatch",
+              failureCode: "sdk_system_tools_name_mismatch",
               message: "Cursor SDK did not expose submit_completion_report",
               rawToolNames: ["read_file"],
               normalizedToolNames: [],
               envKeyNames: ["LINEAR_API_KEY"],
+              sdkRoleRunRole: "worker",
+              sdkRoleRunIndex: 0,
             },
           ],
         },
@@ -217,7 +269,16 @@ describe("StatusServer durable API", () => {
           baseRef: string | null;
         };
         capabilities: { openWorkspace: boolean };
-        diagnostics: { mcpToolExposure: { ok: boolean; stages: Array<{ failureCode: string | null }> } | null };
+        diagnostics: {
+          mcpToolExposure: {
+            ok: boolean;
+            stages: Array<{
+              failureCode: string | null;
+              sdkRoleRuns?: Array<{ role: string; roleStatus: string; primaryFailureCode: string | null }>;
+              results?: Array<{ sdkRoleRunRole?: string; sdkRoleRunIndex?: number }>;
+            }>;
+          } | null;
+        };
       };
       const runsBody = (await runsResponse.json()) as { runs: unknown[] };
       const runBody = (await runResponse.json()) as {
@@ -231,7 +292,15 @@ describe("StatusServer durable API", () => {
       };
       const transcriptBody = (await transcriptResponse.json()) as { events: Array<{ message?: string }> };
       const workspaceBody = (await workspaceResponse.json()) as { gitBranchName?: string };
-      const diagnosticsBody = (await diagnosticsResponse.json()) as { latest: { ok: boolean } | null };
+      const diagnosticsBody = (await diagnosticsResponse.json()) as {
+        latest: {
+          ok: boolean;
+          stages: Array<{
+            sdkRoleRuns?: Array<{ role: string; roleStatus: string; primaryFailureCode: string | null }>;
+            results?: Array<{ sdkRoleRunRole?: string; sdkRoleRunIndex?: number }>;
+          }>;
+        } | null;
+      };
 
       expect(issueResponse.status).toBe(200);
       expect(issueBody.latestRun.runId).toBe("run-1");
@@ -263,7 +332,18 @@ describe("StatusServer durable API", () => {
       expect(issueBody.capabilities.openWorkspace).toBe(false);
       expect(issueBody.diagnostics.mcpToolExposure).toMatchObject({
         ok: false,
-        stages: [{ failureCode: "sdk_init_timeout_no_tools_empty_tools_name_mismatch" }],
+        probeConfig: { sdkTimeoutMs: 45_000, waitTimeoutMs: 5_000, postCancelWaitMs: 1_500 },
+        stages: [{ failureCode: "sdk_system_tools_name_mismatch" }],
+      });
+      expect(issueBody.diagnostics.mcpToolExposure?.stages[0]).toMatchObject({
+        sdkRoleRuns: [
+          {
+            role: "worker",
+            roleStatus: "failure",
+            primaryFailureCode: "sdk_system_tools_name_mismatch",
+          },
+        ],
+        results: [{ sdkRoleRunRole: "worker", sdkRoleRunIndex: 0 }],
       });
       expect(runsBody.runs).toHaveLength(1);
       expect(runResponse.status).toBe(200);
@@ -277,6 +357,16 @@ describe("StatusServer durable API", () => {
       expect(workspaceBody.gitBranchName).toBe("symphony/TEST-1");
       expect(diagnosticsResponse.status).toBe(200);
       expect(diagnosticsBody.latest).toMatchObject({ ok: false });
+      expect(diagnosticsBody.latest?.stages[0]).toMatchObject({
+        sdkRoleRuns: [
+          {
+            role: "worker",
+            roleStatus: "failure",
+            primaryFailureCode: "sdk_system_tools_name_mismatch",
+          },
+        ],
+        results: [{ sdkRoleRunRole: "worker", sdkRoleRunIndex: 0 }],
+      });
       expect(openResponse.status).toBe(401);
       expect(pauseWithoutTokenResponse.status).toBe(401);
       expect(pauseResponse.status).toBe(202);

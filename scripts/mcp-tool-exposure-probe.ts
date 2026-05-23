@@ -5,13 +5,18 @@ import { WorkflowLoader } from "../src/core/workflow/WorkflowLoader.js";
 import { runMcpToolExposureProbe, type McpToolExposureReport } from "../src/core/harness/McpToolExposureProbe.js";
 import { FileMcpExposureDiagnosticsStore } from "../src/core/persistence/McpExposureDiagnosticsStore.js";
 import type { AgentRunRole } from "../src/core/types.js";
+import type { CursorSettingSource } from "../src/core/config/Config.js";
 import { errorMessage } from "../src/core/errors.js";
 
 interface RawOptions {
   cliPath?: string;
   role?: string;
   timeoutMs?: string;
+  waitTimeoutMs?: string;
+  postCancelWaitMs?: string;
   cwd?: string;
+  mcpCwd?: string;
+  settingSources?: string;
   json?: boolean;
 }
 
@@ -22,7 +27,11 @@ const program = new Command()
   .option("--cli-path <path>", "explicit Symphony CLI entrypoint for MCP subprocesses", path.resolve(process.cwd(), "src/cli.ts"))
   .option("--role <role>", "worker, reviewer, or all", "all")
   .option("--timeout-ms <ms>", "live SDK system.tools wait timeout", "45000")
-  .option("--cwd <path>", "local Cursor SDK cwd for the synthetic probe run")
+  .option("--wait-timeout-ms <ms>", "bounded live SDK wait() timeout after stream drain", "5000")
+  .option("--post-cancel-wait-ms <ms>", "bounded live SDK wait() timeout after cancel cleanup", "1500")
+  .option("--cwd <path>", "local Cursor SDK agent cwd for the synthetic probe run")
+  .option("--mcp-cwd <path>", "cwd used by MCP subprocess server configs during the live SDK probe")
+  .option("--setting-sources <sources>", "comma-separated Cursor setting sources for the live SDK probe, or none")
   .option("--json", "print the sanitized diagnostic report as JSON");
 
 program.parse(process.argv);
@@ -45,7 +54,11 @@ async function main(workflow: string, rawOptions: RawOptions): Promise<void> {
       roles,
       liveSmokeEnabled: process.env.SYMPHONY_MCP_EXPOSURE_SMOKE === "1",
       sdkTimeoutMs: parsePositiveInt(rawOptions.timeoutMs ?? "45000", "--timeout-ms"),
+      waitTimeoutMs: parsePositiveInt(rawOptions.waitTimeoutMs ?? "5000", "--wait-timeout-ms"),
+      postCancelWaitMs: parsePositiveInt(rawOptions.postCancelWaitMs ?? "1500", "--post-cancel-wait-ms"),
       ...(rawOptions.cwd === undefined ? {} : { sdkCwd: path.resolve(process.cwd(), rawOptions.cwd) }),
+      ...(rawOptions.mcpCwd === undefined ? {} : { mcpCwd: path.resolve(process.cwd(), rawOptions.mcpCwd) }),
+      ...(rawOptions.settingSources === undefined ? {} : { settingSources: parseSettingSources(rawOptions.settingSources) }),
     });
     await new FileMcpExposureDiagnosticsStore(loaded.serviceConfig.workspace.stateDir).writeLatest(report);
     if (rawOptions.json) {
@@ -71,12 +84,29 @@ function parsePositiveInt(input: string, label: string): number {
   return value;
 }
 
+function parseSettingSources(input: string): CursorSettingSource[] {
+  const values = input
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  if (values.length === 1 && values[0] === "none") return [];
+  const valid = new Set(["project", "user", "team", "mdm", "plugins", "all"]);
+  const invalid = values.filter((value) => !valid.has(value));
+  if (invalid.length > 0) {
+    throw new Error(`Invalid --setting-sources value: ${invalid.join(", ")}.`);
+  }
+  return values as CursorSettingSource[];
+}
+
 function formatReport(report: McpToolExposureReport): string {
   const lines = [
     `[${report.ok ? "OK" : "FAIL"}] Symphony MCP tool exposure probe`,
     `workflow: ${report.workflowPath}`,
     `cliPath: ${report.cliPath}`,
     `liveSmokeEnabled: ${report.liveSmokeEnabled}`,
+    `agentCwd: ${report.probeConfig.agentCwd}`,
+    `mcpCwd: ${report.probeConfig.mcpCwd}`,
+    `settingSources: ${formatList(report.probeConfig.settingSources)}`,
   ];
   for (const stage of report.stages) {
     lines.push(`[${stage.status.toUpperCase()}] ${stage.stage}: ${stage.message}`);

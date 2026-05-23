@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { Agent, type Run, type SDKAgent } from "@cursor/sdk";
-import type { ServiceConfig } from "../config/Config.js";
+import { Agent, type Run, type SDKAgent, type SettingSource } from "@cursor/sdk";
+import type { CursorSettingSource, ServiceConfig } from "../config/Config.js";
 import type { AgentRunContext } from "./AgentHarness.js";
 import { COMPLETION_REPORT_TOOL_NAME, writeCompletionReportMcpContext } from "./CompletionReportMcpServer.js";
 import {
@@ -29,12 +29,22 @@ import {
 
 export type McpToolExposureStage = "subprocess" | "sdk";
 export type McpToolExposureStatus = "success" | "failure" | "skipped";
+export type SdkRoleStatus = "success" | "failure" | "partial" | "skipped";
 export type McpToolExposureFailureCode =
   | "subprocess_spawn_list_failure"
   | "subprocess_missing_empty_name_mismatch"
   | "sdk_credentials_missing"
   | "sdk_startup_send_failure"
-  | "sdk_init_timeout_no_tools_empty_tools_name_mismatch"
+  | "sdk_stream_unsupported"
+  | "sdk_stream_failure"
+  | "sdk_stream_timeout"
+  | "sdk_no_system_messages"
+  | "sdk_system_tools_absent"
+  | "sdk_system_tools_empty"
+  | "sdk_system_tools_unnamed"
+  | "sdk_system_tools_name_mismatch"
+  | "sdk_wait_failure"
+  | "sdk_wait_unsupported"
   | "unexpected_tool_call";
 
 export interface McpToolExposureSpec {
@@ -55,6 +65,8 @@ export interface McpToolExposureServerResult {
   rawToolNames: string[];
   normalizedToolNames: string[];
   envKeyNames: string[];
+  sdkRoleRunRole?: AgentRunRole;
+  sdkRoleRunIndex?: number;
 }
 
 export interface McpToolExposureStageResult {
@@ -63,6 +75,19 @@ export interface McpToolExposureStageResult {
   failureCode: McpToolExposureFailureCode | null;
   message: string;
   results: McpToolExposureServerResult[];
+  sdkRoleRuns?: SdkRoleRunResult[];
+}
+
+export interface McpToolExposureProbeConfig {
+  cliPath: string;
+  liveSmokeEnabled: boolean;
+  roles: AgentRunRole[];
+  sdkTimeoutMs: number;
+  waitTimeoutMs: number;
+  postCancelWaitMs: number;
+  agentCwd: string;
+  mcpCwd: string;
+  settingSources: CursorSettingSource[];
 }
 
 export interface McpToolExposureReport {
@@ -71,6 +96,7 @@ export interface McpToolExposureReport {
   workflowPath: string;
   cliPath: string;
   liveSmokeEnabled: boolean;
+  probeConfig: McpToolExposureProbeConfig;
   ok: boolean;
   stages: McpToolExposureStageResult[];
 }
@@ -81,7 +107,60 @@ export interface McpToolExposureProbeOptions {
   roles?: AgentRunRole[];
   liveSmokeEnabled?: boolean;
   sdkTimeoutMs?: number;
+  waitTimeoutMs?: number;
+  postCancelWaitMs?: number;
   sdkCwd?: string;
+  mcpCwd?: string;
+  settingSources?: CursorSettingSource[];
+}
+
+export interface SdkSystemToolExtraction {
+  rawToolNames: string[];
+  normalizedToolNames: string[];
+  systemToolsCount: number;
+  namedToolCount: number;
+  unnamedToolObjectCount: number;
+  malformedToolObjectCount: number;
+}
+
+export interface SdkToolDiagnostics {
+  role: AgentRunRole;
+  agentCwd: string;
+  mcpCwd: string;
+  settingSources: CursorSettingSource[];
+  sdkTimeoutMs: number;
+  waitTimeoutMs: number;
+  postCancelWaitMs: number;
+  supportsStream: boolean | null;
+  supportsWait: boolean | null;
+  streamStatus: "not_started" | "drained" | "unsupported" | "timeout" | "error" | "unexpected_tool_call";
+  waitStatus: string | null;
+  waitError: string | null;
+  timedOut: boolean;
+  cancelledAfterTimeout: boolean;
+  startupSendError: string | null;
+  unexpectedToolCall: string | null;
+  systemMessageCount: number;
+  systemToolPayloadCount: number;
+  systemToolsCount: number;
+  namedToolCount: number;
+  unnamedToolObjectCount: number;
+  malformedToolObjectCount: number;
+  rawSystemToolPayloads: unknown[];
+  rawToolNames: string[];
+  normalizedToolNames: string[];
+  observedMessageTypes: string[];
+  messageTypeCounts: Record<string, number>;
+  streamError: string | null;
+}
+
+export interface SdkRoleRunResult {
+  role: AgentRunRole;
+  agentId: string | null;
+  runId: string | null;
+  primaryFailureCode: McpToolExposureFailureCode | null;
+  roleStatus: SdkRoleStatus;
+  sdkObservation: SdkToolDiagnostics;
 }
 
 export const MCP_TOOL_EXPOSURE_SPECS: readonly McpToolExposureSpec[] = [
@@ -107,18 +186,33 @@ export const MCP_TOOL_EXPOSURE_SPECS: readonly McpToolExposureSpec[] = [
 
 export async function runMcpToolExposureProbe(options: McpToolExposureProbeOptions): Promise<McpToolExposureReport> {
   const roles = options.roles ?? ["worker", "reviewer"];
-  const subprocess = await runSubprocessMcpToolExposureProbe(options.config, {
+  const probeConfig: McpToolExposureProbeConfig = {
     cliPath: options.cliPath,
+    liveSmokeEnabled: options.liveSmokeEnabled ?? process.env.SYMPHONY_MCP_EXPOSURE_SMOKE === "1",
+    roles,
+    sdkTimeoutMs: options.sdkTimeoutMs ?? 45_000,
+    waitTimeoutMs: options.waitTimeoutMs ?? 5_000,
+    postCancelWaitMs: options.postCancelWaitMs ?? 1_500,
+    agentCwd: options.sdkCwd ?? options.config.workflowDir,
+    mcpCwd: options.mcpCwd ?? options.config.workflowDir,
+    settingSources: options.settingSources ?? options.config.cursor.settingSources,
+  };
+  const subprocess = await runSubprocessMcpToolExposureProbe(options.config, {
+    cliPath: probeConfig.cliPath,
     roles,
   });
   const sdk = await runSdkMcpToolExposureProbe(options.config, {
-    cliPath: options.cliPath,
+    cliPath: probeConfig.cliPath,
     roles,
-    enabled: options.liveSmokeEnabled ?? process.env.SYMPHONY_MCP_EXPOSURE_SMOKE === "1",
-    timeoutMs: options.sdkTimeoutMs ?? 45_000,
-    ...(options.sdkCwd === undefined ? {} : { cwd: options.sdkCwd }),
+    enabled: probeConfig.liveSmokeEnabled,
+    timeoutMs: probeConfig.sdkTimeoutMs,
+    waitTimeoutMs: probeConfig.waitTimeoutMs,
+    postCancelWaitMs: probeConfig.postCancelWaitMs,
+    cwd: probeConfig.agentCwd,
+    mcpCwd: probeConfig.mcpCwd,
+    settingSources: probeConfig.settingSources,
   });
-  return reportFromStages(options.config, options.cliPath, sdk.status !== "skipped", [subprocess, sdk]);
+  return reportFromStages(options.config, probeConfig, [subprocess, sdk]);
 }
 
 export async function runSubprocessMcpToolExposureProbe(
@@ -169,44 +263,95 @@ export async function runSdkMcpToolExposureProbe(
     roles?: AgentRunRole[];
     enabled: boolean;
     timeoutMs: number;
+    waitTimeoutMs?: number;
+    postCancelWaitMs?: number;
     cwd?: string;
+    mcpCwd?: string;
+    settingSources?: CursorSettingSource[];
   },
 ): Promise<McpToolExposureStageResult> {
   const specs = specsForRoles(options.roles ?? ["worker", "reviewer"]);
+  const roleRunContext = {
+    agentCwd: options.cwd ?? config.workflowDir,
+    mcpCwd: options.mcpCwd ?? config.workflowDir,
+    settingSources: options.settingSources ?? config.cursor.settingSources,
+    sdkTimeoutMs: options.timeoutMs,
+    waitTimeoutMs: options.waitTimeoutMs ?? 5_000,
+    postCancelWaitMs: options.postCancelWaitMs ?? 1_500,
+  };
   if (!options.enabled) {
+    const sdkRoleRuns = uniqueRoles(specs).map((role) =>
+      syntheticSdkRoleRun({
+        role,
+        roleStatus: "skipped",
+        primaryFailureCode: null,
+        message: "Live SDK probe skipped",
+        ...roleRunContext,
+      }),
+    );
     return {
       stage: "sdk",
       status: "skipped",
       failureCode: null,
       message: "Live Cursor SDK MCP exposure smoke skipped because SYMPHONY_MCP_EXPOSURE_SMOKE is not 1",
-      results: specs.map((spec) => skippedServerResult(spec, "Live SDK probe skipped")),
+      results: specs.map((spec) => {
+        const roleRunIndex = sdkRoleRuns.findIndex((roleRun) => roleRun.role === spec.role);
+        return skippedServerResult(spec, "Live SDK probe skipped", roleRunIndex);
+      }),
+      sdkRoleRuns,
     };
   }
 
   const apiKey = process.env.CURSOR_API_KEY;
   if (!apiKey) {
+    const sdkRoleRuns = uniqueRoles(specs).map((role) =>
+      syntheticSdkRoleRun({
+        role,
+        roleStatus: "failure",
+        primaryFailureCode: "sdk_credentials_missing",
+        message: "CURSOR_API_KEY is not set",
+        ...roleRunContext,
+      }),
+    );
     return {
       stage: "sdk",
       status: "failure",
       failureCode: "sdk_credentials_missing",
       message: "CURSOR_API_KEY is not set; live Cursor SDK MCP exposure probe cannot run",
-      results: specs.map((spec) => failureServerResult(spec, "sdk_credentials_missing", "CURSOR_API_KEY is not set")),
+      results: specs.map((spec) => {
+        const roleRunIndex = sdkRoleRuns.findIndex((roleRun) => roleRun.role === spec.role);
+        return failureServerResult(
+          spec,
+          "sdk_credentials_missing",
+          "CURSOR_API_KEY is not set",
+          [],
+          roleRunIndex,
+        );
+      }),
+      sdkRoleRuns,
     };
   }
 
   const results: McpToolExposureServerResult[] = [];
+  const sdkRoleRuns: SdkRoleRunResult[] = [];
   for (const role of uniqueRoles(specs)) {
-    results.push(
-      ...(await runSdkRoleProbe(config, {
-        role,
-        cliPath: options.cliPath,
-        apiKey,
-        timeoutMs: options.timeoutMs,
-        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-      })),
-    );
+    const roleRunIndex = sdkRoleRuns.length;
+    const roleProbe = await runSdkRoleProbe(config, {
+      role,
+      cliPath: options.cliPath,
+      apiKey,
+      timeoutMs: options.timeoutMs,
+      waitTimeoutMs: roleRunContext.waitTimeoutMs,
+      postCancelWaitMs: roleRunContext.postCancelWaitMs,
+      cwd: roleRunContext.agentCwd,
+      mcpCwd: roleRunContext.mcpCwd,
+      settingSources: roleRunContext.settingSources,
+      roleRunIndex,
+    });
+    sdkRoleRuns.push(roleProbe.roleRun);
+    results.push(...roleProbe.results);
   }
-  return summarizeStage("sdk", results);
+  return summarizeStage("sdk", results, sdkRoleRuns);
 }
 
 export function normalizeMcpToolName(rawName: string, specs: readonly McpToolExposureSpec[] = MCP_TOOL_EXPOSURE_SPECS): string | null {
@@ -241,7 +386,7 @@ export function redactSensitiveText(input: string, extraSecrets: string[] = []):
 }
 
 export function classifyToolListResult(
-  stage: McpToolExposureStage,
+  stage: Extract<McpToolExposureStage, "subprocess">,
   spec: McpToolExposureSpec,
   rawToolNames: string[],
   envKeyNames: string[] = [],
@@ -258,8 +403,7 @@ export function classifyToolListResult(
       command: spec.command,
       expectedTool: spec.expectedTool,
       status: "failure",
-      failureCode:
-        stage === "subprocess" ? "subprocess_missing_empty_name_mismatch" : "sdk_init_timeout_no_tools_empty_tools_name_mismatch",
+      failureCode: "subprocess_missing_empty_name_mismatch",
       message: `${stageLabel(stage)} exposed no MCP tools for ${spec.serverKey}`,
       rawToolNames,
       normalizedToolNames,
@@ -273,8 +417,7 @@ export function classifyToolListResult(
       command: spec.command,
       expectedTool: spec.expectedTool,
       status: "failure",
-      failureCode:
-        stage === "subprocess" ? "subprocess_missing_empty_name_mismatch" : "sdk_init_timeout_no_tools_empty_tools_name_mismatch",
+      failureCode: "subprocess_missing_empty_name_mismatch",
       message: `${stageLabel(stage)} did not expose ${spec.expectedTool} for ${spec.serverKey}; raw tools: ${rawToolNames.join(", ")}`,
       rawToolNames,
       normalizedToolNames,
@@ -349,12 +492,28 @@ export async function listMcpToolsViaCommand(input: {
     .filter((name): name is string => typeof name === "string" && name.length > 0);
 }
 
+interface SdkRoleProbeResult {
+  roleRun: SdkRoleRunResult;
+  results: McpToolExposureServerResult[];
+}
+
 async function runSdkRoleProbe(
   config: ServiceConfig,
-  options: { role: AgentRunRole; cliPath: string; apiKey: string; timeoutMs: number; cwd?: string },
-): Promise<McpToolExposureServerResult[]> {
+  options: {
+    role: AgentRunRole;
+    cliPath: string;
+    apiKey: string;
+    timeoutMs: number;
+    waitTimeoutMs: number;
+    postCancelWaitMs: number;
+    cwd: string;
+    mcpCwd: string;
+    settingSources: CursorSettingSource[];
+    roleRunIndex: number;
+  },
+): Promise<SdkRoleProbeResult> {
   const roleSpecs = specsForRoles([options.role]);
-  const ctx = probeAgentRunContext(config, options.role, options.cwd ?? config.workflowDir);
+  const ctx = probeAgentRunContext(config, options.role, options.cwd);
   await writeRoleContexts(ctx);
   const envKeyNamesByServer = new Map(
     roleSpecs.map((spec) => [
@@ -365,83 +524,236 @@ async function runSdkRoleProbe(
   let agent: SDKAgent | null = null;
   let run: Run | null = null;
   try {
-    agent = await Agent.create(cursorAgentCreateOptions(ctx, options.apiKey));
+    const createOptions = cursorAgentCreateOptions(ctx, options.apiKey);
+    createOptions.local = {
+      ...createOptions.local,
+      settingSources: options.settingSources as SettingSource[],
+    };
+    agent = await Agent.create(createOptions);
     run = await agent.send("Observe available tools, do not call any tools, and wait.", {
       model: cursorModelSelection(ctx),
       local: { force: true },
-      mcpServers: roleMcpServers(ctx, options.cliPath),
+      mcpServers: roleMcpServers(ctx, options.cliPath, options.mcpCwd),
     });
   } catch (error) {
-    return roleSpecs.map((spec) =>
-      failureServerResult(
-        spec,
-        "sdk_startup_send_failure",
-        `Cursor SDK startup/send failed for ${options.role}: ${redactSensitiveText(errorMessage(error), [options.apiKey])}`,
-        envKeyNamesByServer.get(spec.serverKey),
-      ),
+    const roleRun = sdkRoleRunFromObservation(
+      options.role,
+      agentId(agent),
+      runId(run),
+      sdkDiagnostics({
+        role: options.role,
+        agentCwd: options.cwd,
+        mcpCwd: options.mcpCwd,
+        settingSources: options.settingSources,
+        sdkTimeoutMs: options.timeoutMs,
+        waitTimeoutMs: options.waitTimeoutMs,
+        postCancelWaitMs: options.postCancelWaitMs,
+        startupSendError: `Cursor SDK startup/send failed for ${options.role}: ${redactSensitiveText(
+          errorMessage(error),
+          [options.apiKey],
+        )}`,
+      }),
+      roleSpecs,
     );
+    await agent?.[Symbol.asyncDispose]().catch(() => undefined);
+    return {
+      roleRun,
+      results: roleSpecs.map((spec) =>
+        deriveSdkPerSpecResult(spec, roleRun, options.roleRunIndex, envKeyNamesByServer.get(spec.serverKey)),
+      ),
+    };
   }
 
   try {
-    const observed = await observeSdkTools(run, options.timeoutMs);
-    if (observed.unexpectedToolCall) {
-      await run.cancel();
-      return roleSpecs.map((spec) =>
-        failureServerResult(
-          spec,
-          "unexpected_tool_call",
-          `Cursor SDK attempted unexpected tool call: ${observed.unexpectedToolCall}`,
-          envKeyNamesByServer.get(spec.serverKey),
-        ),
-      );
-    }
-    return roleSpecs.map((spec) =>
-      classifyToolListResult("sdk", spec, observed.rawToolNames, envKeyNamesByServer.get(spec.serverKey) ?? []),
-    );
-  } catch (error) {
-    return roleSpecs.map((spec) =>
-      failureServerResult(
-        spec,
-        "sdk_init_timeout_no_tools_empty_tools_name_mismatch",
-        `Cursor SDK did not expose tools for ${options.role}: ${redactSensitiveText(errorMessage(error), [options.apiKey])}`,
-        envKeyNamesByServer.get(spec.serverKey),
+    const roleRun = await observeSdkRoleRun({
+      role: options.role,
+      agentId: agentId(agent),
+      runId: runId(run),
+      run,
+      roleSpecs,
+      agentCwd: options.cwd,
+      mcpCwd: options.mcpCwd,
+      settingSources: options.settingSources,
+      sdkTimeoutMs: options.timeoutMs,
+      waitTimeoutMs: options.waitTimeoutMs,
+      postCancelWaitMs: options.postCancelWaitMs,
+      secrets: [options.apiKey],
+    });
+    return {
+      roleRun,
+      results: roleSpecs.map((spec) =>
+        deriveSdkPerSpecResult(spec, roleRun, options.roleRunIndex, envKeyNamesByServer.get(spec.serverKey)),
       ),
-    );
+    };
   } finally {
-    await run?.cancel().catch(() => undefined);
     await agent?.[Symbol.asyncDispose]().catch(() => undefined);
   }
 }
 
-async function observeSdkTools(run: Run, timeoutMs: number): Promise<{ rawToolNames: string[]; unexpectedToolCall: string | null }> {
-  const timeout = new Promise<never>((_, reject) => {
-    setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms waiting for Cursor SDK system.tools`)), timeoutMs);
+export async function observeSdkRoleRun(input: {
+  role: AgentRunRole;
+  agentId: string | null;
+  runId: string | null;
+  run: Pick<Run, "stream" | "wait" | "cancel">;
+  roleSpecs?: readonly McpToolExposureSpec[];
+  agentCwd: string;
+  mcpCwd: string;
+  settingSources: CursorSettingSource[];
+  sdkTimeoutMs: number;
+  waitTimeoutMs: number;
+  postCancelWaitMs: number;
+  secrets?: string[];
+}): Promise<SdkRoleRunResult> {
+  const observation = sdkDiagnostics({
+    role: input.role,
+    agentCwd: input.agentCwd,
+    mcpCwd: input.mcpCwd,
+    settingSources: input.settingSources,
+    sdkTimeoutMs: input.sdkTimeoutMs,
+    waitTimeoutMs: input.waitTimeoutMs,
+    postCancelWaitMs: input.postCancelWaitMs,
   });
-  return Promise.race([observeSdkToolsFromStream(run), timeout]);
+  if (typeof input.run.stream !== "function") {
+    observation.supportsStream = false;
+    observation.streamStatus = "unsupported";
+    return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
+  }
+
+  observation.supportsStream = true;
+  const streamOutcome = await settleWithTimeout(drainSdkStream(input.run, observation, input.secrets ?? []), input.sdkTimeoutMs);
+  if (streamOutcome.status === "timeout") {
+    observation.timedOut = true;
+    observation.streamStatus = "timeout";
+    await cancelAndWaitAfterAbnormalStream(input.run, observation, input.postCancelWaitMs, true, input.secrets ?? []);
+    return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
+  }
+  if (streamOutcome.status === "rejected") {
+    observation.streamStatus = "error";
+    observation.streamError = redactSensitiveText(errorMessage(streamOutcome.error), input.secrets ?? []);
+    return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
+  }
+  if (observation.unexpectedToolCall) {
+    observation.streamStatus = "unexpected_tool_call";
+    await cancelAndWaitAfterAbnormalStream(input.run, observation, input.postCancelWaitMs, false, input.secrets ?? []);
+    return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
+  }
+
+  observation.streamStatus = "drained";
+  await observeSdkWait(input.run, observation, input.waitTimeoutMs, input.secrets ?? []);
+  return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
 }
 
-async function observeSdkToolsFromStream(run: Run): Promise<{ rawToolNames: string[]; unexpectedToolCall: string | null }> {
+async function drainSdkStream(
+  run: Pick<Run, "stream">,
+  observation: SdkToolDiagnostics,
+  secrets: string[],
+): Promise<void> {
   for await (const message of run.stream()) {
+    recordSdkMessage(observation, message);
     const unexpectedToolCall = sdkToolCallName(message);
-    if (unexpectedToolCall) return { rawToolNames: [], unexpectedToolCall };
+    if (unexpectedToolCall) {
+      observation.unexpectedToolCall = redactSensitiveText(unexpectedToolCall, secrets);
+      return;
+    }
     if (isRecord(message) && message.type === "system") {
-      const rawToolNames = sdkSystemToolNames(message.tools);
-      if (rawToolNames.length > 0) return { rawToolNames, unexpectedToolCall: null };
+      observation.systemMessageCount += 1;
+      if (Object.prototype.hasOwnProperty.call(message, "tools")) {
+        observation.systemToolPayloadCount += 1;
+        pushBounded(observation.rawSystemToolPayloads, sanitizeDiagnosticPayload(message.tools, secrets), 5);
+        const extracted = extractSdkSystemToolNames(message.tools);
+        observation.systemToolsCount += extracted.systemToolsCount;
+        observation.namedToolCount += extracted.namedToolCount;
+        observation.unnamedToolObjectCount += extracted.unnamedToolObjectCount;
+        observation.malformedToolObjectCount += extracted.malformedToolObjectCount;
+        observation.rawToolNames = unique([...observation.rawToolNames, ...extracted.rawToolNames]);
+        observation.normalizedToolNames = unique([...observation.normalizedToolNames, ...extracted.normalizedToolNames]);
+      }
     }
   }
-  return { rawToolNames: [], unexpectedToolCall: null };
 }
 
-function roleMcpServers(ctx: AgentRunContext, cliPath: string): Record<string, McpSubprocessServerConfig> {
+async function observeSdkWait(
+  run: Pick<Run, "wait">,
+  observation: SdkToolDiagnostics,
+  timeoutMs: number,
+  secrets: string[],
+): Promise<void> {
+  if (typeof run.wait !== "function") {
+    observation.supportsWait = false;
+    observation.waitStatus = "unsupported";
+    return;
+  }
+  observation.supportsWait = true;
+  const waitOutcome = await settleWithTimeout(run.wait(), timeoutMs);
+  if (waitOutcome.status === "timeout") {
+    observation.waitStatus = "timeout";
+    observation.waitError = `timed out after ${timeoutMs}ms waiting for Cursor SDK run completion`;
+    return;
+  }
+  if (waitOutcome.status === "rejected") {
+    observation.waitStatus = "error";
+    observation.waitError = redactSensitiveText(errorMessage(waitOutcome.error), secrets);
+    return;
+  }
+  observation.waitStatus = sdkWaitStatus(waitOutcome.value);
+  if (observation.waitStatus !== "finished") {
+    observation.waitError = sdkWaitResultMessage(waitOutcome.value);
+  }
+}
+
+async function cancelAndWaitAfterAbnormalStream(
+  run: Pick<Run, "wait" | "cancel">,
+  observation: SdkToolDiagnostics,
+  postCancelWaitMs: number,
+  cancelledAfterTimeout: boolean,
+  secrets: string[],
+): Promise<void> {
+  if (typeof run.cancel === "function") {
+    await run.cancel().catch((error: unknown) => {
+      observation.waitError = redactSensitiveText(errorMessage(error), secrets);
+    });
+  }
+  observation.cancelledAfterTimeout = cancelledAfterTimeout;
+  if (typeof run.wait !== "function") {
+    observation.supportsWait = false;
+    observation.waitStatus = "unsupported";
+    return;
+  }
+  observation.supportsWait = true;
+  const waitOutcome = await settleWithTimeout(run.wait(), postCancelWaitMs);
+  if (waitOutcome.status === "timeout") {
+    observation.waitStatus = "timeout";
+    observation.waitError = `timed out after ${postCancelWaitMs}ms waiting after Cursor SDK run cancellation`;
+    return;
+  }
+  if (waitOutcome.status === "rejected") {
+    observation.waitStatus = "error";
+    observation.waitError = redactSensitiveText(errorMessage(waitOutcome.error), secrets);
+    return;
+  }
+  observation.waitStatus = sdkWaitStatus(waitOutcome.value);
+}
+
+function roleMcpServers(ctx: AgentRunContext, cliPath: string, mcpCwd: string): Record<string, McpSubprocessServerConfig> {
   if (ctx.role === "worker") {
     return {
-      symphony: completionReportMcpServerConfig(ctx, completionReportContextFilePath(ctx), { cliPath }),
+      symphony: withMcpCwd(completionReportMcpServerConfig(ctx, completionReportContextFilePath(ctx), { cliPath }), mcpCwd),
     };
   }
   return {
-    symphony_review_verdict: reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFilePath(ctx), { cliPath }),
-    symphony_review_feedback: reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFilePath(ctx), { cliPath }),
+    symphony_review_verdict: withMcpCwd(
+      reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFilePath(ctx), { cliPath }),
+      mcpCwd,
+    ),
+    symphony_review_feedback: withMcpCwd(
+      reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFilePath(ctx), { cliPath }),
+      mcpCwd,
+    ),
   };
+}
+
+function withMcpCwd(server: McpSubprocessServerConfig, cwd: string): McpSubprocessServerConfig {
+  return { ...server, cwd };
 }
 
 async function writeRoleContexts(ctx: AgentRunContext): Promise<void> {
@@ -518,7 +830,11 @@ function probeAgentRunContext(config: ServiceConfig, role: AgentRunRole, cwd: st
   };
 }
 
-function summarizeStage(stage: McpToolExposureStage, results: McpToolExposureServerResult[]): McpToolExposureStageResult {
+function summarizeStage(
+  stage: McpToolExposureStage,
+  results: McpToolExposureServerResult[],
+  sdkRoleRuns?: SdkRoleRunResult[],
+): McpToolExposureStageResult {
   const failure = results.find((result) => result.status === "failure");
   if (failure) {
     return {
@@ -530,6 +846,7 @@ function summarizeStage(stage: McpToolExposureStage, results: McpToolExposureSer
         .map((result) => result.message)
         .join("; "),
       results,
+      ...(sdkRoleRuns === undefined ? {} : { sdkRoleRuns }),
     };
   }
   if (results.every((result) => result.status === "skipped")) {
@@ -539,6 +856,7 @@ function summarizeStage(stage: McpToolExposureStage, results: McpToolExposureSer
       failureCode: null,
       message: results[0]?.message ?? `${stageLabel(stage)} skipped`,
       results,
+      ...(sdkRoleRuns === undefined ? {} : { sdkRoleRuns }),
     };
   }
   return {
@@ -547,21 +865,22 @@ function summarizeStage(stage: McpToolExposureStage, results: McpToolExposureSer
     failureCode: null,
     message: `${stageLabel(stage)} exposed all expected Symphony MCP tools`,
     results,
+    ...(sdkRoleRuns === undefined ? {} : { sdkRoleRuns }),
   };
 }
 
 function reportFromStages(
   config: ServiceConfig,
-  cliPath: string,
-  liveSmokeEnabled: boolean,
+  probeConfig: McpToolExposureProbeConfig,
   stages: McpToolExposureStageResult[],
 ): McpToolExposureReport {
   return {
     version: 1,
     generatedAt: new Date().toISOString(),
     workflowPath: config.workflowPath,
-    cliPath,
-    liveSmokeEnabled,
+    cliPath: probeConfig.cliPath,
+    liveSmokeEnabled: probeConfig.liveSmokeEnabled,
+    probeConfig,
     ok: stages.every((stage) => stage.status !== "failure"),
     stages,
   };
@@ -576,7 +895,198 @@ function uniqueRoles(specs: McpToolExposureSpec[]): AgentRunRole[] {
   return unique(specs.map((spec) => spec.role));
 }
 
-function skippedServerResult(spec: McpToolExposureSpec, message: string): McpToolExposureServerResult {
+export function extractSdkSystemToolNames(tools: unknown): SdkSystemToolExtraction {
+  const extraction: SdkSystemToolExtraction = {
+    rawToolNames: [],
+    normalizedToolNames: [],
+    systemToolsCount: 0,
+    namedToolCount: 0,
+    unnamedToolObjectCount: 0,
+    malformedToolObjectCount: 0,
+  };
+  if (!Array.isArray(tools)) {
+    extraction.malformedToolObjectCount = 1;
+    return extraction;
+  }
+  extraction.systemToolsCount = tools.length;
+  for (const tool of tools) {
+    if (typeof tool === "string") {
+      const name = tool.trim();
+      if (name.length === 0) {
+        extraction.unnamedToolObjectCount += 1;
+        continue;
+      }
+      extraction.rawToolNames.push(name);
+      extraction.namedToolCount += 1;
+      continue;
+    }
+    if (isRecord(tool)) {
+      if (typeof tool.name === "string" && tool.name.trim().length > 0) {
+        extraction.rawToolNames.push(tool.name.trim());
+        extraction.namedToolCount += 1;
+      } else {
+        extraction.unnamedToolObjectCount += 1;
+      }
+      continue;
+    }
+    extraction.malformedToolObjectCount += 1;
+  }
+  extraction.rawToolNames = unique(extraction.rawToolNames);
+  extraction.normalizedToolNames = unique(
+    extraction.rawToolNames
+      .map((name) => normalizeMcpToolName(name))
+      .filter((name): name is string => name !== null),
+  );
+  return extraction;
+}
+
+export function classifySdkRoleFailureCode(
+  observation: SdkToolDiagnostics,
+  roleSpecs: readonly McpToolExposureSpec[] = specsForRoles([observation.role]),
+): McpToolExposureFailureCode | null {
+  if (observation.startupSendError) return "sdk_startup_send_failure";
+  if (observation.supportsStream === false) return "sdk_stream_unsupported";
+  if (observation.unexpectedToolCall) return "unexpected_tool_call";
+  if (observation.timedOut || observation.streamStatus === "timeout") return "sdk_stream_timeout";
+  if (observation.streamStatus === "error") return "sdk_stream_failure";
+  if (observation.systemMessageCount === 0) return "sdk_no_system_messages";
+  if (observation.systemToolPayloadCount === 0) return "sdk_system_tools_absent";
+  if (observation.systemToolsCount === 0 && observation.malformedToolObjectCount === 0) return "sdk_system_tools_empty";
+  if (
+    observation.rawToolNames.length === 0 &&
+    observation.normalizedToolNames.length === 0 &&
+    (observation.unnamedToolObjectCount > 0 || observation.malformedToolObjectCount > 0)
+  ) {
+    return "sdk_system_tools_unnamed";
+  }
+  if (isSdkWaitFailure(observation.waitStatus)) return "sdk_wait_failure";
+  if (!roleSpecs.every((spec) => observation.normalizedToolNames.includes(spec.expectedTool))) {
+    return "sdk_system_tools_name_mismatch";
+  }
+  if (observation.waitStatus === "unsupported") return null;
+  return null;
+}
+
+export function classifySdkRoleObservation(
+  observation: SdkToolDiagnostics,
+  roleSpecs: readonly McpToolExposureSpec[] = specsForRoles([observation.role]),
+): Pick<SdkRoleRunResult, "primaryFailureCode" | "roleStatus"> {
+  const primaryFailureCode = classifySdkRoleFailureCode(observation, roleSpecs);
+  if (primaryFailureCode === null) return { primaryFailureCode, roleStatus: "success" };
+  if (primaryFailureCode === "sdk_system_tools_name_mismatch") {
+    const successfulSpecs = roleSpecs.filter((spec) => observation.normalizedToolNames.includes(spec.expectedTool));
+    return {
+      primaryFailureCode,
+      roleStatus: successfulSpecs.length > 0 ? "partial" : "failure",
+    };
+  }
+  return { primaryFailureCode, roleStatus: "failure" };
+}
+
+export function classifySdkDiagnosticsForSpec(
+  spec: McpToolExposureSpec,
+  observation: SdkToolDiagnostics,
+): Pick<McpToolExposureServerResult, "status" | "failureCode" | "message" | "rawToolNames" | "normalizedToolNames"> {
+  const primaryFailureCode = classifySdkRoleFailureCode(observation, specsForRoles([spec.role]));
+  if (
+    primaryFailureCode === null ||
+    (primaryFailureCode === "sdk_system_tools_name_mismatch" && observation.normalizedToolNames.includes(spec.expectedTool))
+  ) {
+    return {
+      status: "success",
+      failureCode: null,
+      message: `Cursor SDK system.tools exposed ${spec.expectedTool} for ${spec.serverKey}`,
+      rawToolNames: observation.rawToolNames,
+      normalizedToolNames: observation.normalizedToolNames,
+    };
+  }
+  return {
+    status: "failure",
+    failureCode: primaryFailureCode,
+    message: sdkFailureMessage(spec, observation, primaryFailureCode),
+    rawToolNames: observation.rawToolNames,
+    normalizedToolNames: observation.normalizedToolNames,
+  };
+}
+
+export function deriveSdkPerSpecResult(
+  spec: McpToolExposureSpec,
+  roleRun: SdkRoleRunResult,
+  sdkRoleRunIndex: number,
+  envKeyNames: string[] = [],
+): McpToolExposureServerResult {
+  const classified = classifySdkDiagnosticsForSpec(spec, roleRun.sdkObservation);
+  return {
+    role: spec.role,
+    serverKey: spec.serverKey,
+    command: spec.command,
+    expectedTool: spec.expectedTool,
+    status: classified.status,
+    failureCode: classified.failureCode,
+    message: classified.message,
+    rawToolNames: classified.rawToolNames,
+    normalizedToolNames: classified.normalizedToolNames,
+    envKeyNames: sortedKeysFromList(envKeyNames),
+    sdkRoleRunRole: roleRun.role,
+    sdkRoleRunIndex,
+  };
+}
+
+function sdkRoleRunFromObservation(
+  role: AgentRunRole,
+  agentIdValue: string | null,
+  runIdValue: string | null,
+  sdkObservation: SdkToolDiagnostics,
+  roleSpecs: readonly McpToolExposureSpec[] = specsForRoles([role]),
+): SdkRoleRunResult {
+  const classified = classifySdkRoleObservation(sdkObservation, roleSpecs);
+  return {
+    role,
+    agentId: agentIdValue,
+    runId: runIdValue,
+    primaryFailureCode: classified.primaryFailureCode,
+    roleStatus: classified.roleStatus,
+    sdkObservation,
+  };
+}
+
+function syntheticSdkRoleRun(input: {
+  role: AgentRunRole;
+  roleStatus: SdkRoleStatus;
+  primaryFailureCode: McpToolExposureFailureCode | null;
+  message: string;
+  agentCwd: string;
+  mcpCwd: string;
+  settingSources: CursorSettingSource[];
+  sdkTimeoutMs: number;
+  waitTimeoutMs: number;
+  postCancelWaitMs: number;
+}): SdkRoleRunResult {
+  const sdkObservation = sdkDiagnostics({
+    role: input.role,
+    agentCwd: input.agentCwd,
+    mcpCwd: input.mcpCwd,
+    settingSources: input.settingSources,
+    sdkTimeoutMs: input.sdkTimeoutMs,
+    waitTimeoutMs: input.waitTimeoutMs,
+    postCancelWaitMs: input.postCancelWaitMs,
+    startupSendError: input.primaryFailureCode === "sdk_credentials_missing" ? input.message : null,
+  });
+  return {
+    role: input.role,
+    agentId: null,
+    runId: null,
+    primaryFailureCode: input.primaryFailureCode,
+    roleStatus: input.roleStatus,
+    sdkObservation,
+  };
+}
+
+function skippedServerResult(
+  spec: McpToolExposureSpec,
+  message: string,
+  sdkRoleRunIndex?: number,
+): McpToolExposureServerResult {
   return {
     role: spec.role,
     serverKey: spec.serverKey,
@@ -588,6 +1098,7 @@ function skippedServerResult(spec: McpToolExposureSpec, message: string): McpToo
     rawToolNames: [],
     normalizedToolNames: [],
     envKeyNames: [],
+    ...(sdkRoleRunIndex === undefined ? {} : { sdkRoleRunRole: spec.role, sdkRoleRunIndex }),
   };
 }
 
@@ -596,6 +1107,7 @@ function failureServerResult(
   failureCode: McpToolExposureFailureCode,
   message: string,
   envKeyNames: string[] = [],
+  sdkRoleRunIndex?: number,
 ): McpToolExposureServerResult {
   return {
     role: spec.role,
@@ -608,18 +1120,172 @@ function failureServerResult(
     rawToolNames: [],
     normalizedToolNames: [],
     envKeyNames: sortedKeysFromList(envKeyNames),
+    ...(sdkRoleRunIndex === undefined ? {} : { sdkRoleRunRole: spec.role, sdkRoleRunIndex }),
   };
 }
 
-function sdkSystemToolNames(tools: unknown): string[] {
-  if (!Array.isArray(tools)) return [];
-  return tools
-    .map((tool) => {
-      if (typeof tool === "string") return tool;
-      if (isRecord(tool) && typeof tool.name === "string") return tool.name;
-      return null;
-    })
-    .filter((name): name is string => name !== null && name.length > 0);
+function sdkDiagnostics(input: {
+  role: AgentRunRole;
+  agentCwd: string;
+  mcpCwd: string;
+  settingSources: CursorSettingSource[];
+  sdkTimeoutMs: number;
+  waitTimeoutMs: number;
+  postCancelWaitMs: number;
+  startupSendError?: string | null;
+}): SdkToolDiagnostics {
+  return {
+    role: input.role,
+    agentCwd: input.agentCwd,
+    mcpCwd: input.mcpCwd,
+    settingSources: input.settingSources,
+    sdkTimeoutMs: input.sdkTimeoutMs,
+    waitTimeoutMs: input.waitTimeoutMs,
+    postCancelWaitMs: input.postCancelWaitMs,
+    supportsStream: null,
+    supportsWait: null,
+    streamStatus: "not_started",
+    waitStatus: null,
+    waitError: null,
+    timedOut: false,
+    cancelledAfterTimeout: false,
+    startupSendError: input.startupSendError ?? null,
+    unexpectedToolCall: null,
+    systemMessageCount: 0,
+    systemToolPayloadCount: 0,
+    systemToolsCount: 0,
+    namedToolCount: 0,
+    unnamedToolObjectCount: 0,
+    malformedToolObjectCount: 0,
+    rawSystemToolPayloads: [],
+    rawToolNames: [],
+    normalizedToolNames: [],
+    observedMessageTypes: [],
+    messageTypeCounts: {},
+    streamError: null,
+  };
+}
+
+function sdkFailureMessage(
+  spec: McpToolExposureSpec,
+  observation: SdkToolDiagnostics,
+  failureCode: McpToolExposureFailureCode,
+): string {
+  switch (failureCode) {
+    case "sdk_credentials_missing":
+      return "CURSOR_API_KEY is not set";
+    case "sdk_startup_send_failure":
+      return observation.startupSendError ?? `Cursor SDK startup/send failed for ${spec.role}`;
+    case "sdk_stream_unsupported":
+      return "Cursor SDK run does not expose stream()";
+    case "sdk_stream_failure":
+      return `Cursor SDK stream failed for ${spec.role}: ${observation.streamError ?? "unknown stream error"}`;
+    case "sdk_stream_timeout":
+      return `Cursor SDK stream timed out after ${observation.sdkTimeoutMs}ms for ${spec.role}`;
+    case "sdk_no_system_messages":
+      return `Cursor SDK stream ended without system messages for ${spec.role}`;
+    case "sdk_system_tools_absent":
+      return `Cursor SDK system messages did not include a tools payload for ${spec.role}`;
+    case "sdk_system_tools_empty":
+      return `Cursor SDK system.tools payload was empty for ${spec.role}`;
+    case "sdk_system_tools_unnamed":
+      return `Cursor SDK system.tools payload had unnamed or malformed tools for ${spec.role}`;
+    case "sdk_system_tools_name_mismatch":
+      return `Cursor SDK did not expose ${spec.expectedTool} for ${spec.serverKey}; raw tools: ${formatListForMessage(
+        observation.rawToolNames,
+      )}`;
+    case "sdk_wait_failure":
+      return `Cursor SDK wait failed for ${spec.role}: ${observation.waitError ?? observation.waitStatus ?? "unknown wait error"}`;
+    case "sdk_wait_unsupported":
+      return "Cursor SDK run does not expose wait()";
+    case "unexpected_tool_call":
+      return `Cursor SDK attempted unexpected tool call: ${observation.unexpectedToolCall ?? "unknown"}`;
+    case "subprocess_spawn_list_failure":
+    case "subprocess_missing_empty_name_mismatch":
+      return `Unexpected SDK failure code ${failureCode}`;
+  }
+}
+
+function isSdkWaitFailure(waitStatus: string | null): boolean {
+  return waitStatus !== null && waitStatus !== "finished" && waitStatus !== "unsupported";
+}
+
+function recordSdkMessage(observation: SdkToolDiagnostics, message: unknown): void {
+  const messageType = sdkMessageType(message);
+  observation.messageTypeCounts[messageType] = (observation.messageTypeCounts[messageType] ?? 0) + 1;
+  if (!observation.observedMessageTypes.includes(messageType)) {
+    observation.observedMessageTypes.push(messageType);
+  }
+}
+
+function sdkMessageType(message: unknown): string {
+  if (isRecord(message) && typeof message.type === "string" && message.type.length > 0) return message.type;
+  if (message === null) return "null";
+  if (Array.isArray(message)) return "array";
+  return typeof message;
+}
+
+function sdkWaitStatus(value: unknown): string {
+  if (isRecord(value) && typeof value.status === "string" && value.status.length > 0) return value.status;
+  return "finished";
+}
+
+function sdkWaitResultMessage(value: unknown): string | null {
+  if (isRecord(value)) {
+    if (typeof value.result === "string" && value.result.length > 0) return value.result;
+    if (typeof value.error === "string" && value.error.length > 0) return value.error;
+  }
+  return null;
+}
+
+type SettledWithTimeout<T> =
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; error: unknown }
+  | { status: "timeout" };
+
+async function settleWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<SettledWithTimeout<T>> {
+  let timeout: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race<SettledWithTimeout<T>>([
+      promise.then(
+        (value) => ({ status: "fulfilled", value }) as const,
+        (error: unknown) => ({ status: "rejected", error }) as const,
+      ),
+      new Promise<{ status: "timeout" }>((resolve) => {
+        timeout = setTimeout(() => resolve({ status: "timeout" }), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function sanitizeDiagnosticPayload(value: unknown, secrets: string[]): unknown {
+  try {
+    const json = JSON.stringify(value);
+    if (json === undefined) return value;
+    const redacted = redactSensitiveText(json, secrets);
+    if (redacted.length > 4_000) return `${redacted.slice(0, 4_000)}...[truncated]`;
+    return JSON.parse(redacted) as unknown;
+  } catch {
+    return redactSensitiveText(String(value), secrets);
+  }
+}
+
+function pushBounded<T>(values: T[], value: T, limit: number): void {
+  if (values.length < limit) values.push(value);
+}
+
+function agentId(agent: SDKAgent | null): string | null {
+  return isRecord(agent) && typeof agent.agentId === "string" ? agent.agentId : null;
+}
+
+function runId(run: Run | null): string | null {
+  return isRecord(run) && typeof run.id === "string" ? run.id : null;
+}
+
+function formatListForMessage(values: string[]): string {
+  return values.length === 0 ? "none" : values.join(", ");
 }
 
 function sdkToolCallName(message: unknown): string | null {
