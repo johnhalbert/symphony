@@ -7,7 +7,12 @@ import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { AgentRunRole, Issue, RuntimeTotals, TokenCounts, Workspace } from "../types.js";
 import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
-import type { RunRecord, RunTranscriptStore, TranscriptEvent } from "../persistence/RunTranscriptStore.js";
+import {
+  compareRunChronology,
+  type RunRecord,
+  type RunTranscriptStore,
+  type TranscriptEvent,
+} from "../persistence/RunTranscriptStore.js";
 import {
   phaseForIssueState,
   type IssueCompletionReportRecord,
@@ -1663,7 +1668,7 @@ async function listRunsForLifecycle(
       byId.set(run.runId, run);
     }
   }
-  return [...byId.values()].sort((left, right) => Date.parse(left.startedAt) - Date.parse(right.startedAt));
+  return [...byId.values()].sort(compareRunChronology);
 }
 
 async function readContinuationTranscriptEvents(
