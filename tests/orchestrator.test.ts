@@ -742,7 +742,7 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
-  it("treats accepted completion reports as handoff when the harness fails after reporting", async () => {
+  it("[event-guard:failed] treats accepted completion reports as handoff when the harness fails after reporting", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 3;
     config.writeback.enabled = true;
@@ -814,6 +814,7 @@ describe("Orchestrator", () => {
     expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
     expect(currentState).toBe("In Review");
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-failed"))).toBe(false);
+    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-cancelled"))).toBe(false);
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
     expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
     await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
@@ -835,6 +836,212 @@ describe("Orchestrator", () => {
         lastEvidenceCursor: "idem-1",
       },
     });
+    const transcript = await runStore.readTranscript("report-run-1");
+    const eventTypes = transcript.events.map((event) => event.eventType);
+    expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("failed");
+    expect(eventTypes).not.toContain("completed");
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("[event-guard:cancelled] treats accepted completion reports as handoff when the harness is cancelled after reporting", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 3;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const harness = new ReportingHarness(lifecycleStore, outboxStore, runStore, publisher, {
+      type: "cancelled",
+    });
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.prompts).toEqual(["Work on TEST-1"]);
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
+      "report-run-1:run-started",
+      "report-run-1:completion-report:idem-1",
+    ]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
+    expect(currentState).toBe("In Review");
+    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-failed"))).toBe(false);
+    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-cancelled"))).toBe(false);
+    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
+    expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
+    await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
+      status: "succeeded",
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "review",
+      incompleteTurnCount: 0,
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+        lastEvidenceCursor: "idem-1",
+      },
+    });
+    const transcript = await runStore.readTranscript("report-run-1");
+    const eventTypes = transcript.events.map((event) => event.eventType);
+    expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("cancelled");
+    expect(eventTypes).not.toContain("completed");
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("[backstop:throw] reconciles accepted completion reports when the harness throws after reporting", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 3;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const harness = new ReportingHarness(lifecycleStore, outboxStore, runStore, publisher, "throw");
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.prompts).toEqual(["Work on TEST-1"]);
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
+      "report-run-1:run-started",
+      "report-run-1:completion-report:idem-1",
+    ]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
+    expect(currentState).toBe("In Review");
+    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-failed"))).toBe(false);
+    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-cancelled"))).toBe(false);
+    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
+    expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
+    await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
+      status: "succeeded",
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "review",
+      incompleteTurnCount: 0,
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+        lastEvidenceCursor: "idem-1",
+      },
+    });
+    const transcript = await runStore.readTranscript("report-run-1");
+    const eventTypes = transcript.events.map((event) => event.eventType);
+    expect(eventTypes).toContain("session_started");
+    expect(eventTypes).not.toContain("failed");
+    expect(eventTypes).not.toContain("cancelled");
+    expect(eventTypes).not.toContain("completed");
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -2257,6 +2464,8 @@ class CursorPromptHarness implements AgentHarness {
   }
 }
 
+type ReportingHarnessTerminal = AgentEvent | "throw";
+
 class ReportingHarness implements AgentHarness {
   readonly id = "reporting";
   readonly prompts: string[] = [];
@@ -2266,7 +2475,7 @@ class ReportingHarness implements AgentHarness {
     private readonly outboxStore: FileWritebackOutboxStore,
     private readonly runStore: FileRunTranscriptStore,
     private readonly publisher: CompletionReportPullRequestPublisher,
-    private readonly terminalEvent: AgentEvent = { type: "completed" },
+    private readonly terminalEvent: ReportingHarnessTerminal = { type: "completed" },
   ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
@@ -2307,6 +2516,9 @@ class ReportingHarness implements AgentHarness {
         phase: "implementation",
       },
     );
+    if (this.terminalEvent === "throw") {
+      throw new Error("post-handoff harness throw");
+    }
     yield this.terminalEvent;
   }
 }
