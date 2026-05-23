@@ -460,6 +460,33 @@ describe("StatusServer durable API", () => {
 
   it("serves live liveness and cancellation state from the orchestrator snapshot", async () => {
     const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-1",
+      sessionId: "session-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: path.join(config.workspace.root, "TEST-1"),
+    });
+    await runStore.startRun({
+      runId: "run-reviewer",
+      sessionId: "session-reviewer",
+      agentId: "agent-reviewer",
+      role: "reviewer",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "review",
+      workspaceKey: "TEST-1",
+      workspacePath: path.join(config.workspace.root, "TEST-1"),
+    });
     const liveRunning: ReturnType<Orchestrator["snapshot"]>["running"][number] = {
       issueId: "issue-1",
       issueIdentifier: "TEST-1",
@@ -513,6 +540,7 @@ describe("StatusServer durable API", () => {
         logger: new StructuredLogger(() => undefined),
       }),
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -522,15 +550,35 @@ describe("StatusServer durable API", () => {
       const baseUrl = `http://${address.host}:${address.port}`;
       const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
       const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const dashboardResponse = await fetch(`${baseUrl}/`);
       const stateBody = (await stateResponse.json()) as {
         running: Array<{ liveness: unknown; cancellation: unknown }>;
+        operatorView: {
+          running: Array<{
+            liveness: { status: string; agentId: string | null };
+            controls: { cancel: boolean };
+            humanRequired: { active: boolean };
+            continuationSummary: { available: boolean };
+          }>;
+        };
+        operatorLivenessContract: { deferred: { cancelFailed: { tracked: boolean } } };
       };
       const issueBody = (await issueResponse.json()) as {
-        live: { liveness: unknown; cancellation: unknown };
+        live: { liveness: unknown; cancellation: unknown; operatorLiveness: { status: string; agentId: string | null; cancelFailed: { tracked: boolean } } };
+        operatorLiveness: { status: string; agentId: string | null; cancelFailed: { tracked: boolean } };
+        capabilities: {
+          cancel: boolean;
+          pause: boolean;
+          mutationsRequireToken: boolean;
+          continuationSummary: { available: boolean };
+          humanRequired: { active: boolean };
+        };
       };
+      const dashboardHtml = await dashboardResponse.text();
 
       expect(stateResponse.status).toBe(200);
       expect(issueResponse.status).toBe(200);
+      expect(dashboardResponse.status).toBe(200);
       expect(stateBody.running[0]).toMatchObject({
         liveness: { status: "cancelling", activeRunId: "run-1" },
         cancellation: {
@@ -550,21 +598,304 @@ describe("StatusServer durable API", () => {
           source: "operator",
         },
       });
+      expect(stateBody.operatorView.running[0]).toMatchObject({
+        liveness: { status: "cancelling", agentId: "agent-1" },
+        controls: { cancel: false },
+        humanRequired: { active: false },
+        continuationSummary: { available: false },
+      });
+      expect(dashboardHtml).toContain("agent <code>agent-1</code>");
+      expect(issueBody.operatorLiveness).toMatchObject({ status: "cancelling" });
+      expect(issueBody.live.operatorLiveness).toMatchObject({ status: "cancelling" });
+      expect(issueBody.operatorLiveness.agentId).toBe("agent-1");
+      expect(issueBody.live.operatorLiveness.agentId).toBe("agent-1");
+      expect(issueBody.operatorLiveness.cancelFailed).toMatchObject({ tracked: false });
+      expect(stateBody.operatorLivenessContract.deferred.cancelFailed).toMatchObject({ tracked: false });
+      expect(issueBody.capabilities).toMatchObject({
+        cancel: false,
+        pause: true,
+        mutationsRequireToken: true,
+        continuationSummary: { available: false },
+        humanRequired: { active: false },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("includes lifecycle-aware operator liveness and timelines in run history", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-old",
+      sessionId: "session-old",
+      agentId: "agent-old",
+      role: "worker",
+      issueId: "issue-4",
+      issueIdentifier: "TEST-4",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "old work",
+      workspaceKey: "TEST-4",
+      workspacePath: path.join(config.workspace.root, "TEST-4"),
+    });
+    await runStore.updateRun("run-old", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:01:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-blocked",
+      sessionId: "session-blocked",
+      agentId: "agent-blocked",
+      role: "worker",
+      issueId: "issue-4",
+      issueIdentifier: "TEST-4",
+      attempt: null,
+      turnNumber: 2,
+      prompt: "blocked work",
+      workspaceKey: "TEST-4",
+      workspacePath: path.join(config.workspace.root, "TEST-4"),
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(
+      { id: "issue-4", identifier: "TEST-4" },
+      {
+        phase: "blocked",
+        blockedReason: "human required",
+        summaryPointers: {},
+      },
+    );
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-4`);
+      const runsResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-4/runs`);
+      const runDetailResponse = await fetch(`${baseUrl}/api/v1/runs/run-blocked`);
+      const issueBody = (await issueResponse.json()) as {
+        operatorLiveness: { status: string };
+        capabilities: { humanRequired: { active: boolean; reason: string | null }; continuationSummary: { available: boolean; path: string } };
+      };
+      const runsBody = (await runsResponse.json()) as {
+        issueBlocked: { status: string; reason: string };
+        enrichment: { timelineIncluded: boolean; level: string };
+        runs: Array<{ runId: string; operatorLiveness: null | { status: string; timeline: Array<{ kind: string }> }; livenessSummary: { status: string | null } }>;
+      };
+      const runDetailBody = (await runDetailResponse.json()) as {
+        operatorLiveness: null | { status: string; timeline: Array<{ kind: string }> };
+      };
+
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.operatorLiveness).toMatchObject({ status: "blocked_human_required" });
+      expect(issueBody.capabilities).toMatchObject({
+        humanRequired: { active: true, reason: "human required" },
+        continuationSummary: { available: true, path: "/api/v1/issues/TEST-4/continuation-summary" },
+      });
+      expect(runsResponse.status).toBe(200);
+      expect(runDetailResponse.status).toBe(200);
+      expect(runsBody.issueBlocked).toMatchObject({ status: "blocked_human_required", reason: "human required" });
+      expect(runsBody.enrichment).toMatchObject({ timelineIncluded: true, level: "operator_liveness_with_timeline" });
+      expect(runsBody.runs.find((run) => run.runId === "run-old")?.operatorLiveness).toBeNull();
+      const blockedRun = runsBody.runs.find((run) => run.runId === "run-blocked");
+      expect(blockedRun?.operatorLiveness).toMatchObject({ status: "blocked_human_required" });
+      expect(blockedRun?.livenessSummary).toMatchObject({ status: "blocked_human_required" });
+      expect(blockedRun?.operatorLiveness?.timeline.some((event) => event.kind === "lifecycle_blocked")).toBe(true);
+      expect(runDetailBody.operatorLiveness).toMatchObject({ status: "blocked_human_required" });
+      expect(runDetailBody.operatorLiveness?.timeline.some((event) => event.kind === "lifecycle_blocked")).toBe(true);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("renders operator liveness, retrying, and paused rows on the dashboard", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const blockedLifecycle = await lifecycleStore.ensureIssue(
+      { id: "issue-blocked", identifier: "TEST-BLOCKED" },
+      {
+        phase: "blocked",
+        blockedReason: "needs operator",
+        summaryPointers: {},
+      },
+    );
+    await lifecycleStore.ensureIssue(
+      { id: "issue-paused", identifier: "TEST-PAUSED" },
+      {
+        phase: "blocked",
+        blockedReason: "paused needs operator",
+        summaryPointers: {},
+      },
+    );
+    const stalledRunning: ReturnType<Orchestrator["snapshot"]>["running"][number] = {
+      issueId: "issue-2",
+      issueIdentifier: "TEST-2",
+      role: "worker",
+      state: "In Progress",
+      workspacePath: path.join(config.workspace.root, "TEST-2"),
+      sessionId: "session-2",
+      runId: "run-2",
+      turnCount: 1,
+      lastEvent: "progress",
+      lastMessage: "<script>alert(1)</script>",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      lastEventAt: "2026-01-01T00:00:01.000Z",
+      liveness: {
+        status: "stalled",
+        activeRunId: "run-2",
+        lastActivityAt: "2026-01-01T00:00:01.000Z",
+        secondsSinceLastActivity: 301,
+        stallTimeoutMs: 300_000,
+      },
+      cancellation: {
+        requested: false,
+        requestedAt: null,
+        source: null,
+        reason: null,
+        abortSignalled: false,
+        harnessStopRequestedAt: null,
+        suppressRetryOnExit: false,
+      },
+      tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      lifecycle: null,
+      metadata: {
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+        ciStatus: null,
+        lastPushedAt: null,
+        lastEvidenceCursor: null,
+        branchName: "symphony/TEST-2",
+        gitBranchName: "symphony/TEST-2",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    };
+    const blockedRunning: ReturnType<Orchestrator["snapshot"]>["running"][number] = {
+      ...stalledRunning,
+      issueId: "issue-blocked",
+      issueIdentifier: "TEST-BLOCKED",
+      state: "Blocked",
+      workspacePath: path.join(config.workspace.root, "TEST-BLOCKED"),
+      sessionId: "session-blocked",
+      runId: "run-blocked-live",
+      liveness: {
+        ...stalledRunning.liveness,
+        activeRunId: "run-blocked-live",
+      },
+      lifecycle: blockedLifecycle,
+    };
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([stalledRunning, blockedRunning], {
+        paused: ["issue-paused"],
+        retrying: [
+          {
+            issueId: "issue-3",
+            issueIdentifier: "TEST-3",
+            attempt: 2,
+            dueAt: "2026-01-01T00:05:00.000Z",
+            error: "rate limited",
+          },
+        ],
+      }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const response = await fetch(`${baseUrl}/`);
+      const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
+      const html = await response.text();
+      const stateBody = (await stateResponse.json()) as {
+        operatorView: {
+          running: Array<{
+            issueIdentifier: string;
+            liveness: { status: string };
+            humanRequired: { active: boolean; reason: string | null };
+            continuationSummary: { available: boolean; path: string };
+          }>;
+          paused: Array<{
+            issueId: string;
+            issueIdentifier: string;
+            controls: { pause: boolean; resume: boolean; cancel: boolean; mutationsRequireToken: boolean };
+            humanRequired: { active: boolean; reason: string | null };
+            continuationSummary: { available: boolean; path: string };
+          }>;
+        };
+      };
+
+      expect(response.status).toBe(200);
+      expect(stateResponse.status).toBe(200);
+      expect(html).toContain("possibly_stalled");
+      expect(html).toContain("operator-possibly_stalled");
+      expect(html).toContain("blocked_human_required");
+      expect(html).toContain("301s idle");
+      expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+      expect(html).toContain("TEST-3");
+      expect(html).toContain("issue-paused");
+      expect(html).toContain("TEST-PAUSED");
+      expect(html).toContain("controls: resume");
+      expect(html).toContain("continuation-summary POST /api/v1/issues/TEST-PAUSED/continuation-summary");
+      const paused = stateBody.operatorView.paused[0];
+      expect(paused).toMatchObject({
+        issueId: "issue-paused",
+        issueIdentifier: "TEST-PAUSED",
+        controls: { pause: false, resume: true, cancel: false, mutationsRequireToken: false },
+        humanRequired: { active: true, reason: "paused needs operator" },
+        continuationSummary: { available: true, path: "/api/v1/issues/TEST-PAUSED/continuation-summary" },
+      });
+      const blocked = stateBody.operatorView.running.find((row) => row.issueIdentifier === "TEST-BLOCKED");
+      expect(blocked).toMatchObject({
+        liveness: { status: "blocked_human_required" },
+        humanRequired: { active: true, reason: "needs operator" },
+        continuationSummary: { available: true, path: "/api/v1/issues/TEST-BLOCKED/continuation-summary" },
+      });
     } finally {
       await server.stop();
     }
   });
 });
 
-function fakeOrchestrator(running: ReturnType<Orchestrator["snapshot"]>["running"] = []): Orchestrator {
+function fakeOrchestrator(
+  running: ReturnType<Orchestrator["snapshot"]>["running"] = [],
+  overrides: Partial<Pick<ReturnType<Orchestrator["snapshot"]>, "paused" | "retrying">> = {},
+): Orchestrator {
   return {
     snapshot() {
       return {
         generatedAt: new Date(0).toISOString(),
-        counts: { running: running.length, retrying: 0, paused: 0 },
+        counts: {
+          running: running.length,
+          retrying: overrides.retrying?.length ?? 0,
+          paused: overrides.paused?.length ?? 0,
+        },
         running,
-        retrying: [],
-        paused: [],
+        retrying: overrides.retrying ?? [],
+        paused: overrides.paused ?? [],
         totals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, secondsRunning: 0 },
         rateLimits: null,
       };
