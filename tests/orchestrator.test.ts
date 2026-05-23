@@ -119,7 +119,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => harness.prompts.length === 1);
     await orchestrator.stop();
 
     expect(harness.prompts[0]).toContain("Work on TEST-1");
@@ -741,6 +741,139 @@ describe("Orchestrator", () => {
     });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
+
+  it("smokes a manufactured fail, revision worker, and pass review loop", async () => {
+    const config = testConfig(root);
+    config.agent.maxConcurrentAgents = 1;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "In Progress";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+    expect(config.continuationContext.searchEnabled).toBe(false);
+    expect(config.continuationContext.summarizationEnabled).toBe(false);
+
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return ["Todo", "In Progress"].includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const harness = new ManufacturedReviewLoopHarness(lifecycleStore, outboxStore, runStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => currentState === "In Review" && harness.runs.length === 1 && orchestrator.snapshot().counts.running === 0,
+        "first worker handoff",
+      );
+      await settleOrchestratorExit();
+
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => currentState === "In Progress" && harness.runs.length === 2 && orchestrator.snapshot().counts.running === 0,
+        "reviewer fail handoff",
+      );
+      await settleOrchestratorExit();
+
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => currentState === "In Review" && harness.runs.length === 3 && orchestrator.snapshot().counts.running === 0,
+        "revision worker handoff",
+      );
+      await settleOrchestratorExit();
+
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => currentState === "Ready to Merge" && harness.runs.length === 4 && orchestrator.snapshot().counts.running === 0,
+        "reviewer pass handoff",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
+
+    expect(harness.runs.map(({ role, runId }) => ({ role, runId }))).toEqual([
+      { role: "worker", runId: "smoke-worker-run-1" },
+      { role: "reviewer", runId: "smoke-review-run-1" },
+      { role: "worker", runId: "smoke-worker-run-2" },
+      { role: "reviewer", runId: "smoke-review-run-2" },
+    ]);
+    expect(harness.runs[2]?.prompt).toContain("Reviewer findings to address");
+    expect(harness.runs[2]?.prompt).toContain("Add the manufactured smoke revision.");
+    expect(currentState).toBe("Ready to Merge");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+      "In Review",
+      "In Progress",
+      "In Review",
+      "Ready to Merge",
+    ]);
+
+    const lifecycle = await lifecycleStore.get(candidate.identifier);
+    expect(lifecycle).toMatchObject({
+      phase: "passed",
+      reviewRound: 1,
+      incompleteTurnCount: 0,
+      lastCompletionReportId: "completion-report:issue-1:smoke-report-2",
+      lastReviewVerdictId: "review-verdict:issue-1:smoke-verdict-pass",
+    });
+    expect(lifecycle?.completionReports.map((report) => report.idempotencyKey)).toEqual([
+      "smoke-report-1",
+      "smoke-report-2",
+    ]);
+    expect(lifecycle?.reviewVerdicts.map((verdict) => verdict.idempotencyKey)).toEqual([
+      "smoke-verdict-fail",
+      "smoke-verdict-pass",
+    ]);
+    expect(lifecycle?.summaryPointers.workspacePath).toBeTruthy();
+
+    const runs = await runStore.listRunsForIssue(candidate.identifier);
+    expect(runs).toHaveLength(4);
+    expect(runs.map((run) => run.runId)).toEqual(
+      expect.arrayContaining([
+        "smoke-worker-run-1",
+        "smoke-review-run-1",
+        "smoke-worker-run-2",
+        "smoke-review-run-2",
+      ]),
+    );
+    expect(runs.every((run) => run.status === "succeeded")).toBe(true);
+    for (const runId of runs.map((run) => run.runId)) {
+      await expect(runStore.readTranscript(runId)).resolves.toMatchObject({
+        runId,
+        events: expect.arrayContaining([expect.objectContaining({ eventType: "completed" })]),
+      });
+    }
+  }, 15_000);
 
   it("dispatches reviewer runs from configured review states with reviewer evidence", async () => {
     const config = testConfig(root);
@@ -1975,6 +2108,19 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+async function waitFor(predicate: () => boolean, description = "condition", timeoutMs = 2_000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(predicate(), `Timed out waiting for ${description}`).toBe(true);
+}
+
+async function settleOrchestratorExit(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 25));
+}
+
 class BlockingHarness implements AgentHarness {
   readonly id = "blocking";
   readonly stoppedRunIds: string[] = [];
@@ -2065,6 +2211,120 @@ class ReportingHarness implements AgentHarness {
       },
     );
     yield { type: "completed" };
+  }
+}
+
+class ManufacturedReviewLoopHarness implements AgentHarness {
+  readonly id = "manufactured-review-loop";
+  readonly runs: Array<{ role: string; runId: string; prompt: string }> = [];
+
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly outboxStore: FileWritebackOutboxStore,
+    private readonly runStore: FileRunTranscriptStore,
+  ) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    const roleRunNumber = this.runs.filter((run) => run.role === ctx.role).length + 1;
+    const runId = ctx.role === "reviewer" ? `smoke-review-run-${roleRunNumber}` : `smoke-worker-run-${roleRunNumber}`;
+    this.runs.push({ role: ctx.role, runId, prompt });
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+
+    if (ctx.role === "reviewer") {
+      await this.submitReviewVerdict(ctx, runId, roleRunNumber);
+    } else {
+      await this.submitCompletionReport(ctx, runId, roleRunNumber);
+    }
+
+    yield { type: "progress", message: `${ctx.role} submitted manufactured review-loop evidence.` };
+    yield { type: "completed" };
+  }
+
+  private async submitCompletionReport(ctx: AgentRunContext, runId: string, runNumber: number): Promise<void> {
+    await new CompletionReportService({
+      config: ctx.config,
+      lifecycleStore: this.lifecycleStore,
+      writebackOutbox: this.outboxStore,
+      runStore: this.runStore,
+    }).submitCompletionReport(
+      {
+        runId,
+        issueId: ctx.issue.id,
+        summary:
+          runNumber === 1
+            ? "Submitted the manufactured smoke implementation."
+            : "Addressed the manufactured smoke revision.",
+        validationEvidence: ["npm test -- tests/orchestrator.test.ts"],
+        acceptanceChecklist: [
+          {
+            text: "Manufactured fail/revise/pass smoke is covered.",
+            satisfied: runNumber === 2,
+            evidence: runNumber === 1 ? "Initial manufactured implementation." : "Revision worker handled reviewer feedback.",
+          },
+        ],
+        changedFiles: ["tests/orchestrator.test.ts"],
+        branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
+        pullRequest: null,
+        risks: [],
+        idempotencyKey: `smoke-report-${runNumber}`,
+      },
+      {
+        issue: ctx.issue,
+        activeRunId: runId,
+        role: "worker",
+        sessionId: `${runId}-session`,
+        workspacePath: ctx.workspace.path,
+        workspace: ctx.workspace,
+        phase: "implementation",
+      },
+    );
+  }
+
+  private async submitReviewVerdict(ctx: AgentRunContext, runId: string, runNumber: number): Promise<void> {
+    await new ReviewVerdictService({
+      config: ctx.config,
+      lifecycleStore: this.lifecycleStore,
+      writebackOutbox: this.outboxStore,
+    }).submitReviewVerdict(
+      runNumber === 1
+        ? {
+            runId,
+            issueId: ctx.issue.id,
+            verdict: "fail",
+            acceptanceResults: [
+              {
+                text: "Revision worker handles the manufactured reviewer feedback.",
+                satisfied: false,
+                evidence: "First worker intentionally leaves the manufactured revision outstanding.",
+              },
+            ],
+            findings: ["Add the manufactured smoke revision."],
+            evidence: ["manufactured-review-loop-smoke"],
+            idempotencyKey: "smoke-verdict-fail",
+          }
+        : {
+            runId,
+            issueId: ctx.issue.id,
+            verdict: "pass",
+            acceptanceResults: [
+              {
+                text: "Revision worker handles the manufactured reviewer feedback.",
+                satisfied: true,
+                evidence: "Second worker prompt included and addressed the manufactured revision.",
+              },
+            ],
+            findings: [],
+            evidence: ["manufactured-review-loop-smoke"],
+            idempotencyKey: "smoke-verdict-pass",
+          },
+      {
+        issue: ctx.issue,
+        activeRunId: runId,
+        role: "reviewer",
+        reviewer: "reviewer-agent",
+        phase: "review",
+      },
+    );
   }
 }
 
