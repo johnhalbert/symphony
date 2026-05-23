@@ -524,9 +524,12 @@ describe("StatusServer durable API", () => {
       const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
       const stateBody = (await stateResponse.json()) as {
         running: Array<{ liveness: unknown; cancellation: unknown }>;
+        operatorView: { running: Array<{ liveness: { status: string }; controls: { cancel: boolean } }> };
       };
       const issueBody = (await issueResponse.json()) as {
-        live: { liveness: unknown; cancellation: unknown };
+        live: { liveness: unknown; cancellation: unknown; operatorLiveness: { status: string } };
+        operatorLiveness: { status: string };
+        capabilities: { cancel: boolean; pause: boolean; mutationsRequireToken: boolean };
       };
 
       expect(stateResponse.status).toBe(200);
@@ -550,21 +553,128 @@ describe("StatusServer durable API", () => {
           source: "operator",
         },
       });
+      expect(stateBody.operatorView.running[0]).toMatchObject({
+        liveness: { status: "cancelling" },
+        controls: { cancel: false },
+      });
+      expect(issueBody.operatorLiveness).toMatchObject({ status: "cancelling" });
+      expect(issueBody.live.operatorLiveness).toMatchObject({ status: "cancelling" });
+      expect(issueBody.capabilities).toMatchObject({
+        cancel: false,
+        pause: true,
+        mutationsRequireToken: true,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("renders operator liveness, retrying, and paused rows on the dashboard", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const stalledRunning: ReturnType<Orchestrator["snapshot"]>["running"][number] = {
+      issueId: "issue-2",
+      issueIdentifier: "TEST-2",
+      role: "worker",
+      state: "In Progress",
+      workspacePath: path.join(config.workspace.root, "TEST-2"),
+      sessionId: "session-2",
+      runId: "run-2",
+      turnCount: 1,
+      lastEvent: "progress",
+      lastMessage: "<script>alert(1)</script>",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      lastEventAt: "2026-01-01T00:00:01.000Z",
+      liveness: {
+        status: "stalled",
+        activeRunId: "run-2",
+        lastActivityAt: "2026-01-01T00:00:01.000Z",
+        secondsSinceLastActivity: 301,
+        stallTimeoutMs: 300_000,
+      },
+      cancellation: {
+        requested: false,
+        requestedAt: null,
+        source: null,
+        reason: null,
+        abortSignalled: false,
+        harnessStopRequestedAt: null,
+        suppressRetryOnExit: false,
+      },
+      tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      lifecycle: null,
+      metadata: {
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+        ciStatus: null,
+        lastPushedAt: null,
+        lastEvidenceCursor: null,
+        branchName: "symphony/TEST-2",
+        gitBranchName: "symphony/TEST-2",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    };
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([stalledRunning], {
+        paused: ["issue-paused"],
+        retrying: [
+          {
+            issueId: "issue-3",
+            issueIdentifier: "TEST-3",
+            attempt: 2,
+            dueAt: "2026-01-01T00:05:00.000Z",
+            error: "rate limited",
+          },
+        ],
+      }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const response = await fetch(`${baseUrl}/`);
+      const html = await response.text();
+
+      expect(response.status).toBe(200);
+      expect(html).toContain("possibly_stalled");
+      expect(html).toContain("operator-possibly_stalled");
+      expect(html).toContain("301s idle");
+      expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+      expect(html).toContain("TEST-3");
+      expect(html).toContain("issue-paused");
+      expect(html).toContain("Paused (internal id only)");
     } finally {
       await server.stop();
     }
   });
 });
 
-function fakeOrchestrator(running: ReturnType<Orchestrator["snapshot"]>["running"] = []): Orchestrator {
+function fakeOrchestrator(
+  running: ReturnType<Orchestrator["snapshot"]>["running"] = [],
+  overrides: Partial<Pick<ReturnType<Orchestrator["snapshot"]>, "paused" | "retrying">> = {},
+): Orchestrator {
   return {
     snapshot() {
       return {
         generatedAt: new Date(0).toISOString(),
-        counts: { running: running.length, retrying: 0, paused: 0 },
+        counts: {
+          running: running.length,
+          retrying: overrides.retrying?.length ?? 0,
+          paused: overrides.paused?.length ?? 0,
+        },
         running,
-        retrying: [],
-        paused: [],
+        retrying: overrides.retrying ?? [],
+        paused: overrides.paused ?? [],
         totals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, secondsRunning: 0 },
         rateLimits: null,
       };

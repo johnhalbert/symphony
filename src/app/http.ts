@@ -61,11 +61,15 @@ export class StatusServer {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       if (request.method === "GET" && url.pathname === "/") {
-        sendHtml(response, renderDashboard(this.options.orchestrator.snapshot()));
+        sendHtml(response, renderDashboard(this.options.orchestrator.snapshot(), Boolean(this.options.openWorkspaceToken)));
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/state") {
-        sendJson(response, 200, this.options.orchestrator.snapshot());
+        const snapshot = this.options.orchestrator.snapshot();
+        sendJson(response, 200, {
+          ...snapshot,
+          operatorView: operatorSnapshotView(snapshot, Boolean(this.options.openWorkspaceToken)),
+        });
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
@@ -121,9 +125,20 @@ export class StatusServer {
       const issueRunsMatch = /^\/api\/v1\/issues\/([^/]+)\/runs$/.exec(url.pathname);
       if (request.method === "GET" && issueRunsMatch) {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
+        const snapshot = this.options.orchestrator.snapshot();
+        const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
         sendJson(response, 200, {
           issue: issueId,
-          runs: (await this.options.runStore?.listRunsForIssue(issueId)) ?? [],
+          runs: runs.map((run) => ({
+            ...run,
+            livenessSummary: runLivenessSummary(run, snapshot),
+          })),
+          enrichment: {
+            level: "summary_only",
+            detailEndpoint: "/api/v1/runs/{runId}",
+            transcriptEndpoint: "/api/v1/runs/{runId}/transcript",
+            timelineIncluded: false,
+          },
         });
         return;
       }
@@ -144,26 +159,42 @@ export class StatusServer {
       const issueMatch = /^\/api\/v1\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && issueMatch) {
         const issueId = decodeURIComponent(issueMatch[1] ?? "");
+        const snapshot = this.options.orchestrator.snapshot();
         const live = this.options.orchestrator.getIssueDetails(issueId);
         const workspace = await this.options.runStore?.findWorkspace(issueId);
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
         const lifecycle = await this.options.lifecycleStore?.get(issueId);
         if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
+        const keys = issueKeys(issueId, { live, latestRun, lifecycle });
+        const paused = isIssuePaused(snapshot, keys);
+        const operatorLiveness = issueOperatorLiveness({
+          live,
+          latestRun,
+          lifecycle,
+          paused,
+        });
+        const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
         sendJson(response, 200, {
           issue: issueId,
-          live,
+          live: live ? { ...live, operatorLiveness: runningOperatorLiveness(live, paused) } : null,
           workspace,
           latestRun,
           lifecycle,
           reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
           metadata: statusMetadata({ live, workspace, latestRun, lifecycle }),
+          operatorLiveness,
           diagnostics: {
             mcpToolExposure: (await this.options.mcpExposureDiagnosticsStore?.latest()) ?? null,
           },
           capabilities: {
             transcript: Boolean(latestRun),
             openWorkspace: workspacePath === null ? false : await pathExists(workspacePath),
+            pause: controls.pause,
+            resume: controls.resume,
+            cancel: controls.cancel,
+            mutationsRequireToken: controls.mutationsRequireToken,
+            mutationHeader: "X-Symphony-Token",
           },
         });
         return;
@@ -183,7 +214,10 @@ export class StatusServer {
         const runId = decodeURIComponent(runMatch[1] ?? "");
         const run = await this.options.runStore?.getRun(runId);
         if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
-        sendJson(response, 200, run);
+        sendJson(response, 200, {
+          ...run,
+          operatorLiveness: runOperatorLiveness(run, this.options.orchestrator.snapshot()),
+        });
         return;
       }
 
@@ -249,24 +283,405 @@ function sendHtml(response: ServerResponse, body: string): void {
   response.end(body);
 }
 
-function renderDashboard(snapshot: ReturnType<Orchestrator["snapshot"]>): string {
-  const running = snapshot.running
-    .map(
-      (row) =>
-        `<li><strong>${escapeHtml(row.issueIdentifier)}</strong> ${escapeHtml(row.state)} ${escapeHtml(
-          row.lastEvent ?? "",
-        )}<br><code>${escapeHtml(row.workspacePath ?? "")}</code></li>`,
-    )
-    .join("");
+type RuntimeSnapshot = ReturnType<Orchestrator["snapshot"]>;
+type RunningRow = RuntimeSnapshot["running"][number];
+type OperatorLivenessStatus = "running" | "possibly_stalled" | "cancelling" | "cancelled" | "blocked_human_required";
+
+interface OperatorControls {
+  pause: boolean;
+  resume: boolean;
+  cancel: boolean;
+  mutationsRequireToken: boolean;
+}
+
+function renderDashboard(snapshot: RuntimeSnapshot, mutationsConfigured: boolean): string {
+  const running = snapshot.running.map((row) => renderRunningRow(row, snapshot, mutationsConfigured)).join("");
+  const paused =
+    snapshot.paused.length === 0
+      ? ""
+      : `<section><h2>Paused</h2><ul class="plain-list">${snapshot.paused
+          .map((issueId) => `<li><span class="paused-label">Paused (internal id only)</span> <code>${escapeHtml(issueId)}</code></li>`)
+          .join("")}</ul></section>`;
+  const retrying =
+    snapshot.retrying.length === 0
+      ? ""
+      : `<section><h2>Retrying</h2><ul class="plain-list">${snapshot.retrying
+          .map(
+            (row) =>
+              `<li><strong>${escapeHtml(row.issueIdentifier)}</strong> attempt ${row.attempt}, due ${escapeHtml(row.dueAt)}${
+                row.error ? `, error ${escapeHtml(row.error)}` : ""
+              }</li>`,
+          )
+          .join("")}</ul></section>`;
   return `<!doctype html>
 <html>
-  <head><title>Symphony</title></head>
+  <head>
+    <title>Symphony</title>
+    <style>
+      body { font-family: system-ui, sans-serif; line-height: 1.4; margin: 2rem; }
+      code { background: #f5f5f5; border-radius: 4px; padding: 0.1rem 0.25rem; }
+      .plain-list { padding-left: 0; }
+      .plain-list li, .run-row { list-style: none; margin: 0 0 0.75rem; }
+      .run-row { border: 1px solid #ddd; border-left: 5px solid #888; border-radius: 6px; padding: 0.75rem; }
+      .run-row.operator-running { border-left-color: #2e7d32; }
+      .run-row.operator-possibly_stalled { border-left-color: #e65100; background: #fff8ef; }
+      .run-row.operator-cancelling { border-left-color: #c62828; background: #fff5f7; }
+      .run-row.operator-blocked_human_required { border-left-color: #6a1b9a; background: #fbf5ff; }
+      .badge { border-radius: 999px; display: inline-block; font-size: 0.8rem; font-weight: 700; margin-left: 0.4rem; padding: 0.1rem 0.45rem; }
+      .operator-running .badge { background: #e8f5e9; color: #2e7d32; }
+      .operator-possibly_stalled .badge { background: #fff3e0; color: #e65100; }
+      .operator-cancelling .badge { background: #fce4ec; color: #c62828; }
+      .operator-blocked_human_required .badge { background: #f3e5f5; color: #6a1b9a; }
+      .meta, .activity, .controls { color: #555; font-size: 0.9rem; }
+      .cancellation, .blocked { margin-top: 0.25rem; font-size: 0.9rem; }
+      .cancellation { color: #a31919; }
+      .blocked { color: #5e197c; }
+      .paused-label { color: #555; }
+    </style>
+  </head>
   <body>
     <h1>Symphony</h1>
-    <p>Running: ${snapshot.counts.running}, retrying: ${snapshot.counts.retrying}</p>
-    <ul>${running}</ul>
+    <p>Running: ${snapshot.counts.running}, retrying: ${snapshot.counts.retrying}, paused: ${snapshot.counts.paused}</p>
+    <p class="meta">Mutations ${mutationsConfigured ? "require X-Symphony-Token" : "do not require a configured token"}; use the existing pause, resume, and cancel API endpoints.</p>
+    <section>
+      <h2>Running Agents</h2>
+      <ul class="plain-list">${running || "<li>No active runs</li>"}</ul>
+    </section>
+    ${paused}
+    ${retrying}
+    <p class="meta">Snapshot generated at ${escapeHtml(snapshot.generatedAt)}</p>
   </body>
 </html>`;
+}
+
+function renderRunningRow(row: RunningRow, snapshot: RuntimeSnapshot, mutationsConfigured: boolean): string {
+  const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
+  const paused = isIssuePaused(snapshot, keys);
+  const operator = runningOperatorLiveness(row, paused);
+  const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
+  const runId = row.liveness.activeRunId ?? row.runId ?? "n/a";
+  const idle = `${Math.round(row.liveness.secondsSinceLastActivity)}s idle`;
+  const threshold = row.liveness.stallTimeoutMs === null ? "no stall threshold" : `${row.liveness.stallTimeoutMs}ms threshold`;
+  const cancellation = cancellationSummary(row);
+  const blockedReason = row.lifecycle?.blockedReason ?? null;
+  return `<li class="run-row operator-${operator.status}">
+    <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.state)}</span></div>
+    <div class="meta">run <code>${escapeHtml(runId)}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
+    <div class="activity">last activity ${escapeHtml(row.liveness.lastActivityAt)} (${escapeHtml(idle)}, ${escapeHtml(threshold)}); event <code>${escapeHtml(row.lastEvent ?? "n/a")}</code>${row.lastEventAt ? ` at ${escapeHtml(row.lastEventAt)}` : ""}</div>
+    ${row.lastMessage ? `<div>${escapeHtml(row.lastMessage)}</div>` : ""}
+    <div><code>${escapeHtml(row.workspacePath ?? "")}</code></div>
+    ${cancellation ? `<div class="cancellation">${escapeHtml(cancellation)}</div>` : ""}
+    ${blockedReason ? `<div class="blocked">Blocked: ${escapeHtml(blockedReason)}</div>` : ""}
+    <div class="controls">controls: ${formatControls(controls)}</div>
+  </li>`;
+}
+
+function operatorSnapshotView(snapshot: RuntimeSnapshot, mutationsConfigured: boolean) {
+  return {
+    generatedAt: snapshot.generatedAt,
+    mutationsRequireToken: mutationsConfigured,
+    running: snapshot.running.map((row) => {
+      const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
+      const paused = isIssuePaused(snapshot, keys);
+      return {
+        issueId: row.issueId,
+        issueIdentifier: row.issueIdentifier,
+        role: row.role,
+        state: row.state,
+        runId: row.liveness.activeRunId ?? row.runId,
+        workspacePath: row.workspacePath,
+        paused,
+        liveness: runningOperatorLiveness(row, paused),
+        controls: operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured }),
+      };
+    }),
+    paused: snapshot.paused.map((issueId) => ({ issueId, label: "Paused (internal id only)" })),
+    retrying: snapshot.retrying,
+  };
+}
+
+function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: IssueLifecycleRecord | null | undefined = row.lifecycle, agentId: string | null = null) {
+  const status = liveOperatorStatus(row, lifecycle);
+  return {
+    status,
+    rawStatus: row.liveness.status,
+    tracking: "live",
+    cancelFailed: "not_tracked",
+    linearAuditComments: "not_tracked",
+    runId: row.runId,
+    activeRunId: row.liveness.activeRunId,
+    agentId,
+    sessionId: row.sessionId,
+    workspacePath: row.workspacePath,
+    lastActivityAt: row.liveness.lastActivityAt,
+    lastTranscriptEventAt: row.lastEventAt,
+    lastTranscriptEvent: row.lastEvent,
+    lastMessage: row.lastMessage,
+    secondsSinceLastActivity: row.liveness.secondsSinceLastActivity,
+    stallTimeoutMs: row.liveness.stallTimeoutMs,
+    cancellation: row.cancellation,
+    paused,
+    activity: {
+      lastHarnessActivityAt: row.liveness.lastActivityAt,
+      lastStreamActivityAt: null,
+      lastDeltaOrToolActivityAt: null,
+      lastToolActivityAt: null,
+      unavailable: ["stream_activity_not_tracked_in_status_snapshot", "delta_and_tool_activity_not_split_in_status_snapshot"],
+    },
+    timeline: liveTimeline(row),
+  };
+}
+
+function issueOperatorLiveness(input: {
+  live: RunningRow | null;
+  latestRun: RunRecord | null | undefined;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+  paused: boolean;
+}) {
+  if (input.live) {
+    const agentId =
+      input.latestRun &&
+      (input.latestRun.runId === input.live.runId || input.latestRun.runId === input.live.liveness.activeRunId)
+        ? input.latestRun.agentId
+        : null;
+    return runningOperatorLiveness(input.live, input.paused, input.lifecycle ?? input.live.lifecycle, agentId);
+  }
+  if (isLifecycleBlocked(input.lifecycle)) {
+    return terminalOperatorLiveness("blocked_human_required", input.latestRun ?? null, input.lifecycle ?? null, input.paused);
+  }
+  if (input.latestRun?.status === "cancelled") {
+    return terminalOperatorLiveness("cancelled", input.latestRun, input.lifecycle ?? null, input.paused);
+  }
+  return null;
+}
+
+function runOperatorLiveness(run: RunRecord, snapshot: RuntimeSnapshot) {
+  const live = findLiveRun(snapshot, run.runId);
+  if (live) {
+    const keys = issueKeys(run.issueIdentifier, { live, latestRun: run, lifecycle: live.lifecycle });
+    return runningOperatorLiveness(live, isIssuePaused(snapshot, keys), live.lifecycle, run.agentId);
+  }
+  if (run.status === "cancelled") {
+    return terminalOperatorLiveness("cancelled", run, null, false);
+  }
+  return null;
+}
+
+function runLivenessSummary(run: RunRecord, snapshot: RuntimeSnapshot) {
+  const live = findLiveRun(snapshot, run.runId);
+  if (live) {
+    const keys = issueKeys(run.issueIdentifier, { live, latestRun: run, lifecycle: live.lifecycle });
+    return {
+      tracking: "live",
+      status: liveOperatorStatus(live, live.lifecycle),
+      paused: isIssuePaused(snapshot, keys),
+    };
+  }
+  if (run.status === "cancelled") return { tracking: "terminal", status: "cancelled" as const, paused: false };
+  if (run.status === "running") return { tracking: "orphaned", status: null, paused: false };
+  return { tracking: "terminal", status: null, paused: false };
+}
+
+function terminalOperatorLiveness(
+  status: Extract<OperatorLivenessStatus, "cancelled" | "blocked_human_required">,
+  run: RunRecord | null,
+  lifecycle: IssueLifecycleRecord | null,
+  paused: boolean,
+) {
+  return {
+    status,
+    rawStatus: null,
+    tracking: "terminal",
+    cancelFailed: "not_tracked",
+    linearAuditComments: "not_tracked",
+    runId: run?.runId ?? lifecycle?.summaryPointers.lastRunId ?? null,
+    activeRunId: null,
+    agentId: run?.agentId ?? null,
+    sessionId: run?.sessionId ?? null,
+    workspacePath: run?.workspacePath ?? lifecycle?.summaryPointers.workspacePath ?? null,
+    lastActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
+    lastTranscriptEventAt: null,
+    lastTranscriptEvent: null,
+    lastMessage: lifecycle?.blockedReason ?? run?.error ?? null,
+    secondsSinceLastActivity: null,
+    stallTimeoutMs: null,
+    cancellation: null,
+    paused,
+    activity: {
+      lastHarnessActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
+      lastStreamActivityAt: null,
+      lastDeltaOrToolActivityAt: null,
+      lastToolActivityAt: null,
+      unavailable: ["stream_activity_not_tracked_in_status_snapshot", "delta_and_tool_activity_not_split_in_status_snapshot"],
+    },
+    timeline: terminalTimeline(status, run, lifecycle),
+  };
+}
+
+function liveTimeline(row: RunningRow) {
+  return [
+    {
+      at: row.startedAt,
+      kind: "run_started",
+      label: "Run started",
+      detail: row.runId,
+      synthetic: true,
+      source: "live_snapshot",
+    },
+    {
+      at: row.liveness.lastActivityAt,
+      kind: "last_activity",
+      label: "Last harness activity",
+      detail: row.lastMessage ?? row.lastEvent,
+      synthetic: true,
+      source: "live_snapshot",
+    },
+    ...(row.cancellation.requestedAt
+      ? [
+          {
+            at: row.cancellation.requestedAt,
+            kind: "cancellation_requested",
+            label: "Cancellation requested",
+            detail: row.cancellation.reason,
+            synthetic: true,
+            source: "live_snapshot",
+          },
+        ]
+      : []),
+    ...(row.cancellation.harnessStopRequestedAt
+      ? [
+          {
+            at: row.cancellation.harnessStopRequestedAt,
+            kind: "harness_stop_requested",
+            label: "Harness stop requested",
+            detail: row.cancellation.source,
+            synthetic: true,
+            source: "live_snapshot",
+          },
+        ]
+      : []),
+  ];
+}
+
+function terminalTimeline(
+  status: Extract<OperatorLivenessStatus, "cancelled" | "blocked_human_required">,
+  run: RunRecord | null,
+  lifecycle: IssueLifecycleRecord | null,
+) {
+  return [
+    ...(run
+      ? [
+          {
+            at: run.startedAt,
+            kind: "run_started",
+            label: "Run started",
+            detail: run.runId,
+            synthetic: true,
+            source: "run_record",
+          },
+        ]
+      : []),
+    ...(run?.completedAt
+      ? [
+          {
+            at: run.completedAt,
+            kind: "run_terminal",
+            label: `Run ${run.status}`,
+            detail: run.error,
+            synthetic: true,
+            source: "run_record",
+          },
+        ]
+      : []),
+    ...(status === "blocked_human_required" && lifecycle
+      ? [
+          {
+            at: lifecycle.updatedAt,
+            kind: "lifecycle_blocked",
+            label: "Human-required block recorded",
+            detail: lifecycle.blockedReason,
+            synthetic: true,
+            source: "lifecycle_store",
+          },
+        ]
+      : []),
+  ];
+}
+
+function liveOperatorStatus(row: RunningRow, lifecycle: IssueLifecycleRecord | null | undefined): OperatorLivenessStatus {
+  if (row.cancellation.requested || row.liveness.status === "cancelling") return "cancelling";
+  if (isLifecycleBlocked(lifecycle)) return "blocked_human_required";
+  if (row.liveness.status === "stalled") return "possibly_stalled";
+  return "running";
+}
+
+function findLiveRun(snapshot: RuntimeSnapshot, runId: string): RunningRow | null {
+  return snapshot.running.find((row) => row.runId === runId || row.liveness.activeRunId === runId) ?? null;
+}
+
+function isLifecycleBlocked(lifecycle: IssueLifecycleRecord | null | undefined): boolean {
+  return lifecycle !== null && lifecycle !== undefined && (lifecycle.phase === "blocked" || lifecycle.blockedReason !== null);
+}
+
+function issueKeys(
+  requestKey: string,
+  input: {
+    live: RunningRow | null;
+    latestRun: RunRecord | null | undefined;
+    lifecycle: IssueLifecycleRecord | null | undefined;
+  },
+): string[] {
+  return [
+    requestKey,
+    input.live?.issueId,
+    input.live?.issueIdentifier,
+    input.latestRun?.issueId,
+    input.latestRun?.issueIdentifier,
+    input.lifecycle?.issueId,
+    input.lifecycle?.issueIdentifier,
+  ].filter((value, index, values): value is string => value !== null && value !== undefined && values.indexOf(value) === index);
+}
+
+function isIssuePaused(snapshot: RuntimeSnapshot, keys: string[]): boolean {
+  return keys.some((key) => snapshot.paused.includes(key));
+}
+
+function operatorControls(input: {
+  issueKnown: boolean;
+  live: RunningRow | null;
+  paused: boolean;
+  mutationsConfigured: boolean;
+}): OperatorControls {
+  return {
+    pause: input.issueKnown && !input.paused,
+    resume: input.paused,
+    cancel: input.live !== null && !input.live.cancellation.requested,
+    mutationsRequireToken: input.mutationsConfigured,
+  };
+}
+
+function cancellationSummary(row: RunningRow): string | null {
+  if (!row.cancellation.requested) return null;
+  return [
+    "Cancellation requested",
+    row.cancellation.source ? `source=${row.cancellation.source}` : null,
+    row.cancellation.reason,
+    row.cancellation.requestedAt ? `at ${row.cancellation.requestedAt}` : null,
+    row.cancellation.abortSignalled ? "abort signalled" : null,
+    row.cancellation.harnessStopRequestedAt ? `harness stop requested ${row.cancellation.harnessStopRequestedAt}` : null,
+  ]
+    .filter((part): part is string => part !== null && part.length > 0)
+    .join(" · ");
+}
+
+function formatControls(controls: OperatorControls): string {
+  const enabled = [
+    controls.pause ? "pause" : null,
+    controls.resume ? "resume" : null,
+    controls.cancel ? "cancel" : null,
+  ].filter((item): item is string => item !== null);
+  const token = controls.mutationsRequireToken ? "requires X-Symphony-Token" : "no configured token";
+  return `${enabled.length === 0 ? "status only" : enabled.join(", ")} (${token})`;
 }
 
 function parsePagination(url: URL): { offset: number; limit: number } {
