@@ -1698,10 +1698,16 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    const lifecycle = orchestrator.snapshot().running[0]?.lifecycle;
-    await orchestrator.stop();
+    let lifecycle = orchestrator.snapshot().running[0]?.lifecycle;
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => {
+        lifecycle = orchestrator.snapshot().running[0]?.lifecycle;
+        return lifecycle?.summaryPointers.lastRunId === "run-123";
+      }, "lifecycle run id to be recorded");
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(lifecycle).toMatchObject({
       issueId: candidate.id,
