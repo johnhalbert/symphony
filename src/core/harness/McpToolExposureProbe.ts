@@ -16,6 +16,7 @@ import { REVIEW_VERDICT_TOOL_NAME, writeReviewVerdictMcpContext } from "./Review
 import type { AgentRunRole, Issue, Workspace } from "../types.js";
 import { errorMessage } from "../errors.js";
 import { StructuredLogger } from "../logging/StructuredLogger.js";
+import { resolveCursorRuntimeApiKey } from "../../app/RuntimeDependencies.js";
 import {
   completionReportContextFilePath,
   cursorAgentCreateOptions,
@@ -302,39 +303,39 @@ export async function runSdkMcpToolExposureProbe(
     };
   }
 
-  const apiKey = process.env.CURSOR_API_KEY;
-  if (!apiKey) {
-    const sdkRoleRuns = uniqueRoles(specs).map((role) =>
-      syntheticSdkRoleRun({
-        role,
-        roleStatus: "failure",
-        primaryFailureCode: "sdk_credentials_missing",
-        message: "CURSOR_API_KEY is not set",
-        ...roleRunContext,
-      }),
+  const roleApiKeys = new Map<AgentRunRole, string>();
+  const missingRoles: AgentRunRole[] = [];
+  try {
+    for (const role of uniqueRoles(specs)) {
+      const apiKey = resolveCursorRuntimeApiKey(config, role);
+      if (apiKey) {
+        roleApiKeys.set(role, apiKey);
+      } else {
+        missingRoles.push(role);
+      }
+    }
+  } catch (error) {
+    return missingCredentialsStage(specs, roleRunContext, `cursor.runtime: ${errorMessage(error)}`);
+  }
+  if (missingRoles.length > 0) {
+    return missingCredentialsStage(
+      specs,
+      roleRunContext,
+      `cursor.runtime credentials are missing for ${missingRoles.join(", ")}`,
     );
-    return {
-      stage: "sdk",
-      status: "failure",
-      failureCode: "sdk_credentials_missing",
-      message: "CURSOR_API_KEY is not set; live Cursor SDK MCP exposure probe cannot run",
-      results: specs.map((spec) => {
-        const roleRunIndex = sdkRoleRuns.findIndex((roleRun) => roleRun.role === spec.role);
-        return failureServerResult(
-          spec,
-          "sdk_credentials_missing",
-          "CURSOR_API_KEY is not set",
-          [],
-          roleRunIndex,
-        );
-      }),
-      sdkRoleRuns,
-    };
+  }
+
+  if (roleApiKeys.size === 0) {
+    return missingCredentialsStage(specs, roleRunContext, "cursor.runtime credentials are missing");
   }
 
   const results: McpToolExposureServerResult[] = [];
   const sdkRoleRuns: SdkRoleRunResult[] = [];
   for (const role of uniqueRoles(specs)) {
+    const apiKey = roleApiKeys.get(role);
+    if (!apiKey) {
+      throw new Error(`cursor.runtime credential unexpectedly missing for ${role}`);
+    }
     const roleRunIndex = sdkRoleRuns.length;
     const roleProbe = await runSdkRoleProbe(config, {
       role,
@@ -352,6 +353,46 @@ export async function runSdkMcpToolExposureProbe(
     results.push(...roleProbe.results);
   }
   return summarizeStage("sdk", results, sdkRoleRuns);
+}
+
+function missingCredentialsStage(
+  specs: readonly McpToolExposureSpec[],
+  roleRunContext: {
+    agentCwd: string;
+    mcpCwd: string;
+    settingSources: CursorSettingSource[];
+    sdkTimeoutMs: number;
+    waitTimeoutMs: number;
+    postCancelWaitMs: number;
+  },
+  message: string,
+): McpToolExposureStageResult {
+  const sdkRoleRuns = uniqueRoles(specs).map((role) =>
+    syntheticSdkRoleRun({
+      role,
+      roleStatus: "failure",
+      primaryFailureCode: "sdk_credentials_missing",
+      message,
+      ...roleRunContext,
+    }),
+  );
+  return {
+    stage: "sdk",
+    status: "failure",
+    failureCode: "sdk_credentials_missing",
+    message: `${message}; live Cursor SDK MCP exposure probe cannot run`,
+    results: specs.map((spec) => {
+      const roleRunIndex = sdkRoleRuns.findIndex((roleRun) => roleRun.role === spec.role);
+      return failureServerResult(
+        spec,
+        "sdk_credentials_missing",
+        message,
+        [],
+        roleRunIndex,
+      );
+    }),
+    sdkRoleRuns,
+  };
 }
 
 export function normalizeMcpToolName(rawName: string, specs: readonly McpToolExposureSpec[] = MCP_TOOL_EXPOSURE_SPECS): string | null {
@@ -900,7 +941,7 @@ function specsForRoles(roles: AgentRunRole[]): McpToolExposureSpec[] {
   return MCP_TOOL_EXPOSURE_SPECS.filter((spec) => roleSet.has(spec.role));
 }
 
-function uniqueRoles(specs: McpToolExposureSpec[]): AgentRunRole[] {
+function uniqueRoles(specs: readonly McpToolExposureSpec[]): AgentRunRole[] {
   return unique(specs.map((spec) => spec.role));
 }
 

@@ -331,6 +331,66 @@ describe("MergePolicyService", () => {
     expect(currentIssue.state).toBe("Ready to Merge");
   });
 
+  it("rejects a returned required check with a non-success status", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({
+      checkResults: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/Required checks are not passing: test/);
+    expect(client.mergeInput).toBeNull();
+    expect(writer.transitions).toEqual([]);
+    expect(currentIssue.state).toBe("Ready to Merge");
+  });
+
+  it("rejects a successful Done writeback when the tracker still reports a non-Done state", async () => {
+    const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient();
+    const writer = new MemoryWriter(currentIssue, "verified");
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/Done writeback could not be verified/);
+    expect(client.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-1" });
+    expect(writer.transitions).toEqual([
+      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+    ]);
+    expect(currentIssue.state).toBe("Ready to Merge");
+  });
+
   it("enforces service-owned github.merge capability when a merge client is injected", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",

@@ -10,14 +10,12 @@ import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureD
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
-import { LinearTrackerClient } from "./integrations/linear/LinearTrackerClient.js";
-import { createLinearTrackerClientForCapability } from "./integrations/linear/LinearCredentialResolver.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
-import { FileWritebackOutboxStore, WritebackProcessor } from "./core/writeback/WritebackOutbox.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
+import { createRuntimeTrackerClient, createRuntimeWritebackProcessor, resolveStatusMutationToken } from "./app/RuntimeDependencies.js";
 
 const program = new Command();
 
@@ -99,18 +97,11 @@ program
       },
     };
 
-    const tracker = new LinearTrackerClient(config.tracker);
+    const tracker = createRuntimeTrackerClient(config);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
-    const writeback = config.writeback.enabled
-      ? new WritebackProcessor(
-          new FileWritebackOutboxStore(config.workspace.stateDir),
-          createLinearTrackerClientForCapability(config, "linear.writeback"),
-          logger,
-          config.writeback.maxBackoffMs,
-        )
-      : undefined;
+    const writeback = createRuntimeWritebackProcessor(config, logger);
     const workspaceManager = new WorkspaceManager({
       workspace: config.workspace,
       hooks: config.hooks,
@@ -154,7 +145,7 @@ program
             mcpExposureDiagnosticsStore,
             host: config.server.host,
             port: config.server.port,
-            openWorkspaceToken: config.server.openWorkspaceToken,
+            openWorkspaceToken: resolveStatusMutationToken(config),
           });
 
     if (statusServer) {

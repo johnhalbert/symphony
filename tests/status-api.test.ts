@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
+import { resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
+import { parseServiceConfig } from "../src/core/config/Config.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "../src/core/persistence/McpExposureDiagnosticsStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
@@ -396,6 +398,61 @@ describe("StatusServer durable API", () => {
         transcriptPointers: ["/api/v1/runs/run-1/transcript"],
         statusApiPointers: ["/api/v1/issues/TEST-1"],
       });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("protects status mutations with the resolved server.open_workspace profile token", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        workspace: { root: path.join(root, "workspaces") },
+        server: { open_workspace_token: "$LEGACY_OPEN_WORKSPACE_TOKEN" },
+        credential_profiles: {
+          profiles: {
+            "open-workspace": { value: "$OPEN_WORKSPACE_PROFILE_TOKEN", capabilities: ["server.open_workspace"] },
+          },
+          roles: {
+            worker: {
+              "server.open_workspace": "open-workspace",
+            },
+          },
+        },
+      },
+      path.join(root, "WORKFLOW.md"),
+      {
+        LINEAR_API_KEY: "linear-secret",
+        LEGACY_OPEN_WORKSPACE_TOKEN: "legacy-open-secret",
+        OPEN_WORKSPACE_PROFILE_TOKEN: "profile-open-secret",
+      },
+    );
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: resolveStatusMutationToken(config),
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const legacyPauseResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "legacy-open-secret" },
+      });
+      const profilePauseResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "profile-open-secret" },
+      });
+
+      expect(legacyPauseResponse.status).toBe(401);
+      expect(profilePauseResponse.status).toBe(202);
     } finally {
       await server.stop();
     }
