@@ -143,6 +143,26 @@ export interface IssueReviewFeedbackRecord {
   submittedAt: string;
 }
 
+export interface IssueMergeMetadata {
+  id: string;
+  pullRequest: CompletionReportPullRequestRef;
+  headSha: string;
+  mergeCommitSha: string;
+  mergedAt: string;
+  mergedBy: {
+    login: string | null;
+    profile: string | null;
+    capability: "github.merge";
+  };
+  checkStatus: {
+    requiredChecks: string[];
+    passedChecks: string[];
+    noCiEvidence: string | null;
+  };
+  mergeOperationKey: string;
+  doneTransitionOperationKey: string;
+}
+
 export interface IssueLifecycleRecord {
   issueId: string;
   issueIdentifier: string;
@@ -158,6 +178,7 @@ export interface IssueLifecycleRecord {
   reviewVerdicts: IssueReviewVerdictRecord[];
   reviewFeedback: IssueReviewFeedbackRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
+  merge: IssueMergeMetadata | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -175,6 +196,7 @@ export interface IssueLifecyclePatch {
   reviewVerdicts?: IssueReviewVerdictRecord[];
   reviewFeedback?: IssueReviewFeedbackRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
+  merge?: IssueMergeMetadata | null;
 }
 
 export type IssueLifecycleStore = FileIssueLifecycleStore;
@@ -204,6 +226,7 @@ export class FileIssueLifecycleStore {
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
       reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
+      merge: patchValue(patch, "merge", existing?.merge ?? null),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
@@ -340,6 +363,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
     reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
+    merge: normalizeMergeMetadata(value.merge, filePath),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
   };
@@ -558,6 +582,49 @@ function normalizeReviewFeedbackRecord(value: unknown, filePath: string, index: 
     reviewUrl: optionalNullableString(value.reviewUrl, filePath, `reviewFeedback[${index}].reviewUrl`),
     commentUrls: requiredStringArray(value.commentUrls, filePath, `reviewFeedback[${index}].commentUrls`),
     submittedAt: requiredString(value.submittedAt, filePath, `reviewFeedback[${index}].submittedAt`),
+  };
+}
+
+function normalizeMergeMetadata(value: unknown, filePath: string): IssueMergeMetadata | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "merge is invalid");
+  const mergedBy = value.mergedBy;
+  if (!isRecord(mergedBy)) throw corruptLifecycle(filePath, "merge.mergedBy is invalid");
+  if (mergedBy.capability !== "github.merge") throw corruptLifecycle(filePath, "merge.mergedBy.capability is invalid");
+  const checkStatus = value.checkStatus;
+  if (!isRecord(checkStatus)) throw corruptLifecycle(filePath, "merge.checkStatus is invalid");
+  return {
+    id: requiredString(value.id, filePath, "merge.id"),
+    pullRequest: normalizeMergePullRequest(value.pullRequest, filePath),
+    headSha: requiredString(value.headSha, filePath, "merge.headSha"),
+    mergeCommitSha: requiredString(value.mergeCommitSha, filePath, "merge.mergeCommitSha"),
+    mergedAt: requiredString(value.mergedAt, filePath, "merge.mergedAt"),
+    mergedBy: {
+      login: optionalNullableString(mergedBy.login, filePath, "merge.mergedBy.login"),
+      profile: optionalNullableString(mergedBy.profile, filePath, "merge.mergedBy.profile"),
+      capability: "github.merge",
+    },
+    checkStatus: {
+      requiredChecks: requiredStringArray(checkStatus.requiredChecks, filePath, "merge.checkStatus.requiredChecks"),
+      passedChecks: requiredStringArray(checkStatus.passedChecks, filePath, "merge.checkStatus.passedChecks"),
+      noCiEvidence: optionalNullableString(checkStatus.noCiEvidence, filePath, "merge.checkStatus.noCiEvidence"),
+    },
+    mergeOperationKey: requiredString(value.mergeOperationKey, filePath, "merge.mergeOperationKey"),
+    doneTransitionOperationKey: requiredString(
+      value.doneTransitionOperationKey,
+      filePath,
+      "merge.doneTransitionOperationKey",
+    ),
+  };
+}
+
+function normalizeMergePullRequest(value: unknown, filePath: string): CompletionReportPullRequestRef {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "merge.pullRequest is invalid");
+  return {
+    url: nullableString(value.url, filePath, "merge.pullRequest.url"),
+    number: nullableNumber(value.number, filePath, "merge.pullRequest.number"),
+    headSha: optionalNullableString(value.headSha, filePath, "merge.pullRequest.headSha"),
+    branch: optionalNullableString(value.branch, filePath, "merge.pullRequest.branch"),
   };
 }
 

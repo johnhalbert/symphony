@@ -11,6 +11,7 @@ import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { LinearTrackerClient } from "./integrations/linear/LinearTrackerClient.js";
+import { createLinearTrackerClientForCapability } from "./integrations/linear/LinearCredentialResolver.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "./core/writeback/WritebackOutbox.js";
@@ -105,7 +106,7 @@ program
     const writeback = config.writeback.enabled
       ? new WritebackProcessor(
           new FileWritebackOutboxStore(config.workspace.stateDir),
-          tracker,
+          createLinearTrackerClientForCapability(config, "linear.writeback"),
           logger,
           config.writeback.maxBackoffMs,
         )

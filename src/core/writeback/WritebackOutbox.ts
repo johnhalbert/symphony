@@ -4,7 +4,7 @@ import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerWriter } from "../tracker/TrackerWriter.js";
 import { errorMessage } from "../errors.js";
 
-export type WritebackStatus = "pending" | "in_flight" | "succeeded" | "retrying" | "dead_letter";
+export type WritebackStatus = "pending" | "in_flight" | "succeeded" | "skipped" | "retrying" | "dead_letter";
 
 export type WritebackOperation =
   | {
@@ -34,10 +34,11 @@ export type WritebackOperation =
       payload: { body: string; dedupeKey: string };
     };
 
-export type NewWritebackOperation = Omit<
-  WritebackOperation,
-  "status" | "attempt" | "createdAt" | "updatedAt" | "nextAttemptAt" | "lastError"
->;
+type PersistedWritebackFields = "status" | "attempt" | "createdAt" | "updatedAt" | "nextAttemptAt" | "lastError";
+
+export type NewWritebackOperation =
+  | Omit<Extract<WritebackOperation, { kind: "transition" }>, PersistedWritebackFields>
+  | Omit<Extract<WritebackOperation, { kind: "comment" }>, PersistedWritebackFields>;
 
 export class FileWritebackOutboxStore {
   constructor(private readonly stateDir: string) {}
@@ -75,6 +76,19 @@ export class FileWritebackOutboxStore {
 
   async markSucceeded(record: WritebackOperation): Promise<WritebackOperation> {
     return this.update(record, { status: "succeeded", lastError: null });
+  }
+
+  async markSkipped(record: WritebackOperation, message: string): Promise<WritebackOperation> {
+    return this.update(record, { status: "skipped", lastError: message });
+  }
+
+  async requeueSkipped(record: WritebackOperation): Promise<WritebackOperation> {
+    if (record.status !== "skipped") return record;
+    return this.update(record, {
+      status: "pending",
+      nextAttemptAt: new Date().toISOString(),
+      lastError: null,
+    });
   }
 
   async markRetry(record: WritebackOperation, error: string, nextAttemptAt: string): Promise<WritebackOperation> {
@@ -131,9 +145,12 @@ export class WritebackProcessor {
     private readonly maxBackoffMs: number,
   ) {}
 
-  async enqueueAndProcess(operation: NewWritebackOperation): Promise<WritebackOperation> {
-    const record = await this.store.enqueueOnce(operation);
+  async enqueueAndProcess(operation: NewWritebackOperation, options: { retrySkipped?: boolean } = {}): Promise<WritebackOperation> {
+    let record = await this.store.enqueueOnce(operation);
     if (record.status === "succeeded") return record;
+    if (options.retrySkipped === true && record.status === "skipped" && matchesNewWritebackOperation(record, operation)) {
+      record = await this.store.requeueSkipped(record);
+    }
     await this.processDue();
     return (await this.store.get(record.idempotencyKey)) ?? record;
   }
@@ -141,8 +158,12 @@ export class WritebackProcessor {
   async processDue(): Promise<void> {
     for (const record of await this.store.claimDue()) {
       try {
-        await this.execute(record);
-        await this.store.markSucceeded(record);
+        const result = await this.execute(record);
+        if (result.status === "applied" || result.status === "verified") {
+          await this.store.markSucceeded(record);
+        } else {
+          await this.store.markSkipped(record, result.message ?? `Writeback ${result.status}`);
+        }
       } catch (error) {
         const message = errorMessage(error);
         const nextAttemptAt = new Date(Date.now() + computeWritebackBackoffMs(record.attempt + 1, this.maxBackoffMs)).toISOString();
@@ -157,17 +178,16 @@ export class WritebackProcessor {
     }
   }
 
-  private async execute(record: WritebackOperation): Promise<void> {
+  private async execute(record: WritebackOperation) {
     if (record.kind === "transition") {
-      await this.writer.transitionIssueState({
+      return this.writer.transitionIssueState({
         issueId: record.issueId,
         toState: record.payload.toState,
         ...(record.payload.fromStates === undefined ? {} : { fromStates: record.payload.fromStates }),
         ...(record.payload.reason === undefined ? {} : { reason: record.payload.reason }),
       });
-      return;
     }
-    await this.writer.createIssueComment({
+    return this.writer.createIssueComment({
       issueId: record.issueId,
       body: record.payload.body,
       dedupeKey: record.payload.dedupeKey,
@@ -181,6 +201,29 @@ export function computeWritebackBackoffMs(attempt: number, maxBackoffMs: number)
 
 function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "record";
+}
+
+function matchesNewWritebackOperation(record: WritebackOperation, operation: NewWritebackOperation): boolean {
+  if (record.idempotencyKey !== operation.idempotencyKey || record.kind !== operation.kind || record.issueId !== operation.issueId) {
+    return false;
+  }
+  if (record.runId !== operation.runId) return false;
+  if (record.kind === "transition" && operation.kind === "transition") {
+    return (
+      record.payload.toState === operation.payload.toState &&
+      record.payload.reason === operation.payload.reason &&
+      stringArraysEqual(record.payload.fromStates, operation.payload.fromStates)
+    );
+  }
+  if (record.kind === "comment" && operation.kind === "comment") {
+    return record.payload.body === operation.payload.body && record.payload.dedupeKey === operation.payload.dedupeKey;
+  }
+  return false;
+}
+
+function stringArraysEqual(left: string[] | undefined, right: string[] | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 async function readJsonIfExists<T>(filePath: string): Promise<T | null> {

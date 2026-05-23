@@ -22,6 +22,7 @@ import {
   type IssueLifecycleStore,
   type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
+import { MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
 import {
   formatWorkerReviewEvidencePrompt,
   PullRequestReviewEvidenceService,
@@ -55,6 +56,7 @@ export interface OrchestratorOptions {
   writeback?: WritebackProcessor;
   pullRequestClient?: PullRequestDiscoveryClient;
   pullRequestReviewClient?: PullRequestReviewEvidenceClient;
+  pullRequestMergeClient?: MergePolicyGitHubClient;
 }
 
 export interface PullRequestDiscoveryClient {
@@ -411,6 +413,7 @@ export class Orchestrator {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchReviewerIssue(issue);
       }
+      await this.reconcileMergePolicyIssues();
     } catch (error) {
       this.options.logger.warn("orchestrator tick failed", { error: errorMessage(error) });
     } finally {
@@ -1302,7 +1305,54 @@ export class Orchestrator {
       });
     }
 
+    if (verdict.verdict === "pass") await this.tryReconcileMergePolicy(entry.issue);
     return true;
+  }
+
+  private async reconcileMergePolicyIssues(): Promise<void> {
+    if (this.config.mergePolicy.mode !== "gated" || this.config.mergePolicy.sourceStates.length === 0) return;
+    let candidates: Issue[];
+    try {
+      candidates = await this.options.tracker.fetchIssuesByStates(this.config.mergePolicy.sourceStates);
+    } catch (error) {
+      this.options.logger.warn("merge policy issue fetch failed", { error: errorMessage(error) });
+      return;
+    }
+    for (const issue of sortIssuesForDispatch(candidates)) {
+      if (this.running.has(issue.id) || this.pausedIssues.has(issue.id)) continue;
+      if (!this.passesLabelGuardrails(issue)) continue;
+      await this.tryReconcileMergePolicy(issue);
+    }
+  }
+
+  private async tryReconcileMergePolicy(issue: Issue): Promise<void> {
+    if (this.config.mergePolicy.mode !== "gated" || !this.options.lifecycleStore) return;
+    try {
+      const service = new MergePolicyService({
+        config: this.config,
+        tracker: this.options.tracker,
+        lifecycleStore: this.options.lifecycleStore,
+        ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+        ...(this.options.writeback === undefined ? {} : { writeback: this.options.writeback }),
+        ...(this.options.pullRequestMergeClient === undefined ? {} : { client: this.options.pullRequestMergeClient }),
+        logger: this.options.logger,
+      });
+      const result = await service.reconcileIssue(issue);
+      if (result.status !== "skipped") {
+        this.options.logger.info("merge policy reconciled issue", {
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          status: result.status,
+          merge_id: result.merge.id,
+        });
+      }
+    } catch (error) {
+      this.options.logger.warn("merge policy reconciliation failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        error: errorMessage(error),
+      });
+    }
   }
 
   private async updateLifecycle(entry: RunningEntry, patch: IssueLifecyclePatch): Promise<void> {

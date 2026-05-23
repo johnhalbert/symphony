@@ -26,6 +26,16 @@ review_loop:
   max_incomplete_turns: 3
   continuation_history_threshold: 5
 
+merge_policy:
+  mode: manual
+  source_states:
+    - Ready to Merge
+  done_state: Done
+  merge_method: merge
+  required_checks: []
+  no_ci:
+    allowed: false
+
 continuation_context:
   search_enabled: false
   summarization_enabled: false
@@ -105,6 +115,8 @@ Use Linear only as read context unless the prompt explicitly asks for a non-life
 `Todo` and `In Progress` are the worker implementation queue. `In Review` is the independent reviewer-agent queue, not a human review handoff. `Blocked` is the human-required escalation state for exhausted review loops, repeated incomplete worker turns, or other conditions that require operator intervention.
 
 A passing review is recorded with structured reviewer verdict evidence, such as a Linear comment or PR review, and Symphony transitions the issue from `In Review` to `Ready to Merge`. Review failures continue through the review loop, and escalation failures transition to `Blocked`.
+
+Reviewer-approved GitHub merge remains manual unless `merge_policy.mode: gated` is explicitly enabled. In gated mode, Symphony must confirm the issue reached `Ready to Merge`, validate the lifecycle-bound PR, approval evidence, current head SHA, and configured CI/no-CI policy, then perform service-owned merge and transition the issue to `Done`.
 
 Search and richer summarization for continuation context are roadmap placeholders only. Keep `continuation_context.search_enabled` and `continuation_context.summarization_enabled` disabled until concrete implementations exist; enabling them only produces doctor warnings and must not create worker or reviewer dispatch paths.
 

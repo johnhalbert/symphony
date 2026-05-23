@@ -12,7 +12,7 @@ export interface TrackerCommentInput {
 }
 
 export interface TrackerWriteResult {
-  status: "applied" | "skipped" | "dry_run";
+  status: "applied" | "verified" | "skipped" | "dry_run";
   message?: string;
 }
 

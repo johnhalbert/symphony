@@ -574,6 +574,81 @@ describe("GitHubPullRequestClient", () => {
       /PR review evidence ingestion/,
     );
   });
+
+  it("inspects pull request merge metadata for recovery", async () => {
+    const client = new GitHubPullRequestClient(config(), async () =>
+      jsonResponse({
+        html_url: "https://github.com/octo-org/symphony/pull/42",
+        number: 42,
+        state: "closed",
+        merged: true,
+        merge_commit_sha: "merge-sha-1",
+        merged_at: "2026-01-01T00:00:02Z",
+        merged_by: { login: "symphony-bot" },
+        head: {
+          ref: "symphony/TEST-1",
+          sha: "head-sha-1",
+          repo: { pushed_at: "2026-01-01T00:00:00Z" },
+        },
+      }),
+    );
+
+    await expect(client.getPullRequest({ pullRequestNumber: 42 })).resolves.toMatchObject({
+      url: "https://github.com/octo-org/symphony/pull/42",
+      number: 42,
+      state: "closed",
+      merged: true,
+      mergeCommitSha: "merge-sha-1",
+      mergedAt: "2026-01-01T00:00:02Z",
+      mergedBy: "symphony-bot",
+      headBranch: "symphony/TEST-1",
+      headSha: "head-sha-1",
+    });
+  });
+
+  it("merges pull requests with the expected head SHA guard", async () => {
+    const calls: Array<{ pathname: string; body: unknown }> = [];
+    const client = new GitHubPullRequestClient(config(), async (input, init) => {
+      const url = new URL(String(input));
+      calls.push({ pathname: url.pathname, body: init?.body === undefined ? null : JSON.parse(String(init.body)) });
+      if (url.pathname === "/user") return jsonResponse({ login: "symphony-bot" });
+      return jsonResponse({ merged: true, sha: "merge-sha-1" });
+    });
+
+    await expect(
+      client.mergePullRequest({ pullRequestNumber: 42, expectedHeadSha: "head-sha-1", method: "squash" }),
+    ).resolves.toMatchObject({
+      merged: true,
+      mergeCommitSha: "merge-sha-1",
+      mergedBy: "symphony-bot",
+    });
+    expect(calls[0]).toMatchObject({
+      pathname: "/repos/octo-org/symphony/pulls/42/merge",
+      body: { sha: "head-sha-1", merge_method: "squash" },
+    });
+  });
+
+  it("checks required commit statuses and check runs by name", async () => {
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/status")) {
+        return jsonResponse({ statuses: [{ context: "test", state: "success", target_url: "https://ci.test/test" }] });
+      }
+      return jsonResponse({
+        check_runs: [
+          { name: "typecheck", status: "completed", conclusion: "success", html_url: "https://ci.test/typecheck" },
+        ],
+      });
+    });
+
+    await expect(
+      client.getRequiredCheckResults({ headSha: "head-sha-1", requiredChecks: ["test", "typecheck", "lint"] }),
+    ).resolves.toEqual([
+      { name: "test", status: "success", conclusion: "success", url: "https://ci.test/test" },
+      { name: "typecheck", status: "success", conclusion: "success", url: "https://ci.test/typecheck" },
+      { name: "lint", status: "missing", conclusion: null, url: null },
+    ]);
+  });
 });
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {

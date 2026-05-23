@@ -41,6 +41,13 @@ export interface BlockedEscalationWritebackContext {
   requiredAction?: string;
 }
 
+export interface MergeCompletedWritebackContext {
+  issue: Issue;
+  mergeId: string;
+  fromState: string;
+  doneState: string;
+}
+
 export interface CompletionReportWritebackDetails {
   reportId: string;
   idempotencyKey: string;
@@ -330,6 +337,25 @@ export function planBlockedEscalationWritebacks(
   }
 
   return operations;
+}
+
+export function planMergeCompletedWritebacks(
+  context: MergeCompletedWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  return [
+    {
+      idempotencyKey: `transition:${context.issue.id}:${context.mergeId}:${context.doneState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      payload: {
+        fromStates: [context.fromState],
+        toState: context.doneState,
+        reason: "Symphony reviewer-approved merge completed",
+      },
+    },
+  ];
 }
 
 export function planRunFailedComment(context: RunWritebackContext, config: ServiceConfig, error: string | null): NewWritebackOperation | null {

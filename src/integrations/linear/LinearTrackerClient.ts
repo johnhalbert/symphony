@@ -340,7 +340,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     const currentState = asString(context.state?.name);
     if (!currentState) throw new SymphonyError("tracker_error", `Linear issue ${input.issueId} is missing state`);
     if (sameName(currentState, input.toState)) {
-      return { status: "skipped", message: `Issue is already in ${input.toState}` };
+      return { status: "verified", message: `Issue is already in ${input.toState}` };
     }
     if (input.fromStates && input.fromStates.length > 0 && !input.fromStates.some((state) => sameName(state, currentState))) {
       return {
@@ -365,7 +365,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     const marker = commentMarker(input.dedupeKey);
     const context = await this.fetchIssueWriteContext(input.issueId);
     if ((context.comments?.nodes ?? []).some((comment) => asString(comment.body)?.includes(marker))) {
-      return { status: "skipped", message: `Comment already exists for ${input.dedupeKey}` };
+      return { status: "verified", message: `Comment already exists for ${input.dedupeKey}` };
     }
     const response = await this.graphql<{ commentCreate: { success?: unknown } }>(COMMENT_CREATE_MUTATION, {
       input: {

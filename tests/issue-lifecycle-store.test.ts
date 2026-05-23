@@ -94,6 +94,44 @@ describe("FileIssueLifecycleStore", () => {
     await expect(store.get("TEST-404")).resolves.toBeNull();
   });
 
+  it("persists merge metadata for status API consumers", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(issue(), {
+      merge: {
+        id: "merge:issue-1:head-sha-1",
+        pullRequest: {
+          url: "https://github.com/acme/repo/pull/7",
+          number: 7,
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
+        headSha: "head-sha-1",
+        mergeCommitSha: "merge-sha-1",
+        mergedAt: "2026-01-01T00:00:00.000Z",
+        mergedBy: {
+          login: "symphony-bot",
+          profile: "github-merge",
+          capability: "github.merge",
+        },
+        checkStatus: {
+          requiredChecks: ["test"],
+          passedChecks: ["test"],
+          noCiEvidence: null,
+        },
+        mergeOperationKey: "github-merge:issue-1:7:head-sha-1",
+        doneTransitionOperationKey: "transition:issue-1:merge:issue-1:head-sha-1:Done",
+      },
+    });
+
+    await expect(store.get("issue-1")).resolves.toMatchObject({
+      merge: {
+        mergeCommitSha: "merge-sha-1",
+        mergedBy: { capability: "github.merge", profile: "github-merge" },
+        doneTransitionOperationKey: "transition:issue-1:merge:issue-1:head-sha-1:Done",
+      },
+    });
+  });
+
   it("surfaces corrupt lifecycle records", async () => {
     await mkdir(path.join(root, "issue-lifecycle"), { recursive: true });
     await writeFile(path.join(root, "issue-lifecycle", "issue-1.json"), "{nope", "utf8");

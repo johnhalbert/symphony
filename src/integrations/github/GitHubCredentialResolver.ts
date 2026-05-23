@@ -1,23 +1,23 @@
 import type { ServiceConfig, GitHubConfig } from "../../core/config/Config.js";
-import type { CredentialCapability, ResolvedCredential } from "../../core/config/CredentialProfiles.js";
+import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../../core/config/CredentialProfiles.js";
 import { SymphonyError } from "../../core/errors.js";
-import type { AgentRunRole } from "../../core/types.js";
 import { GitHubPullRequestClient } from "./GitHubPullRequestClient.js";
 
 type FetchLike = typeof fetch;
 
 export type GitHubCredentialCapability = Extract<CredentialCapability, `github.${string}`>;
 
-export const GITHUB_CREDENTIAL_CAPABILITY_OWNERS: Readonly<Record<GitHubCredentialCapability, AgentRunRole>> = {
+export const GITHUB_CREDENTIAL_CAPABILITY_OWNERS: Readonly<Record<GitHubCredentialCapability, CredentialRole>> = {
   "github.discovery": "worker",
   "github.publication": "worker",
   "github.review_evidence_read": "reviewer",
   "github.review_feedback_write": "reviewer",
+  "github.merge": "service",
 };
 
 export interface ResolvedGitHubClientConfig {
   capability: GitHubCredentialCapability;
-  role: AgentRunRole;
+  role: CredentialRole;
   github: GitHubConfig;
   credential: ResolvedCredential | null;
 }

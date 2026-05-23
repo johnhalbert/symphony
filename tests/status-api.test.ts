@@ -95,6 +95,22 @@ describe("StatusServer durable API", () => {
           ciStatus: "success",
           lastPushedAt: "2026-01-01T00:00:00.500Z",
         },
+        merge: {
+          id: "merge:issue-1:head-sha-1",
+          pullRequest: {
+            url: "https://github.com/acme/repo/pull/7",
+            number: 7,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-1",
+          },
+          headSha: "head-sha-1",
+          mergeCommitSha: "merge-sha-1",
+          mergedAt: "2026-01-01T00:00:06.000Z",
+          mergedBy: { login: "symphony-bot", profile: "github-merge", capability: "github.merge" },
+          checkStatus: { requiredChecks: ["test"], passedChecks: ["test"], noCiEvidence: null },
+          mergeOperationKey: "github-merge:issue-1:7:head-sha-1",
+          doneTransitionOperationKey: "transition:issue-1:merge:issue-1:head-sha-1:Done",
+        },
         completionReports: [
           {
             id: "completion-report:issue-1:report-1",
@@ -269,6 +285,7 @@ describe("StatusServer durable API", () => {
           gitBranchName: string | null;
           repoPath: string | null;
           baseRef: string | null;
+          merge: { mergeCommitSha: string } | null;
         };
         capabilities: { openWorkspace: boolean };
         diagnostics: {
@@ -330,6 +347,7 @@ describe("StatusServer durable API", () => {
         gitBranchName: "symphony/TEST-1",
         repoPath: "/repo",
         baseRef: "origin/main",
+        merge: { mergeCommitSha: "merge-sha-1" },
       });
       expect(issueBody.capabilities.openWorkspace).toBe(false);
       expect(issueBody.diagnostics.mcpToolExposure).toMatchObject({
