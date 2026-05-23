@@ -5,3 +5,9 @@ This file was created by the ENG-5 live dogfood smoke for https://linear.app/joh
 ## Round 1
 
 The first worker intentionally omitted the reviewer validation token.
+
+## Revision
+
+The reviewer requested the missing validation token.
+
+Reviewer validation token: ENG5-LIVE-PASS
