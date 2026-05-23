@@ -50,6 +50,10 @@ describe("GitHub credential resolver", () => {
               value: "$GITHUB_FEEDBACK_WRITE_TOKEN",
               capabilities: ["github.review_feedback_write"],
             },
+            merge: {
+              value: "$GITHUB_MERGE_TOKEN",
+              capabilities: ["github.merge"],
+            },
           },
           roles: {
             worker: {
@@ -59,6 +63,9 @@ describe("GitHub credential resolver", () => {
             reviewer: {
               "github.review_evidence_read": "review-read",
               "github.review_feedback_write": "feedback-write",
+            },
+            service: {
+              "github.merge": "merge",
             },
           },
         },
@@ -70,6 +77,7 @@ describe("GitHub credential resolver", () => {
         GITHUB_PUBLICATION_TOKEN: "publication-token",
         GITHUB_REVIEW_READ_TOKEN: "review-read-token",
         GITHUB_FEEDBACK_WRITE_TOKEN: "feedback-write-token",
+        GITHUB_MERGE_TOKEN: "merge-token",
       },
     );
 
@@ -77,6 +85,7 @@ describe("GitHub credential resolver", () => {
     expect(resolveGitHubClientConfig(config, "github.publication").github.token).toBe("publication-token");
     expect(resolveGitHubClientConfig(config, "github.review_evidence_read").github.token).toBe("review-read-token");
     expect(resolveGitHubClientConfig(config, "github.review_feedback_write").github.token).toBe("feedback-write-token");
+    expect(resolveGitHubClientConfig(config, "github.merge").github.token).toBe("merge-token");
   });
 
   it("reports missing publication tokens through the publication client", async () => {
@@ -136,9 +145,11 @@ function githubCapabilities(): GitHubCredentialCapability[] {
     "github.publication",
     "github.review_evidence_read",
     "github.review_feedback_write",
+    "github.merge",
   ];
 }
 
-function expectedRole(capability: GitHubCredentialCapability): "worker" | "reviewer" {
+function expectedRole(capability: GitHubCredentialCapability): "worker" | "reviewer" | "service" {
+  if (capability === "github.merge") return "service";
   return capability === "github.discovery" || capability === "github.publication" ? "worker" : "reviewer";
 }

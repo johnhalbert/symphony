@@ -18,6 +18,35 @@ export interface PullRequestMetadata {
   lastPushedAt: string | null;
 }
 
+export interface PullRequestDetails extends PullRequestMetadata {
+  state: string | null;
+}
+
+export interface PullRequestCheckResult {
+  name: string;
+  status: "success" | "failure" | "pending" | "missing";
+  conclusion: string | null;
+  url: string | null;
+}
+
+export interface PullRequestChecksInput {
+  headSha: string;
+  requiredChecks: string[];
+}
+
+export interface PullRequestMergeInput {
+  pullRequestNumber: number;
+  expectedHeadSha: string;
+  method: "merge" | "squash" | "rebase";
+}
+
+export interface PullRequestMergeResult {
+  merged: boolean;
+  mergeCommitSha: string;
+  mergedAt: string;
+  mergedBy: string | null;
+}
+
 export interface PullRequestPublicationInput {
   workspacePath: string;
   branchName: string;
@@ -103,6 +132,7 @@ export interface PullRequestReviewFeedbackResult {
 interface GitHubPullRequestNode {
   html_url?: unknown;
   number?: unknown;
+  state?: unknown;
   updated_at?: unknown;
   head?: {
     ref?: unknown;
@@ -158,6 +188,19 @@ interface GitHubIssueCommentNode {
 
 interface GitHubReviewFeedbackNode extends GitHubReviewNode {
   comments?: unknown;
+}
+
+interface GitHubCommitStatusNode {
+  context?: unknown;
+  state?: unknown;
+  target_url?: unknown;
+}
+
+interface GitHubCheckRunNode {
+  name?: unknown;
+  status?: unknown;
+  conclusion?: unknown;
+  html_url?: unknown;
 }
 
 interface GraphQlPageInfoNode {
@@ -274,6 +317,93 @@ export class GitHubPullRequestClient {
         .map((comment) => normalizeIssueComment(comment, input.pullRequestNumber))
         .filter((item): item is GitHubPullRequestReviewEvidence => item !== null),
     ].sort(compareEvidence);
+  }
+
+  async getPullRequest(input: { pullRequestNumber: number }): Promise<PullRequestDetails> {
+    this.assertConfiguredForMerge();
+    assertPullRequestNumber(input.pullRequestNumber, "PR merge inspection");
+    const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}`), {
+      method: "GET",
+      headers: requestHeaders(this.config.token ?? ""),
+    });
+    if (!response.ok) {
+      throw new SymphonyError("tracker_error", `GitHub PR inspection returned HTTP ${response.status}`);
+    }
+    const pullRequest = normalizePullRequestDetails((await response.json()) as GitHubPullRequestNode);
+    if (!pullRequest) throw new SymphonyError("tracker_error", "GitHub PR inspection response is invalid");
+    return pullRequest;
+  }
+
+  async getRequiredCheckResults(input: PullRequestChecksInput): Promise<PullRequestCheckResult[]> {
+    this.assertConfiguredForMerge();
+    const headSha = requireNonEmpty(input.headSha, "A pull request head SHA is required for check validation");
+    const requiredChecks = input.requiredChecks.map((check) => check.trim()).filter((check) => check.length > 0);
+    const [statusResponse, checkRunsResponse] = await Promise.all([
+      this.fetchImpl(this.repoUrl(`commits/${encodeURIComponent(headSha)}/status`), {
+        method: "GET",
+        headers: requestHeaders(this.config.token ?? ""),
+      }),
+      this.fetchImpl(this.repoUrl(`commits/${encodeURIComponent(headSha)}/check-runs`), {
+        method: "GET",
+        headers: {
+          ...requestHeaders(this.config.token ?? ""),
+          accept: "application/vnd.github+json",
+        },
+      }),
+    ]);
+    if (!statusResponse.ok) {
+      throw new SymphonyError("tracker_error", `GitHub commit status inspection returned HTTP ${statusResponse.status}`);
+    }
+    if (!checkRunsResponse.ok) {
+      throw new SymphonyError("tracker_error", `GitHub check run inspection returned HTTP ${checkRunsResponse.status}`);
+    }
+    const statusBody = (await statusResponse.json()) as { statuses?: unknown };
+    const checkRunsBody = (await checkRunsResponse.json()) as { check_runs?: unknown };
+    const statuses = Array.isArray(statusBody.statuses) ? statusBody.statuses : [];
+    const checkRuns = Array.isArray(checkRunsBody.check_runs) ? checkRunsBody.check_runs : [];
+    return requiredChecks.map((required) => {
+      const status = statuses
+        .filter(isRecord)
+        .map((item) => normalizeCommitStatus(item as GitHubCommitStatusNode))
+        .find((item) => item?.name === required);
+      if (status) return status;
+      const checkRun = checkRuns
+        .filter(isRecord)
+        .map((item) => normalizeCheckRun(item as GitHubCheckRunNode))
+        .find((item) => item?.name === required);
+      return checkRun ?? { name: required, status: "missing", conclusion: null, url: null };
+    });
+  }
+
+  async mergePullRequest(input: PullRequestMergeInput): Promise<PullRequestMergeResult> {
+    this.assertConfiguredForMerge();
+    assertPullRequestNumber(input.pullRequestNumber, "PR merge");
+    const expectedHeadSha = requireNonEmpty(input.expectedHeadSha, "A pull request head SHA is required for PR merge");
+    const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}/merge`), {
+      method: "PUT",
+      headers: {
+        ...requestHeaders(this.config.token ?? ""),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        sha: expectedHeadSha,
+        merge_method: input.method,
+      }),
+    });
+    if (!response.ok) {
+      throw new SymphonyError("tracker_error", await this.githubWriteError(response, "GitHub PR merge"));
+    }
+    const body = (await response.json()) as Record<string, unknown>;
+    const sha = asNullableString(body.sha);
+    if (body.merged !== true || sha === null) {
+      throw new SymphonyError("tracker_error", "GitHub PR merge response is invalid");
+    }
+    return {
+      merged: true,
+      mergeCommitSha: sha,
+      mergedAt: new Date().toISOString(),
+      mergedBy: await this.authenticatedLogin(),
+    };
   }
 
   async submitPullRequestReviewFeedback(
@@ -488,6 +618,15 @@ export class GitHubPullRequestClient {
     }
   }
 
+  private assertConfiguredForMerge(): void {
+    if (!this.config.owner || !this.config.repo || !this.config.token) {
+      throw new SymphonyError(
+        "invalid_request",
+        "GitHub owner, repo, and token are required for service-owned PR merge",
+      );
+    }
+  }
+
   private repoUrl(repoPath: string): URL {
     const suffix = repoPath.length === 0 ? "" : `/${repoPath}`;
     return new URL(
@@ -542,6 +681,16 @@ export class GitHubPullRequestClient {
     const pullRequest = normalizePullRequest((await response.json()) as GitHubPullRequestNode);
     if (!pullRequest) throw new SymphonyError("tracker_error", "GitHub PR creation response is invalid");
     return pullRequest;
+  }
+
+  private async authenticatedLogin(): Promise<string | null> {
+    const response = await this.fetchImpl(new URL("user", normalizedApiBaseUrl(this.config.apiBaseUrl)), {
+      method: "GET",
+      headers: requestHeaders(this.config.token ?? ""),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json()) as GitHubUserNode;
+    return asNullableString(body.login);
   }
 
   private async fetchPaginatedJsonArray<T>(repoPath: string): Promise<T[]> {
@@ -649,6 +798,40 @@ function normalizePullRequest(node: GitHubPullRequestNode): PullRequestMetadata 
     headBranch,
     headSha,
     lastPushedAt: asNullableString(node.head?.repo?.pushed_at) ?? asNullableString(node.updated_at),
+  };
+}
+
+function normalizePullRequestDetails(node: GitHubPullRequestNode): PullRequestDetails | null {
+  const metadata = normalizePullRequest(node);
+  if (!metadata) return null;
+  return {
+    ...metadata,
+    state: asNullableString(node.state),
+  };
+}
+
+function normalizeCommitStatus(node: GitHubCommitStatusNode): PullRequestCheckResult | null {
+  const name = asString(node.context);
+  if (!name) return null;
+  const state = asNullableString(node.state);
+  return {
+    name,
+    status: state === "success" ? "success" : state === "pending" ? "pending" : "failure",
+    conclusion: state,
+    url: asNullableString(node.target_url),
+  };
+}
+
+function normalizeCheckRun(node: GitHubCheckRunNode): PullRequestCheckResult | null {
+  const name = asString(node.name);
+  if (!name) return null;
+  const status = asNullableString(node.status);
+  const conclusion = asNullableString(node.conclusion);
+  return {
+    name,
+    status: status === "completed" && conclusion === "success" ? "success" : status === "completed" ? "failure" : "pending",
+    conclusion,
+    url: asNullableString(node.html_url),
   };
 }
 

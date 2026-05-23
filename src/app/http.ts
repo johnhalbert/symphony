@@ -307,6 +307,7 @@ function statusMetadata(input: {
       null,
     repoPath: input.live?.metadata?.repoPath ?? pointers?.repoPath ?? input.latestRun?.repoPath ?? input.workspace?.repoPath ?? null,
     baseRef: input.live?.metadata?.baseRef ?? pointers?.baseRef ?? input.latestRun?.baseRef ?? input.workspace?.baseRef ?? null,
+    merge: input.lifecycle?.merge ?? null,
   };
 }
 

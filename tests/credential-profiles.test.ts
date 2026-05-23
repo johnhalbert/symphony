@@ -23,6 +23,10 @@ describe("credential profile config", () => {
               value: "$GITHUB_FEEDBACK_TOKEN",
               capabilities: ["github.review_feedback_write"],
             },
+            "github-merge": {
+              value: "$GITHUB_MERGE_TOKEN",
+              capabilities: ["github.merge"],
+            },
             "linear-read": {
               value: "$LINEAR_READ_TOKEN",
               capabilities: ["linear.tracker"],
@@ -55,6 +59,10 @@ describe("credential profile config", () => {
               "linear.writeback": "linear-write",
               "cursor.runtime": "cursor-runtime",
             },
+            service: {
+              "github.merge": "github-merge",
+              "linear.writeback": "linear-write",
+            },
           },
         },
       },
@@ -64,6 +72,7 @@ describe("credential profile config", () => {
         GITHUB_READ_TOKEN: "github-read-secret",
         GITHUB_PUBLISH_TOKEN: "github-publish-secret",
         GITHUB_FEEDBACK_TOKEN: "github-feedback-secret",
+        GITHUB_MERGE_TOKEN: "github-merge-secret",
         LINEAR_READ_TOKEN: "linear-read-secret",
         LINEAR_WRITE_TOKEN: "linear-write-secret",
         CURSOR_PROFILE_TOKEN: "cursor-profile-secret",
@@ -87,6 +96,11 @@ describe("credential profile config", () => {
       source: "profile",
       profileName: "github-feedback",
     });
+    expect(config.credentialProfiles.resolveForRole("service", "github.merge")).toMatchObject({
+      value: "github-merge-secret",
+      source: "profile",
+      profileName: "github-merge",
+    });
     expect(config.credentialProfiles.resolveForRole("worker", "server.open_workspace")).toMatchObject({
       value: "workspace-open-secret",
       source: "profile",
@@ -99,6 +113,7 @@ describe("credential profile config", () => {
       "linear.writeback",
       "cursor.runtime",
     ]);
+    expect(config.credentialProfiles.capabilitiesForRole("service")).toEqual(["github.merge", "linear.writeback"]);
 
     const serialized = JSON.stringify(config.credentialProfiles);
     expect(serialized).toContain("GITHUB_READ_TOKEN");
@@ -178,6 +193,8 @@ describe("credential profile config", () => {
     expect(config.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")?.value).toBe(
       "legacy-github-secret",
     );
+    expect(config.credentialProfiles.resolveForRole("service", "github.merge")?.value).toBe("legacy-github-secret");
+    expect(config.credentialProfiles.resolveForRole("service", "linear.writeback")?.value).toBe("legacy-linear-secret");
     expect(config.credentialProfiles.resolveForRole("worker", "linear.tracker")?.value).toBe("legacy-linear-secret");
     expect(config.credentialProfiles.resolveForRole("worker", "linear.writeback")?.value).toBe(
       "legacy-linear-secret",

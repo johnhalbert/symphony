@@ -7,6 +7,7 @@ export * from "./core/harness/FakeHarness.js";
 export * from "./core/harness/HarnessFactory.js";
 export * from "./core/harness/ReviewFeedbackMcpServer.js";
 export * from "./core/logging/StructuredLogger.js";
+export * from "./core/merge/MergePolicyService.js";
 export * from "./core/orchestrator/Orchestrator.js";
 export * from "./core/persistence/IssueLifecycleStore.js";
 export * from "./core/review/PullRequestReviewEvidenceService.js";

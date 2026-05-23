@@ -7,6 +7,7 @@ export const CREDENTIAL_CAPABILITIES = [
   "github.publication",
   "github.review_evidence_read",
   "github.review_feedback_write",
+  "github.merge",
   "linear.tracker",
   "linear.writeback",
   "cursor.runtime",
@@ -16,6 +17,7 @@ export const CREDENTIAL_CAPABILITIES = [
 const credentialCapabilitySchema = z.enum(CREDENTIAL_CAPABILITIES);
 
 export type CredentialCapability = z.infer<typeof credentialCapabilitySchema>;
+export type CredentialRole = AgentRunRole | "service";
 
 export const rawCredentialProfilesSchema = z
   .object({
@@ -34,6 +36,7 @@ export const rawCredentialProfilesSchema = z
       .object({
         worker: z.record(z.string(), z.string()).optional(),
         reviewer: z.record(z.string(), z.string()).optional(),
+        service: z.record(z.string(), z.string()).optional(),
       })
       .strict()
       .optional(),
@@ -56,14 +59,14 @@ export interface CredentialProfileDefinition {
 }
 
 export interface ResolvedCredential {
-  role: AgentRunRole;
+  role: CredentialRole;
   capability: CredentialCapability;
   value: string;
   source: "profile" | "legacy";
   profileName: string | null;
 }
 
-export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<AgentRunRole, readonly CredentialCapability[]>> = {
+export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<CredentialRole, readonly CredentialCapability[]>> = {
   worker: [
     "github.discovery",
     "github.publication",
@@ -79,21 +82,22 @@ export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<AgentRunRole,
     "linear.writeback",
     "cursor.runtime",
   ],
+  service: ["github.merge", "linear.writeback"],
 };
 
-const ROLE_NAMES: readonly AgentRunRole[] = ["worker", "reviewer"];
+const ROLE_NAMES: readonly CredentialRole[] = ["worker", "reviewer", "service"];
 const VALID_CAPABILITIES = new Set<CredentialCapability>(CREDENTIAL_CAPABILITIES);
 const ENV_REFERENCE_PATTERN = /^\$([A-Za-z_][A-Za-z0-9_]*)$/;
 
 export class CredentialProfileRegistry {
   readonly #profiles: Map<string, CredentialProfileDefinition>;
-  readonly #roleAssignments: Map<AgentRunRole, Map<CredentialCapability, string>>;
+  readonly #roleAssignments: Map<CredentialRole, Map<CredentialCapability, string>>;
   readonly #env: NodeJS.ProcessEnv;
   readonly #fallbacks: CredentialLegacyFallbacks;
 
   constructor(input: {
     profiles: Map<string, CredentialProfileDefinition>;
-    roleAssignments: Map<AgentRunRole, Map<CredentialCapability, string>>;
+    roleAssignments: Map<CredentialRole, Map<CredentialCapability, string>>;
     env: NodeJS.ProcessEnv;
     fallbacks: CredentialLegacyFallbacks;
   }) {
@@ -103,7 +107,7 @@ export class CredentialProfileRegistry {
     this.#fallbacks = input.fallbacks;
   }
 
-  resolveForRole(role: AgentRunRole, capability: CredentialCapability): ResolvedCredential | null {
+  resolveForRole(role: CredentialRole, capability: CredentialCapability): ResolvedCredential | null {
     const profileName = this.#roleAssignments.get(role)?.get(capability);
     if (profileName !== undefined) {
       const profile = this.#profiles.get(profileName);
@@ -125,15 +129,15 @@ export class CredentialProfileRegistry {
     return { role, capability, value: fallbackValue, source: "legacy", profileName: null };
   }
 
-  hasAssignment(role: AgentRunRole, capability: CredentialCapability): boolean {
+  hasAssignment(role: CredentialRole, capability: CredentialCapability): boolean {
     return this.#roleAssignments.get(role)?.has(capability) ?? false;
   }
 
-  assignmentRolesFor(capability: CredentialCapability): AgentRunRole[] {
+  assignmentRolesFor(capability: CredentialCapability): CredentialRole[] {
     return ROLE_NAMES.filter((role) => this.hasAssignment(role, capability));
   }
 
-  capabilitiesForRole(role: AgentRunRole): CredentialCapability[] {
+  capabilitiesForRole(role: CredentialRole): CredentialCapability[] {
     const defaults = DEFAULT_ROLE_CREDENTIAL_CAPABILITIES[role] ?? [];
     return [
       ...new Set<CredentialCapability>([
@@ -145,7 +149,7 @@ export class CredentialProfileRegistry {
 
   toJSON(): {
     profiles: Record<string, { source: { kind: "env"; name: string }; capabilities: CredentialCapability[] }>;
-    roles: Record<AgentRunRole, Partial<Record<CredentialCapability, string>>>;
+    roles: Record<CredentialRole, Partial<Record<CredentialCapability, string>>>;
   } {
     return {
       profiles: Object.fromEntries(
@@ -157,6 +161,7 @@ export class CredentialProfileRegistry {
       roles: {
         worker: Object.fromEntries(this.#roleAssignments.get("worker") ?? []),
         reviewer: Object.fromEntries(this.#roleAssignments.get("reviewer") ?? []),
+        service: Object.fromEntries(this.#roleAssignments.get("service") ?? []),
       },
     };
   }
@@ -207,8 +212,8 @@ function parseProfiles(
 function parseRoleAssignments(
   rawRoles: RawCredentialProfilesConfig["roles"] | undefined,
   profiles: Map<string, CredentialProfileDefinition>,
-): Map<AgentRunRole, Map<CredentialCapability, string>> {
-  const result = new Map<AgentRunRole, Map<CredentialCapability, string>>();
+): Map<CredentialRole, Map<CredentialCapability, string>> {
+  const result = new Map<CredentialRole, Map<CredentialCapability, string>>();
   for (const role of ROLE_NAMES) {
     const assignments = new Map<CredentialCapability, string>();
     for (const [capabilityName, profileName] of Object.entries(rawRoles?.[role] ?? {})) {

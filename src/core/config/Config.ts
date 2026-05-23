@@ -37,6 +37,24 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    merge_policy: z
+      .object({
+        enabled: z.boolean().optional(),
+        mode: z.enum(["disabled", "manual", "gated"]).optional(),
+        source_states: stringArray.optional(),
+        done_state: z.string().optional(),
+        merge_method: z.enum(["merge", "squash", "rebase"]).optional(),
+        required_checks: stringArray.optional(),
+        no_ci: z
+          .object({
+            allowed: z.boolean().optional(),
+            evidence: z.string().optional(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
     continuation_context: z
       .object({
         search_enabled: z.boolean().optional(),
@@ -237,6 +255,16 @@ export interface ReviewLoopConfig {
   continuationHistoryThreshold: number;
 }
 
+export interface MergePolicyConfig {
+  mode: "disabled" | "manual" | "gated";
+  sourceStates: string[];
+  doneState: string;
+  mergeMethod: "merge" | "squash" | "rebase";
+  requiredChecks: string[];
+  noCiAllowed: boolean;
+  noCiEvidence: string | null;
+}
+
 export interface ContinuationContextConfig {
   searchEnabled: boolean;
   summarizationEnabled: boolean;
@@ -258,6 +286,7 @@ export interface ServiceConfig {
   github: GitHubConfig;
   credentialProfiles: CredentialProfileRegistry;
   reviewLoop: ReviewLoopConfig;
+  mergePolicy: MergePolicyConfig;
   continuationContext: ContinuationContextConfig;
   raw: RawWorkflowConfig;
 }
@@ -367,6 +396,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const reviewStates = raw.review_loop?.review_states ?? handoffStates;
   const blockedStates = raw.review_loop?.blocked_states ?? [];
   const reviewPassState = raw.review_loop?.review_pass_state ?? null;
+  const mergePolicy = normalizeMergePolicy(raw, reviewPassState);
   validateStateBuckets({
     activeStates,
     handoffStates,
@@ -449,6 +479,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
       continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
     },
+    mergePolicy,
     continuationContext: {
       searchEnabled: raw.continuation_context?.search_enabled ?? false,
       summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
@@ -490,6 +521,29 @@ function normalizeLabels(input: string[] | undefined): string[] {
 function normalizeOptionalConfigString(value: string | undefined): string | null {
   const trimmed = value?.trim() ?? "";
   return trimmed.length === 0 ? null : trimmed;
+}
+
+function normalizeMergePolicy(raw: RawWorkflowConfig, reviewPassState: string | null): MergePolicyConfig {
+  const rawPolicy = raw.merge_policy;
+  const mode =
+    rawPolicy?.mode ??
+    (rawPolicy?.enabled === true ? "gated" : rawPolicy?.enabled === false ? "disabled" : "disabled");
+  const noCiEvidence = normalizeOptionalConfigString(rawPolicy?.no_ci?.evidence);
+  if (rawPolicy?.no_ci?.allowed === true && noCiEvidence === null) {
+    throw new SymphonyError(
+      "config_validation_error",
+      "merge_policy.no_ci.evidence is required when merge_policy.no_ci.allowed is true",
+    );
+  }
+  return {
+    mode,
+    sourceStates: rawPolicy?.source_states ?? (reviewPassState === null ? [] : [reviewPassState]),
+    doneState: rawPolicy?.done_state ?? "Done",
+    mergeMethod: rawPolicy?.merge_method ?? "merge",
+    requiredChecks: rawPolicy?.required_checks ?? [],
+    noCiAllowed: rawPolicy?.no_ci?.allowed ?? false,
+    noCiEvidence,
+  };
 }
 
 function validateStateBuckets(input: {

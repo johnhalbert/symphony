@@ -50,6 +50,15 @@ Work on {{ issue.identifier }}.`,
       searchEnabled: false,
       summarizationEnabled: false,
     });
+    expect(config.mergePolicy).toEqual({
+      mode: "disabled",
+      sourceStates: [],
+      doneState: "Done",
+      mergeMethod: "merge",
+      requiredChecks: [],
+      noCiAllowed: false,
+      noCiEvidence: null,
+    });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
   });
 
@@ -84,6 +93,14 @@ Work on {{ issue.identifier }}.`,
           max_incomplete_turns: 2,
           continuation_history_threshold: 7,
         },
+        merge_policy: {
+          mode: "gated",
+          source_states: ["Review Passed"],
+          done_state: "Done",
+          merge_method: "squash",
+          required_checks: ["test"],
+          no_ci: { allowed: false },
+        },
         continuation_context: {
           search_enabled: true,
           summarization_enabled: true,
@@ -116,6 +133,31 @@ Work on {{ issue.identifier }}.`,
       searchEnabled: true,
       summarizationEnabled: true,
     });
+    expect(config.mergePolicy).toEqual({
+      mode: "gated",
+      sourceStates: ["Review Passed"],
+      doneState: "Done",
+      mergeMethod: "squash",
+      requiredChecks: ["test"],
+      noCiAllowed: false,
+      noCiEvidence: null,
+    });
+  });
+
+  it("requires explicit no-CI evidence when no-CI is allowed", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          merge_policy: {
+            mode: "gated",
+            no_ci: { allowed: true },
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow(SymphonyError);
   });
 
   it("rejects handoff states that overlap active or terminal states", () => {
