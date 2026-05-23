@@ -297,14 +297,15 @@ export class Orchestrator {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     for (const retry of this.retryAttempts.values()) clearTimeout(retry.timer);
     for (const [issueId, running] of this.running) {
+      const stopRunId = this.harnessStopRunId(running);
       this.markCancellationRequested(running, {
         source: "service_stop",
         reason: "orchestrator stop",
         abortSignalled: true,
-        harnessStopRequested: typeof this.options.harness.stop === "function",
+        harnessStopRequested: stopRunId !== null,
       });
       running.abortController.abort();
-      await this.options.harness.stop?.(running.runId ?? issueId);
+      if (stopRunId !== null) await this.options.harness.stop?.(stopRunId);
     }
     await Promise.allSettled([...this.running.values()].map((entry) => entry.worker));
   }
@@ -334,14 +335,15 @@ export class Orchestrator {
     const running = this.running.get(issueId);
     if (!running) return;
     running.suppressRetryOnExit = true;
+    const stopRunId = this.harnessStopRunId(running);
     this.markCancellationRequested(running, {
       source: "operator",
       reason: "operator request",
       abortSignalled: true,
-      harnessStopRequested: typeof this.options.harness.stop === "function",
+      harnessStopRequested: stopRunId !== null,
     });
     running.abortController.abort();
-    await this.options.harness.stop?.(running.runId ?? issueId);
+    if (stopRunId !== null) await this.options.harness.stop?.(stopRunId);
   }
 
   async createContinuationSummary(
@@ -516,6 +518,7 @@ export class Orchestrator {
     for (const [issueId, entry] of this.running) {
       const lastActivity = entry.lastEventAt?.getTime() ?? entry.startedAt.getTime();
       if (now - lastActivity > stallTimeout) {
+        entry.suppressRetryOnExit = true;
         this.markCancellationRequested(entry, {
           source: "stalled",
           reason: "run stalled",
@@ -1719,6 +1722,11 @@ export class Orchestrator {
     const codexConfig = this.config.raw as { codex?: { stall_timeout_ms?: unknown } };
     const stallTimeout = codexConfig.codex?.stall_timeout_ms ?? 300_000;
     return typeof stallTimeout === "number" && stallTimeout > 0 ? stallTimeout : null;
+  }
+
+  private harnessStopRunId(entry: RunningEntry): string | null {
+    if (typeof this.options.harness.stop !== "function") return null;
+    return entry.activeRunId ?? entry.runId;
   }
 }
 

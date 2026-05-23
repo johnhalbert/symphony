@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import path from "node:path";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { mapCursorDelta, mapCursorMessage } from "../cursor/src/CursorEventMapper.js";
 import {
+  CursorHarness,
   completionReportContextFilePath,
   completionReportMcpServerConfig,
   cursorAgentCreateOptions,
@@ -16,7 +17,24 @@ import {
 } from "../cursor/src/CursorHarness.js";
 import { issue, testConfig } from "./helpers.js";
 
+const cursorSdk = vi.hoisted(() => ({
+  create: vi.fn(),
+  resume: vi.fn(),
+}));
+
+vi.mock("@cursor/sdk", () => ({
+  Agent: {
+    create: cursorSdk.create,
+    resume: cursorSdk.resume,
+  },
+}));
+
 describe("Cursor event mapping", () => {
+  beforeEach(() => {
+    cursorSdk.create.mockReset();
+    cursorSdk.resume.mockReset();
+  });
+
   it("maps assistant text to progress", () => {
     const events = mapCursorMessage({
       type: "assistant",
@@ -276,6 +294,56 @@ describe("Cursor event mapping", () => {
     expect(mcpServers.symphony_review_verdict?.args).toEqual(expect.arrayContaining(["review-verdict-mcp"]));
     expect(mcpServers.symphony_review_feedback?.args).toEqual(expect.arrayContaining(["review-feedback-mcp"]));
   });
+
+  it("cancels the SDK run through the abort signal when cancellation happens before session_started", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const controller = new AbortController();
+    const sendDeferred = deferred<{
+      id: string;
+      stream(): AsyncIterable<unknown>;
+      wait(): Promise<{ status: "cancelled" }>;
+      cancel(): Promise<void>;
+    }>();
+    const cancel = vi.fn(async () => undefined);
+    const run = {
+      id: "sdk-run-1",
+      async *stream(): AsyncIterable<unknown> {},
+      wait: async () => ({ status: "cancelled" as const }),
+      cancel,
+    };
+    const send = vi.fn(() => sendDeferred.promise);
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-1",
+      send,
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const harness = new CursorHarness();
+    const iterator = harness.run(
+      {
+        ...agentContext(config, "worker"),
+        abortSignal: controller.signal,
+      },
+      "Work on TEST-1",
+    )[Symbol.asyncIterator]();
+
+    const firstEvent = iterator.next();
+    await waitFor(() => send.mock.calls.length === 1, "agent send to start");
+    controller.abort();
+    await harness.stop("issue-1");
+    expect(cancel).not.toHaveBeenCalled();
+
+    sendDeferred.resolve(run);
+    await expect(firstEvent).resolves.toMatchObject({
+      value: {
+        type: "session_started",
+        runId: "sdk-run-1",
+      },
+      done: false,
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    await iterator.return?.();
+  });
 });
 
 function agentContext(config: ReturnType<typeof parseServiceConfig>, role: "worker" | "reviewer"): AgentRunContext {
@@ -296,4 +364,23 @@ function agentContext(config: ReturnType<typeof parseServiceConfig>, role: "work
     abortSignal: new AbortController().signal,
     logger: new StructuredLogger(() => undefined),
   };
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitFor(predicate: () => boolean, description = "condition", timeoutMs = 2_000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(predicate(), `Timed out waiting for ${description}`).toBe(true);
 }

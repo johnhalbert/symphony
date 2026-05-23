@@ -2214,6 +2214,167 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
+  it("treats stalled cancellation as terminal cancelled without retrying", async () => {
+    const config = testConfig(root);
+    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 1 };
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new StalledAbortHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-stalled", "stalled run to start");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await orchestrator.refreshNow();
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.cancellation.source === "stalled",
+      "stalled cancellation to be recorded",
+    );
+    const stalled = orchestrator.snapshot().running[0];
+    expect(stalled).toMatchObject({
+      liveness: { status: "cancelling" },
+      cancellation: {
+        requested: true,
+        source: "stalled",
+        reason: "run stalled",
+        abortSignalled: true,
+        suppressRetryOnExit: true,
+      },
+    });
+
+    harness.release();
+    await waitFor(() => orchestrator.snapshot().running.length === 0, "stalled run to exit");
+
+    await expect(runStore.getRun("run-stalled")).resolves.toMatchObject({
+      status: "cancelled",
+      error: "stalled abort",
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+    await orchestrator.stop();
+  });
+
+  it("does not record harness stop metadata before a run id is known for operator cancellation", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new PreSessionCancellationHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await harness.started;
+    await orchestrator.cancelIssue(candidate.id);
+
+    const cancelling = orchestrator.snapshot().running[0];
+    expect(cancelling).toMatchObject({
+      runId: null,
+      liveness: { status: "cancelling", activeRunId: null },
+      cancellation: {
+        requested: true,
+        source: "operator",
+        reason: "operator request",
+        abortSignalled: true,
+        harnessStopRequestedAt: null,
+        suppressRetryOnExit: true,
+      },
+    });
+    expect(harness.stoppedRunIds).toEqual([]);
+
+    harness.release();
+    await waitFor(() => orchestrator.snapshot().running.length === 0, "pre-session cancelled run to exit");
+    await orchestrator.stop();
+  });
+
+  it("does not call harness stop with an issue id during pre-session orchestrator shutdown", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new PreSessionCancellationHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await harness.started;
+    const stopPromise = orchestrator.stop();
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.cancellation.source === "service_stop",
+      "service stop cancellation to be recorded",
+    );
+
+    const stopping = orchestrator.snapshot().running[0];
+    expect(stopping).toMatchObject({
+      runId: null,
+      cancellation: {
+        requested: true,
+        source: "service_stop",
+        reason: "orchestrator stop",
+        abortSignalled: true,
+        harnessStopRequestedAt: null,
+      },
+    });
+    expect(harness.stoppedRunIds).toEqual([]);
+
+    harness.release();
+    await stopPromise;
+  });
+
   it("blocks continuation turns for non-resumable harnesses", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
@@ -2529,6 +2690,55 @@ class HeldCancellationHarness implements AgentHarness {
   async *run(): AsyncIterable<AgentEvent> {
     yield { type: "session_started", sessionId: "session-123", runId: "run-123" };
     await this.released;
+    yield { type: "cancelled" };
+  }
+
+  async stop(runId: string): Promise<void> {
+    this.stoppedRunIds.push(runId);
+  }
+
+  release(): void {
+    this.releaseRun();
+  }
+}
+
+class StalledAbortHarness implements AgentHarness {
+  readonly id = "stalled-abort";
+  private releaseRun: () => void = () => undefined;
+  private readonly released = new Promise<void>((resolve) => {
+    this.releaseRun = resolve;
+  });
+
+  async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+    yield { type: "session_started", sessionId: "session-stalled", runId: "run-stalled" };
+    if (!ctx.abortSignal.aborted) {
+      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+    }
+    await this.released;
+    throw new Error("stalled abort");
+  }
+
+  release(): void {
+    this.releaseRun();
+  }
+}
+
+class PreSessionCancellationHarness implements AgentHarness {
+  readonly id = "pre-session-cancellation";
+  readonly stoppedRunIds: string[] = [];
+  private resolveStarted: () => void = () => undefined;
+  readonly started = new Promise<void>((resolve) => {
+    this.resolveStarted = resolve;
+  });
+  private releaseRun: () => void = () => undefined;
+  private readonly released = new Promise<void>((resolve) => {
+    this.releaseRun = resolve;
+  });
+
+  async *run(): AsyncIterable<AgentEvent> {
+    this.resolveStarted();
+    await this.released;
+    yield { type: "session_started", sessionId: "session-pre", runId: "run-pre" };
     yield { type: "cancelled" };
   }
 
