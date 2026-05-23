@@ -123,6 +123,9 @@ During the smoke:
 After the smoke:
 
 - [ ] Inspect `/api/v1/issues/<issue>` and confirm `reviewLoop.phase`, `role`, `reviewRound`, `incompleteTurnCount`, `lastCompletionReport`, `lastReviewVerdict`, and `blockedReason` match the observed loop.
+- [ ] Identify the handoff worker run from `reviewLoop.lastCompletionReport.runId`, or from the matching `role: "worker"` entry in `/api/v1/issues/<issue>/runs` when correlating multiple worker runs. Do not use `latestRun` alone for post-handoff interpretation; after reviewer dispatch, `latestRun` may be a reviewer run while `lastCompletionReport` still describes the worker handoff.
+- [ ] Inspect `/api/v1/runs/<handoffWorkerRunId>`. In the post-handoff context where `reviewLoop.lastCompletionReport` points at that worker run and `reviewLoop.phase` is `review`, `status: "succeeded"` means Symphony reconciled the accepted handoff. A succeeded worker run without a matching completion report is an incomplete turn, not a successful handoff.
+- [ ] Inspect `/api/v1/runs/<handoffWorkerRunId>/transcript` when the SDK tail looks suspicious. Raw harness `failed` or `cancelled` events may appear after an accepted report even though the handoff worker run status is `succeeded`; a throw path may leave no terminal harness event. Treat lifecycle and the report-linked worker run record as authoritative for handoff outcome.
 - [ ] Confirm no unrelated issue acquired `dogfood-ready`, entered `Todo`/`In Progress`, or received a Symphony worker run.
 
 ## 8. Recovery

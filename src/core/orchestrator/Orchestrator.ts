@@ -868,6 +868,14 @@ export class Orchestrator {
         }
       }
       if (event.type === "failed") {
+        if (entry.role === "worker" && (await this.reconcileCompletionReportHandoff(entry))) {
+          await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
+            status: "succeeded",
+            completedAt: new Date().toISOString(),
+            tokens: entry.tokens,
+          });
+          return;
+        }
         await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
           status: "failed",
           completedAt: new Date().toISOString(),
@@ -877,6 +885,14 @@ export class Orchestrator {
         throw new SymphonyError("agent_error", event.error);
       }
       if (event.type === "cancelled") {
+        if (entry.role === "worker" && (await this.reconcileCompletionReportHandoff(entry))) {
+          await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
+            status: "succeeded",
+            completedAt: new Date().toISOString(),
+            tokens: entry.tokens,
+          });
+          return;
+        }
         await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
           status: "cancelled",
           completedAt: new Date().toISOString(),
@@ -893,6 +909,19 @@ export class Orchestrator {
     this.running.delete(issueId);
     this.endedRuntimeSeconds += (Date.now() - entry.startedAt.getTime()) / 1000;
 
+    if (entry.role === "worker" && (await this.reconcileCompletionReportHandoff(entry))) {
+      if (entry.runId) {
+        await this.options.runStore?.updateRun(entry.runId, {
+          status: "succeeded",
+          completedAt: new Date().toISOString(),
+          tokens: entry.tokens,
+        });
+      }
+      this.completed.add(issueId);
+      this.claimed.delete(issueId);
+      return;
+    }
+
     if (kind === "normal") {
       if (entry.runId) {
         await this.options.runStore?.updateRun(entry.runId, {
@@ -904,10 +933,6 @@ export class Orchestrator {
       this.completed.add(issueId);
       if (entry.role === "reviewer") {
         await this.reconcileReviewVerdictHandoff(entry);
-        this.claimed.delete(issueId);
-        return;
-      }
-      if (await this.reconcileCompletionReportHandoff(entry)) {
         this.claimed.delete(issueId);
         return;
       }
