@@ -60,7 +60,15 @@ export class CursorHarness implements AgentHarness {
 
     this.activeRuns.set(run.id, run);
     const abort = () => {
-      void run.cancel();
+      void run.cancel().catch((error) => {
+        ctx.logger.warn("cursor sdk run cancel failed", {
+          run_id: run.id,
+          issue_id: ctx.issue.id,
+          issue_identifier: ctx.issue.identifier,
+          role: ctx.role,
+          error: errorMessage(error),
+        });
+      });
     };
     ctx.abortSignal.addEventListener("abort", abort, { once: true });
     if (ctx.abortSignal.aborted) abort();
@@ -140,7 +148,7 @@ export class CursorHarness implements AgentHarness {
       this.activeRuns.delete(run.id);
       if (ctx.role === "reviewer") {
         this.agents.delete(agentKey(ctx));
-        await agent[Symbol.asyncDispose]();
+        await this.disposeAgent(agent, ctx, "reviewer_run_finished");
       }
     }
   }
@@ -151,7 +159,7 @@ export class CursorHarness implements AgentHarness {
   }
 
   async dispose(): Promise<void> {
-    await Promise.all([...this.agents.values()].map((agent) => agent[Symbol.asyncDispose]()));
+    await Promise.all([...this.agents.values()].map((agent) => this.disposeAgent(agent, null, "harness_dispose")));
     this.agents.clear();
   }
 
@@ -183,6 +191,21 @@ export class CursorHarness implements AgentHarness {
     }
     this.agents.set(key, agent);
     return agent;
+  }
+
+  private async disposeAgent(agent: SDKAgent, ctx: AgentRunContext | null, reason: string): Promise<void> {
+    try {
+      await agent[Symbol.asyncDispose]();
+    } catch (error) {
+      ctx?.logger.warn("cursor sdk agent dispose failed", {
+        agent_id: agent.agentId,
+        issue_id: ctx.issue.id,
+        issue_identifier: ctx.issue.identifier,
+        role: ctx.role,
+        reason,
+        error: errorMessage(error),
+      });
+    }
   }
 }
 

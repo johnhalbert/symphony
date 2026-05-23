@@ -344,6 +344,45 @@ describe("Cursor event mapping", () => {
     expect(cancel).toHaveBeenCalledTimes(1);
     await iterator.return?.();
   });
+
+  it("preserves SDK stream failures when reviewer cleanup also fails", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const dispose = vi.fn(async () => {
+      throw new Error("dispose auth failure");
+    });
+    const run = {
+      id: "sdk-run-auth",
+      async *stream(): AsyncIterable<unknown> {
+        throw new Error("authentication stream failure");
+      },
+      wait: vi.fn(async () => ({ status: "failed" as const, result: "wait should not run" })),
+      cancel: vi.fn(async () => undefined),
+    };
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-auth",
+      send: vi.fn(async () => run),
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: dispose,
+    });
+    const harness = new CursorHarness();
+    const events: unknown[] = [];
+
+    await expect(async () => {
+      for await (const event of harness.run(agentContext(config, "reviewer"), "Review TEST-1")) {
+        events.push(event);
+      }
+    }).rejects.toThrow("Cursor run failed: authentication stream failure");
+
+    expect(events).toEqual([
+      {
+        type: "session_started",
+        sessionId: "agent-auth:sdk-run-auth",
+        threadId: "agent-auth",
+        runId: "sdk-run-auth",
+      },
+    ]);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
 });
 
 function agentContext(config: ReturnType<typeof parseServiceConfig>, role: "worker" | "reviewer"): AgentRunContext {
