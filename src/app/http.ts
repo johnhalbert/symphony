@@ -67,6 +67,7 @@ export class StatusServer {
             this.options.orchestrator.snapshot(),
             Boolean(this.options.openWorkspaceToken),
             this.options.runStore,
+            this.options.lifecycleStore,
           ),
         );
         return;
@@ -75,7 +76,12 @@ export class StatusServer {
         const snapshot = this.options.orchestrator.snapshot();
         sendJson(response, 200, {
           ...snapshot,
-          operatorView: await operatorSnapshotView(snapshot, Boolean(this.options.openWorkspaceToken), this.options.runStore),
+          operatorView: await operatorSnapshotView(
+            snapshot,
+            Boolean(this.options.openWorkspaceToken),
+            this.options.runStore,
+            this.options.lifecycleStore,
+          ),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
@@ -181,13 +187,21 @@ export class StatusServer {
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
+        const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
         const operatorLiveness = issueOperatorLiveness({
           live,
           latestRun,
           lifecycle,
           paused,
+          resolvedAgentId,
         });
         const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
+        const affordances = operatorAffordances({
+          issueKey: issueId,
+          lifecycle,
+          continuationSummaryAvailable: Boolean(this.options.lifecycleStore && this.options.runStore),
+          mutationsRequireToken: controls.mutationsRequireToken,
+        });
         sendJson(response, 200, {
           issue: issueId,
           live: live ? { ...live, operatorLiveness } : null,
@@ -206,17 +220,8 @@ export class StatusServer {
             pause: controls.pause,
             resume: controls.resume,
             cancel: controls.cancel,
-            humanRequired: {
-              active: isLifecycleBlocked(lifecycle),
-              reason: lifecycle?.blockedReason ?? null,
-              continuationSummaryRecommended: isLifecycleBlocked(lifecycle),
-            },
-            continuationSummary: {
-              available: Boolean(this.options.lifecycleStore && this.options.runStore),
-              method: "POST",
-              path: `/api/v1/issues/${encodeURIComponent(issueId)}/continuation-summary`,
-              requiresToken: controls.mutationsRequireToken,
-            },
+            humanRequired: affordances.humanRequired,
+            continuationSummary: affordances.continuationSummary,
             mutationsRequireToken: controls.mutationsRequireToken,
             mutationHeader: "X-Symphony-Token",
           },
@@ -239,13 +244,16 @@ export class StatusServer {
         const runId = decodeURIComponent(runMatch[1] ?? "");
         const run = await this.options.runStore?.getRun(runId);
         if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
+        const issueRunsByIdentifier = (await this.options.runStore?.listRunsForIssue(run.issueIdentifier)) ?? [];
+        const issueRuns =
+          issueRunsByIdentifier.length > 0 || run.issueIdentifier === run.issueId
+            ? issueRunsByIdentifier
+            : ((await this.options.runStore?.listRunsForIssue(run.issueId)) ?? []);
+        const lifecycle =
+          (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
           ...run,
-          operatorLiveness: runOperatorLiveness(
-            run,
-            this.options.orchestrator.snapshot(),
-            (await this.options.lifecycleStore?.get(run.issueId)) ?? null,
-          ),
+          operatorLiveness: runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
@@ -341,10 +349,33 @@ interface OperatorControls {
   mutationsRequireToken: boolean;
 }
 
+interface OperatorAffordances {
+  humanRequired: {
+    active: boolean;
+    reason: string | null;
+    continuationSummaryRecommended: boolean;
+  };
+  continuationSummary: {
+    available: boolean;
+    method: "POST";
+    path: string;
+    requiresToken: boolean;
+  };
+}
+
+interface PausedOperatorView extends OperatorAffordances {
+  issueId: string;
+  issueIdentifier: string;
+  label: string;
+  paused: true;
+  controls: OperatorControls;
+}
+
 async function renderDashboard(
   snapshot: RuntimeSnapshot,
   mutationsConfigured: boolean,
   runStore?: RunTranscriptStore,
+  lifecycleStore?: IssueLifecycleStore,
 ): Promise<string> {
   const runningRows = await Promise.all(
     snapshot.running.map(async (row) => ({
@@ -352,12 +383,20 @@ async function renderDashboard(
       agentId: await resolveRunningAgentId(row, runStore),
     })),
   );
-  const running = runningRows.map(({ row, agentId }) => renderRunningRow(row, snapshot, mutationsConfigured, agentId)).join("");
+  const running = runningRows
+    .map(({ row, agentId }) =>
+      renderRunningRow(row, snapshot, mutationsConfigured, agentId, Boolean(lifecycleStore && runStore)),
+    )
+    .join("");
+  const pausedRows = await pausedOperatorViews(snapshot.paused, mutationsConfigured, runStore, lifecycleStore);
   const paused =
-    snapshot.paused.length === 0
+    pausedRows.length === 0
       ? ""
-      : `<section><h2>Paused</h2><ul class="plain-list">${snapshot.paused
-          .map((issueId) => `<li><span class="paused-label">Paused (internal id only)</span> <code>${escapeHtml(issueId)}</code></li>`)
+      : `<section><h2>Paused</h2><ul class="plain-list">${pausedRows
+          .map(
+            (row) =>
+              `<li><span class="paused-label">${escapeHtml(row.label)}</span> <code>${escapeHtml(row.issueId)}</code><div class="controls">controls: ${formatControls(row.controls)}</div>${formatAffordances(row)}</li>`,
+          )
           .join("")}</ul></section>`;
   const retrying =
     snapshot.retrying.length === 0
@@ -399,7 +438,7 @@ async function renderDashboard(
   <body>
     <h1>Symphony</h1>
     <p>Running: ${snapshot.counts.running}, retrying: ${snapshot.counts.retrying}, paused: ${snapshot.counts.paused}</p>
-    <p class="meta">Mutations ${mutationsConfigured ? "require X-Symphony-Token" : "do not require a configured token"}; use the existing pause, resume, and cancel API endpoints.</p>
+    <p class="meta">Mutations ${mutationsConfigured ? "require X-Symphony-Token" : "do not require a configured token"}; use the existing pause, resume, cancel, and continuation-summary API endpoints.</p>
     <section>
       <h2>Running Agents</h2>
       <ul class="plain-list">${running || "<li>No active runs</li>"}</ul>
@@ -411,11 +450,23 @@ async function renderDashboard(
 </html>`;
 }
 
-function renderRunningRow(row: RunningRow, snapshot: RuntimeSnapshot, mutationsConfigured: boolean, agentId: string | null): string {
+function renderRunningRow(
+  row: RunningRow,
+  snapshot: RuntimeSnapshot,
+  mutationsConfigured: boolean,
+  agentId: string | null,
+  continuationSummaryAvailable: boolean,
+): string {
   const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
   const paused = isIssuePaused(snapshot, keys);
   const operator = runningOperatorLiveness(row, paused, row.lifecycle, agentId);
   const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
+  const affordances = operatorAffordances({
+    issueKey: row.issueIdentifier,
+    lifecycle: row.lifecycle,
+    continuationSummaryAvailable,
+    mutationsRequireToken: controls.mutationsRequireToken,
+  });
   const runId = row.liveness.activeRunId ?? row.runId ?? "n/a";
   const idle = `${Math.round(row.liveness.secondsSinceLastActivity)}s idle`;
   const threshold = row.liveness.stallTimeoutMs === null ? "no stall threshold" : `${row.liveness.stallTimeoutMs}ms threshold`;
@@ -430,15 +481,28 @@ function renderRunningRow(row: RunningRow, snapshot: RuntimeSnapshot, mutationsC
     ${cancellation ? `<div class="cancellation">${escapeHtml(cancellation)}</div>` : ""}
     ${blockedReason ? `<div class="blocked">Blocked: ${escapeHtml(blockedReason)}</div>` : ""}
     <div class="controls">controls: ${formatControls(controls)}</div>
+    ${formatAffordances(affordances)}
   </li>`;
 }
 
-async function operatorSnapshotView(snapshot: RuntimeSnapshot, mutationsConfigured: boolean, runStore?: RunTranscriptStore) {
+async function operatorSnapshotView(
+  snapshot: RuntimeSnapshot,
+  mutationsConfigured: boolean,
+  runStore?: RunTranscriptStore,
+  lifecycleStore?: IssueLifecycleStore,
+) {
   const running = await Promise.all(
     snapshot.running.map(async (row) => {
       const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
       const paused = isIssuePaused(snapshot, keys);
       const agentId = await resolveRunningAgentId(row, runStore);
+      const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
+      const affordances = operatorAffordances({
+        issueKey: row.issueIdentifier,
+        lifecycle: row.lifecycle,
+        continuationSummaryAvailable: Boolean(lifecycleStore && runStore),
+        mutationsRequireToken: controls.mutationsRequireToken,
+      });
       return {
         issueId: row.issueId,
         issueIdentifier: row.issueIdentifier,
@@ -448,7 +512,8 @@ async function operatorSnapshotView(snapshot: RuntimeSnapshot, mutationsConfigur
         workspacePath: row.workspacePath,
         paused,
         liveness: runningOperatorLiveness(row, paused, row.lifecycle, agentId),
-        controls: operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured }),
+        controls,
+        ...affordances,
       };
     }),
   );
@@ -457,7 +522,7 @@ async function operatorSnapshotView(snapshot: RuntimeSnapshot, mutationsConfigur
     mutationsRequireToken: mutationsConfigured,
     operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
     running,
-    paused: snapshot.paused.map((issueId) => ({ issueId, label: "Paused (internal id only)" })),
+    paused: await pausedOperatorViews(snapshot.paused, mutationsConfigured, runStore, lifecycleStore),
     retrying: snapshot.retrying,
   };
 }
@@ -512,19 +577,44 @@ function runMatchesLiveRow(row: RunningRow, run: RunRecord | null): run is RunRe
   return run !== null && (run.runId === row.runId || run.runId === row.liveness.activeRunId);
 }
 
+async function pausedOperatorViews(
+  pausedKeys: string[],
+  mutationsConfigured: boolean,
+  runStore?: RunTranscriptStore,
+  lifecycleStore?: IssueLifecycleStore,
+): Promise<PausedOperatorView[]> {
+  return Promise.all(
+    pausedKeys.map(async (pausedKey) => {
+      const lifecycle = (await lifecycleStore?.get(pausedKey)) ?? null;
+      const workspace = await runStore?.findWorkspace(pausedKey);
+      const issueIdentifier = lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? pausedKey;
+      const controls = operatorControls({ issueKnown: true, live: null, paused: true, mutationsConfigured });
+      return {
+        issueId: pausedKey,
+        issueIdentifier,
+        label: `Paused ${issueIdentifier}`,
+        paused: true,
+        controls,
+        ...operatorAffordances({
+          issueKey: issueIdentifier,
+          lifecycle,
+          continuationSummaryAvailable: Boolean(lifecycleStore && runStore),
+          mutationsRequireToken: controls.mutationsRequireToken,
+        }),
+      };
+    }),
+  );
+}
+
 function issueOperatorLiveness(input: {
   live: RunningRow | null;
   latestRun: RunRecord | null | undefined;
   lifecycle: IssueLifecycleRecord | null | undefined;
   paused: boolean;
+  resolvedAgentId: string | null;
 }) {
   if (input.live) {
-    const agentId =
-      input.latestRun &&
-      (input.latestRun.runId === input.live.runId || input.latestRun.runId === input.live.liveness.activeRunId)
-        ? input.latestRun.agentId
-        : null;
-    return runningOperatorLiveness(input.live, input.paused, input.lifecycle ?? input.live.lifecycle, agentId);
+    return runningOperatorLiveness(input.live, input.paused, input.lifecycle ?? input.live.lifecycle, input.resolvedAgentId);
   }
   if (isLifecycleBlocked(input.lifecycle)) {
     return terminalOperatorLiveness("blocked_human_required", input.latestRun ?? null, input.lifecycle ?? null, input.paused);
@@ -780,6 +870,28 @@ function operatorControls(input: {
   };
 }
 
+function operatorAffordances(input: {
+  issueKey: string;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+  continuationSummaryAvailable: boolean;
+  mutationsRequireToken: boolean;
+}): OperatorAffordances {
+  const blocked = isLifecycleBlocked(input.lifecycle);
+  return {
+    humanRequired: {
+      active: blocked,
+      reason: input.lifecycle?.blockedReason ?? null,
+      continuationSummaryRecommended: blocked,
+    },
+    continuationSummary: {
+      available: input.continuationSummaryAvailable,
+      method: "POST",
+      path: `/api/v1/issues/${encodeURIComponent(input.issueKey)}/continuation-summary`,
+      requiresToken: input.mutationsRequireToken,
+    },
+  };
+}
+
 function cancellationSummary(row: RunningRow): string | null {
   if (!row.cancellation.requested) return null;
   return [
@@ -802,6 +914,18 @@ function formatControls(controls: OperatorControls): string {
   ].filter((item): item is string => item !== null);
   const token = controls.mutationsRequireToken ? "requires X-Symphony-Token" : "no configured token";
   return `${enabled.length === 0 ? "status only" : enabled.join(", ")} (${token})`;
+}
+
+function formatAffordances(affordances: OperatorAffordances): string {
+  if (!affordances.humanRequired.active) return "";
+  const parts = [
+    "human-required",
+    affordances.humanRequired.reason,
+    affordances.continuationSummary.available
+      ? `continuation-summary ${affordances.continuationSummary.method} ${affordances.continuationSummary.path}`
+      : "continuation-summary unavailable",
+  ].filter((part): part is string => part !== null && part.length > 0);
+  return `<div class="blocked">${escapeHtml(parts.join(" · "))}</div>`;
 }
 
 function parsePagination(url: URL): { offset: number; limit: number } {
