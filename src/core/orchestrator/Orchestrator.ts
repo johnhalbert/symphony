@@ -99,6 +99,11 @@ export interface RunningEntry {
   completionReportAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
+  cancellationRequestedAt: Date | null;
+  cancellationSource: RunCancellationSource | null;
+  cancellationReason: string | null;
+  abortSignalledAt: Date | null;
+  harnessStopRequestedAt: Date | null;
 }
 
 interface ReviewerDispatchEvidence {
@@ -137,6 +142,8 @@ export interface RuntimeSnapshot {
     lastMessage: string | null;
     startedAt: string;
     lastEventAt: string | null;
+    liveness: RunLivenessState;
+    cancellation: RunCancellationState;
     tokens: TokenCounts;
     lifecycle: IssueLifecycleRecord | null;
     metadata: IssueRunMetadata;
@@ -151,6 +158,28 @@ export interface RuntimeSnapshot {
   paused: string[];
   totals: RuntimeTotals;
   rateLimits: unknown;
+}
+
+export type RunLivenessStatus = "starting" | "active" | "stalled" | "cancelling";
+
+export interface RunLivenessState {
+  status: RunLivenessStatus;
+  activeRunId: string | null;
+  lastActivityAt: string;
+  secondsSinceLastActivity: number;
+  stallTimeoutMs: number | null;
+}
+
+export type RunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
+
+export interface RunCancellationState {
+  requested: boolean;
+  requestedAt: string | null;
+  source: RunCancellationSource | null;
+  reason: string | null;
+  abortSignalled: boolean;
+  harnessStopRequestedAt: string | null;
+  suppressRetryOnExit: boolean;
 }
 
 export interface IssueRunMetadata {
@@ -268,8 +297,16 @@ export class Orchestrator {
     if (this.pollTimer) clearTimeout(this.pollTimer);
     for (const retry of this.retryAttempts.values()) clearTimeout(retry.timer);
     for (const [issueId, running] of this.running) {
+      running.suppressRetryOnExit = true;
+      const stopRunId = this.harnessStopRunId(running);
+      this.markCancellationRequested(running, {
+        source: "service_stop",
+        reason: "orchestrator stop",
+        abortSignalled: true,
+        harnessStopRequested: stopRunId !== null,
+      });
       running.abortController.abort();
-      await this.options.harness.stop?.(running.runId ?? issueId);
+      if (stopRunId !== null) await this.options.harness.stop?.(stopRunId);
     }
     await Promise.allSettled([...this.running.values()].map((entry) => entry.worker));
   }
@@ -299,8 +336,15 @@ export class Orchestrator {
     const running = this.running.get(issueId);
     if (!running) return;
     running.suppressRetryOnExit = true;
+    const stopRunId = this.harnessStopRunId(running);
+    this.markCancellationRequested(running, {
+      source: "operator",
+      reason: "operator request",
+      abortSignalled: true,
+      harnessStopRequested: stopRunId !== null,
+    });
     running.abortController.abort();
-    await this.options.harness.stop?.(running.runId ?? issueId);
+    if (stopRunId !== null) await this.options.harness.stop?.(stopRunId);
   }
 
   async createContinuationSummary(
@@ -361,6 +405,8 @@ export class Orchestrator {
         lastMessage: entry.lastMessage,
         startedAt: entry.startedAt.toISOString(),
         lastEventAt: entry.lastEventAt?.toISOString() ?? null,
+        liveness: this.livenessForEntry(entry, now),
+        cancellation: cancellationForEntry(entry),
         tokens: entry.tokens,
         lifecycle: entry.lifecycle,
         metadata: metadataForRunningEntry(entry),
@@ -467,13 +513,18 @@ export class Orchestrator {
   }
 
   private reconcileStalledRuns(): void {
-    const codexConfig = this.config.raw as { codex?: { stall_timeout_ms?: unknown } };
-    const stallTimeout = codexConfig.codex?.stall_timeout_ms ?? 300_000;
-    if (typeof stallTimeout !== "number" || stallTimeout <= 0) return;
+    const stallTimeout = this.stallTimeoutMs();
+    if (stallTimeout === null) return;
     const now = Date.now();
     for (const [issueId, entry] of this.running) {
       const lastActivity = entry.lastEventAt?.getTime() ?? entry.startedAt.getTime();
       if (now - lastActivity > stallTimeout) {
+        entry.suppressRetryOnExit = true;
+        this.markCancellationRequested(entry, {
+          source: "stalled",
+          reason: "run stalled",
+          abortSignalled: true,
+        });
         entry.abortController.abort();
         this.options.logger.warn("run stalled", {
           issue_id: issueId,
@@ -487,6 +538,11 @@ export class Orchestrator {
     const entry = this.running.get(issueId);
     if (!entry) return;
     entry.suppressRetryOnExit = true;
+    this.markCancellationRequested(entry, {
+      source: "state_change",
+      reason,
+      abortSignalled: true,
+    });
     entry.abortController.abort();
     if (cleanupWorkspace) {
       entry.cleanupWorkspaceOnExit = true;
@@ -675,6 +731,11 @@ export class Orchestrator {
       completionReportAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
+      cancellationRequestedAt: null,
+      cancellationSource: null,
+      cancellationReason: null,
+      abortSignalledAt: null,
+      harnessStopRequestedAt: null,
     };
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
@@ -1613,6 +1674,61 @@ export class Orchestrator {
   private activeRuntimeSeconds(now: number): number {
     return [...this.running.values()].reduce((sum, entry) => sum + (now - entry.startedAt.getTime()) / 1000, 0);
   }
+
+  private markCancellationRequested(
+    entry: RunningEntry,
+    input: {
+      source: RunCancellationSource;
+      reason: string;
+      abortSignalled?: boolean;
+      harnessStopRequested?: boolean;
+    },
+    now = new Date(),
+  ): void {
+    if (!entry.cancellationRequestedAt) {
+      entry.cancellationRequestedAt = now;
+      entry.cancellationSource = input.source;
+      entry.cancellationReason = input.reason;
+    }
+    if (input.abortSignalled) {
+      entry.abortSignalledAt = entry.abortSignalledAt ?? now;
+    }
+    if (input.harnessStopRequested) {
+      entry.harnessStopRequestedAt = now;
+    }
+  }
+
+  private livenessForEntry(entry: RunningEntry, now: number): RunLivenessState {
+    const stallTimeoutMs = this.stallTimeoutMs();
+    const lastActivityAt = entry.lastEventAt ?? entry.startedAt;
+    const idleMs = Math.max(now - lastActivityAt.getTime(), 0);
+    const status: RunLivenessStatus =
+      entry.cancellationRequestedAt !== null
+        ? "cancelling"
+        : stallTimeoutMs !== null && idleMs > stallTimeoutMs
+          ? "stalled"
+          : entry.runId === null
+            ? "starting"
+            : "active";
+    return {
+      status,
+      activeRunId: entry.activeRunId,
+      lastActivityAt: lastActivityAt.toISOString(),
+      secondsSinceLastActivity: idleMs / 1000,
+      stallTimeoutMs,
+    };
+  }
+
+  private stallTimeoutMs(): number | null {
+    const codexConfig = this.config.raw as { codex?: { stall_timeout_ms?: unknown } };
+    const stallTimeout = codexConfig.codex?.stall_timeout_ms ?? 300_000;
+    return typeof stallTimeout === "number" && stallTimeout > 0 ? stallTimeout : null;
+  }
+
+  private harnessStopRunId(entry: RunningEntry): string | null {
+    if (typeof this.options.harness.stop !== "function") return null;
+    return entry.activeRunId ?? entry.runId;
+  }
 }
 
 export function sortIssuesForDispatch(issues: Issue[]): Issue[] {
@@ -1801,5 +1917,17 @@ function metadataForRunningEntry(entry: RunningEntry): IssueRunMetadata {
     gitBranchName: pointers?.gitBranchName ?? entry.workspace?.gitBranchName ?? entry.issue.branchName ?? null,
     repoPath: pointers?.repoPath ?? entry.workspace?.repoPath ?? null,
     baseRef: pointers?.baseRef ?? entry.workspace?.baseRef ?? null,
+  };
+}
+
+function cancellationForEntry(entry: RunningEntry): RunCancellationState {
+  return {
+    requested: entry.cancellationRequestedAt !== null,
+    requestedAt: entry.cancellationRequestedAt?.toISOString() ?? null,
+    source: entry.cancellationSource,
+    reason: entry.cancellationReason,
+    abortSignalled: entry.abortSignalledAt !== null || entry.abortController.signal.aborted,
+    harnessStopRequestedAt: entry.harnessStopRequestedAt?.toISOString() ?? null,
+    suppressRetryOnExit: entry.suppressRetryOnExit,
   };
 }
