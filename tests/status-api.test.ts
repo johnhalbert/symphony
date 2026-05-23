@@ -537,9 +537,10 @@ describe("StatusServer durable API", () => {
       const baseUrl = `http://${address.host}:${address.port}`;
       const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
       const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const dashboardResponse = await fetch(`${baseUrl}/`);
       const stateBody = (await stateResponse.json()) as {
         running: Array<{ liveness: unknown; cancellation: unknown }>;
-        operatorView: { running: Array<{ liveness: { status: string }; controls: { cancel: boolean } }> };
+        operatorView: { running: Array<{ liveness: { status: string; agentId: string | null }; controls: { cancel: boolean } }> };
         operatorLivenessContract: { deferred: { cancelFailed: { tracked: boolean } } };
       };
       const issueBody = (await issueResponse.json()) as {
@@ -553,9 +554,11 @@ describe("StatusServer durable API", () => {
           humanRequired: { active: boolean };
         };
       };
+      const dashboardHtml = await dashboardResponse.text();
 
       expect(stateResponse.status).toBe(200);
       expect(issueResponse.status).toBe(200);
+      expect(dashboardResponse.status).toBe(200);
       expect(stateBody.running[0]).toMatchObject({
         liveness: { status: "cancelling", activeRunId: "run-1" },
         cancellation: {
@@ -576,9 +579,10 @@ describe("StatusServer durable API", () => {
         },
       });
       expect(stateBody.operatorView.running[0]).toMatchObject({
-        liveness: { status: "cancelling" },
+        liveness: { status: "cancelling", agentId: "agent-1" },
         controls: { cancel: false },
       });
+      expect(dashboardHtml).toContain("agent <code>agent-1</code>");
       expect(issueBody.operatorLiveness).toMatchObject({ status: "cancelling" });
       expect(issueBody.live.operatorLiveness).toMatchObject({ status: "cancelling" });
       expect(issueBody.operatorLiveness.agentId).toBe("agent-1");

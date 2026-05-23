@@ -61,14 +61,21 @@ export class StatusServer {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       if (request.method === "GET" && url.pathname === "/") {
-        sendHtml(response, renderDashboard(this.options.orchestrator.snapshot(), Boolean(this.options.openWorkspaceToken)));
+        sendHtml(
+          response,
+          await renderDashboard(
+            this.options.orchestrator.snapshot(),
+            Boolean(this.options.openWorkspaceToken),
+            this.options.runStore,
+          ),
+        );
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/state") {
         const snapshot = this.options.orchestrator.snapshot();
         sendJson(response, 200, {
           ...snapshot,
-          operatorView: operatorSnapshotView(snapshot, Boolean(this.options.openWorkspaceToken)),
+          operatorView: await operatorSnapshotView(snapshot, Boolean(this.options.openWorkspaceToken), this.options.runStore),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
@@ -334,8 +341,18 @@ interface OperatorControls {
   mutationsRequireToken: boolean;
 }
 
-function renderDashboard(snapshot: RuntimeSnapshot, mutationsConfigured: boolean): string {
-  const running = snapshot.running.map((row) => renderRunningRow(row, snapshot, mutationsConfigured)).join("");
+async function renderDashboard(
+  snapshot: RuntimeSnapshot,
+  mutationsConfigured: boolean,
+  runStore?: RunTranscriptStore,
+): Promise<string> {
+  const runningRows = await Promise.all(
+    snapshot.running.map(async (row) => ({
+      row,
+      agentId: await resolveRunningAgentId(row, runStore),
+    })),
+  );
+  const running = runningRows.map(({ row, agentId }) => renderRunningRow(row, snapshot, mutationsConfigured, agentId)).join("");
   const paused =
     snapshot.paused.length === 0
       ? ""
@@ -394,10 +411,10 @@ function renderDashboard(snapshot: RuntimeSnapshot, mutationsConfigured: boolean
 </html>`;
 }
 
-function renderRunningRow(row: RunningRow, snapshot: RuntimeSnapshot, mutationsConfigured: boolean): string {
+function renderRunningRow(row: RunningRow, snapshot: RuntimeSnapshot, mutationsConfigured: boolean, agentId: string | null): string {
   const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
   const paused = isIssuePaused(snapshot, keys);
-  const operator = runningOperatorLiveness(row, paused);
+  const operator = runningOperatorLiveness(row, paused, row.lifecycle, agentId);
   const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
   const runId = row.liveness.activeRunId ?? row.runId ?? "n/a";
   const idle = `${Math.round(row.liveness.secondsSinceLastActivity)}s idle`;
@@ -406,7 +423,7 @@ function renderRunningRow(row: RunningRow, snapshot: RuntimeSnapshot, mutationsC
   const blockedReason = row.lifecycle?.blockedReason ?? null;
   return `<li class="run-row operator-${operator.status}">
     <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.state)}</span></div>
-    <div class="meta">run <code>${escapeHtml(runId)}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
+    <div class="meta">run <code>${escapeHtml(runId)}</code> · agent <code>${escapeHtml(agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
     <div class="activity">last activity ${escapeHtml(row.liveness.lastActivityAt)} (${escapeHtml(idle)}, ${escapeHtml(threshold)}); event <code>${escapeHtml(row.lastEvent ?? "n/a")}</code>${row.lastEventAt ? ` at ${escapeHtml(row.lastEventAt)}` : ""}</div>
     ${row.lastMessage ? `<div>${escapeHtml(row.lastMessage)}</div>` : ""}
     <div><code>${escapeHtml(row.workspacePath ?? "")}</code></div>
@@ -416,14 +433,12 @@ function renderRunningRow(row: RunningRow, snapshot: RuntimeSnapshot, mutationsC
   </li>`;
 }
 
-function operatorSnapshotView(snapshot: RuntimeSnapshot, mutationsConfigured: boolean) {
-  return {
-    generatedAt: snapshot.generatedAt,
-    mutationsRequireToken: mutationsConfigured,
-    operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
-    running: snapshot.running.map((row) => {
+async function operatorSnapshotView(snapshot: RuntimeSnapshot, mutationsConfigured: boolean, runStore?: RunTranscriptStore) {
+  const running = await Promise.all(
+    snapshot.running.map(async (row) => {
       const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
       const paused = isIssuePaused(snapshot, keys);
+      const agentId = await resolveRunningAgentId(row, runStore);
       return {
         issueId: row.issueId,
         issueIdentifier: row.issueIdentifier,
@@ -432,10 +447,16 @@ function operatorSnapshotView(snapshot: RuntimeSnapshot, mutationsConfigured: bo
         runId: row.liveness.activeRunId ?? row.runId,
         workspacePath: row.workspacePath,
         paused,
-        liveness: runningOperatorLiveness(row, paused),
+        liveness: runningOperatorLiveness(row, paused, row.lifecycle, agentId),
         controls: operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured }),
       };
     }),
+  );
+  return {
+    generatedAt: snapshot.generatedAt,
+    mutationsRequireToken: mutationsConfigured,
+    operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
+    running,
     paused: snapshot.paused.map((issueId) => ({ issueId, label: "Paused (internal id only)" })),
     retrying: snapshot.retrying,
   };
@@ -471,6 +492,24 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
     },
     timeline: liveTimeline(row),
   };
+}
+
+async function resolveRunningAgentId(row: RunningRow, runStore?: RunTranscriptStore): Promise<string | null> {
+  if (!runStore) return null;
+  const runId = row.liveness.activeRunId ?? row.runId;
+  if (runId) {
+    const run = await runStore.getRun(runId);
+    if (runMatchesLiveRow(row, run)) return run.agentId;
+  }
+  for (const issueKey of [row.issueId, row.issueIdentifier]) {
+    const run = await runStore.latestRunForIssue(issueKey);
+    if (runMatchesLiveRow(row, run)) return run.agentId;
+  }
+  return null;
+}
+
+function runMatchesLiveRow(row: RunningRow, run: RunRecord | null): run is RunRecord {
+  return run !== null && (run.runId === row.runId || run.runId === row.liveness.activeRunId);
 }
 
 function issueOperatorLiveness(input: {
