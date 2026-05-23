@@ -82,4 +82,37 @@ describe("FileRunTranscriptStore", () => {
     ]);
     expect(page.nextOffset).toBeNull();
   });
+
+  it("can scope latest issue run lookup by role", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await store.startRun({
+      runId: "worker-run",
+      sessionId: "worker-session",
+      agentId: "worker-agent",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+    await store.startRun({
+      runId: "reviewer-run",
+      sessionId: "reviewer-session",
+      agentId: "reviewer-agent",
+      role: "reviewer",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 2,
+      prompt: "review",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+
+    await expect(store.latestRunForIssue("TEST-1")).resolves.toMatchObject({ runId: "reviewer-run" });
+    await expect(store.latestRunForIssue("TEST-1", { role: "worker" })).resolves.toMatchObject({ runId: "worker-run" });
+  });
 });

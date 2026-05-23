@@ -189,6 +189,8 @@ describe("StatusServer durable API", () => {
                 rawSystemToolPayloads: [[{ name: "read_file" }]],
                 rawToolNames: ["read_file"],
                 normalizedToolNames: [],
+                mcpTraceFile: null,
+                mcpTraceMethodsByServer: {},
                 observedMessageTypes: ["system"],
                 messageTypeCounts: { system: 1 },
                 streamError: null,

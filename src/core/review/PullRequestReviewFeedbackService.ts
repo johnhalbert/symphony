@@ -243,6 +243,7 @@ export class PullRequestReviewFeedbackService {
 
 export function reviewFeedbackInputSchema(): Record<string, unknown> {
   return {
+    type: "object",
     oneOf: [
       {
         type: "object",

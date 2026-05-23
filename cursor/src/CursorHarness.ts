@@ -36,67 +36,26 @@ export class CursorHarness implements AgentHarness {
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     const agent = await this.getOrCreateAgent(ctx);
     const deltaEvents: AgentEvent[] = [];
-    const completionReportContextFile = completionReportContextFilePath(ctx);
-    const isWorker = ctx.role === "worker";
-    const reviewVerdictContextFile = reviewVerdictContextFilePath(ctx);
-    const reviewFeedbackContextFile = reviewFeedbackContextFilePath(ctx);
-    const isReviewer = ctx.role === "reviewer";
     const cliPath = currentSymphonyCliPath();
-    if (isWorker) {
-      await writeCompletionReportMcpContext(completionReportContextFile, {
-        issue: ctx.issue,
-        activeRunId: null,
-        role: "worker",
-        token: null,
-        expectedToken: null,
-        sessionId: null,
-        workspacePath: ctx.workspace.path,
-        workspace: ctx.workspace,
-        phase: "implementation",
-      });
-    }
-    if (isReviewer) {
-      await writeReviewVerdictMcpContext(reviewVerdictContextFile, {
-        issue: ctx.issue,
-        activeRunId: null,
-        role: "reviewer",
-        token: null,
-        expectedToken: null,
-        reviewer: null,
-        phase: "review",
-      });
-      await writeReviewFeedbackMcpContext(reviewFeedbackContextFile, {
-        issue: ctx.issue,
-        activeRunId: null,
-        role: "reviewer",
-        token: null,
-        expectedToken: null,
-        reviewer: null,
-        phase: "review",
-      });
-    }
+    await writeInitialRoleMcpContexts(ctx);
     const runOptions: NonNullable<Parameters<SDKAgent["send"]>[1]> = {
       model: cursorModelSelection(ctx),
       local: { force: true },
       onDelta: ({ update }) => {
         deltaEvents.push(...mapCursorDelta(update));
       },
-      ...(isWorker
-        ? {
-            mcpServers: {
-              symphony: completionReportMcpServerConfig(ctx, completionReportContextFile, { cliPath }),
-            },
-          }
-        : isReviewer
-          ? {
-              mcpServers: {
-                symphony_review_verdict: reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFile, { cliPath }),
-                symphony_review_feedback: reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFile, { cliPath }),
-              },
-            }
-        : {}),
+      mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
     };
-    const run = await agent.send(prompt, runOptions);
+    let run: Run;
+    try {
+      run = await agent.send(prompt, runOptions);
+    } catch (error) {
+      if (ctx.role === "reviewer") {
+        this.agents.delete(agentKey(ctx));
+        await agent[Symbol.asyncDispose]().catch(() => undefined);
+      }
+      throw error;
+    }
 
     this.activeRuns.set(run.id, run);
     const abort = () => {
@@ -104,14 +63,9 @@ export class CursorHarness implements AgentHarness {
     };
     ctx.abortSignal.addEventListener("abort", abort, { once: true });
 
-    yield {
-      type: "session_started",
-      sessionId: `${agent.agentId}:${run.id}`,
-      threadId: agent.agentId,
-      runId: run.id,
-    };
-    if (isWorker) {
-      await writeCompletionReportMcpContext(completionReportContextFile, {
+    try {
+    if (ctx.role === "worker") {
+      await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
         issue: ctx.issue,
         activeRunId: run.id,
         role: "worker",
@@ -123,8 +77,8 @@ export class CursorHarness implements AgentHarness {
         phase: "implementation",
       });
     }
-    if (isReviewer) {
-      await writeReviewVerdictMcpContext(reviewVerdictContextFile, {
+    if (ctx.role === "reviewer") {
+      await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
         issue: ctx.issue,
         activeRunId: run.id,
         role: "reviewer",
@@ -133,7 +87,7 @@ export class CursorHarness implements AgentHarness {
         reviewer: `${agent.agentId}:${run.id}`,
         phase: "review",
       });
-      await writeReviewFeedbackMcpContext(reviewFeedbackContextFile, {
+      await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
         issue: ctx.issue,
         activeRunId: run.id,
         role: "reviewer",
@@ -143,12 +97,17 @@ export class CursorHarness implements AgentHarness {
         phase: "review",
       });
     }
+    yield {
+      type: "session_started",
+      sessionId: `${agent.agentId}:${run.id}`,
+      threadId: agent.agentId,
+      runId: run.id,
+    };
     await this.options.runStore?.updateRun(run.id, {
       sessionId: `${agent.agentId}:${run.id}`,
       agentId: agent.agentId,
     });
 
-    try {
       for await (const message of run.stream()) {
         await this.options.runStore?.appendEvent({
           runId: run.id,
@@ -199,8 +158,12 @@ export class CursorHarness implements AgentHarness {
     const existing = this.agents.get(key);
     if (existing) return existing;
 
-    const agentOptions = cursorAgentCreateOptions(ctx);
-    const latestRun = ctx.role === "worker" ? await this.options.runStore?.latestRunForIssue(ctx.issue.id) : null;
+    const cliPath = currentSymphonyCliPath();
+    await writeInitialRoleMcpContexts(ctx);
+    const agentOptions = cursorAgentCreateOptions(ctx, process.env.CURSOR_API_KEY, {
+      mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
+    });
+    const latestRun = ctx.role === "worker" ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker" }) : null;
     let agent: SDKAgent;
     if (latestRun?.agentId) {
       try {
@@ -225,7 +188,11 @@ function flush(events: AgentEvent[]): AgentEvent[] {
   return events.splice(0, events.length);
 }
 
-export function cursorAgentCreateOptions(ctx: AgentRunContext, apiKey = process.env.CURSOR_API_KEY): Parameters<typeof Agent.create>[0] {
+export function cursorAgentCreateOptions(
+  ctx: AgentRunContext,
+  apiKey = process.env.CURSOR_API_KEY,
+  options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
+): Parameters<typeof Agent.create>[0] {
   return {
     model: cursorModelSelection(ctx),
     local: {
@@ -234,7 +201,60 @@ export function cursorAgentCreateOptions(ctx: AgentRunContext, apiKey = process.
     },
     name: cursorAgentName(ctx),
     ...(apiKey ? { apiKey } : {}),
+    ...(options.mcpServers === undefined ? {} : { mcpServers: options.mcpServers }),
   };
+}
+
+export function cursorRoleMcpServers(
+  ctx: AgentRunContext,
+  options: { cliPath: string; mcpCwd?: string },
+): Record<string, McpSubprocessServerConfig> {
+  const applyCwd = (server: McpSubprocessServerConfig): McpSubprocessServerConfig =>
+    options.mcpCwd === undefined ? server : { ...server, cwd: options.mcpCwd };
+  if (ctx.role === "worker") {
+    return {
+      symphony: applyCwd(completionReportMcpServerConfig(ctx, completionReportContextFilePath(ctx), options)),
+    };
+  }
+  return {
+    symphony_review_verdict: applyCwd(reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFilePath(ctx), options)),
+    symphony_review_feedback: applyCwd(reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFilePath(ctx), options)),
+  };
+}
+
+export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise<void> {
+  if (ctx.role === "worker") {
+    await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: null,
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "implementation",
+    });
+    return;
+  }
+  await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
+    issue: ctx.issue,
+    activeRunId: null,
+    role: "reviewer",
+    token: null,
+    expectedToken: null,
+    reviewer: null,
+    phase: "review",
+  });
+  await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
+    issue: ctx.issue,
+    activeRunId: null,
+    role: "reviewer",
+    token: null,
+    expectedToken: null,
+    reviewer: null,
+    phase: "review",
+  });
 }
 
 export function cursorAgentName(ctx: AgentRunContext): string {

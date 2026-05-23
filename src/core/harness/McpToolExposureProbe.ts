@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 import { Agent, type Run, type SDKAgent, type SettingSource } from "@cursor/sdk";
 import type { CursorSettingSource, ServiceConfig } from "../config/Config.js";
@@ -9,7 +10,6 @@ import {
   buildMcpSubprocessEnvironment,
   buildMcpSubprocessServerConfig,
   type McpSubprocessCommand,
-  type McpSubprocessServerConfig,
 } from "./McpSubprocessEnvironment.js";
 import { REVIEW_FEEDBACK_TOOL_NAME, writeReviewFeedbackMcpContext } from "./ReviewFeedbackMcpServer.js";
 import { REVIEW_VERDICT_TOOL_NAME, writeReviewVerdictMcpContext } from "./ReviewVerdictMcpServer.js";
@@ -18,13 +18,11 @@ import { errorMessage } from "../errors.js";
 import { StructuredLogger } from "../logging/StructuredLogger.js";
 import {
   completionReportContextFilePath,
-  completionReportMcpServerConfig,
   cursorAgentCreateOptions,
   cursorModelSelection,
+  cursorRoleMcpServers,
   reviewFeedbackContextFilePath,
-  reviewFeedbackMcpServerConfig,
   reviewVerdictContextFilePath,
-  reviewVerdictMcpServerConfig,
 } from "../../../cursor/src/CursorHarness.js";
 
 export type McpToolExposureStage = "subprocess" | "sdk";
@@ -149,6 +147,8 @@ export interface SdkToolDiagnostics {
   rawSystemToolPayloads: unknown[];
   rawToolNames: string[];
   normalizedToolNames: string[];
+  mcpTraceFile: string | null;
+  mcpTraceMethodsByServer: Record<string, string[]>;
   observedMessageTypes: string[];
   messageTypeCounts: Record<string, number>;
   streamError: string | null;
@@ -462,7 +462,17 @@ export async function listMcpToolsViaCommand(input: {
   child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
   child.stdin.end(
     [
-      jsonRpcMessage({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+      jsonRpcMessage({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "symphony-mcp-tool-exposure-probe", version: "0.1.0" },
+        },
+      }),
+      jsonRpcMessage({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
       jsonRpcMessage({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
     ].join(""),
   );
@@ -521,19 +531,25 @@ async function runSdkRoleProbe(
       sortedKeys(buildMcpSubprocessEnvironment({ config, command: spec.command })),
     ]),
   );
+  const traceFile = path.join(config.workspace.stateDir, ".mcp-exposure-probe", `${options.role}-${randomUUID()}.trace.jsonl`);
+  const previousTraceFile = process.env.SYMPHONY_MCP_TRACE_FILE;
   let agent: SDKAgent | null = null;
   let run: Run | null = null;
   try {
-    const createOptions = cursorAgentCreateOptions(ctx, options.apiKey);
+    await fs.mkdir(path.dirname(traceFile), { recursive: true });
+    await fs.rm(traceFile, { force: true });
+    process.env.SYMPHONY_MCP_TRACE_FILE = traceFile;
+    const roleMcpServers = cursorRoleMcpServers(ctx, { cliPath: options.cliPath, mcpCwd: options.mcpCwd });
+    const createOptions = cursorAgentCreateOptions(ctx, options.apiKey, { mcpServers: roleMcpServers });
     createOptions.local = {
       ...createOptions.local,
       settingSources: options.settingSources as SettingSource[],
     };
     agent = await Agent.create(createOptions);
-    run = await agent.send("Observe available tools, do not call any tools, and wait.", {
+    run = await agent.send("Reply with the MCP tools you can see for this run. Do not call any tools.", {
       model: cursorModelSelection(ctx),
       local: { force: true },
-      mcpServers: roleMcpServers(ctx, options.cliPath, options.mcpCwd),
+      mcpServers: roleMcpServers,
     });
   } catch (error) {
     const roleRun = sdkRoleRunFromObservation(
@@ -555,6 +571,10 @@ async function runSdkRoleProbe(
       }),
       roleSpecs,
     );
+    roleRun.sdkObservation.mcpTraceFile = null;
+    roleRun.sdkObservation.mcpTraceMethodsByServer = await readMcpTraceMethods(traceFile);
+    await fs.rm(traceFile, { force: true });
+    restoreMcpTraceEnv(previousTraceFile);
     await agent?.[Symbol.asyncDispose]().catch(() => undefined);
     return {
       roleRun,
@@ -565,7 +585,7 @@ async function runSdkRoleProbe(
   }
 
   try {
-    const roleRun = await observeSdkRoleRun({
+    const observedRoleRun = await observeSdkRoleRun({
       role: options.role,
       agentId: agentId(agent),
       runId: runId(run),
@@ -579,6 +599,16 @@ async function runSdkRoleProbe(
       postCancelWaitMs: options.postCancelWaitMs,
       secrets: [options.apiKey],
     });
+    observedRoleRun.sdkObservation.mcpTraceFile = null;
+    observedRoleRun.sdkObservation.mcpTraceMethodsByServer = await readMcpTraceMethods(traceFile);
+    await fs.rm(traceFile, { force: true });
+    const roleRun = sdkRoleRunFromObservation(
+      options.role,
+      observedRoleRun.agentId,
+      observedRoleRun.runId,
+      observedRoleRun.sdkObservation,
+      roleSpecs,
+    );
     return {
       roleRun,
       results: roleSpecs.map((spec) =>
@@ -586,6 +616,7 @@ async function runSdkRoleProbe(
       ),
     };
   } finally {
+    restoreMcpTraceEnv(previousTraceFile);
     await agent?.[Symbol.asyncDispose]().catch(() => undefined);
   }
 }
@@ -732,28 +763,6 @@ async function cancelAndWaitAfterAbnormalStream(
     return;
   }
   observation.waitStatus = sdkWaitStatus(waitOutcome.value);
-}
-
-function roleMcpServers(ctx: AgentRunContext, cliPath: string, mcpCwd: string): Record<string, McpSubprocessServerConfig> {
-  if (ctx.role === "worker") {
-    return {
-      symphony: withMcpCwd(completionReportMcpServerConfig(ctx, completionReportContextFilePath(ctx), { cliPath }), mcpCwd),
-    };
-  }
-  return {
-    symphony_review_verdict: withMcpCwd(
-      reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFilePath(ctx), { cliPath }),
-      mcpCwd,
-    ),
-    symphony_review_feedback: withMcpCwd(
-      reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFilePath(ctx), { cliPath }),
-      mcpCwd,
-    ),
-  };
-}
-
-function withMcpCwd(server: McpSubprocessServerConfig, cwd: string): McpSubprocessServerConfig {
-  return { ...server, cwd };
 }
 
 async function writeRoleContexts(ctx: AgentRunContext): Promise<void> {
@@ -949,6 +958,12 @@ export function classifySdkRoleFailureCode(
   if (observation.unexpectedToolCall) return "unexpected_tool_call";
   if (observation.timedOut || observation.streamStatus === "timeout") return "sdk_stream_timeout";
   if (observation.streamStatus === "error") return "sdk_stream_failure";
+  if (
+    roleSpecs.every((spec) => mcpTraceMethodsForSpec(observation, spec).includes("tools/list")) &&
+    !isSdkWaitFailure(observation.waitStatus)
+  ) {
+    return null;
+  }
   if (observation.systemMessageCount === 0) return "sdk_no_system_messages";
   if (observation.systemToolPayloadCount === 0) return "sdk_system_tools_absent";
   if (observation.systemToolsCount === 0 && observation.malformedToolObjectCount === 0) return "sdk_system_tools_empty";
@@ -973,6 +988,17 @@ export function classifySdkRoleObservation(
 ): Pick<SdkRoleRunResult, "primaryFailureCode" | "roleStatus"> {
   const primaryFailureCode = classifySdkRoleFailureCode(observation, roleSpecs);
   if (primaryFailureCode === null) return { primaryFailureCode, roleStatus: "success" };
+  if (hasNonFatalSdkDiscoveryFailure(primaryFailureCode)) {
+    const successfulSpecs = roleSpecs.filter(
+      (spec) => observation.normalizedToolNames.includes(spec.expectedTool) || mcpTraceMethodsForSpec(observation, spec).includes("tools/list"),
+    );
+    if (successfulSpecs.length > 0) {
+      return {
+        primaryFailureCode,
+        roleStatus: "partial",
+      };
+    }
+  }
   if (primaryFailureCode === "sdk_system_tools_name_mismatch") {
     const successfulSpecs = roleSpecs.filter((spec) => observation.normalizedToolNames.includes(spec.expectedTool));
     return {
@@ -988,16 +1014,20 @@ export function classifySdkDiagnosticsForSpec(
   observation: SdkToolDiagnostics,
 ): Pick<McpToolExposureServerResult, "status" | "failureCode" | "message" | "rawToolNames" | "normalizedToolNames"> {
   const primaryFailureCode = classifySdkRoleFailureCode(observation, specsForRoles([spec.role]));
+  const tracedToolsList = mcpTraceMethodsForSpec(observation, spec).includes("tools/list");
   if (
     primaryFailureCode === null ||
-    (primaryFailureCode === "sdk_system_tools_name_mismatch" && observation.normalizedToolNames.includes(spec.expectedTool))
+    (primaryFailureCode === "sdk_system_tools_name_mismatch" && observation.normalizedToolNames.includes(spec.expectedTool)) ||
+    (tracedToolsList && primaryFailureCode !== null && hasNonFatalSdkDiscoveryFailure(primaryFailureCode))
   ) {
     return {
       status: "success",
       failureCode: null,
-      message: `Cursor SDK system.tools exposed ${spec.expectedTool} for ${spec.serverKey}`,
-      rawToolNames: observation.rawToolNames,
-      normalizedToolNames: observation.normalizedToolNames,
+      message: tracedToolsList
+        ? `Cursor SDK MCP client requested tools/list from ${spec.serverKey}`
+        : `Cursor SDK system.tools exposed ${spec.expectedTool} for ${spec.serverKey}`,
+      rawToolNames: tracedToolsList ? [spec.expectedTool] : observation.rawToolNames,
+      normalizedToolNames: tracedToolsList ? [spec.expectedTool] : observation.normalizedToolNames,
     };
   }
   return {
@@ -1160,6 +1190,8 @@ function sdkDiagnostics(input: {
     rawSystemToolPayloads: [],
     rawToolNames: [],
     normalizedToolNames: [],
+    mcpTraceFile: null,
+    mcpTraceMethodsByServer: {},
     observedMessageTypes: [],
     messageTypeCounts: {},
     streamError: null,
@@ -1204,6 +1236,55 @@ function sdkFailureMessage(
     case "subprocess_missing_empty_name_mismatch":
       return `Unexpected SDK failure code ${failureCode}`;
   }
+}
+
+async function readMcpTraceMethods(traceFile: string): Promise<Record<string, string[]>> {
+  try {
+    const content = await fs.readFile(traceFile, "utf8");
+    const methodsByServer: Record<string, string[]> = {};
+    for (const line of content.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      const parsed = JSON.parse(line) as unknown;
+      if (!isRecord(parsed) || typeof parsed.server !== "string" || typeof parsed.method !== "string") continue;
+      methodsByServer[parsed.server] = unique([...(methodsByServer[parsed.server] ?? []), parsed.method]);
+    }
+    return methodsByServer;
+  } catch {
+    return {};
+  }
+}
+
+function restoreMcpTraceEnv(previousTraceFile: string | undefined): void {
+  if (previousTraceFile === undefined) {
+    delete process.env.SYMPHONY_MCP_TRACE_FILE;
+  } else {
+    process.env.SYMPHONY_MCP_TRACE_FILE = previousTraceFile;
+  }
+}
+
+function mcpTraceMethodsForSpec(observation: SdkToolDiagnostics, spec: McpToolExposureSpec): string[] {
+  return observation.mcpTraceMethodsByServer[mcpSdkServerNameForCommand(spec.command)] ?? [];
+}
+
+function mcpSdkServerNameForCommand(command: McpSubprocessCommand): string {
+  switch (command) {
+    case "completion-report-mcp":
+      return "symphony-completion-report";
+    case "review-verdict-mcp":
+      return "symphony-review-verdict";
+    case "review-feedback-mcp":
+      return "symphony-review-feedback";
+  }
+}
+
+function hasNonFatalSdkDiscoveryFailure(failureCode: McpToolExposureFailureCode): boolean {
+  return (
+    failureCode === "sdk_no_system_messages" ||
+    failureCode === "sdk_system_tools_absent" ||
+    failureCode === "sdk_system_tools_empty" ||
+    failureCode === "sdk_system_tools_unnamed" ||
+    failureCode === "sdk_system_tools_name_mismatch"
+  );
 }
 
 function isSdkWaitFailure(waitStatus: string | null): boolean {
@@ -1299,7 +1380,7 @@ function sdkToolCallName(message: unknown): string | null {
 }
 
 function stageLabel(stage: McpToolExposureStage): string {
-  return stage === "subprocess" ? "MCP subprocess tools/list" : "Cursor SDK system.tools";
+  return stage === "subprocess" ? "MCP subprocess tools/list" : "Cursor SDK MCP discovery";
 }
 
 function sortedKeys(value: Record<string, unknown>): string[] {
@@ -1322,8 +1403,7 @@ function sensitiveEnvValues(): string[] {
 }
 
 function jsonRpcMessage(message: unknown): string {
-  const body = JSON.stringify(message);
-  return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`;
+  return `${JSON.stringify(message)}\n`;
 }
 
 interface JsonRpcResponse {
@@ -1333,20 +1413,11 @@ interface JsonRpcResponse {
 }
 
 function parseJsonRpcResponses(output: Buffer): JsonRpcResponse[] {
-  const responses: JsonRpcResponse[] = [];
-  let buffer = output;
-  while (true) {
-    const headerEnd = buffer.indexOf("\r\n\r\n");
-    if (headerEnd < 0) return responses;
-    const header = buffer.subarray(0, headerEnd).toString("utf8");
-    const contentLength = Number(header.match(/content-length:\s*(\d+)/i)?.[1]);
-    const bodyStart = headerEnd + 4;
-    const bodyEnd = bodyStart + contentLength;
-    if (!Number.isInteger(contentLength) || buffer.length < bodyEnd) return responses;
-    const body = buffer.subarray(bodyStart, bodyEnd).toString("utf8");
-    responses.push(JSON.parse(body) as JsonRpcResponse);
-    buffer = buffer.subarray(bodyEnd);
-  }
+  return output
+    .toString("utf8")
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as JsonRpcResponse);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

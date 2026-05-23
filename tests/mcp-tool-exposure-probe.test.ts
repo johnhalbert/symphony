@@ -181,6 +181,14 @@ describe("MCP tool exposure probe helpers", () => {
     if (!workerSpec) throw new Error("missing worker spec");
 
     expect(classifySdkRoleFailureCode(sdkObservation())).toBe("sdk_no_system_messages");
+    expect(
+      classifySdkDiagnosticsForSpec(
+        workerSpec,
+        sdkObservation({
+          mcpTraceMethodsByServer: { "symphony-completion-report": ["notifications/initialized", "tools/list"] },
+        }),
+      ),
+    ).toMatchObject({ status: "success", failureCode: null, normalizedToolNames: [workerSpec.expectedTool] });
     expect(classifySdkRoleFailureCode(sdkObservation({ systemMessageCount: 1 }))).toBe("sdk_system_tools_absent");
     expect(classifySdkRoleFailureCode(sdkObservation({ systemMessageCount: 1, systemToolPayloadCount: 1 }))).toBe(
       "sdk_system_tools_empty",
@@ -241,6 +249,23 @@ describe("MCP tool exposure probe helpers", () => {
     expect(reviewerSpecs.map((spec) => deriveSdkPerSpecResult(spec, roleRun, 2))).toMatchObject([
       { status: "success", failureCode: null, sdkRoleRunRole: "reviewer", sdkRoleRunIndex: 2 },
       { status: "failure", failureCode: "sdk_system_tools_name_mismatch", sdkRoleRunRole: "reviewer", sdkRoleRunIndex: 2 },
+    ]);
+
+    const partialTraceObservation = sdkObservation({
+      role: "reviewer",
+      mcpTraceMethodsByServer: { "symphony-review-verdict": ["tools/list"] },
+    });
+    const partialTraceRun: SdkRoleRunResult = {
+      role: "reviewer",
+      agentId: "agent-2",
+      runId: "run-2",
+      ...classifySdkRoleObservation(partialTraceObservation, reviewerSpecs),
+      sdkObservation: partialTraceObservation,
+    };
+    expect(partialTraceRun).toMatchObject({ primaryFailureCode: "sdk_no_system_messages", roleStatus: "partial" });
+    expect(reviewerSpecs.map((spec) => deriveSdkPerSpecResult(spec, partialTraceRun, 3))).toMatchObject([
+      { status: "success", failureCode: null, sdkRoleRunIndex: 3 },
+      { status: "failure", failureCode: "sdk_no_system_messages", sdkRoleRunIndex: 3 },
     ]);
 
     const startupObservation = sdkObservation({ startupSendError: "Cursor SDK startup/send failed" });
@@ -405,6 +430,8 @@ function sdkObservation(overrides: Partial<SdkToolDiagnostics> = {}): SdkToolDia
     rawSystemToolPayloads: overrides.rawSystemToolPayloads ?? [],
     rawToolNames,
     normalizedToolNames,
+    mcpTraceFile: overrides.mcpTraceFile ?? null,
+    mcpTraceMethodsByServer: overrides.mcpTraceMethodsByServer ?? {},
     observedMessageTypes: overrides.observedMessageTypes ?? [],
     messageTypeCounts: overrides.messageTypeCounts ?? {},
     streamError: overrides.streamError ?? null,
