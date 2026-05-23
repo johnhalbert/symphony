@@ -143,6 +143,14 @@ export class StatusServer {
         );
         return;
       }
+      if (request.method === "GET" && url.pathname === "/api/v1/activity") {
+        sendJson(
+          response,
+          200,
+          await buildActivityFeed(this.options.orchestrator.snapshot().generatedAt, this.options.runStore, parseActivityQuery(url)),
+        );
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
         sendJson(response, 200, {
           workspaces: (await this.options.runStore?.listWorkspaces()) ?? [],
@@ -516,6 +524,40 @@ interface IssueBoardTrackerCache {
   projection: IssueBoardTrackerProjection;
 }
 
+interface ActivityQuery {
+  issue: string | null;
+  offset: number;
+  limit: number;
+}
+
+interface ActivityItem {
+  id: string;
+  at: string;
+  kind: "run_started" | "run_completed" | "transcript_event";
+  source: "run" | TranscriptEvent["source"];
+  issue: {
+    id: string;
+    identifier: string;
+  };
+  run: {
+    runId: string;
+    role: AgentRunRole;
+    status: RunRecord["status"];
+    agentId: string | null;
+    sessionId: string | null;
+  };
+  transcript: {
+    sequence: number;
+    eventType: string;
+    message: string | null;
+  } | null;
+  links: {
+    issue: string;
+    run: string;
+    transcript: string | null;
+  };
+}
+
 interface IssueBoardCard {
   key: string;
   issueId: string | null;
@@ -609,6 +651,151 @@ async function buildIssueBoard(
       blocked: cards.filter((card) => card.issueDetails.blockers.blocked).length,
     },
   };
+}
+
+async function buildActivityFeed(generatedAt: string, runStore: RunTranscriptStore | undefined, query: ActivityQuery) {
+  if (!runStore) {
+    return {
+      generatedAt,
+      offset: query.offset,
+      limit: query.limit,
+      nextOffset: null,
+      activity: [],
+      counts: {
+        totalItems: 0,
+        distinctRunsConsidered: 0,
+        transcriptEventsConsidered: 0,
+        syntheticRunEvents: 0,
+      },
+      source: {
+        kind: "durable_transcripts" as const,
+        runStoreAvailable: false,
+      },
+      filter: {
+        issue: query.issue,
+      },
+    };
+  }
+
+  const runs = query.issue ? await runStore.listRunsForIssue(query.issue) : await runStore.listRuns();
+  const activity: ActivityItem[] = [];
+  let transcriptEventsConsidered = 0;
+  let syntheticRunEvents = 0;
+
+  for (const run of runs) {
+    activity.push(activityItemForRun(run, "run_started", run.startedAt));
+    syntheticRunEvents += 1;
+    if (run.completedAt) {
+      activity.push(activityItemForRun(run, "run_completed", run.completedAt));
+      syntheticRunEvents += 1;
+    }
+
+    const events = await readAllTranscriptEvents(runStore, run.runId);
+    transcriptEventsConsidered += events.length;
+    activity.push(...events.map((event) => activityItemForTranscriptEvent(run, event)));
+  }
+
+  activity.sort(compareActivityItems);
+  const page = activity.slice(query.offset, query.offset + query.limit);
+  const nextOffset = query.offset + page.length < activity.length ? query.offset + page.length : null;
+  return {
+    generatedAt,
+    offset: query.offset,
+    limit: query.limit,
+    nextOffset,
+    activity: page,
+    counts: {
+      totalItems: activity.length,
+      distinctRunsConsidered: runs.length,
+      transcriptEventsConsidered,
+      syntheticRunEvents,
+    },
+    source: {
+      kind: "durable_transcripts" as const,
+      runStoreAvailable: true,
+    },
+    filter: {
+      issue: query.issue,
+    },
+  };
+}
+
+function activityItemForRun(run: RunRecord, kind: Extract<ActivityItem["kind"], "run_started" | "run_completed">, at: string): ActivityItem {
+  return {
+    id: `run:${run.runId}:${kind}`,
+    at,
+    kind,
+    source: "run",
+    issue: activityIssue(run),
+    run: activityRun(run),
+    transcript: null,
+    links: activityLinks(run, null),
+  };
+}
+
+function activityItemForTranscriptEvent(run: RunRecord, event: TranscriptEvent): ActivityItem {
+  return {
+    id: `transcript:${run.runId}:${event.sequence}`,
+    at: event.at,
+    kind: "transcript_event",
+    source: event.source,
+    issue: activityIssue(run),
+    run: activityRun(run),
+    transcript: {
+      sequence: event.sequence,
+      eventType: event.eventType,
+      message: event.message ?? null,
+    },
+    links: activityLinks(run, event),
+  };
+}
+
+function activityIssue(run: RunRecord): ActivityItem["issue"] {
+  return {
+    id: run.issueId,
+    identifier: run.issueIdentifier,
+  };
+}
+
+function activityRun(run: RunRecord): ActivityItem["run"] {
+  return {
+    runId: run.runId,
+    role: run.role,
+    status: run.status,
+    agentId: run.agentId,
+    sessionId: run.sessionId,
+  };
+}
+
+function activityLinks(run: RunRecord, event: TranscriptEvent | null): ActivityItem["links"] {
+  return {
+    issue: `/api/v1/issues/${encodeURIComponent(run.issueIdentifier)}`,
+    run: `/api/v1/runs/${encodeURIComponent(run.runId)}`,
+    transcript: event
+      ? `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript?offset=${Math.max(event.sequence - 1, 0)}&limit=1`
+      : null,
+  };
+}
+
+function compareActivityItems(left: ActivityItem, right: ActivityItem): number {
+  return (
+    compareIsoDesc(left.at, right.at) ||
+    compareNumber(kindRank(left.kind), kindRank(right.kind)) ||
+    compareString(left.run.runId, right.run.runId) ||
+    compareNumber(right.transcript?.sequence ?? -1, left.transcript?.sequence ?? -1) ||
+    compareString(left.id, right.id)
+  );
+}
+
+function kindRank(kind: ActivityItem["kind"]): number {
+  switch (kind) {
+    case "transcript_event":
+      return 0;
+    case "run_completed":
+      return 1;
+    case "run_started":
+      return 2;
+  }
 }
 
 async function buildTrackerBoardCard(input: {
@@ -1900,6 +2087,34 @@ function parsePagination(url: URL): { offset: number; limit: number } {
     offset: Number.isFinite(offset) ? Math.max(Math.floor(offset), 0) : 0,
     limit: Number.isFinite(limit) ? Math.max(Math.floor(limit), 1) : 100,
   };
+}
+
+function parseActivityQuery(url: URL): ActivityQuery {
+  const offset = Number(url.searchParams.get("offset") ?? "0");
+  const limit = Number(url.searchParams.get("limit") ?? "50");
+  const issue = url.searchParams.get("issue");
+  return {
+    issue: issue && issue.length > 0 ? issue : null,
+    offset: Number.isFinite(offset) ? Math.max(Math.floor(offset), 0) : 0,
+    limit: Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 1), 100) : 50,
+  };
+}
+
+function compareIsoDesc(left: string, right: string): number {
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  if (!Number.isNaN(leftMs) && !Number.isNaN(rightMs) && leftMs !== rightMs) return rightMs - leftMs;
+  return compareString(right, left);
+}
+
+function compareNumber(left: number, right: number): number {
+  return left - right;
+}
+
+function compareString(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 function statusMetadata(input: {

@@ -422,6 +422,177 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("serves a redacted globally sorted activity feed from persisted transcripts", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-a",
+      sessionId: "session-a",
+      agentId: "agent-a",
+      role: "worker",
+      issueId: "issue-a",
+      issueIdentifier: "TEST-A",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "PROMPT_SECRET_A",
+      workspaceKey: "TEST-A",
+      workspacePath: path.join(config.workspace.root, "TEST-A"),
+    });
+    await runStore.startRun({
+      runId: "run-b",
+      sessionId: "session-b",
+      agentId: "agent-b",
+      role: "reviewer",
+      issueId: "issue-b",
+      issueIdentifier: "TEST-B",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "PROMPT_SECRET_B",
+      workspaceKey: "TEST-B",
+      workspacePath: path.join(config.workspace.root, "TEST-B"),
+    });
+    await runStore.appendEvent({
+      runId: "run-a",
+      at: "2030-01-01T00:04:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "safe run-a progress",
+      payload: { secret: "PAYLOAD_SECRET_A" },
+    });
+    for (let sequence = 1; sequence <= 1_000; sequence += 1) {
+      await runStore.appendEvent({
+        runId: "run-b",
+        sequence,
+        at: "2030-01-01T00:00:00.000Z",
+        source: "harness",
+        eventType: "tokens",
+        payload: { secret: `PAYLOAD_SECRET_B_${sequence}` },
+      });
+    }
+    await runStore.appendEvent({
+      runId: "run-b",
+      sequence: 1_001,
+      at: "2030-01-01T00:05:00.000Z",
+      source: "orchestrator",
+      eventType: "pr_updated",
+      message: "latest from long transcript",
+      payload: { secret: "PAYLOAD_SECRET_B_LATEST" },
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const firstPageResponse = await fetch(`${baseUrl}/api/v1/activity?limit=1`);
+      const firstPageText = await firstPageResponse.text();
+      const firstPage = JSON.parse(firstPageText) as {
+        limit: number;
+        nextOffset: number | null;
+        activity: Array<{
+          kind: string;
+          source: string;
+          issue: { identifier: string };
+          run: { runId: string; role: string };
+          transcript: { sequence: number; eventType: string; message: string | null } | null;
+          links: { run: string; transcript: string | null };
+        }>;
+        counts: { totalItems: number; distinctRunsConsidered: number; transcriptEventsConsidered: number; syntheticRunEvents: number };
+        source: { runStoreAvailable: boolean };
+      };
+      const secondPageResponse = await fetch(`${baseUrl}/api/v1/activity?offset=1&limit=1`);
+      const secondPage = (await secondPageResponse.json()) as typeof firstPage;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-A&limit=100`);
+      const issueBody = (await issueResponse.json()) as typeof firstPage;
+      const clampedResponse = await fetch(`${baseUrl}/api/v1/activity?limit=999`);
+      const clampedBody = (await clampedResponse.json()) as { limit: number };
+
+      expect(firstPageResponse.status).toBe(200);
+      expect(firstPage.activity).toHaveLength(1);
+      expect(firstPage.activity[0]).toMatchObject({
+        kind: "transcript_event",
+        source: "orchestrator",
+        issue: { identifier: "TEST-B" },
+        run: { runId: "run-b", role: "reviewer" },
+        transcript: { sequence: 1_001, eventType: "pr_updated", message: "latest from long transcript" },
+        links: {
+          run: "/api/v1/runs/run-b",
+          transcript: "/api/v1/runs/run-b/transcript?offset=1000&limit=1",
+        },
+      });
+      expect(firstPage.nextOffset).toBe(1);
+      expect(firstPage.counts).toMatchObject({
+        totalItems: 1_004,
+        distinctRunsConsidered: 2,
+        transcriptEventsConsidered: 1_002,
+        syntheticRunEvents: 2,
+      });
+      expect(firstPage.source.runStoreAvailable).toBe(true);
+      expect(firstPageText).not.toContain("PROMPT_SECRET");
+      expect(firstPageText).not.toContain("PAYLOAD_SECRET");
+      expect(secondPage.activity[0]?.issue.identifier).toBe("TEST-A");
+      expect(issueBody.activity.map((item) => item.issue.identifier)).toEqual(["TEST-A", "TEST-A"]);
+      expect(issueBody.counts.distinctRunsConsidered).toBe(1);
+      expect(clampedBody.limit).toBe(100);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves an empty activity feed when no run store is configured", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/activity`);
+      const body = (await response.json()) as {
+        activity: unknown[];
+        nextOffset: number | null;
+        counts: { totalItems: number; distinctRunsConsidered: number; transcriptEventsConsidered: number; syntheticRunEvents: number };
+        source: { kind: string; runStoreAvailable: boolean };
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.activity).toEqual([]);
+      expect(body.nextOffset).toBeNull();
+      expect(body.counts).toEqual({
+        totalItems: 0,
+        distinctRunsConsidered: 0,
+        transcriptEventsConsidered: 0,
+        syntheticRunEvents: 0,
+      });
+      expect(body.source).toEqual({ kind: "durable_transcripts", runStoreAvailable: false });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("protects status mutations with the resolved server.open_workspace profile token", async () => {
     const config = parseServiceConfig(
       {

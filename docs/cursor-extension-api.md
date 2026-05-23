@@ -11,6 +11,8 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 ## Stable Resources
 
 - `GET /api/v1/state` returns the live orchestrator snapshot.
+- `GET /api/v1/issue-board?refresh=1` returns a Linear-backed issue board enriched with Symphony run, workspace, review-loop, liveness, and blocker state. `refresh=1` bypasses the short-lived tracker cache.
+- `GET /api/v1/activity?offset=0&limit=50` returns a globally sorted feed of persisted run and transcript activity.
 - `GET /api/v1/issues/:id` returns live issue status when present plus durable workspace, latest run metadata, and an `issueDetails` envelope. Prefer `issueDetails` for extension issue cards; top-level `metadata`, `workspace`, `latestRun`, and `lifecycle` remain available for backward compatibility and detailed inspection.
 - `GET /api/v1/issues/:id/runs` returns all persisted runs for an issue id or identifier plus the same `issueDetails` envelope.
 - `GET /api/v1/runs/:runId` returns run metadata.
@@ -48,6 +50,41 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 `GET /api/v1/issues/:id` also keeps `live.issueDetails` as a deprecated raw tracker-view mirror for compatibility with older clients. Prefer the top-level `issueDetails` envelope and `issueDetails.issue` for new code.
 
 On `GET /api/v1/issues/:id/runs`, the top-level `enrichment` object describes run-list liveness/timeline enrichment. It is separate from `issueDetails` and should not be confused with the issue details envelope.
+
+## Issue Board
+
+`GET /api/v1/issue-board` returns `lanes`, a flat `issues` list, tracker cache metadata, and counts. Cards use the same `issueDetails` envelope as issue detail endpoints, so extension clients can render tracker-backed and Symphony-only cards without separate lookups. The endpoint requires a configured tracker client and returns `503` with `tracker_unavailable` when tracker access is not configured.
+
+## Activity Feed
+
+`GET /api/v1/activity?offset=0&limit=50` returns read-only activity from persisted Symphony runs and transcripts. `limit` defaults to `50` and is clamped to `100`; `offset` defaults to `0`. Add `issue=ENG-11` or a Linear issue id to restrict the feed to one issue.
+
+The response shape is:
+
+```json
+{
+  "generatedAt": "2026-01-01T00:00:00.000Z",
+  "offset": 0,
+  "limit": 50,
+  "nextOffset": null,
+  "activity": [],
+  "counts": {
+    "totalItems": 0,
+    "distinctRunsConsidered": 0,
+    "transcriptEventsConsidered": 0,
+    "syntheticRunEvents": 0
+  },
+  "source": {
+    "kind": "durable_transcripts",
+    "runStoreAvailable": true
+  },
+  "filter": {
+    "issue": null
+  }
+}
+```
+
+Activity items are explicit summaries, not raw persisted records. They include `id`, `at`, `kind`, source, issue id/identifier, run id/role/status/agent/session, optional transcript sequence/event type/message, and links to the issue, run, and one-event transcript page. Raw transcript `payload`, run prompts, workspace paths, and repo-local paths are intentionally omitted from the feed; clients that need full transcript details should follow the per-run transcript link.
 
 ## Non-Goals
 
