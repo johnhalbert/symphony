@@ -741,9 +741,31 @@ export class Orchestrator {
     this.claimed.add(issue.id);
     this.clearRetry(issue.id);
     const run = role === "reviewer" ? this.runReviewer(entry) : this.runWorker(entry, attempt);
-    entry.worker = run
-      .then(() => this.onWorkerExit(issue.id, "normal", null))
-      .catch((error: unknown) => this.onWorkerExit(issue.id, "abnormal", errorMessage(error)));
+    entry.worker = this.monitorRunExit(entry, run);
+  }
+
+  private async monitorRunExit(entry: RunningEntry, run: Promise<void>): Promise<void> {
+    const issueId = entry.issue.id;
+    try {
+      await run;
+      await this.onWorkerExit(issueId, "normal", null);
+    } catch (error) {
+      try {
+        await this.onWorkerExit(issueId, "abnormal", errorMessage(error));
+      } catch (exitError) {
+        this.options.logger.error("run exit handling failed", {
+          issue_id: entry.issue.id,
+          issue_identifier: entry.issue.identifier,
+          role: entry.role,
+          run_id: entry.runId,
+          active_run_id: entry.activeRunId,
+          error: errorMessage(exitError),
+          original_error: errorMessage(error),
+        });
+        this.running.delete(issueId);
+        this.claimed.delete(issueId);
+      }
+    }
   }
 
   private async runWorker(entry: RunningEntry, attempt: number | null): Promise<void> {
