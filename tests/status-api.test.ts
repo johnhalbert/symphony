@@ -457,23 +457,123 @@ describe("StatusServer durable API", () => {
       await server.stop();
     }
   });
+
+  it("serves live liveness and cancellation state from the orchestrator snapshot", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const liveRunning: ReturnType<Orchestrator["snapshot"]>["running"][number] = {
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      role: "worker",
+      state: "In Progress",
+      workspacePath: null,
+      sessionId: "session-1",
+      runId: "run-1",
+      turnCount: 1,
+      lastEvent: "progress",
+      lastMessage: "Stopping run",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      lastEventAt: "2026-01-01T00:00:01.000Z",
+      liveness: {
+        status: "cancelling",
+        activeRunId: "run-1",
+        lastActivityAt: "2026-01-01T00:00:01.000Z",
+        secondsSinceLastActivity: 2,
+        stallTimeoutMs: 300_000,
+      },
+      cancellation: {
+        requested: true,
+        requestedAt: "2026-01-01T00:00:02.000Z",
+        source: "operator",
+        reason: "operator request",
+        abortSignalled: true,
+        harnessStopRequestedAt: "2026-01-01T00:00:02.000Z",
+        suppressRetryOnExit: true,
+      },
+      tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+      lifecycle: null,
+      metadata: {
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+        ciStatus: null,
+        lastPushedAt: null,
+        lastEvidenceCursor: null,
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    };
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([liveRunning]),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const stateBody = (await stateResponse.json()) as {
+        running: Array<{ liveness: unknown; cancellation: unknown }>;
+      };
+      const issueBody = (await issueResponse.json()) as {
+        live: { liveness: unknown; cancellation: unknown };
+      };
+
+      expect(stateResponse.status).toBe(200);
+      expect(issueResponse.status).toBe(200);
+      expect(stateBody.running[0]).toMatchObject({
+        liveness: { status: "cancelling", activeRunId: "run-1" },
+        cancellation: {
+          requested: true,
+          requestedAt: "2026-01-01T00:00:02.000Z",
+          source: "operator",
+          reason: "operator request",
+          abortSignalled: true,
+          suppressRetryOnExit: true,
+        },
+      });
+      expect(issueBody.live).toMatchObject({
+        liveness: { status: "cancelling", activeRunId: "run-1" },
+        cancellation: {
+          requested: true,
+          requestedAt: "2026-01-01T00:00:02.000Z",
+          source: "operator",
+        },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
 });
 
-function fakeOrchestrator(): Orchestrator {
+function fakeOrchestrator(running: ReturnType<Orchestrator["snapshot"]>["running"] = []): Orchestrator {
   return {
     snapshot() {
       return {
         generatedAt: new Date(0).toISOString(),
-        counts: { running: 0, retrying: 0, paused: 0 },
-        running: [],
+        counts: { running: running.length, retrying: 0, paused: 0 },
+        running,
         retrying: [],
         paused: [],
         totals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, secondsRunning: 0 },
         rateLimits: null,
       };
     },
-    getIssueDetails() {
-      return null;
+    getIssueDetails(issueIdOrIdentifier: string) {
+      return (
+        running.find((row) => row.issueId === issueIdOrIdentifier || row.issueIdentifier === issueIdOrIdentifier) ??
+        null
+      );
     },
     async refreshNow() {
       return undefined;

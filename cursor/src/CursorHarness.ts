@@ -63,51 +63,52 @@ export class CursorHarness implements AgentHarness {
       void run.cancel();
     };
     ctx.abortSignal.addEventListener("abort", abort, { once: true });
+    if (ctx.abortSignal.aborted) abort();
 
     try {
-    if (ctx.role === "worker") {
-      await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
-        issue: ctx.issue,
-        activeRunId: run.id,
-        role: "worker",
-        token: null,
-        expectedToken: null,
+      if (ctx.role === "worker") {
+        await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
+          issue: ctx.issue,
+          activeRunId: run.id,
+          role: "worker",
+          token: null,
+          expectedToken: null,
+          sessionId: `${agent.agentId}:${run.id}`,
+          workspacePath: ctx.workspace.path,
+          workspace: ctx.workspace,
+          phase: "implementation",
+        });
+      }
+      if (ctx.role === "reviewer") {
+        await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
+          issue: ctx.issue,
+          activeRunId: run.id,
+          role: "reviewer",
+          token: null,
+          expectedToken: null,
+          reviewer: `${agent.agentId}:${run.id}`,
+          phase: "review",
+        });
+        await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
+          issue: ctx.issue,
+          activeRunId: run.id,
+          role: "reviewer",
+          token: null,
+          expectedToken: null,
+          reviewer: `${agent.agentId}:${run.id}`,
+          phase: "review",
+        });
+      }
+      yield {
+        type: "session_started",
         sessionId: `${agent.agentId}:${run.id}`,
-        workspacePath: ctx.workspace.path,
-        workspace: ctx.workspace,
-        phase: "implementation",
+        threadId: agent.agentId,
+        runId: run.id,
+      };
+      await this.options.runStore?.updateRun(run.id, {
+        sessionId: `${agent.agentId}:${run.id}`,
+        agentId: agent.agentId,
       });
-    }
-    if (ctx.role === "reviewer") {
-      await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
-        issue: ctx.issue,
-        activeRunId: run.id,
-        role: "reviewer",
-        token: null,
-        expectedToken: null,
-        reviewer: `${agent.agentId}:${run.id}`,
-        phase: "review",
-      });
-      await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
-        issue: ctx.issue,
-        activeRunId: run.id,
-        role: "reviewer",
-        token: null,
-        expectedToken: null,
-        reviewer: `${agent.agentId}:${run.id}`,
-        phase: "review",
-      });
-    }
-    yield {
-      type: "session_started",
-      sessionId: `${agent.agentId}:${run.id}`,
-      threadId: agent.agentId,
-      runId: run.id,
-    };
-    await this.options.runStore?.updateRun(run.id, {
-      sessionId: `${agent.agentId}:${run.id}`,
-      agentId: agent.agentId,
-    });
 
       for await (const message of run.stream()) {
         await this.options.runStore?.appendEvent({

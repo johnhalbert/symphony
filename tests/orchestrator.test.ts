@@ -2137,6 +2137,83 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
+  it("exposes live liveness and cancellation state before a cancelled run exits", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new HeldCancellationHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-123", "run to start");
+    const active = orchestrator.snapshot().running[0];
+    expect(active).toMatchObject({
+      issueIdentifier: "TEST-1",
+      runId: "run-123",
+      liveness: {
+        status: "active",
+        activeRunId: "run-123",
+        stallTimeoutMs: 300_000,
+      },
+      cancellation: {
+        requested: false,
+        requestedAt: null,
+        source: null,
+        reason: null,
+        abortSignalled: false,
+        harnessStopRequestedAt: null,
+        suppressRetryOnExit: false,
+      },
+    });
+
+    await orchestrator.cancelIssue(candidate.id);
+    const cancelling = orchestrator.snapshot().running[0];
+    expect(cancelling).toMatchObject({
+      issueIdentifier: "TEST-1",
+      liveness: {
+        status: "cancelling",
+        activeRunId: "run-123",
+      },
+      cancellation: {
+        requested: true,
+        source: "operator",
+        reason: "operator request",
+        abortSignalled: true,
+        suppressRetryOnExit: true,
+      },
+    });
+    expect(cancelling?.cancellation.requestedAt).toEqual(expect.any(String));
+    expect(cancelling?.cancellation.harnessStopRequestedAt).toEqual(expect.any(String));
+
+    await orchestrator.cancelIssue(candidate.id);
+    const repeatedCancel = orchestrator.snapshot().running[0];
+    expect(repeatedCancel?.cancellation.requestedAt).toBe(cancelling?.cancellation.requestedAt);
+    expect(repeatedCancel?.cancellation.reason).toBe("operator request");
+
+    harness.release();
+    await waitFor(() => orchestrator.snapshot().running.length === 0, "cancelled run to exit");
+    await orchestrator.stop();
+  });
+
   it("blocks continuation turns for non-resumable harnesses", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
@@ -2438,6 +2515,29 @@ class BlockingHarness implements AgentHarness {
 
   async stop(runId: string): Promise<void> {
     this.stoppedRunIds.push(runId);
+  }
+}
+
+class HeldCancellationHarness implements AgentHarness {
+  readonly id = "held-cancellation";
+  readonly stoppedRunIds: string[] = [];
+  private releaseRun: () => void = () => undefined;
+  private readonly released = new Promise<void>((resolve) => {
+    this.releaseRun = resolve;
+  });
+
+  async *run(): AsyncIterable<AgentEvent> {
+    yield { type: "session_started", sessionId: "session-123", runId: "run-123" };
+    await this.released;
+    yield { type: "cancelled" };
+  }
+
+  async stop(runId: string): Promise<void> {
+    this.stoppedRunIds.push(runId);
+  }
+
+  release(): void {
+    this.releaseRun();
   }
 }
 
