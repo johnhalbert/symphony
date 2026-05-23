@@ -11,7 +11,7 @@ import type {
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
-import type { RunRecord, RunTranscriptStore, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
+import type { RunRecord, RunTranscriptStore, TranscriptEvent, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
@@ -142,13 +142,16 @@ export class StatusServer {
         const snapshot = this.options.orchestrator.snapshot();
         const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
         const lifecycle = await this.options.lifecycleStore?.get(issueId);
-        sendJson(response, 200, {
-          issue: issueId,
-          runs: runs.map((run) => ({
+        const enrichedRuns = await Promise.all(
+          runs.map(async (run) => ({
             ...run,
-            operatorLiveness: runOperatorLiveness(run, snapshot, lifecycle, runs),
+            operatorLiveness: await runOperatorLiveness(run, snapshot, lifecycle, runs, this.options.runStore),
             livenessSummary: runLivenessSummary(run, snapshot, lifecycle, runs),
           })),
+        );
+        sendJson(response, 200, {
+          issue: issueId,
+          runs: enrichedRuns,
           issueBlocked: blockedIssueView(lifecycle),
           enrichment: {
             level: "operator_liveness_with_timeline",
@@ -188,12 +191,13 @@ export class StatusServer {
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
-        const operatorLiveness = issueOperatorLiveness({
+        const operatorLiveness = await issueOperatorLiveness({
           live,
           latestRun,
           lifecycle,
           paused,
           resolvedAgentId,
+          runStore: this.options.runStore,
         });
         const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
         const affordances = operatorAffordances({
@@ -253,7 +257,7 @@ export class StatusServer {
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
           ...run,
-          operatorLiveness: runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns),
+          operatorLiveness: await runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns, this.options.runStore),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
@@ -470,6 +474,7 @@ function renderRunningRow(
   const idle = `${Math.round(row.liveness.secondsSinceLastActivity)}s idle`;
   const threshold = row.liveness.stallTimeoutMs === null ? "no stall threshold" : `${row.liveness.stallTimeoutMs}ms threshold`;
   const cancellation = cancellationSummary(row);
+  const cancelFailed = cancelFailedSummary(liveCancelFailed(row));
   const activitySources = activitySummary(row);
   const blockedReason = row.lifecycle?.blockedReason ?? null;
   return `<li class="run-row operator-${operator.status}">
@@ -480,6 +485,7 @@ function renderRunningRow(
     ${row.lastMessage ? `<div>${escapeHtml(row.lastMessage)}</div>` : ""}
     <div><code>${escapeHtml(row.workspacePath ?? "")}</code></div>
     ${cancellation ? `<div class="cancellation">${escapeHtml(cancellation)}</div>` : ""}
+    ${cancelFailed ? `<div class="cancellation">${escapeHtml(cancelFailed)}</div>` : ""}
     ${blockedReason ? `<div class="blocked">Blocked: ${escapeHtml(blockedReason)}</div>` : ""}
     <div class="controls">controls: ${formatControls(controls)}</div>
     ${formatAffordances(affordances)}
@@ -601,30 +607,32 @@ async function pausedOperatorViews(
   );
 }
 
-function issueOperatorLiveness(input: {
+async function issueOperatorLiveness(input: {
   live: RunningRow | null;
   latestRun: RunRecord | null | undefined;
   lifecycle: IssueLifecycleRecord | null | undefined;
   paused: boolean;
   resolvedAgentId: string | null;
+  runStore: RunTranscriptStore | undefined;
 }) {
   if (input.live) {
     return runningOperatorLiveness(input.live, input.paused, input.lifecycle ?? input.live.lifecycle, input.resolvedAgentId);
   }
   if (isLifecycleBlocked(input.lifecycle)) {
-    return terminalOperatorLiveness("blocked_human_required", input.latestRun ?? null, input.lifecycle ?? null, input.paused);
+    return terminalOperatorLiveness("blocked_human_required", input.latestRun ?? null, input.lifecycle ?? null, input.paused, input.runStore);
   }
   if (input.latestRun?.status === "cancelled" || input.latestRun?.cancellationRequestedAt || input.latestRun?.cancelFailed) {
-    return terminalOperatorLiveness("cancelled", input.latestRun, input.lifecycle ?? null, input.paused);
+    return terminalOperatorLiveness("cancelled", input.latestRun, input.lifecycle ?? null, input.paused, input.runStore);
   }
   return null;
 }
 
-function runOperatorLiveness(
+async function runOperatorLiveness(
   run: RunRecord,
   snapshot: RuntimeSnapshot,
   lifecycle: IssueLifecycleRecord | null = null,
   issueRuns: RunRecord[] = [],
+  runStore?: RunTranscriptStore,
 ) {
   const live = findLiveRun(snapshot, run.runId);
   if (live) {
@@ -632,10 +640,10 @@ function runOperatorLiveness(
     return runningOperatorLiveness(live, isIssuePaused(snapshot, keys), live.lifecycle, run.agentId);
   }
   if (isLatestRunForBlockedLifecycle(run, lifecycle, issueRuns)) {
-    return terminalOperatorLiveness("blocked_human_required", run, lifecycle, false);
+    return terminalOperatorLiveness("blocked_human_required", run, lifecycle, false, runStore);
   }
   if (run.status === "cancelled" || run.cancellationRequestedAt || run.cancelFailed) {
-    return terminalOperatorLiveness("cancelled", run, null, false);
+    return terminalOperatorLiveness("cancelled", run, null, false, runStore);
   }
   return null;
 }
@@ -664,11 +672,12 @@ function runLivenessSummary(
   return { tracking: "terminal", status: null, paused: false };
 }
 
-function terminalOperatorLiveness(
+async function terminalOperatorLiveness(
   status: Extract<OperatorLivenessStatus, "cancelled" | "blocked_human_required">,
   run: RunRecord | null,
   lifecycle: IssueLifecycleRecord | null,
   paused: boolean,
+  runStore?: RunTranscriptStore,
 ) {
   return {
     status,
@@ -689,7 +698,7 @@ function terminalOperatorLiveness(
     stallTimeoutMs: null,
     cancellation: null,
     paused,
-    activity: terminalActivity(run, lifecycle),
+    activity: await terminalActivity(run, lifecycle, runStore),
     timeline: terminalTimeline(status, run, lifecycle),
   };
 }
@@ -752,20 +761,80 @@ function liveActivity(row: RunningRow) {
   );
 }
 
-function terminalActivity(run: RunRecord | null, lifecycle: IssueLifecycleRecord | null) {
+async function terminalActivity(run: RunRecord | null, lifecycle: IssueLifecycleRecord | null, runStore?: RunTranscriptStore) {
   if (run?.activitySnapshot) {
     return {
       ...run.activitySnapshot,
       unavailable: [],
     };
   }
+  if (run && runStore) {
+    return deriveTerminalActivityFromTranscript(await readAllTranscriptEvents(runStore, run.runId), run.updatedAt ?? lifecycle?.updatedAt ?? null);
+  }
   return {
     lastHarnessActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
     lastStreamActivityAt: null,
     lastDeltaOrToolActivityAt: null,
     lastToolActivityAt: null,
-    unavailable: ["terminal_activity_sources_not_persisted"],
+    unavailable: ["transcript_store_unavailable"],
   };
+}
+
+async function readAllTranscriptEvents(runStore: RunTranscriptStore, runId: string): Promise<TranscriptEvent[]> {
+  const events: TranscriptEvent[] = [];
+  let offset = 0;
+  do {
+    const page = await runStore.readTranscript(runId, { offset, limit: 1_000 });
+    events.push(...page.events);
+    if (page.nextOffset === null) break;
+    offset = page.nextOffset;
+  } while (true);
+  return events;
+}
+
+function deriveTerminalActivityFromTranscript(events: TranscriptEvent[], fallbackHarnessActivityAt: string | null) {
+  let lastHarnessActivityAt: string | null = null;
+  let lastStreamActivityAt: string | null = null;
+  let lastDeltaOrToolActivityAt: string | null = null;
+  let lastToolActivityAt: string | null = null;
+
+  for (const event of events) {
+    if (event.source !== "harness") continue;
+    lastHarnessActivityAt = latestIso(lastHarnessActivityAt, event.at);
+    if (event.eventType !== "progress") continue;
+
+    const source = transcriptActivitySource(event.payload);
+    if (source === "stream") {
+      lastStreamActivityAt = latestIso(lastStreamActivityAt, event.at);
+    }
+    if (source === "delta" || source === "tool") {
+      lastDeltaOrToolActivityAt = latestIso(lastDeltaOrToolActivityAt, event.at);
+    }
+    if (source === "tool") {
+      lastToolActivityAt = latestIso(lastToolActivityAt, event.at);
+    }
+  }
+
+  return {
+    lastHarnessActivityAt: lastHarnessActivityAt ?? fallbackHarnessActivityAt,
+    lastStreamActivityAt,
+    lastDeltaOrToolActivityAt,
+    lastToolActivityAt,
+    unavailable: [],
+  };
+}
+
+function transcriptActivitySource(payload: unknown): "stream" | "delta" | "tool" {
+  if (payload && typeof payload === "object" && "activitySource" in payload) {
+    const source = (payload as { activitySource?: unknown }).activitySource;
+    if (source === "delta" || source === "tool" || source === "stream") return source;
+  }
+  return "stream";
+}
+
+function latestIso(current: string | null, candidate: string): string {
+  if (current === null) return candidate;
+  return Date.parse(candidate) >= Date.parse(current) ? candidate : current;
 }
 
 function blockedIssueView(lifecycle: IssueLifecycleRecord | null | undefined) {
@@ -989,9 +1058,19 @@ function cancellationSummary(row: RunningRow): string | null {
     row.cancellation.requestedAt ? `at ${row.cancellation.requestedAt}` : null,
     row.cancellation.abortSignalled ? "abort signalled" : null,
     row.cancellation.harnessStopRequestedAt ? `harness stop requested ${row.cancellation.harnessStopRequestedAt}` : null,
-    row.cancellation.harnessStopFailedAt
-      ? `harness stop failed ${row.cancellation.harnessStopFailedReason ?? row.cancellation.harnessStopFailedAt}`
-      : null,
+  ]
+    .filter((part): part is string => part !== null && part.length > 0)
+    .join(" · ");
+}
+
+function cancelFailedSummary(cancelFailed: ReturnType<typeof liveCancelFailed>): string | null {
+  if (!cancelFailed.active) return null;
+  return [
+    "cancel_failed",
+    `phase=${cancelFailed.phase}`,
+    cancelFailed.source ? `source=${cancelFailed.source}` : null,
+    cancelFailed.at ? `at=${cancelFailed.at}` : null,
+    cancelFailed.reason ? `reason=${cancelFailed.reason}` : null,
   ]
     .filter((part): part is string => part !== null && part.length > 0)
     .join(" · ");
