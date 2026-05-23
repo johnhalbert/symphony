@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 
 describe("FileRunTranscriptStore", () => {
@@ -12,6 +12,7 @@ describe("FileRunTranscriptStore", () => {
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -114,5 +115,75 @@ describe("FileRunTranscriptStore", () => {
 
     await expect(store.latestRunForIssue("TEST-1")).resolves.toMatchObject({ runId: "reviewer-run" });
     await expect(store.latestRunForIssue("TEST-1", { role: "worker" })).resolves.toMatchObject({ runId: "worker-run" });
+  });
+
+  it("orders equal-timestamp issue runs deterministically", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+    const store = new FileRunTranscriptStore(root);
+    await store.startRun({
+      runId: "run-z-worker-turn",
+      sessionId: "worker-turn-session",
+      agentId: "worker-turn-agent",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 2,
+      prompt: "continue work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+    await store.startRun({
+      runId: "run-c-worker-retry",
+      sessionId: "worker-retry-session",
+      agentId: "worker-retry-agent",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: 1,
+      turnNumber: 1,
+      prompt: "retry work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+    await store.startRun({
+      runId: "run-b-reviewer",
+      sessionId: "reviewer-session",
+      agentId: "reviewer-agent",
+      role: "reviewer",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "review",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+    await store.startRun({
+      runId: "run-a-worker",
+      sessionId: "worker-session",
+      agentId: "worker-agent",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+
+    await expect(store.listRunsForIssue("TEST-1")).resolves.toMatchObject([
+      { runId: "run-a-worker" },
+      { runId: "run-b-reviewer" },
+      { runId: "run-z-worker-turn" },
+      { runId: "run-c-worker-retry" },
+    ]);
+    await expect(store.latestRunForIssue("TEST-1")).resolves.toMatchObject({ runId: "run-c-worker-retry" });
+    await expect(store.latestRunForIssue("TEST-1", { role: "worker" })).resolves.toMatchObject({
+      runId: "run-c-worker-retry",
+    });
   });
 });
