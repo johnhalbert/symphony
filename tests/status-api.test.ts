@@ -11,7 +11,7 @@ import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptSto
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
-import type { IssueDetailsEnvelope, IssueStatusView } from "../src/core/types.js";
+import type { IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { testConfig } from "./helpers.js";
 
@@ -249,6 +249,8 @@ describe("StatusServer durable API", () => {
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
     });
     const address = await server.start();
     try {
@@ -326,7 +328,14 @@ describe("StatusServer durable API", () => {
       };
 
       expect(issueResponse.status).toBe(200);
-      expect(issueBody.issueDetails).toEqual(durableIssueDetails());
+      expect(issueBody.issueDetails).toMatchObject({
+        source: "durable",
+        completeness: "partial",
+        issue: { id: "issue-1", identifier: "TEST-1", state: null, branchName: "symphony/TEST-1" },
+        tracker: { generatedAt: null, stale: null, classification: null },
+        pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7 },
+        latestRun: { runId: "run-1", status: "running", terminalReason: null },
+      });
       expect(issueBody.latestRun.runId).toBe("run-1");
       expect(issueBody.reviewLoop).toMatchObject({
         phase: "review",
@@ -371,7 +380,12 @@ describe("StatusServer durable API", () => {
         results: [{ sdkRoleRunRole: "worker", sdkRoleRunIndex: 0 }],
       });
       expect(runsBody.runs).toHaveLength(1);
-      expect(runsBody.issueDetails).toEqual(durableIssueDetails());
+      expect(runsBody.issueDetails).toMatchObject({
+        source: "durable",
+        completeness: "partial",
+        issue: { id: "issue-1", identifier: "TEST-1", state: null, branchName: "symphony/TEST-1" },
+        latestRun: { runId: "run-1", terminalReason: null },
+      });
       expect(runResponse.status).toBe(200);
       expect(runBody).toMatchObject({
         prUrl: "https://github.com/acme/repo/pull/7",
@@ -442,6 +456,8 @@ describe("StatusServer durable API", () => {
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: resolveStatusMutationToken(config),
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
     });
     const address = await server.start();
     try {
@@ -457,6 +473,57 @@ describe("StatusServer durable API", () => {
 
       expect(legacyPauseResponse.status).toBe(401);
       expect(profilePauseResponse.status).toBe(202);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps durable issue ids null when only workspace identity is known", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.upsertWorkspace({
+      workspaceKey: "workspace-only",
+      issueId: null,
+      issueIdentifier: "TEST-WORKSPACE-ONLY",
+      path: path.join(config.workspace.root, "workspace-only"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/TEST-WORKSPACE-ONLY",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/workspace-only`);
+      const issueBody = (await issueResponse.json()) as { issueDetails: IssueDetailsEnvelope };
+
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.issueDetails).toMatchObject({
+        source: "durable",
+        completeness: "partial",
+        issue: {
+          id: null,
+          identifier: "TEST-WORKSPACE-ONLY",
+          branchName: "symphony/TEST-WORKSPACE-ONLY",
+          state: null,
+        },
+        tracker: { generatedAt: null, stale: null, classification: null },
+      });
     } finally {
       await server.stop();
     }
@@ -559,8 +626,9 @@ describe("StatusServer durable API", () => {
         state: "In Progress",
         branchName: "live/TEST-1",
         labels: ["dogfood-ready"],
-        blockedBy: [{ id: "blocker-1", identifier: "TEST-0", state: "Done" }],
+        blockedBy: [{ id: "blocker-1", identifier: "TEST-0", state: "In Progress" }],
         url: "https://linear.app/acme/issue/TEST-1/live-issue",
+        updatedAt: "2026-01-01T00:00:00.000Z",
       }),
     };
     const server = new StatusServer({
@@ -575,12 +643,15 @@ describe("StatusServer durable API", () => {
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
     });
     const address = await server.start();
     try {
       const baseUrl = `http://${address.host}:${address.port}`;
       const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
       const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const runsResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/runs`);
       const dashboardResponse = await fetch(`${baseUrl}/`);
       const stateBody = (await stateResponse.json()) as {
         running: Array<{ issueDetails: IssueStatusView; liveness: unknown; cancellation: unknown }>;
@@ -622,10 +693,12 @@ describe("StatusServer durable API", () => {
           humanRequired: { active: boolean };
         };
       };
+      const runsBody = (await runsResponse.json()) as { issueDetails: IssueDetailsEnvelope };
       const dashboardHtml = await dashboardResponse.text();
 
       expect(stateResponse.status).toBe(200);
       expect(issueResponse.status).toBe(200);
+      expect(runsResponse.status).toBe(200);
       expect(dashboardResponse.status).toBe(200);
       expect(stateBody.running[0]).toMatchObject({
         issueDetails: {
@@ -653,16 +726,21 @@ describe("StatusServer durable API", () => {
         },
       });
       expect(issueBody.live).not.toHaveProperty("issueDetails");
-      expect(issueBody.issueDetails).toEqual({
+      expect(issueBody.issueDetails).toMatchObject({
         source: "live",
         completeness: "full",
         issue: stateBody.running[0]?.issueDetails,
+        tracker: { generatedAt: "2026-01-01T00:10:00.000Z", classification: "active", stale: true },
+        blockers: { available: true, totalCount: 1, openCount: 1, blocked: true },
+        latestRun: { runId: "run-reviewer", status: "running", terminalReason: null },
       });
+      expect(runsBody.issueDetails).toMatchObject(issueBody.issueDetails);
       expect(stateBody.operatorView.running[0]).toMatchObject({
         issueDetails: {
           source: "live",
           completeness: "full",
           issue: stateBody.running[0]?.issueDetails,
+          tracker: { generatedAt: "2026-01-01T00:10:00.000Z", classification: "active", stale: true },
         },
         liveness: { status: "cancelling", agentId: "agent-1" },
         controls: { cancel: false },
@@ -771,6 +849,8 @@ describe("StatusServer durable API", () => {
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
     });
     const address = await server.start();
     try {
@@ -834,7 +914,7 @@ describe("StatusServer durable API", () => {
       completedAt: "2026-01-01T00:05:00.000Z",
       metadata: {
         cancellationRequestedAt: "2026-01-01T00:04:00.000Z",
-        cancellationSource: "operator",
+          cancellationSource: "stalled",
         cancellationOutcome: "cancel_ignored",
         cancelFailed: true,
         cancelFailedAt: "2026-01-01T00:05:00.000Z",
@@ -899,6 +979,8 @@ describe("StatusServer durable API", () => {
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
     });
     const address = await server.start();
     try {
@@ -919,9 +1001,11 @@ describe("StatusServer durable API", () => {
         };
       };
       const issueRunsBody = (await issueRunsResponse.json()) as {
+        issueDetails: IssueDetailsEnvelope;
         runs: Array<{ runId: string; operatorLiveness: null | typeof runDetailBody.operatorLiveness }>;
       };
       const issueBody = (await issueResponse.json()) as {
+        issueDetails: IssueDetailsEnvelope;
         operatorLiveness: typeof runDetailBody.operatorLiveness;
       };
 
@@ -946,6 +1030,12 @@ describe("StatusServer durable API", () => {
       expect(issueRun?.operatorLiveness?.activity).toEqual(expectedActivity);
       expect(issueBody.operatorLiveness.cancelFailed).toMatchObject(expectedCancelFailed);
       expect(issueBody.operatorLiveness.activity).toEqual(expectedActivity);
+      expect(issueBody.issueDetails.latestRun).toMatchObject({
+        runId: "run-terminal-activity",
+        status: "cancelled",
+        terminalReason: "stalled",
+      });
+      expect(issueRunsBody.issueDetails.latestRun).toMatchObject(issueBody.issueDetails.latestRun);
     } finally {
       await server.stop();
     }
@@ -1006,6 +1096,8 @@ describe("StatusServer durable API", () => {
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
     });
     const address = await server.start();
     try {
@@ -1165,6 +1257,8 @@ describe("StatusServer durable API", () => {
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
     });
     const address = await server.start();
     try {
@@ -1210,7 +1304,13 @@ describe("StatusServer durable API", () => {
         issueId: "issue-paused",
         issueIdentifier: "TEST-PAUSED",
         controls: { pause: false, resume: true, cancel: false, mutationsRequireToken: false },
-        issueDetails: durableIssueDetails({ id: "issue-paused", identifier: "TEST-PAUSED", branchName: null }),
+        issueDetails: {
+          source: "durable",
+          completeness: "partial",
+          issue: { id: "issue-paused", identifier: "TEST-PAUSED", branchName: null, state: null },
+          tracker: { generatedAt: null, classification: null, stale: null },
+          blockers: { available: false, humanBlockedReason: "paused needs operator" },
+        },
         humanRequired: { active: true, reason: "paused needs operator" },
         continuationSummary: { available: true, path: "/api/v1/issues/TEST-PAUSED/continuation-summary" },
       });
@@ -1249,25 +1349,77 @@ function issueDetailsFixture(overrides: Partial<IssueStatusView> & Pick<IssueSta
 }
 
 function durableIssueDetails(overrides: Partial<IssueDetailsEnvelope["issue"]> = {}): IssueDetailsEnvelope {
+  const issue = {
+    id: "issue-1",
+    identifier: "TEST-1",
+    title: null,
+    description: null,
+    priority: null,
+    state: null,
+    branchName: "symphony/TEST-1",
+    url: null,
+    assigneeId: null,
+    labels: [],
+    blockedBy: [],
+    createdAt: null,
+    updatedAt: null,
+    ...overrides,
+  };
   return {
     source: "durable",
     completeness: "partial",
-    issue: {
-      id: "issue-1",
-      identifier: "TEST-1",
-      title: null,
-      description: null,
-      priority: null,
-      state: null,
-      branchName: "symphony/TEST-1",
-      url: null,
-      assigneeId: null,
-      labels: [],
-      blockedBy: [],
-      createdAt: null,
+    issue,
+    tracker: {
+      generatedAt: null,
       updatedAt: null,
-      ...overrides,
+      ageMs: null,
+      stale: null,
+      staleThresholdMs: 300_000,
+      state: null,
+      classification: null,
     },
+    blockers: {
+      available: false,
+      totalCount: 0,
+      openCount: 0,
+      open: [],
+      blocked: false,
+      humanBlockedReason: null,
+    },
+    workspace: {
+      workspaceKey: "TEST-1",
+      path: null,
+      sourceKind: null,
+      branchName: issue.branchName,
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+    },
+    pullRequest: {
+      url: "https://github.com/acme/repo/pull/7",
+      number: 7,
+      headSha: null,
+      branch: null,
+      ciStatus: "success",
+      lastPushedAt: "2026-01-01T00:00:00.500Z",
+    },
+    latestRun: {
+      runId: "run-1",
+      status: "running",
+      terminalReason: null,
+      error: null,
+      completedAt: null,
+    },
+  };
+}
+
+function testTrackerStateLists(): TrackerStateLists {
+  return {
+    activeStates: ["Todo", "In Progress"],
+    handoffStates: ["In Review"],
+    reviewStates: ["In Review"],
+    blockedStates: ["Blocked"],
+    terminalStates: ["Done", "Closed", "Cancelled", "Canceled", "Duplicate"],
   };
 }
 
@@ -1278,7 +1430,7 @@ function fakeOrchestrator(
   return {
     snapshot() {
       return {
-        generatedAt: new Date(0).toISOString(),
+        generatedAt: "2026-01-01T00:10:00.000Z",
         counts: {
           running: running.length,
           retrying: overrides.retrying?.length ?? 0,
