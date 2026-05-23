@@ -255,7 +255,7 @@ export class FileRunTranscriptStore {
     const records = await this.listRuns();
     return records
       .filter((record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier)
-      .sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+      .sort(compareRunChronology);
   }
 
   async latestRunForIssue(issueIdOrIdentifier: string, options: { role?: AgentRunRole } = {}): Promise<RunRecord | null> {
@@ -319,8 +319,38 @@ export class FileRunTranscriptStore {
 
 export type RunTranscriptStore = FileRunTranscriptStore;
 
+export function compareRunChronology(left: RunRecord, right: RunRecord): number {
+  return (
+    compareNumber(Date.parse(left.startedAt), Date.parse(right.startedAt)) ||
+    compareString(left.startedAt, right.startedAt) ||
+    compareNullableNumber(left.attempt, right.attempt) ||
+    compareNumber(left.turnNumber, right.turnNumber) ||
+    compareString(left.runId, right.runId)
+  );
+}
+
 function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "record";
+}
+
+function compareNumber(left: number, right: number): number {
+  if (Number.isNaN(left) && Number.isNaN(right)) return 0;
+  if (Number.isNaN(left)) return -1;
+  if (Number.isNaN(right)) return 1;
+  return left - right;
+}
+
+function compareNullableNumber(left: number | null, right: number | null): number {
+  if (left === right) return 0;
+  if (left === null) return -1;
+  if (right === null) return 1;
+  return compareNumber(left, right);
+}
+
+function compareString(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
