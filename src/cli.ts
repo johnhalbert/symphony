@@ -8,6 +8,7 @@ import { Orchestrator } from "./core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureDiagnosticsStore.js";
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
+import { FileWritebackOutboxStore } from "./core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
@@ -106,6 +107,7 @@ program
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
+    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writeback = createRuntimeWritebackProcessor(config, logger);
     const workspaceManager = new WorkspaceManager({
       workspace: config.workspace,
@@ -148,6 +150,7 @@ program
             runStore,
             lifecycleStore,
             mcpExposureDiagnosticsStore,
+            writebackOutbox,
             host: config.server.host,
             port: config.server.port,
             openWorkspaceToken: resolveStatusMutationToken(config),

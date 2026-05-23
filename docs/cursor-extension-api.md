@@ -11,8 +11,10 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 ## Stable Resources
 
 - `GET /api/v1/state` returns the live orchestrator snapshot.
-- `GET /api/v1/issue-board?refresh=1` returns a Linear-backed issue board enriched with Symphony run, workspace, review-loop, liveness, and blocker state. `refresh=1` bypasses the short-lived tracker cache.
-- `GET /api/v1/activity?offset=0&limit=50` returns a globally sorted feed of persisted run and transcript activity.
+- `GET /api/v1/board?refresh=1` returns the extension-facing issue board with `columns`, flat `issues`, `counts`, and `generatedAt` metadata. `refresh=1` bypasses the short-lived tracker cache.
+- `GET /api/v1/board/issues/:id` returns a board-scoped issue detail payload with the issue envelope, workspace capabilities, runs, PR/CI, blockers, and liveness data.
+- `GET /api/v1/issue-board?refresh=1` remains the legacy board response with `lanes` for existing clients.
+- `GET /api/v1/activity?offset=0&limit=50` returns a globally sorted feed of persisted run, transcript, and writeback activity.
 - `GET /api/v1/issues/:id` returns live issue status when present plus durable workspace, latest run metadata, and an `issueDetails` envelope. Prefer `issueDetails` for extension issue cards; top-level `metadata`, `workspace`, `latestRun`, and `lifecycle` remain available for backward compatibility and detailed inspection.
 - `GET /api/v1/issues/:id/runs` returns all persisted runs for an issue id or identifier plus the same `issueDetails` envelope.
 - `GET /api/v1/runs/:runId` returns run metadata.
@@ -53,11 +55,33 @@ On `GET /api/v1/issues/:id/runs`, the top-level `enrichment` object describes ru
 
 ## Issue Board
 
-`GET /api/v1/issue-board` returns `lanes`, a flat `issues` list, tracker cache metadata, and counts. Cards use the same `issueDetails` envelope as issue detail endpoints, so extension clients can render tracker-backed and Symphony-only cards without separate lookups. The endpoint requires a configured tracker client and returns `503` with `tracker_unavailable` when tracker access is not configured.
+`GET /api/v1/board` returns:
+
+```json
+{
+  "generatedAt": "2026-01-01T00:00:00.000Z",
+  "tracker": { "status": "ok", "cached": false, "issueCount": 0 },
+  "columns": [
+    { "id": "todo", "title": "Todo", "states": ["Todo"], "count": 0, "issues": [] }
+  ],
+  "issues": [],
+  "counts": { "total": 0, "trackerBacked": 0, "symphonyOnly": 0, "live": 0, "paused": 0, "blocked": 0 }
+}
+```
+
+Columns contain the same card shape as the flat `issues` list. Card `capabilities.detail` points at `GET /api/v1/board/issues/:id`, preferring the Linear issue id when available and falling back to the identifier or durable card key. The endpoint requires a configured tracker client and returns `503` with `tracker_unavailable` when tracker access is not configured.
+
+`GET /api/v1/issue-board` is kept for compatibility and returns the older `lanes` field and legacy card links.
+
+## Board Issue Detail
+
+`GET /api/v1/board/issues/:id` accepts either a Linear issue id or identifier. It first resolves the issue against the current board projection so tracker-backed board cards include title, description, labels, state, and blockers. It then attaches durable Symphony data: `workspace`, `latestRun`, enriched `runs`, `lifecycle`, `reviewLoop`, `metadata`, `pullRequest`, `blockers`, `operatorLiveness`, and `capabilities`.
+
+If tracker lookup fails but live or durable Symphony data exists, the endpoint returns that partial detail. It returns `503` only when tracker-backed data is required and no local fallback exists, and `404` when the issue is absent from board, live, workspace, run, and lifecycle sources.
 
 ## Activity Feed
 
-`GET /api/v1/activity?offset=0&limit=50` returns read-only activity from persisted Symphony runs and transcripts. `limit` defaults to `50` and is clamped to `100`; `offset` defaults to `0`. Add `issue=ENG-11` or a Linear issue id to restrict the feed to one issue.
+`GET /api/v1/activity?offset=0&limit=50` returns read-only activity from persisted Symphony runs, transcripts, and writeback outbox records. `limit` defaults to `50` and is clamped to `100`; `offset` defaults to `0`. Add `issue=ENG-11` or a Linear issue id to restrict the feed to one issue.
 
 The response shape is:
 
@@ -72,11 +96,13 @@ The response shape is:
     "totalItems": 0,
     "distinctRunsConsidered": 0,
     "transcriptEventsConsidered": 0,
-    "syntheticRunEvents": 0
+    "syntheticRunEvents": 0,
+    "writebackOperationsConsidered": 0
   },
   "source": {
-    "kind": "durable_transcripts",
-    "runStoreAvailable": true
+    "kind": "durable_activity",
+    "runStoreAvailable": true,
+    "writebackOutboxAvailable": true
   },
   "filter": {
     "issue": null
@@ -84,7 +110,9 @@ The response shape is:
 }
 ```
 
-Activity items are explicit summaries, not raw persisted records. They include `id`, `at`, `kind`, source, issue id/identifier, run id/role/status/agent/session, optional transcript sequence/event type/message, and links to the issue, run, and one-event transcript page. Raw transcript `payload`, run prompts, workspace paths, and repo-local paths are intentionally omitted from the feed; clients that need full transcript details should follow the per-run transcript link.
+Activity items are explicit summaries, not raw persisted records. Run and transcript items include `id`, `at`, `kind`, source, issue id/identifier, run id/role/status/agent/session, optional transcript sequence/event type/message, and links to the board issue, run, and one-event transcript page.
+
+Writeback items use `kind: "writeback_operation"`, `source: "writeback"`, `at` from the outbox record `updatedAt`, `transcript: null`, and a redacted `writeback` object with operation kind, status, attempt, timestamps, transition `toState`/`fromStates`, or comment `dedupeKey`/`bodyLength`/`bodyRedacted`. Raw writeback comment bodies, raw transcript `payload`, run prompts, workspace paths, repo-local paths, and unbounded tracker error text are intentionally omitted from the feed.
 
 ## Non-Goals
 

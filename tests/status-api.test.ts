@@ -8,6 +8,7 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "../src/core/persistence/McpExposureDiagnosticsStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -478,6 +479,17 @@ describe("StatusServer durable API", () => {
       message: "latest from long transcript",
       payload: { secret: "PAYLOAD_SECRET_B_LATEST" },
     });
+    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writebackOperation = await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-b:report",
+      kind: "comment",
+      issueId: "issue-b",
+      runId: "run-b",
+      payload: {
+        body: "WRITEBACK_BODY_SECRET /local/workspace/path",
+        dedupeKey: "report",
+      },
+    });
 
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
@@ -488,6 +500,7 @@ describe("StatusServer durable API", () => {
       }),
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
       runStore,
+      writebackOutbox,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: null,
@@ -506,17 +519,36 @@ describe("StatusServer durable API", () => {
           kind: string;
           source: string;
           issue: { identifier: string };
-          run: { runId: string; role: string };
+          run: { runId: string; role: string } | null;
           transcript: { sequence: number; eventType: string; message: string | null } | null;
-          links: { run: string; transcript: string | null };
+          links: { issue?: string; run: string | null; transcript: string | null };
+          id?: string;
+          writeback?: null | {
+            operationKind: string;
+            status: string;
+            attempt: number;
+            createdAt: string;
+            updatedAt: string;
+            nextAttemptAt: string;
+            comment: null | { dedupeKey: string; bodyLength: number; bodyRedacted: true };
+          };
         }>;
-        counts: { totalItems: number; distinctRunsConsidered: number; transcriptEventsConsidered: number; syntheticRunEvents: number };
-        source: { runStoreAvailable: boolean };
+        counts: {
+          totalItems: number;
+          distinctRunsConsidered: number;
+          transcriptEventsConsidered: number;
+          syntheticRunEvents: number;
+          writebackOperationsConsidered: number;
+        };
+        source: { runStoreAvailable: boolean; writebackOutboxAvailable: boolean };
       };
       const secondPageResponse = await fetch(`${baseUrl}/api/v1/activity?offset=1&limit=1`);
       const secondPage = (await secondPageResponse.json()) as typeof firstPage;
       const issueResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-A&limit=100`);
       const issueBody = (await issueResponse.json()) as typeof firstPage;
+      const writebackResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-B&offset=1001&limit=10`);
+      const writebackText = await writebackResponse.text();
+      const writebackBody = JSON.parse(writebackText) as typeof firstPage;
       const clampedResponse = await fetch(`${baseUrl}/api/v1/activity?limit=999`);
       const clampedBody = (await clampedResponse.json()) as { limit: number };
 
@@ -535,17 +567,46 @@ describe("StatusServer durable API", () => {
       });
       expect(firstPage.nextOffset).toBe(1);
       expect(firstPage.counts).toMatchObject({
-        totalItems: 1_004,
+        totalItems: 1_005,
         distinctRunsConsidered: 2,
         transcriptEventsConsidered: 1_002,
         syntheticRunEvents: 2,
+        writebackOperationsConsidered: 1,
       });
       expect(firstPage.source.runStoreAvailable).toBe(true);
+      expect(firstPage.source.writebackOutboxAvailable).toBe(true);
       expect(firstPageText).not.toContain("PROMPT_SECRET");
       expect(firstPageText).not.toContain("PAYLOAD_SECRET");
       expect(secondPage.activity[0]?.issue.identifier).toBe("TEST-A");
       expect(issueBody.activity.map((item) => item.issue.identifier)).toEqual(["TEST-A", "TEST-A"]);
       expect(issueBody.counts.distinctRunsConsidered).toBe(1);
+      const writebackItem = writebackBody.activity.find((item) => item.id === "writeback:comment:issue-b:report");
+      expect(writebackItem).toMatchObject({
+        at: writebackOperation.updatedAt,
+        kind: "writeback_operation",
+        source: "writeback",
+        issue: { id: "issue-b", identifier: "TEST-B" },
+        run: { runId: "run-b" },
+        transcript: null,
+        writeback: {
+          operationKind: "comment",
+          status: "pending",
+          attempt: 0,
+          comment: {
+            dedupeKey: "report",
+            bodyLength: "WRITEBACK_BODY_SECRET /local/workspace/path".length,
+            bodyRedacted: true,
+          },
+        },
+        links: {
+          issue: "/api/v1/board/issues/TEST-B",
+          run: "/api/v1/runs/run-b",
+          transcript: null,
+        },
+      });
+      expect(writebackBody.counts.writebackOperationsConsidered).toBe(1);
+      expect(writebackText).not.toContain("WRITEBACK_BODY_SECRET");
+      expect(writebackText).not.toContain("/local/workspace/path");
       expect(clampedBody.limit).toBe(100);
     } finally {
       await server.stop();
@@ -574,8 +635,14 @@ describe("StatusServer durable API", () => {
       const body = (await response.json()) as {
         activity: unknown[];
         nextOffset: number | null;
-        counts: { totalItems: number; distinctRunsConsidered: number; transcriptEventsConsidered: number; syntheticRunEvents: number };
-        source: { kind: string; runStoreAvailable: boolean };
+        counts: {
+          totalItems: number;
+          distinctRunsConsidered: number;
+          transcriptEventsConsidered: number;
+          syntheticRunEvents: number;
+          writebackOperationsConsidered: number;
+        };
+        source: { kind: string; runStoreAvailable: boolean; writebackOutboxAvailable: boolean };
       };
 
       expect(response.status).toBe(200);
@@ -586,8 +653,9 @@ describe("StatusServer durable API", () => {
         distinctRunsConsidered: 0,
         transcriptEventsConsidered: 0,
         syntheticRunEvents: 0,
+        writebackOperationsConsidered: 0,
       });
-      expect(body.source).toEqual({ kind: "durable_transcripts", runStoreAvailable: false });
+      expect(body.source).toEqual({ kind: "durable_activity", runStoreAvailable: false, writebackOutboxAvailable: false });
     } finally {
       await server.stop();
     }
@@ -809,6 +877,7 @@ describe("StatusServer durable API", () => {
         id: "issue-todo",
         identifier: "TEST-TODO",
         title: "Todo with dependency",
+        description: "Todo detail description",
         state: "Todo",
         blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
       }),
@@ -932,6 +1001,51 @@ describe("StatusServer durable API", () => {
         },
       });
 
+      const boardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
+      const boardBody = (await boardResponse.json()) as {
+        columns: Array<{
+          id: string;
+          count: number;
+          issues: Array<{ issueId: string | null; issueIdentifier: string | null; capabilities: { detail: string | null } }>;
+        }>;
+        issues: Array<{ issueIdentifier: string | null; capabilities: { detail: string | null } }>;
+        counts: { total: number };
+      };
+      expect(boardResponse.status).toBe(200);
+      expect(boardBody.columns.map((column) => column.id)).toEqual(["backlog", "todo", "progress", "review", "done", "canceled"]);
+      expect(boardBody.columns.find((column) => column.id === "todo")?.count).toBe(1);
+      expect(boardBody.counts.total).toBe(7);
+      expect(boardBody.issues.find((item) => item.issueIdentifier === "TEST-TODO")?.capabilities.detail).toBe(
+        "/api/v1/board/issues/issue-todo",
+      );
+
+      const boardDetailByIdResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board/issues/issue-todo`);
+      const boardDetailByIdentifierResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board/issues/TEST-TODO`);
+      const boardDetail = (await boardDetailByIdResponse.json()) as {
+        boardCard: { issueIdentifier: string | null; capabilities: { detail: string | null } };
+        issueDetails: IssueDetailsEnvelope;
+        runs: unknown[];
+        pullRequest: IssueDetailsEnvelope["pullRequest"];
+        blockers: IssueDetailsEnvelope["blockers"];
+        capabilities: { openWorkspace: boolean; transcript: boolean };
+      };
+      expect(boardDetailByIdResponse.status).toBe(200);
+      expect(boardDetailByIdentifierResponse.status).toBe(200);
+      expect(boardDetail).toMatchObject({
+        boardCard: {
+          issueIdentifier: "TEST-TODO",
+          capabilities: { detail: "/api/v1/board/issues/issue-todo" },
+        },
+        issueDetails: {
+          source: "tracker",
+          issue: { description: "Todo detail description", identifier: "TEST-TODO" },
+        },
+        runs: [],
+        pullRequest: { url: null, ciStatus: null },
+        blockers: { openCount: 1, blocked: true },
+        capabilities: { openWorkspace: false, transcript: false },
+      });
+
       const cachedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
       const cachedBody = (await cachedResponse.json()) as { tracker: { cached: boolean } };
       expect(cachedResponse.status).toBe(200);
@@ -967,13 +1081,57 @@ describe("StatusServer durable API", () => {
     const address = await server.start();
     try {
       const response = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
+      const acceptedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
       const body = (await response.json()) as { error: { code: string; message: string } };
+      const acceptedBody = (await acceptedResponse.json()) as { error: { code: string; message: string } };
 
       expect(response.status).toBe(503);
       expect(body.error).toMatchObject({
         code: "tracker_unavailable",
         message: "Issue board requires a configured tracker client",
       });
+      expect(acceptedResponse.status).toBe(503);
+      expect(acceptedBody.error).toMatchObject(body.error);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves an empty accepted board and clear missing board detail errors", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      tracker: new FakeTracker([]),
+      trackerStateLists: testTrackerStateLists(),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const boardResponse = await fetch(`${baseUrl}/api/v1/board`);
+      const boardBody = (await boardResponse.json()) as {
+        columns: Array<{ id: string; count: number; issues: unknown[] }>;
+        issues: unknown[];
+        counts: { total: number; trackerBacked: number };
+      };
+      const missingResponse = await fetch(`${baseUrl}/api/v1/board/issues/TEST-MISSING`);
+      const missingBody = (await missingResponse.json()) as { error: { code: string; message: string } };
+
+      expect(boardResponse.status).toBe(200);
+      expect(boardBody.issues).toEqual([]);
+      expect(boardBody.counts).toMatchObject({ total: 0, trackerBacked: 0 });
+      expect(boardBody.columns.every((column) => column.count === 0 && column.issues.length === 0)).toBe(true);
+      expect(missingResponse.status).toBe(404);
+      expect(missingBody.error).toMatchObject({ code: "not_found", message: "Board issue not found: TEST-MISSING" });
     } finally {
       await server.stop();
     }

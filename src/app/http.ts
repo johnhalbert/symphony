@@ -25,6 +25,7 @@ import {
   type TranscriptEvent,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
+import type { FileWritebackOutboxStore, WritebackOperation } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import type {
   IssueBlockerRef,
@@ -46,6 +47,7 @@ export interface StatusServerOptions {
   runStore?: RunTranscriptStore;
   lifecycleStore?: IssueLifecycleStore;
   mcpExposureDiagnosticsStore?: FileMcpExposureDiagnosticsStore;
+  writebackOutbox?: Pick<FileWritebackOutboxStore, "list">;
   host: string;
   port: number;
   openWorkspaceToken: string | null;
@@ -121,25 +123,33 @@ export class StatusServer {
         });
         return;
       }
-      if (request.method === "GET" && url.pathname === "/api/v1/issue-board") {
-        const issueBoardColumns = this.options.issueBoardColumns ?? defaultIssueBoardColumns(this.options.trackerStateLists);
-        const trackerProjection = await this.fetchIssueBoardTrackerProjection(
-          issueBoardColumns,
+      const boardIssueMatch = /^\/api\/v1\/board\/issues\/([^/]+)$/.exec(url.pathname);
+      if (request.method === "GET" && boardIssueMatch) {
+        const issueId = decodeURIComponent(boardIssueMatch[1] ?? "");
+        const detail = await this.fetchBoardIssueDetail(
+          issueId,
           url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true",
         );
+        sendJson(response, 200, detail);
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/board") {
         sendJson(
           response,
           200,
-          await buildIssueBoard(
-            this.options.orchestrator.snapshot(),
-            Boolean(this.options.openWorkspaceToken),
-            trackerProjection,
-            this.options.runStore,
-            this.options.lifecycleStore,
-            this.options.trackerStateLists,
-            issueBoardColumns,
-            this.options.staleThresholdMs,
+          acceptedBoardResponse(
+            await this.fetchIssueBoard(
+              url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true",
+            ),
           ),
+        );
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/issue-board") {
+        sendJson(
+          response,
+          200,
+          await this.fetchIssueBoard(url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true"),
         );
         return;
       }
@@ -147,7 +157,13 @@ export class StatusServer {
         sendJson(
           response,
           200,
-          await buildActivityFeed(this.options.orchestrator.snapshot().generatedAt, this.options.runStore, parseActivityQuery(url)),
+          await buildActivityFeed({
+            generatedAt: this.options.orchestrator.snapshot().generatedAt,
+            runStore: this.options.runStore,
+            lifecycleStore: this.options.lifecycleStore,
+            writebackOutbox: this.options.writebackOutbox,
+            query: parseActivityQuery(url),
+          }),
         );
         return;
       }
@@ -408,6 +424,51 @@ export class StatusServer {
     }
   }
 
+  private async fetchIssueBoard(forceRefresh: boolean): Promise<IssueBoardResponse> {
+    const issueBoardColumns = this.options.issueBoardColumns ?? defaultIssueBoardColumns(this.options.trackerStateLists);
+    const trackerProjection = await this.fetchIssueBoardTrackerProjection(issueBoardColumns, forceRefresh);
+    return buildIssueBoard(
+      this.options.orchestrator.snapshot(),
+      Boolean(this.options.openWorkspaceToken),
+      trackerProjection,
+      this.options.runStore,
+      this.options.lifecycleStore,
+      this.options.trackerStateLists,
+      issueBoardColumns,
+      this.options.staleThresholdMs,
+    );
+  }
+
+  private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
+    let board: IssueBoardResponse | null = null;
+    let trackerFailure: SymphonyError | null = null;
+    try {
+      board = await this.fetchIssueBoard(forceRefresh);
+    } catch (error) {
+      if (error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")) {
+        trackerFailure = error;
+      } else {
+        throw error;
+      }
+    }
+
+    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [issueId])) ?? null;
+    const detail = await buildBoardIssueDetail({
+      requestKey: issueId,
+      card,
+      snapshot: this.options.orchestrator.snapshot(),
+      mutationsConfigured: Boolean(this.options.openWorkspaceToken),
+      runStore: this.options.runStore,
+      lifecycleStore: this.options.lifecycleStore,
+      mcpExposureDiagnosticsStore: this.options.mcpExposureDiagnosticsStore,
+      trackerStateLists: this.options.trackerStateLists,
+      staleThresholdMs: this.options.staleThresholdMs,
+    });
+    if (detail) return detail;
+    if (trackerFailure) throw trackerFailure;
+    throw new SymphonyError("not_found", `Board issue not found: ${issueId}`);
+  }
+
   private async fetchIssueBoardTrackerProjection(
     columns: IssueBoardColumnMapping,
     forceRefresh: boolean,
@@ -533,8 +594,8 @@ interface ActivityQuery {
 interface ActivityItem {
   id: string;
   at: string;
-  kind: "run_started" | "run_completed" | "transcript_event";
-  source: "run" | TranscriptEvent["source"];
+  kind: "run_started" | "run_completed" | "transcript_event" | "writeback_operation";
+  source: "run" | TranscriptEvent["source"] | "writeback";
   issue: {
     id: string;
     identifier: string;
@@ -545,15 +606,25 @@ interface ActivityItem {
     status: RunRecord["status"];
     agentId: string | null;
     sessionId: string | null;
-  };
+  } | null;
   transcript: {
     sequence: number;
     eventType: string;
     message: string | null;
   } | null;
+  writeback: {
+    operationKind: WritebackOperation["kind"];
+    status: WritebackOperation["status"];
+    attempt: number;
+    createdAt: string;
+    updatedAt: string;
+    nextAttemptAt: string;
+    transition: { toState: string; fromStates: string[] | null } | null;
+    comment: { dedupeKey: string; bodyLength: number; bodyRedacted: true } | null;
+  } | null;
   links: {
     issue: string;
-    run: string;
+    run: string | null;
     transcript: string | null;
   };
 }
@@ -653,34 +724,144 @@ async function buildIssueBoard(
   };
 }
 
-async function buildActivityFeed(generatedAt: string, runStore: RunTranscriptStore | undefined, query: ActivityQuery) {
-  if (!runStore) {
-    return {
-      generatedAt,
-      offset: query.offset,
-      limit: query.limit,
-      nextOffset: null,
-      activity: [],
-      counts: {
-        totalItems: 0,
-        distinctRunsConsidered: 0,
-        transcriptEventsConsidered: 0,
-        syntheticRunEvents: 0,
-      },
-      source: {
-        kind: "durable_transcripts" as const,
-        runStoreAvailable: false,
-      },
-      filter: {
-        issue: query.issue,
-      },
-    };
-  }
+type IssueBoardResponse = Awaited<ReturnType<typeof buildIssueBoard>>;
 
-  const runs = query.issue ? await runStore.listRunsForIssue(query.issue) : await runStore.listRuns();
+function acceptedBoardResponse(board: IssueBoardResponse) {
+  const columns = board.lanes.map((lane) => ({
+    id: lane.id,
+    title: lane.title,
+    states: lane.states,
+    count: lane.issues.length,
+    issues: lane.issues.map(acceptedBoardCard),
+  }));
+  return {
+    generatedAt: board.generatedAt,
+    tracker: board.tracker,
+    columns,
+    issues: board.issues.map(acceptedBoardCard),
+    counts: board.counts,
+  };
+}
+
+function acceptedBoardCard(card: IssueBoardCard): IssueBoardCard {
+  const detailKey = card.issueId ?? card.issueIdentifier ?? card.key;
+  return {
+    ...card,
+    capabilities: {
+      ...card.capabilities,
+      detail: `/api/v1/board/issues/${encodeURIComponent(detailKey)}`,
+    },
+  };
+}
+
+async function buildBoardIssueDetail(input: {
+  requestKey: string;
+  card: IssueBoardCard | null;
+  snapshot: RuntimeSnapshot;
+  mutationsConfigured: boolean;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  mcpExposureDiagnosticsStore: FileMcpExposureDiagnosticsStore | undefined;
+  trackerStateLists: TrackerStateLists;
+  staleThresholdMs: number;
+}) {
+  const keys = input.card ? boardCardKeys(input.card) : [input.requestKey];
+  const live = liveIssueByKeys(input.snapshot, keys);
+  const workspace = await workspaceByKeys(input.runStore, keys);
+  const latestRun = await latestRunByKeys(input.runStore, keys);
+  const lifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  if (!input.card && !live && !workspace && !latestRun && !lifecycle) return null;
+
+  const issueKey = input.card?.issueIdentifier ?? input.card?.issueId ?? input.requestKey;
+  const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
+  const runs = await runsByKeys(input.runStore, keys);
+  const enrichedRuns = await Promise.all(
+    runs.map(async (run) => ({
+      ...run,
+      operatorLiveness: await runOperatorLiveness(run, input.snapshot, lifecycle, runs, input.runStore),
+      livenessSummary: runLivenessSummary(run, input.snapshot, lifecycle, runs),
+    })),
+  );
+  const issueDetails =
+    input.card?.issueDetails ??
+    buildIssueDetailsEnvelope({
+      requestKey: input.requestKey,
+      generatedAt: input.snapshot.generatedAt,
+      trackerStateLists: input.trackerStateLists,
+      staleThresholdMs: input.staleThresholdMs,
+      live,
+      workspace,
+      latestRun,
+      summaryRun,
+      lifecycle,
+    });
+  const allKeys = issueKeys(issueKey, { live, latestRun, lifecycle });
+  const paused = isIssuePaused(input.snapshot, [input.requestKey, ...keys, ...allKeys]);
+  const resolvedAgentId = live ? await resolveRunningAgentId(live, input.runStore) : null;
+  const operatorLiveness = await issueOperatorLiveness({
+    live,
+    latestRun,
+    lifecycle,
+    paused,
+    resolvedAgentId,
+    runStore: input.runStore,
+  });
+  const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: input.mutationsConfigured });
+  const affordances = operatorAffordances({
+    issueKey,
+    lifecycle,
+    continuationSummaryAvailable: Boolean(input.lifecycleStore && input.runStore),
+    mutationsRequireToken: controls.mutationsRequireToken,
+  });
+  const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
+  const metadata = statusMetadata({ live, workspace, latestRun, lifecycle });
+  return {
+    issue: input.requestKey,
+    boardCard: input.card ? acceptedBoardCard(input.card) : null,
+    issueDetails,
+    live: live ? liveIssueResponse(live, operatorLiveness) : null,
+    workspace,
+    latestRun,
+    runs: enrichedRuns,
+    lifecycle,
+    reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
+    metadata,
+    pullRequest: issueDetails.pullRequest,
+    blockers: issueDetails.blockers,
+    operatorLiveness,
+    capabilities: {
+      transcript: Boolean(latestRun),
+      openWorkspace: workspacePath === null ? false : await pathExists(workspacePath),
+      pause: controls.pause,
+      resume: controls.resume,
+      cancel: controls.cancel,
+      humanRequired: affordances.humanRequired,
+      continuationSummary: affordances.continuationSummary,
+      mutationsRequireToken: controls.mutationsRequireToken,
+      mutationHeader: "X-Symphony-Token",
+    },
+    diagnostics: {
+      mcpToolExposure: (await input.mcpExposureDiagnosticsStore?.latest()) ?? null,
+    },
+    operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
+  };
+}
+
+async function buildActivityFeed(input: {
+  generatedAt: string;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  writebackOutbox: Pick<FileWritebackOutboxStore, "list"> | undefined;
+  query: ActivityQuery;
+}) {
+  const allRuns = input.runStore ? await input.runStore.listRuns() : [];
+  const lifecycleRecords = (await input.lifecycleStore?.list()) ?? [];
+  const issueFilter = input.query.issue;
+  const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : allRuns;
   const activity: ActivityItem[] = [];
   let transcriptEventsConsidered = 0;
   let syntheticRunEvents = 0;
+  let writebackOperationsConsidered = 0;
 
   for (const run of runs) {
     activity.push(activityItemForRun(run, "run_started", run.startedAt));
@@ -690,18 +871,25 @@ async function buildActivityFeed(generatedAt: string, runStore: RunTranscriptSto
       syntheticRunEvents += 1;
     }
 
-    const events = await readAllTranscriptEvents(runStore, run.runId);
+    const events = input.runStore ? await readAllTranscriptEvents(input.runStore, run.runId) : [];
     transcriptEventsConsidered += events.length;
     activity.push(...events.map((event) => activityItemForTranscriptEvent(run, event)));
   }
 
+  const writebackOperations = (await input.writebackOutbox?.list()) ?? [];
+  const filteredWritebackOperations = issueFilter
+    ? writebackOperations.filter((operation) => writebackOperationMatchesIssue(operation, issueFilter, allRuns, lifecycleRecords))
+    : writebackOperations;
+  writebackOperationsConsidered = filteredWritebackOperations.length;
+  activity.push(...filteredWritebackOperations.map((operation) => activityItemForWritebackOperation(operation, allRuns, lifecycleRecords)));
+
   activity.sort(compareActivityItems);
-  const page = activity.slice(query.offset, query.offset + query.limit);
-  const nextOffset = query.offset + page.length < activity.length ? query.offset + page.length : null;
+  const page = activity.slice(input.query.offset, input.query.offset + input.query.limit);
+  const nextOffset = input.query.offset + page.length < activity.length ? input.query.offset + page.length : null;
   return {
-    generatedAt,
-    offset: query.offset,
-    limit: query.limit,
+    generatedAt: input.generatedAt,
+    offset: input.query.offset,
+    limit: input.query.limit,
     nextOffset,
     activity: page,
     counts: {
@@ -709,13 +897,15 @@ async function buildActivityFeed(generatedAt: string, runStore: RunTranscriptSto
       distinctRunsConsidered: runs.length,
       transcriptEventsConsidered,
       syntheticRunEvents,
+      writebackOperationsConsidered,
     },
     source: {
-      kind: "durable_transcripts" as const,
-      runStoreAvailable: true,
+      kind: "durable_activity" as const,
+      runStoreAvailable: Boolean(input.runStore),
+      writebackOutboxAvailable: Boolean(input.writebackOutbox),
     },
     filter: {
-      issue: query.issue,
+      issue: input.query.issue,
     },
   };
 }
@@ -729,6 +919,7 @@ function activityItemForRun(run: RunRecord, kind: Extract<ActivityItem["kind"], 
     issue: activityIssue(run),
     run: activityRun(run),
     transcript: null,
+    writeback: null,
     links: activityLinks(run, null),
   };
 }
@@ -746,7 +937,59 @@ function activityItemForTranscriptEvent(run: RunRecord, event: TranscriptEvent):
       eventType: event.eventType,
       message: event.message ?? null,
     },
+    writeback: null,
     links: activityLinks(run, event),
+  };
+}
+
+function activityItemForWritebackOperation(
+  operation: WritebackOperation,
+  runs: RunRecord[],
+  lifecycles: IssueLifecycleRecord[],
+): ActivityItem {
+  const run = operation.runId ? (runs.find((candidate) => candidate.runId === operation.runId) ?? null) : null;
+  const lifecycle =
+    lifecycles.find((candidate) => candidate.issueId === operation.issueId || candidate.issueIdentifier === operation.issueId) ?? null;
+  const issueIdentifier = run?.issueIdentifier ?? lifecycle?.issueIdentifier ?? operation.issueId;
+  return {
+    id: `writeback:${operation.idempotencyKey}`,
+    at: operation.updatedAt,
+    kind: "writeback_operation",
+    source: "writeback",
+    issue: {
+      id: operation.issueId,
+      identifier: issueIdentifier,
+    },
+    run: run ? activityRun(run) : null,
+    transcript: null,
+    writeback: {
+      operationKind: operation.kind,
+      status: operation.status,
+      attempt: operation.attempt,
+      createdAt: operation.createdAt,
+      updatedAt: operation.updatedAt,
+      nextAttemptAt: operation.nextAttemptAt,
+      transition:
+        operation.kind === "transition"
+          ? {
+              toState: operation.payload.toState,
+              fromStates: operation.payload.fromStates ?? null,
+            }
+          : null,
+      comment:
+        operation.kind === "comment"
+          ? {
+              dedupeKey: operation.payload.dedupeKey,
+              bodyLength: operation.payload.body.length,
+              bodyRedacted: true,
+            }
+          : null,
+    },
+    links: {
+      issue: `/api/v1/board/issues/${encodeURIComponent(issueIdentifier)}`,
+      run: operation.runId ? `/api/v1/runs/${encodeURIComponent(operation.runId)}` : null,
+      transcript: null,
+    },
   };
 }
 
@@ -769,7 +1012,7 @@ function activityRun(run: RunRecord): ActivityItem["run"] {
 
 function activityLinks(run: RunRecord, event: TranscriptEvent | null): ActivityItem["links"] {
   return {
-    issue: `/api/v1/issues/${encodeURIComponent(run.issueIdentifier)}`,
+    issue: `/api/v1/board/issues/${encodeURIComponent(run.issueIdentifier)}`,
     run: `/api/v1/runs/${encodeURIComponent(run.runId)}`,
     transcript: event
       ? `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript?offset=${Math.max(event.sequence - 1, 0)}&limit=1`
@@ -781,7 +1024,7 @@ function compareActivityItems(left: ActivityItem, right: ActivityItem): number {
   return (
     compareIsoDesc(left.at, right.at) ||
     compareNumber(kindRank(left.kind), kindRank(right.kind)) ||
-    compareString(left.run.runId, right.run.runId) ||
+    compareString(left.run?.runId ?? "", right.run?.runId ?? "") ||
     compareNumber(right.transcript?.sequence ?? -1, left.transcript?.sequence ?? -1) ||
     compareString(left.id, right.id)
   );
@@ -795,6 +1038,8 @@ function kindRank(kind: ActivityItem["kind"]): number {
       return 1;
     case "run_started":
       return 2;
+    case "writeback_operation":
+      return 3;
   }
 }
 
@@ -1065,6 +1310,17 @@ async function latestRunByKeys(runStore: RunTranscriptStore | undefined, keys: s
   return [...byRunId.values()].sort(compareRunChronology).at(-1) ?? null;
 }
 
+async function runsByKeys(runStore: RunTranscriptStore | undefined, keys: string[]): Promise<RunRecord[]> {
+  if (!runStore) return [];
+  const byRunId = new Map<string, RunRecord>();
+  for (const key of keys) {
+    for (const run of await runStore.listRunsForIssue(key)) {
+      byRunId.set(run.runId, run);
+    }
+  }
+  return [...byRunId.values()].sort(compareRunChronology);
+}
+
 async function lifecycleByKeys(lifecycleStore: IssueLifecycleStore | undefined, keys: string[]): Promise<IssueLifecycleRecord | null> {
   if (!lifecycleStore) return null;
   for (const key of keys) {
@@ -1086,6 +1342,26 @@ function hasBoardKey(target: Set<string>, keys: Array<string | null | undefined>
 
 function boardCardKeys(card: IssueBoardCard): string[] {
   return [card.key, card.issueId, card.issueIdentifier].filter((value): value is string => value !== null && value !== undefined);
+}
+
+function activityRunMatchesIssue(run: RunRecord, issue: string): boolean {
+  return run.issueId === issue || run.issueIdentifier === issue;
+}
+
+function writebackOperationMatchesIssue(
+  operation: WritebackOperation,
+  issue: string,
+  runs: RunRecord[],
+  lifecycles: IssueLifecycleRecord[],
+): boolean {
+  if (operation.issueId === issue) return true;
+  const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
+  if (run && activityRunMatchesIssue(run, issue)) return true;
+  return lifecycles.some(
+    (lifecycle) =>
+      (lifecycle.issueId === operation.issueId || lifecycle.issueIdentifier === operation.issueId) &&
+      (lifecycle.issueId === issue || lifecycle.issueIdentifier === issue),
+  );
 }
 
 function uniqueStateNames(states: readonly string[]): string[] {
