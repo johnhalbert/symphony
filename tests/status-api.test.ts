@@ -11,6 +11,7 @@ import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptSto
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import type { IssueDetailsEnvelope, IssueStatusView } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { testConfig } from "./helpers.js";
 
@@ -269,6 +270,7 @@ describe("StatusServer durable API", () => {
         headers: { "x-symphony-token": "secret" },
       });
       const issueBody = (await issueResponse.json()) as {
+        issueDetails: IssueDetailsEnvelope;
         latestRun: { runId: string };
         reviewLoop: {
           phase: string | null;
@@ -301,7 +303,7 @@ describe("StatusServer durable API", () => {
           } | null;
         };
       };
-      const runsBody = (await runsResponse.json()) as { runs: unknown[] };
+      const runsBody = (await runsResponse.json()) as { issueDetails: IssueDetailsEnvelope; runs: unknown[] };
       const runBody = (await runResponse.json()) as {
         prUrl: string | null;
         prNumber: number | null;
@@ -324,6 +326,7 @@ describe("StatusServer durable API", () => {
       };
 
       expect(issueResponse.status).toBe(200);
+      expect(issueBody.issueDetails).toEqual(durableIssueDetails());
       expect(issueBody.latestRun.runId).toBe("run-1");
       expect(issueBody.reviewLoop).toMatchObject({
         phase: "review",
@@ -368,6 +371,7 @@ describe("StatusServer durable API", () => {
         results: [{ sdkRoleRunRole: "worker", sdkRoleRunIndex: 0 }],
       });
       expect(runsBody.runs).toHaveLength(1);
+      expect(runsBody.issueDetails).toEqual(durableIssueDetails());
       expect(runResponse.status).toBe(200);
       expect(runBody).toMatchObject({
         prUrl: "https://github.com/acme/repo/pull/7",
@@ -548,6 +552,16 @@ describe("StatusServer durable API", () => {
         repoPath: "/repo",
         baseRef: "main",
       },
+      issueDetails: issueDetailsFixture({
+        id: "issue-1",
+        identifier: "TEST-1",
+        title: "Live issue",
+        state: "In Progress",
+        branchName: "live/TEST-1",
+        labels: ["dogfood-ready"],
+        blockedBy: [{ id: "blocker-1", identifier: "TEST-0", state: "Done" }],
+        url: "https://linear.app/acme/issue/TEST-1/live-issue",
+      }),
     };
     const server = new StatusServer({
       orchestrator: fakeOrchestrator([liveRunning]),
@@ -569,9 +583,10 @@ describe("StatusServer durable API", () => {
       const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
       const dashboardResponse = await fetch(`${baseUrl}/`);
       const stateBody = (await stateResponse.json()) as {
-        running: Array<{ liveness: unknown; cancellation: unknown }>;
+        running: Array<{ issueDetails: IssueStatusView; liveness: unknown; cancellation: unknown }>;
         operatorView: {
           running: Array<{
+            issueDetails: IssueDetailsEnvelope;
             liveness: { status: string; agentId: string | null };
             controls: { cancel: boolean };
             humanRequired: { active: boolean };
@@ -581,7 +596,9 @@ describe("StatusServer durable API", () => {
         operatorLivenessContract: { cancelFailed: { tracked: boolean }; deferred: Record<string, unknown> };
       };
       const issueBody = (await issueResponse.json()) as {
+        issueDetails: IssueDetailsEnvelope;
         live: {
+          issueDetails?: IssueStatusView;
           liveness: unknown;
           cancellation: unknown;
           operatorLiveness: {
@@ -611,6 +628,12 @@ describe("StatusServer durable API", () => {
       expect(issueResponse.status).toBe(200);
       expect(dashboardResponse.status).toBe(200);
       expect(stateBody.running[0]).toMatchObject({
+        issueDetails: {
+          id: "issue-1",
+          identifier: "TEST-1",
+          title: "Live issue",
+          labels: ["dogfood-ready"],
+        },
         liveness: { status: "cancelling", activeRunId: "run-1" },
         cancellation: {
           requested: true,
@@ -629,7 +652,18 @@ describe("StatusServer durable API", () => {
           source: "operator",
         },
       });
+      expect(issueBody.live).not.toHaveProperty("issueDetails");
+      expect(issueBody.issueDetails).toEqual({
+        source: "live",
+        completeness: "full",
+        issue: stateBody.running[0]?.issueDetails,
+      });
       expect(stateBody.operatorView.running[0]).toMatchObject({
+        issueDetails: {
+          source: "live",
+          completeness: "full",
+          issue: stateBody.running[0]?.issueDetails,
+        },
         liveness: { status: "cancelling", agentId: "agent-1" },
         controls: { cancel: false },
         humanRequired: { active: false },
@@ -719,6 +753,12 @@ describe("StatusServer durable API", () => {
         repoPath: "/repo",
         baseRef: "main",
       },
+      issueDetails: issueDetailsFixture({
+        id: "issue-failed-cancel",
+        identifier: "TEST-CANCEL-FAILED",
+        state: "In Progress",
+        branchName: "symphony/TEST-CANCEL-FAILED",
+      }),
     };
     const server = new StatusServer({
       orchestrator: fakeOrchestrator([liveRunning]),
@@ -1072,6 +1112,13 @@ describe("StatusServer durable API", () => {
         repoPath: "/repo",
         baseRef: "main",
       },
+      issueDetails: issueDetailsFixture({
+        id: "issue-2",
+        identifier: "TEST-2",
+        title: "Stalled issue",
+        state: "In Progress",
+        branchName: "symphony/TEST-2",
+      }),
     };
     const blockedRunning: ReturnType<Orchestrator["snapshot"]>["running"][number] = {
       ...stalledRunning,
@@ -1086,6 +1133,13 @@ describe("StatusServer durable API", () => {
         activeRunId: "run-blocked-live",
       },
       lifecycle: blockedLifecycle,
+      issueDetails: issueDetailsFixture({
+        id: "issue-blocked",
+        identifier: "TEST-BLOCKED",
+        title: "Blocked issue",
+        state: "Blocked",
+        branchName: "symphony/TEST-BLOCKED",
+      }),
     };
     const server = new StatusServer({
       orchestrator: fakeOrchestrator([stalledRunning, blockedRunning], {
@@ -1119,9 +1173,11 @@ describe("StatusServer durable API", () => {
       const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
       const html = await response.text();
       const stateBody = (await stateResponse.json()) as {
+        running: Array<{ issueIdentifier: string; issueDetails: IssueStatusView }>;
         operatorView: {
           running: Array<{
             issueIdentifier: string;
+            issueDetails: IssueDetailsEnvelope;
             liveness: { status: string };
             humanRequired: { active: boolean; reason: string | null };
             continuationSummary: { available: boolean; path: string };
@@ -1129,6 +1185,7 @@ describe("StatusServer durable API", () => {
           paused: Array<{
             issueId: string;
             issueIdentifier: string;
+            issueDetails: IssueDetailsEnvelope;
             controls: { pause: boolean; resume: boolean; cancel: boolean; mutationsRequireToken: boolean };
             humanRequired: { active: boolean; reason: string | null };
             continuationSummary: { available: boolean; path: string };
@@ -1153,11 +1210,14 @@ describe("StatusServer durable API", () => {
         issueId: "issue-paused",
         issueIdentifier: "TEST-PAUSED",
         controls: { pause: false, resume: true, cancel: false, mutationsRequireToken: false },
+        issueDetails: durableIssueDetails({ id: "issue-paused", identifier: "TEST-PAUSED", branchName: null }),
         humanRequired: { active: true, reason: "paused needs operator" },
         continuationSummary: { available: true, path: "/api/v1/issues/TEST-PAUSED/continuation-summary" },
       });
       const blocked = stateBody.operatorView.running.find((row) => row.issueIdentifier === "TEST-BLOCKED");
+      const rawBlocked = stateBody.running.find((row) => row.issueIdentifier === "TEST-BLOCKED");
       expect(blocked).toMatchObject({
+        issueDetails: { source: "live", completeness: "full", issue: rawBlocked?.issueDetails },
         liveness: { status: "blocked_human_required" },
         humanRequired: { active: true, reason: "needs operator" },
         continuationSummary: { available: true, path: "/api/v1/issues/TEST-BLOCKED/continuation-summary" },
@@ -1167,6 +1227,49 @@ describe("StatusServer durable API", () => {
     }
   });
 });
+
+function issueDetailsFixture(overrides: Partial<IssueStatusView> & Pick<IssueStatusView, "id" | "identifier">): IssueStatusView {
+  const { id, identifier, ...rest } = overrides;
+  return {
+    id,
+    identifier,
+    title: "Test issue",
+    description: null,
+    priority: null,
+    state: "In Progress",
+    branchName: null,
+    url: null,
+    assigneeId: null,
+    labels: [],
+    blockedBy: [],
+    createdAt: null,
+    updatedAt: null,
+    ...rest,
+  };
+}
+
+function durableIssueDetails(overrides: Partial<IssueDetailsEnvelope["issue"]> = {}): IssueDetailsEnvelope {
+  return {
+    source: "durable",
+    completeness: "partial",
+    issue: {
+      id: "issue-1",
+      identifier: "TEST-1",
+      title: null,
+      description: null,
+      priority: null,
+      state: null,
+      branchName: "symphony/TEST-1",
+      url: null,
+      assigneeId: null,
+      labels: [],
+      blockedBy: [],
+      createdAt: null,
+      updatedAt: null,
+      ...overrides,
+    },
+  };
+}
 
 function fakeOrchestrator(
   running: ReturnType<Orchestrator["snapshot"]>["running"] = [],

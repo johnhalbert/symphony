@@ -11,8 +11,8 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 ## Stable Resources
 
 - `GET /api/v1/state` returns the live orchestrator snapshot.
-- `GET /api/v1/issues/:id` returns live issue status when present plus durable workspace and latest run metadata.
-- `GET /api/v1/issues/:id/runs` returns all persisted runs for an issue id or identifier.
+- `GET /api/v1/issues/:id` returns live issue status when present plus durable workspace, latest run metadata, and an `issueDetails` envelope. `issueDetails.source` is `live` only when tracker metadata is available from an active orchestrator row; durable responses are `partial` and only include identity plus branch hints.
+- `GET /api/v1/issues/:id/runs` returns all persisted runs for an issue id or identifier plus the same `issueDetails` envelope.
 - `GET /api/v1/runs/:runId` returns run metadata.
 - `GET /api/v1/runs/:runId/transcript?offset=0&limit=100` returns paginated transcript events.
 - `GET /api/v1/workspaces` returns known durable workspace records.
