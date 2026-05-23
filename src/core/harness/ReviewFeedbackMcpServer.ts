@@ -1,8 +1,7 @@
-import { EventEmitter } from "node:events";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
-import { errorMessage, SymphonyError } from "../errors.js";
+import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import {
   PullRequestReviewFeedbackService,
@@ -11,6 +10,7 @@ import {
 } from "../review/PullRequestReviewFeedbackService.js";
 import type { Issue } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
+import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
 
 export const REVIEW_FEEDBACK_TOOL_NAME = "submit_pull_request_review_feedback";
 
@@ -80,48 +80,18 @@ export async function runReviewFeedbackMcpServer(options: {
   input?: NodeJS.ReadStream;
   output?: NodeJS.WriteStream;
 }): Promise<void> {
-  const input = options.input ?? process.stdin;
-  const output = options.output ?? process.stdout;
-  const server = new JsonRpcStdioServer(input, output);
-  server.onRequest(async (request) => handleMcpRequest(request, options));
-  await server.start();
-}
-
-async function handleMcpRequest(
-  request: JsonRpcRequest,
-  options: { workflowPath: string; contextFile: string },
-): Promise<unknown> {
-  if (request.method === "initialize") {
-    return {
-      protocolVersion: "2024-11-05",
-      capabilities: { tools: {} },
-      serverInfo: { name: "symphony-review-feedback", version: "0.1.0" },
-    };
-  }
-  if (request.method === "tools/list") {
-    return {
-      tools: [
-        {
-          name: REVIEW_FEEDBACK_TOOL_NAME,
-          description: "Submit reviewer-owned GitHub PR feedback for the active lifecycle-bound pull request.",
-          inputSchema: reviewFeedbackInputSchema(),
-        },
-      ],
-    };
-  }
-  if (request.method === "tools/call") {
-    const params = asRecord(request.params);
-    if (params.name !== REVIEW_FEEDBACK_TOOL_NAME) {
-      throw new SymphonyError("invalid_request", `Unknown tool: ${String(params.name)}`);
-    }
-    const result = await submitReviewFeedbackFromMcp(params.arguments, options);
-    return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      structuredContent: result,
-    };
-  }
-  if (request.method.startsWith("notifications/")) return null;
-  throw new SymphonyError("invalid_request", `Unsupported MCP method: ${request.method}`);
+  await runSingleToolMcpServer({
+    serverName: "symphony-review-feedback",
+    version: "0.1.0",
+    input: options.input,
+    output: options.output,
+    tool: {
+      name: REVIEW_FEEDBACK_TOOL_NAME,
+      description: "Submit reviewer-owned GitHub PR feedback for the active lifecycle-bound pull request.",
+      inputSchema: reviewFeedbackInputSchema(),
+      handler: (input) => submitReviewFeedbackFromMcp(input, options),
+    },
+  });
 }
 
 async function readReviewFeedbackContext(filePath: string): Promise<ReviewFeedbackMcpContextFile> {
@@ -132,91 +102,3 @@ async function readReviewFeedbackContext(filePath: string): Promise<ReviewFeedba
   return parsed;
 }
 
-interface JsonRpcRequest {
-  jsonrpc?: "2.0";
-  id?: string | number | null;
-  method: string;
-  params?: unknown;
-}
-
-class JsonRpcStdioServer {
-  private readonly emitter = new EventEmitter();
-  private buffer = Buffer.alloc(0);
-
-  constructor(
-    private readonly input: NodeJS.ReadStream,
-    private readonly output: NodeJS.WriteStream,
-  ) {}
-
-  onRequest(handler: (request: JsonRpcRequest) => Promise<unknown>): void {
-    this.emitter.on("request", (request: JsonRpcRequest) => {
-      void this.respond(request, handler);
-    });
-  }
-
-  async start(): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      this.input.on("data", (chunk: Buffer) => {
-        try {
-          this.buffer = Buffer.concat([this.buffer, chunk]);
-          this.drainMessages();
-        } catch (error) {
-          reject(error);
-        }
-      });
-      this.input.on("end", resolve);
-      this.input.on("error", reject);
-    });
-  }
-
-  private drainMessages(): void {
-    while (true) {
-      const headerEnd = this.buffer.indexOf("\r\n\r\n");
-      if (headerEnd < 0) return;
-      const header = this.buffer.subarray(0, headerEnd).toString("utf8");
-      const contentLength = parseContentLength(header);
-      const bodyStart = headerEnd + 4;
-      const bodyEnd = bodyStart + contentLength;
-      if (this.buffer.length < bodyEnd) return;
-      const body = this.buffer.subarray(bodyStart, bodyEnd).toString("utf8");
-      this.buffer = this.buffer.subarray(bodyEnd);
-      const request = JSON.parse(body) as JsonRpcRequest;
-      if (request.id === undefined && request.method.startsWith("notifications/")) continue;
-      this.emitter.emit("request", request);
-    }
-  }
-
-  private async respond(request: JsonRpcRequest, handler: (request: JsonRpcRequest) => Promise<unknown>): Promise<void> {
-    if (request.id === undefined) return;
-    try {
-      const result = await handler(request);
-      this.write({ jsonrpc: "2.0", id: request.id, result });
-    } catch (error) {
-      this.write({
-        jsonrpc: "2.0",
-        id: request.id,
-        error: {
-          code: -32000,
-          message: errorMessage(error),
-        },
-      });
-    }
-  }
-
-  private write(message: unknown): void {
-    const body = JSON.stringify(message);
-    this.output.write(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`);
-  }
-}
-
-function parseContentLength(header: string): number {
-  const line = header.split(/\r?\n/).find((item) => item.toLowerCase().startsWith("content-length:"));
-  const value = Number(line?.split(":")[1]?.trim());
-  if (!Number.isInteger(value) || value < 0) throw new Error("Invalid MCP Content-Length header");
-  return value;
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>;
-  return {};
-}

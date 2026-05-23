@@ -272,7 +272,16 @@ describe("completion report MCP handoff", () => {
       output: output as unknown as NodeJS.WriteStream,
     });
 
-    writeJsonRpc(input, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    writeJsonRpc(input, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "symphony-test-client", version: "0.1.0" },
+      },
+    });
     writeJsonRpc(input, { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
     writeJsonRpc(input, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     const toolsList = await waitForResponse(responses, 2);
@@ -300,7 +309,10 @@ describe("completion report MCP handoff", () => {
       params: { name: COMPLETION_REPORT_TOOL_NAME, arguments: { idempotencyKey: "missing-summary" } },
     });
     await expect(waitForResponse(responses, 3)).resolves.toMatchObject({
-      error: { message: expect.stringContaining("Completion report is invalid") },
+      result: {
+        isError: true,
+        content: [{ text: expect.stringContaining("Completion report is invalid") }],
+      },
     });
 
     writeJsonRpc(input, {
@@ -496,26 +508,20 @@ interface JsonRpcResponse {
 }
 
 function writeJsonRpc(input: PassThrough, message: unknown): void {
-  const body = JSON.stringify(message);
-  input.write(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`);
+  input.write(`${JSON.stringify(message)}\n`);
 }
 
 function collectJsonRpcResponses(output: PassThrough): JsonRpcResponse[] {
   const responses: JsonRpcResponse[] = [];
-  let buffer = Buffer.alloc(0);
+  let buffer = "";
   output.on("data", (chunk: Buffer) => {
-    buffer = Buffer.concat([buffer, chunk]);
+    buffer += chunk.toString("utf8");
     while (true) {
-      const headerEnd = buffer.indexOf("\r\n\r\n");
-      if (headerEnd < 0) return;
-      const header = buffer.subarray(0, headerEnd).toString("utf8");
-      const contentLength = Number(header.match(/content-length:\s*(\d+)/i)?.[1]);
-      const bodyStart = headerEnd + 4;
-      const bodyEnd = bodyStart + contentLength;
-      if (!Number.isInteger(contentLength) || buffer.length < bodyEnd) return;
-      const body = buffer.subarray(bodyStart, bodyEnd).toString("utf8");
-      buffer = buffer.subarray(bodyEnd);
-      responses.push(JSON.parse(body) as JsonRpcResponse);
+      const lineEnd = buffer.indexOf("\n");
+      if (lineEnd < 0) return;
+      const line = buffer.slice(0, lineEnd).replace(/\r$/, "");
+      buffer = buffer.slice(lineEnd + 1);
+      if (line.trim()) responses.push(JSON.parse(line) as JsonRpcResponse);
     }
   });
   return responses;

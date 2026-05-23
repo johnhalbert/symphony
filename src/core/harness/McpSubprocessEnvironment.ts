@@ -48,6 +48,7 @@ const RUNTIME_BASELINE_ENV_KEYS = [
   "LOCALAPPDATA",
   "NODE_OPTIONS",
   "NODE_PATH",
+  "SYMPHONY_MCP_TRACE_FILE",
 ] as const;
 
 const ENV_REFERENCE_PATTERN = /^\$([A-Za-z_][A-Za-z0-9_]*)$/;

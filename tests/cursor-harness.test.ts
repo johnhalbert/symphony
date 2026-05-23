@@ -6,6 +6,8 @@ import { mapCursorDelta, mapCursorMessage } from "../cursor/src/CursorEventMappe
 import {
   completionReportContextFilePath,
   completionReportMcpServerConfig,
+  cursorAgentCreateOptions,
+  cursorRoleMcpServers,
   reviewFeedbackContextFilePath,
   reviewFeedbackMcpServerConfig,
   reviewVerdictContextFilePath,
@@ -75,6 +77,45 @@ describe("Cursor event mapping", () => {
     expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key" });
     expect(server.env).not.toHaveProperty("GITHUB_TOKEN");
     expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
+  });
+
+  it("mounts worker MCP servers on Cursor agent create/resume options", () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const ctx: AgentRunContext = {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      role: "worker",
+      attempt: null,
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      config,
+      turnNumber: 1,
+      abortSignal: new AbortController().signal,
+      logger: new StructuredLogger(() => undefined),
+    };
+
+    const mcpServers = cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" });
+    const createOptions = cursorAgentCreateOptions(ctx, "cursor-test-key", { mcpServers });
+
+    expect(Object.keys(mcpServers)).toEqual(["symphony"]);
+    expect(createOptions).toMatchObject({
+      apiKey: "cursor-test-key",
+      mcpServers: {
+        symphony: {
+          type: "stdio",
+          command: process.execPath,
+          cwd: config.workflowDir,
+        },
+      },
+    });
+    expect(mcpServers.symphony?.args).toEqual(
+      expect.arrayContaining(["completion-report-mcp", "--workflow", config.workflowPath]),
+    );
   });
 
   it("wires the Symphony review verdict MCP server into reviewer Cursor runs", () => {
@@ -165,5 +206,40 @@ describe("Cursor event mapping", () => {
     expect(reviewFeedbackContextFilePath(ctx)).toBe(path.join(config.workspace.stateDir, "review-feedback-mcp", "issue-1-1.json"));
     expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key", GITHUB_TOKEN: "feedback-secret" });
     expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
+  });
+
+  it("mounts both reviewer MCP servers on Cursor agent create/resume options", () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "feedback-secret";
+    const ctx: AgentRunContext = {
+      issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      role: "reviewer",
+      attempt: null,
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      config,
+      turnNumber: 1,
+      abortSignal: new AbortController().signal,
+      logger: new StructuredLogger(() => undefined),
+    };
+
+    const mcpServers = cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" });
+    const createOptions = cursorAgentCreateOptions(ctx, "cursor-test-key", { mcpServers });
+
+    expect(Object.keys(mcpServers).sort()).toEqual(["symphony_review_feedback", "symphony_review_verdict"]);
+    expect(createOptions.mcpServers).toMatchObject({
+      symphony_review_verdict: { type: "stdio", command: process.execPath, cwd: config.workflowDir },
+      symphony_review_feedback: { type: "stdio", command: process.execPath, cwd: config.workflowDir },
+    });
+    expect(mcpServers.symphony_review_verdict?.args).toEqual(expect.arrayContaining(["review-verdict-mcp"]));
+    expect(mcpServers.symphony_review_feedback?.args).toEqual(expect.arrayContaining(["review-feedback-mcp"]));
   });
 });

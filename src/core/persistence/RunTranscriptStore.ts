@@ -258,9 +258,10 @@ export class FileRunTranscriptStore {
       .sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
   }
 
-  async latestRunForIssue(issueIdOrIdentifier: string): Promise<RunRecord | null> {
+  async latestRunForIssue(issueIdOrIdentifier: string, options: { role?: AgentRunRole } = {}): Promise<RunRecord | null> {
     const records = await this.listRunsForIssue(issueIdOrIdentifier);
-    return records[records.length - 1] ?? null;
+    const filtered = options.role === undefined ? records : records.filter((record) => record.role === options.role);
+    return filtered[filtered.length - 1] ?? null;
   }
 
   async readTranscript(runId: string, options: { offset?: number; limit?: number } = {}): Promise<TranscriptPage> {

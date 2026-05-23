@@ -136,11 +136,27 @@ async function listToolsViaServer(): Promise<string> {
   });
   input.end(
     [
-      jsonRpcMessage({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+      jsonRpcMessage({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "symphony-test-client", version: "0.1.0" },
+        },
+      }),
+      jsonRpcMessage({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
       jsonRpcMessage({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
     ].join(""),
   );
   await server;
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const outputText = Buffer.concat(chunks).toString("utf8");
+    if (outputText.includes(REVIEW_FEEDBACK_TOOL_NAME)) return outputText;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   return Buffer.concat(chunks).toString("utf8");
 }
 
@@ -207,8 +223,7 @@ Work on {{ issue.identifier }}.
 }
 
 function jsonRpcMessage(message: unknown): string {
-  const body = JSON.stringify(message);
-  return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`;
+  return `${JSON.stringify(message)}\n`;
 }
 
 function slash(value: string): string {
