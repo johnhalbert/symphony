@@ -11,7 +11,7 @@ import type {
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
-import type { RunRecord, RunTranscriptStore, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
+import type { RunRecord, RunTranscriptStore, TranscriptEvent, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
@@ -142,13 +142,16 @@ export class StatusServer {
         const snapshot = this.options.orchestrator.snapshot();
         const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
         const lifecycle = await this.options.lifecycleStore?.get(issueId);
-        sendJson(response, 200, {
-          issue: issueId,
-          runs: runs.map((run) => ({
+        const enrichedRuns = await Promise.all(
+          runs.map(async (run) => ({
             ...run,
-            operatorLiveness: runOperatorLiveness(run, snapshot, lifecycle, runs),
+            operatorLiveness: await runOperatorLiveness(run, snapshot, lifecycle, runs, this.options.runStore),
             livenessSummary: runLivenessSummary(run, snapshot, lifecycle, runs),
           })),
+        );
+        sendJson(response, 200, {
+          issue: issueId,
+          runs: enrichedRuns,
           issueBlocked: blockedIssueView(lifecycle),
           enrichment: {
             level: "operator_liveness_with_timeline",
@@ -188,12 +191,13 @@ export class StatusServer {
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
-        const operatorLiveness = issueOperatorLiveness({
+        const operatorLiveness = await issueOperatorLiveness({
           live,
           latestRun,
           lifecycle,
           paused,
           resolvedAgentId,
+          runStore: this.options.runStore,
         });
         const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
         const affordances = operatorAffordances({
@@ -253,7 +257,7 @@ export class StatusServer {
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
           ...run,
-          operatorLiveness: runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns),
+          operatorLiveness: await runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns, this.options.runStore),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
@@ -326,14 +330,13 @@ type RunningRow = RuntimeSnapshot["running"][number];
 type OperatorLivenessStatus = "running" | "possibly_stalled" | "cancelling" | "cancelled" | "blocked_human_required";
 
 const OPERATOR_LIVENESS_CONTRACT = {
-  version: "eng-44-v1",
+  version: "eng-62-v1",
   supportedStatuses: ["running", "possibly_stalled", "cancelling", "cancelled", "blocked_human_required"],
+  cancelFailed: {
+    tracked: true,
+    sources: ["harness_stop", "cancel_ignored"],
+  },
   deferred: {
-    cancelFailed: {
-      tracked: false,
-      reason: "no_orchestrator_or_run_store_signal_distinguishes_cancel_failure_from_prolonged_cancelling",
-      followUp: "orchestrator_terminal_cancel_outcome",
-    },
     linearAuditComments: {
       tracked: false,
       reason: "writeback_status_does_not_persist_linear_comment_urls",
@@ -471,14 +474,18 @@ function renderRunningRow(
   const idle = `${Math.round(row.liveness.secondsSinceLastActivity)}s idle`;
   const threshold = row.liveness.stallTimeoutMs === null ? "no stall threshold" : `${row.liveness.stallTimeoutMs}ms threshold`;
   const cancellation = cancellationSummary(row);
+  const cancelFailed = cancelFailedSummary(liveCancelFailed(row));
+  const activitySources = activitySummary(row);
   const blockedReason = row.lifecycle?.blockedReason ?? null;
   return `<li class="run-row operator-${operator.status}">
     <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.state)}</span></div>
     <div class="meta">run <code>${escapeHtml(runId)}</code> · agent <code>${escapeHtml(agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
     <div class="activity">last activity ${escapeHtml(row.liveness.lastActivityAt)} (${escapeHtml(idle)}, ${escapeHtml(threshold)}); event <code>${escapeHtml(row.lastEvent ?? "n/a")}</code>${row.lastEventAt ? ` at ${escapeHtml(row.lastEventAt)}` : ""}</div>
+    ${activitySources ? `<div class="activity">${escapeHtml(activitySources)}</div>` : ""}
     ${row.lastMessage ? `<div>${escapeHtml(row.lastMessage)}</div>` : ""}
     <div><code>${escapeHtml(row.workspacePath ?? "")}</code></div>
     ${cancellation ? `<div class="cancellation">${escapeHtml(cancellation)}</div>` : ""}
+    ${cancelFailed ? `<div class="cancellation">${escapeHtml(cancelFailed)}</div>` : ""}
     ${blockedReason ? `<div class="blocked">Blocked: ${escapeHtml(blockedReason)}</div>` : ""}
     <div class="controls">controls: ${formatControls(controls)}</div>
     ${formatAffordances(affordances)}
@@ -533,7 +540,7 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
     status,
     rawStatus: row.liveness.status,
     tracking: "live",
-    cancelFailed: OPERATOR_LIVENESS_CONTRACT.deferred.cancelFailed,
+    cancelFailed: liveCancelFailed(row),
     linearAuditComments: OPERATOR_LIVENESS_CONTRACT.deferred.linearAuditComments,
     runId: row.runId,
     activeRunId: row.liveness.activeRunId,
@@ -548,13 +555,7 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
     stallTimeoutMs: row.liveness.stallTimeoutMs,
     cancellation: row.cancellation,
     paused,
-    activity: {
-      lastHarnessActivityAt: row.liveness.lastActivityAt,
-      lastStreamActivityAt: null,
-      lastDeltaOrToolActivityAt: null,
-      lastToolActivityAt: null,
-      unavailable: ["stream_activity_not_tracked_in_status_snapshot", "delta_and_tool_activity_not_split_in_status_snapshot"],
-    },
+    activity: liveActivity(row),
     timeline: liveTimeline(row),
   };
 }
@@ -606,30 +607,32 @@ async function pausedOperatorViews(
   );
 }
 
-function issueOperatorLiveness(input: {
+async function issueOperatorLiveness(input: {
   live: RunningRow | null;
   latestRun: RunRecord | null | undefined;
   lifecycle: IssueLifecycleRecord | null | undefined;
   paused: boolean;
   resolvedAgentId: string | null;
+  runStore: RunTranscriptStore | undefined;
 }) {
   if (input.live) {
     return runningOperatorLiveness(input.live, input.paused, input.lifecycle ?? input.live.lifecycle, input.resolvedAgentId);
   }
   if (isLifecycleBlocked(input.lifecycle)) {
-    return terminalOperatorLiveness("blocked_human_required", input.latestRun ?? null, input.lifecycle ?? null, input.paused);
+    return terminalOperatorLiveness("blocked_human_required", input.latestRun ?? null, input.lifecycle ?? null, input.paused, input.runStore);
   }
-  if (input.latestRun?.status === "cancelled") {
-    return terminalOperatorLiveness("cancelled", input.latestRun, input.lifecycle ?? null, input.paused);
+  if (input.latestRun?.status === "cancelled" || input.latestRun?.cancellationRequestedAt || input.latestRun?.cancelFailed) {
+    return terminalOperatorLiveness("cancelled", input.latestRun, input.lifecycle ?? null, input.paused, input.runStore);
   }
   return null;
 }
 
-function runOperatorLiveness(
+async function runOperatorLiveness(
   run: RunRecord,
   snapshot: RuntimeSnapshot,
   lifecycle: IssueLifecycleRecord | null = null,
   issueRuns: RunRecord[] = [],
+  runStore?: RunTranscriptStore,
 ) {
   const live = findLiveRun(snapshot, run.runId);
   if (live) {
@@ -637,10 +640,10 @@ function runOperatorLiveness(
     return runningOperatorLiveness(live, isIssuePaused(snapshot, keys), live.lifecycle, run.agentId);
   }
   if (isLatestRunForBlockedLifecycle(run, lifecycle, issueRuns)) {
-    return terminalOperatorLiveness("blocked_human_required", run, lifecycle, false);
+    return terminalOperatorLiveness("blocked_human_required", run, lifecycle, false, runStore);
   }
-  if (run.status === "cancelled") {
-    return terminalOperatorLiveness("cancelled", run, null, false);
+  if (run.status === "cancelled" || run.cancellationRequestedAt || run.cancelFailed) {
+    return terminalOperatorLiveness("cancelled", run, null, false, runStore);
   }
   return null;
 }
@@ -663,22 +666,24 @@ function runLivenessSummary(
   if (isLatestRunForBlockedLifecycle(run, lifecycle, issueRuns)) {
     return { tracking: "terminal", status: "blocked_human_required" as const, paused: false };
   }
-  if (run.status === "cancelled") return { tracking: "terminal", status: "cancelled" as const, paused: false };
+  if (run.status === "cancelled" || run.cancellationRequestedAt || run.cancelFailed)
+    return { tracking: "terminal", status: "cancelled" as const, paused: false, cancelFailed: terminalCancelFailed(run) };
   if (run.status === "running") return { tracking: "orphaned", status: null, paused: false };
   return { tracking: "terminal", status: null, paused: false };
 }
 
-function terminalOperatorLiveness(
+async function terminalOperatorLiveness(
   status: Extract<OperatorLivenessStatus, "cancelled" | "blocked_human_required">,
   run: RunRecord | null,
   lifecycle: IssueLifecycleRecord | null,
   paused: boolean,
+  runStore?: RunTranscriptStore,
 ) {
   return {
     status,
-    rawStatus: null,
+    rawStatus: run?.status ?? null,
     tracking: "terminal",
-    cancelFailed: OPERATOR_LIVENESS_CONTRACT.deferred.cancelFailed,
+    cancelFailed: terminalCancelFailed(run),
     linearAuditComments: OPERATOR_LIVENESS_CONTRACT.deferred.linearAuditComments,
     runId: run?.runId ?? lifecycle?.summaryPointers.lastRunId ?? null,
     activeRunId: null,
@@ -693,15 +698,143 @@ function terminalOperatorLiveness(
     stallTimeoutMs: null,
     cancellation: null,
     paused,
-    activity: {
-      lastHarnessActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
+    activity: await terminalActivity(run, lifecycle, runStore),
+    timeline: terminalTimeline(status, run, lifecycle),
+  };
+}
+
+function liveCancelFailed(row: RunningRow) {
+  if (row.cancellation.cancelFailed) return row.cancellation.cancelFailed;
+  if (row.cancellation.harnessStopFailedAt) {
+    return {
+      tracked: true,
+      active: true,
+      phase: "failed",
+      at: row.cancellation.harnessStopFailedAt,
+      reason: row.cancellation.harnessStopFailedReason ?? null,
+      source: "harness_stop",
+    };
+  }
+  return {
+    tracked: true,
+    active: false,
+    phase: row.cancellation.requested ? "requested" : "none",
+    at: null,
+    reason: null,
+    source: null,
+  };
+}
+
+function terminalCancelFailed(run: RunRecord | null) {
+  if (!run) {
+    return { tracked: true, active: false, phase: "none", at: null, reason: null, source: null };
+  }
+  if (run.cancelFailed) {
+    return {
+      tracked: true,
+      active: true,
+      phase: "resolved_failed",
+      at: run.cancelFailedAt ?? null,
+      reason: run.cancelFailedReason ?? null,
+      source: run.cancelFailedSource ?? null,
+    };
+  }
+  return {
+    tracked: true,
+    active: false,
+    phase: run.cancellationRequestedAt ? "resolved_cancelled" : "none",
+    at: null,
+    reason: null,
+    source: null,
+  };
+}
+
+function liveActivity(row: RunningRow) {
+  return (
+    row.activity ?? {
+      lastHarnessActivityAt: row.liveness.lastActivityAt,
       lastStreamActivityAt: null,
       lastDeltaOrToolActivityAt: null,
       lastToolActivityAt: null,
-      unavailable: ["stream_activity_not_tracked_in_status_snapshot", "delta_and_tool_activity_not_split_in_status_snapshot"],
-    },
-    timeline: terminalTimeline(status, run, lifecycle),
+      unavailable: ["activity_source_not_available_in_snapshot"],
+    }
+  );
+}
+
+async function terminalActivity(run: RunRecord | null, lifecycle: IssueLifecycleRecord | null, runStore?: RunTranscriptStore) {
+  if (run?.activitySnapshot) {
+    return {
+      ...run.activitySnapshot,
+      unavailable: [],
+    };
+  }
+  if (run && runStore) {
+    return deriveTerminalActivityFromTranscript(await readAllTranscriptEvents(runStore, run.runId), run.updatedAt ?? lifecycle?.updatedAt ?? null);
+  }
+  return {
+    lastHarnessActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
+    lastStreamActivityAt: null,
+    lastDeltaOrToolActivityAt: null,
+    lastToolActivityAt: null,
+    unavailable: ["transcript_store_unavailable"],
   };
+}
+
+async function readAllTranscriptEvents(runStore: RunTranscriptStore, runId: string): Promise<TranscriptEvent[]> {
+  const events: TranscriptEvent[] = [];
+  let offset = 0;
+  do {
+    const page = await runStore.readTranscript(runId, { offset, limit: 1_000 });
+    events.push(...page.events);
+    if (page.nextOffset === null) break;
+    offset = page.nextOffset;
+  } while (true);
+  return events;
+}
+
+function deriveTerminalActivityFromTranscript(events: TranscriptEvent[], fallbackHarnessActivityAt: string | null) {
+  let lastHarnessActivityAt: string | null = null;
+  let lastStreamActivityAt: string | null = null;
+  let lastDeltaOrToolActivityAt: string | null = null;
+  let lastToolActivityAt: string | null = null;
+
+  for (const event of events) {
+    if (event.source !== "harness") continue;
+    lastHarnessActivityAt = latestIso(lastHarnessActivityAt, event.at);
+    if (event.eventType !== "progress") continue;
+
+    const source = transcriptActivitySource(event.payload);
+    if (source === "stream") {
+      lastStreamActivityAt = latestIso(lastStreamActivityAt, event.at);
+    }
+    if (source === "delta" || source === "tool") {
+      lastDeltaOrToolActivityAt = latestIso(lastDeltaOrToolActivityAt, event.at);
+    }
+    if (source === "tool") {
+      lastToolActivityAt = latestIso(lastToolActivityAt, event.at);
+    }
+  }
+
+  return {
+    lastHarnessActivityAt: lastHarnessActivityAt ?? fallbackHarnessActivityAt,
+    lastStreamActivityAt,
+    lastDeltaOrToolActivityAt,
+    lastToolActivityAt,
+    unavailable: [],
+  };
+}
+
+function transcriptActivitySource(payload: unknown): "stream" | "delta" | "tool" {
+  if (payload && typeof payload === "object" && "activitySource" in payload) {
+    const source = (payload as { activitySource?: unknown }).activitySource;
+    if (source === "delta" || source === "tool" || source === "stream") return source;
+  }
+  return "stream";
+}
+
+function latestIso(current: string | null, candidate: string): string {
+  if (current === null) return candidate;
+  return Date.parse(candidate) >= Date.parse(current) ? candidate : current;
 }
 
 function blockedIssueView(lifecycle: IssueLifecycleRecord | null | undefined) {
@@ -770,6 +903,18 @@ function liveTimeline(row: RunningRow) {
           },
         ]
       : []),
+    ...(row.cancellation.harnessStopFailedAt
+      ? [
+          {
+            at: row.cancellation.harnessStopFailedAt,
+            kind: "harness_stop_failed",
+            label: "Harness stop failed",
+            detail: row.cancellation.harnessStopFailedReason ?? null,
+            synthetic: true,
+            source: "live_snapshot",
+          },
+        ]
+      : []),
   ];
 }
 
@@ -798,6 +943,18 @@ function terminalTimeline(
             kind: "run_terminal",
             label: `Run ${run.status}`,
             detail: run.error,
+            synthetic: true,
+            source: "run_record",
+          },
+        ]
+      : []),
+    ...(run?.cancelFailed
+      ? [
+          {
+            at: run.cancelFailedAt ?? run.completedAt ?? run.updatedAt,
+            kind: "cancel_failed",
+            label: "Cancel failed",
+            detail: run.cancelFailedReason ?? null,
             synthetic: true,
             source: "run_record",
           },
@@ -904,6 +1061,29 @@ function cancellationSummary(row: RunningRow): string | null {
   ]
     .filter((part): part is string => part !== null && part.length > 0)
     .join(" · ");
+}
+
+function cancelFailedSummary(cancelFailed: ReturnType<typeof liveCancelFailed>): string | null {
+  if (!cancelFailed.active) return null;
+  return [
+    "cancel_failed",
+    `phase=${cancelFailed.phase}`,
+    cancelFailed.source ? `source=${cancelFailed.source}` : null,
+    cancelFailed.at ? `at=${cancelFailed.at}` : null,
+    cancelFailed.reason ? `reason=${cancelFailed.reason}` : null,
+  ]
+    .filter((part): part is string => part !== null && part.length > 0)
+    .join(" · ");
+}
+
+function activitySummary(row: RunningRow): string | null {
+  if (!row.activity) return null;
+  const parts = [
+    row.activity.lastStreamActivityAt ? `stream ${row.activity.lastStreamActivityAt}` : null,
+    row.activity.lastDeltaOrToolActivityAt ? `delta/tool ${row.activity.lastDeltaOrToolActivityAt}` : null,
+    row.activity.lastToolActivityAt ? `tool ${row.activity.lastToolActivityAt}` : null,
+  ].filter((part): part is string => part !== null);
+  return parts.length === 0 ? null : `activity sources: ${parts.join(" · ")}`;
 }
 
 function formatControls(controls: OperatorControls): string {

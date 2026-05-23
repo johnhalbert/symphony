@@ -514,7 +514,24 @@ describe("StatusServer durable API", () => {
         reason: "operator request",
         abortSignalled: true,
         harnessStopRequestedAt: "2026-01-01T00:00:02.000Z",
+        harnessStopFailedAt: null,
+        harnessStopFailedReason: null,
+        cancelFailed: {
+          tracked: true,
+          active: false,
+          phase: "requested",
+          at: null,
+          reason: null,
+          source: null,
+        },
         suppressRetryOnExit: true,
+      },
+      activity: {
+        lastHarnessActivityAt: "2026-01-01T00:00:01.000Z",
+        lastStreamActivityAt: "2026-01-01T00:00:01.000Z",
+        lastDeltaOrToolActivityAt: null,
+        lastToolActivityAt: null,
+        unavailable: [],
       },
       tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
       lifecycle: null,
@@ -561,11 +578,25 @@ describe("StatusServer durable API", () => {
             continuationSummary: { available: boolean };
           }>;
         };
-        operatorLivenessContract: { deferred: { cancelFailed: { tracked: boolean } } };
+        operatorLivenessContract: { cancelFailed: { tracked: boolean }; deferred: Record<string, unknown> };
       };
       const issueBody = (await issueResponse.json()) as {
-        live: { liveness: unknown; cancellation: unknown; operatorLiveness: { status: string; agentId: string | null; cancelFailed: { tracked: boolean } } };
-        operatorLiveness: { status: string; agentId: string | null; cancelFailed: { tracked: boolean } };
+        live: {
+          liveness: unknown;
+          cancellation: unknown;
+          operatorLiveness: {
+            status: string;
+            agentId: string | null;
+            cancelFailed: { tracked: boolean; active: boolean };
+            activity: { lastStreamActivityAt: string | null };
+          };
+        };
+        operatorLiveness: {
+          status: string;
+          agentId: string | null;
+          cancelFailed: { tracked: boolean; active: boolean };
+          activity: { lastStreamActivityAt: string | null };
+        };
         capabilities: {
           cancel: boolean;
           pause: boolean;
@@ -609,8 +640,10 @@ describe("StatusServer durable API", () => {
       expect(issueBody.live.operatorLiveness).toMatchObject({ status: "cancelling" });
       expect(issueBody.operatorLiveness.agentId).toBe("agent-1");
       expect(issueBody.live.operatorLiveness.agentId).toBe("agent-1");
-      expect(issueBody.operatorLiveness.cancelFailed).toMatchObject({ tracked: false });
-      expect(stateBody.operatorLivenessContract.deferred.cancelFailed).toMatchObject({ tracked: false });
+      expect(issueBody.operatorLiveness.cancelFailed).toMatchObject({ tracked: true, active: false });
+      expect(issueBody.operatorLiveness.activity).toMatchObject({ lastStreamActivityAt: "2026-01-01T00:00:01.000Z" });
+      expect(stateBody.operatorLivenessContract.cancelFailed).toMatchObject({ tracked: true });
+      expect(stateBody.operatorLivenessContract.deferred).not.toHaveProperty("cancelFailed");
       expect(issueBody.capabilities).toMatchObject({
         cancel: false,
         pause: true,
@@ -618,6 +651,261 @@ describe("StatusServer durable API", () => {
         continuationSummary: { available: false },
         humanRequired: { active: false },
       });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("surfaces active cancelFailed on state, issue, and dashboard output", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const liveRunning: ReturnType<Orchestrator["snapshot"]>["running"][number] = {
+      issueId: "issue-failed-cancel",
+      issueIdentifier: "TEST-CANCEL-FAILED",
+      role: "worker",
+      state: "In Progress",
+      workspacePath: path.join(config.workspace.root, "TEST-CANCEL-FAILED"),
+      sessionId: "session-failed-cancel",
+      runId: "run-failed-cancel",
+      turnCount: 1,
+      lastEvent: "progress",
+      lastMessage: "Still running",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      lastEventAt: "2026-01-01T00:00:03.000Z",
+      liveness: {
+        status: "cancelling",
+        activeRunId: "run-failed-cancel",
+        lastActivityAt: "2026-01-01T00:00:03.000Z",
+        secondsSinceLastActivity: 1,
+        stallTimeoutMs: 300_000,
+      },
+      cancellation: {
+        requested: true,
+        requestedAt: "2026-01-01T00:00:02.000Z",
+        source: "operator",
+        reason: "operator request",
+        abortSignalled: true,
+        harnessStopRequestedAt: "2026-01-01T00:00:02.000Z",
+        harnessStopFailedAt: "2026-01-01T00:00:04.000Z",
+        harnessStopFailedReason: "stop failed",
+        cancelFailed: {
+          tracked: true,
+          active: true,
+          phase: "failed",
+          at: "2026-01-01T00:00:04.000Z",
+          reason: "stop failed",
+          source: "harness_stop",
+        },
+        suppressRetryOnExit: true,
+      },
+      activity: {
+        lastHarnessActivityAt: "2026-01-01T00:00:03.000Z",
+        lastStreamActivityAt: "2026-01-01T00:00:03.000Z",
+        lastDeltaOrToolActivityAt: null,
+        lastToolActivityAt: null,
+        unavailable: [],
+      },
+      tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      lifecycle: null,
+      metadata: {
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+        ciStatus: null,
+        lastPushedAt: null,
+        lastEvidenceCursor: null,
+        branchName: "symphony/TEST-CANCEL-FAILED",
+        gitBranchName: "symphony/TEST-CANCEL-FAILED",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    };
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([liveRunning]),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-CANCEL-FAILED`);
+      const dashboardResponse = await fetch(`${baseUrl}/`);
+      const stateBody = (await stateResponse.json()) as {
+        running: Array<{ cancellation: { cancelFailed: { active: boolean; phase: string; source: string | null; at: string | null; reason: string | null } } }>;
+        operatorView: {
+          running: Array<{
+            liveness: { cancelFailed: { active: boolean; phase: string; source: string | null; at: string | null; reason: string | null } };
+          }>;
+        };
+      };
+      const issueBody = (await issueResponse.json()) as {
+        operatorLiveness: { cancelFailed: { active: boolean; phase: string; source: string | null; at: string | null; reason: string | null } };
+        live: { operatorLiveness: { cancelFailed: { active: boolean; phase: string; source: string | null; at: string | null; reason: string | null } } };
+      };
+      const dashboardHtml = await dashboardResponse.text();
+
+      const expectedCancelFailed = {
+        active: true,
+        phase: "failed",
+        source: "harness_stop",
+        at: "2026-01-01T00:00:04.000Z",
+        reason: "stop failed",
+      };
+      expect(stateBody.running[0]?.cancellation.cancelFailed).toMatchObject(expectedCancelFailed);
+      expect(stateBody.operatorView.running[0]?.liveness.cancelFailed).toMatchObject(expectedCancelFailed);
+      expect(issueBody.operatorLiveness.cancelFailed).toMatchObject(expectedCancelFailed);
+      expect(issueBody.live.operatorLiveness.cancelFailed).toMatchObject(expectedCancelFailed);
+      expect(dashboardHtml).toContain("cancel_failed");
+      expect(dashboardHtml).toContain("phase=failed");
+      expect(dashboardHtml).toContain("source=harness_stop");
+      expect(dashboardHtml).toContain("reason=stop failed");
+      expect(dashboardHtml).not.toContain("harness stop failed stop failed");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("derives terminal activity from transcript events when activitySnapshot is absent", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-terminal-activity",
+      sessionId: "session-terminal-activity",
+      agentId: "agent-terminal-activity",
+      role: "worker",
+      issueId: "issue-terminal-activity",
+      issueIdentifier: "TEST-TERMINAL-ACTIVITY",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-TERMINAL-ACTIVITY",
+      workspacePath: path.join(config.workspace.root, "TEST-TERMINAL-ACTIVITY"),
+    });
+    await runStore.updateRun("run-terminal-activity", {
+      status: "cancelled",
+      completedAt: "2026-01-01T00:05:00.000Z",
+      metadata: {
+        cancellationRequestedAt: "2026-01-01T00:04:00.000Z",
+        cancellationSource: "operator",
+        cancellationOutcome: "cancel_ignored",
+        cancelFailed: true,
+        cancelFailedAt: "2026-01-01T00:05:00.000Z",
+        cancelFailedReason: "run completed after cancellation was requested",
+        cancelFailedSource: "cancel_ignored",
+      },
+    });
+    for (let sequence = 1; sequence <= 1_000; sequence += 1) {
+      await runStore.appendEvent({
+        runId: "run-terminal-activity",
+        sequence,
+        at: "2026-01-01T00:00:00.000Z",
+        source: "harness",
+        eventType: "tokens",
+        payload: { type: "tokens", tokens: { totalTokens: sequence } },
+      });
+    }
+    await runStore.appendEvent({
+      runId: "run-terminal-activity",
+      sequence: 1_001,
+      at: "2026-01-01T00:01:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "stream",
+      payload: { type: "progress", message: "stream", activitySource: "stream" },
+    });
+    await runStore.appendEvent({
+      runId: "run-terminal-activity",
+      sequence: 1_002,
+      at: "2026-01-01T00:02:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "delta",
+      payload: { type: "progress", message: "delta", activitySource: "delta" },
+    });
+    await runStore.appendEvent({
+      runId: "run-terminal-activity",
+      sequence: 1_003,
+      at: "2026-01-01T00:03:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "tool",
+      payload: { type: "progress", message: "tool", activitySource: "tool" },
+    });
+    await runStore.appendEvent({
+      runId: "run-terminal-activity",
+      sequence: 1_004,
+      at: "2026-01-01T00:04:30.000Z",
+      source: "harness",
+      eventType: "cancelled",
+      payload: { type: "cancelled" },
+    });
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const runDetailResponse = await fetch(`${baseUrl}/api/v1/runs/run-terminal-activity`);
+      const issueRunsResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-TERMINAL-ACTIVITY/runs`);
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-TERMINAL-ACTIVITY`);
+      const runDetailBody = (await runDetailResponse.json()) as {
+        operatorLiveness: {
+          cancelFailed: { active: boolean; phase: string; source: string | null; at: string | null; reason: string | null };
+          activity: {
+            lastHarnessActivityAt: string | null;
+            lastStreamActivityAt: string | null;
+            lastDeltaOrToolActivityAt: string | null;
+            lastToolActivityAt: string | null;
+            unavailable: string[];
+          };
+        };
+      };
+      const issueRunsBody = (await issueRunsResponse.json()) as {
+        runs: Array<{ runId: string; operatorLiveness: null | typeof runDetailBody.operatorLiveness }>;
+      };
+      const issueBody = (await issueResponse.json()) as {
+        operatorLiveness: typeof runDetailBody.operatorLiveness;
+      };
+
+      const expectedActivity = {
+        lastHarnessActivityAt: "2026-01-01T00:04:30.000Z",
+        lastStreamActivityAt: "2026-01-01T00:01:00.000Z",
+        lastDeltaOrToolActivityAt: "2026-01-01T00:03:00.000Z",
+        lastToolActivityAt: "2026-01-01T00:03:00.000Z",
+        unavailable: [],
+      };
+      const expectedCancelFailed = {
+        active: true,
+        phase: "resolved_failed",
+        source: "cancel_ignored",
+        at: "2026-01-01T00:05:00.000Z",
+        reason: "run completed after cancellation was requested",
+      };
+      expect(runDetailBody.operatorLiveness.cancelFailed).toMatchObject(expectedCancelFailed);
+      expect(runDetailBody.operatorLiveness.activity).toEqual(expectedActivity);
+      const issueRun = issueRunsBody.runs.find((run) => run.runId === "run-terminal-activity");
+      expect(issueRun?.operatorLiveness?.cancelFailed).toMatchObject(expectedCancelFailed);
+      expect(issueRun?.operatorLiveness?.activity).toEqual(expectedActivity);
+      expect(issueBody.operatorLiveness.cancelFailed).toMatchObject(expectedCancelFailed);
+      expect(issueBody.operatorLiveness.activity).toEqual(expectedActivity);
     } finally {
       await server.stop();
     }

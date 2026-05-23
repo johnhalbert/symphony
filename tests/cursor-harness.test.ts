@@ -43,7 +43,23 @@ describe("Cursor event mapping", () => {
       message: { role: "assistant", content: [{ type: "text", text: "hello" }] },
     });
 
-    expect(events).toEqual([{ type: "progress", message: "hello" }]);
+    expect(events).toEqual([{ type: "progress", message: "hello", activitySource: "stream" }]);
+  });
+
+  it("tags tool and text delta activity sources", () => {
+    expect(
+      mapCursorMessage({
+        type: "tool_call",
+        agent_id: "agent",
+        run_id: "run",
+        call_id: "call",
+        name: "shell",
+        status: "completed",
+      }),
+    ).toEqual([{ type: "progress", message: "tool shell completed", activitySource: "tool" }]);
+    expect(mapCursorDelta({ type: "text-delta", text: "chunk" })).toEqual([
+      { type: "progress", message: "chunk", activitySource: "delta" },
+    ]);
   });
 
   it("maps turn-ended usage into token totals", () => {

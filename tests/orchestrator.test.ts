@@ -2214,6 +2214,69 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
+  it("records harness stop failures without failing cancellation", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new FailingStopHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-failing-stop", "run to start");
+    await expect(orchestrator.cancelIssue(candidate.id)).resolves.toBeUndefined();
+
+    const cancelling = orchestrator.snapshot().running[0];
+    expect(cancelling).toMatchObject({
+      liveness: { status: "cancelling", activeRunId: "run-failing-stop" },
+      cancellation: {
+        requested: true,
+        source: "operator",
+        harnessStopFailedReason: "stop failed",
+        cancelFailed: {
+          tracked: true,
+          active: true,
+          phase: "failed",
+          source: "harness_stop",
+        },
+      },
+    });
+    expect(cancelling?.cancellation.harnessStopFailedAt).toEqual(expect.any(String));
+
+    harness.release();
+    await waitFor(() => orchestrator.snapshot().running.length === 0, "cancelled run to exit");
+    await expect(runStore.getRun("run-failing-stop")).resolves.toMatchObject({
+      status: "cancelled",
+      cancelFailed: false,
+      cancellationOutcome: "cancelled",
+      harnessStopFailedReason: "stop failed",
+      activitySnapshot: {
+        lastHarnessActivityAt: expect.any(String),
+      },
+    });
+    await orchestrator.stop();
+  });
+
   it("treats stalled cancellation as terminal cancelled without retrying", async () => {
     const config = testConfig(root);
     (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 1 };
@@ -2752,6 +2815,31 @@ class HeldCancellationHarness implements AgentHarness {
 
   async stop(runId: string): Promise<void> {
     this.stoppedRunIds.push(runId);
+  }
+
+  release(): void {
+    this.releaseRun();
+  }
+}
+
+class FailingStopHarness implements AgentHarness {
+  readonly id = "failing-stop";
+  readonly stoppedRunIds: string[] = [];
+  private releaseRun: () => void = () => undefined;
+  private readonly released = new Promise<void>((resolve) => {
+    this.releaseRun = resolve;
+  });
+
+  async *run(): AsyncIterable<AgentEvent> {
+    yield { type: "session_started", sessionId: "session-failing-stop", runId: "run-failing-stop" };
+    yield { type: "progress", message: "working", activitySource: "stream" };
+    await this.released;
+    yield { type: "cancelled" };
+  }
+
+  async stop(runId: string): Promise<void> {
+    this.stoppedRunIds.push(runId);
+    throw new Error("stop failed");
   }
 
   release(): void {

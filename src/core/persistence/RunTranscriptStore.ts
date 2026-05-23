@@ -3,6 +3,16 @@ import path from "node:path";
 import type { AgentRunRole, TokenCounts } from "../types.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
+export type PersistedRunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
+export type PersistedCancelFailedSource = "harness_stop" | "cancel_ignored";
+export type PersistedCancellationOutcome = "none" | "requested" | "cancelled" | "harness_stop_failed" | "cancel_ignored";
+
+export interface RunActivitySnapshot {
+  lastHarnessActivityAt: string | null;
+  lastStreamActivityAt: string | null;
+  lastDeltaOrToolActivityAt: string | null;
+  lastToolActivityAt: string | null;
+}
 
 export interface WorkspaceRecord {
   workspaceKey: string;
@@ -28,6 +38,18 @@ export interface RunMetadata {
   gitBranchName?: string | null;
   repoPath?: string | null;
   baseRef?: string | null;
+  cancellationRequestedAt?: string | null;
+  cancellationSource?: PersistedRunCancellationSource | null;
+  cancellationReason?: string | null;
+  harnessStopRequestedAt?: string | null;
+  harnessStopFailedAt?: string | null;
+  harnessStopFailedReason?: string | null;
+  cancellationOutcome?: PersistedCancellationOutcome;
+  cancelFailed?: boolean;
+  cancelFailedAt?: string | null;
+  cancelFailedReason?: string | null;
+  cancelFailedSource?: PersistedCancelFailedSource | null;
+  activitySnapshot?: RunActivitySnapshot;
 }
 
 export interface RunRecord {
@@ -58,6 +80,18 @@ export interface RunRecord {
   ciStatus?: string | null;
   lastPushedAt?: string | null;
   lastEvidenceCursor?: string | null;
+  cancellationRequestedAt?: string | null;
+  cancellationSource?: PersistedRunCancellationSource | null;
+  cancellationReason?: string | null;
+  harnessStopRequestedAt?: string | null;
+  harnessStopFailedAt?: string | null;
+  harnessStopFailedReason?: string | null;
+  cancellationOutcome?: PersistedCancellationOutcome;
+  cancelFailed?: boolean;
+  cancelFailedAt?: string | null;
+  cancelFailedReason?: string | null;
+  cancelFailedSource?: PersistedCancelFailedSource | null;
+  activitySnapshot?: RunActivitySnapshot;
 }
 
 export interface TranscriptEvent {
@@ -366,6 +400,18 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.gitBranchName === undefined ? {} : { gitBranchName: metadata.gitBranchName }),
     ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
     ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),
+    ...(metadata.cancellationRequestedAt === undefined ? {} : { cancellationRequestedAt: metadata.cancellationRequestedAt }),
+    ...(metadata.cancellationSource === undefined ? {} : { cancellationSource: metadata.cancellationSource }),
+    ...(metadata.cancellationReason === undefined ? {} : { cancellationReason: metadata.cancellationReason }),
+    ...(metadata.harnessStopRequestedAt === undefined ? {} : { harnessStopRequestedAt: metadata.harnessStopRequestedAt }),
+    ...(metadata.harnessStopFailedAt === undefined ? {} : { harnessStopFailedAt: metadata.harnessStopFailedAt }),
+    ...(metadata.harnessStopFailedReason === undefined ? {} : { harnessStopFailedReason: metadata.harnessStopFailedReason }),
+    ...(metadata.cancellationOutcome === undefined ? {} : { cancellationOutcome: metadata.cancellationOutcome }),
+    ...(metadata.cancelFailed === undefined ? {} : { cancelFailed: metadata.cancelFailed }),
+    ...(metadata.cancelFailedAt === undefined ? {} : { cancelFailedAt: metadata.cancelFailedAt }),
+    ...(metadata.cancelFailedReason === undefined ? {} : { cancelFailedReason: metadata.cancelFailedReason }),
+    ...(metadata.cancelFailedSource === undefined ? {} : { cancelFailedSource: metadata.cancelFailedSource }),
+    ...(metadata.activitySnapshot === undefined ? {} : { activitySnapshot: metadata.activitySnapshot }),
   };
 }
 
