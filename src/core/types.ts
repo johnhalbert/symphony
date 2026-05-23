@@ -41,7 +41,7 @@ export interface IssueStatusView {
   updatedAt: string | null;
 }
 
-export type IssueDetailsSource = "live" | "durable";
+export type IssueDetailsSource = "live" | "durable" | "tracker";
 export type IssueDetailsCompleteness = "full" | "partial";
 export type IssueStateClassification = "active" | "handoff" | "terminal" | "blocked" | "unknown";
 export type RunTerminalReason = "succeeded" | "failed" | "timed_out" | "stalled" | "cancelled";

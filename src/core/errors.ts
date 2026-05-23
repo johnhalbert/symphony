@@ -12,6 +12,7 @@ export type SymphonyErrorCode =
   | "hook_error"
   | "lifecycle_store_corrupt"
   | "tracker_error"
+  | "tracker_unavailable"
   | "agent_error"
   | "not_found"
   | "invalid_request";

@@ -151,7 +151,12 @@ program
             host: config.server.host,
             port: config.server.port,
             openWorkspaceToken: resolveStatusMutationToken(config),
+            tracker,
             trackerStateLists: resolveTrackerStateLists(config),
+            issueBoardMergeReadyStates: [
+              ...(config.reviewLoop.reviewPassState === null ? [] : [config.reviewLoop.reviewPassState]),
+              ...config.mergePolicy.sourceStates,
+            ],
             staleThresholdMs: config.polling.intervalMs,
           });
 

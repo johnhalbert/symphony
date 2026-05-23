@@ -4,6 +4,7 @@ import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { CursorWorkspaceOpener } from "../../cursor/src/CursorWorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
+import { toIssueStatusView, type AgentRunRole, type Issue } from "../core/types.js";
 import type {
   IssueCompletionReportRecord,
   IssueLifecycleRecord,
@@ -11,7 +12,14 @@ import type {
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
-import type { RunRecord, RunTranscriptStore, TranscriptEvent, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
+import {
+  compareRunChronology,
+  type RunRecord,
+  type RunTranscriptStore,
+  type TranscriptEvent,
+  type WorkspaceRecord,
+} from "../core/persistence/RunTranscriptStore.js";
+import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -35,7 +43,9 @@ export interface StatusServerOptions {
   host: string;
   port: number;
   openWorkspaceToken: string | null;
+  tracker?: TrackerClient;
   trackerStateLists: TrackerStateLists;
+  issueBoardMergeReadyStates?: readonly string[];
   staleThresholdMs: number;
 }
 
@@ -102,6 +112,23 @@ export class StatusServer {
           ),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/issue-board") {
+        sendJson(
+          response,
+          200,
+          await buildIssueBoard(
+            this.options.orchestrator.snapshot(),
+            Boolean(this.options.openWorkspaceToken),
+            this.options.tracker,
+            this.options.runStore,
+            this.options.lifecycleStore,
+            this.options.trackerStateLists,
+            this.options.issueBoardMergeReadyStates ?? [],
+            this.options.staleThresholdMs,
+          ),
+        );
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
@@ -338,6 +365,8 @@ export class StatusServer {
       const status =
         error instanceof SymphonyError && error.code === "not_found"
           ? 404
+          : error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")
+            ? 503
           : error instanceof SymphonyError && error.code === "invalid_request"
             ? 401
             : 500;
@@ -418,6 +447,385 @@ interface PausedOperatorView extends OperatorAffordances {
   paused: true;
   controls: OperatorControls;
   issueDetails: IssueDetailsEnvelope;
+}
+
+type IssueBoardLaneId = "active" | "handoff" | "merge_ready" | "blocked" | "unknown";
+
+interface IssueBoardCard {
+  key: string;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  origin: "tracker" | "symphony";
+  lane: IssueBoardLaneId;
+  issueDetails: IssueDetailsEnvelope;
+  paused: boolean;
+  live: { role: AgentRunRole; state: string; runId: string | null } | null;
+  operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>;
+  reviewLoop: ReturnType<typeof reviewLoopStatus>;
+  metadata: ReturnType<typeof statusMetadata>;
+  capabilities: {
+    detail: string | null;
+    runs: string | null;
+    humanRequired: OperatorAffordances["humanRequired"];
+    continuationSummary: OperatorAffordances["continuationSummary"];
+  };
+}
+
+interface IssueBoardLane {
+  id: IssueBoardLaneId;
+  title: string;
+  states: string[];
+  issues: IssueBoardCard[];
+}
+
+async function buildIssueBoard(
+  snapshot: RuntimeSnapshot,
+  mutationsConfigured: boolean,
+  tracker: TrackerClient | undefined,
+  runStore: RunTranscriptStore | undefined,
+  lifecycleStore: IssueLifecycleStore | undefined,
+  trackerStateLists: TrackerStateLists,
+  mergeReadyStates: readonly string[],
+  staleThresholdMs: number,
+) {
+  if (!tracker) {
+    throw new SymphonyError("tracker_unavailable", "Issue board requires a configured tracker client");
+  }
+
+  const fetchedStates = boardFetchStates(trackerStateLists, mergeReadyStates);
+  let trackerIssues: Issue[];
+  try {
+    trackerIssues = await tracker.fetchIssuesByStates(fetchedStates);
+  } catch (error) {
+    if (error instanceof SymphonyError) throw error;
+    throw new SymphonyError("tracker_error", `Issue board tracker fetch failed: ${errorMessage(error)}`);
+  }
+
+  const representedKeys = new Set<string>();
+  const cards: IssueBoardCard[] = [];
+  for (const issue of trackerIssues) {
+    addBoardKeys(representedKeys, [issue.id, issue.identifier]);
+    cards.push(
+      await buildTrackerBoardCard({
+        issue,
+        snapshot,
+        mutationsConfigured,
+        runStore,
+        lifecycleStore,
+        trackerStateLists,
+        mergeReadyStates,
+        staleThresholdMs,
+      }),
+    );
+  }
+
+  const symphonyOnlyCards = await buildSymphonyOnlyBoardCards({
+    snapshot,
+    mutationsConfigured,
+    runStore,
+    lifecycleStore,
+    trackerStateLists,
+    mergeReadyStates,
+    staleThresholdMs,
+    representedKeys,
+  });
+  cards.push(...symphonyOnlyCards);
+
+  const lanes = boardLanes(trackerStateLists, mergeReadyStates).map((lane) => ({
+    ...lane,
+    issues: cards.filter((card) => card.lane === lane.id),
+  }));
+
+  return {
+    generatedAt: snapshot.generatedAt,
+    tracker: {
+      status: "ok" as const,
+      fetchedStates,
+      issueCount: trackerIssues.length,
+      error: null,
+    },
+    lanes,
+    issues: cards,
+    counts: {
+      total: cards.length,
+      trackerBacked: cards.filter((card) => card.origin === "tracker").length,
+      symphonyOnly: cards.filter((card) => card.origin === "symphony").length,
+      live: cards.filter((card) => card.live !== null).length,
+      paused: cards.filter((card) => card.paused).length,
+      blocked: cards.filter((card) => card.issueDetails.blockers.blocked).length,
+    },
+  };
+}
+
+async function buildTrackerBoardCard(input: {
+  issue: Issue;
+  snapshot: RuntimeSnapshot;
+  mutationsConfigured: boolean;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  trackerStateLists: TrackerStateLists;
+  mergeReadyStates: readonly string[];
+  staleThresholdMs: number;
+}): Promise<IssueBoardCard> {
+  const issueStatus = toIssueStatusView(input.issue);
+  const keys = [input.issue.id, input.issue.identifier];
+  const live = liveIssueByKeys(input.snapshot, keys);
+  const workspace = await workspaceByKeys(input.runStore, keys);
+  const latestRun = await latestRunByKeys(input.runStore, keys);
+  const lifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
+  const paused = isIssuePaused(input.snapshot, [
+    ...keys,
+    ...issueKeys(input.issue.identifier, { live, latestRun, lifecycle }),
+  ]);
+  const issueDetails = buildIssueDetailsEnvelope({
+    requestKey: input.issue.identifier,
+    generatedAt: input.snapshot.generatedAt,
+    trackerStateLists: input.trackerStateLists,
+    staleThresholdMs: input.staleThresholdMs,
+    live,
+    workspace,
+    latestRun,
+    summaryRun,
+    lifecycle,
+    trackerIssue: issueStatus,
+  });
+  return buildBoardCard({
+    key: input.issue.id,
+    origin: "tracker",
+    lane: classifyBoardLane(input.issue.state, lifecycle, input.trackerStateLists, input.mergeReadyStates),
+    issueDetails,
+    live,
+    workspace,
+    latestRun,
+    lifecycle,
+    paused,
+    mutationsConfigured: input.mutationsConfigured,
+    runStore: input.runStore,
+    continuationSummaryAvailable: Boolean(input.lifecycleStore && input.runStore),
+  });
+}
+
+async function buildSymphonyOnlyBoardCards(input: {
+  snapshot: RuntimeSnapshot;
+  mutationsConfigured: boolean;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  trackerStateLists: TrackerStateLists;
+  mergeReadyStates: readonly string[];
+  staleThresholdMs: number;
+  representedKeys: Set<string>;
+}): Promise<IssueBoardCard[]> {
+  const cards: IssueBoardCard[] = [];
+  const localKeys = new Set<string>();
+  const maybeAdd = async (requestKey: string, forcedLive: RunningRow | null = null) => {
+    if (hasBoardKey(input.representedKeys, [requestKey]) || hasBoardKey(localKeys, [requestKey])) return;
+    const keys = [requestKey];
+    const live = forcedLive ?? liveIssueByKeys(input.snapshot, keys);
+    const workspace = await workspaceByKeys(input.runStore, keys);
+    const latestRun = await latestRunByKeys(input.runStore, keys);
+    const lifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+    const isBlocked = isLifecycleBlocked(lifecycle);
+    const isPaused = isIssuePaused(input.snapshot, [
+      requestKey,
+      ...issueKeys(requestKey, { live, latestRun, lifecycle }),
+    ]);
+    if (!live && !isPaused && !isBlocked) return;
+    if (!live && !isPaused && lifecycle?.phase === "terminal") return;
+    const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
+    const issueDetails = buildIssueDetailsEnvelope({
+      requestKey,
+      generatedAt: input.snapshot.generatedAt,
+      trackerStateLists: input.trackerStateLists,
+      staleThresholdMs: input.staleThresholdMs,
+      live,
+      workspace,
+      latestRun,
+      summaryRun,
+      lifecycle,
+    });
+    const card = await buildBoardCard({
+      key: issueDetails.issue.id ?? issueDetails.issue.identifier ?? requestKey,
+      origin: "symphony",
+      lane: classifyBoardLane(live?.state ?? issueDetails.issue.state, lifecycle, input.trackerStateLists, input.mergeReadyStates),
+      issueDetails,
+      live,
+      workspace,
+      latestRun,
+      lifecycle,
+      paused: isPaused,
+      mutationsConfigured: input.mutationsConfigured,
+      runStore: input.runStore,
+      continuationSummaryAvailable: Boolean(input.lifecycleStore && input.runStore),
+    });
+    addBoardKeys(localKeys, boardCardKeys(card));
+    cards.push(card);
+  };
+
+  for (const live of input.snapshot.running) {
+    await maybeAdd(live.issueIdentifier, live);
+  }
+  for (const pausedKey of input.snapshot.paused) {
+    await maybeAdd(pausedKey);
+  }
+  for (const lifecycle of (await input.lifecycleStore?.list()) ?? []) {
+    if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueIdentifier);
+  }
+  return cards;
+}
+
+async function buildBoardCard(input: {
+  key: string;
+  origin: "tracker" | "symphony";
+  lane: IssueBoardLaneId;
+  issueDetails: IssueDetailsEnvelope;
+  live: RunningRow | null;
+  workspace: WorkspaceRecord | null | undefined;
+  latestRun: RunRecord | null | undefined;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+  paused: boolean;
+  mutationsConfigured: boolean;
+  runStore: RunTranscriptStore | undefined;
+  continuationSummaryAvailable: boolean;
+}): Promise<IssueBoardCard> {
+  const issueKey = input.issueDetails.issue.identifier ?? input.issueDetails.issue.id ?? input.key;
+  const resolvedAgentId = input.live ? await resolveRunningAgentId(input.live, input.runStore) : null;
+  const operatorLiveness = await issueOperatorLiveness({
+    live: input.live,
+    latestRun: input.latestRun,
+    lifecycle: input.lifecycle,
+    paused: input.paused,
+    resolvedAgentId,
+    runStore: input.runStore,
+  });
+  const affordances = operatorAffordances({
+    issueKey,
+    lifecycle: input.lifecycle,
+    continuationSummaryAvailable: input.continuationSummaryAvailable,
+    mutationsRequireToken: input.mutationsConfigured,
+  });
+  return {
+    key: input.key,
+    issueId: input.issueDetails.issue.id,
+    issueIdentifier: input.issueDetails.issue.identifier,
+    origin: input.origin,
+    lane: input.lane,
+    issueDetails: input.issueDetails,
+    paused: input.paused,
+    live: input.live
+      ? {
+          role: input.live.role,
+          state: input.live.state,
+          runId: input.live.liveness.activeRunId ?? input.live.runId,
+        }
+      : null,
+    operatorLiveness,
+    reviewLoop: reviewLoopStatus({ live: input.live, latestRun: input.latestRun, lifecycle: input.lifecycle }),
+    metadata: statusMetadata({
+      live: input.live,
+      workspace: input.workspace,
+      latestRun: input.latestRun,
+      lifecycle: input.lifecycle,
+    }),
+    capabilities: {
+      detail: `/api/v1/issues/${encodeURIComponent(issueKey)}`,
+      runs: `/api/v1/issues/${encodeURIComponent(issueKey)}/runs`,
+      humanRequired: affordances.humanRequired,
+      continuationSummary: affordances.continuationSummary,
+    },
+  };
+}
+
+function boardFetchStates(stateLists: TrackerStateLists, mergeReadyStates: readonly string[]): string[] {
+  return uniqueStateNames([
+    ...stateLists.activeStates,
+    ...stateLists.handoffStates,
+    ...stateLists.reviewStates,
+    ...stateLists.blockedStates,
+    ...mergeReadyStates,
+  ]).filter((state) => !isStateNameIn(state, stateLists.terminalStates));
+}
+
+function boardLanes(stateLists: TrackerStateLists, mergeReadyStates: readonly string[]): Array<Omit<IssueBoardLane, "issues">> {
+  return [
+    { id: "active", title: "Active", states: uniqueStateNames(stateLists.activeStates) },
+    { id: "handoff", title: "Review", states: uniqueStateNames([...stateLists.handoffStates, ...stateLists.reviewStates]) },
+    { id: "merge_ready", title: "Ready to Merge", states: uniqueStateNames(mergeReadyStates) },
+    { id: "blocked", title: "Blocked", states: uniqueStateNames(stateLists.blockedStates) },
+    { id: "unknown", title: "Unknown", states: [] },
+  ];
+}
+
+function classifyBoardLane(
+  state: string | null,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  stateLists: TrackerStateLists,
+  mergeReadyStates: readonly string[],
+): IssueBoardLaneId {
+  if (isLifecycleBlocked(lifecycle) || (state !== null && isStateNameIn(state, stateLists.blockedStates))) return "blocked";
+  if (state !== null && isStateNameIn(state, mergeReadyStates)) return "merge_ready";
+  if (state !== null && isStateNameIn(state, [...stateLists.handoffStates, ...stateLists.reviewStates])) return "handoff";
+  if (state !== null && isStateNameIn(state, stateLists.activeStates)) return "active";
+  return "unknown";
+}
+
+function liveIssueByKeys(snapshot: RuntimeSnapshot, keys: string[]): RunningRow | null {
+  return snapshot.running.find((row) => keys.includes(row.issueId) || keys.includes(row.issueIdentifier)) ?? null;
+}
+
+async function workspaceByKeys(runStore: RunTranscriptStore | undefined, keys: string[]): Promise<WorkspaceRecord | null> {
+  if (!runStore) return null;
+  for (const key of keys) {
+    const workspace = await runStore.findWorkspace(key);
+    if (workspace) return workspace;
+  }
+  return null;
+}
+
+async function latestRunByKeys(runStore: RunTranscriptStore | undefined, keys: string[]): Promise<RunRecord | null> {
+  if (!runStore) return null;
+  const byRunId = new Map<string, RunRecord>();
+  for (const key of keys) {
+    for (const run of await runStore.listRunsForIssue(key)) {
+      byRunId.set(run.runId, run);
+    }
+  }
+  return [...byRunId.values()].sort(compareRunChronology).at(-1) ?? null;
+}
+
+async function lifecycleByKeys(lifecycleStore: IssueLifecycleStore | undefined, keys: string[]): Promise<IssueLifecycleRecord | null> {
+  if (!lifecycleStore) return null;
+  for (const key of keys) {
+    const lifecycle = await lifecycleStore.get(key);
+    if (lifecycle) return lifecycle;
+  }
+  return null;
+}
+
+function addBoardKeys(target: Set<string>, keys: Array<string | null | undefined>): void {
+  for (const key of keys) {
+    if (key) target.add(key);
+  }
+}
+
+function hasBoardKey(target: Set<string>, keys: Array<string | null | undefined>): boolean {
+  return keys.some((key) => key !== null && key !== undefined && target.has(key));
+}
+
+function boardCardKeys(card: IssueBoardCard): string[] {
+  return [card.key, card.issueId, card.issueIdentifier].filter((value): value is string => value !== null && value !== undefined);
+}
+
+function uniqueStateNames(states: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const state of states) {
+    const key = state.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(state);
+  }
+  return result;
 }
 
 async function renderDashboard(
@@ -1105,15 +1513,17 @@ function buildIssueDetailsEnvelope(input: {
   summaryRun: RunRecord | null | undefined;
   lifecycle: IssueLifecycleRecord | null | undefined;
   workspace: WorkspaceRecord | null | undefined;
+  trackerIssue?: IssueStatusView;
 }): IssueDetailsEnvelope {
   const metadata = statusMetadata(input);
-  if (input.live) {
+  const issue = input.trackerIssue ?? input.live?.issueDetails ?? null;
+  if (issue) {
     return {
-      source: "live",
+      source: input.trackerIssue ? "tracker" : "live",
       completeness: "full",
-      issue: input.live.issueDetails,
-      tracker: buildIssueTrackerMetadata(input.live.issueDetails, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
-      blockers: buildIssueBlockerSummary(input.live.issueDetails.blockedBy, input.trackerStateLists.terminalStates, input.lifecycle),
+      issue,
+      tracker: buildIssueTrackerMetadata(issue, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
+      blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists.terminalStates, input.lifecycle),
       workspace: buildIssueWorkspaceSummary(input, metadata),
       pullRequest: buildIssuePullRequestSummary(metadata),
       latestRun: buildIssueLatestRunSummary(input.summaryRun),
