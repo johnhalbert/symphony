@@ -153,10 +153,7 @@ program
             openWorkspaceToken: resolveStatusMutationToken(config),
             tracker,
             trackerStateLists: resolveTrackerStateLists(config),
-            issueBoardMergeReadyStates: [
-              ...(config.reviewLoop.reviewPassState === null ? [] : [config.reviewLoop.reviewPassState]),
-              ...config.mergePolicy.sourceStates,
-            ],
+            issueBoardColumns: config.issueBoard.columns,
             staleThresholdMs: config.polling.intervalMs,
           });
 

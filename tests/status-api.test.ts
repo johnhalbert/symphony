@@ -619,7 +619,7 @@ describe("StatusServer durable API", () => {
       { phase: "blocked", blockedReason: "needs operator", summaryPointers: {} },
     );
     await lifecycleStore.ensureIssue(
-      { id: "issue-terminal", identifier: "TEST-DONE" },
+      { id: "issue-terminal", identifier: "TEST-ARCHIVED" },
       { phase: "terminal", blockedReason: null, summaryPointers: {} },
     );
 
@@ -634,6 +634,20 @@ describe("StatusServer durable API", () => {
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
     const tracker = new FakeTracker([
+      issue({
+        id: "issue-todo",
+        identifier: "TEST-TODO",
+        title: "Todo with dependency",
+        state: "Todo",
+        blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
+      }),
+      issue({
+        id: "issue-progress",
+        identifier: "TEST-PROGRESS",
+        title: "Progress with dependency",
+        state: "In Progress",
+        blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
+      }),
       issue({
         id: "issue-1",
         identifier: "TEST-1",
@@ -650,6 +664,18 @@ describe("StatusServer durable API", () => {
         title: "Ready to merge",
         state: "Ready to Merge",
       }),
+      issue({
+        id: "issue-done",
+        identifier: "TEST-DONE",
+        title: "Done issue",
+        state: "Done",
+      }),
+      issue({
+        id: "issue-canceled",
+        identifier: "TEST-CANCELED",
+        title: "Canceled issue",
+        state: "Canceled",
+      }),
     ]);
 
     const server = new StatusServer({
@@ -664,7 +690,14 @@ describe("StatusServer durable API", () => {
       lifecycleStore,
       tracker,
       trackerStateLists: testTrackerStateLists(),
-      issueBoardMergeReadyStates: ["Ready to Merge"],
+      issueBoardColumns: {
+        backlog: ["Backlog"],
+        todo: ["Todo"],
+        progress: ["In Progress", "Blocked"],
+        review: ["In Review", "Ready to Merge"],
+        done: ["Done"],
+        canceled: ["Canceled"],
+      },
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -674,19 +707,21 @@ describe("StatusServer durable API", () => {
     try {
       const response = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
       const body = (await response.json()) as {
-        tracker: { fetchedStates: string[]; issueCount: number };
+        tracker: { fetchedStates: string[]; issueCount: number; cached: boolean };
         counts: { total: number; trackerBacked: number; symphonyOnly: number; live: number; paused: number; blocked: number };
         lanes: Array<{ id: string; issues: Array<{ issueIdentifier: string | null; origin: string; issueDetails: IssueDetailsEnvelope; live: unknown; paused: boolean }> }>;
         issues: Array<{ issueIdentifier: string | null }>;
       };
 
       expect(response.status).toBe(200);
-      expect(tracker.requestedStates).toEqual(["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge"]);
-      expect(body.tracker).toMatchObject({ issueCount: 2 });
-      expect(body.counts).toMatchObject({ total: 3, trackerBacked: 2, symphonyOnly: 1, live: 1, paused: 1, blocked: 2 });
-      expect(body.issues.map((item) => item.issueIdentifier)).not.toContain("TEST-DONE");
+      expect(tracker.requestedStates).toEqual(["Backlog", "Todo", "In Progress", "Blocked", "In Review", "Ready to Merge", "Done", "Canceled"]);
+      expect(tracker.fetchCount).toBe(1);
+      expect(body.tracker).toMatchObject({ issueCount: 6, cached: false });
+      expect(body.counts).toMatchObject({ total: 7, trackerBacked: 6, symphonyOnly: 1, live: 1, paused: 1, blocked: 3 });
+      expect(body.lanes.map((lane) => lane.id)).toEqual(["backlog", "todo", "progress", "review", "done", "canceled"]);
+      expect(body.issues.map((item) => item.issueIdentifier)).not.toContain("TEST-ARCHIVED");
 
-      const reviewCard = body.lanes.find((lane) => lane.id === "handoff")?.issues.find((item) => item.issueIdentifier === "TEST-1");
+      const reviewCard = body.lanes.find((lane) => lane.id === "review")?.issues.find((item) => item.issueIdentifier === "TEST-1");
       expect(reviewCard).toMatchObject({
         origin: "tracker",
         issueDetails: {
@@ -706,10 +741,17 @@ describe("StatusServer durable API", () => {
       });
       expect(reviewCard?.issueDetails.blockers).toMatchObject({ available: true, totalCount: 1, openCount: 1, blocked: true });
 
-      const mergeCard = body.lanes.find((lane) => lane.id === "merge_ready")?.issues.find((item) => item.issueIdentifier === "TEST-MERGE");
-      expect(mergeCard?.issueDetails.issue.state).toBe("Ready to Merge");
+      const todoCard = body.lanes.find((lane) => lane.id === "todo")?.issues.find((item) => item.issueIdentifier === "TEST-TODO");
+      const progressCard = body.lanes.find((lane) => lane.id === "progress")?.issues.find((item) => item.issueIdentifier === "TEST-PROGRESS");
+      expect(todoCard?.issueDetails.blockers).toMatchObject({ openCount: 1, blocked: true });
+      expect(progressCard?.issueDetails.blockers).toMatchObject({ openCount: 1, blocked: false });
 
-      const blockedCard = body.lanes.find((lane) => lane.id === "blocked")?.issues.find((item) => item.issueIdentifier === "TEST-BLOCKED");
+      const mergeCard = body.lanes.find((lane) => lane.id === "review")?.issues.find((item) => item.issueIdentifier === "TEST-MERGE");
+      expect(mergeCard?.issueDetails.issue.state).toBe("Ready to Merge");
+      expect(body.lanes.find((lane) => lane.id === "done")?.issues.map((item) => item.issueIdentifier)).toContain("TEST-DONE");
+      expect(body.lanes.find((lane) => lane.id === "canceled")?.issues.map((item) => item.issueIdentifier)).toContain("TEST-CANCELED");
+
+      const blockedCard = body.lanes.find((lane) => lane.id === "progress")?.issues.find((item) => item.issueIdentifier === "TEST-BLOCKED");
       expect(blockedCard).toMatchObject({
         origin: "symphony",
         paused: true,
@@ -718,6 +760,18 @@ describe("StatusServer durable API", () => {
           blockers: { humanBlockedReason: "needs operator", blocked: true },
         },
       });
+
+      const cachedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
+      const cachedBody = (await cachedResponse.json()) as { tracker: { cached: boolean } };
+      expect(cachedResponse.status).toBe(200);
+      expect(cachedBody.tracker.cached).toBe(true);
+      expect(tracker.fetchCount).toBe(1);
+
+      const refreshResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board?refresh=1`);
+      const refreshBody = (await refreshResponse.json()) as { tracker: { cached: boolean } };
+      expect(refreshResponse.status).toBe(200);
+      expect(refreshBody.tracker.cached).toBe(false);
+      expect(tracker.fetchCount).toBe(2);
     } finally {
       await server.stop();
     }
@@ -956,7 +1010,7 @@ describe("StatusServer durable API", () => {
         completeness: "full",
         issue: stateBody.running[0]?.issueDetails,
         tracker: { generatedAt: "2026-01-01T00:10:00.000Z", classification: "active", stale: true },
-        blockers: { available: true, totalCount: 1, openCount: 1, blocked: true },
+        blockers: { available: true, totalCount: 1, openCount: 1, blocked: false },
         latestRun: { runId: "run-1", status: "running", terminalReason: null },
         pullRequest: { url: null, number: null, headSha: null, branch: null, ciStatus: null, lastPushedAt: null },
         workspace: { workspaceKey: "TEST-1", sourceKind: null },
@@ -1713,6 +1767,7 @@ function testTrackerStateLists(): TrackerStateLists {
 
 class FakeTracker implements TrackerClient {
   requestedStates: string[] = [];
+  fetchCount = 0;
 
   constructor(private readonly issues: Issue[]) {}
 
@@ -1721,6 +1776,7 @@ class FakeTracker implements TrackerClient {
   }
 
   async fetchIssuesByStates(stateNames: string[]): Promise<Issue[]> {
+    this.fetchCount += 1;
     this.requestedStates = stateNames;
     return this.issues.filter((item) =>
       stateNames.some((state) => state.toLowerCase() === item.state.toLowerCase()),

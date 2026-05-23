@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { SymphonyError } from "../errors.js";
+import type { IssueBoardColumnId, IssueBoardColumnMapping } from "../types.js";
 import {
   createCredentialProfileRegistry,
   rawCredentialProfilesSchema,
@@ -51,6 +52,22 @@ const rawConfigSchema = z
             evidence: z.string().optional(),
           })
           .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
+    issue_board: z
+      .object({
+        columns: z
+          .object({
+            backlog: stringArray.optional(),
+            todo: stringArray.optional(),
+            progress: stringArray.optional(),
+            review: stringArray.optional(),
+            done: stringArray.optional(),
+            canceled: stringArray.optional(),
+          })
+          .strict()
           .optional(),
       })
       .passthrough()
@@ -270,6 +287,10 @@ export interface ContinuationContextConfig {
   summarizationEnabled: boolean;
 }
 
+export interface IssueBoardConfig {
+  columns: IssueBoardColumnMapping;
+}
+
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
@@ -287,6 +308,7 @@ export interface ServiceConfig {
   credentialProfiles: CredentialProfileRegistry;
   reviewLoop: ReviewLoopConfig;
   mergePolicy: MergePolicyConfig;
+  issueBoard: IssueBoardConfig;
   continuationContext: ContinuationContextConfig;
   raw: RawWorkflowConfig;
 }
@@ -405,6 +427,15 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     blockedStates,
     reviewPassState,
   });
+  const issueBoard = normalizeIssueBoardColumns(raw, {
+    activeStates,
+    handoffStates,
+    terminalStates,
+    reviewStates,
+    blockedStates,
+    reviewPassState,
+    mergePolicy,
+  });
 
   return {
     workflowPath: path.resolve(workflowPath),
@@ -480,6 +511,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
     },
     mergePolicy,
+    issueBoard: {
+      columns: issueBoard,
+    },
     continuationContext: {
       searchEnabled: raw.continuation_context?.search_enabled ?? false,
       summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
@@ -547,8 +581,88 @@ function normalizeMergePolicy(raw: RawWorkflowConfig, reviewPassState: string | 
   };
 }
 
+const ISSUE_BOARD_COLUMN_IDS: IssueBoardColumnId[] = ["backlog", "todo", "progress", "review", "done", "canceled"];
+
+function normalizeIssueBoardColumns(
+  raw: RawWorkflowConfig,
+  input: {
+    activeStates: string[];
+    handoffStates: string[];
+    terminalStates: string[];
+    reviewStates: string[];
+    blockedStates: string[];
+    reviewPassState: string | null;
+    mergePolicy: MergePolicyConfig;
+  },
+): IssueBoardColumnMapping {
+  const defaults: IssueBoardColumnMapping = {
+    backlog: ["Backlog"],
+    todo: uniqueStateNames(input.activeStates.filter((state) => statesEqual(state, "Todo"))),
+    progress: uniqueStateNames(
+      [...input.activeStates, ...input.blockedStates].filter(
+        (state) => !statesEqual(state, "Todo") && !statesEqual(state, "Backlog"),
+      ),
+    ),
+    review: uniqueStateNames([
+      ...input.handoffStates,
+      ...input.reviewStates,
+      ...(input.reviewPassState === null ? [] : [input.reviewPassState]),
+      ...input.mergePolicy.sourceStates,
+    ]),
+    done: uniqueStateNames([
+      input.mergePolicy.doneState,
+      ...input.terminalStates.filter((state) => statesEqual(state, "Done") || statesEqual(state, "Closed")),
+    ]),
+    canceled: uniqueStateNames(
+      input.terminalStates.filter(
+        (state) => statesEqual(state, "Cancelled") || statesEqual(state, "Canceled") || statesEqual(state, "Duplicate"),
+      ),
+    ),
+  };
+
+  const configured = raw.issue_board?.columns ?? {};
+  const columns = Object.fromEntries(
+    ISSUE_BOARD_COLUMN_IDS.map((column) => [column, uniqueStateNames(configured[column] ?? defaults[column])]),
+  ) as IssueBoardColumnMapping;
+  validateIssueBoardColumns(columns);
+  return columns;
+}
+
+function validateIssueBoardColumns(columns: IssueBoardColumnMapping): void {
+  const seen = new Map<string, { column: IssueBoardColumnId; state: string }>();
+  for (const column of ISSUE_BOARD_COLUMN_IDS) {
+    for (const state of columns[column]) {
+      const key = state.toLowerCase();
+      const existing = seen.get(key);
+      if (existing) {
+        throw new SymphonyError(
+          "config_validation_error",
+          `issue_board.columns must not map state ${state} to both ${existing.column} and ${column}`,
+        );
+      }
+      seen.set(key, { column, state });
+    }
+  }
+}
+
 function normalizeRequiredChecks(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))];
+}
+
+function uniqueStateNames(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+
+function statesEqual(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
 }
 
 function validateStateBuckets(input: {

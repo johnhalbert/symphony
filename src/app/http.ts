@@ -4,7 +4,13 @@ import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { CursorWorkspaceOpener } from "../../cursor/src/CursorWorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
-import { toIssueStatusView, type AgentRunRole, type Issue } from "../core/types.js";
+import {
+  toIssueStatusView,
+  type AgentRunRole,
+  type Issue,
+  type IssueBoardColumnId,
+  type IssueBoardColumnMapping,
+} from "../core/types.js";
 import type {
   IssueCompletionReportRecord,
   IssueLifecycleRecord,
@@ -45,12 +51,13 @@ export interface StatusServerOptions {
   openWorkspaceToken: string | null;
   tracker?: TrackerClient;
   trackerStateLists: TrackerStateLists;
-  issueBoardMergeReadyStates?: readonly string[];
+  issueBoardColumns?: IssueBoardColumnMapping;
   staleThresholdMs: number;
 }
 
 export class StatusServer {
   private server: http.Server | null = null;
+  private issueBoardTrackerCache: IssueBoardTrackerCache | null = null;
 
   constructor(private readonly options: StatusServerOptions) {}
 
@@ -115,17 +122,22 @@ export class StatusServer {
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/issue-board") {
+        const issueBoardColumns = this.options.issueBoardColumns ?? defaultIssueBoardColumns(this.options.trackerStateLists);
+        const trackerProjection = await this.fetchIssueBoardTrackerProjection(
+          issueBoardColumns,
+          url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true",
+        );
         sendJson(
           response,
           200,
           await buildIssueBoard(
             this.options.orchestrator.snapshot(),
             Boolean(this.options.openWorkspaceToken),
-            this.options.tracker,
+            trackerProjection,
             this.options.runStore,
             this.options.lifecycleStore,
             this.options.trackerStateLists,
-            this.options.issueBoardMergeReadyStates ?? [],
+            issueBoardColumns,
             this.options.staleThresholdMs,
           ),
         );
@@ -387,6 +399,48 @@ export class StatusServer {
       throw new SymphonyError("invalid_request", "Missing or invalid open-workspace token");
     }
   }
+
+  private async fetchIssueBoardTrackerProjection(
+    columns: IssueBoardColumnMapping,
+    forceRefresh: boolean,
+  ): Promise<IssueBoardTrackerProjection> {
+    const tracker = this.options.tracker;
+    if (!tracker) {
+      throw new SymphonyError("tracker_unavailable", "Issue board requires a configured tracker client");
+    }
+
+    const fetchedStates = boardFetchStates(columns);
+    const cacheKey = fetchedStates.map((state) => state.toLowerCase()).join("\0");
+    const now = Date.now();
+    const cached = this.issueBoardTrackerCache;
+    if (
+      cached &&
+      !forceRefresh &&
+      cached.cacheKey === cacheKey &&
+      now - cached.fetchedAtMs <= this.options.staleThresholdMs
+    ) {
+      return { ...cached.projection, cached: true };
+    }
+
+    try {
+      const trackerIssues = await tracker.fetchIssuesByStates(fetchedStates);
+      const projection = {
+        fetchedStates,
+        trackerIssues,
+        fetchedAt: new Date(now).toISOString(),
+        cached: false,
+      };
+      this.issueBoardTrackerCache = {
+        cacheKey,
+        fetchedAtMs: now,
+        projection,
+      };
+      return projection;
+    } catch (error) {
+      if (error instanceof SymphonyError) throw error;
+      throw new SymphonyError("tracker_error", `Issue board tracker fetch failed: ${errorMessage(error)}`);
+    }
+  }
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
@@ -449,14 +503,25 @@ interface PausedOperatorView extends OperatorAffordances {
   issueDetails: IssueDetailsEnvelope;
 }
 
-type IssueBoardLaneId = "active" | "handoff" | "merge_ready" | "blocked" | "unknown";
+interface IssueBoardTrackerProjection {
+  fetchedStates: string[];
+  trackerIssues: Issue[];
+  fetchedAt: string;
+  cached: boolean;
+}
+
+interface IssueBoardTrackerCache {
+  cacheKey: string;
+  fetchedAtMs: number;
+  projection: IssueBoardTrackerProjection;
+}
 
 interface IssueBoardCard {
   key: string;
   issueId: string | null;
   issueIdentifier: string | null;
   origin: "tracker" | "symphony";
-  lane: IssueBoardLaneId;
+  lane: IssueBoardColumnId;
   issueDetails: IssueDetailsEnvelope;
   paused: boolean;
   live: { role: AgentRunRole; state: string; runId: string | null } | null;
@@ -472,7 +537,7 @@ interface IssueBoardCard {
 }
 
 interface IssueBoardLane {
-  id: IssueBoardLaneId;
+  id: IssueBoardColumnId;
   title: string;
   states: string[];
   issues: IssueBoardCard[];
@@ -481,29 +546,16 @@ interface IssueBoardLane {
 async function buildIssueBoard(
   snapshot: RuntimeSnapshot,
   mutationsConfigured: boolean,
-  tracker: TrackerClient | undefined,
+  trackerProjection: IssueBoardTrackerProjection,
   runStore: RunTranscriptStore | undefined,
   lifecycleStore: IssueLifecycleStore | undefined,
   trackerStateLists: TrackerStateLists,
-  mergeReadyStates: readonly string[],
+  issueBoardColumns: IssueBoardColumnMapping,
   staleThresholdMs: number,
 ) {
-  if (!tracker) {
-    throw new SymphonyError("tracker_unavailable", "Issue board requires a configured tracker client");
-  }
-
-  const fetchedStates = boardFetchStates(trackerStateLists, mergeReadyStates);
-  let trackerIssues: Issue[];
-  try {
-    trackerIssues = await tracker.fetchIssuesByStates(fetchedStates);
-  } catch (error) {
-    if (error instanceof SymphonyError) throw error;
-    throw new SymphonyError("tracker_error", `Issue board tracker fetch failed: ${errorMessage(error)}`);
-  }
-
   const representedKeys = new Set<string>();
   const cards: IssueBoardCard[] = [];
-  for (const issue of trackerIssues) {
+  for (const issue of trackerProjection.trackerIssues) {
     addBoardKeys(representedKeys, [issue.id, issue.identifier]);
     cards.push(
       await buildTrackerBoardCard({
@@ -513,7 +565,7 @@ async function buildIssueBoard(
         runStore,
         lifecycleStore,
         trackerStateLists,
-        mergeReadyStates,
+        issueBoardColumns,
         staleThresholdMs,
       }),
     );
@@ -525,13 +577,13 @@ async function buildIssueBoard(
     runStore,
     lifecycleStore,
     trackerStateLists,
-    mergeReadyStates,
+    issueBoardColumns,
     staleThresholdMs,
     representedKeys,
   });
   cards.push(...symphonyOnlyCards);
 
-  const lanes = boardLanes(trackerStateLists, mergeReadyStates).map((lane) => ({
+  const lanes = boardLanes(issueBoardColumns).map((lane) => ({
     ...lane,
     issues: cards.filter((card) => card.lane === lane.id),
   }));
@@ -540,8 +592,10 @@ async function buildIssueBoard(
     generatedAt: snapshot.generatedAt,
     tracker: {
       status: "ok" as const,
-      fetchedStates,
-      issueCount: trackerIssues.length,
+      fetchedStates: trackerProjection.fetchedStates,
+      fetchedAt: trackerProjection.fetchedAt,
+      cached: trackerProjection.cached,
+      issueCount: trackerProjection.trackerIssues.length,
       error: null,
     },
     lanes,
@@ -564,7 +618,7 @@ async function buildTrackerBoardCard(input: {
   runStore: RunTranscriptStore | undefined;
   lifecycleStore: IssueLifecycleStore | undefined;
   trackerStateLists: TrackerStateLists;
-  mergeReadyStates: readonly string[];
+  issueBoardColumns: IssueBoardColumnMapping;
   staleThresholdMs: number;
 }): Promise<IssueBoardCard> {
   const issueStatus = toIssueStatusView(input.issue);
@@ -593,7 +647,7 @@ async function buildTrackerBoardCard(input: {
   return buildBoardCard({
     key: input.issue.id,
     origin: "tracker",
-    lane: classifyBoardLane(input.issue.state, lifecycle, input.trackerStateLists, input.mergeReadyStates),
+    lane: classifyBoardLane(input.issue.state, lifecycle, live?.role ?? null, input.issueBoardColumns),
     issueDetails,
     live,
     workspace,
@@ -612,7 +666,7 @@ async function buildSymphonyOnlyBoardCards(input: {
   runStore: RunTranscriptStore | undefined;
   lifecycleStore: IssueLifecycleStore | undefined;
   trackerStateLists: TrackerStateLists;
-  mergeReadyStates: readonly string[];
+  issueBoardColumns: IssueBoardColumnMapping;
   staleThresholdMs: number;
   representedKeys: Set<string>;
 }): Promise<IssueBoardCard[]> {
@@ -647,7 +701,7 @@ async function buildSymphonyOnlyBoardCards(input: {
     const card = await buildBoardCard({
       key: issueDetails.issue.id ?? issueDetails.issue.identifier ?? requestKey,
       origin: "symphony",
-      lane: classifyBoardLane(live?.state ?? issueDetails.issue.state, lifecycle, input.trackerStateLists, input.mergeReadyStates),
+      lane: classifyBoardLane(live?.state ?? issueDetails.issue.state, lifecycle, live?.role ?? null, input.issueBoardColumns),
       issueDetails,
       live,
       workspace,
@@ -677,7 +731,7 @@ async function buildSymphonyOnlyBoardCards(input: {
 async function buildBoardCard(input: {
   key: string;
   origin: "tracker" | "symphony";
-  lane: IssueBoardLaneId;
+  lane: IssueBoardColumnId;
   issueDetails: IssueDetailsEnvelope;
   live: RunningRow | null;
   workspace: WorkspaceRecord | null | undefined;
@@ -736,37 +790,68 @@ async function buildBoardCard(input: {
   };
 }
 
-function boardFetchStates(stateLists: TrackerStateLists, mergeReadyStates: readonly string[]): string[] {
-  return uniqueStateNames([
-    ...stateLists.activeStates,
-    ...stateLists.handoffStates,
-    ...stateLists.reviewStates,
-    ...stateLists.blockedStates,
-    ...mergeReadyStates,
-  ]).filter((state) => !isStateNameIn(state, stateLists.terminalStates));
+const ISSUE_BOARD_COLUMN_IDS: IssueBoardColumnId[] = ["backlog", "todo", "progress", "review", "done", "canceled"];
+
+function defaultIssueBoardColumns(stateLists: TrackerStateLists): IssueBoardColumnMapping {
+  return {
+    backlog: ["Backlog"],
+    todo: stateLists.activeStates.filter((state) => isStateNameIn(state, ["Todo"])),
+    progress: uniqueStateNames(
+      [...stateLists.activeStates, ...stateLists.blockedStates].filter(
+        (state) => !isStateNameIn(state, ["Todo", "Backlog"]),
+      ),
+    ),
+    review: uniqueStateNames([...stateLists.handoffStates, ...stateLists.reviewStates]),
+    done: stateLists.terminalStates.filter((state) => isStateNameIn(state, ["Done", "Closed"])),
+    canceled: stateLists.terminalStates.filter((state) => isStateNameIn(state, ["Cancelled", "Canceled", "Duplicate"])),
+  };
 }
 
-function boardLanes(stateLists: TrackerStateLists, mergeReadyStates: readonly string[]): Array<Omit<IssueBoardLane, "issues">> {
-  return [
-    { id: "active", title: "Active", states: uniqueStateNames(stateLists.activeStates) },
-    { id: "handoff", title: "Review", states: uniqueStateNames([...stateLists.handoffStates, ...stateLists.reviewStates]) },
-    { id: "merge_ready", title: "Ready to Merge", states: uniqueStateNames(mergeReadyStates) },
-    { id: "blocked", title: "Blocked", states: uniqueStateNames(stateLists.blockedStates) },
-    { id: "unknown", title: "Unknown", states: [] },
-  ];
+function boardFetchStates(columns: IssueBoardColumnMapping): string[] {
+  return uniqueStateNames(ISSUE_BOARD_COLUMN_IDS.flatMap((column) => columns[column]));
+}
+
+function boardLanes(columns: IssueBoardColumnMapping): Array<Omit<IssueBoardLane, "issues">> {
+  return ISSUE_BOARD_COLUMN_IDS.map((id) => ({
+    id,
+    title: boardColumnTitle(id),
+    states: uniqueStateNames(columns[id]),
+  }));
+}
+
+function boardColumnTitle(id: IssueBoardColumnId): string {
+  switch (id) {
+    case "backlog":
+      return "Backlog";
+    case "todo":
+      return "Todo";
+    case "progress":
+      return "In Progress";
+    case "review":
+      return "Review";
+    case "done":
+      return "Done";
+    case "canceled":
+      return "Canceled";
+  }
 }
 
 function classifyBoardLane(
   state: string | null,
   lifecycle: IssueLifecycleRecord | null | undefined,
-  stateLists: TrackerStateLists,
-  mergeReadyStates: readonly string[],
-): IssueBoardLaneId {
-  if (isLifecycleBlocked(lifecycle) || (state !== null && isStateNameIn(state, stateLists.blockedStates))) return "blocked";
-  if (state !== null && isStateNameIn(state, mergeReadyStates)) return "merge_ready";
-  if (state !== null && isStateNameIn(state, [...stateLists.handoffStates, ...stateLists.reviewStates])) return "handoff";
-  if (state !== null && isStateNameIn(state, stateLists.activeStates)) return "active";
-  return "unknown";
+  role: AgentRunRole | null,
+  columns: IssueBoardColumnMapping,
+): IssueBoardColumnId {
+  if (state !== null) {
+    for (const column of ISSUE_BOARD_COLUMN_IDS) {
+      if (isStateNameIn(state, columns[column])) return column;
+    }
+  }
+  if (isLifecycleBlocked(lifecycle)) return "progress";
+  if (role === "reviewer") return "review";
+  if (role === "worker") return "progress";
+  if (lifecycle?.phase === "terminal") return "done";
+  return "backlog";
 }
 
 function liveIssueByKeys(snapshot: RuntimeSnapshot, keys: string[]): RunningRow | null {
@@ -1523,7 +1608,7 @@ function buildIssueDetailsEnvelope(input: {
       completeness: "full",
       issue,
       tracker: buildIssueTrackerMetadata(issue, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
-      blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists.terminalStates, input.lifecycle),
+      blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists, input.lifecycle, issue.state),
       workspace: buildIssueWorkspaceSummary(input, metadata),
       pullRequest: buildIssuePullRequestSummary(metadata),
       latestRun: buildIssueLatestRunSummary(input.summaryRun),
@@ -1535,7 +1620,7 @@ function buildIssueDetailsEnvelope(input: {
     completeness: "partial",
     issue: durableIssueStatusView(input),
     tracker: buildIssueTrackerMetadata(null, null, input.trackerStateLists, input.staleThresholdMs),
-    blockers: buildIssueBlockerSummary(null, input.trackerStateLists.terminalStates, input.lifecycle),
+    blockers: buildIssueBlockerSummary(null, input.trackerStateLists, input.lifecycle, null),
     workspace: buildIssueWorkspaceSummary(input, metadata),
     pullRequest: buildIssuePullRequestSummary(metadata),
     latestRun: buildIssueLatestRunSummary(input.summaryRun),
@@ -1612,17 +1697,23 @@ function classifyIssueState(state: string | null, stateLists: TrackerStateLists)
 
 function buildIssueBlockerSummary(
   blockedBy: IssueBlockerRef[] | null,
-  terminalStates: readonly string[],
+  stateLists: TrackerStateLists,
   lifecycle: IssueLifecycleRecord | null | undefined,
+  issueState: string | null,
 ) {
-  const open = (blockedBy ?? []).filter((blocker) => blocker.state === null || !isStateNameIn(blocker.state, terminalStates));
+  const open = (blockedBy ?? []).filter((blocker) => blocker.state === null || !isStateNameIn(blocker.state, stateLists.terminalStates));
   const lifecycleBlocked = isLifecycleBlocked(lifecycle);
+  const stateBlocked = issueState !== null && isStateNameIn(issueState, stateLists.blockedStates);
+  const dispatchBlocked =
+    issueState !== null &&
+    open.length > 0 &&
+    (issueState.toLowerCase() === "todo" || isStateNameIn(issueState, stateLists.reviewStates));
   return {
     available: blockedBy !== null,
     totalCount: blockedBy?.length ?? 0,
     openCount: open.length,
     open,
-    blocked: open.length > 0 || lifecycleBlocked,
+    blocked: lifecycleBlocked || stateBlocked || dispatchBlocked,
     humanBlockedReason: lifecycleBlocked ? (lifecycle?.blockedReason ?? null) : null,
   };
 }
