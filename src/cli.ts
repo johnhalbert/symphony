@@ -15,7 +15,12 @@ import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
-import { createRuntimeTrackerClient, createRuntimeWritebackProcessor, resolveStatusMutationToken } from "./app/RuntimeDependencies.js";
+import {
+  createRuntimeTrackerClient,
+  createRuntimeWritebackProcessor,
+  resolveStatusMutationToken,
+  resolveTrackerStateLists,
+} from "./app/RuntimeDependencies.js";
 
 const program = new Command();
 
@@ -146,6 +151,8 @@ program
             host: config.server.host,
             port: config.server.port,
             openWorkspaceToken: resolveStatusMutationToken(config),
+            trackerStateLists: resolveTrackerStateLists(config),
+            staleThresholdMs: config.polling.intervalMs,
           });
 
     if (statusServer) {

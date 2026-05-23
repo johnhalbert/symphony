@@ -25,6 +25,110 @@ export interface Issue {
   updatedAt: string | null;
 }
 
+export interface IssueStatusView {
+  id: string | null;
+  identifier: string | null;
+  title: string | null;
+  description: string | null;
+  priority: number | null;
+  state: string | null;
+  branchName: string | null;
+  url: string | null;
+  assigneeId: string | null;
+  labels: string[];
+  blockedBy: IssueBlockerRef[];
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export type IssueDetailsSource = "live" | "durable";
+export type IssueDetailsCompleteness = "full" | "partial";
+export type IssueStateClassification = "active" | "handoff" | "terminal" | "blocked" | "unknown";
+export type RunTerminalReason = "succeeded" | "failed" | "timed_out" | "stalled" | "cancelled";
+
+export interface TrackerStateLists {
+  activeStates: readonly string[];
+  handoffStates: readonly string[];
+  reviewStates: readonly string[];
+  blockedStates: readonly string[];
+  terminalStates: readonly string[];
+}
+
+export interface IssueTrackerMetadata {
+  generatedAt: string | null;
+  updatedAt: string | null;
+  ageMs: number | null;
+  stale: boolean | null;
+  staleThresholdMs: number;
+  state: string | null;
+  classification: IssueStateClassification | null;
+}
+
+export interface IssueBlockerSummary {
+  available: boolean;
+  totalCount: number;
+  openCount: number;
+  open: IssueBlockerRef[];
+  blocked: boolean;
+  humanBlockedReason: string | null;
+}
+
+export interface IssueWorkspaceSummary {
+  workspaceKey: string | null;
+  path: string | null;
+  sourceKind: string | null;
+  branchName: string | null;
+  gitBranchName: string | null;
+  repoPath: string | null;
+  baseRef: string | null;
+}
+
+export interface IssuePullRequestSummary {
+  url: string | null;
+  number: number | null;
+  headSha: string | null;
+  branch: string | null;
+  ciStatus: string | null;
+  lastPushedAt: string | null;
+}
+
+export interface IssueLatestRunSummary {
+  runId: string | null;
+  status: "running" | "succeeded" | "failed" | "cancelled" | null;
+  terminalReason: RunTerminalReason | null;
+  error: string | null;
+  completedAt: string | null;
+}
+
+export interface IssueDetailsEnvelope {
+  source: IssueDetailsSource;
+  completeness: IssueDetailsCompleteness;
+  issue: IssueStatusView;
+  tracker: IssueTrackerMetadata;
+  blockers: IssueBlockerSummary;
+  workspace: IssueWorkspaceSummary;
+  pullRequest: IssuePullRequestSummary;
+  latestRun: IssueLatestRunSummary;
+}
+
+export function toIssueStatusView(issue: Issue): IssueStatusView {
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    description: issue.description,
+    priority: issue.priority,
+    state: issue.state,
+    branchName: issue.branchName,
+    url: issue.url,
+    assigneeId: issue.assigneeId,
+    labels: [...issue.labels],
+    blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
+    createdAt: issue.createdAt,
+    updatedAt: issue.updatedAt,
+  };
+}
+
 export interface Workspace {
   path: string;
   workspaceKey: string;
@@ -51,9 +155,3 @@ export interface RuntimeTotals extends TokenCounts {
   secondsRunning: number;
 }
 
-export type RunTerminalReason =
-  | "succeeded"
-  | "failed"
-  | "timed_out"
-  | "stalled"
-  | "cancelled";

@@ -11,8 +11,8 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 ## Stable Resources
 
 - `GET /api/v1/state` returns the live orchestrator snapshot.
-- `GET /api/v1/issues/:id` returns live issue status when present plus durable workspace and latest run metadata.
-- `GET /api/v1/issues/:id/runs` returns all persisted runs for an issue id or identifier.
+- `GET /api/v1/issues/:id` returns live issue status when present plus durable workspace, latest run metadata, and an `issueDetails` envelope. Prefer `issueDetails` for extension issue cards; top-level `metadata`, `workspace`, `latestRun`, and `lifecycle` remain available for backward compatibility and detailed inspection.
+- `GET /api/v1/issues/:id/runs` returns all persisted runs for an issue id or identifier plus the same `issueDetails` envelope.
 - `GET /api/v1/runs/:runId` returns run metadata.
 - `GET /api/v1/runs/:runId/transcript?offset=0&limit=100` returns paginated transcript events.
 - `GET /api/v1/workspaces` returns known durable workspace records.
@@ -29,6 +29,25 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 - Transcript webview: render persisted transcript events from Symphony's store.
 - Status surface: show live running/retrying state and durable run terminal state.
 - Operator controls: expose pause, resume, cancel, and open-workspace only when a mutation token is configured.
+
+## Issue Details Envelope
+
+`issueDetails` is the enriched issue/status contract on `GET /api/v1/issues/:id`, `GET /api/v1/issues/:id/runs`, and `operatorView` rows in `GET /api/v1/state`.
+
+- `source`: `live` when the envelope was built from an active orchestrator tracker row, otherwise `durable`.
+- `completeness`: `full` for live tracker data and `partial` for durable store synthesis.
+- `issue`: tracker-shaped fields (`id`, `identifier`, title, state, labels, blockers, Linear URL, timestamps). Durable partial responses leave unavailable tracker fields null or empty. `issue.id` is null unless a persisted lifecycle, run, workspace, or live tracker row provides a real Linear issue id; Symphony does not copy the route key into `issue.id`.
+- `tracker`: Linear record-age and classification metadata for tracker-derived fields. Live rows include `generatedAt` (the Symphony snapshot time), tracker `updatedAt` (Linear issue `updatedAt`), `ageMs = max(generatedAt - updatedAt, 0)`, `stale = ageMs > staleThresholdMs`, `staleThresholdMs` (currently the polling interval), raw `state`, and a config-driven `classification` (`active`, `handoff`, `blocked`, `terminal`, or `unknown`). This is not a tracker-cache fetch timestamp. Durable partial rows set tracker timestamps, staleness, and classification to null.
+- `blockers`: summary of live Linear `blockedBy` data plus lifecycle human block state. `available` is false for durable partial rows. `openCount` uses the configured terminal states to distinguish open blockers from completed blockers.
+- `workspace`: workspace and git hints (`workspaceKey`, `path`, `sourceKind`, `branchName`, `gitBranchName`, `repoPath`, `baseRef`) resolved with the same precedence as legacy status metadata.
+- `pullRequest`: GitHub PR hints (`url`, `number`, `headSha`, `branch`, `ciStatus`, `lastPushedAt`) when known.
+- `latestRun`: run summary (`runId`, `status`, `terminalReason`, `error`, `completedAt`). Live envelopes prefer the active run (`activeRunId` or live `runId`) so issue cards describe the running agent. Durable envelopes use the issue-wide latest persisted run. `terminalReason` is normalized from persisted run status; `timed_out` is reserved until a durable timeout signal exists.
+
+`GET /api/v1/state` also exposes raw `running[].issueDetails` directly from the orchestrator snapshot. That raw field is the bare tracker-shaped `issue` view, not the envelope. Use `operatorView.running[].issueDetails` when the extension needs the enriched envelope.
+
+`GET /api/v1/issues/:id` also keeps `live.issueDetails` as a deprecated raw tracker-view mirror for compatibility with older clients. Prefer the top-level `issueDetails` envelope and `issueDetails.issue` for new code.
+
+On `GET /api/v1/issues/:id/runs`, the top-level `enrichment` object describes run-list liveness/timeline enrichment. It is separate from `issueDetails` and should not be confused with the issue details envelope.
 
 ## Non-Goals
 

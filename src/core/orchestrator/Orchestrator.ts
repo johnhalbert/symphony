@@ -4,7 +4,15 @@ import { SymphonyError, errorMessage } from "../errors.js";
 import type { AgentActivitySource, AgentEvent, AgentHarness } from "../harness/AgentHarness.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
-import type { AgentRunRole, Issue, RuntimeTotals, TokenCounts, Workspace } from "../types.js";
+import {
+  toIssueStatusView,
+  type AgentRunRole,
+  type Issue,
+  type IssueStatusView,
+  type RuntimeTotals,
+  type TokenCounts,
+  type Workspace,
+} from "../types.js";
 import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
@@ -155,6 +163,7 @@ export interface RuntimeSnapshot {
     tokens: TokenCounts;
     lifecycle: IssueLifecycleRecord | null;
     metadata: IssueRunMetadata;
+    issueDetails: IssueStatusView;
   }>;
   retrying: Array<{
     issueId: string;
@@ -435,6 +444,7 @@ export class Orchestrator {
         tokens: entry.tokens,
         lifecycle: entry.lifecycle,
         metadata: metadataForRunningEntry(entry),
+        issueDetails: toIssueStatusView(entry.issue),
       })),
       retrying: [...this.retryAttempts.values()].map((entry) => ({
         issueId: entry.issueId,

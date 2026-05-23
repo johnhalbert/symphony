@@ -1,5 +1,5 @@
 import type { Logger } from "../core/logging/StructuredLogger.js";
-import type { AgentRunRole } from "../core/types.js";
+import type { AgentRunRole, TrackerStateLists } from "../core/types.js";
 import type { ServiceConfig } from "../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../core/config/CredentialProfiles.js";
 import { SymphonyError } from "../core/errors.js";
@@ -42,6 +42,16 @@ export function resolveStatusMutationToken(config: ServiceConfig): string | null
 export function resolveStatusMutationCredential(config: ServiceConfig): ResolvedCredential | null {
   enforceCapabilityOwner(config, "worker", "server.open_workspace", "server.open_workspace_token");
   return config.credentialProfiles.resolveForRole("worker", "server.open_workspace");
+}
+
+export function resolveTrackerStateLists(config: ServiceConfig): TrackerStateLists {
+  return {
+    activeStates: config.tracker.activeStates,
+    handoffStates: config.tracker.handoffStates,
+    reviewStates: config.reviewLoop.reviewStates,
+    blockedStates: config.reviewLoop.blockedStates,
+    terminalStates: config.tracker.terminalStates,
+  };
 }
 
 function enforceCapabilityOwner(

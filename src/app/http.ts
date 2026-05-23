@@ -12,6 +12,18 @@ import type {
 } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
 import type { RunRecord, RunTranscriptStore, TranscriptEvent, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
+import type {
+  IssueBlockerRef,
+  IssueDetailsEnvelope,
+  IssueLatestRunSummary,
+  IssuePullRequestSummary,
+  IssueStateClassification,
+  IssueStatusView,
+  IssueTrackerMetadata,
+  IssueWorkspaceSummary,
+  RunTerminalReason,
+  TrackerStateLists,
+} from "../core/types.js";
 
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
@@ -23,6 +35,8 @@ export interface StatusServerOptions {
   host: string;
   port: number;
   openWorkspaceToken: string | null;
+  trackerStateLists: TrackerStateLists;
+  staleThresholdMs: number;
 }
 
 export class StatusServer {
@@ -68,6 +82,8 @@ export class StatusServer {
             Boolean(this.options.openWorkspaceToken),
             this.options.runStore,
             this.options.lifecycleStore,
+            this.options.trackerStateLists,
+            this.options.staleThresholdMs,
           ),
         );
         return;
@@ -81,6 +97,8 @@ export class StatusServer {
             Boolean(this.options.openWorkspaceToken),
             this.options.runStore,
             this.options.lifecycleStore,
+            this.options.trackerStateLists,
+            this.options.staleThresholdMs,
           ),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
@@ -140,6 +158,10 @@ export class StatusServer {
       if (request.method === "GET" && issueRunsMatch) {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
         const snapshot = this.options.orchestrator.snapshot();
+        const live = this.options.orchestrator.getIssueDetails(issueId);
+        const workspace = await this.options.runStore?.findWorkspace(issueId);
+        const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
         const lifecycle = await this.options.lifecycleStore?.get(issueId);
         const enrichedRuns = await Promise.all(
@@ -151,6 +173,17 @@ export class StatusServer {
         );
         sendJson(response, 200, {
           issue: issueId,
+          issueDetails: buildIssueDetailsEnvelope({
+            requestKey: issueId,
+            generatedAt: snapshot.generatedAt,
+            trackerStateLists: this.options.trackerStateLists,
+            staleThresholdMs: this.options.staleThresholdMs,
+            live,
+            workspace,
+            latestRun,
+            summaryRun,
+            lifecycle,
+          }),
           runs: enrichedRuns,
           issueBlocked: blockedIssueView(lifecycle),
           enrichment: {
@@ -185,6 +218,7 @@ export class StatusServer {
         const live = this.options.orchestrator.getIssueDetails(issueId);
         const workspace = await this.options.runStore?.findWorkspace(issueId);
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const lifecycle = await this.options.lifecycleStore?.get(issueId);
         if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
@@ -208,7 +242,18 @@ export class StatusServer {
         });
         sendJson(response, 200, {
           issue: issueId,
-          live: live ? { ...live, operatorLiveness } : null,
+          issueDetails: buildIssueDetailsEnvelope({
+            requestKey: issueId,
+            generatedAt: snapshot.generatedAt,
+            trackerStateLists: this.options.trackerStateLists,
+            staleThresholdMs: this.options.staleThresholdMs,
+            live,
+            workspace,
+            latestRun,
+            summaryRun,
+            lifecycle,
+          }),
+          live: live ? liveIssueResponse(live, operatorLiveness) : null,
           workspace,
           latestRun,
           lifecycle,
@@ -372,6 +417,7 @@ interface PausedOperatorView extends OperatorAffordances {
   label: string;
   paused: true;
   controls: OperatorControls;
+  issueDetails: IssueDetailsEnvelope;
 }
 
 async function renderDashboard(
@@ -379,6 +425,8 @@ async function renderDashboard(
   mutationsConfigured: boolean,
   runStore?: RunTranscriptStore,
   lifecycleStore?: IssueLifecycleStore,
+  trackerStateLists?: TrackerStateLists,
+  staleThresholdMs?: number,
 ): Promise<string> {
   const runningRows = await Promise.all(
     snapshot.running.map(async (row) => ({
@@ -391,7 +439,16 @@ async function renderDashboard(
       renderRunningRow(row, snapshot, mutationsConfigured, agentId, Boolean(lifecycleStore && runStore)),
     )
     .join("");
-  const pausedRows = await pausedOperatorViews(snapshot.paused, mutationsConfigured, runStore, lifecycleStore);
+  const pausedRows = await pausedOperatorViews(
+    snapshot.paused,
+    snapshot.running,
+    snapshot.generatedAt,
+    trackerStateLists ?? defaultTrackerStateLists(),
+    staleThresholdMs ?? 0,
+    mutationsConfigured,
+    runStore,
+    lifecycleStore,
+  );
   const paused =
     pausedRows.length === 0
       ? ""
@@ -497,12 +554,18 @@ async function operatorSnapshotView(
   mutationsConfigured: boolean,
   runStore?: RunTranscriptStore,
   lifecycleStore?: IssueLifecycleStore,
+  trackerStateLists: TrackerStateLists = defaultTrackerStateLists(),
+  staleThresholdMs = 0,
 ) {
   const running = await Promise.all(
     snapshot.running.map(async (row) => {
       const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
       const paused = isIssuePaused(snapshot, keys);
       const agentId = await resolveRunningAgentId(row, runStore);
+      const workspace = (await runStore?.findWorkspace(row.issueId)) ?? (await runStore?.findWorkspace(row.issueIdentifier));
+      const latestRun =
+        (await runStore?.latestRunForIssue(row.issueId)) ?? (await runStore?.latestRunForIssue(row.issueIdentifier));
+      const summaryRun = await resolveIssueDetailsSummaryRun(row, latestRun, runStore);
       const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
       const affordances = operatorAffordances({
         issueKey: row.issueIdentifier,
@@ -518,6 +581,17 @@ async function operatorSnapshotView(
         runId: row.liveness.activeRunId ?? row.runId,
         workspacePath: row.workspacePath,
         paused,
+        issueDetails: buildIssueDetailsEnvelope({
+          requestKey: row.issueIdentifier,
+          generatedAt: snapshot.generatedAt,
+          trackerStateLists,
+          staleThresholdMs,
+          live: row,
+          workspace,
+          latestRun,
+          summaryRun,
+          lifecycle: row.lifecycle,
+        }),
         liveness: runningOperatorLiveness(row, paused, row.lifecycle, agentId),
         controls,
         ...affordances,
@@ -529,7 +603,16 @@ async function operatorSnapshotView(
     mutationsRequireToken: mutationsConfigured,
     operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
     running,
-    paused: await pausedOperatorViews(snapshot.paused, mutationsConfigured, runStore, lifecycleStore),
+    paused: await pausedOperatorViews(
+      snapshot.paused,
+      snapshot.running,
+      snapshot.generatedAt,
+      trackerStateLists,
+      staleThresholdMs,
+      mutationsConfigured,
+      runStore,
+      lifecycleStore,
+    ),
     retrying: snapshot.retrying,
   };
 }
@@ -580,6 +663,10 @@ function runMatchesLiveRow(row: RunningRow, run: RunRecord | null): run is RunRe
 
 async function pausedOperatorViews(
   pausedKeys: string[],
+  running: RunningRow[],
+  generatedAt: string,
+  trackerStateLists: TrackerStateLists,
+  staleThresholdMs: number,
   mutationsConfigured: boolean,
   runStore?: RunTranscriptStore,
   lifecycleStore?: IssueLifecycleStore,
@@ -588,6 +675,9 @@ async function pausedOperatorViews(
     pausedKeys.map(async (pausedKey) => {
       const lifecycle = (await lifecycleStore?.get(pausedKey)) ?? null;
       const workspace = await runStore?.findWorkspace(pausedKey);
+      const latestRun = await runStore?.latestRunForIssue(pausedKey);
+      const live = running.find((row) => row.issueId === pausedKey || row.issueIdentifier === pausedKey) ?? null;
+      const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, runStore);
       const issueIdentifier = lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? pausedKey;
       const controls = operatorControls({ issueKnown: true, live: null, paused: true, mutationsConfigured });
       return {
@@ -596,6 +686,17 @@ async function pausedOperatorViews(
         label: `Paused ${issueIdentifier}`,
         paused: true,
         controls,
+        issueDetails: buildIssueDetailsEnvelope({
+          requestKey: pausedKey,
+          generatedAt,
+          trackerStateLists,
+          staleThresholdMs,
+          live,
+          workspace,
+          latestRun,
+          summaryRun,
+          lifecycle,
+        }),
         ...operatorAffordances({
           issueKey: issueIdentifier,
           lifecycle,
@@ -988,6 +1089,189 @@ function findLiveRun(snapshot: RuntimeSnapshot, runId: string): RunningRow | nul
 
 function isLifecycleBlocked(lifecycle: IssueLifecycleRecord | null | undefined): boolean {
   return lifecycle !== null && lifecycle !== undefined && (lifecycle.phase === "blocked" || lifecycle.blockedReason !== null);
+}
+
+function liveIssueResponse(live: RunningRow, operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>) {
+  return { ...live, operatorLiveness };
+}
+
+function buildIssueDetailsEnvelope(input: {
+  requestKey: string;
+  generatedAt: string;
+  trackerStateLists: TrackerStateLists;
+  staleThresholdMs: number;
+  live: RunningRow | null;
+  latestRun: RunRecord | null | undefined;
+  summaryRun: RunRecord | null | undefined;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+  workspace: WorkspaceRecord | null | undefined;
+}): IssueDetailsEnvelope {
+  const metadata = statusMetadata(input);
+  if (input.live) {
+    return {
+      source: "live",
+      completeness: "full",
+      issue: input.live.issueDetails,
+      tracker: buildIssueTrackerMetadata(input.live.issueDetails, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
+      blockers: buildIssueBlockerSummary(input.live.issueDetails.blockedBy, input.trackerStateLists.terminalStates, input.lifecycle),
+      workspace: buildIssueWorkspaceSummary(input, metadata),
+      pullRequest: buildIssuePullRequestSummary(metadata),
+      latestRun: buildIssueLatestRunSummary(input.summaryRun),
+    };
+  }
+
+  return {
+    source: "durable",
+    completeness: "partial",
+    issue: durableIssueStatusView(input),
+    tracker: buildIssueTrackerMetadata(null, null, input.trackerStateLists, input.staleThresholdMs),
+    blockers: buildIssueBlockerSummary(null, input.trackerStateLists.terminalStates, input.lifecycle),
+    workspace: buildIssueWorkspaceSummary(input, metadata),
+    pullRequest: buildIssuePullRequestSummary(metadata),
+    latestRun: buildIssueLatestRunSummary(input.summaryRun),
+  };
+}
+
+async function resolveIssueDetailsSummaryRun(
+  live: RunningRow | null,
+  issueWideLatestRun: RunRecord | null | undefined,
+  runStore?: RunTranscriptStore,
+): Promise<RunRecord | null> {
+  if (!live) return issueWideLatestRun ?? null;
+  const activeRunId = live.liveness.activeRunId ?? live.runId;
+  if (activeRunId && runStore) {
+    const activeRun = await runStore.getRun(activeRunId);
+    if (runMatchesLiveRow(live, activeRun)) return activeRun;
+  }
+  return runMatchesLiveRow(live, issueWideLatestRun ?? null) ? (issueWideLatestRun ?? null) : null;
+}
+
+function durableIssueStatusView(input: {
+  requestKey: string;
+  latestRun: RunRecord | null | undefined;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+  workspace: WorkspaceRecord | null | undefined;
+}): IssueStatusView {
+  return {
+    id: input.lifecycle?.issueId ?? input.latestRun?.issueId ?? input.workspace?.issueId ?? null,
+    identifier: input.lifecycle?.issueIdentifier ?? input.latestRun?.issueIdentifier ?? input.workspace?.issueIdentifier ?? null,
+    title: null,
+    description: null,
+    priority: null,
+    state: null,
+    branchName:
+      input.lifecycle?.summaryPointers.branchName ?? input.latestRun?.gitBranchName ?? input.workspace?.gitBranchName ?? null,
+    url: null,
+    assigneeId: null,
+    labels: [],
+    blockedBy: [],
+    createdAt: null,
+    updatedAt: null,
+  };
+}
+
+function buildIssueTrackerMetadata(
+  issue: IssueStatusView | null,
+  generatedAt: string | null,
+  stateLists: TrackerStateLists,
+  staleThresholdMs: number,
+): IssueTrackerMetadata {
+  const updatedAt = issue?.updatedAt ?? null;
+  const generatedMs = generatedAt === null ? Number.NaN : Date.parse(generatedAt);
+  const updatedMs = updatedAt === null ? Number.NaN : Date.parse(updatedAt);
+  const ageMs = Number.isFinite(generatedMs) && Number.isFinite(updatedMs) ? Math.max(generatedMs - updatedMs, 0) : null;
+  return {
+    generatedAt,
+    updatedAt,
+    ageMs,
+    stale: ageMs === null ? null : ageMs > staleThresholdMs,
+    staleThresholdMs,
+    state: issue?.state ?? null,
+    classification: classifyIssueState(issue?.state ?? null, stateLists),
+  };
+}
+
+function classifyIssueState(state: string | null, stateLists: TrackerStateLists): IssueStateClassification | null {
+  if (state === null) return null;
+  if (isStateNameIn(state, stateLists.terminalStates)) return "terminal";
+  if (isStateNameIn(state, stateLists.blockedStates)) return "blocked";
+  if (isStateNameIn(state, [...stateLists.handoffStates, ...stateLists.reviewStates])) return "handoff";
+  if (isStateNameIn(state, stateLists.activeStates)) return "active";
+  return "unknown";
+}
+
+function buildIssueBlockerSummary(
+  blockedBy: IssueBlockerRef[] | null,
+  terminalStates: readonly string[],
+  lifecycle: IssueLifecycleRecord | null | undefined,
+) {
+  const open = (blockedBy ?? []).filter((blocker) => blocker.state === null || !isStateNameIn(blocker.state, terminalStates));
+  const lifecycleBlocked = isLifecycleBlocked(lifecycle);
+  return {
+    available: blockedBy !== null,
+    totalCount: blockedBy?.length ?? 0,
+    openCount: open.length,
+    open,
+    blocked: open.length > 0 || lifecycleBlocked,
+    humanBlockedReason: lifecycleBlocked ? (lifecycle?.blockedReason ?? null) : null,
+  };
+}
+
+function buildIssueWorkspaceSummary(
+  input: {
+    live: RunningRow | null;
+    workspace: WorkspaceRecord | null | undefined;
+    latestRun: RunRecord | null | undefined;
+    lifecycle: IssueLifecycleRecord | null | undefined;
+  },
+  metadata: ReturnType<typeof statusMetadata>,
+): IssueWorkspaceSummary {
+  return {
+    workspaceKey: input.workspace?.workspaceKey ?? input.latestRun?.workspaceKey ?? input.lifecycle?.summaryPointers.workspaceKey ?? null,
+    path: input.workspace?.path ?? input.live?.workspacePath ?? input.latestRun?.workspacePath ?? input.lifecycle?.summaryPointers.workspacePath ?? null,
+    sourceKind: input.workspace?.sourceKind ?? null,
+    branchName: metadata.branchName,
+    gitBranchName: metadata.gitBranchName,
+    repoPath: metadata.repoPath,
+    baseRef: metadata.baseRef,
+  };
+}
+
+function buildIssuePullRequestSummary(metadata: ReturnType<typeof statusMetadata>): IssuePullRequestSummary {
+  return {
+    url: metadata.prUrl ?? null,
+    number: metadata.prNumber ?? null,
+    headSha: metadata.prHeadSha ?? null,
+    branch: metadata.prBranch ?? null,
+    ciStatus: metadata.ciStatus ?? null,
+    lastPushedAt: metadata.lastPushedAt ?? null,
+  };
+}
+
+function buildIssueLatestRunSummary(run: RunRecord | null | undefined): IssueLatestRunSummary {
+  return {
+    runId: run?.runId ?? null,
+    status: run?.status ?? null,
+    terminalReason: deriveRunTerminalReason(run ?? null),
+    error: run?.error ?? null,
+    completedAt: run?.completedAt ?? null,
+  };
+}
+
+function deriveRunTerminalReason(run: RunRecord | null): RunTerminalReason | null {
+  if (!run || run.status === "running") return null;
+  if (run.status === "succeeded") return "succeeded";
+  if (run.status === "cancelled") return run.cancellationSource === "stalled" ? "stalled" : "cancelled";
+  if (run.status === "failed") return "failed";
+  return null;
+}
+
+function defaultTrackerStateLists(): TrackerStateLists {
+  return { activeStates: [], handoffStates: [], reviewStates: [], blockedStates: [], terminalStates: [] };
+}
+
+function isStateNameIn(state: string, states: readonly string[]): boolean {
+  return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
 }
 
 function issueKeys(
