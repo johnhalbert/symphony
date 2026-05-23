@@ -41,10 +41,12 @@ export interface IssueStatusView {
   updatedAt: string | null;
 }
 
-export type IssueDetailsSource = "live" | "durable";
+export type IssueDetailsSource = "live" | "durable" | "tracker";
 export type IssueDetailsCompleteness = "full" | "partial";
 export type IssueStateClassification = "active" | "handoff" | "terminal" | "blocked" | "unknown";
 export type RunTerminalReason = "succeeded" | "failed" | "timed_out" | "stalled" | "cancelled";
+export type IssueBoardColumnId = "backlog" | "todo" | "progress" | "review" | "done" | "canceled";
+export type IssueBoardColumnMapping = Record<IssueBoardColumnId, string[]>;
 
 export interface TrackerStateLists {
   activeStates: readonly string[];

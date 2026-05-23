@@ -151,7 +151,9 @@ program
             host: config.server.host,
             port: config.server.port,
             openWorkspaceToken: resolveStatusMutationToken(config),
+            tracker,
             trackerStateLists: resolveTrackerStateLists(config),
+            issueBoardColumns: config.issueBoard.columns,
             staleThresholdMs: config.polling.intervalMs,
           });
 

@@ -59,6 +59,14 @@ Work on {{ issue.identifier }}.`,
       noCiAllowed: false,
       noCiEvidence: null,
     });
+    expect(config.issueBoard.columns).toEqual({
+      backlog: ["Backlog"],
+      todo: ["Todo"],
+      progress: ["In Progress"],
+      review: [],
+      done: ["Done", "Closed"],
+      canceled: ["Cancelled", "Canceled", "Duplicate"],
+    });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
   });
 
@@ -142,6 +150,57 @@ Work on {{ issue.identifier }}.`,
       noCiAllowed: false,
       noCiEvidence: null,
     });
+    expect(config.issueBoard.columns).toEqual({
+      backlog: ["Backlog"],
+      todo: ["Todo"],
+      progress: ["In Progress", "Blocked"],
+      review: ["In Review", "Review Passed"],
+      done: ["Done"],
+      canceled: [],
+    });
+  });
+
+  it("parses configurable issue board columns and rejects duplicate state mappings", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        issue_board: {
+          columns: {
+            backlog: ["Backlog"],
+            todo: ["Ready"],
+            progress: ["Doing"],
+            review: ["Reviewing"],
+            done: ["Shipped"],
+            canceled: ["Won't Do"],
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.issueBoard.columns).toEqual({
+      backlog: ["Backlog"],
+      todo: ["Ready"],
+      progress: ["Doing"],
+      review: ["Reviewing"],
+      done: ["Shipped"],
+      canceled: ["Won't Do"],
+    });
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          issue_board: {
+            columns: {
+              backlog: ["Todo"],
+            },
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("issue_board.columns must not map state Todo to both backlog and todo");
   });
 
   it("requires explicit no-CI evidence when no-CI is allowed", () => {

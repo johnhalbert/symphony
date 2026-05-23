@@ -8,12 +8,13 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "../src/core/persistence/McpExposureDiagnosticsStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
-import type { IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
+import type { Issue, IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { testConfig } from "./helpers.js";
+import { issue, testConfig } from "./helpers.js";
 
 describe("StatusServer durable API", () => {
   let root: string;
@@ -575,6 +576,238 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("serves a Linear-backed issue board enriched with Symphony state", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+    config.mergePolicy.sourceStates = ["Ready to Merge"];
+
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await runStore.upsertWorkspace({
+      workspaceKey: "TEST-1",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      path: path.join(config.workspace.root, "TEST-1"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-test-1",
+      sessionId: "session-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: path.join(config.workspace.root, "TEST-1"),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await lifecycleStore.ensureIssue(
+      { id: "issue-blocked", identifier: "TEST-BLOCKED" },
+      { phase: "blocked", blockedReason: "needs operator", summaryPointers: {} },
+    );
+    await lifecycleStore.ensureIssue(
+      { id: "issue-terminal", identifier: "TEST-ARCHIVED" },
+      { phase: "terminal", blockedReason: null, summaryPointers: {} },
+    );
+
+    const liveRunning = liveRunningFixture(config, "TEST-1", "In Progress");
+    liveRunning.issueId = "issue-1";
+    liveRunning.issueDetails = issueDetailsFixture({
+      id: "issue-1",
+      identifier: "TEST-1",
+      title: "Stale live title",
+      state: "In Progress",
+      url: "https://linear.app/acme/issue/TEST-1/stale-live",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const tracker = new FakeTracker([
+      issue({
+        id: "issue-todo",
+        identifier: "TEST-TODO",
+        title: "Todo with dependency",
+        state: "Todo",
+        blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
+      }),
+      issue({
+        id: "issue-progress",
+        identifier: "TEST-PROGRESS",
+        title: "Progress with dependency",
+        state: "In Progress",
+        blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
+      }),
+      issue({
+        id: "issue-1",
+        identifier: "TEST-1",
+        title: "Linear review title",
+        state: "In Review",
+        url: "https://linear.app/acme/issue/TEST-1/linear-review-title",
+        labels: ["dogfood-ready"],
+        blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
+        updatedAt: "2026-01-01T00:09:00.000Z",
+      }),
+      issue({
+        id: "issue-merge",
+        identifier: "TEST-MERGE",
+        title: "Ready to merge",
+        state: "Ready to Merge",
+      }),
+      issue({
+        id: "issue-done",
+        identifier: "TEST-DONE",
+        title: "Done issue",
+        state: "Done",
+      }),
+      issue({
+        id: "issue-canceled",
+        identifier: "TEST-CANCELED",
+        title: "Canceled issue",
+        state: "Canceled",
+      }),
+    ]);
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([liveRunning], { paused: ["TEST-BLOCKED"] }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      tracker,
+      trackerStateLists: testTrackerStateLists(),
+      issueBoardColumns: {
+        backlog: ["Backlog"],
+        todo: ["Todo"],
+        progress: ["In Progress", "Blocked"],
+        review: ["In Review", "Ready to Merge"],
+        done: ["Done"],
+        canceled: ["Canceled"],
+      },
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
+      const body = (await response.json()) as {
+        tracker: { fetchedStates: string[]; issueCount: number; cached: boolean };
+        counts: { total: number; trackerBacked: number; symphonyOnly: number; live: number; paused: number; blocked: number };
+        lanes: Array<{ id: string; issues: Array<{ issueIdentifier: string | null; origin: string; issueDetails: IssueDetailsEnvelope; live: unknown; paused: boolean }> }>;
+        issues: Array<{ issueIdentifier: string | null }>;
+      };
+
+      expect(response.status).toBe(200);
+      expect(tracker.requestedStates).toEqual(["Backlog", "Todo", "In Progress", "Blocked", "In Review", "Ready to Merge", "Done", "Canceled"]);
+      expect(tracker.fetchCount).toBe(1);
+      expect(body.tracker).toMatchObject({ issueCount: 6, cached: false });
+      expect(body.counts).toMatchObject({ total: 7, trackerBacked: 6, symphonyOnly: 1, live: 1, paused: 1, blocked: 3 });
+      expect(body.lanes.map((lane) => lane.id)).toEqual(["backlog", "todo", "progress", "review", "done", "canceled"]);
+      expect(body.issues.map((item) => item.issueIdentifier)).not.toContain("TEST-ARCHIVED");
+
+      const reviewCard = body.lanes.find((lane) => lane.id === "review")?.issues.find((item) => item.issueIdentifier === "TEST-1");
+      expect(reviewCard).toMatchObject({
+        origin: "tracker",
+        issueDetails: {
+          source: "tracker",
+          completeness: "full",
+          issue: {
+            title: "Linear review title",
+            state: "In Review",
+            url: "https://linear.app/acme/issue/TEST-1/linear-review-title",
+            labels: ["dogfood-ready"],
+          },
+          tracker: { classification: "handoff", stale: false },
+          workspace: { workspaceKey: "TEST-1", gitBranchName: "symphony/TEST-1" },
+          latestRun: { runId: "run-test-1", status: "running" },
+        },
+        live: { state: "In Progress", runId: "run-test-1" },
+      });
+      expect(reviewCard?.issueDetails.blockers).toMatchObject({ available: true, totalCount: 1, openCount: 1, blocked: true });
+
+      const todoCard = body.lanes.find((lane) => lane.id === "todo")?.issues.find((item) => item.issueIdentifier === "TEST-TODO");
+      const progressCard = body.lanes.find((lane) => lane.id === "progress")?.issues.find((item) => item.issueIdentifier === "TEST-PROGRESS");
+      expect(todoCard?.issueDetails.blockers).toMatchObject({ openCount: 1, blocked: true });
+      expect(progressCard?.issueDetails.blockers).toMatchObject({ openCount: 1, blocked: false });
+
+      const mergeCard = body.lanes.find((lane) => lane.id === "review")?.issues.find((item) => item.issueIdentifier === "TEST-MERGE");
+      expect(mergeCard?.issueDetails.issue.state).toBe("Ready to Merge");
+      expect(body.lanes.find((lane) => lane.id === "done")?.issues.map((item) => item.issueIdentifier)).toContain("TEST-DONE");
+      expect(body.lanes.find((lane) => lane.id === "canceled")?.issues.map((item) => item.issueIdentifier)).toContain("TEST-CANCELED");
+
+      const blockedCard = body.lanes.find((lane) => lane.id === "progress")?.issues.find((item) => item.issueIdentifier === "TEST-BLOCKED");
+      expect(blockedCard).toMatchObject({
+        origin: "symphony",
+        paused: true,
+        issueDetails: {
+          source: "durable",
+          blockers: { humanBlockedReason: "needs operator", blocked: true },
+        },
+      });
+
+      const cachedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
+      const cachedBody = (await cachedResponse.json()) as { tracker: { cached: boolean } };
+      expect(cachedResponse.status).toBe(200);
+      expect(cachedBody.tracker.cached).toBe(true);
+      expect(tracker.fetchCount).toBe(1);
+
+      const refreshResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board?refresh=1`);
+      const refreshBody = (await refreshResponse.json()) as { tracker: { cached: boolean } };
+      expect(refreshResponse.status).toBe(200);
+      expect(refreshBody.tracker.cached).toBe(false);
+      expect(tracker.fetchCount).toBe(2);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("fails the issue board clearly when no tracker is configured", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(503);
+      expect(body.error).toMatchObject({
+        code: "tracker_unavailable",
+        message: "Issue board requires a configured tracker client",
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves live liveness and cancellation state from the orchestrator snapshot", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
@@ -777,7 +1010,7 @@ describe("StatusServer durable API", () => {
         completeness: "full",
         issue: stateBody.running[0]?.issueDetails,
         tracker: { generatedAt: "2026-01-01T00:10:00.000Z", classification: "active", stale: true },
-        blockers: { available: true, totalCount: 1, openCount: 1, blocked: true },
+        blockers: { available: true, totalCount: 1, openCount: 1, blocked: false },
         latestRun: { runId: "run-1", status: "running", terminalReason: null },
         pullRequest: { url: null, number: null, headSha: null, branch: null, ciStatus: null, lastPushedAt: null },
         workspace: { workspaceKey: "TEST-1", sourceKind: null },
@@ -1530,6 +1763,29 @@ function testTrackerStateLists(): TrackerStateLists {
     blockedStates: ["Blocked"],
     terminalStates: ["Done", "Closed", "Cancelled", "Canceled", "Duplicate"],
   };
+}
+
+class FakeTracker implements TrackerClient {
+  requestedStates: string[] = [];
+  fetchCount = 0;
+
+  constructor(private readonly issues: Issue[]) {}
+
+  async fetchCandidateIssues(): Promise<Issue[]> {
+    return [];
+  }
+
+  async fetchIssuesByStates(stateNames: string[]): Promise<Issue[]> {
+    this.fetchCount += 1;
+    this.requestedStates = stateNames;
+    return this.issues.filter((item) =>
+      stateNames.some((state) => state.toLowerCase() === item.state.toLowerCase()),
+    );
+  }
+
+  async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
+    return this.issues.filter((item) => issueIds.includes(item.id));
+  }
 }
 
 function fakeOrchestrator(

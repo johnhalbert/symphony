@@ -4,6 +4,13 @@ import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { CursorWorkspaceOpener } from "../../cursor/src/CursorWorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
+import {
+  toIssueStatusView,
+  type AgentRunRole,
+  type Issue,
+  type IssueBoardColumnId,
+  type IssueBoardColumnMapping,
+} from "../core/types.js";
 import type {
   IssueCompletionReportRecord,
   IssueLifecycleRecord,
@@ -11,7 +18,14 @@ import type {
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
-import type { RunRecord, RunTranscriptStore, TranscriptEvent, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
+import {
+  compareRunChronology,
+  type RunRecord,
+  type RunTranscriptStore,
+  type TranscriptEvent,
+  type WorkspaceRecord,
+} from "../core/persistence/RunTranscriptStore.js";
+import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -35,12 +49,15 @@ export interface StatusServerOptions {
   host: string;
   port: number;
   openWorkspaceToken: string | null;
+  tracker?: TrackerClient;
   trackerStateLists: TrackerStateLists;
+  issueBoardColumns?: IssueBoardColumnMapping;
   staleThresholdMs: number;
 }
 
 export class StatusServer {
   private server: http.Server | null = null;
+  private issueBoardTrackerCache: IssueBoardTrackerCache | null = null;
 
   constructor(private readonly options: StatusServerOptions) {}
 
@@ -102,6 +119,28 @@ export class StatusServer {
           ),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/issue-board") {
+        const issueBoardColumns = this.options.issueBoardColumns ?? defaultIssueBoardColumns(this.options.trackerStateLists);
+        const trackerProjection = await this.fetchIssueBoardTrackerProjection(
+          issueBoardColumns,
+          url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true",
+        );
+        sendJson(
+          response,
+          200,
+          await buildIssueBoard(
+            this.options.orchestrator.snapshot(),
+            Boolean(this.options.openWorkspaceToken),
+            trackerProjection,
+            this.options.runStore,
+            this.options.lifecycleStore,
+            this.options.trackerStateLists,
+            issueBoardColumns,
+            this.options.staleThresholdMs,
+          ),
+        );
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
@@ -338,6 +377,8 @@ export class StatusServer {
       const status =
         error instanceof SymphonyError && error.code === "not_found"
           ? 404
+          : error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")
+            ? 503
           : error instanceof SymphonyError && error.code === "invalid_request"
             ? 401
             : 500;
@@ -356,6 +397,48 @@ export class StatusServer {
     const provided = request.headers["x-symphony-token"];
     if (provided !== expected) {
       throw new SymphonyError("invalid_request", "Missing or invalid open-workspace token");
+    }
+  }
+
+  private async fetchIssueBoardTrackerProjection(
+    columns: IssueBoardColumnMapping,
+    forceRefresh: boolean,
+  ): Promise<IssueBoardTrackerProjection> {
+    const tracker = this.options.tracker;
+    if (!tracker) {
+      throw new SymphonyError("tracker_unavailable", "Issue board requires a configured tracker client");
+    }
+
+    const fetchedStates = boardFetchStates(columns);
+    const cacheKey = fetchedStates.map((state) => state.toLowerCase()).join("\0");
+    const now = Date.now();
+    const cached = this.issueBoardTrackerCache;
+    if (
+      cached &&
+      !forceRefresh &&
+      cached.cacheKey === cacheKey &&
+      now - cached.fetchedAtMs <= this.options.staleThresholdMs
+    ) {
+      return { ...cached.projection, cached: true };
+    }
+
+    try {
+      const trackerIssues = await tracker.fetchIssuesByStates(fetchedStates);
+      const projection = {
+        fetchedStates,
+        trackerIssues,
+        fetchedAt: new Date(now).toISOString(),
+        cached: false,
+      };
+      this.issueBoardTrackerCache = {
+        cacheKey,
+        fetchedAtMs: now,
+        projection,
+      };
+      return projection;
+    } catch (error) {
+      if (error instanceof SymphonyError) throw error;
+      throw new SymphonyError("tracker_error", `Issue board tracker fetch failed: ${errorMessage(error)}`);
     }
   }
 }
@@ -418,6 +501,416 @@ interface PausedOperatorView extends OperatorAffordances {
   paused: true;
   controls: OperatorControls;
   issueDetails: IssueDetailsEnvelope;
+}
+
+interface IssueBoardTrackerProjection {
+  fetchedStates: string[];
+  trackerIssues: Issue[];
+  fetchedAt: string;
+  cached: boolean;
+}
+
+interface IssueBoardTrackerCache {
+  cacheKey: string;
+  fetchedAtMs: number;
+  projection: IssueBoardTrackerProjection;
+}
+
+interface IssueBoardCard {
+  key: string;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  origin: "tracker" | "symphony";
+  lane: IssueBoardColumnId;
+  issueDetails: IssueDetailsEnvelope;
+  paused: boolean;
+  live: { role: AgentRunRole; state: string; runId: string | null } | null;
+  operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>;
+  reviewLoop: ReturnType<typeof reviewLoopStatus>;
+  metadata: ReturnType<typeof statusMetadata>;
+  capabilities: {
+    detail: string | null;
+    runs: string | null;
+    humanRequired: OperatorAffordances["humanRequired"];
+    continuationSummary: OperatorAffordances["continuationSummary"];
+  };
+}
+
+interface IssueBoardLane {
+  id: IssueBoardColumnId;
+  title: string;
+  states: string[];
+  issues: IssueBoardCard[];
+}
+
+async function buildIssueBoard(
+  snapshot: RuntimeSnapshot,
+  mutationsConfigured: boolean,
+  trackerProjection: IssueBoardTrackerProjection,
+  runStore: RunTranscriptStore | undefined,
+  lifecycleStore: IssueLifecycleStore | undefined,
+  trackerStateLists: TrackerStateLists,
+  issueBoardColumns: IssueBoardColumnMapping,
+  staleThresholdMs: number,
+) {
+  const representedKeys = new Set<string>();
+  const cards: IssueBoardCard[] = [];
+  for (const issue of trackerProjection.trackerIssues) {
+    addBoardKeys(representedKeys, [issue.id, issue.identifier]);
+    cards.push(
+      await buildTrackerBoardCard({
+        issue,
+        snapshot,
+        mutationsConfigured,
+        runStore,
+        lifecycleStore,
+        trackerStateLists,
+        issueBoardColumns,
+        staleThresholdMs,
+      }),
+    );
+  }
+
+  const symphonyOnlyCards = await buildSymphonyOnlyBoardCards({
+    snapshot,
+    mutationsConfigured,
+    runStore,
+    lifecycleStore,
+    trackerStateLists,
+    issueBoardColumns,
+    staleThresholdMs,
+    representedKeys,
+  });
+  cards.push(...symphonyOnlyCards);
+
+  const lanes = boardLanes(issueBoardColumns).map((lane) => ({
+    ...lane,
+    issues: cards.filter((card) => card.lane === lane.id),
+  }));
+
+  return {
+    generatedAt: snapshot.generatedAt,
+    tracker: {
+      status: "ok" as const,
+      fetchedStates: trackerProjection.fetchedStates,
+      fetchedAt: trackerProjection.fetchedAt,
+      cached: trackerProjection.cached,
+      issueCount: trackerProjection.trackerIssues.length,
+      error: null,
+    },
+    lanes,
+    issues: cards,
+    counts: {
+      total: cards.length,
+      trackerBacked: cards.filter((card) => card.origin === "tracker").length,
+      symphonyOnly: cards.filter((card) => card.origin === "symphony").length,
+      live: cards.filter((card) => card.live !== null).length,
+      paused: cards.filter((card) => card.paused).length,
+      blocked: cards.filter((card) => card.issueDetails.blockers.blocked).length,
+    },
+  };
+}
+
+async function buildTrackerBoardCard(input: {
+  issue: Issue;
+  snapshot: RuntimeSnapshot;
+  mutationsConfigured: boolean;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  trackerStateLists: TrackerStateLists;
+  issueBoardColumns: IssueBoardColumnMapping;
+  staleThresholdMs: number;
+}): Promise<IssueBoardCard> {
+  const issueStatus = toIssueStatusView(input.issue);
+  const keys = [input.issue.id, input.issue.identifier];
+  const live = liveIssueByKeys(input.snapshot, keys);
+  const workspace = await workspaceByKeys(input.runStore, keys);
+  const latestRun = await latestRunByKeys(input.runStore, keys);
+  const lifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
+  const paused = isIssuePaused(input.snapshot, [
+    ...keys,
+    ...issueKeys(input.issue.identifier, { live, latestRun, lifecycle }),
+  ]);
+  const issueDetails = buildIssueDetailsEnvelope({
+    requestKey: input.issue.identifier,
+    generatedAt: input.snapshot.generatedAt,
+    trackerStateLists: input.trackerStateLists,
+    staleThresholdMs: input.staleThresholdMs,
+    live,
+    workspace,
+    latestRun,
+    summaryRun,
+    lifecycle,
+    trackerIssue: issueStatus,
+  });
+  return buildBoardCard({
+    key: input.issue.id,
+    origin: "tracker",
+    lane: classifyBoardLane(input.issue.state, lifecycle, live?.role ?? null, input.issueBoardColumns),
+    issueDetails,
+    live,
+    workspace,
+    latestRun,
+    lifecycle,
+    paused,
+    mutationsConfigured: input.mutationsConfigured,
+    runStore: input.runStore,
+    continuationSummaryAvailable: Boolean(input.lifecycleStore && input.runStore),
+  });
+}
+
+async function buildSymphonyOnlyBoardCards(input: {
+  snapshot: RuntimeSnapshot;
+  mutationsConfigured: boolean;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  trackerStateLists: TrackerStateLists;
+  issueBoardColumns: IssueBoardColumnMapping;
+  staleThresholdMs: number;
+  representedKeys: Set<string>;
+}): Promise<IssueBoardCard[]> {
+  const cards: IssueBoardCard[] = [];
+  const localKeys = new Set<string>();
+  const maybeAdd = async (requestKey: string, forcedLive: RunningRow | null = null) => {
+    if (hasBoardKey(input.representedKeys, [requestKey]) || hasBoardKey(localKeys, [requestKey])) return;
+    const keys = [requestKey];
+    const live = forcedLive ?? liveIssueByKeys(input.snapshot, keys);
+    const workspace = await workspaceByKeys(input.runStore, keys);
+    const latestRun = await latestRunByKeys(input.runStore, keys);
+    const lifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+    const isBlocked = isLifecycleBlocked(lifecycle);
+    const isPaused = isIssuePaused(input.snapshot, [
+      requestKey,
+      ...issueKeys(requestKey, { live, latestRun, lifecycle }),
+    ]);
+    if (!live && !isPaused && !isBlocked) return;
+    if (!live && !isPaused && lifecycle?.phase === "terminal") return;
+    const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
+    const issueDetails = buildIssueDetailsEnvelope({
+      requestKey,
+      generatedAt: input.snapshot.generatedAt,
+      trackerStateLists: input.trackerStateLists,
+      staleThresholdMs: input.staleThresholdMs,
+      live,
+      workspace,
+      latestRun,
+      summaryRun,
+      lifecycle,
+    });
+    const card = await buildBoardCard({
+      key: issueDetails.issue.id ?? issueDetails.issue.identifier ?? requestKey,
+      origin: "symphony",
+      lane: classifyBoardLane(live?.state ?? issueDetails.issue.state, lifecycle, live?.role ?? null, input.issueBoardColumns),
+      issueDetails,
+      live,
+      workspace,
+      latestRun,
+      lifecycle,
+      paused: isPaused,
+      mutationsConfigured: input.mutationsConfigured,
+      runStore: input.runStore,
+      continuationSummaryAvailable: Boolean(input.lifecycleStore && input.runStore),
+    });
+    addBoardKeys(localKeys, boardCardKeys(card));
+    cards.push(card);
+  };
+
+  for (const live of input.snapshot.running) {
+    await maybeAdd(live.issueIdentifier, live);
+  }
+  for (const pausedKey of input.snapshot.paused) {
+    await maybeAdd(pausedKey);
+  }
+  for (const lifecycle of (await input.lifecycleStore?.list()) ?? []) {
+    if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueIdentifier);
+  }
+  return cards;
+}
+
+async function buildBoardCard(input: {
+  key: string;
+  origin: "tracker" | "symphony";
+  lane: IssueBoardColumnId;
+  issueDetails: IssueDetailsEnvelope;
+  live: RunningRow | null;
+  workspace: WorkspaceRecord | null | undefined;
+  latestRun: RunRecord | null | undefined;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+  paused: boolean;
+  mutationsConfigured: boolean;
+  runStore: RunTranscriptStore | undefined;
+  continuationSummaryAvailable: boolean;
+}): Promise<IssueBoardCard> {
+  const issueKey = input.issueDetails.issue.identifier ?? input.issueDetails.issue.id ?? input.key;
+  const resolvedAgentId = input.live ? await resolveRunningAgentId(input.live, input.runStore) : null;
+  const operatorLiveness = await issueOperatorLiveness({
+    live: input.live,
+    latestRun: input.latestRun,
+    lifecycle: input.lifecycle,
+    paused: input.paused,
+    resolvedAgentId,
+    runStore: input.runStore,
+  });
+  const affordances = operatorAffordances({
+    issueKey,
+    lifecycle: input.lifecycle,
+    continuationSummaryAvailable: input.continuationSummaryAvailable,
+    mutationsRequireToken: input.mutationsConfigured,
+  });
+  return {
+    key: input.key,
+    issueId: input.issueDetails.issue.id,
+    issueIdentifier: input.issueDetails.issue.identifier,
+    origin: input.origin,
+    lane: input.lane,
+    issueDetails: input.issueDetails,
+    paused: input.paused,
+    live: input.live
+      ? {
+          role: input.live.role,
+          state: input.live.state,
+          runId: input.live.liveness.activeRunId ?? input.live.runId,
+        }
+      : null,
+    operatorLiveness,
+    reviewLoop: reviewLoopStatus({ live: input.live, latestRun: input.latestRun, lifecycle: input.lifecycle }),
+    metadata: statusMetadata({
+      live: input.live,
+      workspace: input.workspace,
+      latestRun: input.latestRun,
+      lifecycle: input.lifecycle,
+    }),
+    capabilities: {
+      detail: `/api/v1/issues/${encodeURIComponent(issueKey)}`,
+      runs: `/api/v1/issues/${encodeURIComponent(issueKey)}/runs`,
+      humanRequired: affordances.humanRequired,
+      continuationSummary: affordances.continuationSummary,
+    },
+  };
+}
+
+const ISSUE_BOARD_COLUMN_IDS: IssueBoardColumnId[] = ["backlog", "todo", "progress", "review", "done", "canceled"];
+
+function defaultIssueBoardColumns(stateLists: TrackerStateLists): IssueBoardColumnMapping {
+  return {
+    backlog: ["Backlog"],
+    todo: stateLists.activeStates.filter((state) => isStateNameIn(state, ["Todo"])),
+    progress: uniqueStateNames(
+      [...stateLists.activeStates, ...stateLists.blockedStates].filter(
+        (state) => !isStateNameIn(state, ["Todo", "Backlog"]),
+      ),
+    ),
+    review: uniqueStateNames([...stateLists.handoffStates, ...stateLists.reviewStates]),
+    done: stateLists.terminalStates.filter((state) => isStateNameIn(state, ["Done", "Closed"])),
+    canceled: stateLists.terminalStates.filter((state) => isStateNameIn(state, ["Cancelled", "Canceled", "Duplicate"])),
+  };
+}
+
+function boardFetchStates(columns: IssueBoardColumnMapping): string[] {
+  return uniqueStateNames(ISSUE_BOARD_COLUMN_IDS.flatMap((column) => columns[column]));
+}
+
+function boardLanes(columns: IssueBoardColumnMapping): Array<Omit<IssueBoardLane, "issues">> {
+  return ISSUE_BOARD_COLUMN_IDS.map((id) => ({
+    id,
+    title: boardColumnTitle(id),
+    states: uniqueStateNames(columns[id]),
+  }));
+}
+
+function boardColumnTitle(id: IssueBoardColumnId): string {
+  switch (id) {
+    case "backlog":
+      return "Backlog";
+    case "todo":
+      return "Todo";
+    case "progress":
+      return "In Progress";
+    case "review":
+      return "Review";
+    case "done":
+      return "Done";
+    case "canceled":
+      return "Canceled";
+  }
+}
+
+function classifyBoardLane(
+  state: string | null,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  role: AgentRunRole | null,
+  columns: IssueBoardColumnMapping,
+): IssueBoardColumnId {
+  if (state !== null) {
+    for (const column of ISSUE_BOARD_COLUMN_IDS) {
+      if (isStateNameIn(state, columns[column])) return column;
+    }
+  }
+  if (isLifecycleBlocked(lifecycle)) return "progress";
+  if (role === "reviewer") return "review";
+  if (role === "worker") return "progress";
+  if (lifecycle?.phase === "terminal") return "done";
+  return "backlog";
+}
+
+function liveIssueByKeys(snapshot: RuntimeSnapshot, keys: string[]): RunningRow | null {
+  return snapshot.running.find((row) => keys.includes(row.issueId) || keys.includes(row.issueIdentifier)) ?? null;
+}
+
+async function workspaceByKeys(runStore: RunTranscriptStore | undefined, keys: string[]): Promise<WorkspaceRecord | null> {
+  if (!runStore) return null;
+  for (const key of keys) {
+    const workspace = await runStore.findWorkspace(key);
+    if (workspace) return workspace;
+  }
+  return null;
+}
+
+async function latestRunByKeys(runStore: RunTranscriptStore | undefined, keys: string[]): Promise<RunRecord | null> {
+  if (!runStore) return null;
+  const byRunId = new Map<string, RunRecord>();
+  for (const key of keys) {
+    for (const run of await runStore.listRunsForIssue(key)) {
+      byRunId.set(run.runId, run);
+    }
+  }
+  return [...byRunId.values()].sort(compareRunChronology).at(-1) ?? null;
+}
+
+async function lifecycleByKeys(lifecycleStore: IssueLifecycleStore | undefined, keys: string[]): Promise<IssueLifecycleRecord | null> {
+  if (!lifecycleStore) return null;
+  for (const key of keys) {
+    const lifecycle = await lifecycleStore.get(key);
+    if (lifecycle) return lifecycle;
+  }
+  return null;
+}
+
+function addBoardKeys(target: Set<string>, keys: Array<string | null | undefined>): void {
+  for (const key of keys) {
+    if (key) target.add(key);
+  }
+}
+
+function hasBoardKey(target: Set<string>, keys: Array<string | null | undefined>): boolean {
+  return keys.some((key) => key !== null && key !== undefined && target.has(key));
+}
+
+function boardCardKeys(card: IssueBoardCard): string[] {
+  return [card.key, card.issueId, card.issueIdentifier].filter((value): value is string => value !== null && value !== undefined);
+}
+
+function uniqueStateNames(states: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const state of states) {
+    const key = state.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(state);
+  }
+  return result;
 }
 
 async function renderDashboard(
@@ -1105,15 +1598,17 @@ function buildIssueDetailsEnvelope(input: {
   summaryRun: RunRecord | null | undefined;
   lifecycle: IssueLifecycleRecord | null | undefined;
   workspace: WorkspaceRecord | null | undefined;
+  trackerIssue?: IssueStatusView;
 }): IssueDetailsEnvelope {
   const metadata = statusMetadata(input);
-  if (input.live) {
+  const issue = input.trackerIssue ?? input.live?.issueDetails ?? null;
+  if (issue) {
     return {
-      source: "live",
+      source: input.trackerIssue ? "tracker" : "live",
       completeness: "full",
-      issue: input.live.issueDetails,
-      tracker: buildIssueTrackerMetadata(input.live.issueDetails, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
-      blockers: buildIssueBlockerSummary(input.live.issueDetails.blockedBy, input.trackerStateLists.terminalStates, input.lifecycle),
+      issue,
+      tracker: buildIssueTrackerMetadata(issue, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
+      blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists, input.lifecycle, issue.state),
       workspace: buildIssueWorkspaceSummary(input, metadata),
       pullRequest: buildIssuePullRequestSummary(metadata),
       latestRun: buildIssueLatestRunSummary(input.summaryRun),
@@ -1125,7 +1620,7 @@ function buildIssueDetailsEnvelope(input: {
     completeness: "partial",
     issue: durableIssueStatusView(input),
     tracker: buildIssueTrackerMetadata(null, null, input.trackerStateLists, input.staleThresholdMs),
-    blockers: buildIssueBlockerSummary(null, input.trackerStateLists.terminalStates, input.lifecycle),
+    blockers: buildIssueBlockerSummary(null, input.trackerStateLists, input.lifecycle, null),
     workspace: buildIssueWorkspaceSummary(input, metadata),
     pullRequest: buildIssuePullRequestSummary(metadata),
     latestRun: buildIssueLatestRunSummary(input.summaryRun),
@@ -1202,17 +1697,23 @@ function classifyIssueState(state: string | null, stateLists: TrackerStateLists)
 
 function buildIssueBlockerSummary(
   blockedBy: IssueBlockerRef[] | null,
-  terminalStates: readonly string[],
+  stateLists: TrackerStateLists,
   lifecycle: IssueLifecycleRecord | null | undefined,
+  issueState: string | null,
 ) {
-  const open = (blockedBy ?? []).filter((blocker) => blocker.state === null || !isStateNameIn(blocker.state, terminalStates));
+  const open = (blockedBy ?? []).filter((blocker) => blocker.state === null || !isStateNameIn(blocker.state, stateLists.terminalStates));
   const lifecycleBlocked = isLifecycleBlocked(lifecycle);
+  const stateBlocked = issueState !== null && isStateNameIn(issueState, stateLists.blockedStates);
+  const dispatchBlocked =
+    issueState !== null &&
+    open.length > 0 &&
+    (issueState.toLowerCase() === "todo" || isStateNameIn(issueState, stateLists.reviewStates));
   return {
     available: blockedBy !== null,
     totalCount: blockedBy?.length ?? 0,
     openCount: open.length,
     open,
-    blocked: open.length > 0 || lifecycleBlocked,
+    blocked: lifecycleBlocked || stateBlocked || dispatchBlocked,
     humanBlockedReason: lifecycleBlocked ? (lifecycle?.blockedReason ?? null) : null,
   };
 }
