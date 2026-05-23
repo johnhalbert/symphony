@@ -4,6 +4,74 @@ import { SymphonyError } from "../src/core/errors.js";
 import { resolveLinearClientConfig } from "../src/integrations/linear/LinearCredentialResolver.js";
 
 describe("Linear credential resolver", () => {
+  it("binds tracker reads to the worker linear.tracker profile", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LEGACY_LINEAR_TOKEN", project_slug: "TEST" },
+        credential_profiles: {
+          profiles: {
+            "linear-worker-read": {
+              value: "$LINEAR_WORKER_READ_TOKEN",
+              capabilities: ["linear.tracker"],
+            },
+          },
+          roles: {
+            worker: {
+              "linear.tracker": "linear-worker-read",
+            },
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LEGACY_LINEAR_TOKEN: "legacy-linear-secret",
+        LINEAR_WORKER_READ_TOKEN: "linear-worker-read-secret",
+      },
+    );
+
+    const resolved = resolveLinearClientConfig(config, "linear.tracker");
+
+    expect(resolved.role).toBe("worker");
+    expect(resolved.credential).toMatchObject({
+      role: "worker",
+      capability: "linear.tracker",
+      source: "profile",
+      profileName: "linear-worker-read",
+    });
+    expect(resolved.tracker.apiKey).toBe("linear-worker-read-secret");
+  });
+
+  it("rejects wrong-role-only tracker assignments before legacy fallback", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        credential_profiles: {
+          profiles: {
+            wrong: {
+              value: "$LINEAR_WRONG_TOKEN",
+              capabilities: ["linear.tracker"],
+            },
+          },
+          roles: {
+            service: {
+              "linear.tracker": "wrong",
+            },
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "legacy-linear-secret",
+        LINEAR_WRONG_TOKEN: "wrong-role-secret",
+      },
+    );
+
+    expect(() => resolveLinearClientConfig(config, "linear.tracker")).toThrow(SymphonyError);
+    expect(() => resolveLinearClientConfig(config, "linear.tracker")).toThrow(
+      "credential_profiles.roles.worker.linear.tracker",
+    );
+  });
+
   it("binds writeback to the service linear.writeback profile", () => {
     const config = parseServiceConfig(
       {

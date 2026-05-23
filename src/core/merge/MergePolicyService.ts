@@ -1,4 +1,8 @@
-import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
+import {
+  createGitHubPullRequestClientForCapability,
+  resolveGitHubClientConfig,
+} from "../../integrations/github/GitHubCredentialResolver.js";
+import { resolveLinearClientConfig } from "../../integrations/linear/LinearCredentialResolver.js";
 import type {
   PullRequestCheckResult,
   PullRequestDetails,
@@ -55,11 +59,11 @@ export class MergePolicyService {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service-owned writeback");
     }
 
-    const serviceLinear = config.credentialProfiles.resolveForRole("service", "linear.writeback");
+    const serviceLinear = resolveLinearClientConfig(config, "linear.writeback").credential;
     if (!serviceLinear) {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service linear.writeback credentials");
     }
-    const serviceMerge = config.credentialProfiles.resolveForRole("service", "github.merge");
+    const serviceMerge = resolveGitHubClientConfig(config, "github.merge").credential;
     if (!serviceMerge) {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service github.merge credentials");
     }
@@ -196,11 +200,13 @@ export class MergePolicyService {
       return { requiredChecks: [], passedChecks: [], noCiEvidence };
     }
     const checks = await github.getRequiredCheckResults({ headSha, requiredChecks });
-    const failed = checks.filter((check) => check.status !== "success");
+    const failed = requiredChecks.filter(
+      (requiredCheck) => !checks.some((check) => check.name === requiredCheck && check.status === "success"),
+    );
     if (failed.length > 0) {
-      throw new SymphonyError("invalid_request", `Required checks are not passing: ${failed.map((check) => check.name).join(", ")}`);
+      throw new SymphonyError("invalid_request", `Required checks are not passing: ${failed.join(", ")}`);
     }
-    return { requiredChecks, passedChecks: checks.map((check) => check.name), noCiEvidence: null };
+    return { requiredChecks, passedChecks: requiredChecks, noCiEvidence: null };
   }
 }
 

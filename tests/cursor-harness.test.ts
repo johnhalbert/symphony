@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
+import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { mapCursorDelta, mapCursorMessage } from "../cursor/src/CursorEventMapper.js";
@@ -116,6 +117,39 @@ describe("Cursor event mapping", () => {
     expect(mcpServers.symphony?.args).toEqual(
       expect.arrayContaining(["completion-report-mcp", "--workflow", config.workflowPath]),
     );
+  });
+
+  it("uses profile-backed cursor.runtime credentials by default for worker and reviewer runs", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        workspace: { root: "/tmp/symphony-cursor-harness" },
+        credential_profiles: {
+          profiles: {
+            workerCursor: { value: "$WORKER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
+            reviewerCursor: { value: "$REVIEWER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
+          },
+          roles: {
+            worker: { "cursor.runtime": "workerCursor" },
+            reviewer: { "cursor.runtime": "reviewerCursor" },
+          },
+        },
+      },
+      "/tmp/symphony-cursor-harness/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        CURSOR_API_KEY: "decoy-cursor-secret",
+        WORKER_CURSOR_TOKEN: "worker-cursor-secret",
+        REVIEWER_CURSOR_TOKEN: "reviewer-cursor-secret",
+      },
+    );
+
+    expect(cursorAgentCreateOptions(agentContext(config, "worker"))).toMatchObject({
+      apiKey: "worker-cursor-secret",
+    });
+    expect(cursorAgentCreateOptions(agentContext(config, "reviewer"))).toMatchObject({
+      apiKey: "reviewer-cursor-secret",
+    });
   });
 
   it("wires the Symphony review verdict MCP server into reviewer Cursor runs", () => {
@@ -243,3 +277,23 @@ describe("Cursor event mapping", () => {
     expect(mcpServers.symphony_review_feedback?.args).toEqual(expect.arrayContaining(["review-feedback-mcp"]));
   });
 });
+
+function agentContext(config: ReturnType<typeof parseServiceConfig>, role: "worker" | "reviewer"): AgentRunContext {
+  return {
+    issue: issue({ state: role === "reviewer" ? "In Review" : "In Progress", branchName: "symphony/TEST-1" }),
+    role,
+    attempt: null,
+    workspace: {
+      path: "/tmp/workspace",
+      workspaceKey: "TEST-1",
+      createdNow: false,
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    },
+    config,
+    turnNumber: 1,
+    abortSignal: new AbortController().signal,
+    logger: new StructuredLogger(() => undefined),
+  };
+}

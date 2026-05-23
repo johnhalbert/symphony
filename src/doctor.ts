@@ -3,11 +3,13 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { LinearTrackerClient, type LinearWorkflowTeamStates } from "./integrations/linear/LinearTrackerClient.js";
+import type { LinearWorkflowTeamStates } from "./integrations/linear/LinearTrackerClient.js";
+import { createLinearTrackerClientForCapability } from "./integrations/linear/LinearCredentialResolver.js";
 import { createGitHubPullRequestClientForCapability } from "./integrations/github/GitHubCredentialResolver.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { errorMessage } from "./core/errors.js";
 import type { ServiceConfig } from "./core/config/Config.js";
+import { resolveCursorRuntimeApiKey } from "./app/RuntimeDependencies.js";
 import { COMPLETION_REPORT_TOOL_NAME } from "./core/harness/CompletionReportMcpServer.js";
 import { runSubprocessMcpToolExposureProbe } from "./core/harness/McpToolExposureProbe.js";
 import { REVIEW_FEEDBACK_TOOL_NAME } from "./core/harness/ReviewFeedbackMcpServer.js";
@@ -89,13 +91,9 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
     checks.push(await githubPublicationDoctorCheck(config));
     checks.push(await githubReviewFeedbackDoctorCheck(config));
 
-    if (process.env.CURSOR_API_KEY) {
-      checks.push({ id: "env.cursor", status: "ok", message: "CURSOR_API_KEY is set" });
-    } else {
-      checks.push({ id: "env.cursor", status: "warn", message: "CURSOR_API_KEY is not set; SDK smoke cannot run" });
-    }
+    checks.push(cursorRuntimeDoctorCheck(config));
 
-    const tracker = new LinearTrackerClient(config.tracker);
+    const tracker = createLinearTrackerClientForCapability(config, "linear.tracker");
     try {
       const candidates = await tracker.fetchCandidateIssues();
       checks.push({
@@ -221,7 +219,9 @@ async function linearStateAvailabilityCheck(
     };
   }
 
-  const lister = options.linearStateLister ?? ((input) => new LinearTrackerClient(input.config.tracker).fetchWorkflowStatesByTeam());
+  const lister =
+    options.linearStateLister ??
+    ((input) => createLinearTrackerClientForCapability(input.config, "linear.tracker").fetchWorkflowStatesByTeam());
   try {
     const teamStates = await lister({ config });
     if (teamStates.length === 0) {
@@ -429,6 +429,22 @@ export async function githubReviewFeedbackDoctorCheck(config: ServiceConfig): Pr
     };
   } catch (error) {
     return { id: "github.review_feedback_write", status: "error", message: `github.review_feedback_write: ${errorMessage(error)}` };
+  }
+}
+
+function cursorRuntimeDoctorCheck(config: ServiceConfig): DoctorCheck {
+  try {
+    const missing = (["worker", "reviewer"] as const).filter((role) => !resolveCursorRuntimeApiKey(config, role));
+    if (missing.length === 0) {
+      return { id: "env.cursor", status: "ok", message: "cursor.runtime credentials are available for worker and reviewer" };
+    }
+    return {
+      id: "env.cursor",
+      status: "warn",
+      message: `cursor.runtime credentials are missing for ${missing.join(", ")}; SDK smoke cannot run`,
+    };
+  } catch (error) {
+    return { id: "env.cursor", status: "error", message: `cursor.runtime: ${errorMessage(error)}` };
   }
 }
 

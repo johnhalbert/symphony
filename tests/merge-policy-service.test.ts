@@ -11,6 +11,7 @@ import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { TrackerTransitionInput, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import type { Issue } from "../src/core/types.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
+import type { PullRequestCheckResult } from "../src/integrations/github/GitHubPullRequestClient.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { issue } from "./helpers.js";
 
@@ -301,9 +302,223 @@ describe("MergePolicyService", () => {
     expect(client.mergeInput).toBeNull();
     expect(currentIssue.state).toBe("Ready to Merge");
   });
+
+  it("requires every configured required check to be returned successful by the merge client", async () => {
+    const config = mergeConfig({ requiredChecks: ["test", "typecheck"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({
+      checkResults: [{ name: "test", status: "success", conclusion: "success", url: "https://ci.test/test" }],
+    });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/typecheck/);
+    expect(client.mergeInput).toBeNull();
+    expect(currentIssue.state).toBe("Ready to Merge");
+  });
+
+  it("rejects a returned required check with a non-success status", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({
+      checkResults: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/Required checks are not passing: test/);
+    expect(client.mergeInput).toBeNull();
+    expect(writer.transitions).toEqual([]);
+    expect(currentIssue.state).toBe("Ready to Merge");
+  });
+
+  it("rejects a successful Done writeback when the tracker still reports a non-Done state", async () => {
+    const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient();
+    const writer = new MemoryWriter(currentIssue, "verified");
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/Done writeback could not be verified/);
+    expect(client.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-1" });
+    expect(writer.transitions).toEqual([
+      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+    ]);
+    expect(currentIssue.state).toBe("Ready to Merge");
+  });
+
+  it("enforces service-owned github.merge capability when a merge client is injected", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      credentialProfiles: {
+        profiles: {
+          merge: { value: "$GITHUB_MERGE_PROFILE_TOKEN", capabilities: ["github.merge"] },
+        },
+        roles: {
+          worker: {
+            "github.merge": "merge",
+          },
+        },
+      },
+      env: { GITHUB_MERGE_PROFILE_TOKEN: "merge-profile-secret" },
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient();
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/github\.merge is owned by service/);
+    expect(client.mergeInput).toBeNull();
+    expect(writer.transitions).toEqual([]);
+  });
+
+  it("enforces service-owned linear.writeback capability when writeback is injected", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      credentialProfiles: {
+        profiles: {
+          writeback: { value: "$LINEAR_WRITEBACK_PROFILE_TOKEN", capabilities: ["linear.writeback"] },
+        },
+        roles: {
+          worker: {
+            "linear.writeback": "writeback",
+          },
+        },
+      },
+      env: { LINEAR_WRITEBACK_PROFILE_TOKEN: "linear-writeback-profile-secret" },
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient();
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/linear\.writeback is owned by service/);
+    expect(client.mergeInput).toBeNull();
+    expect(writer.transitions).toEqual([]);
+  });
+
+  it("records the explicit service github.merge profile in merge metadata", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      credentialProfiles: {
+        profiles: {
+          merge: { value: "$SERVICE_GITHUB_MERGE_TOKEN", capabilities: ["github.merge"] },
+        },
+        roles: {
+          service: {
+            "github.merge": "merge",
+          },
+        },
+      },
+      env: { SERVICE_GITHUB_MERGE_TOKEN: "service-merge-secret" },
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient(),
+    });
+
+    await service.reconcileIssue(currentIssue);
+    expect((await lifecycleStore.get(currentIssue.id))?.merge?.mergedBy).toMatchObject({
+      capability: "github.merge",
+      profile: "merge",
+    });
+  });
 });
 
-function mergeConfig(input: { requiredChecks?: string[]; noCiEvidence?: string; writebackMode?: "live" | "dry_run" }) {
+function mergeConfig(input: {
+  requiredChecks?: string[];
+  noCiEvidence?: string;
+  writebackMode?: "live" | "dry_run";
+  credentialProfiles?: Record<string, unknown>;
+  env?: NodeJS.ProcessEnv;
+}) {
   return parseServiceConfig(
     {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -322,9 +537,10 @@ function mergeConfig(input: { requiredChecks?: string[]; noCiEvidence?: string; 
             : { allowed: true, evidence: input.noCiEvidence },
       },
       github: { owner: "acme", repo: "symphony" },
+      ...(input.credentialProfiles === undefined ? {} : { credential_profiles: input.credentialProfiles }),
     },
     path.join(root, "WORKFLOW.md"),
-    { LINEAR_API_KEY: "linear-secret", GITHUB_TOKEN: "github-secret" },
+    { LINEAR_API_KEY: "linear-secret", GITHUB_TOKEN: "github-secret", ...input.env },
   );
 }
 
@@ -461,6 +677,7 @@ class FakeMergeClient implements MergePolicyGitHubClient {
       mergedAt?: string | null;
       mergedBy?: string | null;
       serviceLogin?: string | null;
+      checkResults?: PullRequestCheckResult[];
     } = {},
   ) {}
 
@@ -480,7 +697,11 @@ class FakeMergeClient implements MergePolicyGitHubClient {
   }
 
   async getRequiredCheckResults() {
-    return [{ name: "test", status: "success" as const, conclusion: "success", url: "https://ci.test/test" }];
+    return (
+      this.input.checkResults ?? [
+        { name: "test", status: "success" as const, conclusion: "success", url: "https://ci.test/test" },
+      ]
+    );
   }
 
   async mergePullRequest(input: Parameters<MergePolicyGitHubClient["mergePullRequest"]>[0]) {

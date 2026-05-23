@@ -11,6 +11,7 @@ import {
 } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
+import { resolveCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
 import { mapCursorDelta, mapCursorMessage } from "./CursorEventMapper.js";
 
 export interface CursorHarnessOptions {
@@ -160,7 +161,7 @@ export class CursorHarness implements AgentHarness {
 
     const cliPath = currentSymphonyCliPath();
     await writeInitialRoleMcpContexts(ctx);
-    const agentOptions = cursorAgentCreateOptions(ctx, process.env.CURSOR_API_KEY, {
+    const agentOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
       mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
     });
     const latestRun = ctx.role === "worker" ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker" }) : null;
@@ -190,7 +191,7 @@ function flush(events: AgentEvent[]): AgentEvent[] {
 
 export function cursorAgentCreateOptions(
   ctx: AgentRunContext,
-  apiKey = process.env.CURSOR_API_KEY,
+  apiKey: string | null | undefined = resolveCursorRuntimeApiKey(ctx.config, ctx.role),
   options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
 ): Parameters<typeof Agent.create>[0] {
   return {

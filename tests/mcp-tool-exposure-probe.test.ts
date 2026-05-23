@@ -17,7 +17,7 @@ import {
   type SdkRoleRunResult,
   type SdkToolDiagnostics,
 } from "../src/core/harness/McpToolExposureProbe.js";
-import type { CursorSettingSource } from "../src/core/config/Config.js";
+import { parseServiceConfig, type CursorSettingSource } from "../src/core/config/Config.js";
 import { testConfig } from "./helpers.js";
 
 describe("MCP tool exposure probe helpers", () => {
@@ -340,8 +340,19 @@ describe("MCP tool exposure probe helpers", () => {
       const { runSdkMcpToolExposureProbe: runProbeWithMockedSdk } = await import(
         "../src/core/harness/McpToolExposureProbe.js"
       );
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: { root: path.join(root, "workspaces") },
+        },
+        path.join(root, "WORKFLOW.md"),
+        {
+          LINEAR_API_KEY: "linear-secret",
+          CURSOR_API_KEY: "cursor_test_key_for_send_failure",
+        },
+      );
       await expect(
-        runProbeWithMockedSdk(testConfig(path.join(root, "workspaces")), {
+        runProbeWithMockedSdk(config, {
           cliPath: "/repo/src/cli.ts",
           roles: ["worker"],
           enabled: true,
@@ -371,6 +382,70 @@ describe("MCP tool exposure probe helpers", () => {
       expect(dispose).toHaveBeenCalledTimes(1);
     } finally {
       vi.unstubAllEnvs();
+      vi.doUnmock("@cursor/sdk");
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses role-resolved cursor.runtime profiles for live SDK probe startup", async () => {
+    vi.resetModules();
+    const apiKeys: Array<string | undefined> = [];
+    const dispose = vi.fn(async () => undefined);
+    const send = vi.fn(async () => {
+      throw new Error("send failed after create");
+    });
+    vi.doMock("@cursor/sdk", () => ({
+      Agent: {
+        create: vi.fn(async (options: { apiKey?: string }) => {
+          apiKeys.push(options.apiKey);
+          return {
+            agentId: `agent-${apiKeys.length}`,
+            send,
+            [Symbol.asyncDispose]: dispose,
+          };
+        }),
+      },
+    }));
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-mcp-profile-cursor-"));
+    try {
+      const { runSdkMcpToolExposureProbe: runProbeWithMockedSdk } = await import(
+        "../src/core/harness/McpToolExposureProbe.js"
+      );
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: { root: path.join(root, "workspaces") },
+          credential_profiles: {
+            profiles: {
+              workerCursor: { value: "$WORKER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
+              reviewerCursor: { value: "$REVIEWER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
+            },
+            roles: {
+              worker: { "cursor.runtime": "workerCursor" },
+              reviewer: { "cursor.runtime": "reviewerCursor" },
+            },
+          },
+        },
+        path.join(root, "WORKFLOW.md"),
+        {
+          LINEAR_API_KEY: "linear-secret",
+          CURSOR_API_KEY: "decoy-cursor-secret",
+          WORKER_CURSOR_TOKEN: "worker-cursor-secret",
+          REVIEWER_CURSOR_TOKEN: "reviewer-cursor-secret",
+        },
+      );
+
+      await runProbeWithMockedSdk(config, {
+        cliPath: "/repo/src/cli.ts",
+        roles: ["worker", "reviewer"],
+        enabled: true,
+        timeoutMs: 45_000,
+      });
+
+      expect(apiKeys).toEqual(["worker-cursor-secret", "reviewer-cursor-secret"]);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(dispose).toHaveBeenCalledTimes(2);
+    } finally {
       vi.doUnmock("@cursor/sdk");
       await rm(root, { recursive: true, force: true });
     }
