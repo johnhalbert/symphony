@@ -20,6 +20,10 @@ export interface PullRequestMetadata {
 
 export interface PullRequestDetails extends PullRequestMetadata {
   state: string | null;
+  merged: boolean | null;
+  mergeCommitSha: string | null;
+  mergedAt: string | null;
+  mergedBy: string | null;
 }
 
 export interface PullRequestCheckResult {
@@ -133,6 +137,10 @@ interface GitHubPullRequestNode {
   html_url?: unknown;
   number?: unknown;
   state?: unknown;
+  merged?: unknown;
+  merge_commit_sha?: unknown;
+  merged_at?: unknown;
+  merged_by?: GitHubUserNode | null;
   updated_at?: unknown;
   head?: {
     ref?: unknown;
@@ -402,7 +410,7 @@ export class GitHubPullRequestClient {
       merged: true,
       mergeCommitSha: sha,
       mergedAt: new Date().toISOString(),
-      mergedBy: await this.authenticatedLogin(),
+      mergedBy: await this.getAuthenticatedLogin(),
     };
   }
 
@@ -683,7 +691,7 @@ export class GitHubPullRequestClient {
     return pullRequest;
   }
 
-  private async authenticatedLogin(): Promise<string | null> {
+  async getAuthenticatedLogin(): Promise<string | null> {
     const response = await this.fetchImpl(new URL("user", normalizedApiBaseUrl(this.config.apiBaseUrl)), {
       method: "GET",
       headers: requestHeaders(this.config.token ?? ""),
@@ -807,6 +815,10 @@ function normalizePullRequestDetails(node: GitHubPullRequestNode): PullRequestDe
   return {
     ...metadata,
     state: asNullableString(node.state),
+    merged: typeof node.merged === "boolean" ? node.merged : null,
+    mergeCommitSha: asNullableString(node.merge_commit_sha),
+    mergedAt: asNullableString(node.merged_at),
+    mergedBy: asNullableString(node.merged_by?.login),
   };
 }
 

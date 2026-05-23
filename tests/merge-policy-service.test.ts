@@ -99,6 +99,31 @@ describe("MergePolicyService", () => {
     expect(client.mergeInput).toBeNull();
   });
 
+  it("requires live writeback mode before gated merge", async () => {
+    const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test.", writebackMode: "dry_run" });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient();
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/service-owned writeback/);
+    expect(client.mergeInput).toBeNull();
+  });
+
   it("requires service-recorded APPROVE feedback from the reviewer run", async () => {
     const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
@@ -170,14 +195,120 @@ describe("MergePolicyService", () => {
     expect(client.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-1" });
     expect(currentIssue.state).toBe("Ready to Merge");
   });
+
+  it("retries a skipped merge Done writeback on later already-merged reconciliation", async () => {
+    const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient();
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const firstService = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(store, new MemoryWriter(currentIssue, "skipped"), new StructuredLogger(() => undefined), 60_000),
+      client,
+    });
+
+    await expect(firstService.reconcileIssue(currentIssue)).rejects.toThrow(/Done writeback did not succeed/);
+    expect((await lifecycleStore.get(currentIssue.id))?.merge?.mergeCommitSha).toBe("merge-sha-1");
+
+    const writer = new MemoryWriter(currentIssue);
+    const secondService = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 60_000),
+      client,
+    });
+
+    const result = await secondService.reconcileIssue(currentIssue);
+
+    expect(result.status).toBe("already_merged");
+    expect(client.mergeCalls).toBe(1);
+    expect(currentIssue.state).toBe("Done");
+    expect(writer.transitions).toEqual([
+      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+    ]);
+  });
+
+  it("backfills a service-merged PR and transitions Done when lifecycle merge metadata is missing", async () => {
+    const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({
+      state: "closed",
+      merged: true,
+      mergeCommitSha: "merge-sha-recovered",
+      mergedAt: "2026-01-01T00:05:00.000Z",
+      mergedBy: "symphony-bot",
+    });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("already_merged");
+    expect(client.mergeInput).toBeNull();
+    expect(currentIssue.state).toBe("Done");
+    expect(lifecycle?.merge).toMatchObject({
+      mergeCommitSha: "merge-sha-recovered",
+      mergedAt: "2026-01-01T00:05:00.000Z",
+      mergedBy: { login: "symphony-bot", capability: "github.merge" },
+    });
+  });
+
+  it("rejects already-merged PR backfill when GitHub does not attribute the merge to service credentials", async () => {
+    const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({ state: "closed", merged: true, mergedBy: "human" });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/service-merged/);
+    expect(client.mergeInput).toBeNull();
+    expect(currentIssue.state).toBe("Ready to Merge");
+  });
 });
 
-function mergeConfig(input: { requiredChecks?: string[]; noCiEvidence?: string }) {
+function mergeConfig(input: { requiredChecks?: string[]; noCiEvidence?: string; writebackMode?: "live" | "dry_run" }) {
   return parseServiceConfig(
     {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
       workspace: { root },
-      writeback: { enabled: true, mode: "live" },
+      writeback: { enabled: true, mode: input.writebackMode ?? "live" },
       review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge" },
       merge_policy: {
         mode: "gated",
@@ -319,8 +450,19 @@ function tracker(currentIssue: Issue): TrackerClient {
 
 class FakeMergeClient implements MergePolicyGitHubClient {
   mergeInput: Parameters<MergePolicyGitHubClient["mergePullRequest"]>[0] | null = null;
+  mergeCalls = 0;
 
-  constructor(private readonly input: { headSha?: string } = {}) {}
+  constructor(
+    private readonly input: {
+      headSha?: string;
+      state?: string;
+      merged?: boolean;
+      mergeCommitSha?: string | null;
+      mergedAt?: string | null;
+      mergedBy?: string | null;
+      serviceLogin?: string | null;
+    } = {},
+  ) {}
 
   async getPullRequest() {
     return {
@@ -329,7 +471,11 @@ class FakeMergeClient implements MergePolicyGitHubClient {
       headBranch: "symphony/TEST-1",
       headSha: this.input.headSha ?? "head-sha-1",
       lastPushedAt: "2026-01-01T00:00:00Z",
-      state: "open",
+      state: this.input.state ?? "open",
+      merged: this.input.merged ?? false,
+      mergeCommitSha: this.input.mergeCommitSha ?? "merge-sha-1",
+      mergedAt: this.input.mergedAt ?? "2026-01-01T00:00:02.000Z",
+      mergedBy: this.input.mergedBy ?? "symphony-bot",
     };
   }
 
@@ -339,12 +485,17 @@ class FakeMergeClient implements MergePolicyGitHubClient {
 
   async mergePullRequest(input: Parameters<MergePolicyGitHubClient["mergePullRequest"]>[0]) {
     this.mergeInput = input;
+    this.mergeCalls += 1;
     return {
       merged: true,
       mergeCommitSha: "merge-sha-1",
       mergedAt: "2026-01-01T00:00:02.000Z",
       mergedBy: "symphony-bot",
     };
+  }
+
+  async getAuthenticatedLogin() {
+    return this.input.serviceLogin ?? "symphony-bot";
   }
 }
 

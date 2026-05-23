@@ -6,6 +6,7 @@ import type {
   PullRequestMergeResult,
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
+import type { ResolvedCredential } from "../config/CredentialProfiles.js";
 import { SymphonyError } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type {
@@ -26,6 +27,7 @@ export interface MergePolicyGitHubClient {
   getPullRequest(input: { pullRequestNumber: number }): Promise<PullRequestDetails>;
   getRequiredCheckResults(input: { headSha: string; requiredChecks: string[] }): Promise<PullRequestCheckResult[]>;
   mergePullRequest(input: PullRequestMergeInput): Promise<PullRequestMergeResult>;
+  getAuthenticatedLogin(): Promise<string | null>;
 }
 
 export type MergePolicyResult =
@@ -49,7 +51,7 @@ export class MergePolicyService {
   async reconcileIssue(issue: Issue): Promise<MergePolicyResult> {
     const config = this.options.config;
     if (config.mergePolicy.mode !== "gated") return { status: "skipped", reason: "merge policy is not gated" };
-    if (!config.writeback.enabled || !this.options.writeback) {
+    if (!config.writeback.enabled || config.writeback.mode !== "live" || !this.options.writeback) {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service-owned writeback");
     }
 
@@ -57,18 +59,29 @@ export class MergePolicyService {
     if (!serviceLinear) {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service linear.writeback credentials");
     }
+    const serviceMerge = config.credentialProfiles.resolveForRole("service", "github.merge");
+    if (!serviceMerge) {
+      throw new SymphonyError("invalid_request", "Gated merge policy requires service github.merge credentials");
+    }
 
     const latestIssue = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? issue;
-    const sourceState = config.mergePolicy.sourceStates.find((state) => statesEqual(state, latestIssue.state)) ?? null;
-    if (sourceState === null) return { status: "skipped", reason: `issue is not in a merge source state: ${latestIssue.state}` };
-
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
     if (!lifecycle) throw new SymphonyError("invalid_request", "Gated merge policy requires an issue lifecycle record");
 
     if (lifecycle.merge?.mergeCommitSha) {
-      await this.ensureDoneTransition(latestIssue, lifecycle.merge, sourceState);
+      if (statesEqual(latestIssue.state, config.mergePolicy.doneState)) {
+        return { status: "already_merged", merge: lifecycle.merge };
+      }
+      const recoverySourceState = this.mergeSourceState(latestIssue);
+      if (recoverySourceState === null) {
+        throw new SymphonyError("invalid_request", "Gated merge Done recovery requires issue in Done or a merge source state");
+      }
+      await this.ensureDoneTransition(latestIssue, lifecycle.merge, recoverySourceState);
       return { status: "already_merged", merge: lifecycle.merge };
     }
+
+    const sourceState = this.mergeSourceState(latestIssue);
+    if (sourceState === null) return { status: "skipped", reason: `issue is not in a merge source state: ${latestIssue.state}` };
 
     const report = latestCompletionReport(lifecycle);
     const verdict = latestReviewVerdict(lifecycle);
@@ -80,70 +93,46 @@ export class MergePolicyService {
     const headSha = requireValue(pullRequest.headSha, "Completion report pull request head SHA is required for gated merge");
     const github = this.options.client ?? createGitHubPullRequestClientForCapability(config, "github.merge");
     const livePullRequest = await github.getPullRequest({ pullRequestNumber: requireNumber(pullRequest.number) });
-    validateLivePullRequest(livePullRequest, pullRequest, headSha);
+    validateLivePullRequestMetadata(livePullRequest, pullRequest, headSha);
 
     const checkStatus = await this.validateChecks(github, headSha);
-    const serviceMerge = config.credentialProfiles.resolveForRole("service", "github.merge");
-    if (!serviceMerge) {
-      throw new SymphonyError("invalid_request", "Gated merge policy requires service github.merge credentials");
+    const mergeId = `merge:${latestIssue.id}:${headSha}`;
+    const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
+    let status: "merged" | "already_merged" = "merged";
+    let mergeResult: PullRequestMergeResult;
+    if (isOpenPullRequest(livePullRequest)) {
+      mergeResult = await github.mergePullRequest({
+        pullRequestNumber: requireNumber(pullRequest.number),
+        expectedHeadSha: headSha,
+        method: config.mergePolicy.mergeMethod,
+      });
+    } else {
+      const serviceLogin = await github.getAuthenticatedLogin();
+      mergeResult = recoverAlreadyMergedPullRequest(livePullRequest, serviceLogin);
+      status = "already_merged";
     }
 
-    const mergeResult = await github.mergePullRequest({
-      pullRequestNumber: requireNumber(pullRequest.number),
-      expectedHeadSha: headSha,
-      method: config.mergePolicy.mergeMethod,
-    });
-    const mergeId = `merge:${latestIssue.id}:${headSha}`;
-    const doneTransition = planMergeCompletedWritebacks(
-      {
-        issue: latestIssue,
-        mergeId,
-        fromState: sourceState,
-        doneState: config.mergePolicy.doneState,
-      },
-      config,
-    )[0];
-    if (!doneTransition) throw new SymphonyError("invalid_request", "Gated merge policy could not plan Done writeback");
-
-    const merge: IssueMergeMetadata = {
-      id: mergeId,
-      pullRequest,
-      headSha,
-      mergeCommitSha: mergeResult.mergeCommitSha,
-      mergedAt: mergeResult.mergedAt,
-      mergedBy: {
-        login: mergeResult.mergedBy,
-        profile: serviceMerge.profileName,
-        capability: "github.merge",
-      },
-      checkStatus,
-      mergeOperationKey: `github-merge:${latestIssue.id}:${requireNumber(pullRequest.number)}:${headSha}`,
-      doneTransitionOperationKey: doneTransition.idempotencyKey,
-    };
+    const merge = buildMergeMetadata(latestIssue, pullRequest, headSha, mergeResult, serviceMerge, checkStatus, doneTransition.idempotencyKey);
 
     const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge });
     const storedMerge = updated.merge ?? merge;
-    await this.requireDoneWritebackSucceeded(latestIssue, doneTransition);
-    return { status: "merged", merge: storedMerge };
+    await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
+    return { status, merge: storedMerge };
   }
 
   private async ensureDoneTransition(issue: Issue, merge: IssueMergeMetadata, sourceState: string): Promise<void> {
-    const operation = planMergeCompletedWritebacks(
-      {
-        issue,
-        mergeId: merge.id,
-        fromState: sourceState,
-        doneState: this.options.config.mergePolicy.doneState,
-      },
-      this.options.config,
-    )[0];
-    if (operation) await this.requireDoneWritebackSucceeded(issue, operation);
+    if (statesEqual(issue.state, this.options.config.mergePolicy.doneState)) return;
+    const operation = this.planDoneTransition(issue, merge.id, sourceState);
+    if (operation.idempotencyKey !== merge.doneTransitionOperationKey) {
+      throw new SymphonyError("invalid_request", "Gated merge Done writeback key does not match lifecycle merge metadata");
+    }
+    await this.requireDoneWritebackSucceeded(issue, operation);
   }
 
   private async requireDoneWritebackSucceeded(issue: Issue, operation: Parameters<WritebackProcessor["enqueueAndProcess"]>[0]): Promise<void> {
     const writeback = this.options.writeback;
     if (!writeback) throw new SymphonyError("invalid_request", "Gated merge policy requires service-owned writeback");
-    const result: WritebackOperation = await writeback.enqueueAndProcess(operation);
+    const result: WritebackOperation = await writeback.enqueueAndProcess(operation, { retrySkipped: true });
     if (result.status !== "succeeded") {
       throw new SymphonyError(
         "invalid_request",
@@ -154,6 +143,24 @@ export class MergePolicyService {
     if (!latest || !statesEqual(latest.state, this.options.config.mergePolicy.doneState)) {
       throw new SymphonyError("invalid_request", "Gated merge Done writeback could not be verified");
     }
+  }
+
+  private planDoneTransition(issue: Issue, mergeId: string, sourceState: string): Parameters<WritebackProcessor["enqueueAndProcess"]>[0] {
+    const operation = planMergeCompletedWritebacks(
+      {
+        issue,
+        mergeId,
+        fromState: sourceState,
+        doneState: this.options.config.mergePolicy.doneState,
+      },
+      this.options.config,
+    )[0];
+    if (!operation) throw new SymphonyError("invalid_request", "Gated merge policy could not plan Done writeback");
+    return operation;
+  }
+
+  private mergeSourceState(issue: Issue): string | null {
+    return this.options.config.mergePolicy.sourceStates.find((state) => statesEqual(state, issue.state)) ?? null;
   }
 
   private validateLifecycle(
@@ -249,18 +256,66 @@ function validateApprovalFeedback(
   }
 }
 
-function validateLivePullRequest(
+function validateLivePullRequestMetadata(
   livePullRequest: PullRequestDetails,
   expected: CompletionReportPullRequestRef,
   expectedHeadSha: string,
 ): void {
-  if (livePullRequest.state !== null && livePullRequest.state.toLowerCase() !== "open") {
-    throw new SymphonyError("invalid_request", "Gated merge requires an open pull request");
-  }
   requireMatches("live PR number", livePullRequest.number, expected.number);
   requireMatches("live PR URL", livePullRequest.url, expected.url);
   requireMatches("live PR branch", livePullRequest.headBranch, expected.branch);
   requireMatches("live PR head SHA", livePullRequest.headSha, expectedHeadSha);
+}
+
+function isOpenPullRequest(livePullRequest: PullRequestDetails): boolean {
+  return livePullRequest.state === null || livePullRequest.state.toLowerCase() === "open";
+}
+
+function recoverAlreadyMergedPullRequest(
+  livePullRequest: PullRequestDetails,
+  serviceLogin: string | null,
+): PullRequestMergeResult {
+  if (livePullRequest.merged !== true) {
+    throw new SymphonyError("invalid_request", "Gated merge recovery requires an already-merged pull request");
+  }
+  if (serviceLogin === null || livePullRequest.mergedBy !== serviceLogin) {
+    throw new SymphonyError("invalid_request", "Gated merge recovery requires a service-merged pull request");
+  }
+  if (!livePullRequest.mergeCommitSha || !livePullRequest.mergedAt) {
+    throw new SymphonyError("invalid_request", "Gated merge recovery requires GitHub merge metadata");
+  }
+  return {
+    merged: true,
+    mergeCommitSha: livePullRequest.mergeCommitSha,
+    mergedAt: livePullRequest.mergedAt,
+    mergedBy: livePullRequest.mergedBy,
+  };
+}
+
+function buildMergeMetadata(
+  issue: Issue,
+  pullRequest: CompletionReportPullRequestRef,
+  headSha: string,
+  mergeResult: PullRequestMergeResult,
+  serviceMerge: ResolvedCredential,
+  checkStatus: IssueMergeMetadata["checkStatus"],
+  doneTransitionOperationKey: string,
+): IssueMergeMetadata {
+  return {
+    id: `merge:${issue.id}:${headSha}`,
+    pullRequest,
+    headSha,
+    mergeCommitSha: mergeResult.mergeCommitSha,
+    mergedAt: mergeResult.mergedAt,
+    mergedBy: {
+      login: mergeResult.mergedBy,
+      profile: serviceMerge.profileName,
+      capability: "github.merge",
+    },
+    checkStatus,
+    mergeOperationKey: `github-merge:${issue.id}:${requireNumber(pullRequest.number)}:${headSha}`,
+    doneTransitionOperationKey,
+  };
 }
 
 function requirePullRequest(report: IssueCompletionReportRecord): CompletionReportPullRequestRef {

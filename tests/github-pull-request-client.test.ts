@@ -575,6 +575,37 @@ describe("GitHubPullRequestClient", () => {
     );
   });
 
+  it("inspects pull request merge metadata for recovery", async () => {
+    const client = new GitHubPullRequestClient(config(), async () =>
+      jsonResponse({
+        html_url: "https://github.com/octo-org/symphony/pull/42",
+        number: 42,
+        state: "closed",
+        merged: true,
+        merge_commit_sha: "merge-sha-1",
+        merged_at: "2026-01-01T00:00:02Z",
+        merged_by: { login: "symphony-bot" },
+        head: {
+          ref: "symphony/TEST-1",
+          sha: "head-sha-1",
+          repo: { pushed_at: "2026-01-01T00:00:00Z" },
+        },
+      }),
+    );
+
+    await expect(client.getPullRequest({ pullRequestNumber: 42 })).resolves.toMatchObject({
+      url: "https://github.com/octo-org/symphony/pull/42",
+      number: 42,
+      state: "closed",
+      merged: true,
+      mergeCommitSha: "merge-sha-1",
+      mergedAt: "2026-01-01T00:00:02Z",
+      mergedBy: "symphony-bot",
+      headBranch: "symphony/TEST-1",
+      headSha: "head-sha-1",
+    });
+  });
+
   it("merges pull requests with the expected head SHA guard", async () => {
     const calls: Array<{ pathname: string; body: unknown }> = [];
     const client = new GitHubPullRequestClient(config(), async (input, init) => {
