@@ -4,7 +4,7 @@ import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerWriter } from "../tracker/TrackerWriter.js";
 import { errorMessage } from "../errors.js";
 
-export type WritebackStatus = "pending" | "in_flight" | "succeeded" | "retrying" | "dead_letter";
+export type WritebackStatus = "pending" | "in_flight" | "succeeded" | "skipped" | "retrying" | "dead_letter";
 
 export type WritebackOperation =
   | {
@@ -77,6 +77,10 @@ export class FileWritebackOutboxStore {
     return this.update(record, { status: "succeeded", lastError: null });
   }
 
+  async markSkipped(record: WritebackOperation, message: string): Promise<WritebackOperation> {
+    return this.update(record, { status: "skipped", lastError: message });
+  }
+
   async markRetry(record: WritebackOperation, error: string, nextAttemptAt: string): Promise<WritebackOperation> {
     return this.update(record, {
       status: "retrying",
@@ -141,8 +145,12 @@ export class WritebackProcessor {
   async processDue(): Promise<void> {
     for (const record of await this.store.claimDue()) {
       try {
-        await this.execute(record);
-        await this.store.markSucceeded(record);
+        const result = await this.execute(record);
+        if (result.status === "applied" || result.status === "verified") {
+          await this.store.markSucceeded(record);
+        } else {
+          await this.store.markSkipped(record, result.message ?? `Writeback ${result.status}`);
+        }
       } catch (error) {
         const message = errorMessage(error);
         const nextAttemptAt = new Date(Date.now() + computeWritebackBackoffMs(record.attempt + 1, this.maxBackoffMs)).toISOString();
@@ -157,17 +165,16 @@ export class WritebackProcessor {
     }
   }
 
-  private async execute(record: WritebackOperation): Promise<void> {
+  private async execute(record: WritebackOperation) {
     if (record.kind === "transition") {
-      await this.writer.transitionIssueState({
+      return this.writer.transitionIssueState({
         issueId: record.issueId,
         toState: record.payload.toState,
         ...(record.payload.fromStates === undefined ? {} : { fromStates: record.payload.fromStates }),
         ...(record.payload.reason === undefined ? {} : { reason: record.payload.reason }),
       });
-      return;
     }
-    await this.writer.createIssueComment({
+    return this.writer.createIssueComment({
       issueId: record.issueId,
       body: record.payload.body,
       dedupeKey: record.payload.dedupeKey,

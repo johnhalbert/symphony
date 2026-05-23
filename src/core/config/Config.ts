@@ -535,15 +535,20 @@ function normalizeMergePolicy(raw: RawWorkflowConfig, reviewPassState: string | 
       "merge_policy.no_ci.evidence is required when merge_policy.no_ci.allowed is true",
     );
   }
+  const requiredChecks = normalizeRequiredChecks(rawPolicy?.required_checks ?? []);
   return {
     mode,
     sourceStates: rawPolicy?.source_states ?? (reviewPassState === null ? [] : [reviewPassState]),
     doneState: rawPolicy?.done_state ?? "Done",
     mergeMethod: rawPolicy?.merge_method ?? "merge",
-    requiredChecks: rawPolicy?.required_checks ?? [],
+    requiredChecks,
     noCiAllowed: rawPolicy?.no_ci?.allowed ?? false,
     noCiEvidence,
   };
+}
+
+function normalizeRequiredChecks(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))];
 }
 
 function validateStateBuckets(input: {

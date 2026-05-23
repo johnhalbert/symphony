@@ -458,6 +458,60 @@ describe("LinearTrackerClient", () => {
     expect(requests[1]).toMatchObject({ variables: { id: "issue-1", stateId: "progress" } });
   });
 
+  it("verifies already-target transitions without mutating Linear", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: unknown[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return jsonResponse({
+        data: {
+          issue: {
+            id: "issue-1",
+            identifier: "T-1",
+            state: { id: "done", name: "Done" },
+            team: { states: { nodes: [{ id: "done", name: "Done" }] } },
+            comments: { nodes: [] },
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.transitionIssueState({
+      issueId: "issue-1",
+      fromStates: ["Ready to Merge"],
+      toState: "Done",
+    });
+
+    expect(result.status).toBe("verified");
+    expect(requests).toHaveLength(1);
+  });
+
+  it("skips transitions outside allowed source states", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        data: {
+          issue: {
+            id: "issue-1",
+            identifier: "T-1",
+            state: { id: "review", name: "In Review" },
+            team: { states: { nodes: [{ id: "done", name: "Done" }] } },
+            comments: { nodes: [] },
+          },
+        },
+      });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.transitionIssueState({
+      issueId: "issue-1",
+      fromStates: ["Ready to Merge"],
+      toState: "Done",
+    });
+
+    expect(result.status).toBe("skipped");
+  });
+
   it("deduplicates comments with hidden writeback markers", async () => {
     const config = testConfig("/tmp/symphony");
     const fetchImpl: typeof fetch = async () =>
@@ -480,7 +534,7 @@ describe("LinearTrackerClient", () => {
       dedupeKey: "run-1:run-started",
     });
 
-    expect(result.status).toBe("skipped");
+    expect(result.status).toBe("verified");
   });
 });
 

@@ -20,7 +20,7 @@ import type { RunRecord, RunTranscriptStore } from "../persistence/RunTranscript
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { Issue } from "../types.js";
 import { planMergeCompletedWritebacks } from "../writeback/TransitionPolicy.js";
-import type { WritebackProcessor } from "../writeback/WritebackOutbox.js";
+import type { WritebackOperation, WritebackProcessor } from "../writeback/WritebackOutbox.js";
 
 export interface MergePolicyGitHubClient {
   getPullRequest(input: { pullRequestNumber: number }): Promise<PullRequestDetails>;
@@ -123,7 +123,7 @@ export class MergePolicyService {
 
     const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge });
     const storedMerge = updated.merge ?? merge;
-    await this.options.writeback.enqueueAndProcess(doneTransition);
+    await this.requireDoneWritebackSucceeded(latestIssue, doneTransition);
     return { status: "merged", merge: storedMerge };
   }
 
@@ -137,7 +137,23 @@ export class MergePolicyService {
       },
       this.options.config,
     )[0];
-    if (operation) await this.options.writeback?.enqueueAndProcess(operation);
+    if (operation) await this.requireDoneWritebackSucceeded(issue, operation);
+  }
+
+  private async requireDoneWritebackSucceeded(issue: Issue, operation: Parameters<WritebackProcessor["enqueueAndProcess"]>[0]): Promise<void> {
+    const writeback = this.options.writeback;
+    if (!writeback) throw new SymphonyError("invalid_request", "Gated merge policy requires service-owned writeback");
+    const result: WritebackOperation = await writeback.enqueueAndProcess(operation);
+    if (result.status !== "succeeded") {
+      throw new SymphonyError(
+        "invalid_request",
+        `Gated merge Done writeback did not succeed: ${result.status}${result.lastError ? ` (${result.lastError})` : ""}`,
+      );
+    }
+    const latest = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? null;
+    if (!latest || !statesEqual(latest.state, this.options.config.mergePolicy.doneState)) {
+      throw new SymphonyError("invalid_request", "Gated merge Done writeback could not be verified");
+    }
   }
 
   private validateLifecycle(

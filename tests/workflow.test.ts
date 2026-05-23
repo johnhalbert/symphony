@@ -160,6 +160,38 @@ Work on {{ issue.identifier }}.`,
     ).toThrow(SymphonyError);
   });
 
+  it("normalizes merge policy required checks before gating", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        merge_policy: {
+          mode: "gated",
+          required_checks: [" test ", "test", " ", "typecheck"],
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.mergePolicy.requiredChecks).toEqual(["test", "typecheck"]);
+  });
+
+  it("treats blank-only required checks as no configured checks", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        merge_policy: {
+          mode: "gated",
+          required_checks: [" ", "\t"],
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.mergePolicy.requiredChecks).toEqual([]);
+  });
+
   it("rejects handoff states that overlap active or terminal states", () => {
     expect(() =>
       parseServiceConfig(

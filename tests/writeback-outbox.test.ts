@@ -40,15 +40,65 @@ describe("FileWritebackOutboxStore", () => {
     expect(records[0]?.status).toBe("succeeded");
     expect(writer.transitions).toHaveLength(1);
   });
+
+  it("marks verified writeback results as succeeded", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter({ transitionStatus: "verified" });
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+
+    const result = await processor.enqueueAndProcess({
+      idempotencyKey: "transition:issue-1:done",
+      kind: "transition",
+      issueId: "issue-1",
+      payload: { fromStates: ["Ready to Merge"], toState: "Done" },
+    });
+
+    expect(result.status).toBe("succeeded");
+  });
+
+  it("does not mark skipped writeback results as succeeded", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter({ transitionStatus: "skipped" });
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+
+    const result = await processor.enqueueAndProcess({
+      idempotencyKey: "transition:issue-1:done",
+      kind: "transition",
+      issueId: "issue-1",
+      payload: { fromStates: ["Ready to Merge"], toState: "Done" },
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.lastError).toBe("fake skipped");
+  });
+
+  it("does not mark dry-run writeback results as succeeded", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter({ transitionStatus: "dry_run" });
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+
+    const result = await processor.enqueueAndProcess({
+      idempotencyKey: "transition:issue-1:done",
+      kind: "transition",
+      issueId: "issue-1",
+      payload: { fromStates: ["Ready to Merge"], toState: "Done" },
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.lastError).toBe("Writeback dry_run");
+  });
 });
 
 class FakeWriter implements TrackerWriter {
   readonly transitions: TrackerTransitionInput[] = [];
   readonly comments: TrackerCommentInput[] = [];
 
+  constructor(private readonly options: { transitionStatus?: TrackerWriteResult["status"] } = {}) {}
+
   async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
     this.transitions.push(input);
-    return { status: "applied" };
+    const status = this.options.transitionStatus ?? "applied";
+    return status === "skipped" ? { status, message: "fake skipped" } : { status };
   }
 
   async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {

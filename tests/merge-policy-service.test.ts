@@ -31,7 +31,7 @@ describe("MergePolicyService", () => {
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await seedLifecycle(lifecycleStore, runStore, currentIssue);
-    const writer = new MemoryWriter();
+    const writer = new MemoryWriter(currentIssue);
     const client = new FakeMergeClient();
     const service = new MergePolicyService({
       config,
@@ -56,6 +56,7 @@ describe("MergePolicyService", () => {
       expectedHeadSha: "head-sha-1",
       method: "squash",
     });
+    expect(currentIssue.state).toBe("Done");
     expect(writer.transitions).toEqual([
       { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
     ]);
@@ -142,6 +143,32 @@ describe("MergePolicyService", () => {
     });
 
     await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/configured checks or explicit no-CI/);
+  });
+
+  it("does not return merged when Done writeback is skipped", async () => {
+    const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient();
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue, "skipped"),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/Done writeback did not succeed/);
+    expect(client.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-1" });
+    expect(currentIssue.state).toBe("Ready to Merge");
   });
 });
 
@@ -324,9 +351,17 @@ class FakeMergeClient implements MergePolicyGitHubClient {
 class MemoryWriter implements TrackerWriter {
   readonly transitions: TrackerTransitionInput[] = [];
 
+  constructor(
+    private readonly currentIssue?: Issue,
+    private readonly transitionStatus: "applied" | "verified" | "skipped" = "applied",
+  ) {}
+
   async transitionIssueState(input: TrackerTransitionInput) {
     this.transitions.push(input);
-    return { status: "applied" as const };
+    if (this.transitionStatus === "applied" && this.currentIssue) this.currentIssue.state = input.toState;
+    return this.transitionStatus === "skipped"
+      ? { status: "skipped" as const, message: "source state mismatch" }
+      : { status: this.transitionStatus };
   }
 
   async createIssueComment() {
