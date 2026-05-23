@@ -69,6 +69,7 @@ export class StatusServer {
         sendJson(response, 200, {
           ...snapshot,
           operatorView: operatorSnapshotView(snapshot, Boolean(this.options.openWorkspaceToken)),
+          operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
       }
@@ -127,18 +128,23 @@ export class StatusServer {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
         const snapshot = this.options.orchestrator.snapshot();
         const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
+        const lifecycle = await this.options.lifecycleStore?.get(issueId);
         sendJson(response, 200, {
           issue: issueId,
           runs: runs.map((run) => ({
             ...run,
-            livenessSummary: runLivenessSummary(run, snapshot),
+            operatorLiveness: runOperatorLiveness(run, snapshot, lifecycle, runs),
+            livenessSummary: runLivenessSummary(run, snapshot, lifecycle, runs),
           })),
+          issueBlocked: blockedIssueView(lifecycle),
           enrichment: {
-            level: "summary_only",
+            level: "operator_liveness_with_timeline",
             detailEndpoint: "/api/v1/runs/{runId}",
             transcriptEndpoint: "/api/v1/runs/{runId}/transcript",
-            timelineIncluded: false,
+            timelineIncluded: true,
+            operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
           },
+          operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
       }
@@ -177,7 +183,7 @@ export class StatusServer {
         const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
         sendJson(response, 200, {
           issue: issueId,
-          live: live ? { ...live, operatorLiveness: runningOperatorLiveness(live, paused) } : null,
+          live: live ? { ...live, operatorLiveness } : null,
           workspace,
           latestRun,
           lifecycle,
@@ -193,9 +199,21 @@ export class StatusServer {
             pause: controls.pause,
             resume: controls.resume,
             cancel: controls.cancel,
+            humanRequired: {
+              active: isLifecycleBlocked(lifecycle),
+              reason: lifecycle?.blockedReason ?? null,
+              continuationSummaryRecommended: isLifecycleBlocked(lifecycle),
+            },
+            continuationSummary: {
+              available: Boolean(this.options.lifecycleStore && this.options.runStore),
+              method: "POST",
+              path: `/api/v1/issues/${encodeURIComponent(issueId)}/continuation-summary`,
+              requiresToken: controls.mutationsRequireToken,
+            },
             mutationsRequireToken: controls.mutationsRequireToken,
             mutationHeader: "X-Symphony-Token",
           },
+          operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
       }
@@ -216,7 +234,12 @@ export class StatusServer {
         if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
         sendJson(response, 200, {
           ...run,
-          operatorLiveness: runOperatorLiveness(run, this.options.orchestrator.snapshot()),
+          operatorLiveness: runOperatorLiveness(
+            run,
+            this.options.orchestrator.snapshot(),
+            (await this.options.lifecycleStore?.get(run.issueId)) ?? null,
+          ),
+          operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
       }
@@ -286,6 +309,23 @@ function sendHtml(response: ServerResponse, body: string): void {
 type RuntimeSnapshot = ReturnType<Orchestrator["snapshot"]>;
 type RunningRow = RuntimeSnapshot["running"][number];
 type OperatorLivenessStatus = "running" | "possibly_stalled" | "cancelling" | "cancelled" | "blocked_human_required";
+
+const OPERATOR_LIVENESS_CONTRACT = {
+  version: "eng-44-v1",
+  supportedStatuses: ["running", "possibly_stalled", "cancelling", "cancelled", "blocked_human_required"],
+  deferred: {
+    cancelFailed: {
+      tracked: false,
+      reason: "no_orchestrator_or_run_store_signal_distinguishes_cancel_failure_from_prolonged_cancelling",
+      followUp: "orchestrator_terminal_cancel_outcome",
+    },
+    linearAuditComments: {
+      tracked: false,
+      reason: "writeback_status_does_not_persist_linear_comment_urls",
+      followUp: "writeback_result_url_persistence",
+    },
+  },
+} as const;
 
 interface OperatorControls {
   pause: boolean;
@@ -380,6 +420,7 @@ function operatorSnapshotView(snapshot: RuntimeSnapshot, mutationsConfigured: bo
   return {
     generatedAt: snapshot.generatedAt,
     mutationsRequireToken: mutationsConfigured,
+    operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
     running: snapshot.running.map((row) => {
       const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
       const paused = isIssuePaused(snapshot, keys);
@@ -406,8 +447,8 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
     status,
     rawStatus: row.liveness.status,
     tracking: "live",
-    cancelFailed: "not_tracked",
-    linearAuditComments: "not_tracked",
+    cancelFailed: OPERATOR_LIVENESS_CONTRACT.deferred.cancelFailed,
+    linearAuditComments: OPERATOR_LIVENESS_CONTRACT.deferred.linearAuditComments,
     runId: row.runId,
     activeRunId: row.liveness.activeRunId,
     agentId,
@@ -455,11 +496,19 @@ function issueOperatorLiveness(input: {
   return null;
 }
 
-function runOperatorLiveness(run: RunRecord, snapshot: RuntimeSnapshot) {
+function runOperatorLiveness(
+  run: RunRecord,
+  snapshot: RuntimeSnapshot,
+  lifecycle: IssueLifecycleRecord | null = null,
+  issueRuns: RunRecord[] = [],
+) {
   const live = findLiveRun(snapshot, run.runId);
   if (live) {
     const keys = issueKeys(run.issueIdentifier, { live, latestRun: run, lifecycle: live.lifecycle });
     return runningOperatorLiveness(live, isIssuePaused(snapshot, keys), live.lifecycle, run.agentId);
+  }
+  if (isLatestRunForBlockedLifecycle(run, lifecycle, issueRuns)) {
+    return terminalOperatorLiveness("blocked_human_required", run, lifecycle, false);
   }
   if (run.status === "cancelled") {
     return terminalOperatorLiveness("cancelled", run, null, false);
@@ -467,7 +516,12 @@ function runOperatorLiveness(run: RunRecord, snapshot: RuntimeSnapshot) {
   return null;
 }
 
-function runLivenessSummary(run: RunRecord, snapshot: RuntimeSnapshot) {
+function runLivenessSummary(
+  run: RunRecord,
+  snapshot: RuntimeSnapshot,
+  lifecycle: IssueLifecycleRecord | null = null,
+  issueRuns: RunRecord[] = [],
+) {
   const live = findLiveRun(snapshot, run.runId);
   if (live) {
     const keys = issueKeys(run.issueIdentifier, { live, latestRun: run, lifecycle: live.lifecycle });
@@ -476,6 +530,9 @@ function runLivenessSummary(run: RunRecord, snapshot: RuntimeSnapshot) {
       status: liveOperatorStatus(live, live.lifecycle),
       paused: isIssuePaused(snapshot, keys),
     };
+  }
+  if (isLatestRunForBlockedLifecycle(run, lifecycle, issueRuns)) {
+    return { tracking: "terminal", status: "blocked_human_required" as const, paused: false };
   }
   if (run.status === "cancelled") return { tracking: "terminal", status: "cancelled" as const, paused: false };
   if (run.status === "running") return { tracking: "orphaned", status: null, paused: false };
@@ -492,8 +549,8 @@ function terminalOperatorLiveness(
     status,
     rawStatus: null,
     tracking: "terminal",
-    cancelFailed: "not_tracked",
-    linearAuditComments: "not_tracked",
+    cancelFailed: OPERATOR_LIVENESS_CONTRACT.deferred.cancelFailed,
+    linearAuditComments: OPERATOR_LIVENESS_CONTRACT.deferred.linearAuditComments,
     runId: run?.runId ?? lifecycle?.summaryPointers.lastRunId ?? null,
     activeRunId: null,
     agentId: run?.agentId ?? null,
@@ -516,6 +573,30 @@ function terminalOperatorLiveness(
     },
     timeline: terminalTimeline(status, run, lifecycle),
   };
+}
+
+function blockedIssueView(lifecycle: IssueLifecycleRecord | null | undefined) {
+  if (lifecycle === null || lifecycle === undefined || !isLifecycleBlocked(lifecycle)) return null;
+  const blockedLifecycle = lifecycle;
+  return {
+    status: "blocked_human_required" as const,
+    reason: blockedLifecycle.blockedReason,
+    issueId: blockedLifecycle.issueId,
+    issueIdentifier: blockedLifecycle.issueIdentifier,
+    continuationSummaryRecommended: true,
+  };
+}
+
+function isLatestRunForBlockedLifecycle(
+  run: RunRecord,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  issueRuns: RunRecord[],
+): boolean {
+  if (lifecycle === null || lifecycle === undefined || !isLifecycleBlocked(lifecycle)) return false;
+  const blockedLifecycle = lifecycle;
+  if (blockedLifecycle.summaryPointers.lastRunId) return run.runId === blockedLifecycle.summaryPointers.lastRunId;
+  const latestRun = issueRuns[issueRuns.length - 1] ?? null;
+  return latestRun?.runId === run.runId;
 }
 
 function liveTimeline(row: RunningRow) {
