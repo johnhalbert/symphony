@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
 import {
   CompletionReportService,
+  PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+  PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
   type CompletionReportPullRequestPublication,
   type CompletionReportPullRequestPublicationInput,
   type CompletionReportPullRequestPublisher,
@@ -36,6 +38,7 @@ describe("approval status API", () => {
   let root: string;
   let config: ServiceConfig;
   let runStore: FileRunTranscriptStore;
+  let lifecycleStore: FileIssueLifecycleStore;
   let store: FileOperatorApprovalStore;
   let service: OperatorApprovalService;
 
@@ -46,6 +49,7 @@ describe("approval status API", () => {
     config.github.operatorApproval!.requiredForPublication = true;
     config.github.operatorApproval!.rejectPolicy = "cancel";
     runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     store = new FileOperatorApprovalStore(config.workspace.stateDir);
     service = new OperatorApprovalService({ config, store, runStore });
     await runStore.startRun({
@@ -409,7 +413,7 @@ describe("approval status API", () => {
     try {
       await orchestrator.refreshNow();
       const pending = await waitForPendingRun(store, "live-report-run");
-      expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Pending"))).toBe(true);
+      expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Setup Incomplete"))).toBe(true);
       expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
 
       const url = `http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`;
@@ -555,7 +559,7 @@ describe("approval status API", () => {
       expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
-        blockedReason: "awaiting operator approval for PR publication",
+        blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
         incompleteTurnCount: 0,
       });
 
@@ -692,7 +696,7 @@ describe("approval status API", () => {
       await waitFor(() => currentState === "Blocked" && gatedProcessDueCompleted, "partial pending audit writeback");
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
-        blockedReason: "awaiting operator approval for PR publication",
+        blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
         incompleteTurnCount: 0,
         completionReports: [
           expect.objectContaining({
@@ -827,7 +831,7 @@ describe("approval status API", () => {
 
     await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
-      blockedReason: "awaiting operator approval for PR publication",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
       lastCompletionReportId: `completion-report:${candidate.id}:${evidenceCursor}`,
       completionReports: [
         {
@@ -880,7 +884,7 @@ describe("approval status API", () => {
     });
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "blocked",
-      blockedReason: "awaiting operator approval for PR publication",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
       completionReports: [
         expect.objectContaining({
           runId,
@@ -938,7 +942,7 @@ describe("approval status API", () => {
       const acceptedComments = writer.comments.filter((comment) => comment.body.includes("## Symphony Completion Report"));
       expect(acceptedComments).toHaveLength(1);
       expect(acceptedComments[0]?.body).toContain("Status: accepted");
-      expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Publication Approval Pending"))).toHaveLength(1);
+      expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Publication Approval Setup Incomplete"))).toHaveLength(1);
       expect(writer.transitions.filter((transition) => transition.toState === "Blocked")).toHaveLength(1);
       const reviewTransitions = writer.transitions.filter((transition) => transition.toState === "In Review");
       expect(reviewTransitions).toHaveLength(1);
@@ -1349,13 +1353,87 @@ describe("approval status API", () => {
     await runStore.updateRun("run-1", {
       metadata: { pendingApprovalRequestId: record.requestId, pendingApprovalRequestedAt: record.requestedAt },
     });
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      lastCompletionReportId: `completion-report:issue-1:${evidenceCursor}`,
+      completionReports: [
+        {
+          id: `completion-report:issue-1:${evidenceCursor}`,
+          idempotencyKey: evidenceCursor,
+          runId: "run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Implemented the service contract.",
+          validationEvidence: ["npm test -- approval-status-api"],
+          acceptanceChecklist: [
+            {
+              text: "Approval controls are linked to the pending report.",
+              satisfied: true,
+              evidence: "approval status API test",
+            },
+          ],
+          changedFiles: ["src/core/CompletionReportService.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: null,
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      summaryPointers: {
+        workspacePath: path.join(root, "workspace"),
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: root,
+        baseRef: "main",
+      },
+    });
     return record;
   }
 
   async function waitForPending() {
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const pending = await store.findPendingForRun("run-1");
-      if (pending) return pending;
+      if (pending) {
+        await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+          phase: "blocked",
+          blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          lastCompletionReportId: `completion-report:issue-1:${pending.evidenceCursor}`,
+          completionReports: [
+            {
+              id: `completion-report:issue-1:${pending.evidenceCursor}`,
+              idempotencyKey: pending.evidenceCursor,
+              runId: "run-1",
+              issueId: "issue-1",
+              issueIdentifier: "TEST-1",
+              summary: "Implemented the service contract.",
+              validationEvidence: ["npm test -- approval-status-api"],
+              acceptanceChecklist: [
+                {
+                  text: "Approval controls are linked to the pending report.",
+                  satisfied: true,
+                  evidence: "approval status API test",
+                },
+              ],
+              changedFiles: ["src/core/CompletionReportService.ts"],
+              branchName: "symphony/TEST-1",
+              pullRequest: null,
+              risks: [],
+              acceptedAt: "2026-01-01T00:00:00.000Z",
+              writebackOperationKeys: [],
+            },
+          ],
+          summaryPointers: {
+            workspacePath: path.join(root, "workspace"),
+            branchName: "symphony/TEST-1",
+            gitBranchName: "symphony/TEST-1",
+            repoPath: root,
+            baseRef: "main",
+          },
+        });
+        return pending;
+      }
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     throw new Error("pending approval was not created");
@@ -1453,6 +1531,7 @@ describe("approval status API", () => {
       }),
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
       runStore,
+      lifecycleStore,
       operatorApproval: options.operatorApproval ?? service,
       host: "127.0.0.1",
       port: 0,

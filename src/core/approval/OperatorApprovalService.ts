@@ -287,6 +287,10 @@ export class OperatorApprovalService {
     return this.options.store.get(requestId);
   }
 
+  async getByDedupe(runId: string, evidenceCursor: string): Promise<OperatorApprovalRecord | null> {
+    return this.options.store.getByDedupe(runId, evidenceCursor);
+  }
+
   async findPendingForRun(runId: string): Promise<OperatorApprovalRecord | null> {
     return this.options.store.findPendingForRun(runId);
   }

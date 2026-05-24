@@ -2,7 +2,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CompletionReportService, type CompletionReportActiveContext, type CompletionReportInput } from "../src/core/CompletionReportService.js";
+import {
+  CompletionReportService,
+  PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+  PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+  type CompletionReportActiveContext,
+  type CompletionReportInput,
+} from "../src/core/CompletionReportService.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
@@ -164,7 +170,7 @@ describe("CompletionReportService", () => {
     operatorApproval.onRequest = async () => {
       await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
         phase: "blocked",
-        blockedReason: "awaiting operator approval for PR publication",
+        blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
         lastCompletionReportId: "completion-report:issue-1:idem-1",
         completionReports: [
           {
@@ -194,10 +200,13 @@ describe("CompletionReportService", () => {
     expect(pendingOperations).toHaveLength(2);
     expect(pendingOperations.map((operation) => operation.status)).toEqual(["succeeded", "succeeded"]);
     expect(writer.comments).toHaveLength(1);
-    expect(writer.comments[0]?.body).toContain("Symphony Publication Approval Pending");
+    expect(writer.comments[0]?.body).toContain("Symphony Publication Approval Setup Incomplete");
     expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Blocked"]);
     expect(pendingComment?.kind === "comment" ? pendingComment.payload.body : "").toContain(
-      "Status: worker completion report persisted; awaiting operator approval",
+      "Status: worker completion report persisted; Symphony is preparing",
+    );
+    expect(pendingComment?.kind === "comment" ? pendingComment.payload.body : "").not.toContain(
+      "Approve the pending operator request",
     );
     expect(pendingTransition).toMatchObject({
       kind: "transition",
@@ -207,7 +216,7 @@ describe("CompletionReportService", () => {
     });
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       phase: "blocked",
-      blockedReason: "awaiting operator approval for PR publication",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
       lastCompletionReportId: "completion-report:issue-1:idem-1",
       completionReports: [
         {
@@ -233,7 +242,7 @@ describe("CompletionReportService", () => {
     expect(await outbox.list()).toHaveLength(2);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       phase: "blocked",
-      blockedReason: "awaiting operator approval for PR publication",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
       completionReports: [
         {
           id: "completion-report:issue-1:idem-1",
@@ -265,7 +274,7 @@ describe("CompletionReportService", () => {
     const lifecycle = await lifecycleStore.get("issue-1");
     expect(lifecycle).toMatchObject({
       phase: "blocked",
-      blockedReason: "awaiting operator approval for PR publication",
+      blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
       lastCompletionReportId: "completion-report:issue-1:idem-1",
       incompleteTurnCount: 0,
       completionReports: [
@@ -352,7 +361,7 @@ describe("CompletionReportService", () => {
     await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
     await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
       phase: "blocked",
-      blockedReason: "awaiting operator approval for PR publication",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
       lastCompletionReportId: "completion-report:issue-1:idem-1",
       completionReports: [pendingReportRecord()],
       summaryPointers: {
@@ -411,7 +420,7 @@ describe("CompletionReportService", () => {
     await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
     await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
       phase: "blocked",
-      blockedReason: "awaiting operator approval for PR publication",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
       lastCompletionReportId: "completion-report:issue-1:idem-1",
       completionReports: [pendingReportRecord()],
       summaryPointers: {
@@ -825,6 +834,14 @@ class DeferredOperatorApproval {
       this.resolveApproval = resolve;
       this.rejectApproval = reject;
     });
+  }
+
+  async get(requestId: string): Promise<OperatorApprovalRecord | null> {
+    return this.records.find((record) => record.requestId === requestId) ?? null;
+  }
+
+  async getByDedupe(runId: string, evidenceCursor: string): Promise<OperatorApprovalRecord | null> {
+    return this.records.find((record) => record.runId === runId && record.evidenceCursor === evidenceCursor) ?? null;
   }
 
   async waitForRequest(): Promise<OperatorApprovalRequestInput> {

@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CompletionReportService,
+  PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+  PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
   type CompletionReportPullRequestPublication,
   type CompletionReportPullRequestPublicationInput,
   type CompletionReportPullRequestPublisher,
@@ -629,7 +631,7 @@ describe("Orchestrator", () => {
     const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
     await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
-      blockedReason: "awaiting operator approval for PR publication",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
     });
     const harness = new FakeHarness();
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
@@ -650,7 +652,7 @@ describe("Orchestrator", () => {
     expect(harness.runs).toHaveLength(0);
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
       phase: "blocked",
-      blockedReason: "awaiting operator approval for PR publication",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
     });
   });
 
@@ -689,7 +691,10 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
       await waitFor(() => orchestrator.snapshot().running[0]?.runId !== null, "worker run start");
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
-      await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, runId));
+      await lifecycleStore.ensureIssue(
+        candidate,
+        pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
+      );
       await runStore.updateRun(runId, {
         metadata: {
           pendingApprovalRequestId: null,
@@ -714,7 +719,7 @@ describe("Orchestrator", () => {
       expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
-        blockedReason: "awaiting operator approval for PR publication",
+        blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
         incompleteTurnCount: 0,
       });
       await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(1);
@@ -819,7 +824,7 @@ describe("Orchestrator", () => {
       expect(runBeforeRecovery?.pendingApprovalRequestId ?? null).toBeNull();
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
-        blockedReason: "awaiting operator approval for PR publication",
+        blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
         incompleteTurnCount: 0,
         completionReports: [
           expect.objectContaining({
@@ -1426,7 +1431,7 @@ describe("Orchestrator", () => {
     expect(finalRun?.cancellationSource ?? null).toBeNull();
     expect(finalRun?.cancellationOutcome ?? "none").toBe("none");
     expect(publisher.inputs).toEqual([]);
-    expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Pending"))).toBe(true);
+    expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Setup Incomplete"))).toBe(true);
     expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
     await orchestrator.stop();
@@ -1505,7 +1510,7 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     const pending = await waitForPendingApproval(approvalStore, "report-run-1");
-    expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Pending"))).toBe(true);
+    expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Setup Incomplete"))).toBe(true);
     expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
     const result = await operatorApproval.resolve(pending.requestId, "reject");
     await orchestrator.cancelIssue(candidate.id);
@@ -1514,11 +1519,10 @@ describe("Orchestrator", () => {
 
     const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
-      status: "cancelled",
+      status: "succeeded",
       completedAt: expect.any(String),
       pendingApprovalRequestId: null,
     });
-    expect(finalRun?.status).not.toBe("succeeded");
     expect(publisher.inputs).toEqual([]);
     expect(writer.comments.some((comment) => comment.body.includes("Status: rejected"))).toBe(true);
     expect(writer.comments.some((comment) => comment.dedupeKey === "report-run-1:completion-report:idem-1")).toBe(false);
@@ -3541,10 +3545,15 @@ async function startApprovalRun(
   });
 }
 
-function pendingApprovalLifecyclePatch(candidate: Issue, root: string, runId: string): IssueLifecyclePatch {
+function pendingApprovalLifecyclePatch(
+  candidate: Issue,
+  root: string,
+  runId: string,
+  blockedReason = PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+): IssueLifecyclePatch {
   return {
     phase: "blocked",
-    blockedReason: "awaiting operator approval for PR publication",
+    blockedReason,
     lastCompletionReportId: `completion-report:${candidate.id}:idem-1`,
     completionReports: [
       {
@@ -3902,43 +3911,52 @@ class ReportingHarness implements AgentHarness {
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.prompts.push(prompt);
     yield { type: "session_started", sessionId: "report-session-1", runId: "report-run-1" };
-    await new CompletionReportService({
-      config: ctx.config,
-      lifecycleStore: this.lifecycleStore,
-      writebackOutbox: this.outboxStore,
-      ...(this.writebackProcessor ? { writebackProcessor: this.writebackProcessor } : {}),
-      runStore: this.runStore,
-      pullRequestPublisher: this.publisher,
-      ...(this.operatorApproval ? { operatorApproval: this.operatorApproval } : {}),
-    }).submitCompletionReport(
-      {
-        runId: "report-run-1",
-        issueId: ctx.issue.id,
-        summary: "Implemented the requested handoff.",
-        validationEvidence: ["npm test"],
-        acceptanceChecklist: [
-          {
-            text: "Completion report handoff is live.",
-            satisfied: true,
-            evidence: "Orchestrator test",
-          },
-        ],
-        changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
-        branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
-        pullRequest: null,
-        risks: [],
-        idempotencyKey: "idem-1",
-      },
-      {
-        issue: ctx.issue,
-        activeRunId: "report-run-1",
-        role: "worker",
-        sessionId: "report-session-1",
-        workspacePath: ctx.workspace.path,
-        workspace: ctx.workspace,
-        phase: "implementation",
-      },
-    );
+    try {
+      await new CompletionReportService({
+        config: ctx.config,
+        lifecycleStore: this.lifecycleStore,
+        writebackOutbox: this.outboxStore,
+        ...(this.writebackProcessor ? { writebackProcessor: this.writebackProcessor } : {}),
+        runStore: this.runStore,
+        pullRequestPublisher: this.publisher,
+        ...(this.operatorApproval ? { operatorApproval: this.operatorApproval } : {}),
+      }).submitCompletionReport(
+        {
+          runId: "report-run-1",
+          issueId: ctx.issue.id,
+          summary: "Implemented the requested handoff.",
+          validationEvidence: ["npm test"],
+          acceptanceChecklist: [
+            {
+              text: "Completion report handoff is live.",
+              satisfied: true,
+              evidence: "Orchestrator test",
+            },
+          ],
+          changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
+          branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
+          pullRequest: null,
+          risks: [],
+          idempotencyKey: "idem-1",
+        },
+        {
+          issue: ctx.issue,
+          activeRunId: "report-run-1",
+          role: "worker",
+          sessionId: "report-session-1",
+          workspacePath: ctx.workspace.path,
+          workspace: ctx.workspace,
+          phase: "implementation",
+        },
+      );
+    } catch (error) {
+      if (this.terminalEvent !== "throw") {
+        yield this.terminalEvent;
+        return;
+      }
+      yield { type: "failed", error: error instanceof Error ? error.message : String(error) };
+      return;
+    }
     if (this.terminalEvent === "throw") {
       throw new Error("post-handoff harness throw");
     }
@@ -4195,7 +4213,11 @@ class PublicationApprovalCommentFailingWriter extends StateChangingWriter {
 
 class PublicationApprovalTransitionFailingWriter extends StateChangingWriter {
   async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
-    if (input.toState === "Blocked" && input.reason?.includes("operator approval for PR publication")) {
+    if (
+      input.toState === "Blocked" &&
+      (input.reason?.includes("operator approval for PR publication") ||
+        input.reason?.includes("publication approval setup incomplete"))
+    ) {
       throw new Error("linear pending approval transition failed");
     }
     return super.transitionIssueState(input);

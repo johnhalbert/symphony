@@ -16,8 +16,8 @@ import {
 import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
 import {
   CompletionReportService,
-  PUBLICATION_APPROVAL_BLOCKED_REASON,
   isFinalizedCompletionReport,
+  isPendingPublicationApprovalLifecycle,
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
@@ -82,7 +82,8 @@ export interface OrchestratorOptions {
   pullRequestReviewClient?: PullRequestReviewEvidenceClient;
   pullRequestMergeClient?: MergePolicyGitHubClient;
   completionReportPublisher?: CompletionReportPullRequestPublisher;
-  operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest">;
+  operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest"> &
+    Partial<Pick<OperatorApprovalService, "get" | "getByDedupe">>;
 }
 
 export interface PullRequestDiscoveryClient {
@@ -412,6 +413,7 @@ export class Orchestrator {
       lifecycleStore: this.options.lifecycleStore,
       writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+      ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
       pullRequestPublisher: publisher,
     }).resumeApprovedPublication({ approval: request, issue });
     if (!result) return false;
@@ -603,6 +605,9 @@ export class Orchestrator {
       writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
       writebackProcessor: this.options.writeback,
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+      pullRequestPublisher:
+        this.options.completionReportPublisher ??
+        createGitHubPullRequestClientForCapability(this.config, "github.publication"),
       operatorApproval: this.options.operatorApproval,
     });
 
@@ -615,7 +620,8 @@ export class Orchestrator {
             issue_id: lifecycle.issueId,
             issue_identifier: lifecycle.issueIdentifier,
             run_id: result.report.runId,
-            approval_request_id: result.approvalRequest.requestId,
+            approval_request_id: result.outcome === "pending" ? result.approvalRequest.requestId : null,
+            outcome: result.outcome,
           });
         }
       } catch (error) {
@@ -708,7 +714,7 @@ export class Orchestrator {
     const runId = entry.activeRunId ?? entry.runId;
     if (!store || !runId) return false;
     const lifecycle = await store.get(entry.issue.id);
-    if (!lifecycle || lifecycle.blockedReason !== PUBLICATION_APPROVAL_BLOCKED_REASON) return false;
+    if (!isPendingPublicationApprovalLifecycle(lifecycle)) return false;
     const pendingReport = lifecycle.completionReports.find(
       (report) => report.runId === runId && !isFinalizedCompletionReport(report),
     );
@@ -776,7 +782,7 @@ export class Orchestrator {
     const phase = phaseForIssueState(issue.state, this.config);
     const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
     if (blockedByLifecycle) {
-      if (lifecycle.blockedReason === "awaiting operator approval for PR publication") {
+      if (isPendingPublicationApprovalLifecycle(lifecycle)) {
         return false;
       }
       if (this.config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
@@ -1606,7 +1612,7 @@ export class Orchestrator {
     const report = lifecycle?.completionReports.find((item) => item.runId === runId) ?? null;
     if (!lifecycle || !report) return entry.completionReportAccepted;
     if (!isFinalizedCompletionReport(report)) {
-      if (lifecycle.blockedReason !== PUBLICATION_APPROVAL_BLOCKED_REASON) return false;
+      if (!isPendingPublicationApprovalLifecycle(lifecycle)) return false;
       entry.lifecycle = lifecycle;
       entry.completionReportAccepted = true;
       return true;
@@ -2404,11 +2410,7 @@ function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {
 }
 
 function hasRecoverablePendingPublicationApproval(lifecycle: IssueLifecycleRecord): boolean {
-  return (
-    lifecycle.phase === "blocked" &&
-    lifecycle.blockedReason === PUBLICATION_APPROVAL_BLOCKED_REASON &&
-    lifecycle.completionReports.some((report) => !isFinalizedCompletionReport(report))
-  );
+  return isPendingPublicationApprovalLifecycle(lifecycle) && lifecycle.completionReports.some((report) => !isFinalizedCompletionReport(report));
 }
 
 function issueFromPendingPublicationLifecycle(lifecycle: IssueLifecycleRecord, state: string): Issue {

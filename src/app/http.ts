@@ -21,6 +21,11 @@ import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExp
 import type { OperatorApprovalService, OperatorApprovalRecord } from "../core/approval/OperatorApprovalService.js";
 import { approvalResolve } from "../core/approval/OperatorApprovalService.js";
 import {
+  approvalMatchesReport,
+  isAwaitingPublicationApprovalLifecycle,
+  pendingPublicationReport,
+} from "../core/CompletionReportService.js";
+import {
   compareRunChronology,
   type RunRecord,
   type RunTranscriptStore,
@@ -208,6 +213,22 @@ export class StatusServer {
         if (request.method === "POST") {
           this.requireApprovalMutationToken(request);
           const decision = parseApprovalDecision(await readJsonBody(request));
+          let existingApproval: OperatorApprovalRecord | null = null;
+          try {
+            existingApproval = (await this.options.operatorApproval?.get(requestId)) ?? null;
+          } catch {
+            existingApproval = null;
+          }
+          if (existingApproval?.status === "pending") {
+            const currentApproval = await currentPendingPublicationApproval({
+              approval: existingApproval,
+              lifecycleStore: this.options.lifecycleStore,
+              runStore: this.options.runStore,
+            });
+            if (!currentApproval) {
+              throw new SymphonyError("conflict", "Approval request is not current pending publication approval");
+            }
+          }
           let result;
           try {
             result = await this.options.operatorApproval?.resolve(requestId, decision);
@@ -337,7 +358,14 @@ export class StatusServer {
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
-        const pendingApproval = await this.options.operatorApproval?.findPendingForIssue(keys);
+        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys);
+        const pendingApproval = pendingApprovalCandidate
+          ? await currentPendingPublicationApproval({
+              approval: pendingApprovalCandidate,
+              lifecycleStore: this.options.lifecycleStore,
+              runStore: this.options.runStore,
+            })
+          : null;
         const operatorLiveness = await issueOperatorLiveness({
           live,
           latestRun,
@@ -661,6 +689,23 @@ function approvalCapability(
     resolve: record === null ? null : approvalResolve(record),
     requiresToken: approvalMutationsRequireToken(enabled, openWorkspaceToken),
   };
+}
+
+async function currentPendingPublicationApproval(input: {
+  approval: OperatorApprovalRecord;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  runStore: RunTranscriptStore | undefined;
+}): Promise<OperatorApprovalRecord | null> {
+  if (input.approval.status !== "pending" || !input.lifecycleStore || !input.runStore) return null;
+  const lifecycle =
+    (await input.lifecycleStore.get(input.approval.issueId)) ??
+    (await input.lifecycleStore.get(input.approval.issueIdentifier));
+  if (!isAwaitingPublicationApprovalLifecycle(lifecycle)) return null;
+  const report = pendingPublicationReport(lifecycle);
+  if (!report || !approvalMatchesReport(input.approval, report)) return null;
+  const run = await input.runStore.getRun(report.runId);
+  if (run?.pendingApprovalRequestId !== input.approval.requestId) return null;
+  return input.approval;
 }
 
 function approvalMutationsRequireToken(enabled: boolean, openWorkspaceToken: string | null): boolean {

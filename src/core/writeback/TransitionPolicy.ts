@@ -198,10 +198,10 @@ export function planCompletionReportPublicationApprovalPendingWritebacks(
       payload: {
         dedupeKey: eventKey,
         body: [
-          "## Symphony Publication Approval Pending",
+          "## Symphony Publication Approval Setup Incomplete",
           "",
-          "Status: worker completion report persisted; awaiting operator approval for service-owned push/PR publication.",
-          "Symphony will not dispatch another worker while this approval is pending.",
+          "Status: worker completion report persisted; Symphony is preparing service-owned push/PR publication approval.",
+          "Symphony will not dispatch another worker while publication approval setup is pending.",
           "",
           `Run: ${context.runId}`,
           `Workspace: ${context.workspacePath ?? context.workspace?.path ?? action.workspacePath}`,
@@ -210,8 +210,8 @@ export function planCompletionReportPublicationApprovalPendingWritebacks(
           `PR title: ${action.title}`,
           "",
           "Recovery:",
-          "- Approve the pending operator request to let Symphony publish the PR from the stored completion report.",
-          "- Reject or cancel the request if publication should not proceed; Symphony will leave retry instructions here.",
+          "- Symphony will retry this setup and create the operator approval request after the audit writebacks are durable.",
+          "- No operator approval request exists yet for this persisted report.",
           "",
           blockedState === null
             ? "No blocked state is configured, so Symphony recorded a lifecycle-level blocked phase without changing the tracker state."
@@ -231,7 +231,7 @@ export function planCompletionReportPublicationApprovalPendingWritebacks(
       payload: {
         fromStates: [config.writeback.dispatchState],
         toState: blockedState,
-        reason: "Symphony awaiting operator approval for PR publication",
+        reason: "Symphony publication approval setup incomplete",
       },
     });
   }
