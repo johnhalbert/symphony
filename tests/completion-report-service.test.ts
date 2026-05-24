@@ -382,6 +382,75 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("returns missing_run recovery without creating approval or finalizing lifecycle", async () => {
+    const operatorApproval = new DeferredOperatorApproval();
+    const { service, lifecycleStore, outbox } = fixture({
+      operatorApproval,
+      requirePublicationApproval: true,
+    });
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [pendingReportRecord()],
+    });
+    const lifecycleBefore = await lifecycleStore.get("issue-1");
+
+    const recovered = await service.recoverPendingPublicationApproval({
+      issue: issue({ state: "Blocked", branchName: "symphony/TEST-1" }),
+    });
+
+    expect(recovered).toMatchObject({ recovered: false, reason: "missing_run" });
+    expect(operatorApproval.requests).toHaveLength(0);
+    expect(await outbox.list()).toEqual([]);
+    await expect(lifecycleStore.get("issue-1")).resolves.toEqual(lifecycleBefore);
+  });
+
+  it("returns audit_not_settled recovery without duplicate approval or finalization", async () => {
+    const operatorApproval = new DeferredOperatorApproval();
+    const { service, lifecycleStore, outbox, runStore } = fixture({
+      operatorApproval,
+      requirePublicationApproval: true,
+      writer: new FailingWriter(),
+      maxBackoffMs: 0,
+    });
+    await startRun(runStore);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [pendingReportRecord()],
+      summaryPointers: {
+        workspacePath: "/tmp/workspace",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    });
+
+    const recovered = await service.recoverPendingPublicationApproval({
+      issue: issue({ state: "Blocked", branchName: "symphony/TEST-1" }),
+    });
+
+    expect(recovered).toMatchObject({ recovered: false, reason: "audit_not_settled" });
+    expect(operatorApproval.requests).toHaveLength(0);
+    expect((await outbox.list()).map((operation) => operation.status)).toEqual(["retrying", "retrying"]);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      completionReports: [
+        expect.objectContaining({
+          idempotencyKey: "idem-1",
+          pullRequest: null,
+          writebackOperationKeys: [],
+        }),
+      ],
+    });
+    expect((await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null).toBeNull();
+  });
+
   it("repairs an awaiting publication approval lifecycle with only a deduped pending approval", async () => {
     const operatorApproval = new DeferredOperatorApproval();
     operatorApproval.records.push(approvalRecord("pending"));
@@ -417,6 +486,130 @@ describe("CompletionReportService", () => {
     expect((await outbox.list()).map((operation) => operation.status)).toEqual(["succeeded", "succeeded"]);
     await expect(runStore.getRun("run-1")).resolves.toMatchObject({
       pendingApprovalRequestId: "approval-1",
+    });
+  });
+
+  it("recovers a pre-approved publication approval from a stored pending report", async () => {
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const operatorApproval = new DeferredOperatorApproval();
+    operatorApproval.records.push(approvalRecord("approved"));
+    const { service, lifecycleStore, outbox, runStore, writer } = fixture({
+      publisher,
+      operatorApproval,
+      requirePublicationApproval: true,
+    });
+    await startRun(runStore);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [pendingReportRecord()],
+      summaryPointers: {
+        workspacePath: "/tmp/workspace",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    });
+
+    const recovered = await service.recoverPendingPublicationApproval({
+      issue: issue({ state: "Blocked", branchName: "symphony/TEST-1" }),
+    });
+
+    expect(recovered).toMatchObject({ recovered: true, outcome: "approved" });
+    expect(operatorApproval.requests).toHaveLength(0);
+    expect(operatorApproval.records).toHaveLength(1);
+    expect(publisher.inputs).toHaveLength(1);
+    expect((await outbox.list()).map((operation) => operation.status)).toEqual([
+      "succeeded",
+      "succeeded",
+      "succeeded",
+      "succeeded",
+    ]);
+    expect(writer.comments.some((comment) => comment.body.includes("Status: accepted"))).toBe(true);
+    expect(writer.transitions.map((transition) => transition.toState)).toContain("In Review");
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      blockedReason: null,
+      completionReports: [
+        expect.objectContaining({
+          idempotencyKey: "idem-1",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "abc123",
+            branch: "symphony/TEST-1",
+          },
+        }),
+      ],
+    });
+  });
+
+  it("recovers a terminal publication approval from a stored pending report", async () => {
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const operatorApproval = new DeferredOperatorApproval();
+    operatorApproval.records.push(approvalRecord("cancelled"));
+    const { service, lifecycleStore, outbox, runStore, writer } = fixture({
+      publisher,
+      operatorApproval,
+      requirePublicationApproval: true,
+    });
+    await startRun(runStore);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [pendingReportRecord()],
+      summaryPointers: {
+        workspacePath: "/tmp/workspace",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    });
+
+    const recovered = await service.recoverPendingPublicationApproval({
+      issue: issue({ state: "Blocked", branchName: "symphony/TEST-1" }),
+    });
+
+    expect(recovered).toMatchObject({ recovered: true, outcome: "terminal" });
+    expect(operatorApproval.requests).toHaveLength(0);
+    expect(operatorApproval.records).toHaveLength(1);
+    expect(publisher.inputs).toHaveLength(0);
+    expect((await outbox.list()).map((operation) => operation.status)).toEqual(["succeeded", "succeeded", "succeeded"]);
+    expect(writer.comments.some((comment) => comment.body.includes("Status: cancelled"))).toBe(true);
+    expect(writer.comments.some((comment) => comment.body.includes("Status: accepted"))).toBe(false);
+    expect(writer.transitions.map((transition) => transition.toState)).not.toContain("In Review");
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "publication approval cancelled",
+      completionReports: [
+        expect.objectContaining({
+          idempotencyKey: "idem-1",
+          pullRequest: null,
+          writebackOperationKeys: [],
+        }),
+      ],
     });
   });
 

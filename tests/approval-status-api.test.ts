@@ -135,6 +135,91 @@ describe("approval status API", () => {
     }
   });
 
+  it("does not expose approval controls for setup-incomplete pending publication records", async () => {
+    const pending = await createPending("idem-setup-incomplete");
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+    });
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed, terminalRecords });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const issueBody = (await issueResponse.json()) as {
+        capabilities: {
+          pendingApproval: { active: boolean; requestId: string | null; status: string | null };
+          humanRequired: { active: boolean; reason: string | null; continuationSummaryRecommended: boolean };
+        };
+        pendingApproval: unknown;
+      };
+      const approvalPost = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const approvalBody = (await approvalPost.json()) as { error: { code: string; message: string } };
+
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.pendingApproval).toBeNull();
+      expect(issueBody.capabilities.pendingApproval).toMatchObject({
+        active: false,
+        requestId: null,
+        status: null,
+      });
+      expect(issueBody.capabilities.humanRequired).toMatchObject({
+        active: true,
+        reason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+        continuationSummaryRecommended: true,
+      });
+      expect(approvalPost.status).toBe(409);
+      expect(approvalBody.error).toMatchObject({
+        code: "conflict",
+        message: "Approval request is not current pending publication approval",
+      });
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toEqual([]);
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "pending" });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+        pendingApprovalRequestId: pending.requestId,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("fails closed when approving a non-current pending publication approval request", async () => {
+    const oldPending = await createPending("idem-old");
+    const currentPending = await createPending("idem-current");
+    const resumed: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${oldPending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({
+        code: "conflict",
+        message: "Approval request is not current pending publication approval",
+      });
+      expect(resumed).toEqual([]);
+      await expect(store.get(oldPending.requestId)).resolves.toMatchObject({ status: "pending" });
+      await expect(store.get(currentPending.requestId)).resolves.toMatchObject({ status: "pending" });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+        pendingApprovalRequestId: currentPending.requestId,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it.each([
     ["null", null],
     ["empty", ""],
