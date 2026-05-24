@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
 import { FileOperatorApprovalStore, OperatorApprovalService, type OperatorApprovalAction } from "../src/core/approval/OperatorApprovalService.js";
+import type { ServiceConfig } from "../src/core/config/Config.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
@@ -13,15 +14,17 @@ import { testConfig } from "./helpers.js";
 
 describe("approval status API", () => {
   let root: string;
+  let config: ServiceConfig;
   let runStore: FileRunTranscriptStore;
   let store: FileOperatorApprovalStore;
   let service: OperatorApprovalService;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-approval-api-"));
-    const config = testConfig(root);
+    config = testConfig(root);
     config.github.publishPullRequests = true;
     config.github.operatorApproval!.requiredForPublication = true;
+    config.github.operatorApproval!.rejectPolicy = "cancel";
     runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     store = new FileOperatorApprovalStore(config.workspace.stateDir);
     service = new OperatorApprovalService({ config, store, runStore });
@@ -92,6 +95,48 @@ describe("approval status API", () => {
     }
   });
 
+  it("rejects pending requests without cancelling the issue when reject policy is fail", async () => {
+    config.github.operatorApproval!.rejectPolicy = "fail";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+
+    const evidenceCursor = "idem-fail";
+    const wait = service.waitForPublicationApproval({
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      runId: "run-1",
+      evidenceCursor,
+      action: action(evidenceCursor),
+    });
+    const pending = await waitForPending();
+    const cancelled: string[] = [];
+    const server = statusServer(cancelled);
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const body = (await response.json()) as { request: { status: string }; replayed: boolean };
+
+      expect(response.status).toBe(200);
+      expect(body.request.status).toBe("rejected");
+      expect(body.replayed).toBe(false);
+      expect(cancelled).toEqual([]);
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "rejected" });
+      await expect(wait).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({ pendingApprovalRequestId: null });
+
+      const transcript = await runStore.readTranscript("run-1");
+      expect(transcript.events.at(-1)).toMatchObject({
+        eventType: "approval_resolved",
+        payload: { status: "rejected", rejectPolicy: "fail" },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   async function createPending(evidenceCursor: string) {
     const { record } = await store.requestOrGetPending(
       {
@@ -109,8 +154,16 @@ describe("approval status API", () => {
     return record;
   }
 
+  async function waitForPending() {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const pending = await store.findPendingForRun("run-1");
+      if (pending) return pending;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error("pending approval was not created");
+  }
+
   function statusServer(cancelled: string[] = []) {
-    const config = testConfig(root);
     return new StatusServer({
       orchestrator: fakeOrchestrator(cancelled),
       workspaceManager: new WorkspaceManager({
