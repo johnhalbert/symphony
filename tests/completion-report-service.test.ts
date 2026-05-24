@@ -161,6 +161,21 @@ describe("CompletionReportService", () => {
       operatorApproval,
       requirePublicationApproval: true,
     });
+    operatorApproval.onRequest = async () => {
+      await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: "awaiting operator approval for PR publication",
+        lastCompletionReportId: "completion-report:issue-1:idem-1",
+        completionReports: [
+          {
+            id: "completion-report:issue-1:idem-1",
+            idempotencyKey: "idem-1",
+            runId: "run-1",
+            writebackOperationKeys: [],
+          },
+        ],
+      });
+    };
     await startRun(runStore);
 
     const submission = service.submitCompletionReport(report(), contextWithWorkspace());
@@ -229,7 +244,7 @@ describe("CompletionReportService", () => {
     });
   });
 
-  it("does not create an awaiting approval lifecycle or approval request when pending Linear audit writeback fails", async () => {
+  it("keeps the pending lifecycle guard without creating approval when pending Linear audit writeback fails", async () => {
     const operatorApproval = new DeferredOperatorApproval();
     const { service, lifecycleStore, outbox, runStore } = fixture({
       operatorApproval,
@@ -248,8 +263,20 @@ describe("CompletionReportService", () => {
     expect(operatorApproval.requests).toHaveLength(0);
     expect((await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null).toBeNull();
     const lifecycle = await lifecycleStore.get("issue-1");
-    expect(lifecycle?.blockedReason).not.toBe("awaiting operator approval for PR publication");
-    expect(lifecycle?.completionReports ?? []).toHaveLength(0);
+    expect(lifecycle).toMatchObject({
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      incompleteTurnCount: 0,
+      completionReports: [
+        {
+          id: "completion-report:issue-1:idem-1",
+          idempotencyKey: "idem-1",
+          runId: "run-1",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
   });
 
   it("resumes approved publication from a stored pending report after the worker run exits", async () => {
@@ -707,6 +734,7 @@ class FakePublisher implements CompletionReportPullRequestPublisher {
 class DeferredOperatorApproval {
   readonly requests: OperatorApprovalRequestInput[] = [];
   readonly records: OperatorApprovalRecord[] = [];
+  onRequest: ((input: OperatorApprovalRequestInput) => Promise<void> | void) | null = null;
   private readonly requestSeen: Promise<void>;
   private readonly waitSeen: Promise<void>;
   private markRequestSeen: (() => void) | null = null;
@@ -724,6 +752,7 @@ class DeferredOperatorApproval {
   }
 
   async requestPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
+    await this.onRequest?.(input);
     this.requests.push(input);
     const record = approvalRecord("pending");
     this.records.push(record);

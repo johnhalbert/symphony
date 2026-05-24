@@ -220,7 +220,13 @@ export class StatusServer {
             await this.options.orchestrator.cancelIssue(result.request.issueId);
           }
           if (decision === "approve" && result.request.status === "approved") {
-            await this.options.orchestrator.resumeApprovedPublication(result.request);
+            const resumed = await this.options.orchestrator.resumeApprovedPublication(result.request);
+            if (resumed !== true) {
+              throw new SymphonyError(
+                "conflict",
+                "Approved publication could not be resumed from a pending completion report",
+              );
+            }
           }
           if (decision === "reject" && !result.replayed) {
             await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);

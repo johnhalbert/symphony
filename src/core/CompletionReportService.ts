@@ -183,8 +183,6 @@ export class CompletionReportService {
         for (const operation of pendingOperations) {
           enqueuedPendingOperations.push(await this.options.writebackOutbox.enqueueOnce(operation));
         }
-        await this.processAndVerifyPendingPublicationApprovalWritebacks(pendingOperations);
-        const approvalRequest = await this.requestPublicationApproval(report, context, publicationInput);
         lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
           phase: "blocked",
           blockedReason: PUBLICATION_APPROVAL_BLOCKED_REASON,
@@ -192,6 +190,8 @@ export class CompletionReportService {
           completionReports: upsertCompletionReport(existingLifecycle?.completionReports ?? [], pendingReport),
           summaryPointers: summaryPointersFor(context, inputPullRequest, null, existingLifecycle),
         });
+        await this.processAndVerifyPendingPublicationApprovalWritebacks(pendingOperations);
+        const approvalRequest = await this.requestPublicationApproval(report, context, publicationInput);
         return this.waitForServiceOwnedPublicationApproval({
           approvalRequest,
           pendingReport,
