@@ -146,7 +146,13 @@ export type PendingPublicationApprovalRecoveryResult =
     }
   | {
       recovered: false;
-      reason: "not_applicable" | "no_pending_report" | "missing_run" | "audit_not_settled" | "approval_not_pending";
+      reason:
+        | "not_applicable"
+        | "no_pending_report"
+        | "missing_run"
+        | "approval_already_pending"
+        | "audit_not_settled"
+        | "approval_not_pending";
       report?: IssueCompletionReportRecord;
     };
 
@@ -367,6 +373,18 @@ export class CompletionReportService {
     const run = await this.options.runStore?.getRun(pendingReport.runId);
     if (!run) {
       return { recovered: false, reason: "missing_run", report: pendingReport };
+    }
+    const linkedPendingApproval =
+      isAwaitingPublicationApprovalLifecycle(lifecycle) && run.pendingApprovalRequestId && this.options.operatorApproval?.get
+        ? await this.options.operatorApproval.get(run.pendingApprovalRequestId)
+        : null;
+    if (
+      linkedPendingApproval &&
+      linkedPendingApproval.requestId === run.pendingApprovalRequestId &&
+      linkedPendingApproval.status === "pending" &&
+      approvalMatchesReport(linkedPendingApproval, pendingReport)
+    ) {
+      return { recovered: false, reason: "approval_already_pending", report: pendingReport };
     }
     const context = recoveryContextFor({
       issue: input.issue,

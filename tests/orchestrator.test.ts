@@ -891,6 +891,103 @@ describe("Orchestrator", () => {
     },
   );
 
+  it("skips recovery for an already linked pending publication approval wait", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.requiredForPublication = true;
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logs: string[] = [];
+    const logger = new StructuredLogger((line) => logs.push(line));
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter(() => undefined);
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const approvalStore = new FileOperatorApprovalStore(stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    await startApprovalRun(runStore, candidate, "run-1", root);
+    const { record: approval } = await approvalStore.requestOrGetPending(
+      {
+        issueId: candidate.id,
+        issueIdentifier: candidate.identifier,
+        runId: "run-1",
+        evidenceCursor: "idem-1",
+        action: {
+          kind: "push_and_pr",
+          branchName: "symphony/TEST-1",
+          baseBranch: "main",
+          workspacePath: path.join(root, "workspace"),
+          title: `${candidate.identifier}: ${candidate.title}`,
+          evidenceCursor: "idem-1",
+          summaryPreview: "Implemented the requested handoff.",
+          changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
+          plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+        },
+      },
+      null,
+    );
+    await runStore.updateRun("run-1", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:00.000Z",
+      metadata: {
+        pendingApprovalRequestId: approval.requestId,
+        pendingApprovalRequestedAt: approval.requestedAt,
+      },
+    });
+    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    const lifecycleBefore = await lifecycleStore.get(candidate.id);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      operatorApproval,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await orchestrator.refreshNow();
+
+      expect(await approvalStore.list()).toHaveLength(1);
+      expect(await outboxStore.list()).toEqual([]);
+      expect(writer.comments).toEqual([]);
+      expect(writer.transitions).toEqual([]);
+      await expect(lifecycleStore.get(candidate.id)).resolves.toEqual(lifecycleBefore);
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+        pendingApprovalRequestId: approval.requestId,
+        pendingApprovalRequestedAt: approval.requestedAt,
+      });
+      expect(logs.some((line) => line.includes("pending publication approval recovered"))).toBe(false);
+      expect(orchestrator.snapshot().counts.running).toBe(0);
+    } finally {
+      await orchestrator.stop();
+    }
+  });
+
   it("clears blocked lifecycle counters after a human unblock transition", async () => {
     const config = testConfig(root);
     config.reviewLoop.blockedStates = ["Blocked"];
