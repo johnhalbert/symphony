@@ -608,6 +608,50 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("does not redispatch issues with pending publication approval before Linear reaches Blocked", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "In Progress" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
+    });
+  });
+
   it("clears blocked lifecycle counters after a human unblock transition", async () => {
     const config = testConfig(root);
     config.reviewLoop.blockedStates = ["Blocked"];

@@ -100,15 +100,16 @@ describe("OperatorApprovalService", () => {
     expect(transcript.events.at(-1)).toMatchObject({ eventType: "approval_resolved" });
   });
 
-  it("marks approvals stale when the run is no longer active", async () => {
+  it("allows approvals to be resolved after the worker run exits", async () => {
     const wait = service.waitForPublicationApproval(request());
     const pending = await waitForPending();
-    const waiterError = wait.catch((error: unknown) => error);
-    await runStore.updateRun("run-1", { status: "failed", completedAt: "2026-01-01T00:00:00Z" });
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00Z" });
 
-    await expect(service.resolve(pending.requestId, "approve")).rejects.toMatchObject({ code: "conflict" });
-    await expect(waiterError).resolves.toMatchObject({ code: "invalid_request" });
-    await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "stale" });
+    await expect(service.resolve(pending.requestId, "approve")).resolves.toMatchObject({
+      request: { status: "approved" },
+    });
+    await expect(wait).resolves.toMatchObject({ status: "approved" });
+    await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "approved" });
   });
 
   async function waitForPending() {

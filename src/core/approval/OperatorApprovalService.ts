@@ -339,7 +339,6 @@ export class OperatorApprovalService {
   private async staleReason(record: OperatorApprovalRecord): Promise<string | null> {
     const run = await this.getRun(record.runId);
     if (!run) return "run record is missing";
-    if (run.status !== "running") return `run status is ${run.status}`;
     if (run.cancellationRequestedAt) return "run cancellation has been requested";
     const latest = await this.options.store.findPendingForRun(record.runId);
     if (latest && latest.requestId !== record.requestId) return "approval request was superseded";

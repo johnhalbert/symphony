@@ -213,6 +213,12 @@ export class StatusServer {
           if (decision === "reject" && !result.replayed && this.options.operatorApproval?.rejectPolicy === "cancel") {
             await this.options.orchestrator.cancelIssue(result.request.issueId);
           }
+          if (decision === "approve" && result.request.status === "approved") {
+            await this.options.orchestrator.resumeApprovedPublication(result.request);
+          }
+          if (decision === "reject") {
+            await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
+          }
           sendJson(response, 200, {
             request: approvalResponse(result.request, this.options.operatorApproval?.isRequired() ?? false),
             replayed: result.replayed,

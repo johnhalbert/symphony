@@ -8,7 +8,7 @@ import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleS
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
-import type { OperatorApprovalRecord, OperatorApprovalRequestInput } from "../src/core/approval/OperatorApprovalService.js";
+import type { OperatorApprovalRecord, OperatorApprovalRequestInput, OperatorApprovalStatus } from "../src/core/approval/OperatorApprovalService.js";
 import type {
   CompletionReportPullRequestPublication,
   CompletionReportPullRequestPublicationInput,
@@ -138,7 +138,7 @@ describe("CompletionReportService", () => {
     });
   });
 
-  it("persists a pending completion report before waiting for publication approval", async () => {
+  it("persists a pending completion report and Linear audit before waiting for publication approval", async () => {
     const publisher = new FakePublisher({
       action: "created",
       url: "https://github.com/acme/symphony/pull/42",
@@ -165,9 +165,22 @@ describe("CompletionReportService", () => {
       plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
     });
     expect(publisher.inputs).toHaveLength(0);
-    expect(await outbox.list()).toHaveLength(0);
+    const pendingOperations = await outbox.list();
+    const pendingComment = pendingOperations.find((operation) => operation.kind === "comment");
+    const pendingTransition = pendingOperations.find((operation) => operation.kind === "transition");
+    expect(pendingOperations).toHaveLength(2);
+    expect(pendingComment?.kind === "comment" ? pendingComment.payload.body : "").toContain(
+      "Status: worker completion report persisted; awaiting operator approval",
+    );
+    expect(pendingTransition).toMatchObject({
+      kind: "transition",
+      payload: {
+        toState: "Blocked",
+      },
+    });
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "implementation",
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
       lastCompletionReportId: "completion-report:issue-1:idem-1",
       completionReports: [
         {
@@ -198,9 +211,10 @@ describe("CompletionReportService", () => {
       ],
     });
     expect(publisher.inputs).toHaveLength(1);
-    expect(await outbox.list()).toHaveLength(2);
+    expect(await outbox.list()).toHaveLength(4);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       phase: "review",
+      blockedReason: null,
       completionReports: [
         {
           id: "completion-report:issue-1:idem-1",
@@ -225,6 +239,152 @@ describe("CompletionReportService", () => {
       },
     });
   });
+
+  it("resumes approved publication from a stored pending report after the worker run exits", async () => {
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const { service, lifecycleStore, outbox, runStore } = fixture({
+      publisher,
+      requirePublicationApproval: true,
+    });
+    await startRun(runStore);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [pendingReportRecord()],
+      summaryPointers: {
+        workspacePath: "/tmp/workspace",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    });
+
+    const result = await service.resumeApprovedPublication({
+      approval: approvalRecord("approved"),
+      issue: issue({ state: "Blocked", branchName: "symphony/TEST-1" }),
+    });
+
+    expect(result?.replayed).toBe(false);
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      workspacePath: "/tmp/workspace",
+      branchName: "symphony/TEST-1",
+      baseBranch: "main",
+      evidenceCursor: "idem-1",
+    });
+    expect(await outbox.list()).toHaveLength(2);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      blockedReason: null,
+      completionReports: [
+        {
+          idempotencyKey: "idem-1",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "abc123",
+            branch: "symphony/TEST-1",
+          },
+          writebackOperationKeys: [
+            "comment:issue-1:run-1:completion-report:idem-1",
+            "transition:issue-1:run-1:completion-report:idem-1:In Review",
+          ],
+        },
+      ],
+    });
+    await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+    });
+  });
+
+  it("records rejection guidance from a stored pending report after the worker run exits", async () => {
+    const { service, lifecycleStore, outbox, runStore } = fixture({ requirePublicationApproval: true });
+    await startRun(runStore);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [pendingReportRecord()],
+      summaryPointers: {
+        workspacePath: "/tmp/workspace",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    });
+
+    await expect(
+      service.recordPublicationApprovalTerminal({
+        approval: approvalRecord("rejected"),
+        issue: issue({ state: "Blocked", branchName: "symphony/TEST-1" }),
+      }),
+    ).resolves.toBe(true);
+
+    const operations = await outbox.list();
+    expect(operations).toHaveLength(1);
+    expect(operations[0]?.kind === "comment" ? operations[0].payload.body : "").toContain("Status: rejected");
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "publication approval rejected",
+    });
+  });
+
+  it.each(["rejected", "cancelled"] as const)(
+    "records retry guidance when publication approval is %s",
+    async (status) => {
+      const publisher = new FakePublisher({
+        action: "created",
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headBranch: "symphony/TEST-1",
+        headSha: "abc123",
+        lastPushedAt: "2026-01-01T00:00:01Z",
+        evidenceCursor: "idem-1",
+      });
+      const operatorApproval = new DeferredOperatorApproval();
+      const { service, lifecycleStore, outbox, runStore } = fixture({
+        publisher,
+        operatorApproval,
+        requirePublicationApproval: true,
+      });
+      await startRun(runStore);
+
+      const submission = service.submitCompletionReport(report(), contextWithWorkspace());
+      await operatorApproval.waitForRequest();
+      operatorApproval.terminal(status);
+
+      await expect(submission).rejects.toMatchObject({ code: "invalid_request" });
+      expect(publisher.inputs).toHaveLength(0);
+      const operations = await outbox.list();
+      const terminalComment = operations.find(
+        (operation) =>
+          operation.kind === "comment" &&
+          operation.idempotencyKey === `comment:issue-1:run-1:completion-report:idem-1:publication-approval-${status}`,
+      );
+      expect(terminalComment?.kind === "comment" ? terminalComment.payload.body : "").toContain(`Status: ${status}`);
+      expect(terminalComment?.kind === "comment" ? terminalComment.payload.body : "").toContain("Recovery:");
+      await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: `publication approval ${status}`,
+      });
+    },
+  );
 
   it("reuses a service-discovered PR and prevents duplicate publication on replay", async () => {
     const publisher = new FakePublisher({
@@ -347,6 +507,7 @@ describe("CompletionReportService", () => {
     }
     if (options.requirePublicationApproval) {
       config.github.operatorApproval!.requiredForPublication = true;
+      config.reviewLoop.blockedStates = ["Blocked"];
     }
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
@@ -382,6 +543,60 @@ function report(overrides: Partial<CompletionReportInput> = {}): CompletionRepor
     risks: ["Reviewer handler remains out of scope."],
     idempotencyKey: "idem-1",
     ...overrides,
+  };
+}
+
+function pendingReportRecord() {
+  return {
+    id: "completion-report:issue-1:idem-1",
+    idempotencyKey: "idem-1",
+    runId: "run-1",
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    summary: "Implemented the service contract.",
+    validationEvidence: ["npm run typecheck", "npm test"],
+    acceptanceChecklist: [
+      {
+        text: "Completion reports are persisted.",
+        satisfied: true,
+        evidence: "Lifecycle store records completionReports.",
+      },
+    ],
+    changedFiles: ["src/core/CompletionReportService.ts"],
+    branchName: "symphony/TEST-1",
+    pullRequest: null,
+    risks: ["Reviewer handler remains out of scope."],
+    acceptedAt: "2026-01-01T00:00:00.000Z",
+    writebackOperationKeys: [],
+  };
+}
+
+function approvalRecord(status: OperatorApprovalStatus): OperatorApprovalRecord {
+  return {
+    requestId: "approval-1",
+    status,
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    runId: "run-1",
+    evidenceCursor: "idem-1",
+    dedupeKey: "run-1:idem-1:push_and_pr",
+    action: {
+      kind: "push_and_pr",
+      branchName: "symphony/TEST-1",
+      baseBranch: "main",
+      workspacePath: "/tmp/workspace",
+      title: "TEST-1: Do work",
+      evidenceCursor: "idem-1",
+      summaryPreview: "Implemented the service contract.",
+      changedFiles: ["src/core/CompletionReportService.ts"],
+      plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+    },
+    requestedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: null,
+    resolvedAt: status === "pending" ? null : "2026-01-01T00:00:01.000Z",
+    resolvedBy: status === "pending" ? null : "operator",
+    decision: status === "approved" ? "approve" : status === "rejected" ? "reject" : null,
+    staleReason: status === "cancelled" ? "operator cancelled publication" : null,
   };
 }
 
@@ -466,6 +681,7 @@ class DeferredOperatorApproval {
   private readonly requestSeen: Promise<void>;
   private markRequestSeen: (() => void) | null = null;
   private resolveApproval: ((record: OperatorApprovalRecord) => void) | null = null;
+  private rejectApproval: ((error: Error) => void) | null = null;
 
   constructor() {
     this.requestSeen = new Promise((resolve) => {
@@ -476,8 +692,9 @@ class DeferredOperatorApproval {
   waitForPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
     this.requests.push(input);
     this.markRequestSeen?.();
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       this.resolveApproval = resolve;
+      this.rejectApproval = reject;
     });
   }
 
@@ -491,21 +708,11 @@ class DeferredOperatorApproval {
   approve(): void {
     const request = this.requests[0];
     if (!request || !this.resolveApproval) throw new Error("approval request is not pending");
-    this.resolveApproval({
-      requestId: "approval-1",
-      status: "approved",
-      issueId: request.issueId,
-      issueIdentifier: request.issueIdentifier,
-      runId: request.runId,
-      evidenceCursor: request.evidenceCursor,
-      dedupeKey: `${request.runId}:${request.evidenceCursor}:push_and_pr`,
-      action: request.action,
-      requestedAt: "2026-01-01T00:00:00.000Z",
-      expiresAt: null,
-      resolvedAt: "2026-01-01T00:00:01.000Z",
-      resolvedBy: "operator",
-      decision: "approve",
-      staleReason: null,
-    });
+    this.resolveApproval(approvalRecord("approved"));
+  }
+
+  terminal(status: "rejected" | "cancelled" | "stale" | "expired"): void {
+    if (!this.requests[0] || !this.rejectApproval) throw new Error("approval request is not pending");
+    this.rejectApproval(new SymphonyError("invalid_request", `Approval request is ${status}`, approvalRecord(status)));
   }
 }

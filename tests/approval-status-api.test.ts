@@ -420,6 +420,12 @@ function fakeOrchestrator(cancelled: string[], onCancel?: (issueId: string) => P
       cancelled.push(issueId);
       await onCancel?.(issueId);
     },
+    async resumeApprovedPublication() {
+      return false;
+    },
+    async recordPublicationApprovalTerminal() {
+      return false;
+    },
     async createContinuationSummary() {
       throw new Error("not implemented");
     },

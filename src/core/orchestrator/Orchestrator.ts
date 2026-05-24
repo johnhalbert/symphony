@@ -14,6 +14,7 @@ import {
   type Workspace,
 } from "../types.js";
 import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
+import { CompletionReportService, type CompletionReportPullRequestPublisher } from "../CompletionReportService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
   compareRunChronology,
@@ -46,7 +47,7 @@ import {
   PlaceholderContinuationSummarizer,
   type ContinuationSummarizer,
 } from "../summarization/ContinuationSummarizer.js";
-import type { WritebackProcessor } from "../writeback/WritebackOutbox.js";
+import { FileWritebackOutboxStore, type WritebackProcessor } from "../writeback/WritebackOutbox.js";
 import {
   planBlockedEscalationWritebacks,
   planDispatchWriteback,
@@ -56,7 +57,7 @@ import {
   planRunSucceededWritebacks,
 } from "../writeback/TransitionPolicy.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
-import { OPERATOR_REJECTED_PUBLICATION_ERROR } from "../approval/OperatorApprovalService.js";
+import { OPERATOR_REJECTED_PUBLICATION_ERROR, type OperatorApprovalRecord } from "../approval/OperatorApprovalService.js";
 
 export interface OrchestratorOptions {
   config: ServiceConfig;
@@ -71,6 +72,7 @@ export interface OrchestratorOptions {
   pullRequestClient?: PullRequestDiscoveryClient;
   pullRequestReviewClient?: PullRequestReviewEvidenceClient;
   pullRequestMergeClient?: MergePolicyGitHubClient;
+  completionReportPublisher?: CompletionReportPullRequestPublisher;
 }
 
 export interface PullRequestDiscoveryClient {
@@ -388,6 +390,43 @@ export class Orchestrator {
     if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
   }
 
+  async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
+    if (request.status !== "approved" || !this.options.lifecycleStore) return false;
+    const run = await this.options.runStore?.getRun(request.runId);
+    if (run?.status === "running") return false;
+
+    const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
+    const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
+    const publisher =
+      this.options.completionReportPublisher ??
+      createGitHubPullRequestClientForCapability(this.config, "github.publication");
+    const result = await new CompletionReportService({
+      config: this.config,
+      lifecycleStore: this.options.lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
+      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+      pullRequestPublisher: publisher,
+    }).resumeApprovedPublication({ approval: request, issue });
+    if (!result) return false;
+    await this.options.writeback?.processDue();
+    return true;
+  }
+
+  async recordPublicationApprovalTerminal(request: OperatorApprovalRecord): Promise<boolean> {
+    if (!this.options.lifecycleStore) return false;
+    const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
+    const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
+    const result = await new CompletionReportService({
+      config: this.config,
+      lifecycleStore: this.options.lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
+      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+    }).recordPublicationApprovalTerminal({ approval: request, issue });
+    if (!result) return false;
+    await this.options.writeback?.processDue();
+    return true;
+  }
+
   async createContinuationSummary(
     issueOrId: Pick<Issue, "id" | "identifier" | "title"> | string,
     summarizer: ContinuationSummarizer = new PlaceholderContinuationSummarizer(),
@@ -649,6 +688,9 @@ export class Orchestrator {
     const phase = phaseForIssueState(issue.state, this.config);
     const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
     if (blockedByLifecycle) {
+      if (lifecycle.blockedReason === "awaiting operator approval for PR publication") {
+        return false;
+      }
       if (this.config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
         return false;
       }
@@ -2241,6 +2283,28 @@ function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | 
     cancelFailedReason,
     cancelFailedSource,
     activitySnapshot: terminalActivitySnapshot(entry),
+  };
+}
+
+function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {
+  const title = request.action.title.startsWith(`${request.issueIdentifier}: `)
+    ? request.action.title.slice(request.issueIdentifier.length + 2)
+    : request.action.title;
+  return {
+    id: request.issueId,
+    identifier: request.issueIdentifier,
+    title,
+    description: null,
+    priority: null,
+    state: "Blocked",
+    branchName: request.action.branchName,
+    url: null,
+    assigneeId: null,
+    assignedToWorker: false,
+    labels: [],
+    blockedBy: [],
+    createdAt: null,
+    updatedAt: null,
   };
 }
 

@@ -60,6 +60,13 @@ export interface CompletionReportWritebackDetails {
   risks: string[];
 }
 
+export interface PublicationApprovalActionDetails {
+  branchName: string;
+  baseBranch: string;
+  workspacePath: string;
+  title: string;
+}
+
 export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewWritebackOperation | null {
   if (!config.writeback.enabled || !sameName(issue.state, "Todo")) return null;
   return {
@@ -121,7 +128,12 @@ export function planCompletionReportAcceptedWritebacks(
   config: ServiceConfig,
   report: string | CompletionReportWritebackDetails | null = null,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled || !isStateIn(context.issue.state, [config.writeback.dispatchState])) return [];
+  if (
+    !config.writeback.enabled ||
+    !isStateIn(context.issue.state, [config.writeback.dispatchState, ...config.reviewLoop.blockedStates])
+  ) {
+    return [];
+  }
 
   const reviewState = config.reviewLoop.reviewStates[0];
   if (!reviewState) return [];
@@ -159,9 +171,109 @@ export function planCompletionReportAcceptedWritebacks(
       issueId: context.issue.id,
       runId: context.runId,
       payload: {
-        fromStates: [config.writeback.dispatchState],
+        fromStates: uniqueStates([config.writeback.dispatchState, ...config.reviewLoop.blockedStates]),
         toState: reviewState,
         reason: "Symphony completion report accepted",
+      },
+    },
+  ];
+}
+
+export function planCompletionReportPublicationApprovalPendingWritebacks(
+  context: RunWritebackContext,
+  config: ServiceConfig,
+  report: CompletionReportWritebackDetails,
+  action: PublicationApprovalActionDetails,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || !isStateIn(context.issue.state, [config.writeback.dispatchState])) return [];
+
+  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  const eventKey = `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}:publication-approval-pending`;
+  const operations: NewWritebackOperation[] = [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Publication Approval Pending",
+          "",
+          "Status: worker completion report persisted; awaiting operator approval for service-owned push/PR publication.",
+          "Symphony will not dispatch another worker while this approval is pending.",
+          "",
+          `Run: ${context.runId}`,
+          `Workspace: ${context.workspacePath ?? context.workspace?.path ?? action.workspacePath}`,
+          `Branch: ${action.branchName}`,
+          `Base branch: ${action.baseBranch}`,
+          `PR title: ${action.title}`,
+          "",
+          "Recovery:",
+          "- Approve the pending operator request to let Symphony publish the PR from the stored completion report.",
+          "- Reject or cancel the request if publication should not proceed; Symphony will leave retry instructions here.",
+          "",
+          blockedState === null
+            ? "No blocked state is configured, so Symphony recorded a lifecycle-level blocked phase without changing the tracker state."
+            : `Transitioning to non-dispatch state: ${blockedState}`,
+          ...formatCompletionReportForComment(report),
+        ].join("\n"),
+      },
+    },
+  ];
+
+  if (blockedState !== null) {
+    operations.push({
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        fromStates: [config.writeback.dispatchState],
+        toState: blockedState,
+        reason: "Symphony awaiting operator approval for PR publication",
+      },
+    });
+  }
+
+  return operations;
+}
+
+export function planCompletionReportPublicationApprovalTerminalWritebacks(
+  context: RunWritebackContext,
+  config: ServiceConfig,
+  report: CompletionReportWritebackDetails,
+  status: "rejected" | "stale" | "expired" | "cancelled",
+  reason: string | null,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+
+  const fromStates = uniqueStates([config.writeback.dispatchState, ...config.reviewLoop.blockedStates]);
+  if (!isStateIn(context.issue.state, fromStates)) return [];
+
+  const eventKey = `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}:publication-approval-${status}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Publication Approval Not Completed",
+          "",
+          `Status: ${status}`,
+          `Reason: ${reason ?? "n/a"}`,
+          "",
+          "The worker completion report remains stored, but Symphony did not publish a PR.",
+          "",
+          "Recovery:",
+          "- Inspect the stored completion report and worktree before retrying.",
+          "- Move the issue back to the implementation state when Symphony should run another worker.",
+          "- Submit a new completion report or approve a fresh publication request when ready.",
+          ...formatCompletionReportForComment(report),
+        ].join("\n"),
       },
     },
   ];

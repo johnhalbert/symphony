@@ -11,10 +11,16 @@ import type {
 import { phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
 import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
-import type { OperatorApprovalService } from "./approval/OperatorApprovalService.js";
+import type { OperatorApprovalRecord, OperatorApprovalService } from "./approval/OperatorApprovalService.js";
 import type { Issue, Workspace } from "./types.js";
-import { planCompletionReportAcceptedWritebacks } from "./writeback/TransitionPolicy.js";
+import {
+  planCompletionReportAcceptedWritebacks,
+  planCompletionReportPublicationApprovalPendingWritebacks,
+  planCompletionReportPublicationApprovalTerminalWritebacks,
+} from "./writeback/TransitionPolicy.js";
 import type { FileWritebackOutboxStore, WritebackOperation } from "./writeback/WritebackOutbox.js";
+
+const PUBLICATION_APPROVAL_BLOCKED_REASON = "awaiting operator approval for PR publication";
 
 const completionReportSchema = z.object({
   runId: z.string().trim().min(1),
@@ -99,6 +105,11 @@ export interface CompletionReportResult {
   writebackOperations: WritebackOperation[];
 }
 
+export interface PublicationApprovalResumeInput {
+  approval: OperatorApprovalRecord;
+  issue: Issue;
+}
+
 export class CompletionReportService {
   constructor(private readonly options: CompletionReportServiceOptions) {}
 
@@ -115,6 +126,9 @@ export class CompletionReportService {
     if (existing && isFinalizedCompletionReport(existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
     }
+    if (existing && this.shouldPersistBeforePublicationApproval() && isPendingPublicationApprovalLifecycle(existingLifecycle)) {
+      return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
+    }
 
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
     this.validateIssueIsAcceptingReports(context, lifecyclePhase);
@@ -122,6 +136,7 @@ export class CompletionReportService {
     let lifecycle = existingLifecycle;
 
     if (this.shouldPersistBeforePublicationApproval()) {
+      const publicationInput = this.buildPublicationInput(report, context, existingLifecycle);
       const pendingReport = buildCompletionReportRecord({
         report,
         issue: context.issue,
@@ -129,70 +144,143 @@ export class CompletionReportService {
         acceptedAt: existing?.acceptedAt ?? null,
         writebackOperationKeys: [],
       });
+      for (const operation of planCompletionReportPublicationApprovalPendingWritebacks(
+        runWritebackContext(context, report.runId),
+        this.options.config,
+        completionReportWritebackDetails(report, context.issue, inputPullRequest),
+        {
+          branchName: publicationInput.branchName,
+          baseBranch: publicationInput.baseBranch,
+          workspacePath: publicationInput.workspacePath,
+          title: publicationInput.title,
+        },
+      )) {
+        await this.options.writebackOutbox.enqueueOnce(operation);
+      }
       lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
-        phase: lifecyclePhase,
+        phase: "blocked",
+        blockedReason: PUBLICATION_APPROVAL_BLOCKED_REASON,
         lastCompletionReportId: pendingReport.id,
         completionReports: upsertCompletionReport(existingLifecycle?.completionReports ?? [], pendingReport),
         summaryPointers: summaryPointersFor(context, inputPullRequest, null, existingLifecycle),
       });
     }
 
-    const publication = await this.publishPullRequestIfNeeded(report, context, lifecycle);
-    const pullRequest = publication
-      ? pullRequestRefFromPublication(publication)
-      : inputPullRequest;
+    let publication: CompletionReportPullRequestPublication | null;
+    try {
+      publication = await this.publishPullRequestIfNeeded(report, context, lifecycle);
+    } catch (error) {
+      await this.recordPublicationApprovalTerminalIfNeeded(error, report, context, inputPullRequest);
+      throw error;
+    }
+    return this.finalizeCompletionReport({ report, context, inputPullRequest, publication, lifecycle, existing });
+  }
 
-    lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
-      phase: lifecyclePhase,
-      summaryPointers: summaryPointersFor(context, pullRequest, publication, lifecycle),
+  async resumeApprovedPublication(input: PublicationApprovalResumeInput): Promise<CompletionReportResult | null> {
+    if (input.approval.status !== "approved") return null;
+    if (!this.options.config.github.publishPullRequests) return null;
+    if (!this.options.pullRequestPublisher) {
+      throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
+    }
+
+    const lifecycle = await this.options.lifecycleStore.get(input.approval.issueId);
+    const existing = lifecycle?.completionReports.find(
+      (item) => item.runId === input.approval.runId && item.idempotencyKey === input.approval.evidenceCursor,
+    );
+    if (!lifecycle || !existing) return null;
+    if (isFinalizedCompletionReport(existing)) {
+      return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
+    }
+
+    const report = completionReportInputFromRecord(existing);
+    const context: CompletionReportActiveContext = {
+      issue: input.issue,
+      activeRunId: input.approval.runId,
+      role: "worker",
+      sessionId: null,
+      workspacePath: input.approval.action.workspacePath,
+      workspace: workspaceFromApproval(input.approval, lifecycle),
+      phase: "blocked",
+    };
+    const publicationInput = this.buildPublicationInput(report, context, lifecycle);
+    const publication = await this.options.pullRequestPublisher.publishPullRequest(publicationInput);
+    return this.finalizeCompletionReport({
+      report,
+      context,
+      inputPullRequest: normalizeInputPullRequest(report.pullRequest, report.branchName),
+      publication,
+      lifecycle,
+      existing,
     });
+  }
 
+  async recordPublicationApprovalTerminal(input: PublicationApprovalResumeInput): Promise<boolean> {
+    if (!isTerminalApprovalStatus(input.approval.status)) return false;
+    const lifecycle = await this.options.lifecycleStore.get(input.approval.issueId);
+    const existing = lifecycle?.completionReports.find(
+      (item) => item.runId === input.approval.runId && item.idempotencyKey === input.approval.evidenceCursor,
+    );
+    if (!lifecycle || !existing || isFinalizedCompletionReport(existing)) return false;
+
+    const report = completionReportInputFromRecord(existing);
+    const context: CompletionReportActiveContext = {
+      issue: input.issue,
+      activeRunId: input.approval.runId,
+      role: "worker",
+      sessionId: null,
+      workspacePath: input.approval.action.workspacePath,
+      workspace: workspaceFromApproval(input.approval, lifecycle),
+      phase: "blocked",
+    };
+    await this.enqueuePublicationApprovalTerminal(input.approval, report, context, existing.pullRequest);
+    return true;
+  }
+
+  private async finalizeCompletionReport(input: {
+    report: CompletionReportInput;
+    context: CompletionReportActiveContext;
+    inputPullRequest: CompletionReportPullRequestRef | null;
+    publication: CompletionReportPullRequestPublication | null;
+    lifecycle: ExistingIssueLifecycle;
+    existing: IssueCompletionReportRecord | undefined;
+  }): Promise<CompletionReportResult> {
+    const pullRequest = input.publication
+      ? pullRequestRefFromPublication(input.publication)
+      : input.inputPullRequest;
+    const lifecycle = await this.options.lifecycleStore.ensureIssue(input.context.issue, {
+      summaryPointers: summaryPointersFor(input.context, pullRequest, input.publication, input.lifecycle),
+    });
     const operations = planCompletionReportAcceptedWritebacks(
-      {
-        issue: context.issue,
-        runId: report.runId,
-        sessionId: context.sessionId ?? null,
-        workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
-        workspace: context.workspace ?? null,
-      },
+      runWritebackContext(input.context, input.report.runId),
       this.options.config,
-      {
-        reportId: reportIdFor(context.issue.id, report.idempotencyKey),
-        idempotencyKey: report.idempotencyKey,
-        summary: report.summary,
-        validationEvidence: report.validationEvidence,
-        acceptanceChecklist: report.acceptanceChecklist,
-        changedFiles: report.changedFiles,
-        branchName: report.branchName,
-        pullRequest,
-        risks: report.risks,
-      },
+      completionReportWritebackDetails(input.report, input.context.issue, pullRequest),
     );
     if (operations.length === 0) {
       throw new SymphonyError("invalid_request", "Completion report cannot be accepted for the current issue state");
     }
 
     const storedReport = buildCompletionReportRecord({
-      report,
-      issue: context.issue,
+      report: input.report,
+      issue: input.context.issue,
       pullRequest,
       writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
-      acceptedAt: existing?.acceptedAt ?? null,
+      acceptedAt: input.existing?.acceptedAt ?? null,
     });
     const enqueued: WritebackOperation[] = [];
     for (const operation of operations) {
       enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
     }
-    await this.recordPullRequestMetadata(context, publication);
+    await this.recordPullRequestMetadata(input.context, input.publication);
 
-    const updatedLifecycle = await this.options.lifecycleStore.updateIssue(context.issue, {
+    const updatedLifecycle = await this.options.lifecycleStore.updateIssue(input.context.issue, {
       phase: "review",
+      blockedReason: null,
       incompleteTurnCount: 0,
       lastCompletionReportId: storedReport.id,
       completionReports: upsertCompletionReport(lifecycle.completionReports, storedReport),
-      summaryPointers: summaryPointersFor(context, pullRequest, publication, lifecycle),
+      summaryPointers: summaryPointersFor(input.context, pullRequest, input.publication, lifecycle),
     });
-    await appendLaneMemoTelemetry(this.options.runStore, context.activeRunId, updatedLifecycle, "completion_report");
+    await appendLaneMemoTelemetry(this.options.runStore, input.context.activeRunId, updatedLifecycle, "completion_report");
 
     return { accepted: true, replayed: false, report: storedReport, writebackOperations: enqueued };
   }
@@ -227,10 +315,36 @@ export class CompletionReportService {
     existingLifecycle: ExistingIssueLifecycle,
   ): Promise<CompletionReportPullRequestPublication | null> {
     if (!this.options.config.github.publishPullRequests) return null;
+    const publicationInput = this.buildPublicationInput(report, context, existingLifecycle);
+    await this.options.operatorApproval?.waitForPublicationApproval({
+      issueId: context.issue.id,
+      issueIdentifier: context.issue.identifier,
+      runId: context.activeRunId,
+      evidenceCursor: report.idempotencyKey,
+      action: {
+        kind: "push_and_pr",
+        branchName: publicationInput.branchName,
+        baseBranch: publicationInput.baseBranch,
+        workspacePath: publicationInput.workspacePath,
+        title: publicationInput.title,
+        evidenceCursor: report.idempotencyKey,
+        summaryPreview: report.summary.length <= 240 ? report.summary : `${report.summary.slice(0, 237)}...`,
+        changedFiles: report.changedFiles,
+        plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+      },
+    });
+    return this.options.pullRequestPublisher!.publishPullRequest(publicationInput);
+  }
+
+  private buildPublicationInput(
+    report: CompletionReportInput,
+    context: CompletionReportActiveContext,
+    existingLifecycle: ExistingIssueLifecycle,
+  ): CompletionReportPullRequestPublicationInput {
     if (!this.options.pullRequestPublisher) {
       throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
     }
-    const workspacePath = context.workspacePath ?? context.workspace?.path ?? null;
+    const workspacePath = context.workspacePath ?? context.workspace?.path ?? existingLifecycle?.summaryPointers.workspacePath ?? null;
     if (!workspacePath) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree workspace path");
     }
@@ -247,7 +361,7 @@ export class CompletionReportService {
     if (!baseBranch) {
       throw new SymphonyError("invalid_request", "PR publication requires a base branch");
     }
-    const publicationInput = {
+    return {
       workspacePath,
       branchName,
       baseBranch,
@@ -255,24 +369,6 @@ export class CompletionReportService {
       body: formatPullRequestBody(report, context),
       evidenceCursor: report.idempotencyKey,
     };
-    await this.options.operatorApproval?.waitForPublicationApproval({
-      issueId: context.issue.id,
-      issueIdentifier: context.issue.identifier,
-      runId: context.activeRunId,
-      evidenceCursor: report.idempotencyKey,
-      action: {
-        kind: "push_and_pr",
-        branchName,
-        baseBranch,
-        workspacePath,
-        title: publicationInput.title,
-        evidenceCursor: report.idempotencyKey,
-        summaryPreview: report.summary.length <= 240 ? report.summary : `${report.summary.slice(0, 237)}...`,
-        changedFiles: report.changedFiles,
-        plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
-      },
-    });
-    return this.options.pullRequestPublisher.publishPullRequest(publicationInput);
   }
 
   private shouldPersistBeforePublicationApproval(): boolean {
@@ -311,6 +407,43 @@ export class CompletionReportService {
       baseRef: context.workspace?.baseRef ?? null,
     });
   }
+
+  private async recordPublicationApprovalTerminalIfNeeded(
+    error: unknown,
+    report: CompletionReportInput,
+    context: CompletionReportActiveContext,
+    pullRequest: CompletionReportPullRequestRef | null,
+  ): Promise<void> {
+    const approval = error instanceof SymphonyError ? approvalRecordFromDetails(error.details) : null;
+    if (!approval || !["rejected", "stale", "expired", "cancelled"].includes(approval.status)) return;
+    await this.enqueuePublicationApprovalTerminal(approval, report, context, pullRequest);
+  }
+
+  private async enqueuePublicationApprovalTerminal(
+    approval: OperatorApprovalRecord,
+    report: CompletionReportInput,
+    context: CompletionReportActiveContext,
+    pullRequest: CompletionReportPullRequestRef | null,
+  ): Promise<void> {
+    if (!isTerminalApprovalStatus(approval.status)) return;
+    const issue = {
+      ...context.issue,
+      state: this.options.config.reviewLoop.blockedStates[0] ?? context.issue.state,
+    };
+    for (const operation of planCompletionReportPublicationApprovalTerminalWritebacks(
+      runWritebackContext({ ...context, issue }, report.runId),
+      this.options.config,
+      completionReportWritebackDetails(report, issue, pullRequest),
+      approval.status,
+      approval.staleReason,
+    )) {
+      await this.options.writebackOutbox.enqueueOnce(operation);
+    }
+    await this.options.lifecycleStore.updateIssue(context.issue, {
+      phase: "blocked",
+      blockedReason: `publication approval ${approval.status}`,
+    });
+  }
 }
 
 function parseCompletionReport(input: unknown): CompletionReportInput {
@@ -327,6 +460,16 @@ function reportIdFor(issueId: string, idempotencyKey: string): string {
 
 function isFinalizedCompletionReport(report: IssueCompletionReportRecord): boolean {
   return report.writebackOperationKeys.length > 0;
+}
+
+function isPendingPublicationApprovalLifecycle(lifecycle: ExistingIssueLifecycle): boolean {
+  return lifecycle?.phase === "blocked" && lifecycle.blockedReason === PUBLICATION_APPROVAL_BLOCKED_REASON;
+}
+
+function isTerminalApprovalStatus(
+  status: OperatorApprovalRecord["status"],
+): status is "rejected" | "stale" | "expired" | "cancelled" {
+  return status === "rejected" || status === "stale" || status === "expired" || status === "cancelled";
 }
 
 function buildCompletionReportRecord(input: {
@@ -368,11 +511,12 @@ function summaryPointersFor(
   existingLifecycle: ExistingIssueLifecycle,
 ) {
   return {
-    workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
-    branchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
-    gitBranchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
-    repoPath: context.workspace?.repoPath ?? null,
-    baseRef: context.workspace?.baseRef ?? null,
+    workspacePath: context.workspacePath ?? context.workspace?.path ?? existingLifecycle?.summaryPointers.workspacePath ?? null,
+    branchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? existingLifecycle?.summaryPointers.branchName ?? null,
+    gitBranchName:
+      context.workspace?.gitBranchName ?? context.issue.branchName ?? existingLifecycle?.summaryPointers.gitBranchName ?? null,
+    repoPath: context.workspace?.repoPath ?? existingLifecycle?.summaryPointers.repoPath ?? null,
+    baseRef: context.workspace?.baseRef ?? existingLifecycle?.summaryPointers.baseRef ?? null,
     lastRunId: context.activeRunId,
     prUrl: pullRequest?.url ?? null,
     prNumber: pullRequest?.number ?? null,
@@ -411,6 +555,68 @@ function pullRequestRefFromPublication(publication: CompletionReportPullRequestP
     headSha: publication.headSha,
     branch: publication.headBranch,
   };
+}
+
+function runWritebackContext(context: CompletionReportActiveContext, runId: string) {
+  return {
+    issue: context.issue,
+    runId,
+    sessionId: context.sessionId ?? null,
+    workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
+    workspace: context.workspace ?? null,
+  };
+}
+
+function completionReportWritebackDetails(
+  report: CompletionReportInput,
+  issue: Issue,
+  pullRequest: CompletionReportPullRequestRef | null,
+) {
+  return {
+    reportId: reportIdFor(issue.id, report.idempotencyKey),
+    idempotencyKey: report.idempotencyKey,
+    summary: report.summary,
+    validationEvidence: report.validationEvidence,
+    acceptanceChecklist: report.acceptanceChecklist,
+    changedFiles: report.changedFiles,
+    branchName: report.branchName,
+    pullRequest,
+    risks: report.risks,
+  };
+}
+
+function completionReportInputFromRecord(record: IssueCompletionReportRecord): CompletionReportInput {
+  return {
+    runId: record.runId,
+    issueId: record.issueId,
+    summary: record.summary,
+    validationEvidence: record.validationEvidence,
+    acceptanceChecklist: record.acceptanceChecklist,
+    changedFiles: record.changedFiles,
+    branchName: record.branchName,
+    pullRequest: record.pullRequest,
+    risks: record.risks,
+    idempotencyKey: record.idempotencyKey,
+  };
+}
+
+function workspaceFromApproval(approval: OperatorApprovalRecord, lifecycle: NonNullable<ExistingIssueLifecycle>): Workspace {
+  return {
+    path: approval.action.workspacePath,
+    workspaceKey: lifecycle.summaryPointers.workspaceKey ?? approval.issueIdentifier,
+    createdNow: false,
+    issueId: approval.issueId,
+    issueIdentifier: approval.issueIdentifier,
+    gitBranchName: approval.action.branchName,
+    baseRef: approval.action.baseBranch,
+    ...(lifecycle.summaryPointers.repoPath === null ? {} : { repoPath: lifecycle.summaryPointers.repoPath }),
+  };
+}
+
+function approvalRecordFromDetails(details: unknown): OperatorApprovalRecord | null {
+  if (typeof details !== "object" || details === null) return null;
+  const record = details as Partial<OperatorApprovalRecord>;
+  return typeof record.requestId === "string" && typeof record.status === "string" ? (record as OperatorApprovalRecord) : null;
 }
 
 function formatPullRequestBody(report: CompletionReportInput, context: CompletionReportActiveContext): string {
