@@ -70,9 +70,10 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       store: new FileOperatorApprovalStore(config.workspace.stateDir),
       runStore,
     });
+    const approvalRequiredForPublication = config.github.operatorApproval?.requiredForPublication ?? false;
     const pullRequestPublisher =
       options.pullRequestPublisher ??
-      (config.github.publishPullRequests
+      (config.github.publishPullRequests && !approvalRequiredForPublication
         ? createGitHubPullRequestClientForCapability(config, "github.publication")
         : undefined);
     const service = new CompletionReportService({

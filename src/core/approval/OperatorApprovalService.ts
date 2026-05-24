@@ -207,7 +207,7 @@ export class OperatorApprovalService {
     return operatorApprovalConfig(this.options.config).rejectPolicy;
   }
 
-  async waitForPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
+  async requestPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
     if (!this.isRequired()) {
       return {
         requestId: "",
@@ -242,7 +242,15 @@ export class OperatorApprovalService {
       await this.appendApprovalRequestEvent(record);
     }
 
+    return record;
+  }
+
+  async waitForPublicationApprovalRequest(record: OperatorApprovalRecord): Promise<OperatorApprovalRecord> {
     return this.waitForResolution(record);
+  }
+
+  async waitForPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
+    return this.waitForPublicationApprovalRequest(await this.requestPublicationApproval(input));
   }
 
   async resolve(requestId: string, decision: OperatorApprovalDecision): Promise<OperatorApprovalResolution> {

@@ -69,7 +69,6 @@ export interface ResolvedCredential {
 export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<CredentialRole, readonly CredentialCapability[]>> = {
   worker: [
     "github.discovery",
-    "github.publication",
     "linear.tracker",
     "linear.writeback",
     "cursor.runtime",
@@ -82,7 +81,7 @@ export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<CredentialRol
     "linear.writeback",
     "cursor.runtime",
   ],
-  service: ["github.merge", "linear.writeback"],
+  service: ["github.publication", "github.merge", "linear.writeback"],
 };
 
 const ROLE_NAMES: readonly CredentialRole[] = ["worker", "reviewer", "service"];

@@ -64,7 +64,7 @@ describe("approval status API", () => {
   });
 
   afterEach(async () => {
-    await rm(root, { recursive: true, force: true });
+    await rmWithRetry(root);
   });
 
   it("requires the mutation token and approves pending requests", async () => {
@@ -297,7 +297,7 @@ describe("approval status API", () => {
       });
       expect(replayResolvedEvents).toBe(firstResolvedEvents);
       expect(cancelled).toHaveLength(rejectPolicy === "cancel" ? 1 : 0);
-      expect(terminalRecords.map((record) => record.status)).toEqual(["rejected", "rejected"]);
+      expect(terminalRecords.map((record) => record.status)).toEqual(["rejected"]);
     } finally {
       await server.stop();
     }
@@ -431,6 +431,153 @@ describe("approval status API", () => {
       });
       await orchestrator.refreshNow();
       expect(harness.prompts).toHaveLength(1);
+      expect(orchestrator.snapshot().counts.retrying).toBe(0);
+    } finally {
+      await server.stop();
+      await orchestrator.stop();
+    }
+  });
+
+  it("approves live pending publication after a Blocked reconciliation tick without cancelling the worker", async () => {
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-live",
+    });
+    const harness = new LiveCompletionReportHarness(lifecycleStore, outboxStore, runStore, publisher, service, writeback);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      completionReportPublisher: publisher,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      writebackOutbox: outboxStore,
+      operatorApproval: service,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: {
+        activeStates: ["Todo", "In Progress"],
+        handoffStates: ["In Review"],
+        reviewStates: ["In Review"],
+        blockedStates: ["Blocked"],
+        terminalStates: ["Done"],
+      },
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      await orchestrator.refreshNow();
+      const pending = await waitForPendingRun(store, "live-report-run");
+      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+      expect(orchestrator.snapshot().counts.running).toBe(1);
+
+      await orchestrator.refreshNow();
+      expect(orchestrator.snapshot().counts.running).toBe(1);
+      const runningRun = await runStore.getRun("live-report-run");
+      expect(runningRun).toMatchObject({ status: "running", pendingApprovalRequestId: pending.requestId });
+      expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: "awaiting operator approval for PR publication",
+        incompleteTurnCount: 0,
+      });
+
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as { replayed: boolean; request: { status: string } };
+
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({ replayed: false, request: { status: "approved" } });
+      await waitFor(() => publisher.inputs.length === 1, "service-owned live publication");
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "live worker approval exit");
+      expect(publisher.inputs[0]).toMatchObject({
+        branchName: "symphony/TEST-1",
+        baseBranch: "main",
+        evidenceCursor: "idem-live",
+      });
+      const transitionStates = writer.transitions.map((transition) => transition.toState);
+      expect(transitionStates.slice(0, 2)).toEqual(["Todo", "Blocked"]);
+      expect(transitionStates).toContain("In Review");
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "review",
+        blockedReason: null,
+        incompleteTurnCount: 0,
+        completionReports: [
+          expect.objectContaining({
+            runId: "live-report-run",
+            idempotencyKey: "idem-live",
+            pullRequest: {
+              url: "https://github.com/acme/symphony/pull/42",
+              number: 42,
+              headSha: "abc123",
+              branch: "symphony/TEST-1",
+            },
+          }),
+        ],
+      });
+      await expect(runStore.getRun("live-report-run")).resolves.toMatchObject({
+        status: "succeeded",
+        pendingApprovalRequestId: null,
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+      });
+
+      await orchestrator.refreshNow();
+      expect(harness.roles.filter((role) => role === "worker")).toHaveLength(1);
       expect(orchestrator.snapshot().counts.retrying).toBe(0);
     } finally {
       await server.stop();
@@ -1096,6 +1243,18 @@ describe("approval status API", () => {
     expect(predicate(), `Timed out waiting for ${description}`).toBe(true);
   }
 
+  async function rmWithRetry(target: string): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await rm(target, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if (attempt === 2) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  }
+
   function statusServer(
     options: {
       cancelled?: string[];
@@ -1207,6 +1366,7 @@ function fakeOrchestrator(
 class LiveCompletionReportHarness implements AgentHarness {
   readonly id = "live-completion-report";
   readonly prompts: string[] = [];
+  readonly roles: string[] = [];
 
   constructor(
     private readonly lifecycleStore: FileIssueLifecycleStore,
@@ -1219,6 +1379,12 @@ class LiveCompletionReportHarness implements AgentHarness {
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.prompts.push(prompt);
+    this.roles.push(ctx.role);
+    if (ctx.role === "reviewer") {
+      yield { type: "session_started", sessionId: "live-review-session", runId: "live-review-run" };
+      yield { type: "completed" };
+      return;
+    }
     yield { type: "session_started", sessionId: "live-report-session", runId: "live-report-run" };
     await new CompletionReportService({
       config: ctx.config,

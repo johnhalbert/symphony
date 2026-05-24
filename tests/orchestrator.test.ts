@@ -1183,7 +1183,7 @@ describe("Orchestrator", () => {
     });
     await waitFor(() => orchestrator.snapshot().counts.running === 0, "approval-rejected worker exit");
 
-    const finalRun = await waitForRunRecord(runStore, "report-run-1");
+    const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
       status: "failed",
       completedAt: rejectedAt,
@@ -1280,7 +1280,7 @@ describe("Orchestrator", () => {
     await orchestrator.recordPublicationApprovalTerminal(result.request);
     await waitFor(() => orchestrator.snapshot().counts.running === 0, "approval-rejected cancel-policy worker exit");
 
-    const finalRun = await waitForRunRecord(runStore, "report-run-1");
+    const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
       status: "cancelled",
       completedAt: expect.any(String),
@@ -3451,6 +3451,20 @@ async function waitForRunRecord(store: FileRunTranscriptStore, runId: string, ti
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting for run record ${runId}`);
+}
+
+async function waitForTerminalRunRecord(store: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const run = await store.getRun(runId);
+      if (run && run.status !== "running") return run;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for terminal run record ${runId}`);
 }
 
 async function settleOrchestratorExit(): Promise<void> {

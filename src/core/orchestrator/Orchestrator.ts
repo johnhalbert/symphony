@@ -16,6 +16,7 @@ import {
 import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
 import {
   CompletionReportService,
+  PUBLICATION_APPROVAL_BLOCKED_REASON,
   isFinalizedCompletionReport,
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
@@ -396,9 +397,6 @@ export class Orchestrator {
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
-    const run = await this.options.runStore?.getRun(request.runId);
-    if (run?.status === "running") return false;
-
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
     const publisher =
@@ -582,8 +580,15 @@ export class Orchestrator {
       const latest = byId.get(issueId);
       if (!latest) continue;
       entry.issue = latest;
+      const preservePendingApprovalWorker =
+        entry.role === "worker" && (await this.hasPendingPublicationApprovalHandoff(entry));
       if (isStateIn(latest.state, this.config.tracker.terminalStates)) {
         await this.terminateRunningIssue(issueId, true, "terminal state");
+      } else if (preservePendingApprovalWorker) {
+        const now = new Date();
+        entry.lastEvent = "approval_request";
+        entry.lastMessage = "Awaiting operator approval for push/PR";
+        entry.lastEventAt = now;
       } else if (entry.role === "worker" && isStateIn(latest.state, this.config.tracker.handoffStates)) {
         await this.terminateRunningIssue(issueId, false, "handoff state");
       } else if (entry.role === "worker" && !latest.assignedToWorker) {
@@ -631,6 +636,20 @@ export class Orchestrator {
     if (!runId || !this.options.runStore) return false;
     const run = await this.options.runStore.getRun(runId);
     return Boolean(run?.pendingApprovalRequestId);
+  }
+
+  private async hasPendingPublicationApprovalHandoff(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return false;
+    const lifecycle = await store.get(entry.issue.id);
+    if (!lifecycle || lifecycle.blockedReason !== PUBLICATION_APPROVAL_BLOCKED_REASON) return false;
+    const pendingReport = lifecycle.completionReports.find(
+      (report) => report.runId === runId && !isFinalizedCompletionReport(report),
+    );
+    if (!pendingReport) return false;
+    entry.lifecycle = lifecycle;
+    return true;
   }
 
   private async terminateRunningIssue(issueId: string, cleanupWorkspace: boolean, reason: string): Promise<void> {
@@ -1419,6 +1438,7 @@ export class Orchestrator {
   private async recordIncompleteTurn(entry: RunningEntry): Promise<void> {
     const store = this.options.lifecycleStore;
     if (!store) return;
+    if (await this.hasPendingPublicationApprovalHandoff(entry)) return;
     const refreshed = await this.refreshEntryIssue(entry, "incomplete turn refresh");
     if (!refreshed || !this.isImplementationActive(entry.issue)) {
       await this.updateLifecycle(entry, { phase: phaseForIssueState(entry.issue.state, this.config) });

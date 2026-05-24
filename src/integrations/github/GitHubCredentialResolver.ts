@@ -9,7 +9,7 @@ export type GitHubCredentialCapability = Extract<CredentialCapability, `github.$
 
 export const GITHUB_CREDENTIAL_CAPABILITY_OWNERS: Readonly<Record<GitHubCredentialCapability, CredentialRole>> = {
   "github.discovery": "worker",
-  "github.publication": "worker",
+  "github.publication": "service",
   "github.review_evidence_read": "reviewer",
   "github.review_feedback_write": "reviewer",
   "github.merge": "service",

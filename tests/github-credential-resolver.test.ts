@@ -58,13 +58,13 @@ describe("GitHub credential resolver", () => {
           roles: {
             worker: {
               "github.discovery": "discovery",
-              "github.publication": "publication",
             },
             reviewer: {
               "github.review_evidence_read": "review-read",
               "github.review_feedback_write": "feedback-write",
             },
             service: {
+              "github.publication": "publication",
               "github.merge": "merge",
             },
           },
@@ -150,6 +150,6 @@ function githubCapabilities(): GitHubCredentialCapability[] {
 }
 
 function expectedRole(capability: GitHubCredentialCapability): "worker" | "reviewer" | "service" {
-  if (capability === "github.merge") return "service";
-  return capability === "github.discovery" || capability === "github.publication" ? "worker" : "reviewer";
+  if (capability === "github.publication" || capability === "github.merge") return "service";
+  return capability === "github.discovery" ? "worker" : "reviewer";
 }

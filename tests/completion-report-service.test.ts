@@ -145,7 +145,7 @@ describe("CompletionReportService", () => {
     });
   });
 
-  it("persists a pending completion report and Linear audit before waiting for publication approval", async () => {
+  it("persists a pending completion report and Linear audit before waiting for service-owned publication approval", async () => {
     const publisher = new FakePublisher({
       action: "created",
       url: "https://github.com/acme/symphony/pull/42",
@@ -165,6 +165,7 @@ describe("CompletionReportService", () => {
 
     const submission = service.submitCompletionReport(report(), contextWithWorkspace());
     const approvalRequest = await operatorApproval.waitForRequest();
+    await operatorApproval.waitForWaiter();
 
     expect(approvalRequest.action).toMatchObject({
       kind: "push_and_pr",
@@ -210,45 +211,45 @@ describe("CompletionReportService", () => {
     expect(result.replayed).toBe(false);
     expect(result.report).toMatchObject({
       id: "completion-report:issue-1:idem-1",
-      pullRequest: {
-        url: "https://github.com/acme/symphony/pull/42",
-        number: 42,
-        headSha: "abc123",
-        branch: "symphony/TEST-1",
-      },
-      writebackOperationKeys: [
-        "comment:issue-1:run-1:completion-report:idem-1",
-        "transition:issue-1:run-1:completion-report:idem-1:In Review",
-      ],
+      pullRequest: null,
+      writebackOperationKeys: [],
     });
-    expect(publisher.inputs).toHaveLength(1);
-    expect(await outbox.list()).toHaveLength(4);
+    expect(publisher.inputs).toHaveLength(0);
+    expect(await outbox.list()).toHaveLength(2);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "review",
-      blockedReason: null,
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
       completionReports: [
         {
           id: "completion-report:issue-1:idem-1",
-          pullRequest: {
-            url: "https://github.com/acme/symphony/pull/42",
-            number: 42,
-            headSha: "abc123",
-            branch: "symphony/TEST-1",
-          },
-          writebackOperationKeys: [
-            "comment:issue-1:run-1:completion-report:idem-1",
-            "transition:issue-1:run-1:completion-report:idem-1:In Review",
-          ],
+          pullRequest: null,
+          writebackOperationKeys: [],
         },
       ],
-      summaryPointers: {
-        prUrl: "https://github.com/acme/symphony/pull/42",
-        prNumber: 42,
-        prHeadSha: "abc123",
-        prBranch: "symphony/TEST-1",
-        lastEvidenceCursor: "idem-1",
-      },
     });
+  });
+
+  it("does not create an awaiting approval lifecycle or approval request when pending Linear audit writeback fails", async () => {
+    const operatorApproval = new DeferredOperatorApproval();
+    const { service, lifecycleStore, outbox, runStore } = fixture({
+      operatorApproval,
+      requirePublicationApproval: true,
+      writer: new FailingWriter(),
+    });
+    await startRun(runStore);
+
+    await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
+      code: "tracker_error",
+    });
+
+    const operations = await outbox.list();
+    expect(operations).toHaveLength(2);
+    expect(operations.map((operation) => operation.status)).toEqual(["retrying", "retrying"]);
+    expect(operatorApproval.requests).toHaveLength(0);
+    expect((await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null).toBeNull();
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle?.blockedReason).not.toBe("awaiting operator approval for PR publication");
+    expect(lifecycle?.completionReports ?? []).toHaveLength(0);
   });
 
   it("resumes approved publication from a stored pending report after the worker run exits", async () => {
@@ -378,6 +379,7 @@ describe("CompletionReportService", () => {
 
       const submission = service.submitCompletionReport(report(), contextWithWorkspace());
       await operatorApproval.waitForRequest();
+      await operatorApproval.waitForWaiter();
       operatorApproval.terminal(status);
 
       await expect(submission).rejects.toMatchObject({ code: "invalid_request" });
@@ -502,8 +504,9 @@ describe("CompletionReportService", () => {
   function fixture(
     options: {
       publisher?: CompletionReportPullRequestPublisher;
-      operatorApproval?: Pick<DeferredOperatorApproval, "waitForPublicationApproval">;
+      operatorApproval?: Pick<DeferredOperatorApproval, "requestPublicationApproval" | "waitForPublicationApprovalRequest">;
       requirePublicationApproval?: boolean;
+      writer?: TrackerWriter;
     } = {},
   ) {
     const config = testConfig(root);
@@ -518,12 +521,14 @@ describe("CompletionReportService", () => {
     }
     if (options.requirePublicationApproval) {
       config.github.operatorApproval!.requiredForPublication = true;
+      config.github.publishPullRequests = true;
       config.reviewLoop.blockedStates = ["Blocked"];
     }
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
-    const writer = new StateChangingWriter();
+    const stateWriter = new StateChangingWriter();
+    const writer = options.writer ?? stateWriter;
     const writebackProcessor = new WritebackProcessor(
       outbox,
       writer,
@@ -539,7 +544,7 @@ describe("CompletionReportService", () => {
       ...(options.publisher === undefined ? {} : { pullRequestPublisher: options.publisher }),
       ...(options.operatorApproval === undefined ? {} : { operatorApproval: options.operatorApproval }),
     });
-    return { service, lifecycleStore, outbox, runStore, writer };
+    return { service, lifecycleStore, outbox, runStore, writer: stateWriter };
   }
 });
 
@@ -701,8 +706,11 @@ class FakePublisher implements CompletionReportPullRequestPublisher {
 
 class DeferredOperatorApproval {
   readonly requests: OperatorApprovalRequestInput[] = [];
+  readonly records: OperatorApprovalRecord[] = [];
   private readonly requestSeen: Promise<void>;
+  private readonly waitSeen: Promise<void>;
   private markRequestSeen: (() => void) | null = null;
+  private markWaitSeen: (() => void) | null = null;
   private resolveApproval: ((record: OperatorApprovalRecord) => void) | null = null;
   private rejectApproval: ((error: Error) => void) | null = null;
 
@@ -710,11 +718,21 @@ class DeferredOperatorApproval {
     this.requestSeen = new Promise((resolve) => {
       this.markRequestSeen = resolve;
     });
+    this.waitSeen = new Promise((resolve) => {
+      this.markWaitSeen = resolve;
+    });
   }
 
-  waitForPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
+  async requestPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
     this.requests.push(input);
+    const record = approvalRecord("pending");
+    this.records.push(record);
     this.markRequestSeen?.();
+    return record;
+  }
+
+  waitForPublicationApprovalRequest(_record: OperatorApprovalRecord): Promise<OperatorApprovalRecord> {
+    this.markWaitSeen?.();
     return new Promise((resolve, reject) => {
       this.resolveApproval = resolve;
       this.rejectApproval = reject;
@@ -726,6 +744,10 @@ class DeferredOperatorApproval {
     const request = this.requests[0];
     if (!request) throw new Error("approval request was not captured");
     return request;
+  }
+
+  async waitForWaiter(): Promise<void> {
+    await this.waitSeen;
   }
 
   approve(): void {
@@ -752,5 +774,15 @@ class StateChangingWriter implements TrackerWriter {
   async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
     this.comments.push(input);
     return { status: "applied" };
+  }
+}
+
+class FailingWriter implements TrackerWriter {
+  async transitionIssueState(_input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+    throw new Error("linear transition failed");
+  }
+
+  async createIssueComment(_input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    throw new Error("linear comment failed");
   }
 }

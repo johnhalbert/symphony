@@ -222,7 +222,7 @@ export class StatusServer {
           if (decision === "approve" && result.request.status === "approved") {
             await this.options.orchestrator.resumeApprovedPublication(result.request);
           }
-          if (decision === "reject") {
+          if (decision === "reject" && !result.replayed) {
             await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
           }
           sendJson(response, 200, {
