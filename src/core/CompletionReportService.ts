@@ -18,9 +18,16 @@ import {
   planCompletionReportPublicationApprovalPendingWritebacks,
   planCompletionReportPublicationApprovalTerminalWritebacks,
 } from "./writeback/TransitionPolicy.js";
-import type { FileWritebackOutboxStore, WritebackOperation } from "./writeback/WritebackOutbox.js";
+import type {
+  FileWritebackOutboxStore,
+  NewWritebackOperation,
+  WritebackOperation,
+  WritebackProcessor,
+  WritebackStatus,
+} from "./writeback/WritebackOutbox.js";
 
-const PUBLICATION_APPROVAL_BLOCKED_REASON = "awaiting operator approval for PR publication";
+export const PUBLICATION_APPROVAL_BLOCKED_REASON = "awaiting operator approval for PR publication";
+const SETTLED_WRITEBACK_STATUSES = new Set<WritebackStatus>(["succeeded", "skipped"]);
 
 const completionReportSchema = z.object({
   runId: z.string().trim().min(1),
@@ -69,7 +76,8 @@ export interface CompletionReportActiveContext {
 export interface CompletionReportServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
-  writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
+  writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce" | "get">;
+  writebackProcessor?: Pick<WritebackProcessor, "processDue">;
   runStore?: Pick<RunTranscriptStore, "appendEvent" | "getRun" | "recordPullRequestEvent">;
   pullRequestPublisher?: CompletionReportPullRequestPublisher;
   operatorApproval?: Pick<OperatorApprovalService, "waitForPublicationApproval">;
@@ -126,25 +134,21 @@ export class CompletionReportService {
     if (existing && isFinalizedCompletionReport(existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
     }
-    if (existing && this.shouldPersistBeforePublicationApproval() && isPendingPublicationApprovalLifecycle(existingLifecycle)) {
-      return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
-    }
+    const resumingPendingPublication =
+      existing !== undefined &&
+      this.shouldPersistBeforePublicationApproval() &&
+      isPendingPublicationApprovalLifecycle(existingLifecycle);
 
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
-    this.validateIssueIsAcceptingReports(context, lifecyclePhase);
     const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
     let lifecycle = existingLifecycle;
+    if (!resumingPendingPublication) {
+      this.validateIssueIsAcceptingReports(context, lifecyclePhase);
+    }
 
     if (this.shouldPersistBeforePublicationApproval()) {
       const publicationInput = this.buildPublicationInput(report, context, existingLifecycle);
-      const pendingReport = buildCompletionReportRecord({
-        report,
-        issue: context.issue,
-        pullRequest: inputPullRequest,
-        acceptedAt: existing?.acceptedAt ?? null,
-        writebackOperationKeys: [],
-      });
-      for (const operation of planCompletionReportPublicationApprovalPendingWritebacks(
+      const pendingOperations = planCompletionReportPublicationApprovalPendingWritebacks(
         runWritebackContext(context, report.runId),
         this.options.config,
         completionReportWritebackDetails(report, context.issue, inputPullRequest),
@@ -154,16 +158,32 @@ export class CompletionReportService {
           workspacePath: publicationInput.workspacePath,
           title: publicationInput.title,
         },
-      )) {
-        await this.options.writebackOutbox.enqueueOnce(operation);
+      );
+      if (resumingPendingPublication) {
+        for (const operation of pendingOperations) {
+          await this.options.writebackOutbox.enqueueOnce(operation);
+        }
+        await this.processAndVerifyPendingPublicationApprovalWritebacks(pendingOperations);
+      } else {
+        const pendingReport = buildCompletionReportRecord({
+          report,
+          issue: context.issue,
+          pullRequest: inputPullRequest,
+          acceptedAt: existing?.acceptedAt ?? null,
+          writebackOperationKeys: [],
+        });
+        for (const operation of pendingOperations) {
+          await this.options.writebackOutbox.enqueueOnce(operation);
+        }
+        lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
+          phase: "blocked",
+          blockedReason: PUBLICATION_APPROVAL_BLOCKED_REASON,
+          lastCompletionReportId: pendingReport.id,
+          completionReports: upsertCompletionReport(existingLifecycle?.completionReports ?? [], pendingReport),
+          summaryPointers: summaryPointersFor(context, inputPullRequest, null, existingLifecycle),
+        });
+        await this.processAndVerifyPendingPublicationApprovalWritebacks(pendingOperations);
       }
-      lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
-        phase: "blocked",
-        blockedReason: PUBLICATION_APPROVAL_BLOCKED_REASON,
-        lastCompletionReportId: pendingReport.id,
-        completionReports: upsertCompletionReport(existingLifecycle?.completionReports ?? [], pendingReport),
-        summaryPointers: summaryPointersFor(context, inputPullRequest, null, existingLifecycle),
-      });
     }
 
     let publication: CompletionReportPullRequestPublication | null;
@@ -378,6 +398,30 @@ export class CompletionReportService {
     );
   }
 
+  private async processAndVerifyPendingPublicationApprovalWritebacks(
+    operations: NewWritebackOperation[],
+  ): Promise<void> {
+    if (operations.length === 0) return;
+    const processor = this.options.writebackProcessor;
+    if (!processor) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Publication approval requires a writeback processor to apply pending Linear audit before waiting",
+      );
+    }
+    await processor.processDue();
+    for (const operation of operations) {
+      const record = await this.options.writebackOutbox.get(operation.idempotencyKey);
+      if (!record || !SETTLED_WRITEBACK_STATUSES.has(record.status)) {
+        throw new SymphonyError("tracker_error", "Pending publication approval writeback did not complete", {
+          idempotencyKey: operation.idempotencyKey,
+          status: record?.status ?? "missing",
+          lastError: record?.lastError ?? null,
+        });
+      }
+    }
+  }
+
   private async recordPullRequestMetadata(
     context: CompletionReportActiveContext,
     publication: CompletionReportPullRequestPublication | null,
@@ -458,7 +502,7 @@ function reportIdFor(issueId: string, idempotencyKey: string): string {
   return `completion-report:${issueId}:${idempotencyKey}`;
 }
 
-function isFinalizedCompletionReport(report: IssueCompletionReportRecord): boolean {
+export function isFinalizedCompletionReport(report: IssueCompletionReportRecord): boolean {
   return report.writebackOperationKeys.length > 0;
 }
 

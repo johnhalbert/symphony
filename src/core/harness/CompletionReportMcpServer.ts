@@ -9,8 +9,10 @@ import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
-import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
+import { FileWritebackOutboxStore, WritebackProcessor } from "../writeback/WritebackOutbox.js";
+import { StructuredLogger } from "../logging/StructuredLogger.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
+import { createLinearTrackerClientForCapability } from "../../integrations/linear/LinearCredentialResolver.js";
 import { SymphonyError } from "../errors.js";
 import { FileOperatorApprovalStore, OperatorApprovalService } from "../approval/OperatorApprovalService.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
@@ -51,7 +53,18 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
+    const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writebackProcessor =
+      config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
+        ? new WritebackProcessor(
+            writebackOutbox,
+            createLinearTrackerClientForCapability(config, "linear.writeback"),
+            logger,
+            config.writeback.maxBackoffMs,
+          )
+        : undefined;
     const operatorApproval = new OperatorApprovalService({
       config,
       store: new FileOperatorApprovalStore(config.workspace.stateDir),
@@ -65,7 +78,8 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const service = new CompletionReportService({
       config,
       lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
-      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      writebackOutbox,
+      ...(writebackProcessor === undefined ? {} : { writebackProcessor }),
       runStore,
       ...(pullRequestPublisher === undefined ? {} : { pullRequestPublisher }),
       operatorApproval,

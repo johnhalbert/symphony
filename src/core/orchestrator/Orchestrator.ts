@@ -14,7 +14,11 @@ import {
   type Workspace,
 } from "../types.js";
 import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
-import { CompletionReportService, type CompletionReportPullRequestPublisher } from "../CompletionReportService.js";
+import {
+  CompletionReportService,
+  isFinalizedCompletionReport,
+  type CompletionReportPullRequestPublisher,
+} from "../CompletionReportService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
   compareRunChronology,
@@ -1516,6 +1520,7 @@ export class Orchestrator {
     const lifecycle = await store.get(entry.issue.id);
     const report = lifecycle?.completionReports.find((item) => item.runId === runId) ?? null;
     if (!lifecycle || !report) return entry.completionReportAccepted;
+    if (!isFinalizedCompletionReport(report)) return false;
 
     entry.lifecycle = lifecycle;
     entry.completionReportAccepted = true;

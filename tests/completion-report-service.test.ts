@@ -6,7 +6,14 @@ import { CompletionReportService, type CompletionReportActiveContext, type Compl
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
-import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
+import {
+  FileWritebackOutboxStore,
+  WritebackProcessor,
+  type NewWritebackOperation,
+  type WritebackOperation,
+} from "../src/core/writeback/WritebackOutbox.js";
+import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import { issue, testConfig } from "./helpers.js";
 import type { OperatorApprovalRecord, OperatorApprovalRequestInput, OperatorApprovalStatus } from "../src/core/approval/OperatorApprovalService.js";
 import type {
@@ -149,7 +156,7 @@ describe("CompletionReportService", () => {
       evidenceCursor: "idem-1",
     });
     const operatorApproval = new DeferredOperatorApproval();
-    const { service, lifecycleStore, outbox, runStore } = fixture({
+    const { service, lifecycleStore, outbox, runStore, writer } = fixture({
       publisher,
       operatorApproval,
       requirePublicationApproval: true,
@@ -169,6 +176,10 @@ describe("CompletionReportService", () => {
     const pendingComment = pendingOperations.find((operation) => operation.kind === "comment");
     const pendingTransition = pendingOperations.find((operation) => operation.kind === "transition");
     expect(pendingOperations).toHaveLength(2);
+    expect(pendingOperations.map((operation) => operation.status)).toEqual(["succeeded", "succeeded"]);
+    expect(writer.comments).toHaveLength(1);
+    expect(writer.comments[0]?.body).toContain("Symphony Publication Approval Pending");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Blocked"]);
     expect(pendingComment?.kind === "comment" ? pendingComment.payload.body : "").toContain(
       "Status: worker completion report persisted; awaiting operator approval",
     );
@@ -512,15 +523,23 @@ describe("CompletionReportService", () => {
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
+    const writer = new StateChangingWriter();
+    const writebackProcessor = new WritebackProcessor(
+      outbox,
+      writer,
+      new StructuredLogger(() => undefined),
+      config.writeback.maxBackoffMs,
+    );
     const service = new CompletionReportService({
       config,
       lifecycleStore,
       writebackOutbox: outbox,
+      ...(options.requirePublicationApproval ? { writebackProcessor } : {}),
       runStore,
       ...(options.publisher === undefined ? {} : { pullRequestPublisher: options.publisher }),
       ...(options.operatorApproval === undefined ? {} : { operatorApproval: options.operatorApproval }),
     });
-    return { service, lifecycleStore, outbox, runStore };
+    return { service, lifecycleStore, outbox, runStore, writer };
   }
 });
 
@@ -656,6 +675,10 @@ class FailingOutbox {
     this.attempted += 1;
     throw new Error("enqueue failed");
   }
+
+  async get(_idempotencyKey: string): Promise<WritebackOperation | null> {
+    return null;
+  }
 }
 
 class FakePublisher implements CompletionReportPullRequestPublisher {
@@ -714,5 +737,20 @@ class DeferredOperatorApproval {
   terminal(status: "rejected" | "cancelled" | "stale" | "expired"): void {
     if (!this.requests[0] || !this.rejectApproval) throw new Error("approval request is not pending");
     this.rejectApproval(new SymphonyError("invalid_request", `Approval request is ${status}`, approvalRecord(status)));
+  }
+}
+
+class StateChangingWriter implements TrackerWriter {
+  readonly transitions: TrackerTransitionInput[] = [];
+  readonly comments: TrackerCommentInput[] = [];
+
+  async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+    this.transitions.push(input);
+    return { status: "applied" };
+  }
+
+  async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    this.comments.push(input);
+    return { status: "applied" };
   }
 }

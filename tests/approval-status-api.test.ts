@@ -4,6 +4,12 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
 import {
+  CompletionReportService,
+  type CompletionReportPullRequestPublication,
+  type CompletionReportPullRequestPublicationInput,
+  type CompletionReportPullRequestPublisher,
+} from "../src/core/CompletionReportService.js";
+import {
   FileOperatorApprovalStore,
   OPERATOR_REJECTED_PUBLICATION_ERROR,
   OperatorApprovalService,
@@ -12,12 +18,18 @@ import {
 } from "../src/core/approval/OperatorApprovalService.js";
 import type { ServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
+import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
+import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
+import type { Issue } from "../src/core/types.js";
+import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { testConfig } from "./helpers.js";
+import { issue, testConfig } from "./helpers.js";
 
 describe("approval status API", () => {
   let root: string;
@@ -290,6 +302,141 @@ describe("approval status API", () => {
     }
   });
 
+  it("rejects publication approval through a real orchestrator without reconciling pending reports as success", async () => {
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-live",
+    });
+    const harness = new LiveCompletionReportHarness(lifecycleStore, outboxStore, runStore, publisher, service, writeback);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      writebackOutbox: outboxStore,
+      operatorApproval: service,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: {
+        activeStates: ["Todo", "In Progress"],
+        handoffStates: ["In Review"],
+        reviewStates: ["In Review"],
+        blockedStates: ["Blocked"],
+        terminalStates: ["Done"],
+      },
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      await orchestrator.refreshNow();
+      const pending = await waitForPendingRun(store, "live-report-run");
+      expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Pending"))).toBe(true);
+      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+
+      const url = `http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`;
+      const first = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const firstBody = (await first.json()) as { replayed: boolean; request: { status: string } };
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "live approval rejection");
+      const firstRun = await waitForTerminalRun(runStore, "live-report-run");
+      await waitFor(() => writer.comments.filter((comment) => comment.body.includes("Status: rejected")).length === 1, "terminal rejection comment");
+
+      const replay = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const replayBody = (await replay.json()) as { replayed: boolean; request: { status: string } };
+      const replayRun = await waitForTerminalRun(runStore, "live-report-run");
+
+      expect(first.status).toBe(200);
+      expect(firstBody).toMatchObject({ replayed: false, request: { status: "rejected" } });
+      expect(replay.status).toBe(200);
+      expect(replayBody).toMatchObject({ replayed: true, request: { status: "rejected" } });
+      expect(replayRun).toMatchObject({
+        status: "cancelled",
+        completedAt: firstRun.completedAt,
+        pendingApprovalRequestId: null,
+      });
+      expect(replayRun.status).not.toBe("succeeded");
+      expect(publisher.inputs).toEqual([]);
+      expect(writer.comments.filter((comment) => comment.body.includes("Status: rejected"))).toHaveLength(1);
+      expect(writer.comments.some((comment) => comment.dedupeKey === "live-report-run:completion-report:idem-live")).toBe(false);
+      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+      await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: "publication approval rejected",
+        incompleteTurnCount: 0,
+        completionReports: [
+          {
+            runId: "live-report-run",
+            idempotencyKey: "idem-live",
+            writebackOperationKeys: [],
+          },
+        ],
+      });
+      await orchestrator.refreshNow();
+      expect(harness.prompts).toHaveLength(1);
+      expect(orchestrator.snapshot().counts.retrying).toBe(0);
+    } finally {
+      await server.stop();
+      await orchestrator.stop();
+    }
+  });
+
   it("records terminal recovery when pending requests expire during status API resolution after worker exit", async () => {
     const pending = await createPending("idem-expired", -1);
     await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
@@ -510,6 +657,45 @@ describe("approval status API", () => {
     throw new Error("pending approval was not created");
   }
 
+  async function waitForPendingRun(approvalStore: FileOperatorApprovalStore, runId: string, timeoutMs = 2_000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const pending = await approvalStore.findPendingForRun(runId);
+      if (pending) return pending;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`pending approval was not created for ${runId}`);
+  }
+
+  async function waitForRun(transcriptStore: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const run = await transcriptStore.getRun(runId);
+      if (run) return run;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`run was not recorded: ${runId}`);
+  }
+
+  async function waitForTerminalRun(transcriptStore: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const run = await transcriptStore.getRun(runId);
+      if (run && run.status !== "running") return run;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`run did not become terminal: ${runId}`);
+  }
+
+  async function waitFor(predicate: () => boolean, description: string, timeoutMs = 2_000): Promise<void> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(predicate(), `Timed out waiting for ${description}`).toBe(true);
+  }
+
   function statusServer(
     options: {
       cancelled?: string[];
@@ -616,4 +802,92 @@ function fakeOrchestrator(
       throw new Error("not implemented");
     },
   } as unknown as Orchestrator;
+}
+
+class LiveCompletionReportHarness implements AgentHarness {
+  readonly id = "live-completion-report";
+  readonly prompts: string[] = [];
+
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly outboxStore: FileWritebackOutboxStore,
+    private readonly runStore: FileRunTranscriptStore,
+    private readonly publisher: CompletionReportPullRequestPublisher,
+    private readonly operatorApproval: OperatorApprovalService,
+    private readonly writebackProcessor: Pick<WritebackProcessor, "processDue">,
+  ) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.prompts.push(prompt);
+    yield { type: "session_started", sessionId: "live-report-session", runId: "live-report-run" };
+    await new CompletionReportService({
+      config: ctx.config,
+      lifecycleStore: this.lifecycleStore,
+      writebackOutbox: this.outboxStore,
+      writebackProcessor: this.writebackProcessor,
+      runStore: this.runStore,
+      pullRequestPublisher: this.publisher,
+      operatorApproval: this.operatorApproval,
+    }).submitCompletionReport(
+      {
+        runId: "live-report-run",
+        issueId: ctx.issue.id,
+        summary: "Implemented the requested handoff.",
+        validationEvidence: ["npm test"],
+        acceptanceChecklist: [
+          {
+            text: "Completion report handoff is live.",
+            satisfied: true,
+            evidence: "Approval status API integration test",
+          },
+        ],
+        changedFiles: ["src/core/CompletionReportService.ts"],
+        branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
+        pullRequest: null,
+        risks: [],
+        idempotencyKey: "idem-live",
+      },
+      {
+        issue: ctx.issue,
+        activeRunId: "live-report-run",
+        role: "worker",
+        sessionId: "live-report-session",
+        workspacePath: ctx.workspace.path,
+        workspace: ctx.workspace,
+        phase: "implementation",
+      },
+    );
+    yield { type: "completed" };
+  }
+}
+
+class FakeCompletionReportPublisher implements CompletionReportPullRequestPublisher {
+  readonly inputs: CompletionReportPullRequestPublicationInput[] = [];
+
+  constructor(private readonly publication: CompletionReportPullRequestPublication) {}
+
+  async publishPullRequest(
+    input: CompletionReportPullRequestPublicationInput,
+  ): Promise<CompletionReportPullRequestPublication> {
+    this.inputs.push(input);
+    return this.publication;
+  }
+}
+
+class StateChangingWriter implements TrackerWriter {
+  readonly transitions: TrackerTransitionInput[] = [];
+  readonly comments: TrackerCommentInput[] = [];
+
+  constructor(private readonly setState: (state: string) => void) {}
+
+  async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+    this.transitions.push(input);
+    this.setState(input.toState);
+    return { status: "applied" };
+  }
+
+  async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    this.comments.push(input);
+    return { status: "applied" };
+  }
 }

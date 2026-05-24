@@ -1101,7 +1101,10 @@ describe("Orchestrator", () => {
   it("preserves fail-policy approval rejection through abnormal worker exit", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 3;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
     config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
     config.tracker.handoffStates = ["In Review"];
     config.github.publishPullRequests = true;
     config.github.owner = "acme";
@@ -1127,6 +1130,10 @@ describe("Orchestrator", () => {
     const logger = new StructuredLogger(() => undefined);
     const stateDir = config.workspace.stateDir;
     const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
@@ -1140,7 +1147,15 @@ describe("Orchestrator", () => {
       lastPushedAt: "2026-01-01T00:00:01Z",
       evidenceCursor: "idem-1",
     });
-    const harness = new ReportingHarness(lifecycleStore, outboxStore, runStore, publisher, { type: "completed" }, operatorApproval);
+    const harness = new ReportingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+      publisher,
+      { type: "completed" },
+      operatorApproval,
+      writeback,
+    );
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
@@ -1151,6 +1166,7 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
       lifecycleStore,
       runStore,
+      writeback,
     });
 
     await orchestrator.refreshNow();
@@ -1178,6 +1194,117 @@ describe("Orchestrator", () => {
     expect(finalRun?.cancellationSource ?? null).toBeNull();
     expect(finalRun?.cancellationOutcome ?? "none").toBe("none");
     expect(publisher.inputs).toEqual([]);
+    expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Pending"))).toBe(true);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+    await orchestrator.stop();
+  });
+
+  it("preserves cancel-policy approval rejection through cancelled worker exit", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 3;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.tracker.handoffStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.requiredForPublication = true;
+    config.github.operatorApproval!.rejectPolicy = "cancel";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const approvalStore = new FileOperatorApprovalStore(stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const harness = new ReportingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+      publisher,
+      { type: "completed" },
+      operatorApproval,
+      writeback,
+    );
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    const pending = await waitForPendingApproval(approvalStore, "report-run-1");
+    expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Pending"))).toBe(true);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+    const result = await operatorApproval.resolve(pending.requestId, "reject");
+    await orchestrator.cancelIssue(candidate.id);
+    await orchestrator.recordPublicationApprovalTerminal(result.request);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "approval-rejected cancel-policy worker exit");
+
+    const finalRun = await waitForRunRecord(runStore, "report-run-1");
+    expect(finalRun).toMatchObject({
+      status: "cancelled",
+      completedAt: expect.any(String),
+      pendingApprovalRequestId: null,
+    });
+    expect(finalRun?.status).not.toBe("succeeded");
+    expect(publisher.inputs).toEqual([]);
+    expect(writer.comments.some((comment) => comment.body.includes("Status: rejected"))).toBe(true);
+    expect(writer.comments.some((comment) => comment.dedupeKey === "report-run-1:completion-report:idem-1")).toBe(false);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "publication approval rejected",
+      incompleteTurnCount: 0,
+      completionReports: [
+        {
+          idempotencyKey: "idem-1",
+          runId: "report-run-1",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+    await orchestrator.refreshNow();
+    expect(harness.prompts).toHaveLength(1);
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
     await orchestrator.stop();
   });
@@ -3523,6 +3650,7 @@ class ReportingHarness implements AgentHarness {
     private readonly publisher: CompletionReportPullRequestPublisher,
     private readonly terminalEvent: ReportingHarnessTerminal = { type: "completed" },
     private readonly operatorApproval?: OperatorApprovalService,
+    private readonly writebackProcessor?: Pick<WritebackProcessor, "processDue">,
   ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
@@ -3532,6 +3660,7 @@ class ReportingHarness implements AgentHarness {
       config: ctx.config,
       lifecycleStore: this.lifecycleStore,
       writebackOutbox: this.outboxStore,
+      ...(this.writebackProcessor ? { writebackProcessor: this.writebackProcessor } : {}),
       runStore: this.runStore,
       pullRequestPublisher: this.publisher,
       ...(this.operatorApproval ? { operatorApproval: this.operatorApproval } : {}),
