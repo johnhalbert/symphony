@@ -19,6 +19,7 @@ import {
 import type { ServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
@@ -431,6 +432,275 @@ describe("approval status API", () => {
       await orchestrator.refreshNow();
       expect(harness.prompts).toHaveLength(1);
       expect(orchestrator.snapshot().counts.retrying).toBe(0);
+    } finally {
+      await server.stop();
+      await orchestrator.stop();
+    }
+  });
+
+  it("approves persisted publication through a real orchestrator after the worker exits", async () => {
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+    config.workspace.source.baseRef = "main";
+
+    const runId = "run-1";
+    const evidenceCursor = "idem-1";
+    const workspacePath = path.join(root, "workspace");
+    const reportSummary = "Implemented the requested change.";
+    const pullRequestUrl = "https://github.com/acme/symphony/pull/42";
+    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Blocked";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: pullRequestUrl,
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor,
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      completionReportPublisher: publisher,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      writebackOutbox: outboxStore,
+      operatorApproval: service,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: {
+        activeStates: ["Todo", "In Progress"],
+        handoffStates: ["In Review"],
+        reviewStates: ["In Review"],
+        blockedStates: ["Blocked"],
+        terminalStates: ["Done"],
+      },
+      staleThresholdMs: 300_000,
+    });
+
+    await runStore.updateRun(runId, {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:00.000Z",
+      metadata: {
+        gitBranchName: "symphony/TEST-1",
+        repoPath: root,
+        baseRef: "main",
+      },
+    });
+    const preApprovalRun = await runStore.getRun(runId);
+    expect(preApprovalRun).toMatchObject({
+      status: "succeeded",
+      workspacePath,
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    expect(preApprovalRun?.status).not.toBe("running");
+
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
+      lastCompletionReportId: `completion-report:${candidate.id}:${evidenceCursor}`,
+      completionReports: [
+        {
+          id: `completion-report:${candidate.id}:${evidenceCursor}`,
+          idempotencyKey: evidenceCursor,
+          runId,
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          summary: reportSummary,
+          validationEvidence: ["npm test -- orchestrator"],
+          acceptanceChecklist: [
+            {
+              text: "Reviewer dispatch is covered.",
+              satisfied: true,
+              evidence: "Approval status API integration test",
+            },
+          ],
+          changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
+          branchName: candidate.branchName,
+          pullRequest: null,
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      summaryPointers: {
+        workspaceKey: candidate.identifier,
+        workspacePath,
+        branchName: candidate.branchName,
+        gitBranchName: candidate.branchName,
+        repoPath: root,
+        baseRef: "main",
+        lastRunId: runId,
+      },
+    });
+    const { record: pending } = await store.requestOrGetPending(
+      {
+        issueId: candidate.id,
+        issueIdentifier: candidate.identifier,
+        runId,
+        evidenceCursor,
+        action: {
+          kind: "push_and_pr",
+          branchName: candidate.branchName ?? "symphony/TEST-1",
+          baseBranch: "main",
+          workspacePath,
+          title: `${candidate.identifier}: ${candidate.title}`,
+          evidenceCursor,
+          summaryPreview: "Implemented the requested handoff.",
+          changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
+          plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+        },
+      },
+      null,
+    );
+    await runStore.updateRun(runId, {
+      metadata: { pendingApprovalRequestId: pending.requestId, pendingApprovalRequestedAt: pending.requestedAt },
+    });
+
+    await expect(store.findPendingForRun(runId)).resolves.toMatchObject({
+      status: "pending",
+      runId,
+      evidenceCursor,
+    });
+    await expect(runStore.getRun(runId)).resolves.toMatchObject({
+      status: "succeeded",
+      pendingApprovalRequestId: pending.requestId,
+      pendingApprovalRequestedAt: expect.any(String),
+    });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
+      completionReports: [
+        expect.objectContaining({
+          runId,
+          idempotencyKey: evidenceCursor,
+          summary: reportSummary,
+          pullRequest: null,
+          writebackOperationKeys: [],
+        }),
+      ],
+    });
+    expect(publisher.inputs).toEqual([]);
+    expect(orchestrator.snapshot().counts.running).toBe(0);
+    expect(harness.runs).toEqual([]);
+
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const approve = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const approveBody = (await approve.json()) as { request: { status: string }; replayed: boolean };
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const issueBody = (await issueResponse.json()) as { capabilities: { pendingApproval: { active: boolean } } };
+
+      expect(approve.status).toBe(200);
+      expect(approveBody).toMatchObject({ request: { status: "approved" }, replayed: false });
+      expect(issueBody.capabilities.pendingApproval.active).toBe(false);
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "approved" });
+
+      expect(publisher.inputs).toHaveLength(1);
+      expect(publisher.inputs[0]).toMatchObject({
+        workspacePath,
+        branchName: "symphony/TEST-1",
+        baseBranch: "main",
+        evidenceCursor,
+      });
+      expect(writer.comments).toHaveLength(1);
+      expect(writer.comments[0]?.body).toContain("## Symphony Completion Report");
+      expect(writer.comments[0]?.body).toContain("Status: accepted");
+      expect(writer.transitions).toHaveLength(1);
+      expect(writer.transitions[0]).toMatchObject({ toState: "In Review" });
+      expect(currentState).toBe("In Review");
+
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "review",
+        blockedReason: null,
+        completionReports: [
+          expect.objectContaining({
+            runId,
+            idempotencyKey: evidenceCursor,
+            pullRequest: {
+              url: pullRequestUrl,
+              number: 42,
+              headSha: "abc123",
+              branch: "symphony/TEST-1",
+            },
+            writebackOperationKeys: [
+              "comment:issue-1:run-1:completion-report:idem-1",
+              "transition:issue-1:run-1:completion-report:idem-1:In Review",
+            ],
+          }),
+        ],
+      });
+      await expect(runStore.getRun(runId)).resolves.toMatchObject({
+        status: "succeeded",
+        pendingApprovalRequestId: null,
+        prUrl: pullRequestUrl,
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+      });
+
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          harness.runs.filter((run) => run.ctx.role === "reviewer").length === 1 &&
+          harness.runs.filter((run) => run.ctx.role === "worker").length === 0,
+        "reviewer dispatch from stored completion report",
+      );
+      const workerRuns = harness.runs.filter((run) => run.ctx.role === "worker");
+      const reviewerRuns = harness.runs.filter((run) => run.ctx.role === "reviewer");
+      expect(workerRuns).toHaveLength(0);
+      expect(reviewerRuns).toHaveLength(1);
+      expect(reviewerRuns[0]?.prompt).toContain(reportSummary);
+      expect(reviewerRuns[0]?.prompt).toContain(`Pull request: ${pullRequestUrl}`);
     } finally {
       await server.stop();
       await orchestrator.stop();
