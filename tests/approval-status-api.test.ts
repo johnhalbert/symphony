@@ -716,6 +716,12 @@ describe("approval status API", () => {
       const approvalResolvedCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
         (event) => event.eventType === "approval_resolved",
       ).length;
+      const prOpenedCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
+        (event) => event.eventType === "pr_opened",
+      ).length;
+      const prUpdatedCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
+        (event) => event.eventType === "pr_updated",
+      ).length;
       const replayBaseline = {
         publisherCallCount: publisher.inputs.length,
         commentCount: writer.comments.length,
@@ -729,6 +735,8 @@ describe("approval status API", () => {
         lifecycle: {
           phase: lifecycleBeforeReplay?.phase,
           blockedReason: lifecycleBeforeReplay?.blockedReason,
+          lastPushedAt: lifecycleBeforeReplay?.summaryPointers.lastPushedAt,
+          lastEvidenceCursor: lifecycleBeforeReplay?.summaryPointers.lastEvidenceCursor,
           pullRequest: completionReportBeforeReplay?.pullRequest ?? null,
           writebackOperationKeys: completionReportBeforeReplay?.writebackOperationKeys ?? [],
         },
@@ -740,13 +748,23 @@ describe("approval status API", () => {
           prNumber: workerRunBeforeReplay?.prNumber,
           prHeadSha: workerRunBeforeReplay?.prHeadSha,
           prBranch: workerRunBeforeReplay?.prBranch,
+          lastPushedAt: workerRunBeforeReplay?.lastPushedAt,
+          lastEvidenceCursor: workerRunBeforeReplay?.lastEvidenceCursor,
         },
         workerRunCount: harness.runs.filter((run) => run.ctx.role === "worker").length,
         reviewerRunCount: harness.runs.filter((run) => run.ctx.role === "reviewer").length,
         persistedRunCount: (await runStore.listRunsForIssue(candidate.id)).length,
         approvalResolvedCount: approvalResolvedCountBeforeReplay,
+        prOpenedCount: prOpenedCountBeforeReplay,
+        prUpdatedCount: prUpdatedCountBeforeReplay,
       };
+      expect(replayBaseline.lifecycle.lastPushedAt).toBe("2026-01-01T00:00:01Z");
+      expect(replayBaseline.lifecycle.lastEvidenceCursor).toBe(evidenceCursor);
+      expect(replayBaseline.workerRun.lastPushedAt).toBe("2026-01-01T00:00:01Z");
+      expect(replayBaseline.workerRun.lastEvidenceCursor).toBe(evidenceCursor);
       expect(replayBaseline.approvalResolvedCount).toBe(1);
+      expect(replayBaseline.prOpenedCount).toBe(1);
+      expect(replayBaseline.prUpdatedCount).toBe(0);
 
       const replay = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
         method: "POST",
@@ -778,6 +796,8 @@ describe("approval status API", () => {
       expect({
         phase: lifecycleAfterReplay?.phase,
         blockedReason: lifecycleAfterReplay?.blockedReason,
+        lastPushedAt: lifecycleAfterReplay?.summaryPointers.lastPushedAt,
+        lastEvidenceCursor: lifecycleAfterReplay?.summaryPointers.lastEvidenceCursor,
         pullRequest: completionReportAfterReplay?.pullRequest ?? null,
         writebackOperationKeys: completionReportAfterReplay?.writebackOperationKeys ?? [],
       }).toEqual(replayBaseline.lifecycle);
@@ -791,6 +811,8 @@ describe("approval status API", () => {
         prNumber: workerRunAfterReplay?.prNumber,
         prHeadSha: workerRunAfterReplay?.prHeadSha,
         prBranch: workerRunAfterReplay?.prBranch,
+        lastPushedAt: workerRunAfterReplay?.lastPushedAt,
+        lastEvidenceCursor: workerRunAfterReplay?.lastEvidenceCursor,
       }).toEqual(replayBaseline.workerRun);
 
       const run1TranscriptAfterReplay = await runStore.readTranscript(runId);
@@ -799,6 +821,12 @@ describe("approval status API", () => {
       );
       expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_resolved")).toHaveLength(
         1,
+      );
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "pr_opened")).toHaveLength(
+        replayBaseline.prOpenedCount,
+      );
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "pr_updated")).toHaveLength(
+        replayBaseline.prUpdatedCount,
       );
       expect(harness.runs.filter((run) => run.ctx.role === "worker")).toHaveLength(replayBaseline.workerRunCount);
       expect(harness.runs.filter((run) => run.ctx.role === "reviewer")).toHaveLength(replayBaseline.reviewerRunCount);
