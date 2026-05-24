@@ -518,7 +518,7 @@ export class Orchestrator {
   }
 
   private async reconcileRunningIssues(): Promise<void> {
-    this.reconcileStalledRuns();
+    await this.reconcileStalledRuns();
     const runningIds = [...this.running.keys()];
     if (runningIds.length === 0) return;
     let refreshed: Issue[];
@@ -550,11 +550,17 @@ export class Orchestrator {
     }
   }
 
-  private reconcileStalledRuns(): void {
+  private async reconcileStalledRuns(): Promise<void> {
     const stallTimeout = this.stallTimeoutMs();
     if (stallTimeout === null) return;
     const now = Date.now();
     for (const [issueId, entry] of this.running) {
+      if (await this.isAwaitingOperatorApproval(entry)) {
+        entry.lastEvent = "approval_request";
+        entry.lastMessage = "Awaiting operator approval for push/PR";
+        entry.lastEventAt = new Date(now);
+        continue;
+      }
       const lastActivity = entry.lastEventAt?.getTime() ?? entry.startedAt.getTime();
       if (now - lastActivity > stallTimeout) {
         entry.suppressRetryOnExit = true;
@@ -570,6 +576,13 @@ export class Orchestrator {
         });
       }
     }
+  }
+
+  private async isAwaitingOperatorApproval(entry: RunningEntry): Promise<boolean> {
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!runId || !this.options.runStore) return false;
+    const run = await this.options.runStore.getRun(runId);
+    return Boolean(run?.pendingApprovalRequestId);
   }
 
   private async terminateRunningIssue(issueId: string, cleanupWorkspace: boolean, reason: string): Promise<void> {

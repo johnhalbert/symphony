@@ -15,6 +15,7 @@ export type SymphonyErrorCode =
   | "tracker_unavailable"
   | "agent_error"
   | "not_found"
+  | "conflict"
   | "invalid_request";
 
 export class SymphonyError extends Error {

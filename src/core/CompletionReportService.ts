@@ -11,6 +11,7 @@ import type {
 import { phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
 import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
+import type { OperatorApprovalService } from "./approval/OperatorApprovalService.js";
 import type { Issue, Workspace } from "./types.js";
 import { planCompletionReportAcceptedWritebacks } from "./writeback/TransitionPolicy.js";
 import type { FileWritebackOutboxStore, WritebackOperation } from "./writeback/WritebackOutbox.js";
@@ -64,6 +65,7 @@ export interface CompletionReportServiceOptions {
   writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
   runStore?: Pick<RunTranscriptStore, "appendEvent" | "getRun" | "recordPullRequestEvent">;
   pullRequestPublisher?: CompletionReportPullRequestPublisher;
+  operatorApproval?: Pick<OperatorApprovalService, "waitForPublicationApproval">;
 }
 
 export interface CompletionReportPullRequestPublisher {
@@ -260,14 +262,32 @@ export class CompletionReportService {
     if (!baseBranch) {
       throw new SymphonyError("invalid_request", "PR publication requires a base branch");
     }
-    return this.options.pullRequestPublisher.publishPullRequest({
+    const publicationInput = {
       workspacePath,
       branchName,
       baseBranch,
       title: `${context.issue.identifier}: ${context.issue.title}`,
       body: formatPullRequestBody(report, context),
       evidenceCursor: report.idempotencyKey,
+    };
+    await this.options.operatorApproval?.waitForPublicationApproval({
+      issueId: context.issue.id,
+      issueIdentifier: context.issue.identifier,
+      runId: context.activeRunId,
+      evidenceCursor: report.idempotencyKey,
+      action: {
+        kind: "push_and_pr",
+        branchName,
+        baseBranch,
+        workspacePath,
+        title: publicationInput.title,
+        evidenceCursor: report.idempotencyKey,
+        summaryPreview: report.summary.length <= 240 ? report.summary : `${report.summary.slice(0, 237)}...`,
+        changedFiles: report.changedFiles,
+        plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+      },
     });
+    return this.options.pullRequestPublisher.publishPullRequest(publicationInput);
   }
 
   private async recordPullRequestMetadata(

@@ -12,6 +12,7 @@ import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
 import { SymphonyError } from "../errors.js";
+import { FileOperatorApprovalStore, OperatorApprovalService } from "../approval/OperatorApprovalService.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
 
 export const COMPLETION_REPORT_TOOL_NAME = "submit_completion_report";
@@ -51,6 +52,11 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const operatorApproval = new OperatorApprovalService({
+      config,
+      store: new FileOperatorApprovalStore(config.workspace.stateDir),
+      runStore,
+    });
     const pullRequestPublisher =
       options.pullRequestPublisher ??
       (config.github.publishPullRequests
@@ -62,6 +68,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
       runStore,
       ...(pullRequestPublisher === undefined ? {} : { pullRequestPublisher }),
+      operatorApproval,
     });
     const context: CompletionReportActiveContext = {
       issue: loadedContext.issue,

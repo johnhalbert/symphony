@@ -166,6 +166,15 @@ const rawConfigSchema = z
         head_owner: z.string().optional(),
         api_base_url: z.string().optional(),
         publish_pull_requests: z.boolean().optional(),
+        operator_approval: z
+          .object({
+            required_for_publication: z.boolean().optional(),
+            reject_policy: z.enum(["cancel", "fail"]).optional(),
+            poll_interval_ms: z.number().int().positive().optional(),
+            timeout_ms: z.number().int().nonnegative().nullable().optional(),
+          })
+          .passthrough()
+          .optional(),
       })
       .passthrough()
       .optional(),
@@ -268,6 +277,14 @@ export interface GitHubConfig {
   headOwner: string | null;
   apiBaseUrl: string;
   publishPullRequests: boolean;
+  operatorApproval?: GitHubOperatorApprovalConfig;
+}
+
+export interface GitHubOperatorApprovalConfig {
+  requiredForPublication: boolean;
+  rejectPolicy: "cancel" | "fail";
+  pollIntervalMs: number;
+  timeoutMs: number | null;
 }
 
 export interface ReviewLoopConfig {
@@ -416,6 +433,12 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   );
   const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
   const publishPullRequests = raw.github?.publish_pull_requests ?? false;
+  const githubOperatorApproval = {
+    requiredForPublication: raw.github?.operator_approval?.required_for_publication ?? false,
+    rejectPolicy: raw.github?.operator_approval?.reject_policy ?? "cancel",
+    pollIntervalMs: raw.github?.operator_approval?.poll_interval_ms ?? 2_000,
+    timeoutMs: raw.github?.operator_approval?.timeout_ms ?? null,
+  };
   const cursorModel = raw.cursor?.model ?? DEFAULT_CURSOR_MODEL;
   const cursorModelParams = normalizeCursorModelParams(raw.cursor?.model_params);
   const cursorAllowLargeContext = raw.cursor?.allow_large_context ?? false;
@@ -518,6 +541,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       headOwner: githubHeadOwner,
       apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
       publishPullRequests,
+      operatorApproval: githubOperatorApproval,
     },
     credentialProfiles,
     reviewLoop: {

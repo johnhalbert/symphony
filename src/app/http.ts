@@ -18,6 +18,8 @@ import type {
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
+import type { OperatorApprovalService, OperatorApprovalRecord } from "../core/approval/OperatorApprovalService.js";
+import { approvalResolve } from "../core/approval/OperatorApprovalService.js";
 import {
   compareRunChronology,
   type RunRecord,
@@ -48,6 +50,10 @@ export interface StatusServerOptions {
   lifecycleStore?: IssueLifecycleStore;
   mcpExposureDiagnosticsStore?: FileMcpExposureDiagnosticsStore;
   writebackOutbox?: Pick<FileWritebackOutboxStore, "list">;
+  operatorApproval?: Pick<
+    OperatorApprovalService,
+    "get" | "resolve" | "findPendingForIssue" | "findPendingForRun" | "rejectPolicy" | "isRequired"
+  >;
   host: string;
   port: number;
   openWorkspaceToken: string | null;
@@ -190,6 +196,31 @@ export class StatusServer {
         return;
       }
 
+      const approvalMatch = /^\/api\/v1\/approval-requests\/([^/]+)$/.exec(url.pathname);
+      if (approvalMatch) {
+        const requestId = decodeURIComponent(approvalMatch[1] ?? "");
+        if (request.method === "GET") {
+          const approval = await this.options.operatorApproval?.get(requestId);
+          if (!approval) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
+          sendJson(response, 200, approvalResponse(approval, this.options.operatorApproval?.isRequired() ?? false));
+          return;
+        }
+        if (request.method === "POST") {
+          this.requireMutationToken(request);
+          const decision = parseApprovalDecision(await readJsonBody(request));
+          const result = await this.options.operatorApproval?.resolve(requestId, decision);
+          if (!result) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
+          if (decision === "reject" && !result.replayed && this.options.operatorApproval?.rejectPolicy === "cancel") {
+            await this.options.orchestrator.cancelIssue(result.request.issueId);
+          }
+          sendJson(response, 200, {
+            request: approvalResponse(result.request, this.options.operatorApproval?.isRequired() ?? false),
+            replayed: result.replayed,
+          });
+          return;
+        }
+      }
+
       const pauseMatch = /^\/api\/v1\/issues\/([^/]+)\/pause$/.exec(url.pathname);
       if (request.method === "POST" && pauseMatch) {
         this.requireMutationToken(request);
@@ -288,6 +319,7 @@ export class StatusServer {
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
+        const pendingApproval = await this.options.operatorApproval?.findPendingForIssue(keys);
         const operatorLiveness = await issueOperatorLiveness({
           live,
           latestRun,
@@ -332,11 +364,19 @@ export class StatusServer {
             pause: controls.pause,
             resume: controls.resume,
             cancel: controls.cancel,
-            humanRequired: affordances.humanRequired,
+            humanRequired: pendingApproval
+              ? {
+                  active: true,
+                  reason: "awaiting operator approval for push/PR",
+                  continuationSummaryRecommended: false,
+                }
+              : affordances.humanRequired,
             continuationSummary: affordances.continuationSummary,
             mutationsRequireToken: controls.mutationsRequireToken,
             mutationHeader: "X-Symphony-Token",
+            pendingApproval: approvalCapability(pendingApproval ?? null, this.options.operatorApproval?.isRequired() ?? false),
           },
+          pendingApproval: pendingApproval ? approvalResponse(pendingApproval, this.options.operatorApproval?.isRequired() ?? false) : null,
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
@@ -365,6 +405,7 @@ export class StatusServer {
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
           ...run,
+          pendingApproval: (await this.options.operatorApproval?.findPendingForRun(runId)) ?? null,
           telemetry: await runTelemetrySummary(run.runId, this.options.runStore),
           operatorLiveness: await runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns, this.options.runStore),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
@@ -402,6 +443,8 @@ export class StatusServer {
       const status =
         error instanceof SymphonyError && error.code === "not_found"
           ? 404
+          : error instanceof SymphonyError && error.code === "conflict"
+            ? 409
           : error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")
             ? 503
           : error instanceof SymphonyError && error.code === "invalid_request"
@@ -521,6 +564,50 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
 function sendHtml(response: ServerResponse, body: string): void {
   response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   response.end(body);
+}
+
+async function readJsonBody(request: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const body = Buffer.concat(chunks).toString("utf8").trim();
+  if (body.length === 0) return {};
+  return JSON.parse(body) as unknown;
+}
+
+function parseApprovalDecision(body: unknown): "approve" | "reject" {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new SymphonyError("invalid_request", "Approval decision body must be an object");
+  }
+  const decision = (body as { decision?: unknown }).decision;
+  if (decision !== "approve" && decision !== "reject") {
+    throw new SymphonyError("invalid_request", "Approval decision must be approve or reject");
+  }
+  return decision;
+}
+
+function approvalResponse(record: OperatorApprovalRecord, enabled: boolean): Record<string, unknown> {
+  return {
+    ...record,
+    capabilities: {
+      enabled,
+      resolve: approvalResolve(record),
+    },
+  };
+}
+
+function approvalCapability(record: OperatorApprovalRecord | null, enabled: boolean): Record<string, unknown> {
+  return {
+    enabled,
+    active: record !== null,
+    requestId: record?.requestId ?? null,
+    status: record?.status ?? null,
+    action: record?.action ?? null,
+    requestedAt: record?.requestedAt ?? null,
+    resolve: record === null ? null : approvalResolve(record),
+    requiresToken: true,
+  };
 }
 
 type RuntimeSnapshot = ReturnType<Orchestrator["snapshot"]>;

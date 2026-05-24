@@ -1,4 +1,5 @@
 export * from "./core/config/Config.js";
+export * from "./core/approval/OperatorApprovalService.js";
 export * from "./core/CompletionReportService.js";
 export * from "./core/errors.js";
 export * from "./core/harness/AgentHarness.js";
