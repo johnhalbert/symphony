@@ -741,8 +741,8 @@ describe("approval status API", () => {
     const workspacePath = path.join(root, "workspace");
     const reportSummary = "Implemented the requested change.";
     const pullRequestUrl = "https://github.com/acme/symphony/pull/42";
-    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
-    let currentState = "Blocked";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -783,6 +783,7 @@ describe("approval status API", () => {
       runStore,
       writeback,
       completionReportPublisher: publisher,
+      operatorApproval: service,
     });
     const server = new StatusServer({
       orchestrator,
@@ -862,35 +863,16 @@ describe("approval status API", () => {
         lastRunId: runId,
       },
     });
-    const { record: pending } = await store.requestOrGetPending(
-      {
-        issueId: candidate.id,
-        issueIdentifier: candidate.identifier,
-        runId,
-        evidenceCursor,
-        action: {
-          kind: "push_and_pr",
-          branchName: candidate.branchName ?? "symphony/TEST-1",
-          baseBranch: "main",
-          workspacePath,
-          title: `${candidate.identifier}: ${candidate.title}`,
-          evidenceCursor,
-          summaryPreview: "Implemented the requested handoff.",
-          changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
-          plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
-        },
-      },
-      null,
-    );
-    await runStore.updateRun(runId, {
-      metadata: { pendingApprovalRequestId: pending.requestId, pendingApprovalRequestedAt: pending.requestedAt },
-    });
+    await orchestrator.refreshNow();
+    const pending = await waitForPendingRun(store, runId);
+    await orchestrator.refreshNow();
 
     await expect(store.findPendingForRun(runId)).resolves.toMatchObject({
       status: "pending",
       runId,
       evidenceCursor,
     });
+    expect((await store.list()).filter((approval) => approval.runId === runId)).toHaveLength(1);
     await expect(runStore.getRun(runId)).resolves.toMatchObject({
       status: "succeeded",
       pendingApprovalRequestId: pending.requestId,
@@ -912,6 +894,13 @@ describe("approval status API", () => {
     expect(publisher.inputs).toEqual([]);
     expect(orchestrator.snapshot().counts.running).toBe(0);
     expect(harness.runs).toEqual([]);
+    const preApprovalTranscript = await runStore.readTranscript(runId);
+    expect(preApprovalTranscript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
+    const pendingAuditOperations = (await outboxStore.list()).filter((operation) =>
+      operation.idempotencyKey.includes("publication-approval-pending"),
+    );
+    expect(pendingAuditOperations).toHaveLength(2);
+    expect(pendingAuditOperations.map((operation) => operation.status)).toEqual(["succeeded", "succeeded"]);
 
     const address = await server.start();
     try {
@@ -923,11 +912,20 @@ describe("approval status API", () => {
       });
       const approveBody = (await approve.json()) as { request: { status: string }; replayed: boolean };
       const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
-      const issueBody = (await issueResponse.json()) as { capabilities: { pendingApproval: { active: boolean } } };
+      const issueBody = (await issueResponse.json()) as {
+        capabilities: { pendingApproval: { active: boolean } };
+        issueDetails: { pullRequest: { url: string | null; number: number | null; headSha: string | null; branch: string | null } };
+      };
 
       expect(approve.status).toBe(200);
       expect(approveBody).toMatchObject({ request: { status: "approved" }, replayed: false });
       expect(issueBody.capabilities.pendingApproval.active).toBe(false);
+      expect(issueBody.issueDetails.pullRequest).toMatchObject({
+        url: pullRequestUrl,
+        number: 42,
+        headSha: "abc123",
+        branch: "symphony/TEST-1",
+      });
       await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "approved" });
 
       expect(publisher.inputs).toHaveLength(1);
@@ -937,11 +935,13 @@ describe("approval status API", () => {
         baseBranch: "main",
         evidenceCursor,
       });
-      expect(writer.comments).toHaveLength(1);
-      expect(writer.comments[0]?.body).toContain("## Symphony Completion Report");
-      expect(writer.comments[0]?.body).toContain("Status: accepted");
-      expect(writer.transitions).toHaveLength(1);
-      expect(writer.transitions[0]).toMatchObject({ toState: "In Review" });
+      const acceptedComments = writer.comments.filter((comment) => comment.body.includes("## Symphony Completion Report"));
+      expect(acceptedComments).toHaveLength(1);
+      expect(acceptedComments[0]?.body).toContain("Status: accepted");
+      expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Publication Approval Pending"))).toHaveLength(1);
+      expect(writer.transitions.filter((transition) => transition.toState === "Blocked")).toHaveLength(1);
+      const reviewTransitions = writer.transitions.filter((transition) => transition.toState === "In Review");
+      expect(reviewTransitions).toHaveLength(1);
       expect(currentState).toBe("In Review");
 
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
@@ -998,6 +998,9 @@ describe("approval status API", () => {
       );
       const workerRunBeforeReplay = await runStore.getRun(runId);
       const run1TranscriptBeforeReplay = await runStore.readTranscript(runId);
+      const approvalRequestCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
+        (event) => event.eventType === "approval_request",
+      ).length;
       const approvalResolvedCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
         (event) => event.eventType === "approval_resolved",
       ).length;
@@ -1039,6 +1042,7 @@ describe("approval status API", () => {
         workerRunCount: harness.runs.filter((run) => run.ctx.role === "worker").length,
         reviewerRunCount: harness.runs.filter((run) => run.ctx.role === "reviewer").length,
         persistedRunCount: (await runStore.listRunsForIssue(candidate.id)).length,
+        approvalRequestCount: approvalRequestCountBeforeReplay,
         approvalResolvedCount: approvalResolvedCountBeforeReplay,
         prOpenedCount: prOpenedCountBeforeReplay,
         prUpdatedCount: prUpdatedCountBeforeReplay,
@@ -1047,6 +1051,7 @@ describe("approval status API", () => {
       expect(replayBaseline.lifecycle.lastEvidenceCursor).toBe(evidenceCursor);
       expect(replayBaseline.workerRun.lastPushedAt).toBe("2026-01-01T00:00:01Z");
       expect(replayBaseline.workerRun.lastEvidenceCursor).toBe(evidenceCursor);
+      expect(replayBaseline.approvalRequestCount).toBe(1);
       expect(replayBaseline.approvalResolvedCount).toBe(1);
       expect(replayBaseline.prOpenedCount).toBe(1);
       expect(replayBaseline.prUpdatedCount).toBe(0);
@@ -1060,6 +1065,11 @@ describe("approval status API", () => {
 
       expect(replay.status).toBe(200);
       expect(replayBody).toMatchObject({ request: { status: "approved" }, replayed: true });
+      const replayIssueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const replayIssueBody = (await replayIssueResponse.json()) as {
+        issueDetails: { pullRequest: { url: string | null; number: number | null; headSha: string | null; branch: string | null } };
+      };
+      expect(replayIssueBody.issueDetails.pullRequest).toEqual(issueBody.issueDetails.pullRequest);
       expect(publisher.inputs).toHaveLength(replayBaseline.publisherCallCount);
       expect(writer.comments).toHaveLength(replayBaseline.commentCount);
       expect(writer.transitions).toHaveLength(replayBaseline.transitionCount);
@@ -1101,6 +1111,12 @@ describe("approval status API", () => {
       }).toEqual(replayBaseline.workerRun);
 
       const run1TranscriptAfterReplay = await runStore.readTranscript(runId);
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_request")).toHaveLength(
+        replayBaseline.approvalRequestCount,
+      );
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_request")).toHaveLength(
+        1,
+      );
       expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_resolved")).toHaveLength(
         replayBaseline.approvalResolvedCount,
       );
@@ -1113,6 +1129,9 @@ describe("approval status API", () => {
       expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "pr_updated")).toHaveLength(
         replayBaseline.prUpdatedCount,
       );
+      expect(
+        run1TranscriptAfterReplay.events.filter((event) => ["pr_opened", "pr_updated"].includes(event.eventType)),
+      ).toHaveLength(1);
       expect(harness.runs.filter((run) => run.ctx.role === "worker")).toHaveLength(replayBaseline.workerRunCount);
       expect(harness.runs.filter((run) => run.ctx.role === "reviewer")).toHaveLength(replayBaseline.reviewerRunCount);
       await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(replayBaseline.persistedRunCount);

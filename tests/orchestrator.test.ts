@@ -654,6 +654,238 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("does not stall-cancel lifecycle-only pending publication approval handoffs", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.blockedStates = ["Blocked"];
+    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 1 };
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const harness = new BlockingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => orchestrator.snapshot().running[0]?.runId !== null, "worker run start");
+      const runId = orchestrator.snapshot().running[0]?.runId ?? "";
+      await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, runId));
+      await runStore.updateRun(runId, {
+        metadata: {
+          pendingApprovalRequestId: null,
+          pendingApprovalRequestedAt: null,
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      await (
+        orchestrator as unknown as {
+          reconcileStalledRuns(): Promise<void>;
+        }
+      ).reconcileStalledRuns();
+      await orchestrator.refreshNow();
+
+      expect(orchestrator.snapshot().counts.running).toBe(1);
+      await expect(runStore.getRun(runId)).resolves.toMatchObject({
+        status: "running",
+        pendingApprovalRequestId: null,
+      });
+      const runningRun = await runStore.getRun(runId);
+      expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: "awaiting operator approval for PR publication",
+        incompleteTurnCount: 0,
+      });
+      await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(1);
+    } finally {
+      await orchestrator.stop();
+    }
+  });
+
+  it.each([
+    {
+      name: "comment fails while Blocked transition succeeds",
+      writer: (setState: (state: string) => void) => new PublicationApprovalCommentFailingWriter(setState),
+      stateBeforeRecovery: "Blocked",
+      recoveryComments: 1,
+      recoveryTransitions: 0,
+    },
+    {
+      name: "Blocked transition fails after comment succeeds",
+      writer: (setState: (state: string) => void) => new PublicationApprovalTransitionFailingWriter(setState),
+      stateBeforeRecovery: "Todo",
+      recoveryComments: 0,
+      recoveryTransitions: 1,
+    },
+  ])(
+    "recovers a real post-exit pending publication approval handoff after partial audit failure: $name",
+    async ({ writer, stateBeforeRecovery, recoveryComments, recoveryTransitions }) => {
+      const config = testConfig(root);
+      config.writeback.enabled = true;
+      config.writeback.mode = "live";
+      config.writeback.dispatchState = "Todo";
+      config.writeback.maxBackoffMs = 0;
+      config.reviewLoop.blockedStates = ["Blocked"];
+      config.github.publishPullRequests = true;
+      config.github.owner = "acme";
+      config.github.repo = "symphony";
+      config.github.token = "github-token";
+      config.github.operatorApproval!.requiredForPublication = true;
+      config.workspace.source.baseRef = "main";
+      const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+      let currentState = "Todo";
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return ["Todo", "In Progress"].includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+        },
+        async fetchIssuesByStates(states) {
+          return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+        },
+        async fetchIssueStatesByIds() {
+          return [{ ...candidate, state: currentState }];
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+      const approvalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
+      const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+      const partialWriter = writer((state) => {
+        currentState = state;
+      });
+      const partialWriteback = new WritebackProcessor(outboxStore, partialWriter, logger, config.writeback.maxBackoffMs);
+      const publisher = new FakeCompletionReportPublisher({
+        action: "created",
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headBranch: "symphony/TEST-1",
+        headSha: "abc123",
+        lastPushedAt: "2026-01-01T00:00:01Z",
+        evidenceCursor: "idem-1",
+      });
+      const harness = new ReportingHarness(
+        lifecycleStore,
+        outboxStore,
+        runStore,
+        publisher,
+        "throw",
+        operatorApproval,
+        partialWriteback,
+      );
+      const firstOrchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        harness,
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore,
+        writeback: partialWriteback,
+        operatorApproval,
+      });
+
+      await firstOrchestrator.refreshNow();
+      await waitFor(() => firstOrchestrator.snapshot().counts.running === 0, "partial audit worker exit");
+      await firstOrchestrator.stop();
+
+      expect(harness.prompts).toEqual(["Work on TEST-1"]);
+      expect(currentState).toBe(stateBeforeRecovery);
+      await expect(approvalStore.findPendingForRun("report-run-1")).resolves.toBeNull();
+      const runBeforeRecovery = await waitForTerminalRunRecord(runStore, "report-run-1");
+      expect(runBeforeRecovery).toMatchObject({ status: "succeeded" });
+      expect(runBeforeRecovery?.pendingApprovalRequestId ?? null).toBeNull();
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: "awaiting operator approval for PR publication",
+        incompleteTurnCount: 0,
+        completionReports: [
+          expect.objectContaining({
+            runId: "report-run-1",
+            idempotencyKey: "idem-1",
+            writebackOperationKeys: [],
+          }),
+        ],
+      });
+      expect(partialWriter.comments.some((comment) => comment.dedupeKey?.includes("run-failed"))).toBe(false);
+      expect(partialWriter.comments.some((comment) => comment.dedupeKey?.includes("run-cancelled"))).toBe(false);
+      expect(firstOrchestrator.snapshot().counts.retrying).toBe(0);
+      await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(1);
+
+      const recoveryWriter = new StateChangingWriter((state) => {
+        currentState = state;
+      });
+      const recoveryWriteback = new WritebackProcessor(outboxStore, recoveryWriter, logger, config.writeback.maxBackoffMs);
+      const recoveryOrchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        harness: new FakeHarness(),
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore,
+        writeback: recoveryWriteback,
+        operatorApproval,
+      });
+
+      await recoveryOrchestrator.refreshNow();
+      const pending = await approvalStore.findPendingForRun("report-run-1");
+      expect(pending).toMatchObject({
+        status: "pending",
+        issueId: candidate.id,
+        issueIdentifier: candidate.identifier,
+        runId: "report-run-1",
+        evidenceCursor: "idem-1",
+      });
+      await recoveryOrchestrator.refreshNow();
+
+      const approvals = await approvalStore.list();
+      expect(approvals.filter((approval) => approval.runId === "report-run-1")).toHaveLength(1);
+      await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
+        status: "succeeded",
+        pendingApprovalRequestId: pending?.requestId,
+        pendingApprovalRequestedAt: pending?.requestedAt,
+      });
+      const transcript = await runStore.readTranscript("report-run-1");
+      expect(transcript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
+      expect(recoveryWriter.comments).toHaveLength(recoveryComments);
+      expect(recoveryWriter.transitions).toHaveLength(recoveryTransitions);
+      const pendingAuditOperations = (await outboxStore.list()).filter((operation) =>
+        operation.idempotencyKey.includes("publication-approval-pending"),
+      );
+      expect(pendingAuditOperations).toHaveLength(2);
+      expect(pendingAuditOperations.map((operation) => operation.status)).toEqual(["succeeded", "succeeded"]);
+      expect(recoveryOrchestrator.snapshot().counts.running).toBe(0);
+      expect(recoveryOrchestrator.snapshot().counts.retrying).toBe(0);
+      expect(harness.prompts).toHaveLength(1);
+      await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(1);
+      await recoveryOrchestrator.stop();
+    },
+  );
+
   it("clears blocked lifecycle counters after a human unblock transition", async () => {
     const config = testConfig(root);
     config.reviewLoop.blockedStates = ["Blocked"];
@@ -690,7 +922,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await waitFor(() => orchestrator.snapshot().running[0]?.runId !== null, "blocked lifecycle worker start");
     const lifecycle = orchestrator.snapshot().running[0]?.lifecycle;
     await orchestrator.stop();
 
@@ -3949,5 +4181,23 @@ class StateChangingWriter implements TrackerWriter {
   async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
     this.comments.push(input);
     return { status: "applied" };
+  }
+}
+
+class PublicationApprovalCommentFailingWriter extends StateChangingWriter {
+  async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    if (input.dedupeKey?.includes("publication-approval-pending")) {
+      throw new Error("linear pending approval comment failed");
+    }
+    return super.createIssueComment(input);
+  }
+}
+
+class PublicationApprovalTransitionFailingWriter extends StateChangingWriter {
+  async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+    if (input.toState === "Blocked" && input.reason?.includes("operator approval for PR publication")) {
+      throw new Error("linear pending approval transition failed");
+    }
+    return super.transitionIssueState(input);
   }
 }

@@ -62,7 +62,11 @@ import {
   planRunSucceededWritebacks,
 } from "../writeback/TransitionPolicy.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
-import { OPERATOR_REJECTED_PUBLICATION_ERROR, type OperatorApprovalRecord } from "../approval/OperatorApprovalService.js";
+import {
+  OPERATOR_REJECTED_PUBLICATION_ERROR,
+  type OperatorApprovalRecord,
+  type OperatorApprovalService,
+} from "../approval/OperatorApprovalService.js";
 
 export interface OrchestratorOptions {
   config: ServiceConfig;
@@ -78,6 +82,7 @@ export interface OrchestratorOptions {
   pullRequestReviewClient?: PullRequestReviewEvidenceClient;
   pullRequestMergeClient?: MergePolicyGitHubClient;
   completionReportPublisher?: CompletionReportPullRequestPublisher;
+  operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest">;
 }
 
 export interface PullRequestDiscoveryClient {
@@ -533,6 +538,7 @@ export class Orchestrator {
     this.ticking = true;
     try {
       await this.reconcileRunningIssues();
+      await this.recoverPendingPublicationApprovalHandoffs();
       const workerCandidates = await this.options.tracker.fetchCandidateIssues();
       for (const issue of sortIssuesForDispatch(workerCandidates)) {
         if (this.availableSlots() <= 0) break;
@@ -560,6 +566,65 @@ export class Orchestrator {
       }
     } catch (error) {
       this.options.logger.warn("startup terminal cleanup failed", { error: errorMessage(error) });
+    }
+  }
+
+  private async recoverPendingPublicationApprovalHandoffs(): Promise<void> {
+    if (
+      !this.config.github.publishPullRequests ||
+      !(this.config.github.operatorApproval?.requiredForPublication ?? false) ||
+      !this.options.lifecycleStore ||
+      !this.options.writeback ||
+      !this.options.operatorApproval
+    ) {
+      return;
+    }
+
+    let lifecycles: IssueLifecycleRecord[];
+    try {
+      lifecycles = await this.options.lifecycleStore.list();
+    } catch (error) {
+      this.options.logger.warn("pending publication approval recovery lifecycle scan failed", { error: errorMessage(error) });
+      return;
+    }
+    const candidates = lifecycles.filter(hasRecoverablePendingPublicationApproval);
+    if (candidates.length === 0) return;
+
+    let latestIssues: Issue[] = [];
+    try {
+      latestIssues = await this.options.tracker.fetchIssueStatesByIds(candidates.map((lifecycle) => lifecycle.issueId));
+    } catch (error) {
+      this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
+    }
+    const issuesById = new Map(latestIssues.map((issue) => [issue.id, issue]));
+    const service = new CompletionReportService({
+      config: this.config,
+      lifecycleStore: this.options.lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
+      writebackProcessor: this.options.writeback,
+      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+      operatorApproval: this.options.operatorApproval,
+    });
+
+    for (const lifecycle of candidates) {
+      const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      try {
+        const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
+        if (result.recovered) {
+          this.options.logger.info("pending publication approval recovered", {
+            issue_id: lifecycle.issueId,
+            issue_identifier: lifecycle.issueIdentifier,
+            run_id: result.report.runId,
+            approval_request_id: result.approvalRequest.requestId,
+          });
+        }
+      } catch (error) {
+        this.options.logger.warn("pending publication approval recovery failed", {
+          issue_id: lifecycle.issueId,
+          issue_identifier: lifecycle.issueIdentifier,
+          error: errorMessage(error),
+        });
+      }
     }
   }
 
@@ -608,7 +673,7 @@ export class Orchestrator {
     if (stallTimeout === null) return;
     const now = Date.now();
     for (const [issueId, entry] of this.running) {
-      if (await this.isAwaitingOperatorApproval(entry)) {
+      if ((await this.isAwaitingOperatorApproval(entry)) || (await this.hasPendingPublicationApprovalHandoff(entry))) {
         entry.lastEvent = "approval_request";
         entry.lastMessage = "Awaiting operator approval for push/PR";
         entry.lastEventAt = new Date(now);
@@ -1540,7 +1605,12 @@ export class Orchestrator {
     const lifecycle = await store.get(entry.issue.id);
     const report = lifecycle?.completionReports.find((item) => item.runId === runId) ?? null;
     if (!lifecycle || !report) return entry.completionReportAccepted;
-    if (!isFinalizedCompletionReport(report)) return false;
+    if (!isFinalizedCompletionReport(report)) {
+      if (lifecycle.blockedReason !== PUBLICATION_APPROVAL_BLOCKED_REASON) return false;
+      entry.lifecycle = lifecycle;
+      entry.completionReportAccepted = true;
+      return true;
+    }
 
     entry.lifecycle = lifecycle;
     entry.completionReportAccepted = true;
@@ -2323,6 +2393,38 @@ function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {
     priority: null,
     state: "Blocked",
     branchName: request.action.branchName,
+    url: null,
+    assigneeId: null,
+    assignedToWorker: false,
+    labels: [],
+    blockedBy: [],
+    createdAt: null,
+    updatedAt: null,
+  };
+}
+
+function hasRecoverablePendingPublicationApproval(lifecycle: IssueLifecycleRecord): boolean {
+  return (
+    lifecycle.phase === "blocked" &&
+    lifecycle.blockedReason === PUBLICATION_APPROVAL_BLOCKED_REASON &&
+    lifecycle.completionReports.some((report) => !isFinalizedCompletionReport(report))
+  );
+}
+
+function issueFromPendingPublicationLifecycle(lifecycle: IssueLifecycleRecord, state: string): Issue {
+  const report =
+    (lifecycle.lastCompletionReportId === null
+      ? undefined
+      : lifecycle.completionReports.find((item) => item.id === lifecycle.lastCompletionReportId)) ??
+    lifecycle.completionReports.at(-1);
+  return {
+    id: lifecycle.issueId,
+    identifier: lifecycle.issueIdentifier,
+    title: lifecycle.issueIdentifier,
+    description: null,
+    priority: null,
+    state,
+    branchName: report?.branchName ?? lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName,
     url: null,
     assigneeId: null,
     assignedToWorker: false,

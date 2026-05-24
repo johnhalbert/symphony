@@ -141,6 +141,7 @@ program
       runStore,
       lifecycleStore,
       ...(writeback === undefined ? {} : { writeback }),
+      operatorApproval,
     });
 
     loader.watch((event) => {

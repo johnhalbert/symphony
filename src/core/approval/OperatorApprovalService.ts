@@ -232,13 +232,10 @@ export class OperatorApprovalService {
       input,
       operatorApprovalConfig(this.options.config).timeoutMs,
     );
+    if (record.status === "pending") {
+      await this.recordPendingRun(record);
+    }
     if (created) {
-      await this.options.runStore.updateRun(input.runId, {
-        metadata: {
-          pendingApprovalRequestId: record.requestId,
-          pendingApprovalRequestedAt: record.requestedAt,
-        },
-      });
       await this.appendApprovalRequestEvent(record);
     }
 
@@ -370,6 +367,22 @@ export class OperatorApprovalService {
         await sleep(5);
       }
     }
+  }
+
+  private async recordPendingRun(record: OperatorApprovalRecord): Promise<void> {
+    const run = await this.getRun(record.runId);
+    if (
+      run?.pendingApprovalRequestId === record.requestId &&
+      run.pendingApprovalRequestedAt === record.requestedAt
+    ) {
+      return;
+    }
+    await this.options.runStore.updateRun(record.runId, {
+      metadata: {
+        pendingApprovalRequestId: record.requestId,
+        pendingApprovalRequestedAt: record.requestedAt,
+      },
+    });
   }
 
   private async getRun(runId: string) {

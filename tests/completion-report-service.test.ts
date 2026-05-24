@@ -279,6 +279,61 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it.each([
+    ["comment fails after Blocked transition succeeds", () => new CommentFailingWriter()],
+    ["Blocked transition fails after comment succeeds", () => new TransitionFailingWriter()],
+  ])("recovers pending publication approval after partial audit writeback failure: %s", async (_name, writerFactory) => {
+    const operatorApproval = new DeferredOperatorApproval();
+    const { service, lifecycleStore, outbox, runStore, config } = fixture({
+      operatorApproval,
+      requirePublicationApproval: true,
+      writer: writerFactory(),
+      maxBackoffMs: 0,
+    });
+    await startRun(runStore);
+
+    await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
+      code: "tracker_error",
+    });
+    expect(operatorApproval.requests).toHaveLength(0);
+    expect((await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null).toBeNull();
+    expect((await outbox.list()).map((operation) => operation.status)).toContain("retrying");
+
+    const healthyWriter = new StateChangingWriter();
+    const recoveryService = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: outbox,
+      writebackProcessor: new WritebackProcessor(
+        outbox,
+        healthyWriter,
+        new StructuredLogger(() => undefined),
+        config.writeback.maxBackoffMs,
+      ),
+      runStore,
+      operatorApproval,
+    });
+
+    const recovered = await recoveryService.recoverPendingPublicationApproval({
+      issue: issue({ state: "Blocked", branchName: "symphony/TEST-1" }),
+    });
+
+    expect(recovered).toMatchObject({ recovered: true });
+    expect(operatorApproval.requests).toHaveLength(1);
+    expect(operatorApproval.requests[0]).toMatchObject({
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      runId: "run-1",
+      evidenceCursor: "idem-1",
+      action: {
+        branchName: "symphony/TEST-1",
+        baseBranch: "main",
+        workspacePath: "/tmp/workspace",
+      },
+    });
+    expect((await outbox.list()).map((operation) => operation.status)).toEqual(["succeeded", "succeeded"]);
+  });
+
   it("resumes approved publication from a stored pending report after the worker run exits", async () => {
     const publisher = new FakePublisher({
       action: "created",
@@ -534,11 +589,15 @@ describe("CompletionReportService", () => {
       operatorApproval?: Pick<DeferredOperatorApproval, "requestPublicationApproval" | "waitForPublicationApprovalRequest">;
       requirePublicationApproval?: boolean;
       writer?: TrackerWriter;
+      maxBackoffMs?: number;
     } = {},
   ) {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
+    if (options.maxBackoffMs !== undefined) {
+      config.writeback.maxBackoffMs = options.maxBackoffMs;
+    }
     config.reviewLoop.reviewStates = ["In Review"];
     if (options.publisher) {
       config.github.publishPullRequests = true;
@@ -571,7 +630,7 @@ describe("CompletionReportService", () => {
       ...(options.publisher === undefined ? {} : { pullRequestPublisher: options.publisher }),
       ...(options.operatorApproval === undefined ? {} : { operatorApproval: options.operatorApproval }),
     });
-    return { service, lifecycleStore, outbox, runStore, writer: stateWriter };
+    return { service, lifecycleStore, outbox, runStore, writer: stateWriter, config };
   }
 });
 
@@ -813,5 +872,17 @@ class FailingWriter implements TrackerWriter {
 
   async createIssueComment(_input: TrackerCommentInput): Promise<TrackerWriteResult> {
     throw new Error("linear comment failed");
+  }
+}
+
+class CommentFailingWriter extends StateChangingWriter {
+  override async createIssueComment(_input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    throw new Error("linear comment failed");
+  }
+}
+
+class TransitionFailingWriter extends StateChangingWriter {
+  override async transitionIssueState(_input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+    throw new Error("linear transition failed");
   }
 }

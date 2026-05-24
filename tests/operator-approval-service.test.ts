@@ -81,6 +81,26 @@ describe("OperatorApprovalService", () => {
     expect(transcript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
   });
 
+  it("repairs run metadata when reusing an existing pending approval", async () => {
+    const pending = await service.requestPublicationApproval(request());
+    await runStore.updateRun("run-1", {
+      metadata: {
+        pendingApprovalRequestId: null,
+        pendingApprovalRequestedAt: null,
+      },
+    });
+
+    const reused = await service.requestPublicationApproval(request());
+
+    expect(reused.requestId).toBe(pending.requestId);
+    await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+      pendingApprovalRequestId: pending.requestId,
+      pendingApprovalRequestedAt: pending.requestedAt,
+    });
+    const transcript = await runStore.readTranscript("run-1");
+    expect(transcript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
+  });
+
   it("fails the waiter when the operator rejects publication", async () => {
     config.github.operatorApproval!.rejectPolicy = "fail";
     const wait = service.waitForPublicationApproval(request());

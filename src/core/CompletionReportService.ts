@@ -5,6 +5,7 @@ import type {
   CompletionReportChecklistItem,
   CompletionReportPullRequestRef,
   IssueCompletionReportRecord,
+  IssueLifecycleRecord,
   IssueLifecyclePhase,
   IssueLifecycleStore,
 } from "./persistence/IssueLifecycleStore.js";
@@ -64,6 +65,7 @@ const completionReportSchema = z.object({
 export type CompletionReportInput = z.infer<typeof completionReportSchema>;
 export type CompletionReportSubmitterRole = "worker" | "orchestrator" | "reviewer" | string;
 type ExistingIssueLifecycle = Awaited<ReturnType<IssueLifecycleStore["get"]>>;
+type ExistingRunRecord = Awaited<ReturnType<RunTranscriptStore["getRun"]>>;
 
 export interface CompletionReportActiveContext {
   issue: Issue;
@@ -124,6 +126,23 @@ export interface PublicationApprovalResumeInput {
   approval: OperatorApprovalRecord;
   issue: Issue;
 }
+
+export interface PendingPublicationApprovalRecoveryInput {
+  issue: Issue;
+  lifecycle?: IssueLifecycleRecord | null;
+}
+
+export type PendingPublicationApprovalRecoveryResult =
+  | {
+      recovered: true;
+      approvalRequest: OperatorApprovalRecord;
+      report: IssueCompletionReportRecord;
+    }
+  | {
+      recovered: false;
+      reason: "not_applicable" | "no_pending_report" | "audit_not_settled" | "approval_not_pending";
+      report?: IssueCompletionReportRecord;
+    };
 
 export class CompletionReportService {
   constructor(private readonly options: CompletionReportServiceOptions) {}
@@ -288,6 +307,67 @@ export class CompletionReportService {
     };
     await this.enqueuePublicationApprovalTerminal(input.approval, report, context, existing.pullRequest);
     return true;
+  }
+
+  async recoverPendingPublicationApproval(
+    input: PendingPublicationApprovalRecoveryInput,
+  ): Promise<PendingPublicationApprovalRecoveryResult> {
+    if (!this.shouldPersistBeforePublicationApproval()) {
+      return { recovered: false, reason: "not_applicable" };
+    }
+    const lifecycle =
+      input.lifecycle ?? (await this.options.lifecycleStore.get(input.issue.id)) ?? (await this.options.lifecycleStore.get(input.issue.identifier));
+    if (!isPendingPublicationApprovalLifecycle(lifecycle)) {
+      return { recovered: false, reason: "not_applicable" };
+    }
+    const pendingReport = pendingPublicationReport(lifecycle);
+    if (!pendingReport) {
+      return { recovered: false, reason: "no_pending_report" };
+    }
+
+    const report = completionReportInputFromRecord(pendingReport);
+    const run = await this.options.runStore?.getRun(pendingReport.runId);
+    if (run?.pendingApprovalRequestId) {
+      return { recovered: false, reason: "not_applicable", report: pendingReport };
+    }
+    const context = recoveryContextFor({
+      issue: input.issue,
+      lifecycle,
+      pendingReport,
+      run: run ?? null,
+      config: this.options.config,
+    });
+    const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
+    const publicationInput = this.buildPublicationInput(report, context, lifecycle);
+    const pendingOperations = planCompletionReportPublicationApprovalPendingWritebacks(
+      runWritebackContext(context, report.runId),
+      this.options.config,
+      completionReportWritebackDetails(report, context.issue, inputPullRequest),
+      {
+        branchName: publicationInput.branchName,
+        baseBranch: publicationInput.baseBranch,
+        workspacePath: publicationInput.workspacePath,
+        title: publicationInput.title,
+      },
+    );
+
+    for (const operation of pendingOperations) {
+      await this.options.writebackOutbox.enqueueOnce(operation);
+    }
+    try {
+      await this.processAndVerifyPendingPublicationApprovalWritebacks(pendingOperations);
+    } catch (error) {
+      if (error instanceof SymphonyError && error.code === "tracker_error") {
+        return { recovered: false, reason: "audit_not_settled", report: pendingReport };
+      }
+      throw error;
+    }
+
+    const approvalRequest = await this.requestPublicationApproval(report, context, publicationInput);
+    if (approvalRequest.status !== "pending") {
+      return { recovered: false, reason: "approval_not_pending", report: pendingReport };
+    }
+    return { recovered: true, approvalRequest, report: pendingReport };
   }
 
   private async finalizeCompletionReport(input: {
@@ -582,8 +662,16 @@ export function isFinalizedCompletionReport(report: IssueCompletionReportRecord)
   return report.writebackOperationKeys.length > 0;
 }
 
-function isPendingPublicationApprovalLifecycle(lifecycle: ExistingIssueLifecycle): boolean {
+function isPendingPublicationApprovalLifecycle(lifecycle: ExistingIssueLifecycle): lifecycle is IssueLifecycleRecord {
   return lifecycle?.phase === "blocked" && lifecycle.blockedReason === PUBLICATION_APPROVAL_BLOCKED_REASON;
+}
+
+function pendingPublicationReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {
+  const lastPending =
+    lifecycle.lastCompletionReportId === null
+      ? undefined
+      : lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId && !isFinalizedCompletionReport(report));
+  return lastPending ?? [...lifecycle.completionReports].reverse().find((report) => !isFinalizedCompletionReport(report)) ?? null;
 }
 
 function isTerminalApprovalStatus(
@@ -674,6 +762,51 @@ function pullRequestRefFromPublication(publication: CompletionReportPullRequestP
     number: publication.number,
     headSha: publication.headSha,
     branch: publication.headBranch,
+  };
+}
+
+function recoveryContextFor(input: {
+  issue: Issue;
+  lifecycle: IssueLifecycleRecord;
+  pendingReport: IssueCompletionReportRecord;
+  run: ExistingRunRecord;
+  config: ServiceConfig;
+}): CompletionReportActiveContext {
+  const branchName =
+    input.pendingReport.branchName ??
+    input.lifecycle.summaryPointers.gitBranchName ??
+    input.lifecycle.summaryPointers.branchName ??
+    input.run?.gitBranchName ??
+    input.issue.branchName;
+  const workspacePath = input.lifecycle.summaryPointers.workspacePath ?? input.run?.workspacePath ?? null;
+  const baseRef = input.lifecycle.summaryPointers.baseRef ?? input.run?.baseRef ?? input.config.workspace.source.baseRef;
+  const repoPath = input.lifecycle.summaryPointers.repoPath ?? input.run?.repoPath ?? null;
+  const workspace =
+    workspacePath === null
+      ? null
+      : {
+          path: workspacePath,
+          workspaceKey: input.lifecycle.summaryPointers.workspaceKey ?? input.run?.workspaceKey ?? input.pendingReport.issueIdentifier,
+          createdNow: false,
+          issueId: input.pendingReport.issueId,
+          issueIdentifier: input.pendingReport.issueIdentifier,
+          ...(branchName === null ? {} : { gitBranchName: branchName }),
+          ...(baseRef === null ? {} : { baseRef }),
+          ...(repoPath === null ? {} : { repoPath }),
+        };
+  return {
+    issue: {
+      ...input.issue,
+      id: input.pendingReport.issueId,
+      identifier: input.pendingReport.issueIdentifier,
+      state: input.config.writeback.dispatchState,
+      branchName,
+    },
+    activeRunId: input.pendingReport.runId,
+    role: "worker",
+    workspacePath,
+    workspace,
+    phase: "implementation",
   };
 }
 
