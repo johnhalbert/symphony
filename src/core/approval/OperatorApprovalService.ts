@@ -51,6 +51,8 @@ export interface OperatorApprovalRequestInput {
   action: OperatorApprovalAction;
 }
 
+export const OPERATOR_REJECTED_PUBLICATION_ERROR = "Operator rejected push/PR publication";
+
 export class FileOperatorApprovalStore {
   constructor(private readonly stateDir: string) {}
 
@@ -265,7 +267,12 @@ export class OperatorApprovalService {
 
     const result = await this.options.store.resolve(requestId, decision);
     if (!result.replayed) {
-      await this.clearPendingRun(result.request);
+      if (decision === "reject" && this.rejectPolicy === "fail") {
+        await this.clearPendingRun(result.request);
+        await this.markRunFailedForRejection(result.request);
+      } else {
+        await this.clearPendingRun(result.request);
+      }
       await this.appendApprovalResolvedEvent(result.request);
     }
     return result;
@@ -296,7 +303,7 @@ export class OperatorApprovalService {
       }
       if (current.status === "rejected") {
         await this.clearPendingRun(current);
-        throw new SymphonyError("invalid_request", "Operator rejected push/PR publication", current);
+        throw new SymphonyError("invalid_request", OPERATOR_REJECTED_PUBLICATION_ERROR, current);
       }
       if (current.status === "stale" || current.status === "expired" || current.status === "cancelled") {
         await this.clearPendingRun(current);
@@ -368,6 +375,16 @@ export class OperatorApprovalService {
       }
     }
     return null;
+  }
+
+  private async markRunFailedForRejection(record: OperatorApprovalRecord): Promise<void> {
+    const run = await this.getRun(record.runId);
+    if (run?.status !== "running") return;
+    await this.options.runStore.updateRun(record.runId, {
+      status: "failed",
+      completedAt: new Date().toISOString(),
+      error: OPERATOR_REJECTED_PUBLICATION_ERROR,
+    });
   }
 
   private async appendApprovalRequestEvent(record: OperatorApprovalRecord): Promise<TranscriptEvent> {

@@ -206,7 +206,7 @@ export class StatusServer {
           return;
         }
         if (request.method === "POST") {
-          this.requireMutationToken(request);
+          this.requireApprovalMutationToken(request);
           const decision = parseApprovalDecision(await readJsonBody(request));
           const result = await this.options.operatorApproval?.resolve(requestId, decision);
           if (!result) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
@@ -374,7 +374,11 @@ export class StatusServer {
             continuationSummary: affordances.continuationSummary,
             mutationsRequireToken: controls.mutationsRequireToken,
             mutationHeader: "X-Symphony-Token",
-            pendingApproval: approvalCapability(pendingApproval ?? null, this.options.operatorApproval?.isRequired() ?? false),
+            pendingApproval: approvalCapability(
+              pendingApproval ?? null,
+              this.options.operatorApproval?.isRequired() ?? false,
+              this.options.openWorkspaceToken,
+            ),
           },
           pendingApproval: pendingApproval ? approvalResponse(pendingApproval, this.options.operatorApproval?.isRequired() ?? false) : null,
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
@@ -456,6 +460,21 @@ export class StatusServer {
           message: errorMessage(error),
         },
       });
+    }
+  }
+
+  private requireApprovalMutationToken(request: IncomingMessage): void {
+    if (!(this.options.operatorApproval?.isRequired() ?? false)) {
+      this.requireMutationToken(request);
+      return;
+    }
+    const expected = this.options.openWorkspaceToken?.trim() ?? "";
+    if (expected.length === 0) {
+      throw new SymphonyError("invalid_request", "Missing or invalid open-workspace token");
+    }
+    const provided = request.headers["x-symphony-token"];
+    if (provided !== expected) {
+      throw new SymphonyError("invalid_request", "Missing or invalid open-workspace token");
     }
   }
 
@@ -597,7 +616,11 @@ function approvalResponse(record: OperatorApprovalRecord, enabled: boolean): Rec
   };
 }
 
-function approvalCapability(record: OperatorApprovalRecord | null, enabled: boolean): Record<string, unknown> {
+function approvalCapability(
+  record: OperatorApprovalRecord | null,
+  enabled: boolean,
+  openWorkspaceToken: string | null,
+): Record<string, unknown> {
   return {
     enabled,
     active: record !== null,
@@ -606,8 +629,12 @@ function approvalCapability(record: OperatorApprovalRecord | null, enabled: bool
     action: record?.action ?? null,
     requestedAt: record?.requestedAt ?? null,
     resolve: record === null ? null : approvalResolve(record),
-    requiresToken: true,
+    requiresToken: approvalMutationsRequireToken(enabled, openWorkspaceToken),
   };
+}
+
+function approvalMutationsRequireToken(enabled: boolean, openWorkspaceToken: string | null): boolean {
+  return enabled || Boolean(openWorkspaceToken?.trim());
 }
 
 type RuntimeSnapshot = ReturnType<Orchestrator["snapshot"]>;

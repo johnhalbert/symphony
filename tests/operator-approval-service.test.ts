@@ -2,19 +2,25 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FileOperatorApprovalStore, OperatorApprovalService, type OperatorApprovalAction } from "../src/core/approval/OperatorApprovalService.js";
+import {
+  FileOperatorApprovalStore,
+  OPERATOR_REJECTED_PUBLICATION_ERROR,
+  OperatorApprovalService,
+  type OperatorApprovalAction,
+} from "../src/core/approval/OperatorApprovalService.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { testConfig } from "./helpers.js";
 
 describe("OperatorApprovalService", () => {
   let root: string;
+  let config: ReturnType<typeof testConfig>;
   let runStore: FileRunTranscriptStore;
   let store: FileOperatorApprovalStore;
   let service: OperatorApprovalService;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-operator-approval-"));
-    const config = testConfig(root);
+    config = testConfig(root);
     config.github.publishPullRequests = true;
     config.github.operatorApproval!.requiredForPublication = true;
     config.github.operatorApproval!.pollIntervalMs = 5;
@@ -76,12 +82,20 @@ describe("OperatorApprovalService", () => {
   });
 
   it("fails the waiter when the operator rejects publication", async () => {
+    config.github.operatorApproval!.rejectPolicy = "fail";
     const wait = service.waitForPublicationApproval(request());
     const pending = await waitForPending();
+    const waiterError = wait.catch((error: unknown) => error);
 
     await service.resolve(pending.requestId, "reject");
 
-    await expect(wait).rejects.toThrow(/rejected/);
+    await expect(waiterError).resolves.toMatchObject({ code: "invalid_request" });
+    await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+      status: "failed",
+      completedAt: expect.any(String),
+      error: OPERATOR_REJECTED_PUBLICATION_ERROR,
+      pendingApprovalRequestId: null,
+    });
     const transcript = await runStore.readTranscript("run-1");
     expect(transcript.events.at(-1)).toMatchObject({ eventType: "approval_resolved" });
   });
@@ -89,10 +103,11 @@ describe("OperatorApprovalService", () => {
   it("marks approvals stale when the run is no longer active", async () => {
     const wait = service.waitForPublicationApproval(request());
     const pending = await waitForPending();
+    const waiterError = wait.catch((error: unknown) => error);
     await runStore.updateRun("run-1", { status: "failed", completedAt: "2026-01-01T00:00:00Z" });
 
     await expect(service.resolve(pending.requestId, "approve")).rejects.toMatchObject({ code: "conflict" });
-    await expect(wait).rejects.toThrow(/stale/);
+    await expect(waiterError).resolves.toMatchObject({ code: "invalid_request" });
     await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "stale" });
   });
 
