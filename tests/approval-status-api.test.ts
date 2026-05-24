@@ -701,6 +701,108 @@ describe("approval status API", () => {
       expect(reviewerRuns).toHaveLength(1);
       expect(reviewerRuns[0]?.prompt).toContain(reportSummary);
       expect(reviewerRuns[0]?.prompt).toContain(`Pull request: ${pullRequestUrl}`);
+
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "post-approve reviewer quiescence");
+
+      // Approve replays still enter the publication resume hook; finalized report state must keep that path idempotent.
+      const approvedCommentBeforeReplay = writer.comments.find((comment) => comment.body.includes("Status: accepted"));
+      const approvedTransitionBeforeReplay = writer.transitions.find((transition) => transition.toState === "In Review");
+      const lifecycleBeforeReplay = await lifecycleStore.get(candidate.id);
+      const completionReportBeforeReplay = lifecycleBeforeReplay?.completionReports.find(
+        (report) => report.idempotencyKey === evidenceCursor,
+      );
+      const workerRunBeforeReplay = await runStore.getRun(runId);
+      const run1TranscriptBeforeReplay = await runStore.readTranscript(runId);
+      const approvalResolvedCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
+        (event) => event.eventType === "approval_resolved",
+      ).length;
+      const replayBaseline = {
+        publisherCallCount: publisher.inputs.length,
+        commentCount: writer.comments.length,
+        transitionCount: writer.transitions.length,
+        acceptedWriteback: {
+          commentBodyIncludesStatusAccepted: approvedCommentBeforeReplay?.body.includes("Status: accepted") ?? false,
+          commentDedupeKey: approvedCommentBeforeReplay?.dedupeKey ?? null,
+          transitionToState: approvedTransitionBeforeReplay?.toState ?? null,
+        },
+        currentState,
+        lifecycle: {
+          phase: lifecycleBeforeReplay?.phase,
+          blockedReason: lifecycleBeforeReplay?.blockedReason,
+          pullRequest: completionReportBeforeReplay?.pullRequest ?? null,
+          writebackOperationKeys: completionReportBeforeReplay?.writebackOperationKeys ?? [],
+        },
+        workerRun: {
+          status: workerRunBeforeReplay?.status,
+          completedAt: workerRunBeforeReplay?.completedAt,
+          pendingApprovalRequestId: workerRunBeforeReplay?.pendingApprovalRequestId,
+          prUrl: workerRunBeforeReplay?.prUrl,
+          prNumber: workerRunBeforeReplay?.prNumber,
+          prHeadSha: workerRunBeforeReplay?.prHeadSha,
+          prBranch: workerRunBeforeReplay?.prBranch,
+        },
+        workerRunCount: harness.runs.filter((run) => run.ctx.role === "worker").length,
+        reviewerRunCount: harness.runs.filter((run) => run.ctx.role === "reviewer").length,
+        persistedRunCount: (await runStore.listRunsForIssue(candidate.id)).length,
+        approvalResolvedCount: approvalResolvedCountBeforeReplay,
+      };
+      expect(replayBaseline.approvalResolvedCount).toBe(1);
+
+      const replay = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const replayBody = (await replay.json()) as { request: { status: string }; replayed: boolean };
+
+      expect(replay.status).toBe(200);
+      expect(replayBody).toMatchObject({ request: { status: "approved" }, replayed: true });
+      expect(publisher.inputs).toHaveLength(replayBaseline.publisherCallCount);
+      expect(writer.comments).toHaveLength(replayBaseline.commentCount);
+      expect(writer.transitions).toHaveLength(replayBaseline.transitionCount);
+      const approvedCommentAfterReplay = writer.comments.find((comment) => comment.body.includes("Status: accepted"));
+      const approvedTransitionAfterReplay = writer.transitions.find((transition) => transition.toState === "In Review");
+      expect({
+        commentBodyIncludesStatusAccepted: approvedCommentAfterReplay?.body.includes("Status: accepted") ?? false,
+        commentDedupeKey: approvedCommentAfterReplay?.dedupeKey ?? null,
+        transitionToState: approvedTransitionAfterReplay?.toState ?? null,
+      }).toEqual(replayBaseline.acceptedWriteback);
+      expect(approvedCommentAfterReplay?.dedupeKey).toBe(`${runId}:completion-report:${evidenceCursor}`);
+      expect(approvedTransitionAfterReplay).toMatchObject({ toState: "In Review" });
+      expect(currentState).toBe(replayBaseline.currentState);
+
+      const lifecycleAfterReplay = await lifecycleStore.get(candidate.id);
+      const completionReportAfterReplay = lifecycleAfterReplay?.completionReports.find(
+        (report) => report.idempotencyKey === evidenceCursor,
+      );
+      expect({
+        phase: lifecycleAfterReplay?.phase,
+        blockedReason: lifecycleAfterReplay?.blockedReason,
+        pullRequest: completionReportAfterReplay?.pullRequest ?? null,
+        writebackOperationKeys: completionReportAfterReplay?.writebackOperationKeys ?? [],
+      }).toEqual(replayBaseline.lifecycle);
+
+      const workerRunAfterReplay = await runStore.getRun(runId);
+      expect({
+        status: workerRunAfterReplay?.status,
+        completedAt: workerRunAfterReplay?.completedAt,
+        pendingApprovalRequestId: workerRunAfterReplay?.pendingApprovalRequestId,
+        prUrl: workerRunAfterReplay?.prUrl,
+        prNumber: workerRunAfterReplay?.prNumber,
+        prHeadSha: workerRunAfterReplay?.prHeadSha,
+        prBranch: workerRunAfterReplay?.prBranch,
+      }).toEqual(replayBaseline.workerRun);
+
+      const run1TranscriptAfterReplay = await runStore.readTranscript(runId);
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_resolved")).toHaveLength(
+        replayBaseline.approvalResolvedCount,
+      );
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_resolved")).toHaveLength(
+        1,
+      );
+      expect(harness.runs.filter((run) => run.ctx.role === "worker")).toHaveLength(replayBaseline.workerRunCount);
+      expect(harness.runs.filter((run) => run.ctx.role === "reviewer")).toHaveLength(replayBaseline.reviewerRunCount);
+      await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(replayBaseline.persistedRunCount);
     } finally {
       await server.stop();
       await orchestrator.stop();
