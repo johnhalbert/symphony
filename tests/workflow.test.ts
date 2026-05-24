@@ -36,8 +36,13 @@ Work on {{ issue.identifier }}.`,
     expect(config.tracker.assignee).toBe("me");
     expect(config.agent.harness).toBe("cursor");
     expect(config.cursor.model).toBe("gpt-5.5");
-    expect(config.cursor.modelParams).toEqual([{ id: "reasoning", value: "extra-high" }]);
-    expect(config.cursor.settingSources).toEqual(["project", "user"]);
+    expect(config.cursor.modelParams).toEqual([
+      { id: "context", value: "272k" },
+      { id: "reasoning", value: "extra-high" },
+    ]);
+    expect(config.cursor.settingSources).toEqual([]);
+    expect(config.cursor.allowLargeContext).toBe(false);
+    expect(config.cursor.workerAgentLifecycle).toBe("fresh_per_run");
     expect(config.github).toEqual({
       owner: null,
       repo: null,
@@ -136,6 +141,8 @@ Work on {{ issue.identifier }}.`,
       maxReviewRounds: 4,
       maxIncompleteTurns: 2,
       continuationHistoryThreshold: 7,
+      transcriptHistoryLimit: 7,
+      prReviewEvidenceLimit: 5,
     });
     expect(config.continuationContext).toEqual({
       searchEnabled: true,
@@ -310,7 +317,7 @@ Work on {{ issue.identifier }}.`,
     ).toThrow(SymphonyError);
   });
 
-  it("allows cursor model params to be overridden or disabled", () => {
+  it("allows non-default cursor model params to be overridden", () => {
     const configured = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -319,18 +326,54 @@ Work on {{ issue.identifier }}.`,
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
     );
-    const disabled = parseServiceConfig(
+
+    expect(configured.cursor.model).toBe("composer-2.5");
+    expect(configured.cursor.modelParams).toEqual([{ id: "reasoning", value: "high" }]);
+  });
+
+  it("requires bounded gpt-5.5 context unless large context is explicitly allowed", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          cursor: { model_params: {} },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("cursor.model_params.context must be 272k");
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          cursor: { model_params: { context: "1m", reasoning: "extra-high" } },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("cursor.model_params.context=1m requires cursor.allow_large_context");
+
+    const largeContext = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
-        cursor: { model_params: {} },
+        cursor: {
+          allow_large_context: true,
+          model_params: { context: "1m", reasoning: "extra-high" },
+          setting_sources: [],
+          worker_agent_lifecycle: "resume_by_issue",
+        },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
     );
 
-    expect(configured.cursor.model).toBe("composer-2.5");
-    expect(configured.cursor.modelParams).toEqual([{ id: "reasoning", value: "high" }]);
-    expect(disabled.cursor.modelParams).toEqual([]);
+    expect(largeContext.cursor.modelParams).toEqual([
+      { id: "context", value: "1m" },
+      { id: "reasoning", value: "extra-high" },
+    ]);
+    expect(largeContext.cursor.allowLargeContext).toBe(true);
+    expect(largeContext.cursor.settingSources).toEqual([]);
+    expect(largeContext.cursor.workerAgentLifecycle).toBe("resume_by_issue");
   });
 
   it("parses git worktree workspace config", () => {

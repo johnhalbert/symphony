@@ -139,8 +139,8 @@ export function selectEvidenceForWorker(
   const active = activeReviewEvidence(state);
   if (active.length <= fullHistoryThreshold) return active;
   const cursor = state.lastWorkerEvidenceCursor;
-  if (!cursor) return active;
-  return active.filter((item) => compareCursor(item.cursor, cursor) > 0 || item.isResolved === false);
+  if (!cursor) return active.slice(-fullHistoryThreshold);
+  return active.filter((item) => compareCursor(item.cursor, cursor) > 0 || item.isResolved === false).slice(-fullHistoryThreshold);
 }
 
 function activeReviewEvidence(state: PullRequestReviewEvidenceState): PullRequestReviewEvidenceItem[] {

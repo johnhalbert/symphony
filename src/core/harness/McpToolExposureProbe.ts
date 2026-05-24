@@ -1315,6 +1315,8 @@ function mcpSdkServerNameForCommand(command: McpSubprocessCommand): string {
       return "symphony-review-verdict";
     case "review-feedback-mcp":
       return "symphony-review-feedback";
+    case "transcript-recall-mcp":
+      return "symphony-transcript-recall";
   }
 }
 

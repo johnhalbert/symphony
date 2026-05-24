@@ -163,6 +163,62 @@ export interface IssueMergeMetadata {
   doneTransitionOperationKey: string;
 }
 
+export interface IssueWorkerOutputContract {
+  version: 1;
+  reportId: string;
+  runId: string;
+  summary: string;
+  changedFiles: string[];
+  validationEvidence: string[];
+  risks: string[];
+  pullRequest: CompletionReportPullRequestRef | null;
+  acceptedAt: string;
+}
+
+export interface IssueReviewerOutputContract {
+  version: 1;
+  verdictId: string;
+  runId: string;
+  verdict: IssueReviewVerdict;
+  findings: string[];
+  acceptanceResults: ReviewVerdictAcceptanceResult[];
+  evidence: string[];
+  submittedAt: string;
+}
+
+export interface IssueLaneMemo {
+  version: 1;
+  issueId: string;
+  issueIdentifier: string;
+  updatedAt: string;
+  reviewRound: number;
+  incompleteTurnCount: number;
+  sizeChars: number;
+  entries: string[];
+  openFindings: string[];
+  pointers: IssueLifecycleSummaryPointers;
+  lastWorkerRunId: string | null;
+  lastReviewerRunId: string | null;
+}
+
+export interface IssueHandoffState {
+  version: 1;
+  memo: IssueLaneMemo;
+  lastWorkerOutput: IssueWorkerOutputContract | null;
+  lastReviewerOutput: IssueReviewerOutputContract | null;
+}
+
+export interface WorkerHandoffPacket {
+  version: 1;
+  issueId: string;
+  issueIdentifier: string;
+  generatedAt: string;
+  memo: IssueLaneMemo;
+  lastWorkerOutput: IssueWorkerOutputContract | null;
+  lastReviewerOutput: IssueReviewerOutputContract | null;
+  pointers: IssueLifecycleSummaryPointers;
+}
+
 export interface IssueLifecycleRecord {
   issueId: string;
   issueIdentifier: string;
@@ -179,6 +235,7 @@ export interface IssueLifecycleRecord {
   reviewFeedback: IssueReviewFeedbackRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
   merge: IssueMergeMetadata | null;
+  handoff: IssueHandoffState;
   createdAt: string;
   updatedAt: string;
 }
@@ -197,6 +254,7 @@ export interface IssueLifecyclePatch {
   reviewFeedback?: IssueReviewFeedbackRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
   merge?: IssueMergeMetadata | null;
+  handoff?: IssueHandoffState;
 }
 
 export type IssueLifecycleStore = FileIssueLifecycleStore;
@@ -207,7 +265,7 @@ export class FileIssueLifecycleStore {
   async ensureIssue(issue: Pick<Issue, "id" | "identifier">, patch: IssueLifecyclePatch = {}): Promise<IssueLifecycleRecord> {
     const existing = await this.find(issue.id, issue.identifier);
     const now = new Date().toISOString();
-    const record: IssueLifecycleRecord = {
+    const baseRecord = {
       issueId: issue.id,
       issueIdentifier: issue.identifier,
       phase: patch.phase ?? existing?.phase ?? "implementation",
@@ -229,6 +287,10 @@ export class FileIssueLifecycleStore {
       merge: patchValue(patch, "merge", existing?.merge ?? null),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
+    };
+    const record: IssueLifecycleRecord = {
+      ...baseRecord,
+      handoff: patch.handoff ?? buildIssueHandoffState(baseRecord),
     };
     await this.write(record);
     return record;
@@ -292,6 +354,132 @@ export function phaseForIssueState(state: string, config: ServiceConfig): IssueL
   return "unknown";
 }
 
+export function buildWorkerHandoffPacket(
+  record: IssueLifecycleRecord,
+  generatedAt = new Date().toISOString(),
+): WorkerHandoffPacket {
+  return {
+    version: 1,
+    issueId: record.issueId,
+    issueIdentifier: record.issueIdentifier,
+    generatedAt,
+    memo: record.handoff.memo,
+    lastWorkerOutput: record.handoff.lastWorkerOutput,
+    lastReviewerOutput: record.handoff.lastReviewerOutput,
+    pointers: record.summaryPointers,
+  };
+}
+
+export function buildIssueHandoffState(record: Omit<IssueLifecycleRecord, "handoff">): IssueHandoffState {
+  const lastWorkerOutput = workerOutputFromReport(latestCompletionReport(record));
+  const lastReviewerOutput = reviewerOutputFromVerdict(latestReviewVerdict(record));
+  return {
+    version: 1,
+    memo: buildLaneMemo(record, lastWorkerOutput, lastReviewerOutput),
+    lastWorkerOutput,
+    lastReviewerOutput,
+  };
+}
+
+function buildLaneMemo(
+  record: Omit<IssueLifecycleRecord, "handoff">,
+  lastWorkerOutput: IssueWorkerOutputContract | null,
+  lastReviewerOutput: IssueReviewerOutputContract | null,
+): IssueLaneMemo {
+  const openFindings = lastReviewerOutput?.verdict === "fail" ? lastReviewerOutput.findings.slice(0, 8) : [];
+  const acceptedDecisions = [
+    ...(lastReviewerOutput?.verdict === "pass"
+      ? lastReviewerOutput.acceptanceResults
+          .filter((result) => result.satisfied)
+          .map((result) => `Accepted by reviewer: ${clip(result.text)}`)
+      : []),
+    ...(record.merge ? [`Merged PR ${record.merge.pullRequest.number === null ? record.merge.pullRequest.url : `#${record.merge.pullRequest.number}`}.`] : []),
+    ...record.reviewEvidence.items
+      .filter((item) => item.isResolved === true && item.isOutdated !== true)
+      .slice(0, 4)
+      .map((item) => `Resolved PR evidence: ${clip(item.body)}`),
+  ];
+  const entries = [
+    `Lifecycle phase: ${record.phase}; review round: ${record.reviewRound}; incomplete worker turns: ${record.incompleteTurnCount}.`,
+    lastWorkerOutput
+      ? `Latest worker output ${lastWorkerOutput.reportId} (${lastWorkerOutput.runId}): ${clip(lastWorkerOutput.summary)}`
+      : "No accepted worker output is available yet.",
+    lastReviewerOutput
+      ? `Latest reviewer output ${lastReviewerOutput.verdictId} (${lastReviewerOutput.runId}): ${lastReviewerOutput.verdict}.`
+      : "No reviewer output is available yet.",
+    ...acceptedDecisions.map((decision) => clip(decision)),
+    ...openFindings.map((finding) => `Open reviewer finding: ${clip(finding)}`),
+  ].slice(0, 12);
+  const memoWithoutSize = {
+    version: 1 as const,
+    issueId: record.issueId,
+    issueIdentifier: record.issueIdentifier,
+    updatedAt: record.updatedAt,
+    reviewRound: record.reviewRound,
+    incompleteTurnCount: record.incompleteTurnCount,
+    entries,
+    openFindings,
+    pointers: record.summaryPointers,
+    lastWorkerRunId: lastWorkerOutput?.runId ?? null,
+    lastReviewerRunId: lastReviewerOutput?.runId ?? null,
+  };
+  return {
+    ...memoWithoutSize,
+    sizeChars: JSON.stringify(memoWithoutSize).length,
+  };
+}
+
+function latestCompletionReport(
+  record: Pick<IssueLifecycleRecord, "completionReports" | "lastCompletionReportId">,
+): IssueCompletionReportRecord | null {
+  if (record.lastCompletionReportId) {
+    return record.completionReports.find((report) => report.id === record.lastCompletionReportId) ?? null;
+  }
+  return record.completionReports.at(-1) ?? null;
+}
+
+function latestReviewVerdict(
+  record: Pick<IssueLifecycleRecord, "reviewVerdicts" | "lastReviewVerdictId">,
+): IssueReviewVerdictRecord | null {
+  if (record.lastReviewVerdictId) {
+    return record.reviewVerdicts.find((verdict) => verdict.id === record.lastReviewVerdictId) ?? null;
+  }
+  return record.reviewVerdicts.at(-1) ?? null;
+}
+
+function workerOutputFromReport(report: IssueCompletionReportRecord | null): IssueWorkerOutputContract | null {
+  if (!report) return null;
+  return {
+    version: 1,
+    reportId: report.id,
+    runId: report.runId,
+    summary: clip(report.summary),
+    changedFiles: report.changedFiles.slice(0, 25),
+    validationEvidence: report.validationEvidence.map((item) => clip(item)).slice(0, 10),
+    risks: report.risks.map((item) => clip(item)).slice(0, 10),
+    pullRequest: report.pullRequest,
+    acceptedAt: report.acceptedAt,
+  };
+}
+
+function reviewerOutputFromVerdict(verdict: IssueReviewVerdictRecord | null): IssueReviewerOutputContract | null {
+  if (!verdict) return null;
+  return {
+    version: 1,
+    verdictId: verdict.id,
+    runId: verdict.runId,
+    verdict: verdict.verdict,
+    findings: verdict.findings.map((item) => clip(item)).slice(0, 10),
+    acceptanceResults: verdict.acceptanceResults.slice(0, 20),
+    evidence: verdict.evidence.map((item) => clip(item)).slice(0, 10),
+    submittedAt: verdict.submittedAt,
+  };
+}
+
+function clip(value: string, maxChars = 500): string {
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 15)}...[truncated]`;
+}
+
 function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
   return {
     workspaceKey: null,
@@ -348,7 +536,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     throw corruptLifecycle(filePath, "phase is invalid");
   }
 
-  return {
+  const normalized = {
     issueId: value.issueId,
     issueIdentifier: value.issueIdentifier,
     phase: value.phase,
@@ -366,6 +554,10 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     merge: normalizeMergeMetadata(value.merge, filePath),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
+  };
+  return {
+    ...normalized,
+    handoff: normalizeHandoffState(value.handoff, normalized, filePath),
   };
 }
 
@@ -465,6 +657,81 @@ function normalizeReviewEvidence(value: unknown, filePath: string): PullRequestR
     ),
     items: normalizeReviewEvidenceItems(value.items, filePath),
     updatedAt: optionalNullableString(value.updatedAt, filePath, "reviewEvidence.updatedAt"),
+  };
+}
+
+function normalizeHandoffState(
+  value: unknown,
+  record: Omit<IssueLifecycleRecord, "handoff">,
+  filePath: string,
+): IssueHandoffState {
+  if (value === undefined) return buildIssueHandoffState(record);
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "handoff is invalid");
+  if (value.version !== 1) throw corruptLifecycle(filePath, "handoff.version is invalid");
+  return {
+    version: 1,
+    memo: normalizeLaneMemo(value.memo, filePath),
+    lastWorkerOutput: normalizeWorkerOutputContract(value.lastWorkerOutput, filePath),
+    lastReviewerOutput: normalizeReviewerOutputContract(value.lastReviewerOutput, filePath),
+  };
+}
+
+function normalizeLaneMemo(value: unknown, filePath: string): IssueLaneMemo {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "handoff.memo is invalid");
+  if (value.version !== 1) throw corruptLifecycle(filePath, "handoff.memo.version is invalid");
+  return {
+    version: 1,
+    issueId: requiredString(value.issueId, filePath, "handoff.memo.issueId"),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, "handoff.memo.issueIdentifier"),
+    updatedAt: requiredString(value.updatedAt, filePath, "handoff.memo.updatedAt"),
+    reviewRound: nonNegativeInteger(value.reviewRound, filePath, "handoff.memo.reviewRound"),
+    incompleteTurnCount: nonNegativeInteger(value.incompleteTurnCount, filePath, "handoff.memo.incompleteTurnCount"),
+    sizeChars:
+      value.sizeChars === undefined
+        ? JSON.stringify(value).length
+        : nonNegativeInteger(value.sizeChars, filePath, "handoff.memo.sizeChars"),
+    entries: requiredStringArray(value.entries, filePath, "handoff.memo.entries"),
+    openFindings: requiredStringArray(value.openFindings, filePath, "handoff.memo.openFindings"),
+    pointers: normalizeSummaryPointers(value.pointers, filePath),
+    lastWorkerRunId: nullableString(value.lastWorkerRunId, filePath, "handoff.memo.lastWorkerRunId"),
+    lastReviewerRunId: nullableString(value.lastReviewerRunId, filePath, "handoff.memo.lastReviewerRunId"),
+  };
+}
+
+function normalizeWorkerOutputContract(value: unknown, filePath: string): IssueWorkerOutputContract | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "handoff.lastWorkerOutput is invalid");
+  if (value.version !== 1) throw corruptLifecycle(filePath, "handoff.lastWorkerOutput.version is invalid");
+  return {
+    version: 1,
+    reportId: requiredString(value.reportId, filePath, "handoff.lastWorkerOutput.reportId"),
+    runId: requiredString(value.runId, filePath, "handoff.lastWorkerOutput.runId"),
+    summary: requiredString(value.summary, filePath, "handoff.lastWorkerOutput.summary"),
+    changedFiles: requiredStringArray(value.changedFiles, filePath, "handoff.lastWorkerOutput.changedFiles"),
+    validationEvidence: requiredStringArray(value.validationEvidence, filePath, "handoff.lastWorkerOutput.validationEvidence"),
+    risks: requiredStringArray(value.risks, filePath, "handoff.lastWorkerOutput.risks"),
+    pullRequest: normalizePullRequest(value.pullRequest, filePath, 0),
+    acceptedAt: requiredString(value.acceptedAt, filePath, "handoff.lastWorkerOutput.acceptedAt"),
+  };
+}
+
+function normalizeReviewerOutputContract(value: unknown, filePath: string): IssueReviewerOutputContract | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "handoff.lastReviewerOutput is invalid");
+  if (value.version !== 1) throw corruptLifecycle(filePath, "handoff.lastReviewerOutput.version is invalid");
+  const verdict = value.verdict;
+  if (verdict !== "pass" && verdict !== "fail") {
+    throw corruptLifecycle(filePath, "handoff.lastReviewerOutput.verdict is invalid");
+  }
+  return {
+    version: 1,
+    verdictId: requiredString(value.verdictId, filePath, "handoff.lastReviewerOutput.verdictId"),
+    runId: requiredString(value.runId, filePath, "handoff.lastReviewerOutput.runId"),
+    verdict,
+    findings: requiredStringArray(value.findings, filePath, "handoff.lastReviewerOutput.findings"),
+    acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, 0),
+    evidence: requiredStringArray(value.evidence, filePath, "handoff.lastReviewerOutput.evidence"),
+    submittedAt: requiredString(value.submittedAt, filePath, "handoff.lastReviewerOutput.submittedAt"),
   };
 }
 

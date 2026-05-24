@@ -1,7 +1,11 @@
 import type { ServiceConfig } from "../config/Config.js";
 import type { AgentRunRole } from "../types.js";
 
-export type McpSubprocessCommand = "completion-report-mcp" | "review-verdict-mcp" | "review-feedback-mcp";
+export type McpSubprocessCommand =
+  | "completion-report-mcp"
+  | "review-verdict-mcp"
+  | "review-feedback-mcp"
+  | "transcript-recall-mcp";
 
 export interface McpCliSpawnArgsInput {
   cliPath: string;

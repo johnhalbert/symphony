@@ -9,6 +9,7 @@ import type {
   IssueLifecycleStore,
 } from "./persistence/IssueLifecycleStore.js";
 import { phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
+import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue, Workspace } from "./types.js";
 import { planCompletionReportAcceptedWritebacks } from "./writeback/TransitionPolicy.js";
@@ -61,7 +62,7 @@ export interface CompletionReportServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
   writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
-  runStore?: Pick<RunTranscriptStore, "getRun" | "recordPullRequestEvent">;
+  runStore?: Pick<RunTranscriptStore, "appendEvent" | "getRun" | "recordPullRequestEvent">;
   pullRequestPublisher?: CompletionReportPullRequestPublisher;
 }
 
@@ -184,7 +185,7 @@ export class CompletionReportService {
     }
     await this.recordPullRequestMetadata(context, publication);
 
-    await this.options.lifecycleStore.updateIssue(context.issue, {
+    const updatedLifecycle = await this.options.lifecycleStore.updateIssue(context.issue, {
       phase: "review",
       incompleteTurnCount: 0,
       lastCompletionReportId: storedReport.id,
@@ -204,6 +205,7 @@ export class CompletionReportService {
         lastEvidenceCursor: publication?.evidenceCursor ?? existingLifecycle?.summaryPointers.lastEvidenceCursor ?? null,
       },
     });
+    await appendLaneMemoTelemetry(this.options.runStore, context.activeRunId, updatedLifecycle, "completion_report");
 
     return { accepted: true, replayed: false, report: storedReport, writebackOperations: enqueued };
   }

@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SymphonyError } from "../src/core/errors.js";
-import { FileIssueLifecycleStore, phaseForIssueState } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  buildWorkerHandoffPacket,
+  FileIssueLifecycleStore,
+  phaseForIssueState,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import { issue, testConfig } from "./helpers.js";
 
 describe("FileIssueLifecycleStore", () => {
@@ -129,6 +133,79 @@ describe("FileIssueLifecycleStore", () => {
         mergedBy: { capability: "github.merge", profile: "github-merge" },
         doneTransitionOperationKey: "transition:issue-1:merge:issue-1:head-sha-1:Done",
       },
+    });
+  });
+
+  it("generates deterministic handoff contracts and memo from stored lifecycle evidence", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const record = await store.ensureIssue(issue(), {
+      phase: "implementation",
+      reviewRound: 1,
+      lastCompletionReportId: "report-1",
+      lastReviewVerdictId: "verdict-1",
+      completionReports: [
+        {
+          id: "report-1",
+          idempotencyKey: "report-key",
+          runId: "worker-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Implemented the bounded context policy.",
+          validationEvidence: ["npm test -- workflow"],
+          acceptanceChecklist: [{ text: "Context is bounded", satisfied: true, evidence: "config test" }],
+          changedFiles: ["src/core/config/Config.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7, headSha: "abc", branch: "symphony/TEST-1" },
+          risks: ["None"],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: ["op-1"],
+        },
+      ],
+      reviewVerdicts: [
+        {
+          id: "verdict-1",
+          idempotencyKey: "verdict-key",
+          runId: "reviewer-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          verdict: "fail",
+          acceptanceResults: [{ text: "Add doctor coverage", satisfied: false, evidence: "missing test" }],
+          findings: ["Add doctor coverage for unsafe setting sources."],
+          evidence: ["tests/doctor.test.ts"],
+          reviewer: "agent:run",
+          submittedAt: "2026-01-01T00:01:00.000Z",
+          writebackOperationKeys: ["op-2"],
+        },
+      ],
+    });
+
+    expect(record.handoff.lastWorkerOutput).toMatchObject({
+      version: 1,
+      reportId: "report-1",
+      runId: "worker-run-1",
+      summary: "Implemented the bounded context policy.",
+    });
+    expect(record.handoff.lastReviewerOutput).toMatchObject({
+      version: 1,
+      verdictId: "verdict-1",
+      verdict: "fail",
+      findings: ["Add doctor coverage for unsafe setting sources."],
+    });
+    expect(record.handoff.memo).toMatchObject({
+      version: 1,
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      reviewRound: 1,
+      sizeChars: expect.any(Number),
+      openFindings: ["Add doctor coverage for unsafe setting sources."],
+      lastWorkerRunId: "worker-run-1",
+      lastReviewerRunId: "reviewer-run-1",
+    });
+    expect(buildWorkerHandoffPacket(record, "2026-01-01T00:02:00.000Z")).toMatchObject({
+      version: 1,
+      generatedAt: "2026-01-01T00:02:00.000Z",
+      lastWorkerOutput: { reportId: "report-1" },
+      lastReviewerOutput: { verdictId: "verdict-1" },
     });
   });
 

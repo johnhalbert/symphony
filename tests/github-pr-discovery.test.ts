@@ -143,7 +143,12 @@ describe("GitHub pull request discovery", () => {
       gitBranchName: "symphony/TEST-1",
       lastPushedAt: "2026-01-01T00:00:01Z",
     });
-    expect(transcript.events.map((event) => event.eventType)).toEqual(["pr_opened", "session_started", "completed"]);
+    expect(transcript.events.map((event) => event.eventType).filter((eventType) => eventType !== "lane_memo_updated")).toEqual([
+      "pr_opened",
+      "session_started",
+      "completed",
+    ]);
+    expect(transcript.events.map((event) => event.eventType)).toContain("lane_memo_updated");
     expect(lifecycle?.summaryPointers).toMatchObject({
       prUrl: "https://github.com/acme/symphony/pull/42",
       prNumber: 42,

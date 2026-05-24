@@ -9,6 +9,8 @@ import type {
   ReviewVerdictAcceptanceResult,
 } from "./persistence/IssueLifecycleStore.js";
 import { phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
+import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
+import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import {
   planBlockedEscalationWritebacks,
@@ -52,6 +54,7 @@ export interface ReviewVerdictServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
   writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
+  runStore?: Pick<RunTranscriptStore, "appendEvent">;
 }
 
 export interface ReviewVerdictResult {
@@ -140,7 +143,7 @@ export class ReviewVerdictService {
       enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
     }
 
-    await this.options.lifecycleStore.updateIssue(context.issue, {
+    const updatedLifecycle = await this.options.lifecycleStore.updateIssue(context.issue, {
       phase: verdict.verdict === "pass" ? "passed" : ceilingReached ? "blocked" : "implementation",
       ...(verdict.verdict === "fail" ? { reviewRound } : {}),
       incompleteTurnCount: verdict.verdict === "fail" ? 0 : lifecycle.incompleteTurnCount,
@@ -150,6 +153,7 @@ export class ReviewVerdictService {
       lastReviewVerdictId: storedVerdict.id,
       reviewVerdicts: [...lifecycle.reviewVerdicts, storedVerdict],
     });
+    await appendLaneMemoTelemetry(this.options.runStore, context.activeRunId, updatedLifecycle, "review_verdict");
 
     return { accepted: true, replayed: false, verdict: storedVerdict, writebackOperations: enqueued };
   }

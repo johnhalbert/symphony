@@ -35,6 +35,8 @@ const rawConfigSchema = z
         max_review_rounds: z.number().int().positive().optional(),
         max_incomplete_turns: z.number().int().positive().optional(),
         continuation_history_threshold: z.number().int().nonnegative().optional(),
+        transcript_history_limit: z.number().int().nonnegative().optional(),
+        pr_review_evidence_limit: z.number().int().positive().optional(),
       })
       .passthrough()
       .optional(),
@@ -134,6 +136,8 @@ const rawConfigSchema = z
         model_params: z.record(z.string(), z.string()).optional(),
         setting_sources: z.array(z.string()).optional(),
         opener_command: z.string().optional(),
+        allow_large_context: z.boolean().optional(),
+        worker_agent_lifecycle: z.enum(["fresh_per_run", "resume_by_issue"]).optional(),
       })
       .passthrough()
       .optional(),
@@ -233,7 +237,11 @@ export interface CursorConfig {
   modelParams: CursorModelParameter[];
   settingSources: CursorSettingSource[];
   openerCommand: string | null;
+  allowLargeContext: boolean;
+  workerAgentLifecycle: CursorWorkerAgentLifecycle;
 }
+
+export type CursorWorkerAgentLifecycle = "fresh_per_run" | "resume_by_issue";
 
 export interface CursorModelParameter {
   id: string;
@@ -270,6 +278,8 @@ export interface ReviewLoopConfig {
   maxReviewRounds: number;
   maxIncompleteTurns: number;
   continuationHistoryThreshold: number;
+  transcriptHistoryLimit: number;
+  prReviewEvidenceLimit: number;
 }
 
 export interface MergePolicyConfig {
@@ -325,7 +335,10 @@ const VALID_CURSOR_SETTING_SOURCES = new Set<CursorSettingSource>([
 ]);
 const VALID_AGENT_HARNESSES = new Set<AgentHarnessKind>(["cursor"]);
 const DEFAULT_CURSOR_MODEL = "gpt-5.5";
-const DEFAULT_CURSOR_MODEL_PARAMS: CursorModelParameter[] = [{ id: "reasoning", value: "extra-high" }];
+const DEFAULT_CURSOR_MODEL_PARAMS: CursorModelParameter[] = [
+  { id: "context", value: "272k" },
+  { id: "reasoning", value: "extra-high" },
+];
 
 export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
@@ -403,6 +416,10 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   );
   const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
   const publishPullRequests = raw.github?.publish_pull_requests ?? false;
+  const cursorModel = raw.cursor?.model ?? DEFAULT_CURSOR_MODEL;
+  const cursorModelParams = normalizeCursorModelParams(raw.cursor?.model_params);
+  const cursorAllowLargeContext = raw.cursor?.allow_large_context ?? false;
+  validateCursorModelPolicy(cursorModel, cursorModelParams, cursorAllowLargeContext);
   const cursorRuntimeApiKey = normalizeOptionalConfigString(resolveConfigString("$CURSOR_API_KEY", env));
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const credentialProfiles = createCredentialProfileRegistry({
@@ -476,10 +493,12 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       protectedPaths: raw.agent?.protected_paths ?? [],
     },
     cursor: {
-      model: raw.cursor?.model ?? DEFAULT_CURSOR_MODEL,
-      modelParams: normalizeCursorModelParams(raw.cursor?.model_params),
+      model: cursorModel,
+      modelParams: cursorModelParams,
       settingSources: normalizeCursorSettingSources(raw.cursor?.setting_sources),
       openerCommand: raw.cursor?.opener_command ?? null,
+      allowLargeContext: cursorAllowLargeContext,
+      workerAgentLifecycle: raw.cursor?.worker_agent_lifecycle ?? "fresh_per_run",
     },
     server: {
       port: raw.server?.port ?? null,
@@ -509,6 +528,8 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
       maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
       continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
+      transcriptHistoryLimit: raw.review_loop?.transcript_history_limit ?? raw.review_loop?.continuation_history_threshold ?? 5,
+      prReviewEvidenceLimit: raw.review_loop?.pr_review_evidence_limit ?? 5,
     },
     mergePolicy,
     issueBoard: {
@@ -719,11 +740,11 @@ function overlappingStates(left: string[], right: string[]): string[] {
 }
 
 function normalizeCursorSettingSources(values: string[] | undefined): CursorSettingSource[] {
-  const requested = values ?? ["project", "user"];
+  const requested = values ?? [];
   const filtered = requested.filter((value): value is CursorSettingSource =>
     VALID_CURSOR_SETTING_SOURCES.has(value as CursorSettingSource),
   );
-  return filtered.length > 0 ? filtered : ["project", "user"];
+  return filtered;
 }
 
 function normalizeCursorModelParams(values: Record<string, string> | undefined): CursorModelParameter[] {
@@ -731,6 +752,27 @@ function normalizeCursorModelParams(values: Record<string, string> | undefined):
   return Object.entries(values)
     .filter(([id, value]) => id.length > 0 && value.length > 0)
     .map(([id, value]) => ({ id, value }));
+}
+
+function validateCursorModelPolicy(
+  model: string,
+  modelParams: CursorModelParameter[],
+  allowLargeContext: boolean,
+): void {
+  if (model !== DEFAULT_CURSOR_MODEL) return;
+  const context = modelParams.find((param) => param.id === "context")?.value;
+  if (context === "1m" && allowLargeContext) return;
+  if (context === "272k") return;
+  if (context === "1m") {
+    throw new SymphonyError(
+      "config_validation_error",
+      "cursor.model_params.context=1m requires cursor.allow_large_context: true",
+    );
+  }
+  throw new SymphonyError(
+    "config_validation_error",
+    "cursor.model_params.context must be 272k for gpt-5.5 unless cursor.allow_large_context is true",
+  );
 }
 
 function normalizeAgentHarness(value: string | undefined): AgentHarnessKind {

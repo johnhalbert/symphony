@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import path from "node:path";
+import { readFile } from "node:fs/promises";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
@@ -14,6 +15,8 @@ import {
   reviewFeedbackMcpServerConfig,
   reviewVerdictContextFilePath,
   reviewVerdictMcpServerConfig,
+  transcriptRecallContextFilePath,
+  transcriptRecallMcpServerConfig,
 } from "../cursor/src/CursorHarness.js";
 import { issue, testConfig } from "./helpers.js";
 
@@ -47,6 +50,12 @@ describe("Cursor event mapping", () => {
   });
 
   it("tags tool and text delta activity sources", () => {
+    expect(mapCursorMessage({ type: "thinking", text: "private chain of thought" } as never)).toEqual([
+      { type: "progress", message: "Cursor thinking event", activitySource: "stream" },
+    ]);
+    expect(mapCursorMessage({ type: "task", text: "private task text" } as never)).toEqual([
+      { type: "progress", message: "Cursor task event", activitySource: "stream" },
+    ]);
     expect(
       mapCursorMessage({
         type: "tool_call",
@@ -151,6 +160,26 @@ describe("Cursor event mapping", () => {
     expect(mcpServers.symphony?.args).toEqual(
       expect.arrayContaining(["completion-report-mcp", "--workflow", config.workflowPath]),
     );
+  });
+
+  it("mounts read-only transcript recall as a separate MCP server when search is enabled", () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    config.continuationContext.searchEnabled = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-secret";
+    const ctx = agentContext(config, "worker");
+
+    const server = transcriptRecallMcpServerConfig(ctx, transcriptRecallContextFilePath(ctx), { cliPath: "/repo/src/cli.ts" });
+    const mcpServers = cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" });
+
+    expect(Object.keys(mcpServers).sort()).toEqual(["symphony", "symphony_recall"]);
+    expect(server.args).toEqual(
+      expect.arrayContaining(["transcript-recall-mcp", "--workflow", config.workflowPath, "--context-file", transcriptRecallContextFilePath(ctx)]),
+    );
+    expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key" });
+    expect(server.env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
   });
 
   it("uses profile-backed cursor.runtime credentials by default for worker and reviewer runs", () => {
@@ -311,6 +340,160 @@ describe("Cursor event mapping", () => {
     expect(mcpServers.symphony_review_feedback?.args).toEqual(expect.arrayContaining(["review-feedback-mcp"]));
   });
 
+  it("writes MCP context without creating or resuming managed worker agents during prepare or reload in fresh mode", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const harness = new CursorHarness();
+    const ctx = agentContext(config, "worker");
+
+    await harness.prepare(ctx);
+    await harness.reload(ctx);
+
+    expect(cursorSdk.create).not.toHaveBeenCalled();
+    expect(cursorSdk.resume).not.toHaveBeenCalled();
+    await expect(readFile(completionReportContextFilePath(ctx), "utf8")).resolves.toContain('"activeRunId": null');
+  });
+
+  it("creates and disposes a fresh worker agent for each managed run by default", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const dispose = vi.fn(async () => undefined);
+    const send = vi.fn(async () => completedSdkRun("sdk-run-fresh"));
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-fresh",
+      send,
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: dispose,
+    });
+    const runStore = {
+      latestRunForIssue: vi.fn(),
+      updateRun: vi.fn(),
+      appendEvent: vi.fn(),
+    };
+    const harness = new CursorHarness({ runStore: runStore as never });
+
+    const events: unknown[] = [];
+    for await (const event of harness.run(agentContext(config, "worker"), "Work on TEST-1")) {
+      events.push(event);
+    }
+
+    expect(cursorSdk.resume).not.toHaveBeenCalled();
+    expect(runStore.latestRunForIssue).not.toHaveBeenCalled();
+    expect(cursorSdk.create).toHaveBeenCalledTimes(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "sdk-run-fresh",
+        eventType: "cursor_agent_lifecycle",
+        payload: expect.objectContaining({
+          agentId: "agent-fresh",
+          created: true,
+          resumeUsed: false,
+          outcome: "created",
+        }),
+      }),
+    );
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "sdk-run-fresh",
+        eventType: "cursor_agent_disposed",
+        payload: expect.objectContaining({ agentId: "agent-fresh", ok: true }),
+      }),
+    );
+    expect(events).toEqual([
+      { type: "session_started", sessionId: "agent-fresh:sdk-run-fresh", threadId: "agent-fresh", runId: "sdk-run-fresh" },
+      { type: "completed" },
+    ]);
+  });
+
+  it("disposes a fresh worker agent when send fails", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const dispose = vi.fn(async () => undefined);
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-send-fails",
+      send: vi.fn(async () => {
+        throw new Error("send failed");
+      }),
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: dispose,
+    });
+    const harness = new CursorHarness();
+
+    await expect(async () => {
+      for await (const _event of harness.run(agentContext(config, "worker"), "Work on TEST-1")) {
+        // no events expected
+      }
+    }).rejects.toThrow("send failed");
+
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("sanitizes raw Cursor stream payloads before persisting transcript events", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const dispose = vi.fn(async () => undefined);
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-sanitize",
+      send: vi.fn(async () => ({
+        id: "sdk-run-sanitize",
+        async *stream(): AsyncIterable<unknown> {
+          yield { type: "user", message: { content: "SECRET_PROMPT" } };
+          yield { type: "thinking", text: "SECRET_THINKING" };
+          yield { type: "task", text: "SECRET_TASK" };
+          yield { type: "tool_call", name: "shell", status: "completed", arguments: "SECRET_ARGS" };
+        },
+        wait: async () => ({ status: "finished" as const, result: undefined }),
+        cancel: vi.fn(async () => undefined),
+      })),
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: dispose,
+    });
+    const runStore = {
+      latestRunForIssue: vi.fn(),
+      updateRun: vi.fn(),
+      appendEvent: vi.fn(),
+    };
+    const harness = new CursorHarness({ runStore: runStore as never });
+
+    const events: unknown[] = [];
+    for await (const event of harness.run(agentContext(config, "worker"), "SECRET_PROMPT")) {
+      events.push(event);
+    }
+
+    const persisted = JSON.stringify(runStore.appendEvent.mock.calls);
+    expect(persisted).not.toContain("SECRET_PROMPT");
+    expect(persisted).not.toContain("SECRET_THINKING");
+    expect(persisted).not.toContain("SECRET_TASK");
+    expect(persisted).not.toContain("SECRET_ARGS");
+    expect(runStore.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "thinking", message: "Cursor thinking event" }));
+    expect(runStore.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "task", message: "Cursor task event" }));
+    expect(runStore.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "tool_call", message: "tool shell completed" }));
+    expect(events).toContainEqual({ type: "progress", message: "Cursor thinking event", activitySource: "stream" });
+    expect(events).toContainEqual({ type: "progress", message: "Cursor task event", activitySource: "stream" });
+  });
+
+  it("only resumes worker agents when resume_by_issue compatibility mode is explicit", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    config.cursor.workerAgentLifecycle = "resume_by_issue";
+    const agent = {
+      agentId: "agent-reused",
+      send: vi.fn(),
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    };
+    cursorSdk.resume.mockResolvedValue(agent);
+    const runStore = {
+      latestRunForIssue: vi.fn(async () => ({ agentId: "agent-previous" })),
+    };
+    const harness = new CursorHarness({ runStore: runStore as never });
+
+    await harness.prepare(agentContext(config, "worker"));
+    await harness.reload(agentContext(config, "worker"));
+
+    expect(runStore.latestRunForIssue).toHaveBeenCalledTimes(1);
+    expect(cursorSdk.resume).toHaveBeenCalledTimes(1);
+    expect(cursorSdk.resume).toHaveBeenCalledWith("agent-previous", expect.any(Object));
+    expect(agent.reload).toHaveBeenCalledTimes(1);
+    expect(cursorSdk.create).not.toHaveBeenCalled();
+  });
+
   it("cancels the SDK run through the abort signal when cancellation happens before session_started", async () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     const controller = new AbortController();
@@ -429,6 +612,20 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
     reject = promiseReject;
   });
   return { promise, resolve, reject };
+}
+
+function completedSdkRun(id: string): {
+  id: string;
+  stream(): AsyncIterable<unknown>;
+  wait(): Promise<{ status: "finished"; result: undefined }>;
+  cancel(): Promise<void>;
+} {
+  return {
+    id,
+    async *stream(): AsyncIterable<unknown> {},
+    wait: async () => ({ status: "finished" as const, result: undefined }),
+    cancel: vi.fn(async () => undefined),
+  };
 }
 
 async function waitFor(predicate: () => boolean, description = "condition", timeoutMs = 2_000): Promise<void> {

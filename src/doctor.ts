@@ -64,11 +64,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
     checks.push({ id: "workflow.parse", status: "ok", message: `Loaded ${workflowPath}` });
-    checks.push({
-      id: "cursor.model",
-      status: hasBaselineCursorModel(config.cursor.model, config.cursor.modelParams) ? "ok" : "warn",
-      message: `Cursor model is ${config.cursor.model} with params ${formatModelParams(config.cursor.modelParams)}`,
-    });
+    checks.push(...cursorPolicyDoctorChecks(config));
     checks.push({
       id: "agent.concurrency",
       status: config.agent.maxConcurrentAgents === 1 ? "ok" : "warn",
@@ -130,6 +126,14 @@ export function continuationContextDoctorChecks(config: ServiceConfig): DoctorCh
 
   for (const item of enabled) {
     if (!config.continuationContext[item.configKey]) continue;
+    if (item.roadmap.implementationStatus === "implemented") {
+      checks.push({
+        id: `continuation_context.${item.roadmap.capability}`,
+        status: "ok",
+        message: `${item.roadmap.flag} is enabled and ${item.roadmap.capability} is implemented`,
+      });
+      continue;
+    }
     checks.push({
       id: `continuation_context.${item.roadmap.capability}`,
       status: "warn",
@@ -142,8 +146,46 @@ export function continuationContextDoctorChecks(config: ServiceConfig): DoctorCh
   return checks;
 }
 
-function hasBaselineCursorModel(model: string, modelParams: Array<{ id: string; value: string }>): boolean {
-  return model === "gpt-5.5" && modelParams.some((param) => param.id === "reasoning" && param.value === "extra-high");
+export function cursorPolicyDoctorChecks(config: ServiceConfig): DoctorCheck[] {
+  const context = config.cursor.modelParams.find((param) => param.id === "context")?.value ?? "none";
+  return [
+    {
+      id: "cursor.model",
+      status: hasBaselineCursorModel(config.cursor.model, config.cursor.modelParams, config.cursor.allowLargeContext) ? "ok" : "warn",
+      message:
+        `Cursor model is ${config.cursor.model} with params ${formatModelParams(config.cursor.modelParams)}; ` +
+        `large context opt-in is ${config.cursor.allowLargeContext ? "enabled" : "disabled"}`,
+    },
+    {
+      id: "cursor.context",
+      status: config.cursor.model === "gpt-5.5" && context === "272k" && !config.cursor.allowLargeContext ? "ok" : "warn",
+      message:
+        config.cursor.model === "gpt-5.5" && context === "272k" && !config.cursor.allowLargeContext
+          ? "Managed Cursor runs are bounded to context=272k"
+          : `Managed Cursor context policy is non-default: context=${context}, allow_large_context=${config.cursor.allowLargeContext}`,
+    },
+    {
+      id: "cursor.setting_sources",
+      status: config.cursor.settingSources.length === 0 ? "ok" : "warn",
+      message:
+        config.cursor.settingSources.length === 0
+          ? "Managed Cursor runs do not load project/user setting sources by default"
+          : `Managed Cursor runs load setting sources: ${config.cursor.settingSources.join(", ")}`,
+    },
+  ];
+}
+
+function hasBaselineCursorModel(
+  model: string,
+  modelParams: Array<{ id: string; value: string }>,
+  allowLargeContext: boolean,
+): boolean {
+  return (
+    model === "gpt-5.5" &&
+    !allowLargeContext &&
+    modelParams.some((param) => param.id === "context" && param.value === "272k") &&
+    modelParams.some((param) => param.id === "reasoning" && param.value === "extra-high")
+  );
 }
 
 function formatModelParams(modelParams: Array<{ id: string; value: string }>): string {

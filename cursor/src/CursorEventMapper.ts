@@ -10,9 +10,9 @@ export function mapCursorMessage(message: SDKMessage): AgentEvent[] {
         .filter((block) => block.type === "text")
         .map((block) => ({ type: "progress", message: block.text, activitySource: "stream" }));
     case "thinking":
-      return message.text ? [{ type: "progress", message: message.text, activitySource: "stream" }] : [];
+      return [{ type: "progress", message: "Cursor thinking event", activitySource: "stream" }];
     case "task":
-      return message.text ? [{ type: "progress", message: message.text, activitySource: "stream" }] : [];
+      return [{ type: "progress", message: "Cursor task event", activitySource: "stream" }];
     case "tool_call":
       return [
         {

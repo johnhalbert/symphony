@@ -3,8 +3,11 @@ import { describe, expect, it } from "vitest";
 import { CONTINUATION_CONTEXT_ROADMAP } from "../src/core/summarization/ContinuationContextRoadmap.js";
 
 describe("continuation context roadmap placeholders", () => {
-  it("keeps search and summarization roadmap issues blocked out of dispatch", () => {
-    for (const entry of Object.values(CONTINUATION_CONTEXT_ROADMAP)) {
+  it("tracks implemented search separately from blocked summarization roadmap work", () => {
+    expect(CONTINUATION_CONTEXT_ROADMAP.search.implementationStatus).toBe("implemented");
+    expect(CONTINUATION_CONTEXT_ROADMAP.search.dispatchPolicy).toBe("no_orchestrator_dispatch");
+
+    for (const entry of [CONTINUATION_CONTEXT_ROADMAP.summarization]) {
       expect(entry.implementationStatus).toBe("not_implemented");
       expect(entry.dispatchPolicy).toBe("no_orchestrator_dispatch");
       expect(entry.roadmapIssue.state).toBe("Backlog");

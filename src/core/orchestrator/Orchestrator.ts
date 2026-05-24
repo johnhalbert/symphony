@@ -23,7 +23,9 @@ import {
   type RunTranscriptStore,
   type TranscriptEvent,
 } from "../persistence/RunTranscriptStore.js";
+import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
+  buildWorkerHandoffPacket,
   phaseForIssueState,
   type IssueCompletionReportRecord,
   type IssueLifecyclePatch,
@@ -104,6 +106,7 @@ export interface RunningEntry {
   turnCount: number;
   retryAttempt: number;
   tokens: TokenCounts;
+  activeRunTokens: TokenCounts;
   cleanupWorkspaceOnExit: boolean;
   suppressRetryOnExit: boolean;
   completionReportAccepted: boolean;
@@ -761,6 +764,7 @@ export class Orchestrator {
       turnCount: 0,
       retryAttempt,
       tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      activeRunTokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       cleanupWorkspaceOnExit: false,
       suppressRetryOnExit: false,
       completionReportAccepted: false,
@@ -944,6 +948,7 @@ export class Orchestrator {
         entry.sessionId = event.sessionId;
         entry.runId = event.runId ?? event.sessionId;
         entry.activeRunId = entry.runId;
+        entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
         await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
         await this.options.runStore?.startRun({
           runId: entry.runId,
@@ -955,6 +960,11 @@ export class Orchestrator {
           attempt: context.attempt,
           turnNumber: context.turnNumber,
           prompt: context.prompt,
+          cursorModel: this.config.cursor.model,
+          cursorModelParams: this.config.cursor.modelParams,
+          cursorSettingSources: this.config.cursor.settingSources,
+          cursorAllowLargeContext: this.config.cursor.allowLargeContext,
+          cursorWorkerAgentLifecycle: this.config.cursor.workerAgentLifecycle,
           workspaceKey: context.workspace.workspaceKey,
           workspacePath: context.workspace.path,
           ...(context.workspace.gitBranchName === undefined ? {} : { gitBranchName: context.workspace.gitBranchName }),
@@ -986,7 +996,7 @@ export class Orchestrator {
         await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
           status: "succeeded",
           completedAt: new Date().toISOString(),
-          tokens: entry.tokens,
+          tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
         await this.discoverPullRequestForEntry(entry, context.workspace);
@@ -1002,7 +1012,7 @@ export class Orchestrator {
           await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
-            tokens: entry.tokens,
+            tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "succeeded"),
           });
           return;
@@ -1011,7 +1021,7 @@ export class Orchestrator {
           status: "failed",
           completedAt: new Date().toISOString(),
           error: event.error,
-          tokens: entry.tokens,
+          tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
         });
         throw new SymphonyError("agent_error", event.error);
@@ -1021,7 +1031,7 @@ export class Orchestrator {
           await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
-            tokens: entry.tokens,
+            tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "succeeded"),
           });
           return;
@@ -1029,7 +1039,7 @@ export class Orchestrator {
         await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
           status: "cancelled",
           completedAt: new Date().toISOString(),
-          tokens: entry.tokens,
+          tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
         });
         throw new SymphonyError("agent_error", "Run was cancelled");
@@ -1048,7 +1058,7 @@ export class Orchestrator {
         await this.options.runStore?.updateRun(entry.runId, {
           status: "succeeded",
           completedAt: new Date().toISOString(),
-          tokens: entry.tokens,
+          tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
       }
@@ -1062,7 +1072,7 @@ export class Orchestrator {
         await this.options.runStore?.updateRun(entry.runId, {
           status: "succeeded",
           completedAt: new Date().toISOString(),
-          tokens: entry.tokens,
+          tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
       }
@@ -1104,7 +1114,7 @@ export class Orchestrator {
           status: entry.suppressRetryOnExit ? "cancelled" : "failed",
           completedAt: new Date().toISOString(),
           error,
-          tokens: entry.tokens,
+          tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
         });
       }
@@ -1115,7 +1125,7 @@ export class Orchestrator {
           status: "cancelled",
           completedAt: new Date().toISOString(),
           error,
-          tokens: entry.tokens,
+          tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
         });
       }
@@ -1140,7 +1150,7 @@ export class Orchestrator {
           status: "failed",
           completedAt: new Date().toISOString(),
           error,
-          tokens: entry.tokens,
+          tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
         });
       }
@@ -1268,14 +1278,24 @@ export class Orchestrator {
 
   private applyTokenUpdate(entry: RunningEntry, tokens: Partial<TokenCounts>): void {
     const next = {
-      inputTokens: tokens.inputTokens ?? entry.tokens.inputTokens,
-      outputTokens: tokens.outputTokens ?? entry.tokens.outputTokens,
-      totalTokens: tokens.totalTokens ?? entry.tokens.totalTokens,
+      inputTokens: tokens.inputTokens ?? entry.activeRunTokens.inputTokens,
+      outputTokens: tokens.outputTokens ?? entry.activeRunTokens.outputTokens,
+      totalTokens: tokens.totalTokens ?? entry.activeRunTokens.totalTokens,
     };
-    this.totals.inputTokens += Math.max(next.inputTokens - entry.tokens.inputTokens, 0);
-    this.totals.outputTokens += Math.max(next.outputTokens - entry.tokens.outputTokens, 0);
-    this.totals.totalTokens += Math.max(next.totalTokens - entry.tokens.totalTokens, 0);
-    entry.tokens = next;
+    const delta = {
+      inputTokens: Math.max(next.inputTokens - entry.activeRunTokens.inputTokens, 0),
+      outputTokens: Math.max(next.outputTokens - entry.activeRunTokens.outputTokens, 0),
+      totalTokens: Math.max(next.totalTokens - entry.activeRunTokens.totalTokens, 0),
+    };
+    this.totals.inputTokens += delta.inputTokens;
+    this.totals.outputTokens += delta.outputTokens;
+    this.totals.totalTokens += delta.totalTokens;
+    entry.tokens = {
+      inputTokens: entry.tokens.inputTokens + delta.inputTokens,
+      outputTokens: entry.tokens.outputTokens + delta.outputTokens,
+      totalTokens: entry.tokens.totalTokens + delta.totalTokens,
+    };
+    entry.activeRunTokens = next;
   }
 
   private async persistHarnessEvent(entry: RunningEntry, event: AgentEvent): Promise<void> {
@@ -1291,7 +1311,7 @@ export class Orchestrator {
       payload: event,
     });
     if (event.type === "tokens") {
-      await this.options.runStore?.updateRun(runId, { tokens: entry.tokens });
+      await this.options.runStore?.updateRun(runId, { tokens: entry.activeRunTokens });
     }
   }
 
@@ -1495,6 +1515,7 @@ export class Orchestrator {
     const store = this.options.lifecycleStore;
     if (!store) return;
     entry.lifecycle = await store.updateIssue(entry.issue, patch);
+    await appendLaneMemoTelemetry(this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
   }
 
   private async discoverPullRequestForEntry(entry: RunningEntry, workspace: Workspace): Promise<void> {
@@ -1591,19 +1612,22 @@ export class Orchestrator {
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
     const basePrompt = await this.promptRenderer.render(this.promptTemplate, { issue: entry.issue, attempt });
-    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
-    return [basePrompt, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
+    const handoff = await this.loadWorkerHandoffPrompt(entry);
+    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
+    return [basePrompt, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
   }
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
     const continuationBrief = await this.renderContinuationBrief(entry);
-    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
+    const handoff = await this.loadWorkerHandoffPrompt(entry);
+    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
     return [
       continuationBrief,
+      handoff,
       reviewVerdict,
       reviewEvidence,
       this.cursorWorkerMcpPrompt(entry),
@@ -1616,8 +1640,8 @@ export class Orchestrator {
     const lifecycle = entry.lifecycle ?? (await this.options.lifecycleStore?.get(entry.issue.id)) ?? null;
     const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id)) ?? [];
     const history = await this.loadContinuationHistory(runs);
-    const threshold = this.config.reviewLoop.continuationHistoryThreshold;
-    const historyMode = history.eventCount <= threshold ? "full" : "summary";
+    const threshold = this.config.reviewLoop.transcriptHistoryLimit;
+    const historyMode = "summary";
     const summaryReference = latestContinuationSummaryReference(lifecycle);
     const workspace = entry.workspace;
     const pointers = lifecycle?.summaryPointers;
@@ -1654,19 +1678,15 @@ export class Orchestrator {
       `- Mode: ${historyMode}`,
       `- Transcript events considered: ${history.eventCount}`,
       `- Configured full-history threshold: ${threshold}`,
-      ...(historyMode === "full"
-        ? ["", "Full relevant history:", ...formatFullHistory(history.runs)]
-        : [
-            "",
-            "Stored continuation summary:",
-            `- Reference: ${summaryReference?.id ?? "n/a"}`,
-            `- Created at: ${summaryReference?.createdAt ?? "n/a"}`,
-            `- Summary: ${summaryReference?.summary ?? "No stored continuation history summary is available yet."}`,
-            "",
-            "Transcript/status pointers:",
-            ...formatPointerList(summaryReference?.transcriptPointers ?? transcriptPointers),
-            ...formatPointerList(summaryReference?.statusApiPointers ?? statusApiPointers),
-          ]),
+      "",
+      "Stored continuation summary:",
+      `- Reference: ${summaryReference?.id ?? "n/a"}`,
+      `- Created at: ${summaryReference?.createdAt ?? "n/a"}`,
+      `- Summary: ${summaryReference?.summary ?? "No stored continuation history summary is available yet."}`,
+      "",
+      "Transcript/status pointers:",
+      ...formatPointerList(summaryReference?.transcriptPointers ?? transcriptPointers),
+      ...formatPointerList(summaryReference?.statusApiPointers ?? statusApiPointers),
     ].join("\n");
   }
 
@@ -1674,15 +1694,16 @@ export class Orchestrator {
     eventCount: number;
     runs: Array<{ run: RunRecord; events: TranscriptEvent[]; truncated: boolean }>;
   }> {
-    const threshold = this.config.reviewLoop.continuationHistoryThreshold;
+    const threshold = this.config.reviewLoop.transcriptHistoryLimit;
     let eventCount = 0;
     const history: Array<{ run: RunRecord; events: TranscriptEvent[]; truncated: boolean }> = [];
     for (const run of runs) {
       if (!this.options.runStore) break;
       const page = await this.options.runStore.readTranscript(run.runId, { limit: threshold + 1 });
       const truncated = page.nextOffset !== null;
-      eventCount += page.events.length + (truncated ? 1 : 0);
-      history.push({ run, events: page.events, truncated });
+      const events = promptRelevantTranscriptEvents(page.events);
+      eventCount += events.length + (truncated ? 1 : 0);
+      history.push({ run, events, truncated });
     }
     return { eventCount, runs: history };
   }
@@ -1710,6 +1731,69 @@ export class Orchestrator {
     return lifecycle === undefined || lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
   }
 
+  private async loadWorkerHandoffPrompt(entry: RunningEntry): Promise<string | null> {
+    const lifecycle = (await this.options.lifecycleStore?.get(entry.issue.id)) ?? entry.lifecycle ?? null;
+    const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id)) ?? [];
+    if (!lifecycle || !hasRealHandoffContext(lifecycle, runs)) return null;
+    const packet = buildWorkerHandoffPacket(lifecycle);
+    const transcriptPointers = transcriptPointersForRuns(runs);
+    const statusPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
+    const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(
+      (item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true,
+    );
+    return [
+      "",
+      "Compact Symphony handoff packet:",
+      `- Version: ${packet.version}; generatedAt: ${packet.generatedAt}`,
+      `- Issue: ${packet.issueIdentifier} (${packet.issueId})`,
+      `- Objective: ${entry.issue.title}`,
+      `- Next action: ${nextWorkerAction(lifecycle)}`,
+      "",
+      "Lane memo:",
+      ...packet.memo.entries.map((entryLine) => `- ${entryLine}`),
+      "",
+      "Open reviewer findings:",
+      ...(packet.memo.openFindings.length === 0 ? ["- None"] : packet.memo.openFindings.map((finding) => `- ${finding}`)),
+      "",
+      "Latest worker output:",
+      ...(packet.lastWorkerOutput === null
+        ? ["- None"]
+        : [
+            `- Report: ${packet.lastWorkerOutput.reportId}; run: ${packet.lastWorkerOutput.runId}`,
+            `- Summary: ${packet.lastWorkerOutput.summary}`,
+            `- Changed files: ${formatList(packet.lastWorkerOutput.changedFiles)}`,
+            `- Validation: ${formatList(packet.lastWorkerOutput.validationEvidence)}`,
+            `- Risks: ${formatList(packet.lastWorkerOutput.risks)}`,
+          ]),
+      "",
+      "Latest reviewer output:",
+      ...(packet.lastReviewerOutput === null
+        ? ["- None"]
+        : [
+            `- Verdict: ${packet.lastReviewerOutput.verdict}; record: ${packet.lastReviewerOutput.verdictId}; run: ${packet.lastReviewerOutput.runId}`,
+            `- Findings: ${formatList(packet.lastReviewerOutput.findings)}`,
+            `- Evidence: ${formatList(packet.lastReviewerOutput.evidence)}`,
+          ]),
+      "",
+      "Stable pointers:",
+      `- Workspace: ${packet.pointers.workspacePath ?? "n/a"}`,
+      `- Branch: ${packet.pointers.gitBranchName ?? packet.pointers.branchName ?? "n/a"}`,
+      `- Pull request: ${formatPullRequest(packet.pointers.prNumber, packet.pointers.prUrl)}`,
+      `- PR head SHA: ${packet.pointers.prHeadSha ?? "n/a"}`,
+      "",
+      "Active unresolved PR review evidence:",
+      ...(activeReviewEvidence.length === 0
+        ? ["- None"]
+        : activeReviewEvidence
+            .slice(0, this.config.reviewLoop.prReviewEvidenceLimit)
+            .map((item) => `- ${item.source} ${item.path ?? "PR"}: ${oneLine(item.body).slice(0, 240)} (${item.url ?? item.pullRequestUrl ?? "n/a"})`)),
+      "",
+      "Transcript/status pointers:",
+      ...formatPointerList(transcriptPointers),
+      ...formatPointerList(statusPointers),
+    ].join("\n");
+  }
+
   private async loadWorkerReviewEvidencePrompt(entry: RunningEntry): Promise<string | null> {
     if (!this.options.lifecycleStore) return null;
     try {
@@ -1719,7 +1803,7 @@ export class Orchestrator {
       const service = new PullRequestReviewEvidenceService({
         lifecycleStore: this.options.lifecycleStore,
         client,
-        fullHistoryThreshold: this.config.reviewLoop.continuationHistoryThreshold,
+        fullHistoryThreshold: this.config.reviewLoop.prReviewEvidenceLimit,
       });
       const context = await service.prepareWorkerPromptContext(entry.issue);
       return context === null ? null : formatWorkerReviewEvidencePrompt(context);
@@ -1894,11 +1978,11 @@ function digestTranscript(workerRun: RunRecord | null, events: TranscriptEvent[]
     ? [
         `Worker run ${workerRun.runId} status ${workerRun.status}`,
         `Worker agent ${workerRun.agentId ?? "n/a"} session ${workerRun.sessionId ?? "n/a"}`,
-        `Worker prompt: ${oneLine(workerRun.prompt).slice(0, 240)}`,
+        `Worker prompt characters: ${workerRun.promptCharCount ?? "n/a"}`,
       ]
     : ["Worker run metadata is unavailable."];
   const eventDigest = events
-    .filter((event) => event.message !== undefined && event.message.trim().length > 0)
+    .filter((event) => isPromptRelevantTranscriptEvent(event) && event.message !== undefined && event.message.trim().length > 0)
     .slice(-12)
     .map((event) => `#${event.sequence} ${event.eventType}: ${oneLine(event.message ?? "").slice(0, 240)}`);
   return eventDigest.length === 0 ? summary : [...summary, ...eventDigest];
@@ -1914,6 +1998,29 @@ function latestContinuationSummaryReference(
       summaries.length - 1
     ] ?? null
   );
+}
+
+function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[]): boolean {
+  return (
+    lifecycle.handoff.lastWorkerOutput !== null ||
+    lifecycle.handoff.lastReviewerOutput !== null ||
+    runs.length > 0 ||
+    lifecycle.reviewRound > 0 ||
+    lifecycle.incompleteTurnCount > 0 ||
+    lifecycle.summaryReferences.length > 0 ||
+    lifecycle.reviewEvidence.items.some((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true) ||
+    lifecycle.merge !== null ||
+    lifecycle.phase !== "implementation"
+  );
+}
+
+function nextWorkerAction(lifecycle: IssueLifecycleRecord): string {
+  if (lifecycle.handoff.lastReviewerOutput?.verdict === "fail") return "Address the latest reviewer findings, validate, and submit a new completion report.";
+  if (lifecycle.incompleteTurnCount > 0) return "Continue the incomplete implementation using the memo and pointers before rediscovering context.";
+  if (lifecycle.reviewEvidence.items.some((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true)) {
+    return "Address active unresolved PR review evidence before submitting another completion report.";
+  }
+  return "Continue implementation using the compact memo and stable pointers.";
 }
 
 async function listRunsForLifecycle(
@@ -1957,33 +2064,31 @@ function upsertSummaryReference(
 }
 
 function transcriptPointersForRuns(runs: RunRecord[]): string[] {
-  return runs.map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript`);
+  return runs.slice(-5).map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript`);
 }
 
 function statusApiPointersForIssue(issueIdentifier: string, runs: RunRecord[]): string[] {
   return [
     `/api/v1/issues/${encodeURIComponent(issueIdentifier)}`,
     `/api/v1/issues/${encodeURIComponent(issueIdentifier)}/runs`,
-    ...runs.map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}`),
+    ...runs.slice(-5).map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}`),
   ];
 }
 
-function formatFullHistory(history: Array<{ run: RunRecord; events: TranscriptEvent[]; truncated: boolean }>): string[] {
-  if (history.length === 0) return ["- No prior run history is available."];
-  return history.flatMap(({ run, events, truncated }) => [
-    `- Run ${run.runId} (${run.role}, turn ${run.turnNumber}, status ${run.status})`,
-    `  Prompt: ${oneLine(run.prompt).slice(0, 240) || "n/a"}`,
-    `  Workspace: ${run.workspacePath}`,
-    `  Branch: ${run.gitBranchName ?? "n/a"}; base: ${run.baseRef ?? "n/a"}`,
-    ...(events.length === 0
-      ? ["  Transcript events: none"]
-      : events.map((event) => `  #${event.sequence} ${event.eventType}: ${oneLine(event.message ?? "").slice(0, 240) || "n/a"}`)),
-    ...(truncated ? ["  Transcript truncated; inspect the transcript API pointer for the remaining events."] : []),
-  ]);
+function promptRelevantTranscriptEvents(events: TranscriptEvent[]): TranscriptEvent[] {
+  return events.filter(isPromptRelevantTranscriptEvent);
+}
+
+function isPromptRelevantTranscriptEvent(event: TranscriptEvent): boolean {
+  return event.eventType !== "lane_memo_updated" && event.eventType !== "transcript_recall";
 }
 
 function formatPointerList(pointers: string[]): string[] {
   return pointers.length === 0 ? ["- n/a"] : pointers.map((pointer) => `- ${pointer}`);
+}
+
+function formatList(values: string[]): string {
+  return values.length === 0 ? "n/a" : values.join("; ");
 }
 
 function formatPullRequest(number: number | null, url: string | null): string {

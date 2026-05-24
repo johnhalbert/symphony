@@ -365,6 +365,7 @@ export class StatusServer {
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
           ...run,
+          telemetry: await runTelemetrySummary(run.runId, this.options.runStore),
           operatorLiveness: await runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns, this.options.runStore),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
@@ -1703,6 +1704,50 @@ async function runOperatorLiveness(
     return terminalOperatorLiveness("cancelled", run, null, false, runStore);
   }
   return null;
+}
+
+async function runTelemetrySummary(runId: string, runStore?: RunTranscriptStore): Promise<{
+  transcriptRecall: { calls: number; returnedEvents: number; returnedChars: number; truncations: number; denied: number };
+  laneMemo: { updates: number; latestSizeChars: number | null };
+}> {
+  const empty = {
+    transcriptRecall: { calls: 0, returnedEvents: 0, returnedChars: 0, truncations: 0, denied: 0 },
+    laneMemo: { updates: 0, latestSizeChars: null },
+  } as {
+    transcriptRecall: { calls: number; returnedEvents: number; returnedChars: number; truncations: number; denied: number };
+    laneMemo: { updates: number; latestSizeChars: number | null };
+  };
+  if (!runStore) return empty;
+  const events: TranscriptEvent[] = [];
+  let offset = 0;
+  do {
+    const page = await runStore.readTranscript(runId, { offset, limit: 1_000 });
+    events.push(...page.events);
+    if (page.nextOffset === null) break;
+    offset = page.nextOffset;
+  } while (true);
+  return events.reduce((summary, event) => {
+    if (event.eventType === "transcript_recall" && isRecord(event.payload)) {
+      summary.transcriptRecall.calls += 1;
+      summary.transcriptRecall.returnedEvents += numberValue(event.payload.returnedEvents);
+      summary.transcriptRecall.returnedChars += numberValue(event.payload.returnedChars);
+      if (event.payload.truncated === true) summary.transcriptRecall.truncations += 1;
+      if (event.payload.denied === true) summary.transcriptRecall.denied += 1;
+    }
+    if (event.eventType === "lane_memo_updated" && isRecord(event.payload)) {
+      summary.laneMemo.updates += 1;
+      summary.laneMemo.latestSizeChars = numberValue(event.payload.memoSizeChars);
+    }
+    return summary;
+  }, empty);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function numberValue(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function runLivenessSummary(

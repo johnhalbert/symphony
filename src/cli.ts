@@ -16,6 +16,7 @@ import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
+import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcpServer.js";
 import {
   createRuntimeTrackerClient,
   createRuntimeWritebackProcessor,
@@ -80,6 +81,18 @@ program
   .requiredOption("--context-file <path>", "path to the active reviewer feedback context file")
   .action(async (options: { workflow: string; contextFile: string }) => {
     await runReviewFeedbackMcpServer({
+      workflowPath: path.resolve(process.cwd(), options.workflow),
+      contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
+  });
+
+program
+  .command("transcript-recall-mcp")
+  .description("Run the internal Symphony read-only transcript recall MCP server")
+  .requiredOption("--workflow <path>", "path to WORKFLOW.md")
+  .requiredOption("--context-file <path>", "path to the active recall context file")
+  .action(async (options: { workflow: string; contextFile: string }) => {
+    await runTranscriptRecallMcpServer({
       workflowPath: path.resolve(process.cwd(), options.workflow),
       contextFile: path.resolve(process.cwd(), options.contextFile),
     });

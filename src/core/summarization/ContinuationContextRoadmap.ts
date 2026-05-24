@@ -5,7 +5,7 @@ export type ContinuationContextFeatureFlag =
   | "continuation_context.search_enabled"
   | "continuation_context.summarization_enabled";
 
-export type ContinuationContextImplementationStatus = "not_implemented";
+export type ContinuationContextImplementationStatus = "implemented" | "not_implemented";
 
 export interface ContinuationSearchInput {
   issue: Pick<Issue, "id" | "identifier" | "title">;
@@ -67,7 +67,7 @@ export const CONTINUATION_CONTEXT_ROADMAP = {
   search: {
     capability: "search",
     flag: "continuation_context.search_enabled",
-    implementationStatus: "not_implemented",
+    implementationStatus: "implemented",
     dispatchPolicy: "no_orchestrator_dispatch",
     roadmapIssue: blockedRoadmapIssue,
   },

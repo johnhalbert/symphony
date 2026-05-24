@@ -28,6 +28,7 @@ import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, T
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
+import type { TokenCounts } from "../src/core/types.js";
 import { issue, testConfig } from "./helpers.js";
 
 describe("Orchestrator", () => {
@@ -88,6 +89,7 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toBe("Work on TEST-1");
+    expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
     expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
   });
@@ -1099,6 +1101,13 @@ describe("Orchestrator", () => {
         () => currentState === "In Review" && harness.runs.length === 1 && orchestrator.snapshot().counts.running === 0,
         "first worker handoff",
       );
+      await runStore.appendEvent({
+        runId: "smoke-worker-run-1",
+        at: "2026-01-01T00:00:10.000Z",
+        source: "harness",
+        eventType: "progress",
+        message: `RAW_TRANSCRIPT_SECRET ${"x".repeat(20_000)}`,
+      });
       await settleOrchestratorExit();
 
       await orchestrator.refreshNow();
@@ -1132,6 +1141,8 @@ describe("Orchestrator", () => {
     ]);
     expect(harness.runs[2]?.prompt).toContain("Reviewer findings to address");
     expect(harness.runs[2]?.prompt).toContain("Add the manufactured smoke revision.");
+    expect(harness.runs[2]?.prompt).not.toContain("RAW_TRANSCRIPT_SECRET");
+    expect(harness.runs[2]?.prompt.length).toBeLessThan(12_000);
     expect(currentState).toBe("Ready to Merge");
     expect(writer.transitions.map((transition) => transition.toState)).toEqual([
       "In Progress",
@@ -1176,6 +1187,14 @@ describe("Orchestrator", () => {
         events: expect.arrayContaining([expect.objectContaining({ eventType: "completed" })]),
       });
     }
+    await expect(runStore.readTranscript("smoke-worker-run-2")).resolves.toMatchObject({
+      events: expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "lane_memo_updated",
+          payload: expect.objectContaining({ memoSizeChars: expect.any(Number) }),
+        }),
+      ]),
+    });
   }, 15_000);
 
   it("dispatches reviewer runs from configured review states with reviewer evidence", async () => {
@@ -1938,6 +1957,8 @@ describe("Orchestrator", () => {
     expect(pullRequestReviewClient.calls).toEqual([42]);
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("PR review feedback to address");
+    expect(harness.runs[0]?.prompt).toContain("Compact Symphony handoff packet:");
+    expect(harness.runs[0]?.prompt).toContain("Active unresolved PR review evidence:");
     expect(harness.runs[0]?.prompt).toContain("Reviewer verdict: fail / requested changes");
     expect(harness.runs[0]?.prompt).toContain("src/core/review/PullRequestReviewEvidenceService.ts:72");
     expect(harness.runs[0]?.prompt).toContain("thread: thread-1");
@@ -2535,7 +2556,117 @@ describe("Orchestrator", () => {
     expect(harness.prompts).toEqual(["Work on TEST-1"]);
   });
 
-  it("includes full relevant run history in continuation prompts below the event threshold", async () => {
+  it("accounts tokens per fresh active run across continuation turns", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new TokenSequenceHarness([
+      { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+      { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+    ]);
+    const runStore = new FileRunTranscriptStore(root);
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2);
+    await orchestrator.stop();
+
+    const runs = await runStore.listRunsForIssue(candidate.id);
+    expect(runs.map((run) => ({ runId: run.runId, tokens: run.tokens }))).toEqual([
+      { runId: "token-run-1", tokens: { inputTokens: 100, outputTokens: 50, totalTokens: 150 } },
+      { runId: "token-run-2", tokens: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } },
+    ]);
+    expect(orchestrator.snapshot().totals).toMatchObject({
+      inputTokens: 110,
+      outputTokens: 55,
+      totalTokens: 165,
+    });
+  });
+
+  it("includes compact handoff for prior-run-only follow-up prompts", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(candidate);
+    await runStore.startRun({
+      runId: "prior-run-only",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "SECRET_FULL_PROMPT_BODY",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+    });
+    await runStore.appendEvent({
+      runId: "prior-run-only",
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Prior run exists without a lifecycle handoff.",
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await orchestrator.stop();
+
+    const prompt = harness.runs[0]?.prompt ?? "";
+    expect(prompt).toContain("Compact Symphony handoff packet:");
+    expect(prompt).toContain("/api/v1/runs/prior-run-only/transcript");
+    expect(prompt).not.toContain("SECRET_FULL_PROMPT_BODY");
+  });
+
+  it("uses pointers instead of raw run history in continuation prompts below the event threshold", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
     config.reviewLoop.continuationHistoryThreshold = 5;
@@ -2574,10 +2705,10 @@ describe("Orchestrator", () => {
 
     expect(harness.runs).toHaveLength(2);
     expect(harness.runs[1]?.prompt).toContain("Structured continuation brief:");
-    expect(harness.runs[1]?.prompt).toContain("Mode: full");
-    expect(harness.runs[1]?.prompt).toContain("Full relevant history:");
-    expect(harness.runs[1]?.prompt).toContain("Run fake-issue-1-1");
-    expect(harness.runs[1]?.prompt).toContain("#2 completed: fake completed");
+    expect(harness.runs[1]?.prompt).toContain("Mode: summary");
+    expect(harness.runs[1]?.prompt).toContain("Transcript/status pointers:");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/fake-issue-1-1/transcript");
+    expect(harness.runs[1]?.prompt).not.toContain("completed: fake completed");
     expect(harness.runs[1]?.prompt).not.toContain("Continue working on the issue. Check current issue state");
   });
 
@@ -2585,6 +2716,7 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
     config.reviewLoop.continuationHistoryThreshold = 1;
+    config.reviewLoop.transcriptHistoryLimit = 1;
     const candidate = issue({ state: "Todo" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -2951,6 +3083,23 @@ class CursorPromptHarness implements AgentHarness {
   }
 }
 
+class TokenSequenceHarness implements AgentHarness {
+  readonly id = "token-sequence";
+  readonly runs: string[] = [];
+
+  constructor(private readonly tokenEvents: TokenCounts[]) {}
+
+  async *run(_ctx: AgentRunContext, _prompt: string): AsyncIterable<AgentEvent> {
+    const runNumber = this.runs.length + 1;
+    const runId = `token-run-${runNumber}`;
+    this.runs.push(runId);
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    const tokens = this.tokenEvents[runNumber - 1];
+    if (tokens) yield { type: "tokens", tokens };
+    yield { type: "completed" };
+  }
+}
+
 type ReportingHarnessTerminal = AgentEvent | "throw";
 
 class ReportingHarness implements AgentHarness {
@@ -3081,6 +3230,7 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
       config: ctx.config,
       lifecycleStore: this.lifecycleStore,
       writebackOutbox: this.outboxStore,
+      runStore: this.runStore,
     }).submitReviewVerdict(
       runNumber === 1
         ? {

@@ -5,6 +5,7 @@ import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/h
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
 import { writeReviewFeedbackMcpContext } from "../../src/core/harness/ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
+import { writeTranscriptRecallMcpContext } from "../../src/core/harness/TranscriptRecallMcpServer.js";
 import {
   buildMcpSubprocessServerConfig,
   type McpSubprocessServerConfig,
@@ -18,6 +19,14 @@ export interface CursorHarnessOptions {
   runStore?: RunTranscriptStore;
 }
 
+interface CursorAgentLease {
+  agent: SDKAgent;
+  created: boolean;
+  resumeAttempted: boolean;
+  resumeUsed: boolean;
+  outcome: "created" | "resumed" | "reused";
+}
+
 export class CursorHarness implements AgentHarness {
   readonly id = "cursor";
   private readonly agents = new Map<string, SDKAgent>();
@@ -26,19 +35,22 @@ export class CursorHarness implements AgentHarness {
   constructor(private readonly options: CursorHarnessOptions = {}) {}
 
   async prepare(ctx: AgentRunContext): Promise<void> {
-    await this.getOrCreateAgent(ctx);
+    await writeInitialRoleMcpContexts(ctx);
+    if (shouldReuseAgent(ctx)) await this.getOrCreateAgent(ctx);
   }
 
   async reload(ctx: AgentRunContext): Promise<void> {
+    if (!shouldReuseAgent(ctx)) return;
     const agent = await this.getOrCreateAgent(ctx);
     await agent.reload();
   }
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
-    const agent = await this.getOrCreateAgent(ctx);
+    const reusable = shouldReuseAgent(ctx);
+    const lease = reusable ? await this.getOrCreateAgentLease(ctx) : await this.createAgent(ctx, { allowResume: false });
+    const agent = lease.agent;
     const deltaEvents: AgentEvent[] = [];
     const cliPath = currentSymphonyCliPath();
-    await writeInitialRoleMcpContexts(ctx);
     const runOptions: NonNullable<Parameters<SDKAgent["send"]>[1]> = {
       model: cursorModelSelection(ctx),
       local: { force: true },
@@ -51,9 +63,9 @@ export class CursorHarness implements AgentHarness {
     try {
       run = await agent.send(prompt, runOptions);
     } catch (error) {
-      if (ctx.role === "reviewer") {
+      if (!reusable) {
         this.agents.delete(agentKey(ctx));
-        await agent[Symbol.asyncDispose]().catch(() => undefined);
+        await this.disposeAgent(agent, ctx, "send_failed");
       }
       throw error;
     }
@@ -87,6 +99,14 @@ export class CursorHarness implements AgentHarness {
           phase: "implementation",
         });
       }
+      if (ctx.config.continuationContext.searchEnabled) {
+        await writeTranscriptRecallMcpContext(transcriptRecallContextFilePath(ctx), {
+          issue: ctx.issue,
+          activeRunId: run.id,
+          role: ctx.role,
+          phase: ctx.role === "reviewer" ? "review" : "implementation",
+        });
+      }
       if (ctx.role === "reviewer") {
         await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
           issue: ctx.issue,
@@ -117,15 +137,33 @@ export class CursorHarness implements AgentHarness {
         sessionId: `${agent.agentId}:${run.id}`,
         agentId: agent.agentId,
       });
+      await this.options.runStore?.appendEvent({
+        runId: run.id,
+        at: new Date().toISOString(),
+        source: "cursor",
+        eventType: "cursor_agent_lifecycle",
+        message: `Cursor agent ${lease.outcome}; resumeUsed=${lease.resumeUsed}`,
+        payload: {
+          agentId: agent.agentId,
+          lifecycleMode: ctx.config.cursor.workerAgentLifecycle,
+          reusable,
+          created: lease.created,
+          resumeAttempted: lease.resumeAttempted,
+          resumeUsed: lease.resumeUsed,
+          outcome: lease.outcome,
+        },
+      });
 
       for await (const message of run.stream()) {
-        await this.options.runStore?.appendEvent({
-          runId: run.id,
-          at: new Date().toISOString(),
-          source: "cursor",
-          eventType: message.type,
-          payload: message,
-        });
+        const transcriptEvent = cursorTranscriptEvent(message);
+        if (transcriptEvent) {
+          await this.options.runStore?.appendEvent({
+            runId: run.id,
+            at: new Date().toISOString(),
+            source: "cursor",
+            ...transcriptEvent,
+          });
+        }
         for (const event of flush(deltaEvents)) yield event;
         for (const event of mapCursorMessage(message)) yield event;
       }
@@ -146,9 +184,22 @@ export class CursorHarness implements AgentHarness {
     } finally {
       ctx.abortSignal.removeEventListener("abort", abort);
       this.activeRuns.delete(run.id);
-      if (ctx.role === "reviewer") {
+      if (!reusable) {
         this.agents.delete(agentKey(ctx));
-        await this.disposeAgent(agent, ctx, "reviewer_run_finished");
+        const dispose = await this.disposeAgent(agent, ctx, "run_finished");
+        await this.options.runStore?.appendEvent({
+          runId: run.id,
+          at: new Date().toISOString(),
+          source: "cursor",
+          eventType: "cursor_agent_disposed",
+          message: dispose.ok ? "Cursor agent disposed" : `Cursor agent dispose failed: ${dispose.error}`,
+          payload: {
+            agentId: agent.agentId,
+            ok: dispose.ok,
+            reason: "run_finished",
+            ...(dispose.error === null ? {} : { error: dispose.error }),
+          },
+        });
       }
     }
   }
@@ -164,20 +215,34 @@ export class CursorHarness implements AgentHarness {
   }
 
   private async getOrCreateAgent(ctx: AgentRunContext): Promise<SDKAgent> {
+    return (await this.getOrCreateAgentLease(ctx)).agent;
+  }
+
+  private async getOrCreateAgentLease(ctx: AgentRunContext): Promise<CursorAgentLease> {
     const key = agentKey(ctx);
     const existing = this.agents.get(key);
-    if (existing) return existing;
+    if (existing) return { agent: existing, created: false, resumeAttempted: false, resumeUsed: false, outcome: "reused" };
 
+    const lease = await this.createAgent(ctx, { allowResume: true });
+    this.agents.set(key, lease.agent);
+    return lease;
+  }
+
+  private async createAgent(ctx: AgentRunContext, options: { allowResume: boolean }): Promise<CursorAgentLease> {
     const cliPath = currentSymphonyCliPath();
     await writeInitialRoleMcpContexts(ctx);
     const agentOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
       mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
     });
-    const latestRun = ctx.role === "worker" ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker" }) : null;
+    const latestRun =
+      options.allowResume && ctx.role === "worker"
+        ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker" })
+        : null;
     let agent: SDKAgent;
     if (latestRun?.agentId) {
       try {
         agent = await Agent.resume(latestRun.agentId, agentOptions);
+        return { agent, created: false, resumeAttempted: true, resumeUsed: true, outcome: "resumed" };
       } catch (error) {
         ctx.logger.warn("cursor agent resume failed; creating a new agent", {
           agent_id: latestRun.agentId,
@@ -185,32 +250,73 @@ export class CursorHarness implements AgentHarness {
           error: errorMessage(error),
         });
         agent = await Agent.create(agentOptions);
+        return { agent, created: true, resumeAttempted: true, resumeUsed: false, outcome: "created" };
       }
     } else {
       agent = await Agent.create(agentOptions);
+      return { agent, created: true, resumeAttempted: false, resumeUsed: false, outcome: "created" };
     }
-    this.agents.set(key, agent);
-    return agent;
   }
 
-  private async disposeAgent(agent: SDKAgent, ctx: AgentRunContext | null, reason: string): Promise<void> {
+  private async disposeAgent(agent: SDKAgent, ctx: AgentRunContext | null, reason: string): Promise<{ ok: boolean; error: string | null }> {
     try {
       await agent[Symbol.asyncDispose]();
+      return { ok: true, error: null };
     } catch (error) {
+      const message = errorMessage(error);
       ctx?.logger.warn("cursor sdk agent dispose failed", {
         agent_id: agent.agentId,
         issue_id: ctx.issue.id,
         issue_identifier: ctx.issue.identifier,
         role: ctx.role,
         reason,
-        error: errorMessage(error),
+        error: message,
       });
+      return { ok: false, error: message };
     }
   }
 }
 
+function shouldReuseAgent(ctx: AgentRunContext): boolean {
+  return ctx.role === "worker" && ctx.config.cursor.workerAgentLifecycle === "resume_by_issue";
+}
+
 function flush(events: AgentEvent[]): AgentEvent[] {
   return events.splice(0, events.length);
+}
+
+function cursorTranscriptEvent(message: unknown): { eventType: string; message?: string; payload?: unknown } | null {
+  if (!isCursorMessageRecord(message)) return { eventType: "unknown" };
+  switch (message.type) {
+    case "user":
+      return null;
+    case "thinking":
+      return { eventType: "thinking", message: "Cursor thinking event" };
+    case "tool_call":
+      return {
+        eventType: "tool_call",
+        message: `tool ${typeof message.name === "string" ? message.name : "unknown"} ${typeof message.status === "string" ? message.status : "unknown"}`,
+      };
+    case "assistant":
+      return { eventType: "assistant", message: "Cursor assistant message" };
+    case "task":
+      return { eventType: "task", message: "Cursor task event" };
+    case "status":
+      return { eventType: "status", message: typeof message.status === "string" ? `Cursor status ${message.status}` : "Cursor status event" };
+    case "system":
+      return {
+        eventType: "system",
+        message: `Cursor system event: ${typeof message.subtype === "string" ? message.subtype : "system"}`,
+      };
+    case "request":
+      return { eventType: "request", message: "Cursor requested external input" };
+    default:
+      return { eventType: message.type };
+  }
+}
+
+function isCursorMessageRecord(value: unknown): value is { type: string; [key: string]: unknown } {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && typeof (value as { type?: unknown }).type === "string";
 }
 
 export function cursorAgentCreateOptions(
@@ -239,15 +345,25 @@ export function cursorRoleMcpServers(
   if (ctx.role === "worker") {
     return {
       symphony: applyCwd(completionReportMcpServerConfig(ctx, completionReportContextFilePath(ctx), options)),
+      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
   return {
     symphony_review_verdict: applyCwd(reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFilePath(ctx), options)),
     symphony_review_feedback: applyCwd(reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFilePath(ctx), options)),
+    ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
   };
 }
 
 export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise<void> {
+  if (ctx.config.continuationContext.searchEnabled) {
+    await writeTranscriptRecallMcpContext(transcriptRecallContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: ctx.role,
+      phase: ctx.role === "reviewer" ? "review" : "implementation",
+    });
+  }
   if (ctx.role === "worker") {
     await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
       issue: ctx.issue,
@@ -280,6 +396,18 @@ export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise
     reviewer: null,
     phase: "review",
   });
+}
+
+function transcriptRecallMcpServerEntry(
+  ctx: AgentRunContext,
+  options: { cliPath: string },
+  applyCwd: (server: McpSubprocessServerConfig) => McpSubprocessServerConfig,
+): Record<string, McpSubprocessServerConfig> {
+  return ctx.config.continuationContext.searchEnabled
+    ? {
+        symphony_recall: applyCwd(transcriptRecallMcpServerConfig(ctx, transcriptRecallContextFilePath(ctx), options)),
+      }
+    : {};
 }
 
 export function cursorAgentName(ctx: AgentRunContext): string {
@@ -334,6 +462,20 @@ export function reviewFeedbackMcpServerConfig(
   });
 }
 
+export function transcriptRecallMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "transcript-recall-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
+}
+
 export function completionReportContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
@@ -355,6 +497,14 @@ export function reviewFeedbackContextFilePath(ctx: AgentRunContext): string {
     ctx.config.workspace.stateDir,
     "review-feedback-mcp",
     `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
+export function transcriptRecallContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "transcript-recall-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.role}-${ctx.turnNumber}.json`,
   );
 }
 

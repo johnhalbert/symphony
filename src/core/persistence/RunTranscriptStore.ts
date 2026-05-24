@@ -14,6 +14,11 @@ export interface RunActivitySnapshot {
   lastToolActivityAt: string | null;
 }
 
+export interface PersistedCursorModelParam {
+  id: string;
+  value: string;
+}
+
 export interface WorkspaceRecord {
   workspaceKey: string;
   issueId: string | null;
@@ -62,6 +67,12 @@ export interface RunRecord {
   attempt: number | null;
   turnNumber: number;
   prompt: string;
+  promptCharCount?: number;
+  cursorModel?: string | null;
+  cursorModelParams?: PersistedCursorModelParam[];
+  cursorSettingSources?: string[];
+  cursorAllowLargeContext?: boolean;
+  cursorWorkerAgentLifecycle?: string;
   workspaceKey: string;
   workspacePath: string;
   gitBranchName?: string | null;
@@ -122,6 +133,11 @@ export interface StartRunInput {
   attempt: number | null;
   turnNumber: number;
   prompt: string;
+  cursorModel?: string | null;
+  cursorModelParams?: PersistedCursorModelParam[];
+  cursorSettingSources?: string[];
+  cursorAllowLargeContext?: boolean;
+  cursorWorkerAgentLifecycle?: string;
   workspaceKey: string;
   workspacePath: string;
   gitBranchName?: string;
@@ -208,7 +224,13 @@ export class FileRunTranscriptStore {
       issueIdentifier: input.issueIdentifier,
       attempt: input.attempt,
       turnNumber: input.turnNumber,
-      prompt: input.prompt,
+      prompt: promptPreview(input.prompt),
+      promptCharCount: input.prompt.length,
+      ...(input.cursorModel === undefined ? {} : { cursorModel: input.cursorModel }),
+      ...(input.cursorModelParams === undefined ? {} : { cursorModelParams: input.cursorModelParams }),
+      ...(input.cursorSettingSources === undefined ? {} : { cursorSettingSources: input.cursorSettingSources }),
+      ...(input.cursorAllowLargeContext === undefined ? {} : { cursorAllowLargeContext: input.cursorAllowLargeContext }),
+      ...(input.cursorWorkerAgentLifecycle === undefined ? {} : { cursorWorkerAgentLifecycle: input.cursorWorkerAgentLifecycle }),
       workspaceKey: input.workspaceKey,
       workspacePath: input.workspacePath,
       ...(input.gitBranchName === undefined ? {} : { gitBranchName: input.gitBranchName }),
@@ -385,6 +407,11 @@ function compareString(left: string, right: string): number {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
+}
+
+function promptPreview(prompt: string): string {
+  const oneLine = prompt.replace(/\s+/g, " ").trim();
+  return oneLine.length <= 240 ? oneLine : `${oneLine.slice(0, 225)}...[truncated]`;
 }
 
 function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {

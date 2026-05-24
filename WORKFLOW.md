@@ -27,17 +27,18 @@ review_loop:
   continuation_history_threshold: 5
 
 merge_policy:
-  mode: manual
+  mode: gated
   source_states:
     - Ready to Merge
   done_state: Done
   merge_method: merge
-  required_checks: []
+  required_checks:
+    - Typecheck and test
   no_ci:
     allowed: false
 
 continuation_context:
-  search_enabled: false
+  search_enabled: true
   summarization_enabled: false
 
 polling:
@@ -56,7 +57,7 @@ workspace:
 agent:
   harness: cursor
   max_concurrent_agents: 1
-  max_turns: 10
+  max_turns: 1
   max_retry_backoff_ms: 300000
   require_labels:
     - dogfood-ready
@@ -76,10 +77,11 @@ agent:
 cursor:
   model: gpt-5.5
   model_params:
+    context: 272k
     reasoning: extra-high
-  setting_sources:
-    - project
-    - user
+  allow_large_context: false
+  worker_agent_lifecycle: fresh_per_run
+  setting_sources: []
 
 server:
   host: 127.0.0.1
@@ -98,6 +100,22 @@ github:
   token: $GITHUB_TOKEN
   head_owner: johnhalbert
   publish_pull_requests: true
+
+credential_profiles:
+  profiles:
+    publication:
+      value: $GITHUB_PUBLICATION_TOKEN
+      capabilities:
+        - github.publication
+    feedback:
+      value: $GITHUB_FEEDBACK_TOKEN
+      capabilities:
+        - github.review_feedback_write
+  roles:
+    worker:
+      github.publication: publication
+    reviewer:
+      github.review_feedback_write: feedback
 ---
 
 # Symphony Dogfood Worker
@@ -118,7 +136,7 @@ A passing review is recorded with structured reviewer verdict evidence, such as 
 
 Reviewer-approved GitHub merge remains manual unless `merge_policy.mode: gated` is explicitly enabled. In gated mode, Symphony must confirm the issue reached `Ready to Merge`, validate the lifecycle-bound PR, approval evidence, current head SHA, and configured CI/no-CI policy, then perform service-owned merge and transition the issue to `Done`.
 
-Search and richer summarization for continuation context are roadmap placeholders only. Keep `continuation_context.search_enabled` and `continuation_context.summarization_enabled` disabled until concrete implementations exist; enabling them only produces doctor warnings and must not create worker or reviewer dispatch paths.
+Transcript search is available through the bounded, read-only `search_transcript_context` MCP tool when `continuation_context.search_enabled` is true. Richer summarization remains a roadmap placeholder; keep `continuation_context.summarization_enabled` disabled until a concrete implementation exists.
 
 ## Required Workflow
 

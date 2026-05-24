@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import {
   continuationContextDoctorChecks,
+  cursorPolicyDoctorChecks,
   githubPublicationDoctorCheck,
   githubReviewFeedbackDoctorCheck,
   reviewLoopDoctorChecks,
@@ -12,6 +13,45 @@ describe("doctor review-loop checks", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("reports bounded Cursor policy and ambient setting-source warnings", () => {
+    const bounded = testConfig("/tmp/symphony-doctor");
+    expect(cursorPolicyDoctorChecks(bounded)).toEqual([
+      {
+        id: "cursor.model",
+        status: "ok",
+        message: "Cursor model is gpt-5.5 with params context=272k, reasoning=extra-high; large context opt-in is disabled",
+      },
+      {
+        id: "cursor.context",
+        status: "ok",
+        message: "Managed Cursor runs are bounded to context=272k",
+      },
+      {
+        id: "cursor.setting_sources",
+        status: "ok",
+        message: "Managed Cursor runs do not load project/user setting sources by default",
+      },
+    ]);
+
+    const ambient = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        cursor: {
+          model_params: { context: "272k", reasoning: "extra-high" },
+          setting_sources: ["project", "user"],
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(cursorPolicyDoctorChecks(ambient)).toContainEqual({
+      id: "cursor.setting_sources",
+      status: "warn",
+      message: "Managed Cursor runs load setting sources: project, user",
+    });
   });
 
   it("validates review state, blocked state, MCP tools, and candidate isolation", async () => {
@@ -257,7 +297,7 @@ describe("doctor review-loop checks", () => {
     });
   });
 
-  it("warns when continuation context placeholder flags are enabled", () => {
+  it("reports implemented search and warns for placeholder summarization", () => {
     const config = testConfig("/tmp/symphony-doctor");
     config.continuationContext.searchEnabled = true;
     config.continuationContext.summarizationEnabled = true;
@@ -265,9 +305,8 @@ describe("doctor review-loop checks", () => {
     expect(continuationContextDoctorChecks(config)).toEqual([
       {
         id: "continuation_context.search",
-        status: "warn",
-        message:
-          "continuation_context.search_enabled is enabled, but search is not_implemented; keep roadmap issues in Backlog with dogfood-blocked and without dogfood-ready until a concrete implementation lands",
+        status: "ok",
+        message: "continuation_context.search_enabled is enabled and search is implemented",
       },
       {
         id: "continuation_context.summarization",
