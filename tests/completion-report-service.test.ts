@@ -8,6 +8,7 @@ import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleS
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
+import type { OperatorApprovalRecord, OperatorApprovalRequestInput } from "../src/core/approval/OperatorApprovalService.js";
 import type {
   CompletionReportPullRequestPublication,
   CompletionReportPullRequestPublicationInput,
@@ -137,6 +138,94 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("persists a pending completion report before waiting for publication approval", async () => {
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const operatorApproval = new DeferredOperatorApproval();
+    const { service, lifecycleStore, outbox, runStore } = fixture({
+      publisher,
+      operatorApproval,
+      requirePublicationApproval: true,
+    });
+    await startRun(runStore);
+
+    const submission = service.submitCompletionReport(report(), contextWithWorkspace());
+    const approvalRequest = await operatorApproval.waitForRequest();
+
+    expect(approvalRequest.action).toMatchObject({
+      kind: "push_and_pr",
+      branchName: "symphony/TEST-1",
+      plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+    });
+    expect(publisher.inputs).toHaveLength(0);
+    expect(await outbox.list()).toHaveLength(0);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "implementation",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [
+        {
+          id: "completion-report:issue-1:idem-1",
+          idempotencyKey: "idem-1",
+          runId: "run-1",
+          pullRequest: null,
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+
+    operatorApproval.approve();
+    const result = await submission;
+
+    expect(result.replayed).toBe(false);
+    expect(result.report).toMatchObject({
+      id: "completion-report:issue-1:idem-1",
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "abc123",
+        branch: "symphony/TEST-1",
+      },
+      writebackOperationKeys: [
+        "comment:issue-1:run-1:completion-report:idem-1",
+        "transition:issue-1:run-1:completion-report:idem-1:In Review",
+      ],
+    });
+    expect(publisher.inputs).toHaveLength(1);
+    expect(await outbox.list()).toHaveLength(2);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      completionReports: [
+        {
+          id: "completion-report:issue-1:idem-1",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "abc123",
+            branch: "symphony/TEST-1",
+          },
+          writebackOperationKeys: [
+            "comment:issue-1:run-1:completion-report:idem-1",
+            "transition:issue-1:run-1:completion-report:idem-1:In Review",
+          ],
+        },
+      ],
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+        lastEvidenceCursor: "idem-1",
+      },
+    });
+  });
+
   it("reuses a service-discovered PR and prevents duplicate publication on replay", async () => {
     const publisher = new FakePublisher({
       action: "reused",
@@ -239,7 +328,13 @@ describe("CompletionReportService", () => {
     });
   });
 
-  function fixture(options: { publisher?: CompletionReportPullRequestPublisher } = {}) {
+  function fixture(
+    options: {
+      publisher?: CompletionReportPullRequestPublisher;
+      operatorApproval?: Pick<DeferredOperatorApproval, "waitForPublicationApproval">;
+      requirePublicationApproval?: boolean;
+    } = {},
+  ) {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
@@ -250,6 +345,9 @@ describe("CompletionReportService", () => {
       config.github.repo = "symphony";
       config.github.token = "github-token";
     }
+    if (options.requirePublicationApproval) {
+      config.github.operatorApproval!.requiredForPublication = true;
+    }
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
@@ -259,6 +357,7 @@ describe("CompletionReportService", () => {
       writebackOutbox: outbox,
       runStore,
       ...(options.publisher === undefined ? {} : { pullRequestPublisher: options.publisher }),
+      ...(options.operatorApproval === undefined ? {} : { operatorApproval: options.operatorApproval }),
     });
     return { service, lifecycleStore, outbox, runStore };
   }
@@ -359,5 +458,54 @@ class FakePublisher implements CompletionReportPullRequestPublisher {
     if (this.failure) throw this.failure;
     if (!this.publication) throw new Error("missing fake publication");
     return this.publication;
+  }
+}
+
+class DeferredOperatorApproval {
+  readonly requests: OperatorApprovalRequestInput[] = [];
+  private readonly requestSeen: Promise<void>;
+  private markRequestSeen: (() => void) | null = null;
+  private resolveApproval: ((record: OperatorApprovalRecord) => void) | null = null;
+
+  constructor() {
+    this.requestSeen = new Promise((resolve) => {
+      this.markRequestSeen = resolve;
+    });
+  }
+
+  waitForPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
+    this.requests.push(input);
+    this.markRequestSeen?.();
+    return new Promise((resolve) => {
+      this.resolveApproval = resolve;
+    });
+  }
+
+  async waitForRequest(): Promise<OperatorApprovalRequestInput> {
+    await this.requestSeen;
+    const request = this.requests[0];
+    if (!request) throw new Error("approval request was not captured");
+    return request;
+  }
+
+  approve(): void {
+    const request = this.requests[0];
+    if (!request || !this.resolveApproval) throw new Error("approval request is not pending");
+    this.resolveApproval({
+      requestId: "approval-1",
+      status: "approved",
+      issueId: request.issueId,
+      issueIdentifier: request.issueIdentifier,
+      runId: request.runId,
+      evidenceCursor: request.evidenceCursor,
+      dedupeKey: `${request.runId}:${request.evidenceCursor}:push_and_pr`,
+      action: request.action,
+      requestedAt: "2026-01-01T00:00:00.000Z",
+      expiresAt: null,
+      resolvedAt: "2026-01-01T00:00:01.000Z",
+      resolvedBy: "operator",
+      decision: "approve",
+      staleReason: null,
+    });
   }
 }

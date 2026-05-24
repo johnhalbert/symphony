@@ -46,6 +46,7 @@ const completionReportSchema = z.object({
 
 export type CompletionReportInput = z.infer<typeof completionReportSchema>;
 export type CompletionReportSubmitterRole = "worker" | "orchestrator" | "reviewer" | string;
+type ExistingIssueLifecycle = Awaited<ReturnType<IssueLifecycleStore["get"]>>;
 
 export interface CompletionReportActiveContext {
   issue: Issue;
@@ -111,33 +112,39 @@ export class CompletionReportService {
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
     const existing = existingLifecycle?.completionReports.find((item) => item.idempotencyKey === report.idempotencyKey);
-    if (existing) {
+    if (existing && isFinalizedCompletionReport(existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
     }
 
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
     this.validateIssueIsAcceptingReports(context, lifecyclePhase);
-    const publication = await this.publishPullRequestIfNeeded(report, context, existingLifecycle);
+    const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
+    let lifecycle = existingLifecycle;
+
+    if (this.shouldPersistBeforePublicationApproval()) {
+      const pendingReport = buildCompletionReportRecord({
+        report,
+        issue: context.issue,
+        pullRequest: inputPullRequest,
+        acceptedAt: existing?.acceptedAt ?? null,
+        writebackOperationKeys: [],
+      });
+      lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
+        phase: lifecyclePhase,
+        lastCompletionReportId: pendingReport.id,
+        completionReports: upsertCompletionReport(existingLifecycle?.completionReports ?? [], pendingReport),
+        summaryPointers: summaryPointersFor(context, inputPullRequest, null, existingLifecycle),
+      });
+    }
+
+    const publication = await this.publishPullRequestIfNeeded(report, context, lifecycle);
     const pullRequest = publication
       ? pullRequestRefFromPublication(publication)
-      : normalizeInputPullRequest(report.pullRequest, report.branchName);
+      : inputPullRequest;
 
-    const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
+    lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
       phase: lifecyclePhase,
-      summaryPointers: {
-        workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
-        branchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
-        gitBranchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
-        repoPath: context.workspace?.repoPath ?? null,
-        baseRef: context.workspace?.baseRef ?? null,
-        lastRunId: context.activeRunId,
-        prUrl: pullRequest?.url ?? null,
-        prNumber: pullRequest?.number ?? null,
-        prHeadSha: pullRequest?.headSha ?? null,
-        prBranch: pullRequest?.branch ?? null,
-        lastPushedAt: publication?.lastPushedAt ?? existingLifecycle?.summaryPointers.lastPushedAt ?? null,
-        lastEvidenceCursor: publication?.evidenceCursor ?? existingLifecycle?.summaryPointers.lastEvidenceCursor ?? null,
-      },
+      summaryPointers: summaryPointersFor(context, pullRequest, publication, lifecycle),
     });
 
     const operations = planCompletionReportAcceptedWritebacks(
@@ -165,22 +172,13 @@ export class CompletionReportService {
       throw new SymphonyError("invalid_request", "Completion report cannot be accepted for the current issue state");
     }
 
-    const storedReport: IssueCompletionReportRecord = {
-      id: reportIdFor(context.issue.id, report.idempotencyKey),
-      idempotencyKey: report.idempotencyKey,
-      runId: report.runId,
-      issueId: context.issue.id,
-      issueIdentifier: context.issue.identifier,
-      summary: report.summary,
-      validationEvidence: report.validationEvidence,
-      acceptanceChecklist: normalizeChecklist(report.acceptanceChecklist),
-      changedFiles: report.changedFiles,
-      branchName: report.branchName,
+    const storedReport = buildCompletionReportRecord({
+      report,
+      issue: context.issue,
       pullRequest,
-      risks: report.risks,
-      acceptedAt: new Date().toISOString(),
       writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
-    };
+      acceptedAt: existing?.acceptedAt ?? null,
+    });
     const enqueued: WritebackOperation[] = [];
     for (const operation of operations) {
       enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
@@ -191,21 +189,8 @@ export class CompletionReportService {
       phase: "review",
       incompleteTurnCount: 0,
       lastCompletionReportId: storedReport.id,
-      completionReports: [...lifecycle.completionReports, storedReport],
-      summaryPointers: {
-        workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
-        branchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
-        gitBranchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
-        repoPath: context.workspace?.repoPath ?? null,
-        baseRef: context.workspace?.baseRef ?? null,
-        lastRunId: context.activeRunId,
-        prUrl: pullRequest?.url ?? null,
-        prNumber: pullRequest?.number ?? null,
-        prHeadSha: pullRequest?.headSha ?? null,
-        prBranch: pullRequest?.branch ?? null,
-        lastPushedAt: publication?.lastPushedAt ?? existingLifecycle?.summaryPointers.lastPushedAt ?? null,
-        lastEvidenceCursor: publication?.evidenceCursor ?? existingLifecycle?.summaryPointers.lastEvidenceCursor ?? null,
-      },
+      completionReports: upsertCompletionReport(lifecycle.completionReports, storedReport),
+      summaryPointers: summaryPointersFor(context, pullRequest, publication, lifecycle),
     });
     await appendLaneMemoTelemetry(this.options.runStore, context.activeRunId, updatedLifecycle, "completion_report");
 
@@ -239,7 +224,7 @@ export class CompletionReportService {
   private async publishPullRequestIfNeeded(
     report: CompletionReportInput,
     context: CompletionReportActiveContext,
-    existingLifecycle: Awaited<ReturnType<IssueLifecycleStore["get"]>>,
+    existingLifecycle: ExistingIssueLifecycle,
   ): Promise<CompletionReportPullRequestPublication | null> {
     if (!this.options.config.github.publishPullRequests) return null;
     if (!this.options.pullRequestPublisher) {
@@ -290,6 +275,13 @@ export class CompletionReportService {
     return this.options.pullRequestPublisher.publishPullRequest(publicationInput);
   }
 
+  private shouldPersistBeforePublicationApproval(): boolean {
+    return (
+      this.options.config.github.publishPullRequests &&
+      (this.options.config.github.operatorApproval?.requiredForPublication ?? false)
+    );
+  }
+
   private async recordPullRequestMetadata(
     context: CompletionReportActiveContext,
     publication: CompletionReportPullRequestPublication | null,
@@ -331,6 +323,64 @@ function parseCompletionReport(input: unknown): CompletionReportInput {
 
 function reportIdFor(issueId: string, idempotencyKey: string): string {
   return `completion-report:${issueId}:${idempotencyKey}`;
+}
+
+function isFinalizedCompletionReport(report: IssueCompletionReportRecord): boolean {
+  return report.writebackOperationKeys.length > 0;
+}
+
+function buildCompletionReportRecord(input: {
+  report: CompletionReportInput;
+  issue: Issue;
+  pullRequest: CompletionReportPullRequestRef | null;
+  acceptedAt: string | null;
+  writebackOperationKeys: string[];
+}): IssueCompletionReportRecord {
+  return {
+    id: reportIdFor(input.issue.id, input.report.idempotencyKey),
+    idempotencyKey: input.report.idempotencyKey,
+    runId: input.report.runId,
+    issueId: input.issue.id,
+    issueIdentifier: input.issue.identifier,
+    summary: input.report.summary,
+    validationEvidence: input.report.validationEvidence,
+    acceptanceChecklist: normalizeChecklist(input.report.acceptanceChecklist),
+    changedFiles: input.report.changedFiles,
+    branchName: input.report.branchName,
+    pullRequest: input.pullRequest,
+    risks: input.report.risks,
+    acceptedAt: input.acceptedAt ?? new Date().toISOString(),
+    writebackOperationKeys: input.writebackOperationKeys,
+  };
+}
+
+function upsertCompletionReport(
+  reports: IssueCompletionReportRecord[],
+  report: IssueCompletionReportRecord,
+): IssueCompletionReportRecord[] {
+  return [...reports.filter((item) => item.idempotencyKey !== report.idempotencyKey), report];
+}
+
+function summaryPointersFor(
+  context: CompletionReportActiveContext,
+  pullRequest: CompletionReportPullRequestRef | null,
+  publication: CompletionReportPullRequestPublication | null,
+  existingLifecycle: ExistingIssueLifecycle,
+) {
+  return {
+    workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
+    branchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
+    gitBranchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? null,
+    repoPath: context.workspace?.repoPath ?? null,
+    baseRef: context.workspace?.baseRef ?? null,
+    lastRunId: context.activeRunId,
+    prUrl: pullRequest?.url ?? null,
+    prNumber: pullRequest?.number ?? null,
+    prHeadSha: pullRequest?.headSha ?? null,
+    prBranch: pullRequest?.branch ?? null,
+    lastPushedAt: publication?.lastPushedAt ?? existingLifecycle?.summaryPointers.lastPushedAt ?? null,
+    lastEvidenceCursor: publication?.evidenceCursor ?? existingLifecycle?.summaryPointers.lastEvidenceCursor ?? null,
+  };
 }
 
 function normalizeChecklist(items: CompletionReportInput["acceptanceChecklist"]): CompletionReportChecklistItem[] {
