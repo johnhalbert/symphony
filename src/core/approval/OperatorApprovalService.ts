@@ -247,6 +247,13 @@ export class OperatorApprovalService {
     const existing = await this.options.store.get(requestId);
     if (!existing) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
     if (existing.status === "pending") {
+      if (existing.expiresAt !== null && Date.parse(existing.expiresAt) <= Date.now()) {
+        const expired = await this.options.store.markExpired(requestId);
+        await this.clearPendingRun(expired);
+        await this.appendApprovalResolvedEvent(expired);
+        throw new SymphonyError("conflict", "Approval request is expired", expired);
+      }
+
       const staleReason = await this.staleReason(existing);
       if (staleReason !== null) {
         const stale = await this.options.store.markStale(requestId, staleReason);

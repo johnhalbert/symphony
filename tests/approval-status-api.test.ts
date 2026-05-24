@@ -137,7 +137,41 @@ describe("approval status API", () => {
     }
   });
 
-  async function createPending(evidenceCursor: string) {
+  it("expires pending requests before status API rejection can resolve them", async () => {
+    const pending = await createPending("idem-expired", -1);
+    const cancelled: string[] = [];
+    const server = statusServer(cancelled);
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({ code: "conflict", message: "Approval request is expired" });
+      expect(cancelled).toEqual([]);
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({
+        status: "expired",
+        resolvedBy: "system",
+        decision: null,
+        staleReason: "approval request expired",
+      });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({ pendingApprovalRequestId: null });
+
+      const transcript = await runStore.readTranscript("run-1");
+      expect(transcript.events.at(-1)).toMatchObject({
+        eventType: "approval_resolved",
+        payload: { status: "expired", staleReason: "approval request expired" },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  async function createPending(evidenceCursor: string, timeoutMs: number | null = null) {
     const { record } = await store.requestOrGetPending(
       {
         issueId: "issue-1",
@@ -146,7 +180,7 @@ describe("approval status API", () => {
         evidenceCursor,
         action: action(evidenceCursor),
       },
-      null,
+      timeoutMs,
     );
     await runStore.updateRun("run-1", {
       metadata: { pendingApprovalRequestId: record.requestId, pendingApprovalRequestedAt: record.requestedAt },
