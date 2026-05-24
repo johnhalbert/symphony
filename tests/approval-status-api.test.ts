@@ -8,8 +8,10 @@ import {
   OPERATOR_REJECTED_PUBLICATION_ERROR,
   OperatorApprovalService,
   type OperatorApprovalAction,
+  type OperatorApprovalRecord,
 } from "../src/core/approval/OperatorApprovalService.js";
 import type { ServiceConfig } from "../src/core/config/Config.js";
+import { SymphonyError } from "../src/core/errors.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
@@ -54,7 +56,8 @@ describe("approval status API", () => {
 
   it("requires the mutation token and approves pending requests", async () => {
     const pending = await createPending("idem-1");
-    const server = statusServer();
+    const resumed: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed });
     const address = await server.start();
     try {
       const baseUrl = `http://${address.host}:${address.port}`;
@@ -81,6 +84,7 @@ describe("approval status API", () => {
       expect(approved.status).toBe(200);
       expect(approvedBody.request.status).toBe("approved");
       expect(issueBody.capabilities.pendingApproval.active).toBe(false);
+      expect(resumed).toHaveLength(1);
     } finally {
       await server.stop();
     }
@@ -241,7 +245,8 @@ describe("approval status API", () => {
     config.github.operatorApproval!.rejectPolicy = rejectPolicy;
     const pending = await createPending(`idem-replay-${rejectPolicy}`);
     const cancelled: string[] = [];
-    const server = statusServer({ cancelled });
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ cancelled, terminalRecords });
     const address = await server.start();
     try {
       const url = `http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`;
@@ -279,15 +284,19 @@ describe("approval status API", () => {
       });
       expect(replayResolvedEvents).toBe(firstResolvedEvents);
       expect(cancelled).toHaveLength(rejectPolicy === "cancel" ? 1 : 0);
+      expect(terminalRecords.map((record) => record.status)).toEqual(["rejected", "rejected"]);
     } finally {
       await server.stop();
     }
   });
 
-  it("expires pending requests before status API rejection can resolve them", async () => {
+  it("records terminal recovery when pending requests expire during status API resolution after worker exit", async () => {
     const pending = await createPending("idem-expired", -1);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
     const cancelled: string[] = [];
-    const server = statusServer({ cancelled });
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ cancelled, resumed, terminalRecords });
     const address = await server.start();
     try {
       const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
@@ -300,6 +309,13 @@ describe("approval status API", () => {
       expect(response.status).toBe(409);
       expect(body.error).toMatchObject({ code: "conflict", message: "Approval request is expired" });
       expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toHaveLength(1);
+      expect(terminalRecords[0]).toMatchObject({
+        requestId: pending.requestId,
+        status: "expired",
+        staleReason: "approval request expired",
+      });
       await expect(store.get(pending.requestId)).resolves.toMatchObject({
         status: "expired",
         resolvedBy: "system",
@@ -313,6 +329,156 @@ describe("approval status API", () => {
         eventType: "approval_resolved",
         payload: { status: "expired", staleReason: "approval request expired" },
       });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("records terminal recovery when pending requests become stale during status API resolution after worker exit", async () => {
+    const pending = await createPending("idem-stale");
+    await runStore.updateRun("run-1", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:00.000Z",
+      metadata: {
+        cancellationRequestedAt: "2026-01-01T00:00:01.000Z",
+        cancellationSource: "operator",
+        cancellationReason: "operator cancelled publication after worker exit",
+      },
+    });
+    const cancelled: string[] = [];
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ cancelled, resumed, terminalRecords });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({
+        code: "conflict",
+        message: "Approval request is stale: run cancellation has been requested",
+      });
+      expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toHaveLength(1);
+      expect(terminalRecords[0]).toMatchObject({
+        requestId: pending.requestId,
+        status: "stale",
+        staleReason: "run cancellation has been requested",
+      });
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({
+        status: "stale",
+        resolvedBy: "system",
+        decision: null,
+        staleReason: "run cancellation has been requested",
+      });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({ pendingApprovalRequestId: null });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("recovers already-terminal approval conflicts by refetching the approval record", async () => {
+    const pending = await createPending("idem-terminal-before-post");
+    const expired = await store.markExpired(pending.requestId);
+    const cancelled: string[] = [];
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ cancelled, resumed, terminalRecords });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({ code: "conflict", message: "Approval request is expired" });
+      expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toHaveLength(1);
+      expect(terminalRecords[0]).toMatchObject({ requestId: expired.requestId, status: "expired" });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("preserves the original conflict response when terminal recovery writeback fails", async () => {
+    const pending = await createPending("idem-terminal-recorder-fails", -1);
+    const cancelled: string[] = [];
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({
+      cancelled,
+      resumed,
+      terminalRecords,
+      terminalError: new Error("writeback failed"),
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({ code: "conflict", message: "Approval request is expired" });
+      expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("preserves the original conflict response when fallback approval lookup fails", async () => {
+    const cancelled: string[] = [];
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({
+      cancelled,
+      resumed,
+      terminalRecords,
+      operatorApproval: {
+        rejectPolicy: "cancel",
+        isRequired: () => true,
+        async get() {
+          throw new Error("approval store read failed");
+        },
+        async resolve() {
+          throw new SymphonyError("conflict", "Approval request is stale");
+        },
+        async findPendingForIssue() {
+          return null;
+        },
+        async findPendingForRun() {
+          return null;
+        },
+      },
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/request-without-details`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({ code: "conflict", message: "Approval request is stale" });
+      expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toEqual([]);
     } finally {
       await server.stop();
     }
@@ -344,8 +510,19 @@ describe("approval status API", () => {
     throw new Error("pending approval was not created");
   }
 
-  function statusServer(options: { cancelled?: string[]; openWorkspaceToken?: string | null } = {}) {
+  function statusServer(
+    options: {
+      cancelled?: string[];
+      resumed?: OperatorApprovalRecord[];
+      terminalRecords?: OperatorApprovalRecord[];
+      terminalError?: Error;
+      openWorkspaceToken?: string | null;
+      operatorApproval?: ConstructorParameters<typeof StatusServer>[0]["operatorApproval"];
+    } = {},
+  ) {
     const cancelled = options.cancelled ?? [];
+    const resumed = options.resumed ?? [];
+    const terminalRecords = options.terminalRecords ?? [];
     return new StatusServer({
       orchestrator: fakeOrchestrator(cancelled, async () => {
         await runStore.updateRun("run-1", {
@@ -353,7 +530,7 @@ describe("approval status API", () => {
           completedAt: new Date().toISOString(),
           error: "Operator cancelled issue",
         });
-      }),
+      }, resumed, terminalRecords, options.terminalError),
       workspaceManager: new WorkspaceManager({
         workspace: config.workspace,
         hooks: config.hooks,
@@ -361,7 +538,7 @@ describe("approval status API", () => {
       }),
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
       runStore,
-      operatorApproval: service,
+      operatorApproval: options.operatorApproval ?? service,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: options.openWorkspaceToken === undefined ? "secret" : options.openWorkspaceToken,
@@ -391,7 +568,13 @@ function action(evidenceCursor: string): OperatorApprovalAction {
   };
 }
 
-function fakeOrchestrator(cancelled: string[], onCancel?: (issueId: string) => Promise<void>): Orchestrator {
+function fakeOrchestrator(
+  cancelled: string[],
+  onCancel?: (issueId: string) => Promise<void>,
+  resumed: OperatorApprovalRecord[] = [],
+  terminalRecords: OperatorApprovalRecord[] = [],
+  terminalError?: Error,
+): Orchestrator {
   return {
     snapshot() {
       return {
@@ -420,10 +603,13 @@ function fakeOrchestrator(cancelled: string[], onCancel?: (issueId: string) => P
       cancelled.push(issueId);
       await onCancel?.(issueId);
     },
-    async resumeApprovedPublication() {
+    async resumeApprovedPublication(request: OperatorApprovalRecord) {
+      resumed.push(request);
       return false;
     },
-    async recordPublicationApprovalTerminal() {
+    async recordPublicationApprovalTerminal(request: OperatorApprovalRecord) {
+      terminalRecords.push(request);
+      if (terminalError) throw terminalError;
       return false;
     },
     async createContinuationSummary() {

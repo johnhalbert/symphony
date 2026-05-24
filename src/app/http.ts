@@ -208,7 +208,13 @@ export class StatusServer {
         if (request.method === "POST") {
           this.requireApprovalMutationToken(request);
           const decision = parseApprovalDecision(await readJsonBody(request));
-          const result = await this.options.operatorApproval?.resolve(requestId, decision);
+          let result;
+          try {
+            result = await this.options.operatorApproval?.resolve(requestId, decision);
+          } catch (error) {
+            await this.recordPublicationApprovalTerminalConflict(requestId, error);
+            throw error;
+          }
           if (!result) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
           if (decision === "reject" && !result.replayed && this.options.operatorApproval?.rejectPolicy === "cancel") {
             await this.options.orchestrator.cancelIssue(result.request.issueId);
@@ -484,6 +490,18 @@ export class StatusServer {
     }
   }
 
+  private async recordPublicationApprovalTerminalConflict(requestId: string, error: unknown): Promise<void> {
+    if (!(error instanceof SymphonyError) || error.code !== "conflict") return;
+    try {
+      const approval =
+        approvalRecordFromDetails(error.details) ?? (await this.options.operatorApproval?.get(requestId)) ?? null;
+      if (!approval || !isPublicationApprovalTerminal(approval)) return;
+      await this.options.orchestrator.recordPublicationApprovalTerminal(approval);
+    } catch {
+      // Recovery must not mask the approval API's original conflict response.
+    }
+  }
+
   private requireMutationToken(request: IncomingMessage): void {
     const expected = this.options.openWorkspaceToken;
     if (!expected) return;
@@ -641,6 +659,25 @@ function approvalCapability(
 
 function approvalMutationsRequireToken(enabled: boolean, openWorkspaceToken: string | null): boolean {
   return enabled || Boolean(openWorkspaceToken?.trim());
+}
+
+function approvalRecordFromDetails(details: unknown): OperatorApprovalRecord | null {
+  if (typeof details !== "object" || details === null) return null;
+  const record = details as Partial<OperatorApprovalRecord>;
+  return typeof record.requestId === "string" && typeof record.status === "string"
+    ? (record as OperatorApprovalRecord)
+    : null;
+}
+
+function isPublicationApprovalTerminal(
+  record: OperatorApprovalRecord,
+): record is OperatorApprovalRecord & { status: "rejected" | "stale" | "expired" | "cancelled" } {
+  return (
+    record.status === "rejected" ||
+    record.status === "stale" ||
+    record.status === "expired" ||
+    record.status === "cancelled"
+  );
 }
 
 type RuntimeSnapshot = ReturnType<Orchestrator["snapshot"]>;
