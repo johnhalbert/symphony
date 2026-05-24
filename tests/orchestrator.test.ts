@@ -8,6 +8,11 @@ import {
   type CompletionReportPullRequestPublicationInput,
   type CompletionReportPullRequestPublisher,
 } from "../src/core/CompletionReportService.js";
+import {
+  FileOperatorApprovalStore,
+  OPERATOR_REJECTED_PUBLICATION_ERROR,
+  OperatorApprovalService,
+} from "../src/core/approval/OperatorApprovalService.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
@@ -1045,6 +1050,90 @@ describe("Orchestrator", () => {
     expect(eventTypes).not.toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("preserves fail-policy approval rejection through abnormal worker exit", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 3;
+    config.writeback.dispatchState = "Todo";
+    config.tracker.handoffStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.requiredForPublication = true;
+    config.github.operatorApproval!.rejectPolicy = "fail";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const approvalStore = new FileOperatorApprovalStore(stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const harness = new ReportingHarness(lifecycleStore, outboxStore, runStore, publisher, { type: "completed" }, operatorApproval);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    const pending = await waitForPendingApproval(approvalStore, "report-run-1");
+    await operatorApproval.resolve(pending.requestId, "reject");
+    const rejectedRun = await waitForRunRecord(runStore, "report-run-1");
+    const rejectedAt = rejectedRun?.completedAt;
+
+    expect(rejectedRun).toMatchObject({
+      status: "failed",
+      completedAt: expect.any(String),
+      error: OPERATOR_REJECTED_PUBLICATION_ERROR,
+      pendingApprovalRequestId: null,
+    });
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "approval-rejected worker exit");
+
+    const finalRun = await waitForRunRecord(runStore, "report-run-1");
+    expect(finalRun).toMatchObject({
+      status: "failed",
+      completedAt: rejectedAt,
+      error: OPERATOR_REJECTED_PUBLICATION_ERROR,
+      pendingApprovalRequestId: null,
+    });
+    expect(finalRun?.cancellationRequestedAt ?? null).toBeNull();
+    expect(finalRun?.cancellationSource ?? null).toBeNull();
+    expect(finalRun?.cancellationOutcome ?? "none").toBe("none");
+    expect(publisher.inputs).toEqual([]);
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+    await orchestrator.stop();
   });
 
   it("smokes a manufactured fail, revision worker, and pass review loop", async () => {
@@ -2916,6 +3005,30 @@ async function waitFor(predicate: () => boolean, description = "condition", time
   expect(predicate(), `Timed out waiting for ${description}`).toBe(true);
 }
 
+async function waitForPendingApproval(store: FileOperatorApprovalStore, runId: string, timeoutMs = 2_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const pending = await store.findPendingForRun(runId);
+    if (pending) return pending;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for pending approval on ${runId}`);
+}
+
+async function waitForRunRecord(store: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const run = await store.getRun(runId);
+      if (run) return run;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for run record ${runId}`);
+}
+
 async function settleOrchestratorExit(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 25));
 }
@@ -3112,6 +3225,7 @@ class ReportingHarness implements AgentHarness {
     private readonly runStore: FileRunTranscriptStore,
     private readonly publisher: CompletionReportPullRequestPublisher,
     private readonly terminalEvent: ReportingHarnessTerminal = { type: "completed" },
+    private readonly operatorApproval?: OperatorApprovalService,
   ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
@@ -3123,6 +3237,7 @@ class ReportingHarness implements AgentHarness {
       writebackOutbox: this.outboxStore,
       runStore: this.runStore,
       pullRequestPublisher: this.publisher,
+      ...(this.operatorApproval ? { operatorApproval: this.operatorApproval } : {}),
     }).submitCompletionReport(
       {
         runId: "report-run-1",

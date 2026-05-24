@@ -100,6 +100,10 @@ github:
   token: $GITHUB_TOKEN
   head_owner: johnhalbert
   publish_pull_requests: true
+  operator_approval:
+    required_for_publication: true
+    reject_policy: cancel
+    poll_interval_ms: 2000
 
 credential_profiles:
   profiles:
@@ -145,7 +149,8 @@ Transcript search is available through the bounded, read-only `search_transcript
 3. Follow repository style and keep changes focused on the issue.
 4. Run the smallest meaningful validation for the change, and run broader tests when touching shared orchestration, workflow, tracker, harness, or persistence code.
 5. Do not push directly to `main`, merge PRs, force-push protected branches, or remove dirty worktrees.
-6. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will handle the Linear handoff to `In Review`.
+6. When `github.publish_pull_requests` and `github.operator_approval.required_for_publication` are enabled, do not run `git push` or create/update GitHub pull requests yourself. Call `submit_completion_report` when ready; Symphony will create an `approval_request` transcript event and wait for operator approval before service-owned commit, push, and PR publication.
+7. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will handle the Linear handoff to `In Review`.
 
 ## Protected Areas
 

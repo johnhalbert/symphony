@@ -17,6 +17,7 @@ import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcp
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
 import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcpServer.js";
+import { FileOperatorApprovalStore, OperatorApprovalService } from "./core/approval/OperatorApprovalService.js";
 import {
   createRuntimeTrackerClient,
   createRuntimeWritebackProcessor,
@@ -121,6 +122,8 @@ program
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: operatorApprovalStore, runStore });
     const writeback = createRuntimeWritebackProcessor(config, logger);
     const workspaceManager = new WorkspaceManager({
       workspace: config.workspace,
@@ -164,6 +167,7 @@ program
             lifecycleStore,
             mcpExposureDiagnosticsStore,
             writebackOutbox,
+            operatorApproval,
             host: config.server.host,
             port: config.server.port,
             openWorkspaceToken: resolveStatusMutationToken(config),

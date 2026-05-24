@@ -55,6 +55,8 @@ export interface RunMetadata {
   cancelFailedReason?: string | null;
   cancelFailedSource?: PersistedCancelFailedSource | null;
   activitySnapshot?: RunActivitySnapshot;
+  pendingApprovalRequestId?: string | null;
+  pendingApprovalRequestedAt?: string | null;
 }
 
 export interface RunRecord {
@@ -103,6 +105,8 @@ export interface RunRecord {
   cancelFailedReason?: string | null;
   cancelFailedSource?: PersistedCancelFailedSource | null;
   activitySnapshot?: RunActivitySnapshot;
+  pendingApprovalRequestId?: string | null;
+  pendingApprovalRequestedAt?: string | null;
 }
 
 export interface TranscriptEvent {
@@ -439,6 +443,8 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.cancelFailedReason === undefined ? {} : { cancelFailedReason: metadata.cancelFailedReason }),
     ...(metadata.cancelFailedSource === undefined ? {} : { cancelFailedSource: metadata.cancelFailedSource }),
     ...(metadata.activitySnapshot === undefined ? {} : { activitySnapshot: metadata.activitySnapshot }),
+    ...(metadata.pendingApprovalRequestId === undefined ? {} : { pendingApprovalRequestId: metadata.pendingApprovalRequestId }),
+    ...(metadata.pendingApprovalRequestedAt === undefined ? {} : { pendingApprovalRequestedAt: metadata.pendingApprovalRequestedAt }),
   };
 }
 

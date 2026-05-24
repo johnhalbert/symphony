@@ -22,6 +22,7 @@ import {
   type RunRecord,
   type RunTranscriptStore,
   type TranscriptEvent,
+  type UpdateRunInput,
 } from "../persistence/RunTranscriptStore.js";
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
@@ -55,6 +56,7 @@ import {
   planRunSucceededWritebacks,
 } from "../writeback/TransitionPolicy.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
+import { OPERATOR_REJECTED_PUBLICATION_ERROR } from "../approval/OperatorApprovalService.js";
 
 export interface OrchestratorOptions {
   config: ServiceConfig;
@@ -139,6 +141,9 @@ export interface RetryEntry {
   timer: NodeJS.Timeout;
   error: string | null;
 }
+
+type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
+type TerminalUpdateResult = { updated: true; record: RunRecord | null } | { updated: false; record: RunRecord | null };
 
 export interface RuntimeSnapshot {
   generatedAt: string;
@@ -518,7 +523,7 @@ export class Orchestrator {
   }
 
   private async reconcileRunningIssues(): Promise<void> {
-    this.reconcileStalledRuns();
+    await this.reconcileStalledRuns();
     const runningIds = [...this.running.keys()];
     if (runningIds.length === 0) return;
     let refreshed: Issue[];
@@ -550,11 +555,17 @@ export class Orchestrator {
     }
   }
 
-  private reconcileStalledRuns(): void {
+  private async reconcileStalledRuns(): Promise<void> {
     const stallTimeout = this.stallTimeoutMs();
     if (stallTimeout === null) return;
     const now = Date.now();
     for (const [issueId, entry] of this.running) {
+      if (await this.isAwaitingOperatorApproval(entry)) {
+        entry.lastEvent = "approval_request";
+        entry.lastMessage = "Awaiting operator approval for push/PR";
+        entry.lastEventAt = new Date(now);
+        continue;
+      }
       const lastActivity = entry.lastEventAt?.getTime() ?? entry.startedAt.getTime();
       if (now - lastActivity > stallTimeout) {
         entry.suppressRetryOnExit = true;
@@ -570,6 +581,13 @@ export class Orchestrator {
         });
       }
     }
+  }
+
+  private async isAwaitingOperatorApproval(entry: RunningEntry): Promise<boolean> {
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!runId || !this.options.runStore) return false;
+    const run = await this.options.runStore.getRun(runId);
+    return Boolean(run?.pendingApprovalRequestId);
   }
 
   private async terminateRunningIssue(issueId: string, cleanupWorkspace: boolean, reason: string): Promise<void> {
@@ -993,12 +1011,13 @@ export class Orchestrator {
       if (event.type === "rate_limits") this.rateLimits = event.payload;
       await this.persistHarnessEvent(entry, event);
       if (event.type === "completed") {
-        await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
+        const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
           status: "succeeded",
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
+        if (!terminal.updated) return;
         await this.discoverPullRequestForEntry(entry, context.workspace);
         if (entry.role === "worker" && !(await this.reconcileCompletionReportHandoff(entry))) {
           await this.recordIncompleteTurn(entry);
@@ -1009,42 +1028,54 @@ export class Orchestrator {
       }
       if (event.type === "failed") {
         if (entry.role === "worker" && (await this.reconcileCompletionReportHandoff(entry))) {
-          await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
+          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "succeeded"),
           });
+          if (!terminal.updated) return;
           return;
         }
-        await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
+        const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
           status: "failed",
           completedAt: new Date().toISOString(),
           error: event.error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
         });
+        if (!terminal.updated) return;
         throw new SymphonyError("agent_error", event.error);
       }
       if (event.type === "cancelled") {
         if (entry.role === "worker" && (await this.reconcileCompletionReportHandoff(entry))) {
-          await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
+          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "succeeded"),
           });
+          if (!terminal.updated) return;
           return;
         }
-        await this.options.runStore?.updateRun(entry.activeRunId ?? entry.runId ?? "", {
+        const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
           status: "cancelled",
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
         });
+        if (!terminal.updated) return;
         throw new SymphonyError("agent_error", "Run was cancelled");
       }
     }
+  }
+
+  private async updateRunTerminalStateIfRunning(runId: string, patch: TerminalRunPatch): Promise<TerminalUpdateResult> {
+    const runStore = this.options.runStore;
+    if (!runStore) return { updated: true, record: null };
+    const existing = await runStore.getRun(runId);
+    if (existing && existing.status !== "running") return { updated: false, record: existing };
+    return { updated: true, record: await runStore.updateRun(runId, patch) };
   }
 
   private async onWorkerExit(issueId: string, kind: "normal" | "abnormal", error: string | null): Promise<void> {
@@ -1055,12 +1086,16 @@ export class Orchestrator {
 
     if (entry.role === "worker" && (await this.reconcileCompletionReportHandoff(entry))) {
       if (entry.runId) {
-        await this.options.runStore?.updateRun(entry.runId, {
+        const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
           status: "succeeded",
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
+        if (!terminal.updated) {
+          this.claimed.delete(issueId);
+          return;
+        }
       }
       this.completed.add(issueId);
       this.claimed.delete(issueId);
@@ -1069,12 +1104,16 @@ export class Orchestrator {
 
     if (kind === "normal") {
       if (entry.runId) {
-        await this.options.runStore?.updateRun(entry.runId, {
+        const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
           status: "succeeded",
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
+        if (!terminal.updated) {
+          this.claimed.delete(issueId);
+          return;
+        }
       }
       this.completed.add(issueId);
       if (entry.role === "reviewer") {
@@ -1110,24 +1149,32 @@ export class Orchestrator {
       }
     } else if (entry.role === "reviewer") {
       if (entry.runId) {
-        await this.options.runStore?.updateRun(entry.runId, {
+        const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
           status: entry.suppressRetryOnExit ? "cancelled" : "failed",
           completedAt: new Date().toISOString(),
           error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
         });
+        if (!terminal.updated) {
+          this.claimed.delete(issueId);
+          return;
+        }
       }
       this.claimed.delete(issueId);
     } else if (entry.suppressRetryOnExit) {
       if (entry.runId) {
-        await this.options.runStore?.updateRun(entry.runId, {
+        const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
           status: "cancelled",
           completedAt: new Date().toISOString(),
           error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
         });
+        if (!terminal.updated) {
+          this.claimed.delete(issueId);
+          if (terminal.record?.status === "failed" && terminal.record.error === OPERATOR_REJECTED_PUBLICATION_ERROR) return;
+        }
       }
       await this.applyWriteback(
         planRunCancelledComment(
@@ -1146,13 +1193,21 @@ export class Orchestrator {
       this.claimed.delete(issueId);
     } else {
       if (entry.runId) {
-        await this.options.runStore?.updateRun(entry.runId, {
+        const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
           status: "failed",
           completedAt: new Date().toISOString(),
           error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
         });
+        if (error === OPERATOR_REJECTED_PUBLICATION_ERROR) {
+          this.claimed.delete(issueId);
+          return;
+        }
+        if (!terminal.updated) {
+          this.claimed.delete(issueId);
+          if (terminal.record?.status === "failed" && terminal.record.error === OPERATOR_REJECTED_PUBLICATION_ERROR) return;
+        }
       }
       await this.applyWriteback(
         planRunFailedComment(

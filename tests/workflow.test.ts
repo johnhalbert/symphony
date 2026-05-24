@@ -50,6 +50,12 @@ Work on {{ issue.identifier }}.`,
       headOwner: null,
       apiBaseUrl: "https://api.github.com",
       publishPullRequests: false,
+      operatorApproval: {
+        requiredForPublication: false,
+        rejectPolicy: "cancel",
+        pollIntervalMs: 2000,
+        timeoutMs: null,
+      },
     });
     expect(config.continuationContext).toEqual({
       searchEnabled: false,
@@ -430,6 +436,12 @@ Work on {{ issue.identifier }}.`,
       headOwner: "fork-owner",
       apiBaseUrl: "https://github.example/api/v3",
       publishPullRequests: false,
+      operatorApproval: {
+        requiredForPublication: false,
+        rejectPolicy: "cancel",
+        pollIntervalMs: 2000,
+        timeoutMs: null,
+      },
     });
   });
 
