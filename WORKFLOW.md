@@ -107,7 +107,7 @@ github:
     required_checks:
       - Typecheck and test
   operator_approval:
-    required_for_publication: true
+    required_for_publication: false
     reject_policy: cancel
     poll_interval_ms: 2000
 
