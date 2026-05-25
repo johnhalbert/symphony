@@ -65,7 +65,7 @@ export class PullRequestReviewEvidenceService {
     if (!pullRequest?.number) return null;
 
     const remote = await this.options.client.listPullRequestReviewEvidence({ pullRequestNumber: pullRequest.number });
-    const existing = lifecycle.reviewEvidence.items;
+    const existing = lifecycle.reviewEvidence.items.filter(isActionableReviewEvidenceItem);
     const ingested = remote
       .map((item) => normalizeRemoteEvidence(item, pullRequest))
       .filter((item): item is PullRequestReviewEvidenceItem => item !== null);
@@ -143,8 +143,23 @@ export function selectEvidenceForWorker(
   return active.filter((item) => compareCursor(item.cursor, cursor) > 0 || item.isResolved === false).slice(-fullHistoryThreshold);
 }
 
+export function isActionableReviewEvidenceItem(
+  item: Pick<PullRequestReviewEvidenceItem, "source" | "body">,
+): boolean {
+  const body = item.body.trim();
+  if (body.length === 0) return false;
+  if (item.source === "issue_comment" && isLinearLinkbackComment(body)) return false;
+  return true;
+}
+
+export function isActiveReviewEvidenceItem(
+  item: Pick<PullRequestReviewEvidenceItem, "source" | "body" | "isResolved" | "isOutdated">,
+): boolean {
+  return isActionableReviewEvidenceItem(item) && item.isResolved !== true && item.isOutdated !== true;
+}
+
 function activeReviewEvidence(state: PullRequestReviewEvidenceState): PullRequestReviewEvidenceItem[] {
-  return state.items.filter((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true);
+  return state.items.filter(isActiveReviewEvidenceItem);
 }
 
 export function formatWorkerReviewEvidencePrompt(context: WorkerReviewEvidencePromptContext): string {
@@ -166,7 +181,7 @@ export function formatWorkerReviewEvidencePrompt(context: WorkerReviewEvidencePr
 }
 
 export function summarizeReviewEvidenceForLinear(evidence: PullRequestReviewEvidenceItem[]): string[] {
-  const active = evidence.filter((item) => item.isResolved !== true && item.isOutdated !== true);
+  const active = evidence.filter(isActiveReviewEvidenceItem);
   if (active.length === 0) return ["No active PR review evidence was found."];
   return active.map((item) => {
     const location = evidenceLocation(item);
@@ -181,6 +196,7 @@ function normalizeRemoteEvidence(
 ): PullRequestReviewEvidenceItem | null {
   const body = item.body.trim();
   if (body.length === 0) return null;
+  if (!isActionableReviewEvidenceItem({ source: item.source, body })) return null;
   return {
     id: `${item.source}:${item.pullRequestNumber}:${item.githubId}`,
     source: item.source,
@@ -287,4 +303,8 @@ function evidenceLocation(item: PullRequestReviewEvidenceItem): string {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function isLinearLinkbackComment(body: string): boolean {
+  return body.includes("<!-- linear-linkback -->") || body.includes("<!-- linear-review-link -->");
 }

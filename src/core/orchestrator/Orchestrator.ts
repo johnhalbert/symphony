@@ -51,6 +51,7 @@ import {
 import { MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
 import {
   formatWorkerReviewEvidencePrompt,
+  isActiveReviewEvidenceItem,
   PullRequestReviewEvidenceService,
   type PullRequestReviewEvidenceClient,
 } from "../review/PullRequestReviewEvidenceService.js";
@@ -1986,9 +1987,7 @@ export class Orchestrator {
     const packet = buildWorkerHandoffPacket(lifecycle);
     const transcriptPointers = transcriptPointersForRuns(runs);
     const statusPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
-    const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(
-      (item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true,
-    );
+    const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(isActiveReviewEvidenceItem);
     return [
       "",
       "Compact Symphony handoff packet:",
@@ -2256,7 +2255,7 @@ function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[
     lifecycle.reviewRound > 0 ||
     lifecycle.incompleteTurnCount > 0 ||
     lifecycle.summaryReferences.length > 0 ||
-    lifecycle.reviewEvidence.items.some((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true) ||
+    lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem) ||
     lifecycle.merge !== null ||
     lifecycle.phase !== "implementation"
   );
@@ -2265,7 +2264,7 @@ function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[
 function nextWorkerAction(lifecycle: IssueLifecycleRecord): string {
   if (lifecycle.handoff.lastReviewerOutput?.verdict === "fail") return "Address the latest reviewer findings, validate, and submit a new completion report.";
   if (lifecycle.incompleteTurnCount > 0) return "Continue the incomplete implementation using the memo and pointers before rediscovering context.";
-  if (lifecycle.reviewEvidence.items.some((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true)) {
+  if (lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem)) {
     return "Address active unresolved PR review evidence before submitting another completion report.";
   }
   return "Continue implementation using the compact memo and stable pointers.";

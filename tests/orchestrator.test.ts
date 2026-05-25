@@ -3278,6 +3278,27 @@ describe("Orchestrator", () => {
         updatedAt: "2026-01-01T00:00:02Z",
         submittedAt: null,
       },
+      {
+        source: "issue_comment",
+        githubId: "linear-linkback",
+        pullRequestNumber: 42,
+        pullRequestUrl: null,
+        url: "https://github.com/acme/symphony/pull/42#issuecomment-1",
+        reviewer: "linear-code[bot]",
+        body: linearLinkbackComment(),
+        state: null,
+        path: null,
+        line: null,
+        originalLine: null,
+        side: null,
+        threadId: null,
+        inReplyToId: null,
+        isResolved: null,
+        isOutdated: null,
+        createdAt: "2026-01-01T00:00:03Z",
+        updatedAt: "2026-01-01T00:00:03Z",
+        submittedAt: null,
+      },
     ]);
     const harness = new FakeHarness();
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
@@ -3311,6 +3332,8 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("thread: thread-1");
     expect(harness.runs[0]?.prompt).toContain("Add coverage for the dedupe path.");
     expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42");
+    expect(harness.runs[0]?.prompt).not.toContain("linear-linkback");
+    expect(harness.runs[0]?.prompt).not.toContain("Linear linkback");
   });
 
   it("lazy-resolves reviewer GitHub review-evidence credentials for worker feedback prompts", async () => {
@@ -4206,6 +4229,16 @@ function reviewVerdictRecord(candidate = issue()): IssueReviewVerdictRecord {
     submittedAt: "2026-01-01T00:00:02Z",
     writebackOperationKeys: [],
   };
+}
+
+function linearLinkbackComment(): string {
+  return [
+    "<!-- linear-linkback -->",
+    "<details>",
+    "<summary>Linear linkback</summary>",
+    "</details>",
+    "<!-- linear-review-link -->",
+  ].join("\n");
 }
 
 async function startApprovalRun(
