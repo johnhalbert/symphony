@@ -259,6 +259,8 @@ export interface IssueRunMetadata {
   baseRef: string | null;
 }
 
+const PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER = "[[SYMPHONY_PROJECT_REVIEWER_PROMPT_EXTENSIONS]]";
+
 const DEFAULT_REVIEWER_PROMPT_TEMPLATE = `
 You are a reviewer agent for {{ issue.identifier }}.
 
@@ -272,7 +274,7 @@ ${DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE}
 
 ${formatGeneralScenarioMatrix()}
 
-{{ projectReviewerPromptExtensions }}
+${PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER}
 
 Tool payload guidance:
 - acceptanceResults: one entry per acceptance criterion with satisfied true/false and concrete evidence.
@@ -1077,18 +1079,20 @@ export class Orchestrator {
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
 
       entry.turnCount = 1;
-      const prompt = await this.promptRenderer.render(this.reviewerPromptTemplate(), {
-        issue: entry.issue,
-        attempt: null,
-        role: "reviewer",
-        completionReport: evidence.completionReport,
-        acceptanceCriteria: acceptanceCriteriaForReport(evidence.completionReport),
-        workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
-        validationEvidence: evidence.completionReport.validationEvidence,
-        runDigest: evidence.runDigest,
-        reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
-        workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
-      });
+      const prompt = this.formatRenderedReviewerPrompt(
+        await this.promptRenderer.render(this.reviewerPromptTemplate(), {
+          issue: entry.issue,
+          attempt: null,
+          role: "reviewer",
+          completionReport: evidence.completionReport,
+          acceptanceCriteria: acceptanceCriteriaForReport(evidence.completionReport),
+          workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
+          validationEvidence: evidence.completionReport.validationEvidence,
+          runDigest: evidence.runDigest,
+          reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
+          workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+        }),
+      );
       await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
         workspace,
         prompt,
@@ -1821,10 +1825,19 @@ export class Orchestrator {
   private reviewerPromptTemplate(): string {
     const configured = this.config.reviewLoop.reviewerPromptTemplate;
     if (configured !== null && configured.trim().length > 0) return configured;
-    return DEFAULT_REVIEWER_PROMPT_TEMPLATE.replace(
-      "{{ projectReviewerPromptExtensions }}",
-      formatPromptExtensions("Project-specific reviewer extensions:", this.config.reviewLoop.reviewerPromptExtensions) ?? "",
-    );
+    return DEFAULT_REVIEWER_PROMPT_TEMPLATE;
+  }
+
+  private formatRenderedReviewerPrompt(prompt: string): string {
+    const configured = this.config.reviewLoop.reviewerPromptTemplate;
+    if (configured !== null && configured.trim().length > 0) return prompt;
+    return prompt
+      .replace(
+        PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER,
+        formatPromptExtensions("Project-specific reviewer extensions:", this.config.reviewLoop.reviewerPromptExtensions) ??
+          "",
+      )
+      .trim();
   }
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {

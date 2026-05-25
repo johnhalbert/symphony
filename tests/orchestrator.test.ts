@@ -2613,7 +2613,10 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.tracker.handoffStates = ["In Review"];
     config.reviewLoop.reviewStates = ["In Review"];
-    config.reviewLoop.reviewerPromptExtensions = ["Check project-specific billing boundaries."];
+    config.reviewLoop.reviewerPromptExtensions = [
+      "Check project-specific billing boundaries.",
+      "Keep {{ issue.identifier }} literal and {{ missing.value }} literal.",
+    ];
     const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -2672,6 +2675,8 @@ describe("Orchestrator", () => {
     expect(prompt).toContain("Persistence/durability");
     expect(prompt).toContain("Project-specific reviewer extensions:");
     expect(prompt).toContain("Check project-specific billing boundaries.");
+    expect(prompt).toContain("Keep {{ issue.identifier }} literal and {{ missing.value }} literal.");
+    expect(prompt).not.toContain("Keep TEST-1 literal");
     expect(prompt.indexOf("General software review matrix:")).toBeLessThan(
       prompt.indexOf("Project-specific reviewer extensions:"),
     );
