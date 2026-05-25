@@ -125,6 +125,7 @@ const rawConfigSchema = z
         max_concurrent_agents: z.number().int().positive().optional(),
         max_turns: z.number().int().positive().optional(),
         max_retry_backoff_ms: z.number().int().positive().optional(),
+        max_sdk_error_retries: z.number().int().nonnegative().optional(),
         max_concurrent_agents_by_state: z.record(z.string(), z.number()).optional(),
         require_labels: stringArray.optional(),
         exclude_labels: stringArray.optional(),
@@ -243,6 +244,7 @@ export interface AgentConfig {
   maxConcurrentAgents: number;
   maxTurns: number;
   maxRetryBackoffMs: number;
+  maxSdkErrorRetries: number;
   maxConcurrentAgentsByState: Map<string, number>;
   requireLabels: string[];
   excludeLabels: string[];
@@ -553,6 +555,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       maxConcurrentAgents: raw.agent?.max_concurrent_agents ?? 10,
       maxTurns: agentMaxTurns,
       maxRetryBackoffMs: raw.agent?.max_retry_backoff_ms ?? 300_000,
+      maxSdkErrorRetries: raw.agent?.max_sdk_error_retries ?? 2,
       maxConcurrentAgentsByState: normalizeStateLimitMap(raw.agent?.max_concurrent_agents_by_state),
       requireLabels: normalizeLabels(raw.agent?.require_labels),
       excludeLabels: normalizeLabels(raw.agent?.exclude_labels),

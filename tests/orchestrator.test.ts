@@ -495,6 +495,74 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("blocks after consecutive worker SDK wait errors reach the retry cap", async () => {
+    const config = testConfig(root);
+    config.agent.maxSdkErrorRetries = 2;
+    config.agent.maxRetryBackoffMs = 0;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 0);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const harness = new SdkWaitErrorHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => currentState === "Blocked" && orchestrator.snapshot().counts.retrying === 0, "sdk error escalation");
+    } finally {
+      await orchestrator.stop();
+    }
+
+    expect(harness.runs).toEqual(["sdk-error-run-1", "sdk-error-run-2", "sdk-error-run-3"]);
+    const runs = await runStore.listRunsForIssue(candidate.id);
+    expect(runs.map((run) => [run.runId, run.status, run.sdkRunStatus, run.sdkRunStatusSource])).toEqual([
+      ["sdk-error-run-1", "failed", "error", "wait"],
+      ["sdk-error-run-2", "failed", "error", "wait"],
+      ["sdk-error-run-3", "failed", "error", "wait"],
+    ]);
+    expect(runs[2]).toMatchObject({
+      failureKind: "cursor_sdk_terminal_error",
+      failureDiagnosticCode: "cursor_run_wait_terminal_error",
+    });
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Blocked"]);
+    expect(writer.comments.at(-1)?.body).toContain("consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)");
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
+    });
+  });
+
   it.each([
     ["setup-incomplete", PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON],
     ["awaiting operator", PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON],
@@ -4727,6 +4795,25 @@ class TokenSequenceHarness implements AgentHarness {
     const tokens = this.tokenEvents[runNumber - 1];
     if (tokens) yield { type: "tokens", tokens };
     yield { type: "completed" };
+  }
+}
+
+class SdkWaitErrorHarness implements AgentHarness {
+  readonly id = "sdk-wait-error";
+  readonly runs: string[] = [];
+
+  async *run(_ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+    const runId = `sdk-error-run-${this.runs.length + 1}`;
+    this.runs.push(runId);
+    yield { type: "session_started", sessionId: `session-${runId}`, runId };
+    yield { type: "run_status", runId, sdkStatus: "error", source: "wait" };
+    yield {
+      type: "run_diagnostic",
+      code: "cursor_run_wait_terminal_error",
+      message: "Cursor run wait returned terminal SDK error",
+      payload: { runId },
+    };
+    yield { type: "failed", error: "Cursor run failed" };
   }
 }
 

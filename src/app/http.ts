@@ -750,11 +750,17 @@ function isPublicationApprovalTerminal(
 
 type RuntimeSnapshot = ReturnType<Orchestrator["snapshot"]>;
 type RunningRow = RuntimeSnapshot["running"][number];
-type OperatorLivenessStatus = "running" | "possibly_stalled" | "cancelling" | "cancelled" | "blocked_human_required";
+type OperatorLivenessStatus =
+  | "running"
+  | "possibly_stalled"
+  | "cancelling"
+  | "cancelled"
+  | "blocked_human_required"
+  | "not_live";
 
 const OPERATOR_LIVENESS_CONTRACT = {
-  version: "sdk-run-lifecycle-v1",
-  supportedStatuses: ["running", "possibly_stalled", "cancelling", "cancelled", "blocked_human_required"],
+  version: "sdk-run-lifecycle-v2",
+  supportedStatuses: ["running", "possibly_stalled", "cancelling", "cancelled", "blocked_human_required", "not_live"],
   sdkRunLifecycle: {
     tracked: true,
     terminalSource: "run.wait",
@@ -1661,6 +1667,11 @@ async function renderDashboard(
               }</li>`,
           )
           .join("")}</ul></section>`;
+  const orphanedRows = await orphanedOperatorViews(snapshot, runStore);
+  const orphaned =
+    orphanedRows.length === 0
+      ? ""
+      : `<section><h2>Not Live Runs</h2><ul class="plain-list">${orphanedRows.map(renderOrphanedRunRow).join("")}</ul></section>`;
   return `<!doctype html>
 <html>
   <head>
@@ -1680,6 +1691,8 @@ async function renderDashboard(
       .operator-possibly_stalled .badge { background: #fff3e0; color: #e65100; }
       .operator-cancelling .badge { background: #fce4ec; color: #c62828; }
       .operator-blocked_human_required .badge { background: #f3e5f5; color: #6a1b9a; }
+      .operator-not_live { border-left-color: #607d8b; background: #f6f8f9; }
+      .operator-not_live .badge { background: #eceff1; color: #455a64; }
       .meta, .activity, .controls { color: #555; font-size: 0.9rem; }
       .cancellation, .blocked { margin-top: 0.25rem; font-size: 0.9rem; }
       .cancellation { color: #a31919; }
@@ -1697,6 +1710,7 @@ async function renderDashboard(
     </section>
     ${paused}
     ${retrying}
+    ${orphaned}
     <p class="meta">Snapshot generated at ${escapeHtml(snapshot.generatedAt)}</p>
   </body>
 </html>`;
@@ -1738,6 +1752,16 @@ function renderRunningRow(
     ${blockedReason ? `<div class="blocked">Blocked: ${escapeHtml(blockedReason)}</div>` : ""}
     <div class="controls">controls: ${formatControls(controls)}</div>
     ${formatAffordances(affordances)}
+  </li>`;
+}
+
+function renderOrphanedRunRow(row: Awaited<ReturnType<typeof orphanedOperatorViews>>[number]): string {
+  return `<li class="run-row operator-not_live">
+    <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">not_live</span> <span class="meta">${escapeHtml(row.role)}</span></div>
+    <div class="meta">run <code>${escapeHtml(row.runId)}</code> · agent <code>${escapeHtml(row.agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code></div>
+    <div class="activity">persisted running run is not present in the live orchestrator snapshot; SDK status <code>${escapeHtml(row.sdkRunStatus ?? "n/a")}</code>${row.lastActivityAt ? `; last activity ${escapeHtml(row.lastActivityAt)}` : ""}</div>
+    <div><code>${escapeHtml(row.workspacePath ?? "")}</code></div>
+    <div class="controls">controls: none</div>
   </li>`;
 }
 
@@ -1790,11 +1814,13 @@ async function operatorSnapshotView(
       };
     }),
   );
+  const orphaned = await orphanedOperatorViews(snapshot, runStore);
   return {
     generatedAt: snapshot.generatedAt,
     mutationsRequireToken: mutationsConfigured,
     operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
     running,
+    orphaned,
     paused: await pausedOperatorViews(
       snapshot.paused,
       snapshot.running,
@@ -1807,6 +1833,32 @@ async function operatorSnapshotView(
     ),
     retrying: snapshot.retrying,
   };
+}
+
+async function orphanedOperatorViews(snapshot: RuntimeSnapshot, runStore?: RunTranscriptStore) {
+  if (!runStore) return [];
+  const runs = (await runStore.listRuns())
+    .filter((run) => isOrphanedPersistedRun(run, snapshot))
+    .sort(compareRunChronology)
+    .slice(-25)
+    .reverse();
+  return runs.map((run) => ({
+    issueId: run.issueId,
+    issueIdentifier: run.issueIdentifier,
+    role: run.role,
+    runId: run.runId,
+    agentId: run.agentId,
+    sessionId: run.sessionId,
+    workspacePath: run.workspacePath ?? null,
+    rawStatus: run.status,
+    tracking: "orphaned" as const,
+    status: "not_live" as const,
+    sdkRunStatus: run.sdkRunStatus ?? null,
+    sdkRunStatusUpdatedAt: run.sdkRunStatusObservedAt ?? null,
+    sdkRunStatusSource: run.sdkRunStatusSource ?? null,
+    lastActivityAt: run.activitySnapshot?.lastHarnessActivityAt ?? run.updatedAt,
+    controls: { pause: false, resume: false, cancel: false, mutationsRequireToken: false },
+  }));
 }
 
 function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: IssueLifecycleRecord | null | undefined = row.lifecycle, agentId: string | null = null) {
@@ -1921,6 +1973,9 @@ async function issueOperatorLiveness(input: {
   if (input.latestRun?.status === "cancelled" || input.latestRun?.cancellationRequestedAt || input.latestRun?.cancelFailed) {
     return terminalOperatorLiveness("cancelled", input.latestRun, input.lifecycle ?? null, input.paused, input.runStore);
   }
+  if (input.latestRun?.status === "running") {
+    return orphanedOperatorLiveness(input.latestRun, input.paused, input.runStore);
+  }
   return null;
 }
 
@@ -1941,6 +1996,9 @@ async function runOperatorLiveness(
   }
   if (run.status === "cancelled" || run.cancellationRequestedAt || run.cancelFailed) {
     return terminalOperatorLiveness("cancelled", run, null, false, runStore);
+  }
+  if (isOrphanedPersistedRun(run, snapshot)) {
+    return orphanedOperatorLiveness(run, false, runStore);
   }
   return null;
 }
@@ -2009,8 +2067,37 @@ function runLivenessSummary(
   }
   if (run.status === "cancelled" || run.cancellationRequestedAt || run.cancelFailed)
     return { tracking: "terminal", status: "cancelled" as const, paused: false, cancelFailed: terminalCancelFailed(run) };
-  if (run.status === "running") return { tracking: "orphaned", status: null, paused: false };
+  if (isOrphanedPersistedRun(run, snapshot)) return { tracking: "orphaned", status: "not_live" as const, rawStatus: "running" as const, paused: false };
   return { tracking: "terminal", status: null, paused: false };
+}
+
+async function orphanedOperatorLiveness(run: RunRecord, paused: boolean, runStore?: RunTranscriptStore) {
+  return {
+    status: "not_live" as const,
+    rawStatus: run.status,
+    tracking: "orphaned" as const,
+    cancelFailed: terminalCancelFailed(run),
+    linearAuditComments: OPERATOR_LIVENESS_CONTRACT.deferred.linearAuditComments,
+    runId: run.runId,
+    activeRunId: null,
+    agentId: run.agentId ?? null,
+    sessionId: run.sessionId ?? null,
+    workspacePath: run.workspacePath ?? null,
+    lastActivityAt: run.activitySnapshot?.lastHarnessActivityAt ?? run.updatedAt,
+    lastTranscriptEventAt: null,
+    lastTranscriptEvent: null,
+    lastMessage: "Persisted running run is not present in the live orchestrator snapshot",
+    secondsSinceLastActivity: null,
+    stallTimeoutMs: null,
+    sdkRunStatus: run.sdkRunStatus ?? null,
+    sdkRunStatusUpdatedAt: run.sdkRunStatusObservedAt ?? null,
+    sdkRunStatusSource: run.sdkRunStatusSource ?? null,
+    idleAlert: null,
+    cancellation: null,
+    paused,
+    activity: await terminalActivity(run, null, runStore),
+    timeline: [],
+  };
 }
 
 async function terminalOperatorLiveness(
@@ -2320,6 +2407,10 @@ function liveOperatorStatus(row: RunningRow, lifecycle: IssueLifecycleRecord | n
   if (row.cancellation.requested || row.liveness.status === "cancelling") return "cancelling";
   if (isLifecycleBlocked(lifecycle)) return "blocked_human_required";
   return "running";
+}
+
+function isOrphanedPersistedRun(run: RunRecord, snapshot: RuntimeSnapshot): boolean {
+  return run.status === "running" && findLiveRun(snapshot, run.runId) === null;
 }
 
 function findLiveRun(snapshot: RuntimeSnapshot, runId: string): RunningRow | null {

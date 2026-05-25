@@ -130,6 +130,11 @@ export interface RunningEntry {
   sdkRunStatus: AgentRunSdkStatus | null;
   sdkRunStatusUpdatedAt: Date | null;
   sdkRunStatusSource: "initial" | "onDidChangeStatus" | "wait" | null;
+  failureKind: string | null;
+  failureDiagnosticCode: string | null;
+  failureDiagnosticMessage: string | null;
+  failureDiagnosticAt: Date | null;
+  failureDiagnosticPayload: unknown;
   turnCount: number;
   retryAttempt: number;
   tokens: TokenCounts;
@@ -916,6 +921,11 @@ export class Orchestrator {
       sdkRunStatus: null,
       sdkRunStatusUpdatedAt: null,
       sdkRunStatusSource: null,
+      failureKind: null,
+      failureDiagnosticCode: null,
+      failureDiagnosticMessage: null,
+      failureDiagnosticAt: null,
+      failureDiagnosticPayload: undefined,
       turnCount: 0,
       retryAttempt,
       tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
@@ -1163,6 +1173,13 @@ export class Orchestrator {
         }
       }
       if (event.type === "progress" || event.type === "run_diagnostic") entry.lastMessage = event.message;
+      if (event.type === "run_diagnostic") {
+        entry.failureKind = failureKindForDiagnostic(event.code);
+        entry.failureDiagnosticCode = event.code;
+        entry.failureDiagnosticMessage = event.message;
+        entry.failureDiagnosticAt = eventAt;
+        entry.failureDiagnosticPayload = event.payload;
+      }
       if (event.type === "tokens") this.applyTokenUpdate(entry, event.tokens);
       if (event.type === "rate_limits") this.rateLimits = event.payload;
       await this.persistHarnessEvent(entry, event);
@@ -1379,10 +1396,33 @@ export class Orchestrator {
         ),
         "run failed",
       );
+      const sdkErrorFailures = await this.consecutiveSdkErrorFailures(entry.issue);
+      if (sdkErrorFailures >= 1 + this.config.agent.maxSdkErrorRetries) {
+        await this.escalateEntryBlocked(
+          entry,
+          `consecutive Cursor SDK wait errors reached limit (${sdkErrorFailures} failures; max_sdk_error_retries=${this.config.agent.maxSdkErrorRetries})`,
+        );
+        this.claimed.delete(issueId);
+        return;
+      }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
       this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error);
     }
+  }
+
+  private async consecutiveSdkErrorFailures(issue: Issue): Promise<number> {
+    const runs = (await this.options.runStore?.listRunsForIssue(issue.id)) ?? [];
+    const seen = new Set<string>();
+    const workerRuns = runs
+      .filter((run) => run.role === "worker" && !seen.has(run.runId) && seen.add(run.runId))
+      .sort(compareRunChronology);
+    let count = 0;
+    for (const run of workerRuns.slice().reverse()) {
+      if (!isCountedSdkWaitErrorFailure(run)) break;
+      count += 1;
+    }
+    return count;
   }
 
   private async applyWritebacks(
@@ -2456,7 +2496,33 @@ function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | 
     sdkRunStatus: entry.sdkRunStatus,
     sdkRunStatusObservedAt: entry.sdkRunStatusUpdatedAt?.toISOString() ?? null,
     sdkRunStatusSource: entry.sdkRunStatusSource,
+    failureKind: terminalStatus === "failed" ? entry.failureKind : null,
+    failureDiagnosticCode: terminalStatus === "failed" ? entry.failureDiagnosticCode : null,
+    failureDiagnosticMessage: terminalStatus === "failed" ? entry.failureDiagnosticMessage : null,
+    failureDiagnosticAt: terminalStatus === "failed" ? entry.failureDiagnosticAt?.toISOString() ?? null : null,
+    failureDiagnosticPayload: terminalStatus === "failed" ? entry.failureDiagnosticPayload : null,
   };
+}
+
+function failureKindForDiagnostic(code: string): string {
+  if (code === "cursor_run_wait_terminal_error") return "cursor_sdk_terminal_error";
+  if (code === "cursor_run_wait_threw") return "cursor_sdk_wait_error";
+  if (code === "cursor_stream_error" || code.startsWith("cursor_stream_status_")) return "cursor_stream_error";
+  return "harness_diagnostic";
+}
+
+function isCountedSdkWaitErrorFailure(run: RunRecord): boolean {
+  return (
+    run.role === "worker" &&
+    run.status === "failed" &&
+    run.completedAt !== null &&
+    run.sdkRunStatus === "error" &&
+    run.sdkRunStatusSource === "wait" &&
+    run.cancellationRequestedAt == null &&
+    (run.cancellationOutcome ?? "none") === "none" &&
+    run.cancelFailed !== true &&
+    run.error !== OPERATOR_REJECTED_PUBLICATION_ERROR
+  );
 }
 
 function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {

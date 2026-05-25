@@ -93,6 +93,7 @@ export class CursorHarness implements AgentHarness {
     let terminalByStatusObserved = false;
     let pendingTerminalEvents: AgentEvent[] | null = null;
     let streamIterator: AsyncIterator<unknown> | null = null;
+    let lastToolContext: CursorLastToolContext | null = null;
     const bufferedStatusEvents: AgentEvent[] = [];
     const observableRun = run as Run & {
       readonly status?: unknown;
@@ -116,8 +117,30 @@ export class CursorHarness implements AgentHarness {
         if (sessionStarted) void finalizeFromWait();
       }
     };
+    const contextualizeTerminalEvents = (events: AgentEvent[]) =>
+      events.map((event) => {
+        if (
+          event.type !== "run_diagnostic" ||
+          (event.code !== "cursor_run_wait_terminal_error" && event.code !== "cursor_run_wait_threw") ||
+          typeof event.payload !== "object" ||
+          event.payload === null ||
+          Array.isArray(event.payload)
+        ) {
+          return event;
+        }
+        return {
+          ...event,
+          payload: {
+            ...event.payload,
+            streamSettled,
+            terminalByStatusObserved,
+            cancellationRequested: ctx.abortSignal.aborted,
+            lastTool: lastToolContext,
+          },
+        };
+      });
     const emitTerminalEvents = (events: AgentEvent[]) => {
-      for (const event of events) queue.push(event);
+      for (const event of contextualizeTerminalEvents(events)) queue.push(event);
       queue.close();
     };
     const finalizeFromWait = async () => {
@@ -141,13 +164,55 @@ export class CursorHarness implements AgentHarness {
         } else if (result.status === "cancelled") {
           terminalEvents.push({ type: "cancelled" });
         } else {
+          terminalEvents.push({
+            type: "run_diagnostic",
+            code: "cursor_run_wait_terminal_error",
+            message: "Cursor run wait returned terminal SDK error",
+            payload: {
+              runId: run.id,
+              agentId: agent.agentId,
+              sdkStatus: status,
+              sdkStatusSource: "wait",
+              waitResultStatus: previewValue(result.status, 160),
+              waitResultMessage: previewValue(result.result, 500),
+              streamSettled,
+              terminalByStatusObserved,
+              cancellationRequested: ctx.abortSignal.aborted,
+              lastTool: lastToolContext,
+            },
+          });
           terminalEvents.push({ type: "failed", error: result.result ?? "Cursor run failed" });
         }
         if (streamSettled || terminalByStatusObserved) emitTerminalEvents(terminalEvents);
         else pendingTerminalEvents = terminalEvents;
       } catch (error) {
         waitSettled = true;
-        const terminalEvents: AgentEvent[] = [{ type: "failed", error: `Cursor run wait failed: ${errorMessage(error)}` }];
+        const terminalEvents: AgentEvent[] = [
+          {
+            type: "run_status",
+            runId: run.id,
+            sdkStatus: "error",
+            source: "wait",
+            at: new Date().toISOString(),
+          },
+          {
+            type: "run_diagnostic",
+            code: "cursor_run_wait_threw",
+            message: `Cursor run wait threw: ${errorMessage(error)}`,
+            payload: {
+              runId: run.id,
+              agentId: agent.agentId,
+              sdkStatus: "error",
+              sdkStatusSource: "wait",
+              errorPreview: previewValue(errorMessage(error), 500),
+              streamSettled,
+              terminalByStatusObserved,
+              cancellationRequested: ctx.abortSignal.aborted,
+              lastTool: lastToolContext,
+            },
+          },
+          { type: "failed", error: `Cursor run wait failed: ${errorMessage(error)}` },
+        ];
         if (streamSettled || terminalByStatusObserved) emitTerminalEvents(terminalEvents);
         else pendingTerminalEvents = terminalEvents;
       }
@@ -241,6 +306,8 @@ export class CursorHarness implements AgentHarness {
             const next = await streamIterator.next();
             if (next.done) break;
             const message = next.value;
+            const toolContext = cursorLastToolContext(message);
+            if (toolContext) lastToolContext = toolContext;
             const transcriptEvent = cursorTranscriptEvent(message);
             if (transcriptEvent) {
               await this.options.runStore?.appendEvent({
@@ -432,6 +499,12 @@ function isTerminalSdkStatus(status: AgentRunSdkStatus): boolean {
   return status === "finished" || status === "error" || status === "cancelled";
 }
 
+interface CursorLastToolContext {
+  name: string | null;
+  status: string | null;
+  observedAt: string;
+}
+
 function shouldReuseAgent(ctx: AgentRunContext): boolean {
   return ctx.role === "worker" && ctx.config.cursor.workerAgentLifecycle === "resume_by_issue";
 }
@@ -470,8 +543,32 @@ function cursorTranscriptEvent(message: unknown): { eventType: string; message?:
   }
 }
 
+function cursorLastToolContext(message: unknown): CursorLastToolContext | null {
+  if (!isCursorMessageRecord(message) || message.type !== "tool_call") return null;
+  return {
+    name: typeof message.name === "string" ? previewValue(message.name, 160) : null,
+    status: typeof message.status === "string" ? previewValue(message.status, 160) : null,
+    observedAt: new Date().toISOString(),
+  };
+}
+
 function isCursorMessageRecord(value: unknown): value is { type: string; [key: string]: unknown } {
   return typeof value === "object" && value !== null && !Array.isArray(value) && typeof (value as { type?: unknown }).type === "string";
+}
+
+function previewValue(value: unknown, maxLength: number): string | null {
+  if (value === undefined || value === null) return null;
+  const text = typeof value === "string" ? value : safeJsonPreview(value);
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`;
+}
+
+function safeJsonPreview(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 export function cursorAgentCreateOptions(

@@ -60,6 +60,11 @@ export interface RunMetadata {
   sdkRunStatus?: PersistedSdkRunStatus | null;
   sdkRunStatusObservedAt?: string | null;
   sdkRunStatusSource?: PersistedSdkRunStatusSource | null;
+  failureKind?: string | null;
+  failureDiagnosticCode?: string | null;
+  failureDiagnosticMessage?: string | null;
+  failureDiagnosticAt?: string | null;
+  failureDiagnosticPayload?: unknown;
   pendingApprovalRequestId?: string | null;
   pendingApprovalRequestedAt?: string | null;
 }
@@ -113,6 +118,11 @@ export interface RunRecord {
   sdkRunStatus?: PersistedSdkRunStatus | null;
   sdkRunStatusObservedAt?: string | null;
   sdkRunStatusSource?: PersistedSdkRunStatusSource | null;
+  failureKind?: string | null;
+  failureDiagnosticCode?: string | null;
+  failureDiagnosticMessage?: string | null;
+  failureDiagnosticAt?: string | null;
+  failureDiagnosticPayload?: unknown;
   pendingApprovalRequestId?: string | null;
   pendingApprovalRequestedAt?: string | null;
 }
@@ -475,6 +485,11 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.sdkRunStatus === undefined ? {} : { sdkRunStatus: metadata.sdkRunStatus }),
     ...(metadata.sdkRunStatusObservedAt === undefined ? {} : { sdkRunStatusObservedAt: metadata.sdkRunStatusObservedAt }),
     ...(metadata.sdkRunStatusSource === undefined ? {} : { sdkRunStatusSource: metadata.sdkRunStatusSource }),
+    ...(metadata.failureKind === undefined ? {} : { failureKind: metadata.failureKind }),
+    ...(metadata.failureDiagnosticCode === undefined ? {} : { failureDiagnosticCode: metadata.failureDiagnosticCode }),
+    ...(metadata.failureDiagnosticMessage === undefined ? {} : { failureDiagnosticMessage: metadata.failureDiagnosticMessage }),
+    ...(metadata.failureDiagnosticAt === undefined ? {} : { failureDiagnosticAt: metadata.failureDiagnosticAt }),
+    ...(metadata.failureDiagnosticPayload === undefined ? {} : { failureDiagnosticPayload: metadata.failureDiagnosticPayload }),
     ...(metadata.pendingApprovalRequestId === undefined ? {} : { pendingApprovalRequestId: metadata.pendingApprovalRequestId }),
     ...(metadata.pendingApprovalRequestedAt === undefined ? {} : { pendingApprovalRequestedAt: metadata.pendingApprovalRequestedAt }),
   };

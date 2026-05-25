@@ -635,10 +635,99 @@ describe("Cursor event mapping", () => {
         message: "Cursor stream failed: authentication stream failure",
       }),
       expect.objectContaining({ type: "run_status", runId: "sdk-run-auth", sdkStatus: "error", source: "wait" }),
+      expect.objectContaining({
+        type: "run_diagnostic",
+        code: "cursor_run_wait_terminal_error",
+        payload: expect.objectContaining({
+          runId: "sdk-run-auth",
+          agentId: "agent-auth",
+          sdkStatus: "error",
+          sdkStatusSource: "wait",
+          waitResultMessage: "wait should not run",
+        }),
+      }),
       { type: "failed", error: "wait should not run" },
     ]);
     expect(run.wait).toHaveBeenCalledTimes(1);
     expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("emits bounded wait diagnostics with last tool context", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-wait-error",
+      send: vi.fn(async () => ({
+        id: "sdk-run-wait-error",
+        async *stream(): AsyncIterable<unknown> {
+          yield { type: "tool_call", name: "shell", status: "running", arguments: "SECRET_ARGS" };
+        },
+        wait: async () => ({ status: "error" as const, result: "runtime failed with details" }),
+        cancel: vi.fn(async () => undefined),
+      })),
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const harness = new CursorHarness();
+    const events: unknown[] = [];
+
+    for await (const event of harness.run(agentContext(config, "worker"), "Work on TEST-1")) {
+      events.push(event);
+    }
+
+    const diagnostic = events.find(
+      (event): event is { type: "run_diagnostic"; code: string; payload: { lastTool?: unknown } } =>
+        typeof event === "object" &&
+        event !== null &&
+        "type" in event &&
+        event.type === "run_diagnostic" &&
+        "code" in event &&
+        event.code === "cursor_run_wait_terminal_error",
+    );
+    expect(diagnostic).toBeDefined();
+    expect(JSON.stringify(diagnostic)).not.toContain("SECRET_ARGS");
+    expect(diagnostic?.payload).toMatchObject({
+      runId: "sdk-run-wait-error",
+      agentId: "agent-wait-error",
+      sdkStatus: "error",
+      sdkStatusSource: "wait",
+      waitResultMessage: "runtime failed with details",
+      lastTool: { name: "shell", status: "running" },
+    });
+    expect(events.at(-1)).toEqual({ type: "failed", error: "runtime failed with details" });
+  });
+
+  it("emits SDK error status when run.wait throws", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-wait-throw",
+      send: vi.fn(async () => ({
+        id: "sdk-run-wait-throw",
+        async *stream(): AsyncIterable<unknown> {},
+        wait: async () => {
+          throw new Error("wait exploded");
+        },
+        cancel: vi.fn(async () => undefined),
+      })),
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const harness = new CursorHarness();
+    const events: unknown[] = [];
+
+    for await (const event of harness.run(agentContext(config, "worker"), "Work on TEST-1")) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      { type: "session_started", sessionId: "agent-wait-throw:sdk-run-wait-throw", threadId: "agent-wait-throw", runId: "sdk-run-wait-throw" },
+      expect.objectContaining({ type: "run_status", runId: "sdk-run-wait-throw", sdkStatus: "error", source: "wait" }),
+      expect.objectContaining({
+        type: "run_diagnostic",
+        code: "cursor_run_wait_threw",
+        payload: expect.objectContaining({ runId: "sdk-run-wait-throw", errorPreview: "wait exploded" }),
+      }),
+      { type: "failed", error: "Cursor run wait failed: wait exploded" },
+    ]);
   });
 });
 

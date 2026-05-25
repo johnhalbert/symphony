@@ -35,6 +35,7 @@ Work on {{ issue.identifier }}.`,
     expect(config.tracker.projectSlug).toBe("TEST");
     expect(config.tracker.assignee).toBe("me");
     expect(config.agent.harness).toBe("cursor");
+    expect(config.agent.maxSdkErrorRetries).toBe(2);
     expect(config.cursor.model).toBe("gpt-5.5");
     expect(config.cursor.modelParams).toEqual([
       { id: "context", value: "272k" },
@@ -89,6 +90,29 @@ Work on {{ issue.identifier }}.`,
       canceled: ["Cancelled", "Canceled", "Duplicate"],
     });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
+  });
+
+  it("parses bounded SDK error retry configuration", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { max_sdk_error_retries: 4 },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.agent.maxSdkErrorRetries).toBe(4);
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          agent: { max_sdk_error_retries: -1 },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow(SymphonyError);
   });
 
   it("parses PR handoff policy for human review transitions", () => {
