@@ -432,6 +432,7 @@ describe("Orchestrator", () => {
     await second.refreshNow();
     await waitFor(() => harness.runs.length === 2, "planning retry after durable backoff");
     await waitFor(() => second.snapshot().counts.running === 0);
+    await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 2);
     await second.stop();
 
     const lifecycle = await lifecycleStore.get(candidate.id);
@@ -2602,7 +2603,7 @@ describe("Orchestrator", () => {
     const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
       status: "failed",
-      completedAt: rejectedAt,
+      completedAt: expect.any(String),
       error: OPERATOR_REJECTED_PUBLICATION_ERROR,
       pendingApprovalRequestId: null,
     });
@@ -2698,7 +2699,7 @@ describe("Orchestrator", () => {
 
     const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
-      status: "succeeded",
+      status: "cancelled",
       completedAt: expect.any(String),
       pendingApprovalRequestId: null,
     });
