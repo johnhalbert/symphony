@@ -62,10 +62,109 @@ body {
   font-family: var(--vscode-editor-font-family), monospace;
 }
 
+.subsection {
+  border-top: 1px solid var(--border);
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.subsection-title {
+  align-items: center;
+  color: var(--text);
+  display: flex;
+  font-size: 12px;
+  font-weight: 600;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.badge {
+  background: #1f2937;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 7px;
+}
+
+.row-list {
+  display: grid;
+  gap: 6px;
+}
+
+.data-row,
+.activity-row {
+  display: grid;
+  gap: 2px;
+}
+
+.placeholder-grid {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.placeholder-tile {
+  background: #0f172a;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+}
+
+.row-main {
+  color: var(--text);
+  font-family: var(--vscode-editor-font-family), monospace;
+  font-size: 12px;
+}
+
+.row-meta {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.workspace {
+  display: grid;
+  gap: 2px;
+  margin-top: 2px;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.chip {
+  background: #0f172a;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
 .actions {
   display: flex;
   gap: 8px;
   margin-top: 12px;
+}
+
+.row-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.action-reason {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 button {
@@ -80,4 +179,14 @@ button {
 
 button:hover {
   border-color: var(--accent);
+}
+
+button:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+button:disabled:hover {
+  border-color: var(--border);
 }
