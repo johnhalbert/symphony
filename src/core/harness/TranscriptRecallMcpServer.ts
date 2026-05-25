@@ -14,7 +14,7 @@ export interface TranscriptRecallMcpContextFile {
   issue: Issue;
   activeRunId: string | null;
   role: "worker" | "reviewer";
-  phase: "implementation" | "review";
+  phase: "issue_breakdown" | "implementation" | "review";
 }
 
 export async function writeTranscriptRecallMcpContext(

@@ -3,6 +3,7 @@ import type { CredentialRole } from "../config/CredentialProfiles.js";
 
 export type McpSubprocessCommand =
   | "completion-report-mcp"
+  | "issue-breakdown-plan-mcp"
   | "review-verdict-mcp"
   | "review-feedback-mcp"
   | "transcript-recall-mcp";

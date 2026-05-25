@@ -181,6 +181,43 @@ describe("Cursor event mapping", () => {
     );
   });
 
+  it("passes configured plan mode to worker create and send options", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    config.cursor.mode = "plan";
+    const send = vi.fn(async () => completedSdkRun("sdk-run-plan"));
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-plan",
+      send,
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const harness = new CursorHarness();
+
+    const events: unknown[] = [];
+    for await (const event of harness.run(agentContext(config, "worker"), "Plan TEST-1")) {
+      events.push(event);
+    }
+
+    expect(cursorSdk.create).toHaveBeenCalledWith(expect.objectContaining({ mode: "plan" }));
+    expect(send).toHaveBeenCalledWith("Plan TEST-1", expect.objectContaining({ mode: "plan" }));
+    expect(events).toContainEqual({ type: "completed" });
+  });
+
+  it("uses plan mode with planning MCP for issue breakdown runs", () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const ctx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      runPhase: "issue_breakdown",
+      cursorModeOverride: "plan",
+    };
+
+    const mcpServers = cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" });
+    const createOptions = cursorAgentCreateOptions(ctx, "cursor-test-key", { mcpServers });
+
+    expect(Object.keys(mcpServers)).toEqual(["symphony_planning"]);
+    expect(createOptions).toMatchObject({ mode: "plan" });
+  });
+
   it("mounts read-only transcript recall as a separate MCP server when search is enabled", () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     config.continuationContext.searchEnabled = true;
@@ -397,6 +434,9 @@ describe("Cursor event mapping", () => {
     expect(cursorSdk.resume).not.toHaveBeenCalled();
     expect(runStore.latestRunForIssue).not.toHaveBeenCalled();
     expect(cursorSdk.create).toHaveBeenCalledTimes(1);
+    const sendOptions = (send as unknown as { mock: { calls: Array<[string, Record<string, unknown>]> } }).mock.calls[0]?.[1];
+    expect(sendOptions).toBeDefined();
+    expect(sendOptions).not.toHaveProperty("mode");
     expect(dispose).toHaveBeenCalledTimes(1);
     expect(runStore.appendEvent).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -544,6 +584,34 @@ describe("Cursor event mapping", () => {
     expect(cursorSdk.resume).toHaveBeenCalledWith("agent-previous", expect.any(Object));
     expect(agent.reload).toHaveBeenCalledTimes(1);
     expect(cursorSdk.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps resume options mode-free while configured sends request plan mode", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    config.cursor.mode = "plan";
+    config.cursor.workerAgentLifecycle = "resume_by_issue";
+    const send = vi.fn(async () => completedSdkRun("sdk-run-resumed-plan"));
+    const agent = {
+      agentId: "agent-resumed-plan",
+      send,
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    };
+    cursorSdk.resume.mockResolvedValue(agent);
+    const runStore = {
+      latestRunForIssue: vi.fn(async () => ({ agentId: "agent-previous-plan" })),
+      updateRun: vi.fn(),
+      appendEvent: vi.fn(),
+    };
+    const harness = new CursorHarness({ runStore: runStore as never });
+
+    for await (const _event of harness.run(agentContext(config, "worker"), "Plan TEST-1")) {
+      // drain events
+    }
+
+    expect(cursorSdk.resume).toHaveBeenCalledTimes(1);
+    expect(cursorSdk.resume.mock.calls[0]?.[1]).not.toHaveProperty("mode");
+    expect(send).toHaveBeenCalledWith("Plan TEST-1", expect.objectContaining({ mode: "plan" }));
   });
 
   it("cancels the SDK run through the abort signal when cancellation happens before session_started", async () => {

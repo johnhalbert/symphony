@@ -5,7 +5,10 @@ import type { AgentActivitySource, AgentEvent, AgentHarness, AgentRunSdkStatus }
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import {
+  runKindForPhase,
   toIssueStatusView,
+  type AgentRunPhase,
+  type AgentRunKind,
   type AgentRunRole,
   type Issue,
   type IssueStatusView,
@@ -21,6 +24,10 @@ import {
   pendingPublicationHandoffForRun,
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
+import {
+  latestFreshIssueBreakdownPlan,
+  renderIssueBreakdownPlanSummary,
+} from "../IssueBreakdownPlanService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
   DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE,
@@ -115,6 +122,7 @@ export interface ContinuationSummaryCreationResult {
 export interface RunningEntry {
   issue: Issue;
   role: AgentRunRole;
+  runPhase: AgentRunPhase;
   workspacePath: string | null;
   workspace: Workspace | null;
   sessionId: string | null;
@@ -142,6 +150,7 @@ export interface RunningEntry {
   cleanupWorkspaceOnExit: boolean;
   suppressRetryOnExit: boolean;
   completionReportAccepted: boolean;
+  issueBreakdownPlanAccepted: boolean;
   pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
@@ -164,6 +173,10 @@ interface ReviewerDispatchEvidence {
   runDigest: string[];
 }
 
+type WorkerDispatchDecision =
+  | { action: "dispatch"; runPhase: AgentRunPhase }
+  | { action: "skip"; reason: "planning_required_no_lifecycle_store" };
+
 export interface RetryEntry {
   issueId: string;
   identifier: string;
@@ -171,6 +184,7 @@ export interface RetryEntry {
   dueAtMs: number;
   timer: NodeJS.Timeout;
   error: string | null;
+  runPhase: AgentRunPhase;
 }
 
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
@@ -187,6 +201,8 @@ export interface RuntimeSnapshot {
     issueId: string;
     issueIdentifier: string;
     role: AgentRunRole;
+    runPhase: AgentRunPhase;
+    runKind: AgentRunKind;
     state: string;
     workspacePath: string | null;
     sessionId: string | null;
@@ -439,6 +455,34 @@ export class Orchestrator {
     if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
   }
 
+  async requestIssueBreakdown(issueIdOrIdentifier: string): Promise<{ queued: boolean; issue: Issue; reason: string }> {
+    if (!this.config.issueBreakdown.enabled) {
+      throw new SymphonyError("invalid_request", "Issue breakdown planning is disabled");
+    }
+    if (!this.options.lifecycleStore) {
+      throw new SymphonyError("invalid_request", "Issue breakdown planning requires a lifecycle store");
+    }
+    if (this.availableSlots() <= 0) {
+      throw new SymphonyError("conflict", "No agent slots are available for issue breakdown planning");
+    }
+    const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
+    const issue = refreshed[0];
+    if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    if (this.running.has(issue.id)) throw new SymphonyError("conflict", "Issue already has a running Symphony agent");
+    if (!this.shouldDispatchWorker(issue, false)) {
+      throw new SymphonyError("conflict", "Issue is not currently eligible for worker dispatch");
+    }
+    if (!(await this.lifecycleAllowsDispatch(issue, "worker", "issue_breakdown"))) {
+      throw new SymphonyError("conflict", "Issue lifecycle does not currently allow issue breakdown planning");
+    }
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    if (latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) !== null) {
+      return { queued: false, issue, reason: "fresh_plan_exists" };
+    }
+    this.dispatchIssue(issue, null, "worker", null, "issue_breakdown");
+    return { queued: true, issue, reason: "explicit_request" };
+  }
+
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
@@ -523,6 +567,8 @@ export class Orchestrator {
         issueId,
         issueIdentifier: entry.issue.identifier,
         role: entry.role,
+        runPhase: entry.runPhase,
+        runKind: runKindForPhase(entry.runPhase),
         state: entry.issue.state,
         workspacePath: entry.workspacePath,
         sessionId: entry.sessionId,
@@ -776,7 +822,11 @@ export class Orchestrator {
     return this.hasStateSlot(issue.state);
   }
 
-  private async lifecycleAllowsDispatch(issue: Issue, role: AgentRunRole): Promise<boolean> {
+  private async lifecycleAllowsDispatch(
+    issue: Issue,
+    role: AgentRunRole,
+    runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
+  ): Promise<boolean> {
     const store = this.options.lifecycleStore;
     if (!store) return true;
     const lifecycle = await store.get(issue.id);
@@ -800,7 +850,23 @@ export class Orchestrator {
       return true;
     }
 
-    if (role === "worker" && lifecycle.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns) {
+    if (role === "worker" && runPhase === "issue_breakdown") {
+      if (lifecycle.planningFailureCount >= this.config.issueBreakdown.maxPlanningFailures) {
+        await this.escalateLifecycleBlocked(
+          issue,
+          lifecycle,
+          lifecycle.summaryPointers.lastRunId ?? issue.id,
+          maxPlanningFailuresReason(lifecycle.planningFailureCount, this.config.issueBreakdown.maxPlanningFailures),
+        );
+        return false;
+      }
+      if (planningBackoffRemainingMs(lifecycle, this.config) > 0) return false;
+    }
+    if (
+      role === "worker" &&
+      runPhase === "implementation" &&
+      lifecycle.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns
+    ) {
       await this.escalateLifecycleBlocked(
         issue,
         lifecycle,
@@ -832,7 +898,6 @@ export class Orchestrator {
   private async tryDispatchWorkerIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (!this.shouldDispatchWorker(issue, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(issue, "worker"))) return false;
 
     let refreshed: Issue[];
     try {
@@ -850,18 +915,38 @@ export class Orchestrator {
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
     if (!this.shouldDispatchWorker(latest, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(latest, "worker"))) return false;
 
-    const dispatchWriteback = planDispatchWriteback(latest, this.config);
+    const decision = await this.resolveWorkerDispatchDecision(latest);
+    if (decision.action === "skip") {
+      this.options.logger.warn("worker dispatch skipped", {
+        issue_id: latest.id,
+        issue_identifier: latest.identifier,
+        reason: decision.reason,
+      });
+      return false;
+    }
+    let runPhase = decision.runPhase;
+    if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase))) return false;
+    const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, this.config) : null;
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
-    const afterWriteback = dispatchWriteback
-      ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0]
-      : latest;
+    const afterWriteback = dispatchWriteback ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] : latest;
     if (!afterWriteback) return false;
+    if (dispatchWriteback) {
+      const postWritebackDecision = await this.resolveWorkerDispatchDecision(afterWriteback);
+      if (postWritebackDecision.action === "skip") {
+        this.options.logger.warn("worker dispatch skipped after writeback", {
+          issue_id: afterWriteback.id,
+          issue_identifier: afterWriteback.identifier,
+          reason: postWritebackDecision.reason,
+        });
+        return false;
+      }
+      runPhase = postWritebackDecision.runPhase;
+    }
     if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker"))) return false;
+    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase))) return false;
 
-    this.dispatchIssue(afterWriteback, attempt, "worker", null);
+    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase);
     return true;
   }
 
@@ -895,17 +980,36 @@ export class Orchestrator {
     return true;
   }
 
+  private async resolveWorkerDispatchDecision(issue: Issue): Promise<WorkerDispatchDecision> {
+    if (!this.config.issueBreakdown.enabled) return { action: "dispatch", runPhase: "implementation" };
+    if (!this.passesIssueBreakdownRouting(issue)) return { action: "dispatch", runPhase: "implementation" };
+    if (!this.options.lifecycleStore) return { action: "skip", reason: "planning_required_no_lifecycle_store" };
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    return {
+      action: "dispatch",
+      runPhase: latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) === null ? "issue_breakdown" : "implementation",
+    };
+  }
+
+  private passesIssueBreakdownRouting(issue: Issue): boolean {
+    if (this.config.issueBreakdown.planningLabels.length === 0) return false;
+    const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
+    return this.config.issueBreakdown.planningLabels.some((label) => labels.has(label));
+  }
+
   private dispatchIssue(
     issue: Issue,
     attempt: number | null,
     role: AgentRunRole,
     reviewEvidence: ReviewerDispatchEvidence | null,
+    runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
   ): void {
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
     const entry: RunningEntry = {
       issue,
       role,
+      runPhase,
       workspacePath: null,
       workspace: null,
       sessionId: null,
@@ -933,6 +1037,7 @@ export class Orchestrator {
       cleanupWorkspaceOnExit: false,
       suppressRetryOnExit: false,
       completionReportAccepted: false,
+      issueBreakdownPlanAccepted: false,
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
@@ -981,23 +1086,46 @@ export class Orchestrator {
   private async runWorker(entry: RunningEntry, attempt: number | null): Promise<void> {
     let workspace: Workspace | null = null;
     try {
-      workspace = await this.options.workspaceManager.createForIssue(entry.issue);
+      workspace =
+        entry.runPhase === "issue_breakdown"
+          ? await this.options.workspaceManager.createForPlanning(entry.issue)
+          : await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
-      await this.updateLifecycle(entry, {
-        phase: phaseForIssueState(entry.issue.state, this.config),
-        summaryPointers: {
-          workspaceKey: workspace.workspaceKey,
-          workspacePath: workspace.path,
-          branchName: workspace.gitBranchName ?? null,
-          gitBranchName: workspace.gitBranchName ?? null,
-          repoPath: workspace.repoPath ?? null,
-          baseRef: workspace.baseRef ?? null,
-        },
-      });
-      await this.options.workspaceManager.beforeRun(workspace.path);
+      await this.updateLifecycle(
+        entry,
+        entry.runPhase === "issue_breakdown"
+          ? { phase: phaseForIssueState(entry.issue.state, this.config) }
+          : {
+              phase: phaseForIssueState(entry.issue.state, this.config),
+              summaryPointers: {
+                workspaceKey: workspace.workspaceKey,
+                workspacePath: workspace.path,
+                branchName: workspace.gitBranchName ?? null,
+                gitBranchName: workspace.gitBranchName ?? null,
+                repoPath: workspace.repoPath ?? null,
+                baseRef: workspace.baseRef ?? null,
+              },
+            },
+      );
+      if (entry.runPhase !== "issue_breakdown") {
+        await this.options.workspaceManager.beforeRun(workspace.path);
+      }
       await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, 1));
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, 1));
+
+      if (entry.runPhase === "issue_breakdown") {
+        entry.turnCount = 1;
+        const prompt = await this.renderIssueBreakdownPrompt(entry, attempt);
+        const context = this.buildRunContext(entry, workspace, attempt, 1);
+        await this.consumeHarnessEvents(entry, this.options.harness.run(context, prompt), {
+          workspace,
+          prompt,
+          attempt,
+          turnNumber: 1,
+        });
+        return;
+      }
 
       for (let turnNumber = 1; turnNumber <= this.config.agent.maxTurns; turnNumber += 1) {
         if (entry.abortController.signal.aborted) throw new SymphonyError("agent_error", "Run was cancelled");
@@ -1038,7 +1166,11 @@ export class Orchestrator {
       }
     } finally {
       if (workspace) {
-        await this.options.workspaceManager.afterRun(workspace.path);
+        if (entry.runPhase !== "issue_breakdown") {
+          await this.options.workspaceManager.afterRun(workspace.path);
+        } else {
+          await this.options.workspaceManager.removeForPlanning(entry.issue);
+        }
         if (entry.cleanupWorkspaceOnExit) await this.options.workspaceManager.removeForIssue(entry.issue);
       }
     }
@@ -1139,6 +1271,8 @@ export class Orchestrator {
           sessionId: event.sessionId,
           agentId: event.threadId ?? null,
           role: entry.role,
+          runPhase: entry.runPhase,
+          runKind: runKindForPhase(entry.runPhase),
           issueId: entry.issue.id,
           issueIdentifier: entry.issue.identifier,
           attempt: context.attempt,
@@ -1147,6 +1281,7 @@ export class Orchestrator {
           cursorModel: this.config.cursor.model,
           cursorModelParams: this.config.cursor.modelParams,
           cursorSettingSources: this.config.cursor.settingSources,
+          cursorMode: effectiveCursorModeForEntry(entry, this.config),
           cursorAllowLargeContext: this.config.cursor.allowLargeContext,
           cursorWorkerAgentLifecycle: this.config.cursor.workerAgentLifecycle,
           workspaceKey: context.workspace.workspaceKey,
@@ -1155,8 +1290,10 @@ export class Orchestrator {
           ...(context.workspace.repoPath === undefined ? {} : { repoPath: context.workspace.repoPath }),
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
         });
-        await this.discoverPullRequestForEntry(entry, context.workspace);
-        if (entry.role === "worker") {
+        if (entry.runPhase !== "issue_breakdown") {
+          await this.discoverPullRequestForEntry(entry, context.workspace);
+        }
+        if (entry.role === "worker" && entry.runPhase === "implementation") {
           await this.applyWriteback(
             planRunStartedComment(
               {
@@ -1184,6 +1321,18 @@ export class Orchestrator {
       if (event.type === "rate_limits") this.rateLimits = event.payload;
       await this.persistHarnessEvent(entry, event);
       if (event.type === "completed") {
+        if (entry.runPhase === "issue_breakdown") {
+          const accepted = await this.reconcileIssueBreakdownPlanHandoff(entry);
+          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
+            status: accepted ? "succeeded" : "failed",
+            completedAt: new Date().toISOString(),
+            ...(accepted ? {} : { error: "Planning run completed without submit_issue_breakdown_plan" }),
+            tokens: entry.activeRunTokens,
+            metadata: terminalRunMetadata(entry, accepted ? "succeeded" : "failed"),
+          });
+          if (!terminal.updated) return;
+          continue;
+        }
         const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
           status: "succeeded",
           completedAt: new Date().toISOString(),
@@ -1200,7 +1349,14 @@ export class Orchestrator {
         }
       }
       if (event.type === "failed") {
-        if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
+        if (
+          entry.role === "worker" &&
+          entry.runPhase === "issue_breakdown" &&
+          (await this.terminalizeAcceptedIssueBreakdownPlan(entry))
+        ) {
+          return;
+        }
+        if (entry.role === "worker" && entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
@@ -1221,7 +1377,14 @@ export class Orchestrator {
         throw new SymphonyError("agent_error", event.error);
       }
       if (event.type === "cancelled") {
-        if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
+        if (
+          entry.role === "worker" &&
+          entry.runPhase === "issue_breakdown" &&
+          (await this.terminalizeAcceptedIssueBreakdownPlan(entry))
+        ) {
+          return;
+        }
+        if (entry.role === "worker" && entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
@@ -1251,11 +1414,52 @@ export class Orchestrator {
     return { updated: true, record: await runStore.updateRun(runId, patch) };
   }
 
+  private async terminalizeAcceptedIssueBreakdownPlan(entry: RunningEntry): Promise<boolean> {
+    const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
+    if (!accepted) return false;
+    const runId = entry.activeRunId ?? entry.runId ?? "";
+    if (runId.length > 0) {
+      await this.updateRunTerminalStateIfRunning(runId, {
+        status: "succeeded",
+        completedAt: new Date().toISOString(),
+        tokens: entry.activeRunTokens,
+        metadata: terminalRunMetadata(entry, "succeeded"),
+      });
+    }
+    return true;
+  }
+
   private async onWorkerExit(issueId: string, kind: "normal" | "abnormal", error: string | null): Promise<void> {
     const entry = this.running.get(issueId);
     if (!entry) return;
     this.running.delete(issueId);
     this.endedRuntimeSeconds += (Date.now() - entry.startedAt.getTime()) / 1000;
+
+    if (entry.runPhase === "issue_breakdown") {
+      const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
+      if (accepted) {
+        await this.terminalizeAcceptedIssueBreakdownPlan(entry);
+        await this.options.lifecycleStore?.updateIssue(entry.issue, {
+          planningFailureCount: 0,
+          planningDispatchRetryCount: 0,
+          lastPlanningFailureRunId: null,
+          lastPlanningFailureAt: null,
+        });
+        this.clearRetry(issueId);
+        this.completed.add(issueId);
+        this.claimed.delete(issueId);
+        return;
+      }
+      if (entry.suppressRetryOnExit) {
+        this.claimed.delete(issueId);
+        return;
+      }
+      await this.recordPlanningFailure(
+        entry,
+        error ?? (kind === "normal" ? "Planning run completed without submit_issue_breakdown_plan" : "Planning run failed"),
+      );
+      return;
+    }
 
     if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
       if (entry.runId) {
@@ -1316,7 +1520,7 @@ export class Orchestrator {
         return;
       }
       if (await this.shouldScheduleContinuation(entry)) {
-        this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null);
+        this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
       } else {
         this.claimed.delete(issueId);
       }
@@ -1407,8 +1611,48 @@ export class Orchestrator {
       }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
-      this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error);
+      this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error, entry.runPhase);
     }
+  }
+
+  private async recordPlanningFailure(entry: RunningEntry, error: string | null): Promise<void> {
+    const issueId = entry.issue.id;
+    const store = this.options.lifecycleStore;
+    if (!store) {
+      this.claimed.delete(issueId);
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const runId = entry.activeRunId ?? entry.runId ?? issueId;
+    const current = (await store.get(issueId)) ?? entry.lifecycle;
+    const nextCount = (current?.planningFailureCount ?? 0) + 1;
+    const lifecycle = await store.updateIssue(entry.issue, {
+      planningFailureCount: nextCount,
+      planningDispatchRetryCount: 0,
+      lastPlanningFailureRunId: runId,
+      lastPlanningFailureAt: now,
+    });
+    entry.lifecycle = lifecycle;
+    await this.options.runStore?.appendEvent({
+      runId,
+      at: now,
+      source: "orchestrator",
+      eventType: "planning_run_failed",
+      message: error ?? "Planning run failed",
+      payload: { planningFailureCount: nextCount },
+    });
+
+    const maxFailures = this.config.issueBreakdown.maxPlanningFailures;
+    if (nextCount >= maxFailures) {
+      await this.escalateLifecycleBlocked(entry.issue, lifecycle, runId, maxPlanningFailuresReason(nextCount, maxFailures));
+      this.clearRetry(issueId);
+      this.claimed.delete(issueId);
+      return;
+    }
+
+    const delayMs = planningRetryDelayMs(nextCount, this.config);
+    this.scheduleRetry(issueId, entry.issue.identifier, nextCount, delayMs, error, "issue_breakdown");
   }
 
   private async consecutiveSdkErrorFailures(issue: Issue): Promise<number> {
@@ -1471,13 +1715,20 @@ export class Orchestrator {
     return this.shouldDispatchWorker(latest, true);
   }
 
-  private scheduleRetry(issueId: string, identifier: string, attempt: number, delayMs: number, error: string | null): void {
+  private scheduleRetry(
+    issueId: string,
+    identifier: string,
+    attempt: number,
+    delayMs: number,
+    error: string | null,
+    runPhase: AgentRunPhase = "implementation",
+  ): void {
     this.clearRetry(issueId);
     const dueAtMs = Date.now() + delayMs;
     const timer = setTimeout(() => {
       void this.onRetryTimer(issueId);
     }, delayMs);
-    this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error });
+    this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error, runPhase });
   }
 
   private async onRetryTimer(issueId: string): Promise<void> {
@@ -1491,15 +1742,74 @@ export class Orchestrator {
         this.claimed.delete(issueId);
         return;
       }
+      if (retry.runPhase === "issue_breakdown") {
+        const remainingMs = await this.planningBackoffRemainingForIssue(issue);
+        if (remainingMs > 0) {
+          this.scheduleRetry(issueId, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+          return;
+        }
+      }
       if (this.availableSlots() <= 0) {
-        this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, "no available orchestrator slots");
+        if (retry.runPhase === "issue_breakdown") {
+          await this.recordPlanningDispatchRetry(issue, retry, "no available orchestrator slots");
+        } else {
+          this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, "no available orchestrator slots", retry.runPhase);
+        }
         return;
       }
       const dispatched = await this.tryDispatchWorkerIssue(issue, retry.attempt, true);
-      if (!dispatched) this.claimed.delete(issueId);
+      if (!dispatched) {
+        if (retry.runPhase === "issue_breakdown") {
+          await this.recordPlanningDispatchRetry(issue, retry, retry.error ?? "planning dispatch retry failed");
+        } else {
+          this.claimed.delete(issueId);
+        }
+      }
     } catch (error) {
-      this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, errorMessage(error));
+      if (retry.runPhase === "issue_breakdown" && retry.attempt >= this.config.issueBreakdown.maxPlanningDispatchRetries) {
+        this.claimed.delete(issueId);
+        return;
+      }
+      this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, errorMessage(error), retry.runPhase);
     }
+  }
+
+  private async planningBackoffRemainingForIssue(issue: Issue): Promise<number> {
+    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    if (!lifecycle) return 0;
+    return planningBackoffRemainingMs(lifecycle, this.config);
+  }
+
+  private async recordPlanningDispatchRetry(issue: Issue, retry: RetryEntry, error: string | null): Promise<void> {
+    const store = this.options.lifecycleStore;
+    if (!store) {
+      this.claimed.delete(issue.id);
+      return;
+    }
+    const current = await store.get(issue.id);
+    if (current) {
+      const remainingMs = planningBackoffRemainingMs(current, this.config);
+      if (remainingMs > 0) {
+        this.scheduleRetry(issue.id, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+        return;
+      }
+    }
+    const nextCount = (current?.planningDispatchRetryCount ?? 0) + 1;
+    const lifecycle = await store.updateIssue(issue, { planningDispatchRetryCount: nextCount });
+    const maxRetries = this.config.issueBreakdown.maxPlanningDispatchRetries;
+    if (nextCount >= maxRetries) {
+      await this.escalateLifecycleBlocked(
+        issue,
+        lifecycle,
+        lifecycle.summaryPointers.lastRunId ?? retry.identifier,
+        maxPlanningDispatchRetriesReason(nextCount, maxRetries),
+      );
+      this.clearRetry(issue.id);
+      this.claimed.delete(issue.id);
+      return;
+    }
+    const delayMs = planningRetryDelayMs(Math.max(lifecycle.planningFailureCount, 1), this.config);
+    this.scheduleRetry(issue.id, retry.identifier, retry.attempt + 1, delayMs, error, retry.runPhase);
   }
 
   private clearRetry(issueId: string): void {
@@ -1518,10 +1828,12 @@ export class Orchestrator {
     return {
       issue: entry.issue,
       role: entry.role,
+      runPhase: entry.runPhase,
       attempt,
       workspace,
       config: this.config,
       turnNumber,
+      ...(entry.runPhase === "issue_breakdown" ? { cursorModeOverride: this.config.issueBreakdown.cursorMode } : {}),
       abortSignal: entry.abortController.signal,
       logger: this.options.logger,
     };
@@ -1693,6 +2005,18 @@ export class Orchestrator {
       });
     }
 
+    return true;
+  }
+
+  private async reconcileIssueBreakdownPlanHandoff(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return entry.issueBreakdownPlanAccepted;
+    const lifecycle = await store.get(entry.issue.id);
+    const plan = lifecycle?.issueBreakdownPlans.find((item) => item.runId === runId) ?? null;
+    if (!lifecycle || !plan) return entry.issueBreakdownPlanAccepted;
+    entry.lifecycle = lifecycle;
+    entry.issueBreakdownPlanAccepted = true;
     return true;
   }
 
@@ -1889,13 +2213,33 @@ export class Orchestrator {
       reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
       workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
     });
+    const issueBreakdownPlan = await this.loadIssueBreakdownPlanPrompt(entry);
     const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
-    return [basePrompt, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
+    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
+  }
+
+  private async renderIssueBreakdownPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
+    const basePrompt = await this.promptRenderer.render(this.config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
+    return [basePrompt, this.cursorIssueBreakdownMcpPrompt(entry)].join("\n");
+  }
+
+  private cursorIssueBreakdownMcpPrompt(entry: RunningEntry): string {
+    return [
+      "",
+      "Symphony MCP issue-breakdown handoff:",
+      `- Active issue: ${entry.issue.identifier} (${entry.issue.id})`,
+      "- Active role: worker",
+      "- Active phase: issue_breakdown",
+      "- Before ending the run, call the submit_issue_breakdown_plan MCP tool with summary, proposedIssues, and idempotencyKey.",
+      "- Each proposed issue must include title, description, acceptanceCriteria, dependencies, and labels.",
+      "- Do not call submit_completion_report, comment on Linear, transition Linear state, or create child issues.",
+      "- Symphony persists the plan locally and injects it into the later implementation prompt after validation.",
+    ].join("\n");
   }
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
@@ -2000,6 +2344,7 @@ export class Orchestrator {
 
   private cursorWorkerMcpPrompt(entry: RunningEntry): string | null {
     if (this.options.harness.id !== "cursor") return null;
+    if (entry.runPhase !== "implementation") return null;
     const workspace = entry.workspace;
     return [
       "",
@@ -2019,6 +2364,23 @@ export class Orchestrator {
   private async loadWorkerReviewVerdictPrompt(entry: RunningEntry): Promise<string | null> {
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
     return lifecycle === undefined || lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
+  }
+
+  private async loadIssueBreakdownPlanPrompt(entry: RunningEntry): Promise<string | null> {
+    if (!this.config.issueBreakdown.enabled) return null;
+    const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+    const plan = latestFreshIssueBreakdownPlan(lifecycle, entry.issue, this.config);
+    if (plan === null) return null;
+    return [
+      "",
+      "Issue breakdown plan:",
+      `- Source: ${plan.id}; accepted at ${plan.acceptedAt}`,
+      `- Cursor mode: ${plan.cursorMode ?? this.config.issueBreakdown.cursorMode}`,
+      `- Transcript pointers: ${formatList(plan.transcriptPointers)}`,
+      `- Status pointers: ${formatList(plan.statusApiPointers)}`,
+      "",
+      renderIssueBreakdownPlanSummary(plan),
+    ].join("\n");
   }
 
   private async loadWorkerHandoffPrompt(entry: RunningEntry): Promise<string | null> {
@@ -2305,6 +2667,33 @@ function latestContinuationSummaryReference(
       summaries.length - 1
     ] ?? null
   );
+}
+
+function effectiveCursorModeForEntry(entry: RunningEntry, config: ServiceConfig): "agent" | "plan" | null {
+  return entry.runPhase === "issue_breakdown" ? config.issueBreakdown.cursorMode : config.cursor.mode;
+}
+
+function maxPlanningFailuresReason(count: number, max: number): string {
+  return `max planning failures reached (${count}/${max})`;
+}
+
+function maxPlanningDispatchRetriesReason(count: number, max: number): string {
+  return `max planning dispatch retries reached (${count}/${max})`;
+}
+
+function planningRetryDelayMs(failureCount: number, config: ServiceConfig): number {
+  return Math.min(
+    config.issueBreakdown.planningRetryBaseMs * 2 ** Math.max(failureCount - 1, 0),
+    config.issueBreakdown.planningRetryMaxMs,
+  );
+}
+
+function planningBackoffRemainingMs(lifecycle: IssueLifecycleRecord, config: ServiceConfig, nowMs = Date.now()): number {
+  if (lifecycle.planningFailureCount <= 0 || lifecycle.lastPlanningFailureAt === null) return 0;
+  const failedAtMs = Date.parse(lifecycle.lastPlanningFailureAt);
+  if (!Number.isFinite(failedAtMs)) return 0;
+  const dueAtMs = failedAtMs + planningRetryDelayMs(lifecycle.planningFailureCount, config);
+  return Math.max(0, dueAtMs - nowMs);
 }
 
 function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[]): boolean {

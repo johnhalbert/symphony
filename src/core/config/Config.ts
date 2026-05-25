@@ -83,6 +83,20 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    issue_breakdown: z
+      .object({
+        enabled: z.boolean().optional(),
+        cursor_mode: z.enum(["agent", "plan"]).optional(),
+        prompt: z.string().optional(),
+        planning_labels: stringArray.optional(),
+        workspace_mode: z.enum(["none", "readonly_checkout"]).optional(),
+        max_planning_failures: z.number().int().positive().optional(),
+        max_planning_dispatch_retries: z.number().int().positive().optional(),
+        planning_retry_base_ms: z.number().int().positive().optional(),
+        planning_retry_max_ms: z.number().int().positive().optional(),
+      })
+      .passthrough()
+      .optional(),
     polling: z
       .object({
         interval_ms: z.number().int().positive().optional(),
@@ -136,6 +150,7 @@ const rawConfigSchema = z
     cursor: z
       .object({
         model: z.string().optional(),
+        mode: z.enum(["agent", "plan"]).optional(),
         model_params: z.record(z.string(), z.string()).optional(),
         setting_sources: z.array(z.string()).optional(),
         opener_command: z.string().optional(),
@@ -263,6 +278,7 @@ export type CursorSettingSource =
 
 export interface CursorConfig {
   model: string;
+  mode: CursorConversationMode | null;
   modelParams: CursorModelParameter[];
   settingSources: CursorSettingSource[];
   openerCommand: string | null;
@@ -270,6 +286,7 @@ export interface CursorConfig {
   workerAgentLifecycle: CursorWorkerAgentLifecycle;
 }
 
+export type CursorConversationMode = "agent" | "plan";
 export type CursorWorkerAgentLifecycle = "fresh_per_run" | "resume_by_issue";
 
 export interface CursorModelParameter {
@@ -346,6 +363,18 @@ export interface ContinuationContextConfig {
   summarizationEnabled: boolean;
 }
 
+export interface IssueBreakdownConfig {
+  enabled: boolean;
+  cursorMode: CursorConversationMode;
+  promptTemplate: string;
+  planningLabels: string[];
+  workspaceMode: "none" | "readonly_checkout";
+  maxPlanningFailures: number;
+  maxPlanningDispatchRetries: number;
+  planningRetryBaseMs: number;
+  planningRetryMaxMs: number;
+}
+
 export interface IssueBoardConfig {
   columns: IssueBoardColumnMapping;
 }
@@ -369,6 +398,7 @@ export interface ServiceConfig {
   mergePolicy: MergePolicyConfig;
   issueBoard: IssueBoardConfig;
   continuationContext: ContinuationContextConfig;
+  issueBreakdown: IssueBreakdownConfig;
   raw: RawWorkflowConfig;
 }
 
@@ -388,6 +418,15 @@ const DEFAULT_CURSOR_MODEL_PARAMS: CursorModelParameter[] = [
   { id: "context", value: "272k" },
   { id: "reasoning", value: "extra-high" },
 ];
+const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
+  "Break down {{ issue.identifier }} before implementation.",
+  "",
+  "Inspect the issue and repository context only. Do not edit files, create commits, push branches, comment on Linear, transition Linear state, or submit a completion report.",
+  "",
+  "Before ending the run, call submit_issue_breakdown_plan with a concise summary, an idempotencyKey, and proposedIssues[].",
+  "Each proposed issue must include title, description, acceptanceCriteria[], dependencies[], and labels[].",
+  "Symphony persists these proposals locally; do not create or modify Linear issues.",
+].join("\n");
 
 export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
@@ -437,6 +476,21 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     }
     if (!raw.workspace?.source?.base_ref) {
       throw new SymphonyError("config_validation_error", "workspace.source.base_ref is required for git_worktree");
+    }
+  }
+  const issueBreakdownWorkspaceMode = raw.issue_breakdown?.workspace_mode ?? "none";
+  if (issueBreakdownWorkspaceMode === "readonly_checkout") {
+    if (sourceKind !== "git_worktree") {
+      throw new SymphonyError(
+        "config_validation_error",
+        "issue_breakdown.workspace_mode readonly_checkout requires workspace.source.kind git_worktree",
+      );
+    }
+    if (process.platform === "win32") {
+      throw new SymphonyError(
+        "config_validation_error",
+        "issue_breakdown.workspace_mode readonly_checkout is not supported on Windows; use workspace_mode none",
+      );
     }
   }
 
@@ -563,6 +617,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     },
     cursor: {
       model: cursorModel,
+      mode: raw.cursor?.mode ?? null,
       modelParams: cursorModelParams,
       settingSources: normalizeCursorSettingSources(raw.cursor?.setting_sources),
       openerCommand: raw.cursor?.opener_command ?? null,
@@ -611,6 +666,18 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     continuationContext: {
       searchEnabled: raw.continuation_context?.search_enabled ?? false,
       summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
+    },
+    issueBreakdown: {
+      enabled: raw.issue_breakdown?.enabled ?? false,
+      cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
+      promptTemplate: raw.issue_breakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
+      planningLabels: normalizeLabels(raw.issue_breakdown?.planning_labels),
+      workspaceMode: issueBreakdownWorkspaceMode,
+      maxPlanningFailures: raw.issue_breakdown?.max_planning_failures ?? 3,
+      maxPlanningDispatchRetries:
+        raw.issue_breakdown?.max_planning_dispatch_retries ?? raw.issue_breakdown?.max_planning_failures ?? 3,
+      planningRetryBaseMs: raw.issue_breakdown?.planning_retry_base_ms ?? 5_000,
+      planningRetryMaxMs: raw.issue_breakdown?.planning_retry_max_ms ?? 60_000,
     },
     raw,
   };

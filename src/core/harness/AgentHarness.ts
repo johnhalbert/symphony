@@ -1,14 +1,16 @@
-import type { ServiceConfig } from "../config/Config.js";
+import type { CursorConversationMode, ServiceConfig } from "../config/Config.js";
 import type { Logger } from "../logging/StructuredLogger.js";
-import type { AgentRunRole, Issue, TokenCounts, Workspace } from "../types.js";
+import type { AgentRunPhase, AgentRunRole, Issue, TokenCounts, Workspace } from "../types.js";
 
 export interface AgentRunContext {
   issue: Issue;
   role: AgentRunRole;
+  runPhase?: AgentRunPhase;
   attempt: number | null;
   workspace: Workspace;
   config: ServiceConfig;
   turnNumber: number;
+  cursorModeOverride?: CursorConversationMode | null;
   abortSignal: AbortSignal;
   logger: Logger;
 }

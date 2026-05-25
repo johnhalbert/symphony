@@ -37,6 +37,7 @@ Work on {{ issue.identifier }}.`,
     expect(config.agent.harness).toBe("cursor");
     expect(config.agent.maxSdkErrorRetries).toBe(2);
     expect(config.cursor.model).toBe("gpt-5.5");
+    expect(config.cursor.mode).toBeNull();
     expect(config.cursor.modelParams).toEqual([
       { id: "context", value: "272k" },
       { id: "reasoning", value: "extra-high" },
@@ -69,6 +70,17 @@ Work on {{ issue.identifier }}.`,
     expect(config.continuationContext).toEqual({
       searchEnabled: false,
       summarizationEnabled: false,
+    });
+    expect(config.issueBreakdown).toEqual({
+      enabled: false,
+      cursorMode: "plan",
+      promptTemplate: expect.stringContaining("Break down {{ issue.identifier }}"),
+      planningLabels: [],
+      workspaceMode: "none",
+      maxPlanningFailures: 3,
+      maxPlanningDispatchRetries: 3,
+      planningRetryBaseMs: 5_000,
+      planningRetryMaxMs: 60_000,
     });
     expect(config.reviewLoop.reviewerPromptExtensions).toEqual([]);
     expect(config.reviewLoop.workerPromptExtensions).toEqual([]);
@@ -379,6 +391,12 @@ Work on {{ issue.identifier }}.`,
           search_enabled: true,
           summarization_enabled: true,
         },
+        issue_breakdown: {
+          enabled: true,
+          cursor_mode: "plan",
+          prompt: "Plan {{ issue.identifier }}",
+          planning_labels: ["Planning"],
+        },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
@@ -411,6 +429,17 @@ Work on {{ issue.identifier }}.`,
       searchEnabled: true,
       summarizationEnabled: true,
     });
+    expect(config.issueBreakdown).toEqual({
+      enabled: true,
+      cursorMode: "plan",
+      promptTemplate: "Plan {{ issue.identifier }}",
+      planningLabels: ["planning"],
+      workspaceMode: "none",
+      maxPlanningFailures: 3,
+      maxPlanningDispatchRetries: 3,
+      planningRetryBaseMs: 5_000,
+      planningRetryMaxMs: 60_000,
+    });
     expect(config.mergePolicy).toEqual({
       mode: "gated",
       sourceStates: ["Review Passed"],
@@ -428,6 +457,49 @@ Work on {{ issue.identifier }}.`,
       done: ["Done"],
       canceled: [],
     });
+  });
+
+  it("rejects readonly issue breakdown workspaces unless a non-Windows git worktree source can enforce them", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: {
+            source: { kind: "copy", path: "/repo" },
+          },
+          issue_breakdown: {
+            workspace_mode: "readonly_checkout",
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("readonly_checkout requires workspace.source.kind git_worktree");
+
+    const parseGitWorktreeReadonly = () =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: {
+            source: {
+              kind: "git_worktree",
+              repository: "/repo",
+              base_ref: "main",
+            },
+          },
+          issue_breakdown: {
+            workspace_mode: "readonly_checkout",
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      );
+
+    if (process.platform === "win32") {
+      expect(parseGitWorktreeReadonly).toThrow("readonly_checkout is not supported on Windows");
+    } else {
+      expect(parseGitWorktreeReadonly().issueBreakdown.workspaceMode).toBe("readonly_checkout");
+    }
   });
 
   it("parses configurable issue board columns and rejects duplicate state mappings", () => {
@@ -592,6 +664,38 @@ Work on {{ issue.identifier }}.`,
 
     expect(configured.cursor.model).toBe("composer-2.5");
     expect(configured.cursor.modelParams).toEqual([{ id: "reasoning", value: "high" }]);
+  });
+
+  it("parses explicit Cursor conversation modes and rejects unsupported modes", () => {
+    const planMode = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        cursor: { mode: "plan" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+    const agentMode = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        cursor: { mode: "agent" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(planMode.cursor.mode).toBe("plan");
+    expect(agentMode.cursor.mode).toBe("agent");
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          cursor: { mode: "ask" },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow(SymphonyError);
   });
 
   it("requires bounded gpt-5.5 context unless large context is explicitly allowed", () => {

@@ -12,7 +12,8 @@ import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
-import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import type { Issue, IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { issue, testConfig } from "./helpers.js";
@@ -169,6 +170,7 @@ describe("StatusServer durable API", () => {
         agentCwd: "/repo",
         mcpCwd: "/repo",
         settingSources: ["project", "user"],
+        cursorMode: "plan",
       },
       ok: false,
       stages: [
@@ -189,6 +191,7 @@ describe("StatusServer durable API", () => {
                 agentCwd: "/repo",
                 mcpCwd: "/repo",
                 settingSources: ["project", "user"],
+                cursorMode: "plan",
                 sdkTimeoutMs: 45_000,
                 waitTimeoutMs: 5_000,
                 postCancelWaitMs: 1_500,
@@ -420,6 +423,80 @@ describe("StatusServer durable API", () => {
       });
     } finally {
       await server.stop();
+    }
+  });
+
+  it("posts planning-run using internal id and records strict id lookup behavior", async () => {
+    const candidate = issue({ id: "issue-1", identifier: "TEST-1", state: "Todo", labels: ["planning"] });
+    const idFixture = await createPlanningRunApiFixture(path.join(root, "planning-id"), candidate);
+    try {
+      const response = await fetch(`${idFixture.baseUrl}/api/v1/issues/${candidate.id}/planning-run`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const body = (await response.json()) as {
+        queued: boolean;
+        issue: string;
+        issueId: string;
+        runPhase: string;
+        runKind: string;
+        reason: string;
+      };
+
+      expect(response.status).toBe(202);
+      expect(body).toMatchObject({
+        queued: true,
+        issue: "TEST-1",
+        issueId: "issue-1",
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+        reason: "explicit_request",
+      });
+      expect(idFixture.tracker.lookupCalls).toEqual([["issue-1"]]);
+      await waitForStatusApiAsync(
+        async () =>
+          ((await idFixture.runStore.latestRunForIssue(candidate.id, {
+            role: "worker",
+            runPhase: "issue_breakdown",
+          }))?.runKind ?? null) === "planning",
+        "durable planning run",
+      );
+      await expect(
+        idFixture.runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "issue_breakdown" }),
+      ).resolves.toMatchObject({
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+      });
+      expect(idFixture.harness.runs.map((run) => run.ctx.runPhase)).toEqual(["issue_breakdown"]);
+    } finally {
+      await idFixture.orchestrator.stop();
+      await idFixture.server.stop();
+    }
+
+    const identifierFixture = await createPlanningRunApiFixture(path.join(root, "planning-identifier"), candidate);
+    try {
+      const response = await fetch(`${identifierFixture.baseUrl}/api/v1/issues/${candidate.identifier}/planning-run`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(404);
+      expect(body.error).toMatchObject({
+        code: "not_found",
+        message: "Issue not found: TEST-1",
+      });
+      expect(identifierFixture.tracker.lookupCalls).toEqual([["TEST-1"]]);
+      await expect(
+        identifierFixture.runStore.latestRunForIssue(candidate.id, {
+          role: "worker",
+          runPhase: "issue_breakdown",
+        }),
+      ).resolves.toBeNull();
+      expect(identifierFixture.harness.runs).toEqual([]);
+    } finally {
+      await identifierFixture.orchestrator.stop();
+      await identifierFixture.server.stop();
     }
   });
 
@@ -1260,6 +1337,8 @@ describe("StatusServer durable API", () => {
       issueId: "issue-1",
       issueIdentifier: "TEST-1",
       role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
       state: "In Progress",
       workspacePath: null,
       sessionId: "session-1",
@@ -1474,6 +1553,8 @@ describe("StatusServer durable API", () => {
       issueId: "issue-failed-cancel",
       issueIdentifier: "TEST-CANCEL-FAILED",
       role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
       state: "In Progress",
       workspacePath: path.join(config.workspace.root, "TEST-CANCEL-FAILED"),
       sessionId: "session-failed-cancel",
@@ -1864,6 +1945,8 @@ describe("StatusServer durable API", () => {
       issueId: "issue-2",
       issueIdentifier: "TEST-2",
       role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
       state: "In Progress",
       workspacePath: path.join(config.workspace.root, "TEST-2"),
       sessionId: "session-2",
@@ -2105,6 +2188,8 @@ function durableIssueDetails(overrides: Partial<IssueDetailsEnvelope["issue"]> =
     },
     latestRun: {
       runId: "run-1",
+      runPhase: "implementation",
+      runKind: "implementation",
       status: "running",
       terminalReason: null,
       error: null,
@@ -2124,6 +2209,8 @@ function liveRunningFixture(
     issueId: id,
     issueIdentifier: identifier,
     role: "worker",
+    runPhase: "implementation",
+    runKind: "implementation",
     state,
     workspacePath: null,
     sessionId: null,
@@ -2205,6 +2292,95 @@ class FakeTracker implements TrackerClient {
   async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
     return this.issues.filter((item) => issueIds.includes(item.id));
   }
+}
+
+class PlanningRunStrictIdTracker implements TrackerClient {
+  readonly lookupCalls: string[][] = [];
+
+  constructor(private readonly candidate: Issue) {}
+
+  async fetchCandidateIssues(): Promise<Issue[]> {
+    return [];
+  }
+
+  async fetchIssuesByStates(): Promise<Issue[]> {
+    return [];
+  }
+
+  async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
+    this.lookupCalls.push([...issueIds]);
+    return issueIds.includes(this.candidate.id) ? [this.candidate] : [];
+  }
+}
+
+class PlanningRunRecordingHarness implements AgentHarness {
+  readonly id = "planning-run-recording";
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    yield { type: "session_started", sessionId: "planning-api-session", runId: "planning-api-run" };
+    yield { type: "completed" };
+  }
+}
+
+async function createPlanningRunApiFixture(root: string, candidate: Issue): Promise<{
+  baseUrl: string;
+  harness: PlanningRunRecordingHarness;
+  orchestrator: Orchestrator;
+  runStore: FileRunTranscriptStore;
+  server: StatusServer;
+  tracker: PlanningRunStrictIdTracker;
+}> {
+  const config = testConfig(path.join(root, "workspaces"));
+  config.issueBreakdown.enabled = true;
+  const logger = new StructuredLogger(() => undefined);
+  const tracker = new PlanningRunStrictIdTracker(candidate);
+  const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+  const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+  const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+  const harness = new PlanningRunRecordingHarness();
+  const orchestrator = new Orchestrator({
+    config,
+    tracker,
+    workspaceManager,
+    harness,
+    logger,
+    promptTemplate: "Work on {{ issue.identifier }}",
+    lifecycleStore,
+    runStore,
+  });
+  const server = new StatusServer({
+    orchestrator,
+    workspaceManager,
+    workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+    runStore,
+    lifecycleStore,
+    writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+    host: "127.0.0.1",
+    port: 0,
+    openWorkspaceToken: "secret",
+    trackerStateLists: testTrackerStateLists(),
+    staleThresholdMs: 300_000,
+  });
+  const address = await server.start();
+  return {
+    baseUrl: `http://${address.host}:${address.port}`,
+    harness,
+    orchestrator,
+    runStore,
+    server,
+    tracker,
+  };
+}
+
+async function waitForStatusApiAsync(predicate: () => Promise<boolean>, description: string, timeoutMs = 2_000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(await predicate(), `Timed out waiting for ${description}`).toBe(true);
 }
 
 function fakeOrchestrator(

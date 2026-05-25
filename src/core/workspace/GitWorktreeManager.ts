@@ -29,6 +29,19 @@ export interface WorktreeResult {
   baseRef: string;
 }
 
+export interface CreatePlanningCheckoutOptions {
+  source: WorkspaceSourceConfig;
+  stateDir: string;
+  workspacePath: string;
+  timeoutMs: number;
+  logger: Logger;
+}
+
+export interface PlanningCheckoutResult {
+  repoPath: string;
+  baseRef: string;
+}
+
 export async function createGitWorktree(options: CreateWorktreeOptions): Promise<WorktreeResult> {
   const repository = options.source.repository;
   const baseRef = options.source.baseRef;
@@ -45,6 +58,20 @@ export async function createGitWorktree(options: CreateWorktreeOptions): Promise
   });
 
   return { repoPath, branchName: options.branchName, baseRef };
+}
+
+export async function createGitPlanningCheckout(options: CreatePlanningCheckoutOptions): Promise<PlanningCheckoutResult> {
+  const repository = options.source.repository;
+  const baseRef = options.source.baseRef;
+  if (!repository) throw new SymphonyError("workspace_error", "workspace.source.repository is required");
+  if (!baseRef) throw new SymphonyError("workspace_error", "workspace.source.base_ref is required");
+
+  await fs.mkdir(options.stateDir, { recursive: true });
+  const repoPath = await ensureSharedRepo(repository, options.source.cachePath, options.stateDir, options.timeoutMs);
+  await fetchRepo(repoPath, options.timeoutMs, options.logger);
+  const base = await resolveBaseRef(repoPath, baseRef, options.timeoutMs);
+  await runGit(["worktree", "add", "--detach", options.workspacePath, base], repoPath, options.timeoutMs);
+  return { repoPath, baseRef };
 }
 
 export async function removeGitWorktree(options: RemoveWorktreeOptions): Promise<void> {

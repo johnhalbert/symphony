@@ -17,6 +17,7 @@ import type {
   OperatorApprovalRequestInput,
   OperatorApprovalService,
 } from "./approval/OperatorApprovalService.js";
+import { OPERATOR_REJECTED_PUBLICATION_ERROR } from "./approval/OperatorApprovalService.js";
 import type { Issue, Workspace } from "./types.js";
 import {
   planCompletionReportAcceptedWritebacks,
@@ -840,6 +841,7 @@ export class CompletionReportService {
     pullRequest: CompletionReportPullRequestRef | null,
   ): Promise<void> {
     if (!isTerminalApprovalStatus(approval.status)) return;
+    await this.recordPublicationApprovalTerminalRun(approval);
     const issue = {
       ...context.issue,
       state: this.options.config.reviewLoop.blockedStates[0] ?? context.issue.state,
@@ -856,6 +858,29 @@ export class CompletionReportService {
     await this.options.lifecycleStore.updateIssue(context.issue, {
       phase: "blocked",
       blockedReason: `publication approval ${approval.status}`,
+    });
+  }
+
+  private async recordPublicationApprovalTerminalRun(approval: OperatorApprovalRecord): Promise<void> {
+    const runStore = this.options.runStore;
+    if (!runStore) return;
+    const existing = await runStore.getRun(approval.runId);
+    const completedAt = existing?.completedAt ?? new Date().toISOString();
+    const rejectPolicy = this.options.config.github.operatorApproval?.rejectPolicy ?? "cancel";
+    const cancelledByPolicy = approval.status === "rejected" && rejectPolicy === "cancel";
+    const failedByPolicy = approval.status === "rejected" && rejectPolicy === "fail";
+    await runStore.updateRun(approval.runId, {
+      status: cancelledByPolicy ? "cancelled" : "failed",
+      completedAt,
+      error: cancelledByPolicy
+        ? "Operator cancelled issue"
+        : failedByPolicy
+          ? OPERATOR_REJECTED_PUBLICATION_ERROR
+          : `Publication approval ${approval.status}`,
+      metadata: {
+        pendingApprovalRequestId: null,
+        pendingApprovalRequestedAt: null,
+      },
     });
   }
 }

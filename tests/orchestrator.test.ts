@@ -20,6 +20,7 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import { IssueBreakdownPlanService } from "../src/core/IssueBreakdownPlanService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
 import {
@@ -103,6 +104,463 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
     expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
+  });
+
+  it("runs issue breakdown planning before implementation and injects the plan", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    let currentState = "Todo";
+    let updatedAt = "2026-01-02T00:00:00Z";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState, updatedAt }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState, updatedAt }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+      updatedAt = "2026-01-02T00:01:00Z";
+    });
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await waitForAsync(
+      async () => ((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans.length ?? 0) === 1,
+      "persisted issue breakdown plan",
+    );
+    await settleOrchestratorExit();
+    expect(writer.transitions).toEqual([]);
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "implementation dispatch after accepted plan", 5_000);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await orchestrator.refreshNow();
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
+    expect(harness.runs[0]?.prompt).toContain("submit_issue_breakdown_plan");
+    expect(harness.runs[1]?.ctx.runPhase).toBe("implementation");
+    expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
+    expect(harness.runs[1]?.prompt).toContain("Work on TEST-1");
+    expect(harness.runs[1]?.prompt).toContain("Issue breakdown plan:");
+    expect(harness.runs[1]?.prompt).toContain("Create implementation task");
+    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "issue_breakdown" })).resolves.toMatchObject({
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
+    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "implementation" })).resolves.toMatchObject({
+      runPhase: "implementation",
+      runKind: "implementation",
+    });
+  }, 10_000);
+
+  it("reroutes implementation dispatch to planning when writeback reveals stale issue content", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      title: "Original work",
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    let currentState = "Todo";
+    let currentTitle = "Original work";
+    let updatedAt = "2026-01-02T00:00:00Z";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState, title: currentTitle, updatedAt }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState, title: currentTitle, updatedAt }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+      currentTitle = "Edited during dispatch";
+      updatedAt = "2026-01-02T00:01:00Z";
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      writeback: new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await waitForAsync(
+      async () => ((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans.length ?? 0) === 1,
+      "persisted issue breakdown plan",
+    );
+    await settleOrchestratorExit();
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "stale post-writeback planning reroute", 5_000);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await orchestrator.stop();
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[1]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs.some((run) => run.ctx.runPhase === "implementation")).toBe(false);
+    expect(lifecycle?.planningFailureCount).toBe(0);
+  }, 10_000);
+
+  it("allows issue breakdown planning when implementation incomplete-turn limits are exhausted", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.reviewLoop.maxIncompleteTurns = 2;
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, { incompleteTurnCount: 2 });
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
+  });
+
+  it("[event-guard:failed] treats accepted issue breakdown plans as succeeded when the harness fails after submitting", async () => {
+    const result = await runAcceptedIssueBreakdownHandoffScenario(root, {
+      type: "failed",
+      error: "post-plan harness failure",
+    });
+    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+
+    expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("failed");
+    expect(eventTypes).not.toContain("completed");
+  });
+
+  it("[event-guard:cancelled] treats accepted issue breakdown plans as succeeded when the harness is cancelled after submitting", async () => {
+    const result = await runAcceptedIssueBreakdownHandoffScenario(root, { type: "cancelled" });
+    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+
+    expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("cancelled");
+    expect(eventTypes).not.toContain("completed");
+  });
+
+  it("[exit-guard:throw] terminalizes accepted planning runs when the harness throws after submitting without a terminal event", async () => {
+    const result = await runAcceptedIssueBreakdownHandoffScenario(root, "throw");
+    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+
+    expect(eventTypes).toContain("session_started");
+    expect(eventTypes).not.toContain("failed");
+    expect(eventTypes).not.toContain("cancelled");
+    expect(eventTypes).not.toContain("completed");
+  });
+
+  it("blocks repeated issue breakdown failures without incrementing implementation incomplete turns", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.maxPlanningFailures = 1;
+    config.reviewLoop.maxIncompleteTurns = 2;
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, { incompleteTurnCount: 2 });
+    const harness = new IssueBreakdownRejectingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await orchestrator.refreshNow();
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(harness.runs).toHaveLength(1);
+    expect(lifecycle?.planningFailureCount).toBe(1);
+    expect(lifecycle?.incompleteTurnCount).toBe(2);
+    expect(lifecycle?.phase).toBe("blocked");
+    expect(lifecycle?.blockedReason).toBe("max planning failures reached (1/1)");
+    expect(lifecycle?.lastPlanningFailureRunId).toBe("rejecting-plan-run-1");
+  });
+
+  it("honors durable planning backoff after a non-submitting planning run", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.maxPlanningFailures = 3;
+    config.issueBreakdown.planningRetryBaseMs = 200;
+    config.issueBreakdown.planningRetryMaxMs = 200;
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownRejectingHarness();
+    const first = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await first.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => first.snapshot().counts.running === 0);
+    await first.stop();
+
+    const second = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await second.refreshNow();
+    await settleOrchestratorExit();
+    expect(harness.runs).toHaveLength(1);
+    await new Promise((resolve) => setTimeout(resolve, 240));
+    await second.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "planning retry after durable backoff");
+    await waitFor(() => second.snapshot().counts.running === 0);
+    await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 2);
+    await second.stop();
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(lifecycle?.planningFailureCount).toBe(2);
+    expect(lifecycle?.incompleteTurnCount).toBe(0);
+  });
+
+  it("blocks bounded planning dispatch retries without burning implementation incomplete turns", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.maxPlanningFailures = 3;
+    config.issueBreakdown.maxPlanningDispatchRetries = 1;
+    config.issueBreakdown.planningRetryBaseMs = 20;
+    config.issueBreakdown.planningRetryMaxMs = 20;
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownRejectingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    currentState = "Blocked";
+    await waitForAsync(async () => {
+      try {
+        return (await lifecycleStore.get(candidate.id))?.phase === "blocked";
+      } catch {
+        return false;
+      }
+    }, "planning dispatch retry block", 2_000);
+    await orchestrator.stop();
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(harness.runs).toHaveLength(1);
+    expect(lifecycle?.planningFailureCount).toBe(1);
+    expect(lifecycle?.planningDispatchRetryCount).toBe(1);
+    expect(lifecycle?.incompleteTurnCount).toBe(0);
+    expect(lifecycle?.blockedReason).toBe("max planning dispatch retries reached (1/1)");
+  });
+
+  it("does not route planning-labeled issues to implementation when planning persistence is missing", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    const candidate = issue({ state: "Todo", labels: ["planning"] });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+  });
+
+  it("rejects explicit issue breakdown requests without lifecycle persistence", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await expect(orchestrator.requestIssueBreakdown(candidate.id)).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    await orchestrator.stop();
   });
 
   it("adds scoped Symphony MCP completion instructions to Cursor worker prompts", async () => {
@@ -2145,7 +2603,7 @@ describe("Orchestrator", () => {
     const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
       status: "failed",
-      completedAt: rejectedAt,
+      completedAt: expect.any(String),
       error: OPERATOR_REJECTED_PUBLICATION_ERROR,
       pendingApprovalRequestId: null,
     });
@@ -2241,7 +2699,7 @@ describe("Orchestrator", () => {
 
     const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
-      status: "succeeded",
+      status: "cancelled",
       completedAt: expect.any(String),
       pendingApprovalRequestId: null,
     });
@@ -4575,6 +5033,15 @@ async function waitFor(predicate: () => boolean, description = "condition", time
   expect(predicate(), `Timed out waiting for ${description}`).toBe(true);
 }
 
+async function waitForAsync(predicate: () => Promise<boolean>, description = "condition", timeoutMs = 2_000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(await predicate(), `Timed out waiting for ${description}`).toBe(true);
+}
+
 async function waitForPendingApproval(store: FileOperatorApprovalStore, runId: string, timeoutMs = 2_000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -4615,6 +5082,81 @@ async function waitForTerminalRunRecord(store: FileRunTranscriptStore, runId: st
 
 async function settleOrchestratorExit(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 25));
+}
+
+async function runAcceptedIssueBreakdownHandoffScenario(
+  root: string,
+  terminal: IssueBreakdownHandoffTerminal,
+): Promise<{
+  runStore: FileRunTranscriptStore;
+  planRunId: string;
+}> {
+  const config = testConfig(root);
+  config.issueBreakdown.enabled = true;
+  config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+  config.issueBreakdown.planningLabels = ["planning"];
+  config.issueBreakdown.maxPlanningFailures = 3;
+  const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+  let active = true;
+  const tracker: TrackerClient = {
+    async fetchCandidateIssues() {
+      return active ? [candidate] : [];
+    },
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssueStatesByIds() {
+      return [candidate];
+    },
+  };
+  const logger = new StructuredLogger(() => undefined);
+  const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+  await lifecycleStore.ensureIssue(candidate, {
+    incompleteTurnCount: 2,
+    planningFailureCount: 1,
+    planningDispatchRetryCount: 1,
+    lastPlanningFailureRunId: "previous-planning-run",
+    lastPlanningFailureAt: "2026-01-01T00:00:00.000Z",
+  });
+  const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+  const harness = new IssueBreakdownHandoffHarness(lifecycleStore, terminal);
+  const orchestrator = new Orchestrator({
+    config,
+    tracker,
+    workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+    harness,
+    logger,
+    promptTemplate: "Work on {{ issue.identifier }}",
+    lifecycleStore,
+    runStore,
+  });
+
+  await orchestrator.refreshNow();
+  await waitFor(() => harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown").length === 1);
+  await waitFor(() => orchestrator.snapshot().counts.running === 0);
+  await settleOrchestratorExit();
+  const planRunId = harness.runs.find((run) => run.ctx.runPhase === "issue_breakdown")?.runId ?? "";
+  const lifecycle = await lifecycleStore.get(candidate.id);
+
+  await expect(runStore.getRun(planRunId)).resolves.toMatchObject({
+    status: "succeeded",
+    runPhase: "issue_breakdown",
+    runKind: "planning",
+  });
+  expect(lifecycle?.planningFailureCount).toBe(0);
+  expect(lifecycle?.planningDispatchRetryCount).toBe(0);
+  expect(lifecycle?.lastPlanningFailureRunId).toBeNull();
+  expect(lifecycle?.lastPlanningFailureAt).toBeNull();
+  expect(lifecycle?.incompleteTurnCount).toBe(2);
+  expect(orchestrator.snapshot().counts.retrying).toBe(0);
+
+  active = false;
+  await orchestrator.refreshNow();
+  await settleOrchestratorExit();
+  await orchestrator.stop();
+  expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
+
+  return { runStore, planRunId };
 }
 
 class BlockingHarness implements AgentHarness {
@@ -4777,6 +5319,108 @@ class CursorPromptHarness implements AgentHarness {
   async *run(_ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.prompts.push(prompt);
     yield { type: "session_started", sessionId: "cursor-session-1", runId: "cursor-run-1" };
+    yield { type: "completed" };
+  }
+}
+
+class IssueBreakdownAcceptingHarness implements AgentHarness {
+  readonly id = "issue-breakdown-accepting";
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(private readonly lifecycleStore: FileIssueLifecycleStore) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    const runId = `${ctx.runPhase ?? "implementation"}-run-${this.runs.length}`;
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    if (ctx.runPhase === "issue_breakdown") {
+      await new IssueBreakdownPlanService({ config: ctx.config, lifecycleStore: this.lifecycleStore }).submit_issue_breakdown_plan(
+        {
+          runId,
+          issueId: ctx.issue.id,
+          idempotencyKey: `test-plan-${runId}`,
+          summary: "Break implementation into one task.",
+          proposedIssues: [
+            {
+              title: "Create implementation task",
+              description: "Implement the requested behavior.",
+              acceptanceCriteria: ["Behavior is implemented and tested."],
+              dependencies: [],
+              labels: ["planning"],
+            },
+          ],
+        },
+        {
+          issue: ctx.issue,
+          activeRunId: runId,
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      );
+    }
+    yield { type: "completed" };
+  }
+}
+
+type IssueBreakdownHandoffTerminal = { type: "failed"; error: string } | { type: "cancelled" } | "throw";
+
+class IssueBreakdownHandoffHarness implements AgentHarness {
+  readonly id = "issue-breakdown-handoff";
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string; runId: string }> = [];
+
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly terminal: IssueBreakdownHandoffTerminal,
+  ) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    const runId = `${ctx.runPhase ?? "implementation"}-handoff-run-${this.runs.length + 1}`;
+    this.runs.push({ ctx, prompt, runId });
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    if (ctx.runPhase !== "issue_breakdown") {
+      yield { type: "completed" };
+      return;
+    }
+
+    await new IssueBreakdownPlanService({ config: ctx.config, lifecycleStore: this.lifecycleStore }).submit_issue_breakdown_plan(
+      {
+        runId,
+        issueId: ctx.issue.id,
+        idempotencyKey: `test-plan-${runId}`,
+        summary: "Break implementation into one task.",
+        proposedIssues: [
+          {
+            title: "Create implementation task",
+            description: "Implement the requested behavior.",
+            acceptanceCriteria: ["Behavior is implemented and tested."],
+            dependencies: [],
+            labels: ["planning"],
+          },
+        ],
+      },
+      {
+        issue: ctx.issue,
+        activeRunId: runId,
+        role: "worker",
+        phase: "issue_breakdown",
+      },
+    );
+
+    if (this.terminal === "throw") {
+      throw new Error("post-plan harness throw");
+    }
+    yield this.terminal;
+  }
+}
+
+class IssueBreakdownRejectingHarness implements AgentHarness {
+  readonly id = "issue-breakdown-rejecting";
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    const runId = `rejecting-plan-run-${this.runs.length}`;
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
     yield { type: "completed" };
   }
 }

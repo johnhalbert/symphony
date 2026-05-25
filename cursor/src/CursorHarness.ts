@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 import type { AgentEvent, AgentHarness, AgentRunContext, AgentRunSdkStatus } from "../../src/core/harness/AgentHarness.js";
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
+import { writeIssueBreakdownPlanMcpContext } from "../../src/core/harness/IssueBreakdownPlanMcpServer.js";
 import { writeReviewFeedbackMcpContext } from "../../src/core/harness/ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
 import { writeTranscriptRecallMcpContext } from "../../src/core/harness/TranscriptRecallMcpServer.js";
@@ -51,14 +52,12 @@ export class CursorHarness implements AgentHarness {
     const agent = lease.agent;
     const deltaEvents: AgentEvent[] = [];
     const cliPath = currentSymphonyCliPath();
-    const runOptions: NonNullable<Parameters<SDKAgent["send"]>[1]> = {
-      model: cursorModelSelection(ctx),
-      local: { force: true },
+    const runOptions = cursorAgentSendOptions(ctx, {
+      mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
       onDelta: ({ update }) => {
         deltaEvents.push(...mapCursorDelta(update));
       },
-      mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
-    };
+    });
     let run: Run;
     try {
       run = await agent.send(prompt, runOptions);
@@ -228,7 +227,7 @@ export class CursorHarness implements AgentHarness {
     if (initialStatus) enqueueStatus(initialStatus, "initial");
 
     try {
-      if (ctx.role === "worker") {
+      if (ctx.role === "worker" && cursorRunPhase(ctx) === "implementation") {
         await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
           issue: ctx.issue,
           activeRunId: run.id,
@@ -241,12 +240,22 @@ export class CursorHarness implements AgentHarness {
           phase: "implementation",
         });
       }
+      if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
+        await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
+          issue: ctx.issue,
+          activeRunId: run.id,
+          role: "worker",
+          workspacePath: ctx.workspace.path,
+          workspace: ctx.workspace,
+          phase: "issue_breakdown",
+        });
+      }
       if (ctx.config.continuationContext.searchEnabled) {
         await writeTranscriptRecallMcpContext(transcriptRecallContextFilePath(ctx), {
           issue: ctx.issue,
           activeRunId: run.id,
           role: ctx.role,
-          phase: ctx.role === "reviewer" ? "review" : "implementation",
+          phase: cursorRunPhase(ctx),
         });
       }
       if (ctx.role === "reviewer") {
@@ -404,17 +413,21 @@ export class CursorHarness implements AgentHarness {
   private async createAgent(ctx: AgentRunContext, options: { allowResume: boolean }): Promise<CursorAgentLease> {
     const cliPath = currentSymphonyCliPath();
     await writeInitialRoleMcpContexts(ctx);
-    const agentOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
-      mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
+    const mcpServers = cursorRoleMcpServers(ctx, { cliPath });
+    const createOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
+      mcpServers,
+    });
+    const resumeOptions = cursorAgentBaseOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
+      mcpServers,
     });
     const latestRun =
-      options.allowResume && ctx.role === "worker"
-        ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker" })
+      options.allowResume && ctx.role === "worker" && cursorRunPhase(ctx) === "implementation"
+        ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker", runPhase: "implementation" })
         : null;
     let agent: SDKAgent;
     if (latestRun?.agentId) {
       try {
-        agent = await Agent.resume(latestRun.agentId, agentOptions);
+        agent = await Agent.resume(latestRun.agentId, resumeOptions);
         return { agent, created: false, resumeAttempted: true, resumeUsed: true, outcome: "resumed" };
       } catch (error) {
         ctx.logger.warn("cursor agent resume failed; creating a new agent", {
@@ -422,11 +435,11 @@ export class CursorHarness implements AgentHarness {
           workspace_path: ctx.workspace.path,
           error: errorMessage(error),
         });
-        agent = await Agent.create(agentOptions);
+        agent = await Agent.create(createOptions);
         return { agent, created: true, resumeAttempted: true, resumeUsed: false, outcome: "created" };
       }
     } else {
-      agent = await Agent.create(agentOptions);
+      agent = await Agent.create(createOptions);
       return { agent, created: true, resumeAttempted: false, resumeUsed: false, outcome: "created" };
     }
   }
@@ -506,7 +519,7 @@ interface CursorLastToolContext {
 }
 
 function shouldReuseAgent(ctx: AgentRunContext): boolean {
-  return ctx.role === "worker" && ctx.config.cursor.workerAgentLifecycle === "resume_by_issue";
+  return ctx.role === "worker" && cursorRunPhase(ctx) === "implementation" && ctx.config.cursor.workerAgentLifecycle === "resume_by_issue";
 }
 
 function flush(events: AgentEvent[]): AgentEvent[] {
@@ -577,6 +590,17 @@ export function cursorAgentCreateOptions(
   options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
 ): Parameters<typeof Agent.create>[0] {
   return {
+    ...cursorAgentBaseOptions(ctx, apiKey, options),
+    ...cursorConversationModeOption(ctx),
+  };
+}
+
+function cursorAgentBaseOptions(
+  ctx: AgentRunContext,
+  apiKey: string | null | undefined,
+  options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
+): Parameters<typeof Agent.create>[0] {
+  return {
     model: cursorModelSelection(ctx),
     local: {
       cwd: ctx.workspace.path,
@@ -588,15 +612,42 @@ export function cursorAgentCreateOptions(
   };
 }
 
+export function cursorAgentSendOptions(
+  ctx: AgentRunContext,
+  options: {
+    mcpServers?: Record<string, McpSubprocessServerConfig>;
+    onDelta?: NonNullable<Parameters<SDKAgent["send"]>[1]>["onDelta"];
+  } = {},
+): NonNullable<Parameters<SDKAgent["send"]>[1]> {
+  return {
+    model: cursorModelSelection(ctx),
+    ...cursorConversationModeOption(ctx),
+    local: { force: true },
+    ...(options.onDelta === undefined ? {} : { onDelta: options.onDelta }),
+    ...(options.mcpServers === undefined ? {} : { mcpServers: options.mcpServers }),
+  };
+}
+
+function cursorConversationModeOption(ctx: AgentRunContext): { mode?: "agent" | "plan" } {
+  const mode = ctx.cursorModeOverride ?? ctx.config.cursor.mode;
+  return mode === null ? {} : { mode };
+}
+
 export function cursorRoleMcpServers(
   ctx: AgentRunContext,
   options: { cliPath: string; mcpCwd?: string },
 ): Record<string, McpSubprocessServerConfig> {
   const applyCwd = (server: McpSubprocessServerConfig): McpSubprocessServerConfig =>
     options.mcpCwd === undefined ? server : { ...server, cwd: options.mcpCwd };
-  if (ctx.role === "worker") {
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "implementation") {
     return {
       symphony: applyCwd(completionReportMcpServerConfig(ctx, completionReportContextFilePath(ctx), options)),
+      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
+    };
+  }
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
+    return {
+      symphony_planning: applyCwd(issueBreakdownPlanMcpServerConfig(ctx, issueBreakdownPlanContextFilePath(ctx), options)),
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
@@ -613,10 +664,10 @@ export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise
       issue: ctx.issue,
       activeRunId: null,
       role: ctx.role,
-      phase: ctx.role === "reviewer" ? "review" : "implementation",
+      phase: cursorRunPhase(ctx),
     });
   }
-  if (ctx.role === "worker") {
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "implementation") {
     await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
       issue: ctx.issue,
       activeRunId: null,
@@ -630,6 +681,18 @@ export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise
     });
     return;
   }
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
+    await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: "worker",
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "issue_breakdown",
+    });
+    return;
+  }
+  if (ctx.role !== "reviewer") return;
   await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
     issue: ctx.issue,
     activeRunId: null,
@@ -686,6 +749,20 @@ export function completionReportMcpServerConfig(
   });
 }
 
+export function issueBreakdownPlanMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "issue-breakdown-plan-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
+}
+
 export function reviewVerdictMcpServerConfig(
   ctx: AgentRunContext,
   contextFile: string,
@@ -736,6 +813,14 @@ export function completionReportContextFilePath(ctx: AgentRunContext): string {
   );
 }
 
+export function issueBreakdownPlanContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "issue-breakdown-plan-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
 export function reviewVerdictContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
@@ -761,7 +846,11 @@ export function transcriptRecallContextFilePath(ctx: AgentRunContext): string {
 }
 
 function agentKey(ctx: AgentRunContext): string {
-  return ctx.role === "reviewer" ? `${ctx.workspace.path}:reviewer` : `${ctx.workspace.path}:worker`;
+  return ctx.role === "reviewer" ? `${ctx.workspace.path}:reviewer` : `${ctx.workspace.path}:worker:${cursorRunPhase(ctx)}`;
+}
+
+function cursorRunPhase(ctx: AgentRunContext): "issue_breakdown" | "implementation" | "review" {
+  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
 }
 
 function safeFileName(value: string): string {

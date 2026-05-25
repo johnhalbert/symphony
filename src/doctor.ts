@@ -172,6 +172,14 @@ export function cursorPolicyDoctorChecks(config: ServiceConfig): DoctorCheck[] {
           ? "Managed Cursor runs do not load project/user setting sources by default"
           : `Managed Cursor runs load setting sources: ${config.cursor.settingSources.join(", ")}`,
     },
+    {
+      id: "cursor.mode",
+      status: config.cursor.mode === null || config.cursor.mode === "agent" ? "ok" : "warn",
+      message:
+        config.cursor.mode === null
+          ? "Managed Cursor runs use the SDK default conversation mode"
+          : `Managed Cursor runs request ${config.cursor.mode} conversation mode`,
+    },
   ];
 }
 

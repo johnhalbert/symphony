@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { AgentRunRole, TokenCounts } from "../types.js";
+import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type PersistedRunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
@@ -74,6 +74,8 @@ export interface RunRecord {
   sessionId: string | null;
   agentId: string | null;
   role: AgentRunRole;
+  runPhase?: AgentRunPhase;
+  runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
   attempt: number | null;
@@ -83,6 +85,7 @@ export interface RunRecord {
   cursorModel?: string | null;
   cursorModelParams?: PersistedCursorModelParam[];
   cursorSettingSources?: string[];
+  cursorMode?: string | null;
   cursorAllowLargeContext?: boolean;
   cursorWorkerAgentLifecycle?: string;
   workspaceKey: string;
@@ -150,6 +153,8 @@ export interface StartRunInput {
   sessionId?: string | null;
   agentId?: string | null;
   role: AgentRunRole;
+  runPhase?: AgentRunPhase;
+  runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
   attempt: number | null;
@@ -158,6 +163,7 @@ export interface StartRunInput {
   cursorModel?: string | null;
   cursorModelParams?: PersistedCursorModelParam[];
   cursorSettingSources?: string[];
+  cursorMode?: string | null;
   cursorAllowLargeContext?: boolean;
   cursorWorkerAgentLifecycle?: string;
   workspaceKey: string;
@@ -244,6 +250,8 @@ export class FileRunTranscriptStore {
       sessionId: input.sessionId ?? existing?.sessionId ?? null,
       agentId: input.agentId ?? existing?.agentId ?? null,
       role: input.role,
+      runPhase: input.runPhase ?? existing?.runPhase ?? defaultRunPhase(input.role),
+      runKind: input.runKind ?? existing?.runKind ?? runKindForPhase(input.runPhase ?? existing?.runPhase ?? defaultRunPhase(input.role)),
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
       attempt: input.attempt,
@@ -253,6 +261,7 @@ export class FileRunTranscriptStore {
       ...(input.cursorModel === undefined ? {} : { cursorModel: input.cursorModel }),
       ...(input.cursorModelParams === undefined ? {} : { cursorModelParams: input.cursorModelParams }),
       ...(input.cursorSettingSources === undefined ? {} : { cursorSettingSources: input.cursorSettingSources }),
+      ...(input.cursorMode === undefined ? {} : { cursorMode: input.cursorMode }),
       ...(input.cursorAllowLargeContext === undefined ? {} : { cursorAllowLargeContext: input.cursorAllowLargeContext }),
       ...(input.cursorWorkerAgentLifecycle === undefined ? {} : { cursorWorkerAgentLifecycle: input.cursorWorkerAgentLifecycle }),
       workspaceKey: input.workspaceKey,
@@ -330,7 +339,8 @@ export class FileRunTranscriptStore {
   }
 
   async getRun(runId: string): Promise<RunRecord | null> {
-    return readJsonIfExists<RunRecord>(this.metaPath(runId));
+    const record = await readJsonIfExists<RunRecord>(this.metaPath(runId));
+    return record === null ? null : normalizeRunRecord(record);
   }
 
   async listRunsForIssue(issueIdOrIdentifier: string): Promise<RunRecord[]> {
@@ -340,9 +350,17 @@ export class FileRunTranscriptStore {
       .sort(compareRunChronology);
   }
 
-  async latestRunForIssue(issueIdOrIdentifier: string, options: { role?: AgentRunRole } = {}): Promise<RunRecord | null> {
+  async latestRunForIssue(
+    issueIdOrIdentifier: string,
+    options: { role?: AgentRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
+  ): Promise<RunRecord | null> {
     const records = await this.listRunsForIssue(issueIdOrIdentifier);
-    const filtered = options.role === undefined ? records : records.filter((record) => record.role === options.role);
+    const filtered = records.filter(
+      (record) =>
+        (options.role === undefined || record.role === options.role) &&
+        (options.runPhase === undefined || record.runPhase === options.runPhase) &&
+        (options.runKind === undefined || record.runKind === options.runKind),
+    );
     return filtered[filtered.length - 1] ?? null;
   }
 
@@ -361,7 +379,7 @@ export class FileRunTranscriptStore {
     await fs.mkdir(this.runsDir(), { recursive: true });
     const entries = await fs.readdir(this.runsDir());
     const records = await Promise.all(entries.map((entry) => readJsonIfExists<RunRecord>(this.metaPath(entry))));
-    return records.filter((record): record is RunRecord => record !== null);
+    return records.filter((record): record is RunRecord => record !== null).map(normalizeRunRecord);
   }
 
   private async writeRun(record: RunRecord): Promise<void> {
@@ -455,6 +473,19 @@ function compareString(left: string, right: string): number {
 function promptPreview(prompt: string): string {
   const oneLine = prompt.replace(/\s+/g, " ").trim();
   return oneLine.length <= 240 ? oneLine : `${oneLine.slice(0, 225)}...[truncated]`;
+}
+
+function normalizeRunRecord(record: RunRecord): RunRecord {
+  const runPhase = record.runPhase ?? defaultRunPhase(record.role);
+  return {
+    ...record,
+    runPhase,
+    runKind: record.runKind ?? runKindForPhase(runPhase),
+  };
+}
+
+function defaultRunPhase(role: AgentRunRole): AgentRunPhase {
+  return role === "reviewer" ? "review" : "implementation";
 }
 
 function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
