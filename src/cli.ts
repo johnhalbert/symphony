@@ -142,6 +142,7 @@ program
       workspace: config.workspace,
       hooks: config.hooks,
       logger,
+      planningWorkspaceMode: config.issueBreakdown.workspaceMode,
     });
     const harness = createAgentHarness(config, { runStore });
     const orchestrator = new Orchestrator({

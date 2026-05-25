@@ -75,6 +75,11 @@ Work on {{ issue.identifier }}.`,
       cursorMode: "plan",
       promptTemplate: expect.stringContaining("Break down {{ issue.identifier }}"),
       planningLabels: [],
+      workspaceMode: "none",
+      maxPlanningFailures: 3,
+      maxPlanningDispatchRetries: 3,
+      planningRetryBaseMs: 5_000,
+      planningRetryMaxMs: 60_000,
     });
     expect(config.mergePolicy).toEqual({
       mode: "disabled",
@@ -399,6 +404,11 @@ Work on {{ issue.identifier }}.`,
       cursorMode: "plan",
       promptTemplate: "Plan {{ issue.identifier }}",
       planningLabels: ["planning"],
+      workspaceMode: "none",
+      maxPlanningFailures: 3,
+      maxPlanningDispatchRetries: 3,
+      planningRetryBaseMs: 5_000,
+      planningRetryMaxMs: 60_000,
     });
     expect(config.mergePolicy).toEqual({
       mode: "gated",
@@ -417,6 +427,49 @@ Work on {{ issue.identifier }}.`,
       done: ["Done"],
       canceled: [],
     });
+  });
+
+  it("rejects readonly issue breakdown workspaces unless a non-Windows git worktree source can enforce them", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: {
+            source: { kind: "copy", path: "/repo" },
+          },
+          issue_breakdown: {
+            workspace_mode: "readonly_checkout",
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("readonly_checkout requires workspace.source.kind git_worktree");
+
+    const parseGitWorktreeReadonly = () =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: {
+            source: {
+              kind: "git_worktree",
+              repository: "/repo",
+              base_ref: "main",
+            },
+          },
+          issue_breakdown: {
+            workspace_mode: "readonly_checkout",
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      );
+
+    if (process.platform === "win32") {
+      expect(parseGitWorktreeReadonly).toThrow("readonly_checkout is not supported on Windows");
+    } else {
+      expect(parseGitWorktreeReadonly().issueBreakdown.workspaceMode).toBe("readonly_checkout");
+    }
   });
 
   it("parses configurable issue board columns and rejects duplicate state mappings", () => {

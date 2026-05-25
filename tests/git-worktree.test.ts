@@ -77,25 +77,52 @@ describe("git worktree workspace source", () => {
     expect(await manager.getWorkspaceRecord("TEST-5")).toBeNull();
   });
 
-  it("creates read-only detached planning checkouts and removes their planning metadata", async () => {
+  it("creates default no-worktree planning workspaces", async () => {
     const manager = newManager(root, repo, "force");
+    const planningIssue = issue({ identifier: "TEST-PLAN-NONE", branchName: "symphony/TEST-PLAN-NONE" });
+
+    const workspace = await manager.createForPlanning(planningIssue);
+    const marker = await readFile(path.join(workspace.path, ".symphony-planning.json"), "utf8");
+    const record = await manager.getWorkspaceRecord("TEST-PLAN-NONE-planning");
+
+    expect(workspace.workspaceKey).toBe("TEST-PLAN-NONE-planning");
+    expect(workspace.sourceKind).toBe("planning_none");
+    expect(workspace.gitBranchName).toBeUndefined();
+    expect(workspace.repoPath).toBeUndefined();
+    expect(marker).toContain('"mode": "none"');
+    expect(record?.sourceKind).toBe("planning_none");
+    await expect(readFile(path.join(workspace.path, ".git"), "utf8")).rejects.toThrow();
+
+    await manager.removeForPlanning(planningIssue);
+
+    await expect(readFile(path.join(workspace.path, ".symphony-planning.json"), "utf8")).rejects.toThrow();
+    expect(await manager.getWorkspaceRecord("TEST-PLAN-NONE-planning")).toBeNull();
+  });
+
+  it("creates read-only detached planning checkouts and removes their planning metadata when opted in", async () => {
+    const manager = newManager(root, repo, "force", "readonly_checkout");
     const planningIssue = issue({ identifier: "TEST-PLAN", branchName: "symphony/TEST-PLAN" });
+
+    if (process.platform === "win32") {
+      await expect(manager.createForPlanning(planningIssue)).rejects.toThrow("readonly_checkout is not supported on Windows");
+      return;
+    }
 
     const workspace = await manager.createForPlanning(planningIssue);
     const currentBranch = await git(["branch", "--show-current"], workspace.path);
     const readme = await readFile(path.join(workspace.path, "README.md"), "utf8");
+    const marker = await readFile(path.join(workspace.path, ".symphony-planning-readonly.json"), "utf8");
     const record = await manager.getWorkspaceRecord("TEST-PLAN-planning");
 
     expect(currentBranch.trim()).toBe("");
     expect(readme).toContain("hello");
+    expect(marker).toContain('"mode": "readonly_checkout"');
     expect(workspace.workspaceKey).toBe("TEST-PLAN-planning");
     expect(workspace.gitBranchName).toBeUndefined();
     expect(workspace.sourceKind).toBe("planning_readonly");
     expect(record?.sourceKind).toBe("planning_readonly");
     expect(record?.gitBranchName).toBeUndefined();
-    if (process.platform !== "win32") {
-      await expect(writeFile(path.join(workspace.path, "write.txt"), "blocked", "utf8")).rejects.toThrow();
-    }
+    await expect(writeFile(path.join(workspace.path, "write.txt"), "blocked", "utf8")).rejects.toThrow();
 
     await manager.removeForPlanning(planningIssue);
 
@@ -105,7 +132,12 @@ describe("git worktree workspace source", () => {
   });
 });
 
-function newManager(root: string, repository: string, cleanup: "refuse_dirty" | "force" = "refuse_dirty"): WorkspaceManager {
+function newManager(
+  root: string,
+  repository: string,
+  cleanup: "refuse_dirty" | "force" = "refuse_dirty",
+  planningWorkspaceMode: "none" | "readonly_checkout" = "none",
+): WorkspaceManager {
   const config = parseServiceConfig(
     {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -128,6 +160,7 @@ function newManager(root: string, repository: string, cleanup: "refuse_dirty" | 
     workspace: config.workspace,
     hooks: config.hooks,
     logger: new StructuredLogger(() => undefined),
+    planningWorkspaceMode,
   });
 }
 

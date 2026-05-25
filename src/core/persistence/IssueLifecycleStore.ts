@@ -35,6 +35,7 @@ export interface IssueLifecycleSummaryReference {
   transcriptPointers: string[];
   statusApiPointers: string[];
   issueUpdatedAt?: string | null;
+  issueContentFingerprint?: string | null;
   configFingerprint?: string | null;
   cursorMode?: string | null;
   createdAt: string;
@@ -51,6 +52,7 @@ export interface ProposedIssueRecord {
 export interface IssueBreakdownPlanRecord {
   id: string;
   idempotencyKey: string;
+  requestHash: string;
   runId: string;
   issueId: string;
   issueIdentifier: string;
@@ -59,6 +61,7 @@ export interface IssueBreakdownPlanRecord {
   transcriptPointers: string[];
   statusApiPointers: string[];
   issueUpdatedAt: string | null;
+  issueContentFingerprint: string;
   configFingerprint: string;
   cursorMode: string;
   acceptedAt: string;
@@ -255,6 +258,10 @@ export interface IssueLifecycleRecord {
   reviewRound: number;
   incompleteTurnCount: number;
   lastIssueBreakdownPlanId: string | null;
+  planningFailureCount: number;
+  planningDispatchRetryCount: number;
+  lastPlanningFailureRunId: string | null;
+  lastPlanningFailureAt: string | null;
   lastCompletionReportId: string | null;
   lastReviewVerdictId: string | null;
   blockedReason: string | null;
@@ -276,6 +283,10 @@ export interface IssueLifecyclePatch {
   reviewRound?: number;
   incompleteTurnCount?: number;
   lastIssueBreakdownPlanId?: string | null;
+  planningFailureCount?: number;
+  planningDispatchRetryCount?: number;
+  lastPlanningFailureRunId?: string | null;
+  lastPlanningFailureAt?: string | null;
   lastCompletionReportId?: string | null;
   lastReviewVerdictId?: string | null;
   blockedReason?: string | null;
@@ -309,6 +320,14 @@ export class FileIssueLifecycleStore {
         "lastIssueBreakdownPlanId",
         existing?.lastIssueBreakdownPlanId ?? null,
       ),
+      planningFailureCount: patch.planningFailureCount ?? existing?.planningFailureCount ?? 0,
+      planningDispatchRetryCount: patch.planningDispatchRetryCount ?? existing?.planningDispatchRetryCount ?? 0,
+      lastPlanningFailureRunId: patchValue(
+        patch,
+        "lastPlanningFailureRunId",
+        existing?.lastPlanningFailureRunId ?? null,
+      ),
+      lastPlanningFailureAt: patchValue(patch, "lastPlanningFailureAt", existing?.lastPlanningFailureAt ?? null),
       lastCompletionReportId: patchValue(patch, "lastCompletionReportId", existing?.lastCompletionReportId ?? null),
       lastReviewVerdictId: patchValue(patch, "lastReviewVerdictId", existing?.lastReviewVerdictId ?? null),
       blockedReason: patchValue(patch, "blockedReason", existing?.blockedReason ?? null),
@@ -587,6 +606,22 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
       filePath,
       "lastIssueBreakdownPlanId",
     ),
+    planningFailureCount:
+      value.planningFailureCount === undefined
+        ? 0
+        : nonNegativeInteger(value.planningFailureCount, filePath, "planningFailureCount"),
+    planningDispatchRetryCount:
+      value.planningDispatchRetryCount === undefined
+        ? 0
+        : nonNegativeInteger(value.planningDispatchRetryCount, filePath, "planningDispatchRetryCount"),
+    lastPlanningFailureRunId:
+      value.lastPlanningFailureRunId === undefined
+        ? null
+        : nullableString(value.lastPlanningFailureRunId, filePath, "lastPlanningFailureRunId"),
+    lastPlanningFailureAt:
+      value.lastPlanningFailureAt === undefined
+        ? null
+        : nullableString(value.lastPlanningFailureAt, filePath, "lastPlanningFailureAt"),
     lastCompletionReportId: nullableString(value.lastCompletionReportId, filePath, "lastCompletionReportId"),
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
@@ -666,6 +701,13 @@ function normalizeSummaryReference(value: unknown, filePath: string, index: numb
   if (value.issueUpdatedAt !== undefined) {
     normalized.issueUpdatedAt = optionalNullableString(value.issueUpdatedAt, filePath, `summaryReferences[${index}].issueUpdatedAt`);
   }
+  if (value.issueContentFingerprint !== undefined) {
+    normalized.issueContentFingerprint = optionalNullableString(
+      value.issueContentFingerprint,
+      filePath,
+      `summaryReferences[${index}].issueContentFingerprint`,
+    );
+  }
   if (value.configFingerprint !== undefined) {
     normalized.configFingerprint = optionalNullableString(value.configFingerprint, filePath, `summaryReferences[${index}].configFingerprint`);
   }
@@ -686,6 +728,10 @@ function normalizeIssueBreakdownPlan(value: unknown, filePath: string, index: nu
   return {
     id: requiredString(value.id, filePath, `issueBreakdownPlans[${index}].id`),
     idempotencyKey: requiredString(value.idempotencyKey, filePath, `issueBreakdownPlans[${index}].idempotencyKey`),
+    requestHash:
+      value.requestHash === undefined
+        ? ""
+        : requiredString(value.requestHash, filePath, `issueBreakdownPlans[${index}].requestHash`),
     runId: requiredString(value.runId, filePath, `issueBreakdownPlans[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `issueBreakdownPlans[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `issueBreakdownPlans[${index}].issueIdentifier`),
@@ -694,6 +740,14 @@ function normalizeIssueBreakdownPlan(value: unknown, filePath: string, index: nu
     transcriptPointers: requiredStringArray(value.transcriptPointers, filePath, `issueBreakdownPlans[${index}].transcriptPointers`),
     statusApiPointers: requiredStringArray(value.statusApiPointers, filePath, `issueBreakdownPlans[${index}].statusApiPointers`),
     issueUpdatedAt: nullableString(value.issueUpdatedAt, filePath, `issueBreakdownPlans[${index}].issueUpdatedAt`),
+    issueContentFingerprint:
+      value.issueContentFingerprint === undefined
+        ? ""
+        : requiredString(
+            value.issueContentFingerprint,
+            filePath,
+            `issueBreakdownPlans[${index}].issueContentFingerprint`,
+          ),
     configFingerprint: requiredString(value.configFingerprint, filePath, `issueBreakdownPlans[${index}].configFingerprint`),
     cursorMode: requiredString(value.cursorMode, filePath, `issueBreakdownPlans[${index}].cursorMode`),
     acceptedAt: requiredString(value.acceptedAt, filePath, `issueBreakdownPlans[${index}].acceptedAt`),

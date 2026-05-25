@@ -4,6 +4,7 @@ import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
 import type {
   IssueBreakdownPlanRecord,
+  IssueLifecycleRecord,
   IssueLifecycleStore,
   IssueLifecycleSummaryReference,
 } from "./persistence/IssueLifecycleStore.js";
@@ -11,6 +12,7 @@ import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 
 export const ISSUE_BREAKDOWN_PLAN_SCHEMA_VERSION = 1;
+export const ISSUE_CONTENT_FINGERPRINT_VERSION = 1;
 
 const issueBreakdownPlanSchema = z.object({
   runId: z.string().trim().min(1),
@@ -66,13 +68,38 @@ export class IssueBreakdownPlanService {
     validateCaller(parsed, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
-    const existing = existingLifecycle?.issueBreakdownPlans.find((plan) => plan.idempotencyKey === parsed.idempotencyKey);
-    if (existing) return { accepted: true, replayed: true, plan: existing };
+    const configFingerprint = issueBreakdownConfigFingerprint(this.options.config);
+    const contentFingerprint = issueContentFingerprint(context.issue);
+    const requestHash = issueBreakdownPlanRequestHash(parsed);
+    const existingScoped = existingLifecycle?.issueBreakdownPlans.find(
+      (plan) => plan.runId === context.activeRunId && plan.idempotencyKey === parsed.idempotencyKey,
+    );
+    if (existingScoped) {
+      assertIssueBreakdownPlanReplayAllowed(existingScoped, {
+        idempotencyKey: parsed.idempotencyKey,
+        activeRunId: context.activeRunId,
+        requestHash,
+      });
+      return { accepted: true, replayed: true, plan: existingScoped };
+    }
+    const existingCrossRun = existingLifecycle?.issueBreakdownPlans.find(
+      (plan) => plan.idempotencyKey === parsed.idempotencyKey && plan.runId !== context.activeRunId,
+    );
+    if (existingCrossRun) {
+      throw issueBreakdownPlanIdempotencyConflict("cross_run_key_reuse", existingCrossRun, {
+        idempotencyKey: parsed.idempotencyKey,
+        activeRunId: context.activeRunId,
+        requestHash,
+        configFingerprint,
+        issueContentFingerprint: contentFingerprint,
+      });
+    }
 
     const acceptedAt = new Date().toISOString();
     const plan: IssueBreakdownPlanRecord = {
       id: issueBreakdownPlanIdFor(context.issue.id, parsed.idempotencyKey),
       idempotencyKey: parsed.idempotencyKey,
+      requestHash,
       runId: parsed.runId,
       issueId: context.issue.id,
       issueIdentifier: context.issue.identifier,
@@ -85,7 +112,8 @@ export class IssueBreakdownPlanService {
         `/api/v1/runs/${encodeURIComponent(parsed.runId)}`,
       ],
       issueUpdatedAt: context.issue.updatedAt,
-      configFingerprint: issueBreakdownConfigFingerprint(this.options.config),
+      issueContentFingerprint: contentFingerprint,
+      configFingerprint,
       cursorMode: this.options.config.issueBreakdown.cursorMode,
       acceptedAt,
     };
@@ -100,6 +128,7 @@ export class IssueBreakdownPlanService {
       transcriptPointers: plan.transcriptPointers,
       statusApiPointers: plan.statusApiPointers,
       issueUpdatedAt: plan.issueUpdatedAt,
+      issueContentFingerprint: plan.issueContentFingerprint,
       configFingerprint: plan.configFingerprint,
       cursorMode: plan.cursorMode,
       createdAt: acceptedAt,
@@ -107,6 +136,10 @@ export class IssueBreakdownPlanService {
 
     const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
       lastIssueBreakdownPlanId: plan.id,
+      planningFailureCount: 0,
+      planningDispatchRetryCount: 0,
+      lastPlanningFailureRunId: null,
+      lastPlanningFailureAt: null,
       issueBreakdownPlans: [...(existingLifecycle?.issueBreakdownPlans ?? []), plan],
       summaryReferences: upsertIssueBreakdownReference(existingLifecycle?.summaryReferences ?? [], reference),
     });
@@ -133,11 +166,83 @@ export function parseIssueBreakdownPlan(input: unknown): IssueBreakdownPlanInput
 export function issueBreakdownConfigFingerprint(config: ServiceConfig): string {
   return createHash("sha256")
     .update(
-      JSON.stringify({
+      stableJson({
         schemaVersion: ISSUE_BREAKDOWN_PLAN_SCHEMA_VERSION,
         promptTemplate: config.issueBreakdown.promptTemplate,
         cursorMode: config.issueBreakdown.cursorMode,
         planningLabels: config.issueBreakdown.planningLabels,
+        workspaceMode: config.issueBreakdown.workspaceMode,
+      }),
+    )
+    .digest("hex");
+}
+
+export function issueContentFingerprint(issue: Issue): string {
+  return createHash("sha256")
+    .update(
+      stableJson({
+        version: ISSUE_CONTENT_FINGERPRINT_VERSION,
+        title: normalizeString(issue.title),
+        description: normalizeString(issue.description ?? ""),
+        priority: issue.priority,
+        labels: normalizeStringList(issue.labels, { lowercase: true }),
+        blockedBy: issue.blockedBy
+          .map((blocker) => ({
+            id: normalizeNullableString(blocker.id),
+            identifier: normalizeNullableString(blocker.identifier),
+            state: normalizeNullableString(blocker.state),
+          }))
+          .sort((left, right) =>
+            `${left.identifier ?? ""}\0${left.id ?? ""}\0${left.state ?? ""}`.localeCompare(
+              `${right.identifier ?? ""}\0${right.id ?? ""}\0${right.state ?? ""}`,
+            ),
+          ),
+      }),
+    )
+    .digest("hex");
+}
+
+export function isFreshIssueBreakdownPlan(
+  plan: IssueBreakdownPlanRecord,
+  issue: Issue,
+  config: ServiceConfig,
+): boolean {
+  if (plan.configFingerprint !== issueBreakdownConfigFingerprint(config)) return false;
+  if (plan.issueContentFingerprint.length === 0) return false;
+  return plan.issueContentFingerprint === issueContentFingerprint(issue);
+}
+
+export function latestFreshIssueBreakdownPlan(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  issue: Issue,
+  config: ServiceConfig,
+): IssueBreakdownPlanRecord | null {
+  const plans = lifecycle?.issueBreakdownPlans.filter((plan) => isFreshIssueBreakdownPlan(plan, issue, config)) ?? [];
+  return (
+    [...plans].sort((left, right) => Date.parse(left.acceptedAt) - Date.parse(right.acceptedAt))[plans.length - 1] ??
+    null
+  );
+}
+
+export function issueBreakdownPlanRequestHash(input: IssueBreakdownPlanInput): string {
+  return createHash("sha256")
+    .update(
+      stableJson({
+        issueId: input.issueId,
+        summary: normalizeString(input.summary),
+        proposedIssues: input.proposedIssues
+          .map((item) => ({
+            title: normalizeString(item.title),
+            description: normalizeString(item.description),
+            acceptanceCriteria: normalizeStringList(item.acceptanceCriteria),
+            dependencies: normalizeStringList(item.dependencies),
+            labels: normalizeStringList(item.labels, { lowercase: true }),
+          }))
+          .sort((left, right) =>
+            `${left.title}\0${left.description}\0${left.labels.join(",")}`.localeCompare(
+              `${right.title}\0${right.description}\0${right.labels.join(",")}`,
+            ),
+          ),
       }),
     )
     .digest("hex");
@@ -171,6 +276,47 @@ function validateCaller(plan: IssueBreakdownPlanInput, context: IssueBreakdownPl
   }
 }
 
+function assertIssueBreakdownPlanReplayAllowed(
+  existing: IssueBreakdownPlanRecord,
+  expected: {
+    idempotencyKey: string;
+    activeRunId: string;
+    requestHash: string;
+  },
+): void {
+  if (existing.requestHash.length === 0 || existing.issueContentFingerprint.length === 0) {
+    throw issueBreakdownPlanIdempotencyConflict("legacy_plan_not_replayable", existing, expected);
+  }
+  if (existing.requestHash !== expected.requestHash) {
+    throw issueBreakdownPlanIdempotencyConflict("payload_mismatch", existing, expected);
+  }
+}
+
+function issueBreakdownPlanIdempotencyConflict(
+  reason: "payload_mismatch" | "cross_run_key_reuse" | "legacy_plan_not_replayable",
+  existing: IssueBreakdownPlanRecord,
+  expected: {
+    idempotencyKey: string;
+    activeRunId: string;
+    requestHash: string;
+    configFingerprint?: string;
+    issueContentFingerprint?: string;
+  },
+): SymphonyError {
+  return new SymphonyError("conflict", "Issue breakdown plan idempotency key was reused with a different run or payload", {
+    reason,
+    idempotencyKey: expected.idempotencyKey,
+    activeRunId: expected.activeRunId,
+    requestHash: expected.requestHash,
+    issueContentFingerprint: expected.issueContentFingerprint ?? null,
+    configFingerprint: expected.configFingerprint ?? null,
+    existingRunId: existing.runId,
+    existingRequestHash: existing.requestHash,
+    existingIssueContentFingerprint: existing.issueContentFingerprint,
+    existingConfigFingerprint: existing.configFingerprint,
+  });
+}
+
 function issueBreakdownPlanIdFor(issueId: string, idempotencyKey: string): string {
   return `issue-breakdown-plan:${issueId}:${idempotencyKey}`;
 }
@@ -180,4 +326,34 @@ function upsertIssueBreakdownReference(
   reference: IssueLifecycleSummaryReference,
 ): IssueLifecycleSummaryReference[] {
   return [...references.filter((item) => item.id !== reference.id), reference];
+}
+
+function normalizeString(value: string): string {
+  return value.trim();
+}
+
+function normalizeNullableString(value: string | null): string | null {
+  const normalized = value?.trim() ?? "";
+  return normalized.length === 0 ? null : normalized;
+}
+
+function normalizeStringList(values: string[], options: { lowercase?: boolean } = {}): string[] {
+  const normalized = values
+    .map((value) => {
+      const trimmed = value.trim();
+      return options.lowercase ? trimmed.toLowerCase() : trimmed;
+    })
+    .filter((value) => value.length > 0);
+  return [...new Set(normalized)].sort((left, right) => left.localeCompare(right));
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }

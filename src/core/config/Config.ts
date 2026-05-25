@@ -87,6 +87,11 @@ const rawConfigSchema = z
         cursor_mode: z.enum(["agent", "plan"]).optional(),
         prompt: z.string().optional(),
         planning_labels: stringArray.optional(),
+        workspace_mode: z.enum(["none", "readonly_checkout"]).optional(),
+        max_planning_failures: z.number().int().positive().optional(),
+        max_planning_dispatch_retries: z.number().int().positive().optional(),
+        planning_retry_base_ms: z.number().int().positive().optional(),
+        planning_retry_max_ms: z.number().int().positive().optional(),
       })
       .passthrough()
       .optional(),
@@ -357,6 +362,11 @@ export interface IssueBreakdownConfig {
   cursorMode: CursorConversationMode;
   promptTemplate: string;
   planningLabels: string[];
+  workspaceMode: "none" | "readonly_checkout";
+  maxPlanningFailures: number;
+  maxPlanningDispatchRetries: number;
+  planningRetryBaseMs: number;
+  planningRetryMaxMs: number;
 }
 
 export interface IssueBoardConfig {
@@ -460,6 +470,21 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     }
     if (!raw.workspace?.source?.base_ref) {
       throw new SymphonyError("config_validation_error", "workspace.source.base_ref is required for git_worktree");
+    }
+  }
+  const issueBreakdownWorkspaceMode = raw.issue_breakdown?.workspace_mode ?? "none";
+  if (issueBreakdownWorkspaceMode === "readonly_checkout") {
+    if (sourceKind !== "git_worktree") {
+      throw new SymphonyError(
+        "config_validation_error",
+        "issue_breakdown.workspace_mode readonly_checkout requires workspace.source.kind git_worktree",
+      );
+    }
+    if (process.platform === "win32") {
+      throw new SymphonyError(
+        "config_validation_error",
+        "issue_breakdown.workspace_mode readonly_checkout is not supported on Windows; use workspace_mode none",
+      );
     }
   }
 
@@ -638,6 +663,12 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
       promptTemplate: raw.issue_breakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
       planningLabels: normalizeLabels(raw.issue_breakdown?.planning_labels),
+      workspaceMode: issueBreakdownWorkspaceMode,
+      maxPlanningFailures: raw.issue_breakdown?.max_planning_failures ?? 3,
+      maxPlanningDispatchRetries:
+        raw.issue_breakdown?.max_planning_dispatch_retries ?? raw.issue_breakdown?.max_planning_failures ?? 3,
+      planningRetryBaseMs: raw.issue_breakdown?.planning_retry_base_ms ?? 5_000,
+      planningRetryMaxMs: raw.issue_breakdown?.planning_retry_max_ms ?? 60_000,
     },
     raw,
   };

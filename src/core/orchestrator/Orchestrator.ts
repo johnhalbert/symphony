@@ -25,7 +25,7 @@ import {
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
 import {
-  issueBreakdownConfigFingerprint,
+  latestFreshIssueBreakdownPlan,
   renderIssueBreakdownPlanSummary,
 } from "../IssueBreakdownPlanService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
@@ -46,7 +46,6 @@ import {
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
   type IssueLifecycleSummaryReference,
-  type IssueBreakdownPlanRecord,
   type IssueLifecycleStore,
   type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
@@ -170,6 +169,7 @@ export interface RetryEntry {
   dueAtMs: number;
   timer: NodeJS.Timeout;
   error: string | null;
+  runPhase: AgentRunPhase;
 }
 
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
@@ -865,6 +865,18 @@ export class Orchestrator {
       return true;
     }
 
+    if (role === "worker" && runPhase === "issue_breakdown") {
+      if (lifecycle.planningFailureCount >= this.config.issueBreakdown.maxPlanningFailures) {
+        await this.escalateLifecycleBlocked(
+          issue,
+          lifecycle,
+          lifecycle.summaryPointers.lastRunId ?? issue.id,
+          maxPlanningFailuresReason(lifecycle.planningFailureCount, this.config.issueBreakdown.maxPlanningFailures),
+        );
+        return false;
+      }
+      if (planningBackoffRemainingMs(lifecycle, this.config) > 0) return false;
+    }
     if (
       role === "worker" &&
       runPhase === "implementation" &&
@@ -928,12 +940,24 @@ export class Orchestrator {
       });
       return false;
     }
-    const runPhase = decision.runPhase;
+    let runPhase = decision.runPhase;
     if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase))) return false;
     const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, this.config) : null;
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
     const afterWriteback = dispatchWriteback ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] : latest;
     if (!afterWriteback) return false;
+    if (dispatchWriteback) {
+      const postWritebackDecision = await this.resolveWorkerDispatchDecision(afterWriteback);
+      if (postWritebackDecision.action === "skip") {
+        this.options.logger.warn("worker dispatch skipped after writeback", {
+          issue_id: afterWriteback.id,
+          issue_identifier: afterWriteback.identifier,
+          reason: postWritebackDecision.reason,
+        });
+        return false;
+      }
+      runPhase = postWritebackDecision.runPhase;
+    }
     if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase))) return false;
 
@@ -1365,7 +1389,27 @@ export class Orchestrator {
     this.endedRuntimeSeconds += (Date.now() - entry.startedAt.getTime()) / 1000;
 
     if (entry.runPhase === "issue_breakdown") {
-      this.claimed.delete(issueId);
+      const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
+      if (accepted) {
+        await this.options.lifecycleStore?.updateIssue(entry.issue, {
+          planningFailureCount: 0,
+          planningDispatchRetryCount: 0,
+          lastPlanningFailureRunId: null,
+          lastPlanningFailureAt: null,
+        });
+        this.clearRetry(issueId);
+        this.completed.add(issueId);
+        this.claimed.delete(issueId);
+        return;
+      }
+      if (entry.suppressRetryOnExit) {
+        this.claimed.delete(issueId);
+        return;
+      }
+      await this.recordPlanningFailure(
+        entry,
+        error ?? (kind === "normal" ? "Planning run completed without submit_issue_breakdown_plan" : "Planning run failed"),
+      );
       return;
     }
 
@@ -1428,7 +1472,7 @@ export class Orchestrator {
         return;
       }
       if (await this.shouldScheduleContinuation(entry)) {
-        this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null);
+        this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
       } else {
         this.claimed.delete(issueId);
       }
@@ -1510,8 +1554,48 @@ export class Orchestrator {
       );
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
-      this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error);
+      this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error, entry.runPhase);
     }
+  }
+
+  private async recordPlanningFailure(entry: RunningEntry, error: string | null): Promise<void> {
+    const issueId = entry.issue.id;
+    const store = this.options.lifecycleStore;
+    if (!store) {
+      this.claimed.delete(issueId);
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const runId = entry.activeRunId ?? entry.runId ?? issueId;
+    const current = (await store.get(issueId)) ?? entry.lifecycle;
+    const nextCount = (current?.planningFailureCount ?? 0) + 1;
+    const lifecycle = await store.updateIssue(entry.issue, {
+      planningFailureCount: nextCount,
+      planningDispatchRetryCount: 0,
+      lastPlanningFailureRunId: runId,
+      lastPlanningFailureAt: now,
+    });
+    entry.lifecycle = lifecycle;
+    await this.options.runStore?.appendEvent({
+      runId,
+      at: now,
+      source: "orchestrator",
+      eventType: "planning_run_failed",
+      message: error ?? "Planning run failed",
+      payload: { planningFailureCount: nextCount },
+    });
+
+    const maxFailures = this.config.issueBreakdown.maxPlanningFailures;
+    if (nextCount >= maxFailures) {
+      await this.escalateLifecycleBlocked(entry.issue, lifecycle, runId, maxPlanningFailuresReason(nextCount, maxFailures));
+      this.clearRetry(issueId);
+      this.claimed.delete(issueId);
+      return;
+    }
+
+    const delayMs = planningRetryDelayMs(nextCount, this.config);
+    this.scheduleRetry(issueId, entry.issue.identifier, nextCount, delayMs, error, "issue_breakdown");
   }
 
   private async applyWritebacks(
@@ -1560,13 +1644,20 @@ export class Orchestrator {
     return this.shouldDispatchWorker(latest, true);
   }
 
-  private scheduleRetry(issueId: string, identifier: string, attempt: number, delayMs: number, error: string | null): void {
+  private scheduleRetry(
+    issueId: string,
+    identifier: string,
+    attempt: number,
+    delayMs: number,
+    error: string | null,
+    runPhase: AgentRunPhase = "implementation",
+  ): void {
     this.clearRetry(issueId);
     const dueAtMs = Date.now() + delayMs;
     const timer = setTimeout(() => {
       void this.onRetryTimer(issueId);
     }, delayMs);
-    this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error });
+    this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error, runPhase });
   }
 
   private async onRetryTimer(issueId: string): Promise<void> {
@@ -1580,15 +1671,74 @@ export class Orchestrator {
         this.claimed.delete(issueId);
         return;
       }
+      if (retry.runPhase === "issue_breakdown") {
+        const remainingMs = await this.planningBackoffRemainingForIssue(issue);
+        if (remainingMs > 0) {
+          this.scheduleRetry(issueId, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+          return;
+        }
+      }
       if (this.availableSlots() <= 0) {
-        this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, "no available orchestrator slots");
+        if (retry.runPhase === "issue_breakdown") {
+          await this.recordPlanningDispatchRetry(issue, retry, "no available orchestrator slots");
+        } else {
+          this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, "no available orchestrator slots", retry.runPhase);
+        }
         return;
       }
       const dispatched = await this.tryDispatchWorkerIssue(issue, retry.attempt, true);
-      if (!dispatched) this.claimed.delete(issueId);
+      if (!dispatched) {
+        if (retry.runPhase === "issue_breakdown") {
+          await this.recordPlanningDispatchRetry(issue, retry, retry.error ?? "planning dispatch retry failed");
+        } else {
+          this.claimed.delete(issueId);
+        }
+      }
     } catch (error) {
-      this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, errorMessage(error));
+      if (retry.runPhase === "issue_breakdown" && retry.attempt >= this.config.issueBreakdown.maxPlanningDispatchRetries) {
+        this.claimed.delete(issueId);
+        return;
+      }
+      this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, errorMessage(error), retry.runPhase);
     }
+  }
+
+  private async planningBackoffRemainingForIssue(issue: Issue): Promise<number> {
+    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    if (!lifecycle) return 0;
+    return planningBackoffRemainingMs(lifecycle, this.config);
+  }
+
+  private async recordPlanningDispatchRetry(issue: Issue, retry: RetryEntry, error: string | null): Promise<void> {
+    const store = this.options.lifecycleStore;
+    if (!store) {
+      this.claimed.delete(issue.id);
+      return;
+    }
+    const current = await store.get(issue.id);
+    if (current) {
+      const remainingMs = planningBackoffRemainingMs(current, this.config);
+      if (remainingMs > 0) {
+        this.scheduleRetry(issue.id, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+        return;
+      }
+    }
+    const nextCount = (current?.planningDispatchRetryCount ?? 0) + 1;
+    const lifecycle = await store.updateIssue(issue, { planningDispatchRetryCount: nextCount });
+    const maxRetries = this.config.issueBreakdown.maxPlanningDispatchRetries;
+    if (nextCount >= maxRetries) {
+      await this.escalateLifecycleBlocked(
+        issue,
+        lifecycle,
+        lifecycle.summaryPointers.lastRunId ?? retry.identifier,
+        maxPlanningDispatchRetriesReason(nextCount, maxRetries),
+      );
+      this.clearRetry(issue.id);
+      this.claimed.delete(issue.id);
+      return;
+    }
+    const delayMs = planningRetryDelayMs(Math.max(lifecycle.planningFailureCount, 1), this.config);
+    this.scheduleRetry(issue.id, retry.identifier, retry.attempt + 1, delayMs, error, retry.runPhase);
   }
 
   private clearRetry(issueId: string): void {
@@ -2399,25 +2549,31 @@ function latestContinuationSummaryReference(
   );
 }
 
-function latestFreshIssueBreakdownPlan(
-  lifecycle: IssueLifecycleRecord | null | undefined,
-  issue: Issue,
-  config: ServiceConfig,
-): IssueBreakdownPlanRecord | null {
-  const fingerprint = issueBreakdownConfigFingerprint(config);
-  const plans =
-    lifecycle?.issueBreakdownPlans.filter(
-      (plan) =>
-        plan.configFingerprint === fingerprint &&
-        (issue.updatedAt === null || plan.issueUpdatedAt === issue.updatedAt),
-    ) ?? [];
-  return (
-    [...plans].sort((left, right) => Date.parse(left.acceptedAt) - Date.parse(right.acceptedAt))[plans.length - 1] ?? null
+function effectiveCursorModeForEntry(entry: RunningEntry, config: ServiceConfig): "agent" | "plan" | null {
+  return entry.runPhase === "issue_breakdown" ? config.issueBreakdown.cursorMode : config.cursor.mode;
+}
+
+function maxPlanningFailuresReason(count: number, max: number): string {
+  return `max planning failures reached (${count}/${max})`;
+}
+
+function maxPlanningDispatchRetriesReason(count: number, max: number): string {
+  return `max planning dispatch retries reached (${count}/${max})`;
+}
+
+function planningRetryDelayMs(failureCount: number, config: ServiceConfig): number {
+  return Math.min(
+    config.issueBreakdown.planningRetryBaseMs * 2 ** Math.max(failureCount - 1, 0),
+    config.issueBreakdown.planningRetryMaxMs,
   );
 }
 
-function effectiveCursorModeForEntry(entry: RunningEntry, config: ServiceConfig): "agent" | "plan" | null {
-  return entry.runPhase === "issue_breakdown" ? config.issueBreakdown.cursorMode : config.cursor.mode;
+function planningBackoffRemainingMs(lifecycle: IssueLifecycleRecord, config: ServiceConfig, nowMs = Date.now()): number {
+  if (lifecycle.planningFailureCount <= 0 || lifecycle.lastPlanningFailureAt === null) return 0;
+  const failedAtMs = Date.parse(lifecycle.lastPlanningFailureAt);
+  if (!Number.isFinite(failedAtMs)) return 0;
+  const dueAtMs = failedAtMs + planningRetryDelayMs(lifecycle.planningFailureCount, config);
+  return Math.max(0, dueAtMs - nowMs);
 }
 
 function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[]): boolean {

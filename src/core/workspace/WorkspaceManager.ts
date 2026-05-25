@@ -13,6 +13,7 @@ export interface WorkspaceManagerOptions {
   workspace: WorkspaceConfig;
   hooks: HookConfig;
   logger: Logger;
+  planningWorkspaceMode?: "none" | "readonly_checkout";
 }
 
 export interface WorkspaceMetadata {
@@ -129,8 +130,33 @@ export class WorkspaceManager {
     let repoPath = existing?.repoPath;
     let baseRef = existing?.baseRef;
     let sourceKind: string = source.kind;
+    const planningMode = this.options.planningWorkspaceMode ?? "none";
+    assertSupportedPlanningWorkspaceMode(planningMode, source.kind);
 
-    if (source.kind === "git_worktree") {
+    if (planningMode === "none") {
+      if (!createdNow) {
+        await this.removePlanningWorkspace(workspaceKey, workspacePath, existing);
+      }
+      await ensureDirectory(workspacePath);
+      await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+      await fs.writeFile(
+        path.join(workspacePath, ".symphony-planning.json"),
+        `${JSON.stringify(
+          {
+            issueId: issue.id,
+            issueIdentifier,
+            mode: "none",
+            createdAt: new Date().toISOString(),
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
+      repoPath = undefined;
+      baseRef = undefined;
+      sourceKind = "planning_none";
+    } else if (source.kind === "git_worktree") {
       if (!createdNow) {
         await this.removePlanningWorkspace(workspaceKey, workspacePath, existing);
       }
@@ -145,19 +171,21 @@ export class WorkspaceManager {
       baseRef = result.baseRef;
       sourceKind = "planning_readonly";
       await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+      await fs.writeFile(
+        path.join(workspacePath, ".symphony-planning-readonly.json"),
+        `${JSON.stringify(
+          {
+            issueId: issue.id,
+            issueIdentifier,
+            mode: "readonly_checkout",
+            createdAt: new Date().toISOString(),
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
       await applyPlanningReadOnly(workspacePath, this.options.logger);
-    } else {
-      await ensureDirectory(workspacePath);
-      await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
-
-      if (createdNow) {
-        await this.bootstrapWorkspace(workspacePath);
-        await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
-      }
-      if (source.kind !== "none") {
-        sourceKind = "planning_readonly";
-        await applyPlanningReadOnly(workspacePath, this.options.logger);
-      }
     }
 
     const metadata: WorkspaceMetadata = {
@@ -259,7 +287,9 @@ export class WorkspaceManager {
     }
     await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
     await applyPlanningWritable(workspacePath, this.options.logger);
-    if (metadata?.sourceKind === "planning_readonly" && metadata.repoPath && this.options.workspace.source.kind === "git_worktree") {
+    if (metadata?.sourceKind === "planning_none") {
+      await fs.rm(workspacePath, { recursive: true, force: true });
+    } else if (metadata?.sourceKind === "planning_readonly" && metadata.repoPath && this.options.workspace.source.kind === "git_worktree") {
       await removeGitWorktree({
         repoPath: metadata.repoPath,
         workspacePath,
@@ -444,6 +474,22 @@ async function pathExists(targetPath: string): Promise<boolean> {
 
 async function applyPlanningReadOnly(workspacePath: string, logger: Logger): Promise<void> {
   await applyModeRecursive(workspacePath, { directoryMode: 0o555, fileMode: 0o444 }, logger, "read_only");
+}
+
+function assertSupportedPlanningWorkspaceMode(mode: "none" | "readonly_checkout", sourceKind: WorkspaceConfig["source"]["kind"]): void {
+  if (mode !== "readonly_checkout") return;
+  if (sourceKind !== "git_worktree") {
+    throw new SymphonyError(
+      "config_validation_error",
+      "issue_breakdown.workspace_mode readonly_checkout requires workspace.source.kind git_worktree",
+    );
+  }
+  if (process.platform === "win32") {
+    throw new SymphonyError(
+      "config_validation_error",
+      "issue_breakdown.workspace_mode readonly_checkout is not supported on Windows; use workspace_mode none",
+    );
+  }
 }
 
 async function applyPlanningWritable(workspacePath: string, logger: Logger): Promise<void> {
