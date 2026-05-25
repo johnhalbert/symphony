@@ -22,8 +22,16 @@ export function mapCursorMessage(message: SDKMessage): AgentEvent[] {
         },
       ];
     case "status":
-      if (message.status === "ERROR") return [{ type: "failed", error: message.message ?? "Cursor run failed" }];
-      if (message.status === "CANCELLED" || message.status === "EXPIRED") return [{ type: "cancelled" }];
+      if (message.status === "ERROR" || message.status === "CANCELLED" || message.status === "EXPIRED") {
+        return [
+          {
+            type: "run_diagnostic",
+            code: `cursor_stream_status_${message.status.toLowerCase()}`,
+            message: message.message ?? `Cursor stream status ${message.status}`,
+            payload: { status: message.status },
+          },
+        ];
+      }
       return message.message ? [{ type: "progress", message: message.message, activitySource: "stream" }] : [];
     case "request":
       return [{ type: "failed", error: "Cursor requested external input" }];

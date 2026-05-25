@@ -753,8 +753,18 @@ type RunningRow = RuntimeSnapshot["running"][number];
 type OperatorLivenessStatus = "running" | "possibly_stalled" | "cancelling" | "cancelled" | "blocked_human_required";
 
 const OPERATOR_LIVENESS_CONTRACT = {
-  version: "eng-62-v1",
+  version: "sdk-run-lifecycle-v1",
   supportedStatuses: ["running", "possibly_stalled", "cancelling", "cancelled", "blocked_human_required"],
+  sdkRunLifecycle: {
+    tracked: true,
+    terminalSource: "run.wait",
+    streamStatusesAreDiagnostics: true,
+  },
+  idleAlert: {
+    tracked: true,
+    action: "observe_only",
+    deprecatedStatus: "possibly_stalled",
+  },
   cancelFailed: {
     tracked: true,
     sources: ["harness_stop", "cancel_ignored"],
@@ -1711,7 +1721,7 @@ function renderRunningRow(
   });
   const runId = row.liveness.activeRunId ?? row.runId ?? "n/a";
   const idle = `${Math.round(row.liveness.secondsSinceLastActivity)}s idle`;
-  const threshold = row.liveness.stallTimeoutMs === null ? "no stall threshold" : `${row.liveness.stallTimeoutMs}ms threshold`;
+  const threshold = row.liveness.stallTimeoutMs === null ? "no idle alert threshold" : `${row.liveness.stallTimeoutMs}ms idle alert`;
   const cancellation = cancellationSummary(row);
   const cancelFailed = cancelFailedSummary(liveCancelFailed(row));
   const activitySources = activitySummary(row);
@@ -1719,7 +1729,7 @@ function renderRunningRow(
   return `<li class="run-row operator-${operator.status}">
     <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.state)}</span></div>
     <div class="meta">run <code>${escapeHtml(runId)}</code> · agent <code>${escapeHtml(agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
-    <div class="activity">last activity ${escapeHtml(row.liveness.lastActivityAt)} (${escapeHtml(idle)}, ${escapeHtml(threshold)}); event <code>${escapeHtml(row.lastEvent ?? "n/a")}</code>${row.lastEventAt ? ` at ${escapeHtml(row.lastEventAt)}` : ""}</div>
+    <div class="activity">last activity ${escapeHtml(row.liveness.lastActivityAt)} (${escapeHtml(idle)}, ${escapeHtml(threshold)}); SDK status <code>${escapeHtml(row.liveness.sdkRunStatus ?? "n/a")}</code>; event <code>${escapeHtml(row.lastEvent ?? "n/a")}</code>${row.lastEventAt ? ` at ${escapeHtml(row.lastEventAt)}` : ""}</div>
     ${activitySources ? `<div class="activity">${escapeHtml(activitySources)}</div>` : ""}
     ${row.lastMessage ? `<div>${escapeHtml(row.lastMessage)}</div>` : ""}
     <div><code>${escapeHtml(row.workspacePath ?? "")}</code></div>
@@ -1818,6 +1828,10 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
     lastMessage: row.lastMessage,
     secondsSinceLastActivity: row.liveness.secondsSinceLastActivity,
     stallTimeoutMs: row.liveness.stallTimeoutMs,
+    sdkRunStatus: row.liveness.sdkRunStatus ?? null,
+    sdkRunStatusUpdatedAt: row.liveness.sdkRunStatusUpdatedAt ?? null,
+    sdkRunStatusSource: row.liveness.sdkRunStatusSource ?? null,
+    idleAlert: row.liveness.idleAlert ?? null,
     cancellation: row.cancellation,
     paused,
     activity: liveActivity(row),
@@ -2305,7 +2319,6 @@ function terminalTimeline(
 function liveOperatorStatus(row: RunningRow, lifecycle: IssueLifecycleRecord | null | undefined): OperatorLivenessStatus {
   if (row.cancellation.requested || row.liveness.status === "cancelling") return "cancelling";
   if (isLifecycleBlocked(lifecycle)) return "blocked_human_required";
-  if (row.liveness.status === "stalled") return "possibly_stalled";
   return "running";
 }
 

@@ -1,7 +1,7 @@
-import { Agent, type Run, type SDKAgent, type SettingSource } from "@cursor/sdk";
+import { Agent, type Run, type SDKAgent, type SDKMessage, type SettingSource } from "@cursor/sdk";
 import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
-import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
+import type { AgentEvent, AgentHarness, AgentRunContext, AgentRunSdkStatus } from "../../src/core/harness/AgentHarness.js";
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
 import { writeReviewFeedbackMcpContext } from "../../src/core/harness/ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
@@ -85,6 +85,83 @@ export class CursorHarness implements AgentHarness {
     ctx.abortSignal.addEventListener("abort", abort, { once: true });
     if (ctx.abortSignal.aborted) abort();
 
+    const queue = new AsyncEventQueue<AgentEvent>();
+    let sessionStarted = false;
+    let waitStarted = false;
+    let waitSettled = false;
+    let streamSettled = false;
+    let terminalByStatusObserved = false;
+    let pendingTerminalEvents: AgentEvent[] | null = null;
+    let streamIterator: AsyncIterator<unknown> | null = null;
+    const bufferedStatusEvents: AgentEvent[] = [];
+    const observableRun = run as Run & {
+      readonly status?: unknown;
+      onDidChangeStatus?: (listener: (status: AgentRunSdkStatus) => void) => () => void;
+    };
+    const enqueueStatus = (status: AgentRunSdkStatus, source: "initial" | "onDidChangeStatus" | "wait") => {
+      const event: AgentEvent = {
+        type: "run_status",
+        runId: run.id,
+        sdkStatus: status,
+        source,
+        at: new Date().toISOString(),
+      };
+      if (sessionStarted) {
+        queue.push(event);
+      } else {
+        bufferedStatusEvents.push(event);
+      }
+      if (source !== "wait" && isTerminalSdkStatus(status)) {
+        terminalByStatusObserved = true;
+        if (sessionStarted) void finalizeFromWait();
+      }
+    };
+    const emitTerminalEvents = (events: AgentEvent[]) => {
+      for (const event of events) queue.push(event);
+      queue.close();
+    };
+    const finalizeFromWait = async () => {
+      if (waitStarted) return;
+      waitStarted = true;
+      try {
+        const result = await run.wait();
+        waitSettled = true;
+        const status = normalizeSdkRunStatus(result.status) ?? "error";
+        const terminalEvents: AgentEvent[] = [
+          {
+            type: "run_status",
+            runId: run.id,
+            sdkStatus: status,
+            source: "wait",
+            at: new Date().toISOString(),
+          },
+        ];
+        if (result.status === "finished") {
+          terminalEvents.push(result.result === undefined ? { type: "completed" } : { type: "completed", message: result.result });
+        } else if (result.status === "cancelled") {
+          terminalEvents.push({ type: "cancelled" });
+        } else {
+          terminalEvents.push({ type: "failed", error: result.result ?? "Cursor run failed" });
+        }
+        if (streamSettled || terminalByStatusObserved) emitTerminalEvents(terminalEvents);
+        else pendingTerminalEvents = terminalEvents;
+      } catch (error) {
+        waitSettled = true;
+        const terminalEvents: AgentEvent[] = [{ type: "failed", error: `Cursor run wait failed: ${errorMessage(error)}` }];
+        if (streamSettled || terminalByStatusObserved) emitTerminalEvents(terminalEvents);
+        else pendingTerminalEvents = terminalEvents;
+      }
+    };
+    const unsubscribeStatus =
+      typeof observableRun.onDidChangeStatus === "function"
+        ? observableRun.onDidChangeStatus((status) => {
+            const normalized = normalizeSdkRunStatus(status) ?? normalizeSdkRunStatus(observableRun.status);
+            if (normalized) enqueueStatus(normalized, "onDidChangeStatus");
+          })
+        : null;
+    const initialStatus = normalizeSdkRunStatus(observableRun.status);
+    if (initialStatus) enqueueStatus(initialStatus, "initial");
+
     try {
       if (ctx.role === "worker") {
         await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
@@ -154,34 +231,63 @@ export class CursorHarness implements AgentHarness {
         },
       });
 
-      for await (const message of run.stream()) {
-        const transcriptEvent = cursorTranscriptEvent(message);
-        if (transcriptEvent) {
-          await this.options.runStore?.appendEvent({
-            runId: run.id,
-            at: new Date().toISOString(),
-            source: "cursor",
-            ...transcriptEvent,
+      sessionStarted = true;
+      for (const event of bufferedStatusEvents.splice(0, bufferedStatusEvents.length)) queue.push(event);
+      void finalizeFromWait();
+      const streamTask = (async () => {
+        try {
+          streamIterator = run.stream()[Symbol.asyncIterator]();
+          while (true) {
+            const next = await streamIterator.next();
+            if (next.done) break;
+            const message = next.value;
+            const transcriptEvent = cursorTranscriptEvent(message);
+            if (transcriptEvent) {
+              await this.options.runStore?.appendEvent({
+                runId: run.id,
+                at: new Date().toISOString(),
+                source: "cursor",
+                ...transcriptEvent,
+              });
+            }
+            for (const event of flush(deltaEvents)) queue.push(event);
+            for (const event of mapCursorMessage(message as SDKMessage)) queue.push(event);
+          }
+        } catch (error) {
+          queue.push({
+            type: "run_diagnostic",
+            code: "cursor_stream_error",
+            message: `Cursor stream failed: ${errorMessage(error)}`,
+            payload: { error: errorMessage(error) },
           });
+          void run.cancel().catch((cancelError) => {
+            ctx.logger.warn("cursor sdk run cancel after stream failure failed", {
+              run_id: run.id,
+              issue_id: ctx.issue.id,
+              issue_identifier: ctx.issue.identifier,
+              role: ctx.role,
+              error: errorMessage(cancelError),
+            });
+          });
+        } finally {
+          streamSettled = true;
+          for (const event of flush(deltaEvents)) queue.push(event);
+          if (pendingTerminalEvents) emitTerminalEvents(pendingTerminalEvents);
         }
-        for (const event of flush(deltaEvents)) yield event;
-        for (const event of mapCursorMessage(message)) yield event;
-      }
-      for (const event of flush(deltaEvents)) yield event;
+      })();
 
-      const result = await run.wait();
-      if (result.status === "finished") {
-        yield result.result === undefined
-          ? { type: "completed" }
-          : { type: "completed", message: result.result };
-      } else if (result.status === "cancelled") {
-        yield { type: "cancelled" };
-      } else {
-        yield { type: "failed", error: result.result ?? "Cursor run failed" };
+      try {
+        for await (const event of queue) yield event;
+      } finally {
+        if (!waitSettled) queue.close();
+        const iterator = streamIterator as ({ return?: () => Promise<IteratorResult<unknown>> } & AsyncIterator<unknown>) | null;
+        if (typeof iterator?.return === "function") void iterator.return().catch(() => undefined);
+        void streamTask.catch(() => undefined);
       }
     } catch (error) {
       throw new SymphonyError("agent_error", `Cursor run failed: ${errorMessage(error)}`, error);
     } finally {
+      unsubscribeStatus?.();
       ctx.abortSignal.removeEventListener("abort", abort);
       this.activeRuns.delete(run.id);
       if (!reusable) {
@@ -275,6 +381,55 @@ export class CursorHarness implements AgentHarness {
       return { ok: false, error: message };
     }
   }
+}
+
+class AsyncEventQueue<T> implements AsyncIterable<T> {
+  private readonly values: T[] = [];
+  private readonly waiters: Array<(result: IteratorResult<T>) => void> = [];
+  private closed = false;
+
+  push(value: T): void {
+    if (this.closed) return;
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter({ value, done: false });
+      return;
+    }
+    this.values.push(value);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    while (this.waiters.length > 0) {
+      this.waiters.shift()?.({ value: undefined as never, done: true });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return {
+      next: () => this.next(),
+      return: async () => {
+        this.close();
+        return { value: undefined as never, done: true };
+      },
+    };
+  }
+
+  private async next(): Promise<IteratorResult<T>> {
+    const value = this.values.shift();
+    if (value !== undefined) return { value, done: false };
+    if (this.closed) return { value: undefined as never, done: true };
+    return new Promise((resolve) => this.waiters.push(resolve));
+  }
+}
+
+function normalizeSdkRunStatus(status: unknown): AgentRunSdkStatus | null {
+  return status === "running" || status === "finished" || status === "error" || status === "cancelled" ? status : null;
+}
+
+function isTerminalSdkStatus(status: AgentRunSdkStatus): boolean {
+  return status === "finished" || status === "error" || status === "cancelled";
 }
 
 function shouldReuseAgent(ctx: AgentRunContext): boolean {

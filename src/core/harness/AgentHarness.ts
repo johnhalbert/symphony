@@ -14,6 +14,7 @@ export interface AgentRunContext {
 }
 
 export type AgentActivitySource = "stream" | "delta" | "tool";
+export type AgentRunSdkStatus = "running" | "finished" | "error" | "cancelled";
 
 export type AgentEvent =
   | {
@@ -37,6 +38,20 @@ export type AgentEvent =
   | {
       type: "rate_limits";
       payload: unknown;
+      at?: string;
+    }
+  | {
+      type: "run_status";
+      runId: string;
+      sdkStatus: AgentRunSdkStatus;
+      source: "initial" | "onDidChangeStatus" | "wait";
+      at?: string;
+    }
+  | {
+      type: "run_diagnostic";
+      code: string;
+      message: string;
+      payload?: unknown;
       at?: string;
     }
   | {

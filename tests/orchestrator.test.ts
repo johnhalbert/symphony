@@ -769,14 +769,13 @@ describe("Orchestrator", () => {
       });
       await new Promise((resolve) => setTimeout(resolve, 5));
 
-      await (
-        orchestrator as unknown as {
-          reconcileStalledRuns(): Promise<void>;
-        }
-      ).reconcileStalledRuns();
       await orchestrator.refreshNow();
 
       expect(orchestrator.snapshot().counts.running).toBe(1);
+      expect(orchestrator.snapshot().running[0]?.liveness.idleAlert).toMatchObject({
+        active: false,
+        reason: "suppressed",
+      });
       const runningRun = await runStore.getRun(runId);
       expect(runningRun).toMatchObject({
         status: "running",
@@ -3793,7 +3792,7 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
-  it("treats stalled cancellation as terminal cancelled without retrying", async () => {
+  it("keeps quiet SDK-running work active instead of stall-cancelling it", async () => {
     const config = testConfig(root);
     (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 1 };
     const candidate = issue({ state: "Todo" });
@@ -3826,19 +3825,19 @@ describe("Orchestrator", () => {
     await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-stalled", "stalled run to start");
     await new Promise((resolve) => setTimeout(resolve, 5));
     await orchestrator.refreshNow();
-    await waitFor(
-      () => orchestrator.snapshot().running[0]?.cancellation.source === "stalled",
-      "stalled cancellation to be recorded",
-    );
-    const stalled = orchestrator.snapshot().running[0];
-    expect(stalled).toMatchObject({
-      liveness: { status: "cancelling" },
+    const quiet = orchestrator.snapshot().running[0];
+    expect(quiet).toMatchObject({
+      liveness: {
+        status: "active",
+        idleAlert: {
+          active: true,
+          reason: "observe_only",
+        },
+      },
       cancellation: {
-        requested: true,
-        source: "stalled",
-        reason: "run stalled",
-        abortSignalled: true,
-        suppressRetryOnExit: true,
+        requested: false,
+        source: null,
+        abortSignalled: false,
       },
     });
 
@@ -3846,8 +3845,7 @@ describe("Orchestrator", () => {
     await waitFor(() => orchestrator.snapshot().running.length === 0, "stalled run to exit");
 
     await expect(runStore.getRun("run-stalled")).resolves.toMatchObject({
-      status: "cancelled",
-      error: "stalled abort",
+      status: "succeeded",
     });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
     await orchestrator.stop();
@@ -4625,11 +4623,12 @@ class StalledAbortHarness implements AgentHarness {
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
     yield { type: "session_started", sessionId: "session-stalled", runId: "run-stalled" };
-    if (!ctx.abortSignal.aborted) {
-      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
-    }
     await this.released;
-    throw new Error("stalled abort");
+    if (ctx.abortSignal.aborted) {
+      yield { type: "cancelled" };
+      return;
+    }
+    yield { type: "completed" };
   }
 
   release(): void {

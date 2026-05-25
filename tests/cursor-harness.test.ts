@@ -85,6 +85,25 @@ describe("Cursor event mapping", () => {
     expect(events).toEqual([{ type: "tokens", tokens: { inputTokens: 2, outputTokens: 3, totalTokens: 5 } }]);
   });
 
+  it("treats Cursor stream terminal statuses as diagnostics", () => {
+    expect(
+      mapCursorMessage({
+        type: "status",
+        agent_id: "agent",
+        run_id: "run",
+        status: "CANCELLED",
+        message: "cancelled by runtime",
+      } as never),
+    ).toEqual([
+      {
+        type: "run_diagnostic",
+        code: "cursor_stream_status_cancelled",
+        message: "cancelled by runtime",
+        payload: { status: "CANCELLED" },
+      },
+    ]);
+  });
+
   it("wires the Symphony completion report MCP server into Cursor runs", () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     const ctx: AgentRunContext = {
@@ -400,6 +419,39 @@ describe("Cursor event mapping", () => {
     );
     expect(events).toEqual([
       { type: "session_started", sessionId: "agent-fresh:sdk-run-fresh", threadId: "agent-fresh", runId: "sdk-run-fresh" },
+      expect.objectContaining({ type: "run_status", runId: "sdk-run-fresh", sdkStatus: "finished", source: "wait" }),
+      { type: "completed" },
+    ]);
+  });
+
+  it("buffers SDK status observations until after session_started", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const onDidChangeStatus = vi.fn(() => () => undefined);
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-status",
+      send: vi.fn(async () => ({
+        id: "sdk-run-status",
+        status: "running",
+        onDidChangeStatus,
+        async *stream(): AsyncIterable<unknown> {},
+        wait: async () => ({ status: "finished" as const, result: undefined }),
+        cancel: vi.fn(async () => undefined),
+      })),
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const harness = new CursorHarness();
+
+    const events: unknown[] = [];
+    for await (const event of harness.run(agentContext(config, "worker"), "Work on TEST-1")) {
+      events.push(event);
+    }
+
+    expect(onDidChangeStatus).toHaveBeenCalledTimes(1);
+    expect(events).toEqual([
+      { type: "session_started", sessionId: "agent-status:sdk-run-status", threadId: "agent-status", runId: "sdk-run-status" },
+      expect.objectContaining({ type: "run_status", runId: "sdk-run-status", sdkStatus: "running", source: "initial" }),
+      expect.objectContaining({ type: "run_status", runId: "sdk-run-status", sdkStatus: "finished", source: "wait" }),
       { type: "completed" },
     ]);
   });
@@ -544,7 +596,7 @@ describe("Cursor event mapping", () => {
     await iterator.return?.();
   });
 
-  it("preserves SDK stream failures when reviewer cleanup also fails", async () => {
+  it("uses SDK wait as the terminal source when the stream fails", async () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     const dispose = vi.fn(async () => {
       throw new Error("dispose auth failure");
@@ -566,11 +618,9 @@ describe("Cursor event mapping", () => {
     const harness = new CursorHarness();
     const events: unknown[] = [];
 
-    await expect(async () => {
-      for await (const event of harness.run(agentContext(config, "reviewer"), "Review TEST-1")) {
-        events.push(event);
-      }
-    }).rejects.toThrow("Cursor run failed: authentication stream failure");
+    for await (const event of harness.run(agentContext(config, "reviewer"), "Review TEST-1")) {
+      events.push(event);
+    }
 
     expect(events).toEqual([
       {
@@ -579,7 +629,15 @@ describe("Cursor event mapping", () => {
         threadId: "agent-auth",
         runId: "sdk-run-auth",
       },
+      expect.objectContaining({
+        type: "run_diagnostic",
+        code: "cursor_stream_error",
+        message: "Cursor stream failed: authentication stream failure",
+      }),
+      expect.objectContaining({ type: "run_status", runId: "sdk-run-auth", sdkStatus: "error", source: "wait" }),
+      { type: "failed", error: "wait should not run" },
     ]);
+    expect(run.wait).toHaveBeenCalledTimes(1);
     expect(dispose).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
-import type { AgentActivitySource, AgentEvent, AgentHarness } from "../harness/AgentHarness.js";
+import type { AgentActivitySource, AgentEvent, AgentHarness, AgentRunSdkStatus } from "../harness/AgentHarness.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import {
@@ -127,6 +127,9 @@ export interface RunningEntry {
   lastEventAt: Date | null;
   lastEvent: string | null;
   lastMessage: string | null;
+  sdkRunStatus: AgentRunSdkStatus | null;
+  sdkRunStatusUpdatedAt: Date | null;
+  sdkRunStatusSource: "initial" | "onDidChangeStatus" | "wait" | null;
   turnCount: number;
   retryAttempt: number;
   tokens: TokenCounts;
@@ -208,7 +211,15 @@ export interface RuntimeSnapshot {
   rateLimits: unknown;
 }
 
-export type RunLivenessStatus = "starting" | "active" | "stalled" | "cancelling";
+export type RunLivenessStatus = "starting" | "active" | "terminal_pending" | "stalled" | "cancelling";
+
+export interface RunIdleAlertState {
+  active: boolean;
+  thresholdMs: number | null;
+  lastActivityAt: string;
+  secondsSinceLastActivity: number;
+  reason: "observe_only" | "suppressed" | null;
+}
 
 export interface RunLivenessState {
   status: RunLivenessStatus;
@@ -216,6 +227,10 @@ export interface RunLivenessState {
   lastActivityAt: string;
   secondsSinceLastActivity: number;
   stallTimeoutMs: number | null;
+  sdkRunStatus?: AgentRunSdkStatus | null;
+  sdkRunStatusUpdatedAt?: string | null;
+  sdkRunStatusSource?: "initial" | "onDidChangeStatus" | "wait" | null;
+  idleAlert?: RunIdleAlertState;
 }
 
 export type RunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
@@ -653,7 +668,6 @@ export class Orchestrator {
   }
 
   private async reconcileRunningIssues(): Promise<void> {
-    await this.reconcileStalledRuns();
     const runningIds = [...this.running.keys()];
     if (runningIds.length === 0) return;
     let refreshed: Issue[];
@@ -674,10 +688,7 @@ export class Orchestrator {
       if (isStateIn(latest.state, this.config.tracker.terminalStates)) {
         await this.terminateRunningIssue(issueId, true, "terminal state");
       } else if (preservePendingApprovalWorker) {
-        const now = new Date();
-        entry.lastEvent = "approval_request";
         entry.lastMessage = "Awaiting operator approval for push/PR";
-        entry.lastEventAt = now;
       } else if (entry.role === "worker" && isStateIn(latest.state, this.config.tracker.handoffStates)) {
         await this.terminateRunningIssue(issueId, false, "handoff state");
       } else if (entry.role === "worker" && !latest.assignedToWorker) {
@@ -688,34 +699,6 @@ export class Orchestrator {
         await this.terminateRunningIssue(issueId, false, "blocked state");
       } else if (entry.role === "reviewer" && !isStateIn(latest.state, this.config.reviewLoop.reviewStates)) {
         await this.terminateRunningIssue(issueId, false, "non-review state");
-      }
-    }
-  }
-
-  private async reconcileStalledRuns(): Promise<void> {
-    const stallTimeout = this.stallTimeoutMs();
-    if (stallTimeout === null) return;
-    const now = Date.now();
-    for (const [issueId, entry] of this.running) {
-      if ((await this.isAwaitingOperatorApproval(entry)) || (await this.hasPendingPublicationApprovalHandoff(entry))) {
-        entry.lastEvent = "approval_request";
-        entry.lastMessage = "Awaiting operator approval for push/PR";
-        entry.lastEventAt = new Date(now);
-        continue;
-      }
-      const lastActivity = entry.lastEventAt?.getTime() ?? entry.startedAt.getTime();
-      if (now - lastActivity > stallTimeout) {
-        entry.suppressRetryOnExit = true;
-        this.markCancellationRequested(entry, {
-          source: "stalled",
-          reason: "run stalled",
-          abortSignalled: true,
-        });
-        entry.abortController.abort();
-        this.options.logger.warn("run stalled", {
-          issue_id: issueId,
-          issue_identifier: entry.issue.identifier,
-        });
       }
     }
   }
@@ -930,6 +913,9 @@ export class Orchestrator {
       lastEventAt: null,
       lastEvent: null,
       lastMessage: null,
+      sdkRunStatus: null,
+      sdkRunStatusUpdatedAt: null,
+      sdkRunStatusSource: null,
       turnCount: 0,
       retryAttempt,
       tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
@@ -1113,10 +1099,24 @@ export class Orchestrator {
     context: { workspace: Workspace; prompt: string; attempt: number | null; turnNumber: number },
   ): Promise<void> {
     for await (const event of events) {
+      const eventAt = new Date(event.at ?? Date.now());
+      if (event.type === "run_status") {
+        entry.sdkRunStatus = event.sdkStatus;
+        entry.sdkRunStatusUpdatedAt = eventAt;
+        entry.sdkRunStatusSource = event.source;
+        await this.options.runStore?.updateRun(event.runId, {
+          metadata: {
+            sdkRunStatus: event.sdkStatus,
+            sdkRunStatusObservedAt: eventAt.toISOString(),
+            sdkRunStatusSource: event.source,
+          },
+        });
+        continue;
+      }
       entry.lastEvent = event.type;
-      entry.lastEventAt = new Date(event.at ?? Date.now());
+      entry.lastEventAt = eventAt;
       if (event.type === "progress") {
-        recordActivitySource(entry, event.activitySource ?? "stream", entry.lastEventAt);
+        recordActivitySource(entry, event.activitySource ?? "stream", eventAt);
       }
       if (event.type === "session_started") {
         entry.sessionId = event.sessionId;
@@ -1162,7 +1162,7 @@ export class Orchestrator {
           );
         }
       }
-      if (event.type === "progress") entry.lastMessage = event.message;
+      if (event.type === "progress" || event.type === "run_diagnostic") entry.lastMessage = event.message;
       if (event.type === "tokens") this.applyTokenUpdate(entry, event.tokens);
       if (event.type === "rate_limits") this.rateLimits = event.payload;
       await this.persistHarnessEvent(entry, event);
@@ -1512,7 +1512,8 @@ export class Orchestrator {
   private async persistHarnessEvent(entry: RunningEntry, event: AgentEvent): Promise<void> {
     const runId = entry.activeRunId ?? entry.runId;
     if (!runId) return;
-    const message = event.type === "progress" || event.type === "completed" ? event.message : undefined;
+    const message =
+      event.type === "progress" || event.type === "completed" || event.type === "run_diagnostic" ? event.message : undefined;
     await this.options.runStore?.appendEvent({
       runId,
       at: new Date(event.at ?? Date.now()).toISOString(),
@@ -2105,23 +2106,34 @@ export class Orchestrator {
   }
 
   private livenessForEntry(entry: RunningEntry, now: number): RunLivenessState {
-    const stallTimeoutMs = this.stallTimeoutMs();
+    const idleAlertThresholdMs = this.stallTimeoutMs();
     const lastActivityAt = entry.lastEventAt ?? entry.startedAt;
     const idleMs = Math.max(now - lastActivityAt.getTime(), 0);
+    const idleAlertSuppressed = entry.cancellationRequestedAt !== null || isLifecycleHumanBlocked(entry.lifecycle);
     const status: RunLivenessStatus =
       entry.cancellationRequestedAt !== null
         ? "cancelling"
-        : stallTimeoutMs !== null && idleMs > stallTimeoutMs
-          ? "stalled"
-          : entry.runId === null
-            ? "starting"
+        : entry.runId === null
+          ? "starting"
+          : entry.sdkRunStatus !== null && isTerminalSdkRunStatus(entry.sdkRunStatus)
+            ? "terminal_pending"
             : "active";
     return {
       status,
       activeRunId: entry.activeRunId,
       lastActivityAt: lastActivityAt.toISOString(),
       secondsSinceLastActivity: idleMs / 1000,
-      stallTimeoutMs,
+      stallTimeoutMs: idleAlertThresholdMs,
+      sdkRunStatus: entry.sdkRunStatus,
+      sdkRunStatusUpdatedAt: entry.sdkRunStatusUpdatedAt?.toISOString() ?? null,
+      sdkRunStatusSource: entry.sdkRunStatusSource,
+      idleAlert: {
+        active: !idleAlertSuppressed && idleAlertThresholdMs !== null && idleMs > idleAlertThresholdMs,
+        thresholdMs: idleAlertThresholdMs,
+        lastActivityAt: lastActivityAt.toISOString(),
+        secondsSinceLastActivity: idleMs / 1000,
+        reason: idleAlertSuppressed ? "suppressed" : "observe_only",
+      },
     };
   }
 
@@ -2168,6 +2180,14 @@ export function sortIssuesForDispatch(issues: Issue[]): Issue[] {
 
 function isStateIn(state: string, states: string[]): boolean {
   return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
+}
+
+function isTerminalSdkRunStatus(status: AgentRunSdkStatus): boolean {
+  return status === "finished" || status === "error" || status === "cancelled";
+}
+
+function isLifecycleHumanBlocked(lifecycle: IssueLifecycleRecord | null): boolean {
+  return lifecycle !== null && (lifecycle.phase === "blocked" || lifecycle.blockedReason !== null);
 }
 
 function hasOpenBlocker(issue: Issue, terminalStates: string[]): boolean {
@@ -2433,6 +2453,9 @@ function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | 
     cancelFailedReason,
     cancelFailedSource,
     activitySnapshot: terminalActivitySnapshot(entry),
+    sdkRunStatus: entry.sdkRunStatus,
+    sdkRunStatusObservedAt: entry.sdkRunStatusUpdatedAt?.toISOString() ?? null,
+    sdkRunStatusSource: entry.sdkRunStatusSource,
   };
 }
 
