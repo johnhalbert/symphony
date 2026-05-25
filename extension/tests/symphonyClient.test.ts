@@ -49,6 +49,9 @@ describe("SymphonyClient", () => {
       if (url.endsWith("/api/v1/activity?offset=0&limit=20")) {
         return new Response(JSON.stringify({ activity: [], counts: { totalItems: 0 } }), { status: 200 });
       }
+      if (url.endsWith("/api/v1/workspaces")) {
+        return new Response(JSON.stringify({ workspaces: [] }), { status: 200 });
+      }
       return new Response("not found", { status: 404 });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -61,6 +64,7 @@ describe("SymphonyClient", () => {
       "http://127.0.0.1:7331/api/v1/state",
       "http://127.0.0.1:7331/api/v1/board?refresh=1",
       "http://127.0.0.1:7331/api/v1/activity?offset=0&limit=20",
+      "http://127.0.0.1:7331/api/v1/workspaces",
     ]);
     expect(JSON.stringify(fetchMock.mock.calls)).not.toContain(MUTATION_TOKEN_HEADER);
   });
@@ -75,6 +79,9 @@ describe("SymphonyClient", () => {
           status: 503,
         });
       }
+      if (url.endsWith("/api/v1/workspaces")) {
+        return new Response(JSON.stringify({ workspaces: [] }), { status: 200 });
+      }
       return new Response(JSON.stringify({ activity: [], counts: { totalItems: 0 } }), { status: 200 });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -83,6 +90,31 @@ describe("SymphonyClient", () => {
 
     expect(state.connection.kind).toBe("connected");
     expect(state.sections?.board).toMatchObject({ status: "unavailable" });
+  });
+
+  it("keeps the dashboard connected when activity fails", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith("/api/v1/state")) {
+        return new Response(JSON.stringify({ generatedAt: "2026-01-01T00:00:00.000Z", operatorView: { running: [] } }), { status: 200 });
+      }
+      if (url.endsWith("/api/v1/board")) {
+        return new Response(JSON.stringify({ columns: [], counts: { total: 0 } }), { status: 200 });
+      }
+      if (url.endsWith("/api/v1/activity?offset=0&limit=20")) {
+        return new Response(JSON.stringify({ error: { message: "activity unavailable" } }), { status: 500 });
+      }
+      if (url.endsWith("/api/v1/workspaces")) {
+        return new Response(JSON.stringify({ workspaces: [] }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const state = await new SymphonyClient().fetchDashboard("http://127.0.0.1:7331", "");
+
+    expect(state.connection.kind).toBe("connected");
+    expect(state.sections?.activity).toMatchObject({ status: "error" });
+    expect(state.sections?.operatorQueues).toMatchObject({ status: "ready" });
   });
 
   it("skips dashboard section fetches when the state probe fails", async () => {
@@ -101,6 +133,21 @@ describe("SymphonyClient", () => {
 
     expect(client.buildMutationHeaders("")).toEqual({});
     expect(client.buildMutationHeaders(" token ")).toEqual({ [MUTATION_TOKEN_HEADER]: "token" });
+  });
+
+  it("opens workspaces through the public mutation endpoint with token only on the POST", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ opened: true }), { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await new SymphonyClient().openWorkspace("http://127.0.0.1:7331/", " secret ", "ENG-6");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:7331/api/v1/issues/ENG-6/open-workspace",
+      expect.objectContaining({
+        method: "POST",
+        headers: { Accept: "application/json", [MUTATION_TOKEN_HEADER]: "secret" },
+      }),
+    );
   });
 
   it("classifies timeout aborts as offline", async () => {

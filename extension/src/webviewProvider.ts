@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { errorMessage } from "./connectionState";
 import type { DashboardRefreshTrigger, DashboardViewState } from "./dashboardTypes";
 import { readSymphonySettings } from "./settings";
 import type { SymphonyClient } from "./symphonyClient";
@@ -29,21 +30,24 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
     webviewView.onDidChangeVisibility(() => {
       if (webviewView.visible) {
         void this.refreshDashboard("visible");
-        this.startPolling();
-      } else {
-        this.stopPolling();
       }
+      this.updatePolling();
     });
 
     if (webviewView.visible) {
       void this.refreshDashboard("visible");
-      this.startPolling();
     }
+    this.updatePolling();
   }
 
   async openPanel(): Promise<void> {
     await vscode.commands.executeCommand("workbench.view.extension.symphony");
     if (this.view) {
+      return;
+    }
+    if (this.panel) {
+      this.panel.reveal(vscode.ViewColumn.Beside);
+      this.updatePolling();
       return;
     }
 
@@ -57,8 +61,13 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
     this.registerWebviewMessages(this.panel.webview);
     this.panel.onDidDispose(() => {
       this.panel = null;
+      this.updatePolling();
+    });
+    this.panel.onDidChangeViewState(() => {
+      this.updatePolling();
     });
     void this.refreshDashboard("openPanel");
+    this.updatePolling();
   }
 
   async reprobe(trigger: DashboardRefreshTrigger = "command"): Promise<void> {
@@ -90,11 +99,32 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
       if (!isMessage(message)) return;
       if (message.type === "retry") void this.refreshDashboard("retry");
       if (message.type === "openSettings") void vscode.commands.executeCommand("symphony.openSettings");
+      if (message.type === "openWorkspace") void this.openWorkspace(message.issueKey);
     });
   }
 
+  private async openWorkspace(issueKey: string): Promise<void> {
+    const settings = readSymphonySettings();
+    try {
+      await this.client.openWorkspace(settings.baseUrl, settings.token, issueKey);
+      void vscode.window.showInformationMessage(`Opened Symphony workspace for ${issueKey}.`);
+      await this.refreshDashboard("openWorkspace");
+    } catch (error) {
+      void vscode.window.showWarningMessage(`Unable to open Symphony workspace: ${errorMessage(error)}`);
+    }
+  }
+
+  private updatePolling(): void {
+    const shouldPoll = Boolean(this.view?.visible || this.panel?.visible);
+    if (!shouldPoll) {
+      this.stopPolling();
+      return;
+    }
+    this.startPolling();
+  }
+
   private startPolling(): void {
-    this.stopPolling();
+    if (this.pollTimer) return;
     this.pollTimer = setInterval(() => void this.refreshDashboard("poll"), SymphonyPanelProvider.pollIntervalMs);
   }
 
@@ -112,15 +142,17 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
   }
 }
 
-function isMessage(value: unknown): value is { type: "retry" | "openSettings" } {
+function isMessage(value: unknown): value is { type: "retry" | "openSettings" } | { type: "openWorkspace"; issueKey: string } {
   return (
     typeof value === "object" &&
     value !== null &&
     "type" in value &&
-    ((value as { type?: unknown }).type === "retry" || (value as { type?: unknown }).type === "openSettings")
+    ((value as { type?: unknown }).type === "retry" ||
+      (value as { type?: unknown }).type === "openSettings" ||
+      ((value as { type?: unknown }).type === "openWorkspace" && typeof (value as { issueKey?: unknown }).issueKey === "string"))
   );
 }
 
 function shouldRefreshBoard(trigger: DashboardRefreshTrigger): boolean {
-  return trigger === "retry" || trigger === "command";
+  return trigger === "retry" || trigger === "command" || trigger === "openWorkspace";
 }

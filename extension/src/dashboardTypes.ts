@@ -6,9 +6,29 @@ export interface DashboardViewState {
 }
 
 export interface DashboardSections {
+  activeSessions: ActiveSessionsSection;
   operatorQueues: OperatorQueuesSection;
   board: BoardSection;
+  workspaces: WorkspaceSection;
   activity: ActivitySection;
+}
+
+export type ActiveSessionsSection =
+  | { status: "ready"; data: ActiveSessionsSummary }
+  | { status: "partial"; detail: string; data: ActiveSessionsSummary };
+
+export interface ActiveSessionsSummary {
+  sessions: ActiveAgentSession[];
+}
+
+export interface ActiveAgentSession {
+  issueIdentifier: string;
+  issueKey: string;
+  role: string | null;
+  statusLabel: string | null;
+  runId: string | null;
+  detail: string | null;
+  workspace: WorkspaceContext | null;
 }
 
 export type OperatorQueuesSection =
@@ -24,9 +44,11 @@ export interface OperatorQueuesSummary {
 
 export interface OperatorRow {
   issueIdentifier: string;
+  issueKey: string;
   role: string | null;
   statusLabel: string | null;
   detail: string | null;
+  workspace: WorkspaceContext | null;
 }
 
 export interface RetryingRow {
@@ -45,6 +67,7 @@ export interface BoardSummary {
   generatedAt: string | null;
   columns: BoardColumnSummary[];
   counts: BoardCounts | null;
+  issues: BoardIssueSummary[];
 }
 
 export interface BoardColumnSummary {
@@ -58,6 +81,40 @@ export interface BoardCounts {
   live: number | null;
   paused: number | null;
   blocked: number | null;
+}
+
+export interface BoardIssueSummary {
+  issueIdentifier: string;
+  issueKey: string;
+  title: string | null;
+  state: string | null;
+  workspace: WorkspaceContext | null;
+}
+
+export type WorkspaceSection =
+  | { status: "ready"; data: WorkspaceSummary }
+  | { status: "error"; detail: string };
+
+export interface WorkspaceSummary {
+  rows: WorkspaceRow[];
+}
+
+export interface WorkspaceRow {
+  workspaceKey: string;
+  issueIdentifier: string;
+  issueKey: string;
+  path: string;
+  sourceKind: string | null;
+  branchName: string | null;
+}
+
+export interface WorkspaceContext {
+  workspaceKey: string | null;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  path: string | null;
+  sourceKind: string | null;
+  branchName: string | null;
 }
 
 export type ActivitySection =
@@ -76,4 +133,4 @@ export interface ActivityItemSummary {
   summary: string | null;
 }
 
-export type DashboardRefreshTrigger = "activate" | "poll" | "visible" | "config" | "retry" | "command" | "openPanel";
+export type DashboardRefreshTrigger = "activate" | "poll" | "visible" | "config" | "retry" | "command" | "openPanel" | "openWorkspace";

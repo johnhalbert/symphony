@@ -7,7 +7,14 @@ import {
   type ConnectionState,
   type ProbeResult,
 } from "./connectionState";
-import { parseActivitySection, parseBoardSection, parseOperatorQueues, type JsonEndpointResult } from "./dashboardParsers";
+import {
+  parseActiveSessions,
+  parseActivitySection,
+  parseBoardSection,
+  parseOperatorQueues,
+  parseWorkspaceSection,
+  type JsonEndpointResult,
+} from "./dashboardParsers";
 import type { DashboardViewState } from "./dashboardTypes";
 import { normalizeBaseUrl } from "./settings";
 
@@ -26,16 +33,19 @@ export class SymphonyClient {
     if (connection.kind !== "connected" || stateResult.kind !== "http") return { connection, sections: null };
 
     const boardPath = options.refreshBoard ? "/api/v1/board?refresh=1" : "/api/v1/board";
-    const [board, activity] = await Promise.all([
+    const [board, activity, workspaces] = await Promise.all([
       this.fetchJsonEndpoint(connection.baseUrl, boardPath, signal),
       this.fetchJsonEndpoint(connection.baseUrl, "/api/v1/activity?offset=0&limit=20", signal),
+      this.fetchJsonEndpoint(connection.baseUrl, "/api/v1/workspaces", signal),
     ]);
 
     return {
       connection,
       sections: {
+        activeSessions: parseActiveSessions(stateResult.body),
         operatorQueues: parseOperatorQueues(stateResult.body),
         board: parseBoardSection(board),
+        workspaces: parseWorkspaceSection(workspaces),
         activity: parseActivitySection(activity),
       },
     };
@@ -50,6 +60,33 @@ export class SymphonyClient {
   buildMutationHeaders(token: string): Record<string, string> {
     const trimmed = token.trim();
     return trimmed ? { [MUTATION_TOKEN_HEADER]: trimmed } : {};
+  }
+
+  async openWorkspace(baseUrlSetting: string, token: string, issueKey: string, signal?: AbortSignal): Promise<void> {
+    const baseUrl = normalizeBaseUrl(baseUrlSetting);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SYMPHONY_PROBE_TIMEOUT_MS);
+    const abortFromCaller = () => controller.abort();
+    signal?.addEventListener("abort", abortFromCaller, { once: true });
+
+    try {
+      const response = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(issueKey)}/open-workspace`, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          ...this.buildMutationHeaders(token),
+        },
+        signal: controller.signal,
+      });
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`Symphony returned HTTP ${response.status} for open-workspace.`);
+      }
+    } catch (error) {
+      throw new Error(isAbortLikeError(error) ? "Open workspace request timed out." : errorMessage(error));
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abortFromCaller);
+    }
   }
 
   private async fetchState(baseUrlSetting: string, signal?: AbortSignal): Promise<ProbeResult> {
