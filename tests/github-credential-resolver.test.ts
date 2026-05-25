@@ -92,7 +92,7 @@ describe("GitHub credential resolver", () => {
     const config = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
-        github: { owner: "acme", repo: "symphony", publish_pull_requests: true },
+        github: { owner: "acme", repo: "symphony", publish_pull_requests: true, pr_handoff: { enabled: false } },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "linear-secret" },

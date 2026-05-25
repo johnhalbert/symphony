@@ -47,6 +47,7 @@ export interface CompletionReportPullRequestRef {
   number: number | null;
   headSha: string | null;
   branch: string | null;
+  draft?: boolean | null;
 }
 
 export type PullRequestReviewEvidenceSource = "review" | "review_comment" | "issue_comment";
@@ -347,6 +348,7 @@ export class FileIssueLifecycleStore {
 
 export function phaseForIssueState(state: string, config: ServiceConfig): IssueLifecyclePhase {
   if (isStateIn(state, config.reviewLoop.blockedStates)) return "blocked";
+  if (isStateIn(state, config.tracker.handoffStates)) return "review";
   if (isStateIn(state, config.reviewLoop.reviewStates)) return "review";
   if (config.reviewLoop.reviewPassState && statesEqual(state, config.reviewLoop.reviewPassState)) return "passed";
   if (isStateIn(state, config.tracker.terminalStates)) return "terminal";

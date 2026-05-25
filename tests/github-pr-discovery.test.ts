@@ -8,7 +8,9 @@ import { Orchestrator, type PullRequestDiscoveryClient } from "../src/core/orche
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
+import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
+import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { GitHubPullRequestClient } from "../src/integrations/github/GitHubPullRequestClient.js";
 import { issue, testConfig } from "./helpers.js";
 
@@ -49,6 +51,7 @@ describe("GitHub pull request discovery", () => {
             {
               html_url: "https://github.com/acme/symphony/pull/42",
               number: 42,
+              draft: true,
               updated_at: "2026-01-01T00:00:02Z",
               head: {
                 ref: "symphony/TEST-1",
@@ -68,6 +71,7 @@ describe("GitHub pull request discovery", () => {
       headBranch: "symphony/TEST-1",
       headSha: "abc123",
       lastPushedAt: "2026-01-01T00:00:01Z",
+      draft: true,
     });
     expect(requestedPathname).toBe("/api/v3/repos/acme/symphony/pulls");
     expect(requestedState).toBe("open");
@@ -156,10 +160,146 @@ describe("GitHub pull request discovery", () => {
       lastPushedAt: "2026-01-01T00:00:01Z",
     });
   });
+
+  it("links PR metadata without handoff transitions in publication mode", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 1;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "In Progress";
+    config.tracker.handoffStates = ["Human Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = "Human Review";
+    config.github.prHandoff.requiredChecks = ["Typecheck and test"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    let candidateFetches = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        candidateFetches += 1;
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const pullRequestClient = new RecordingPullRequestClient({
+      checks: [{ name: "Typecheck and test", status: "success", conclusion: "success", url: null }],
+    });
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+      writeback,
+      pullRequestClient,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(candidateFetches).toBeGreaterThanOrEqual(1);
+    expect(harness.runs).toHaveLength(1);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.comments.map((comment) => comment.dedupeKey)).not.toContain("pull-request-handoff:pr-42:abc123");
+    expect(currentState).toBe("In Progress");
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "implementation",
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+      },
+    });
+    expect(pullRequestClient.checkInputs).toEqual([]);
+  });
+
+  it("keeps non-publication PR discovery metadata-only even when checks pass", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "In Progress";
+    config.tracker.handoffStates = ["Human Review"];
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = "Human Review";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const pullRequestClient = new RecordingPullRequestClient({
+      checks: [{ name: "Typecheck and test", status: "success", conclusion: "success", url: null }],
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore: new FileRunTranscriptStore(stateDir),
+      lifecycleStore: new FileIssueLifecycleStore(stateDir),
+      writeback: new WritebackProcessor(outboxStore, writer, logger, 300_000),
+      pullRequestClient,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.comments.some((comment) => comment.dedupeKey.startsWith("pull-request-handoff"))).toBe(false);
+    expect(currentState).toBe("In Progress");
+    expect(pullRequestClient.checkInputs).toEqual([]);
+    expect((await new FileIssueLifecycleStore(stateDir).get("issue-1"))?.phase).toBe("implementation");
+  });
 });
 
 class RecordingPullRequestClient implements PullRequestDiscoveryClient {
   readonly branches: string[] = [];
+  readonly checkInputs: Array<{ headSha: string; requiredChecks: string[] }> = [];
+
+  constructor(
+    private readonly options: {
+      draft?: boolean;
+      checks?: Array<{ name: string; status: "success" | "failure" | "pending" | "missing"; conclusion: string | null; url: string | null }>;
+    } = {},
+  ) {}
 
   async findOpenPullRequestByBranch(input: { branchName: string }) {
     this.branches.push(input.branchName);
@@ -169,6 +309,30 @@ class RecordingPullRequestClient implements PullRequestDiscoveryClient {
       headBranch: input.branchName,
       headSha: "abc123",
       lastPushedAt: "2026-01-01T00:00:01Z",
+      ...(this.options.draft ? { draft: true } : {}),
     };
+  }
+
+  async getRequiredCheckResults(input: { headSha: string; requiredChecks: string[] }) {
+    this.checkInputs.push(input);
+    return this.options.checks ?? [];
+  }
+}
+
+class StateChangingWriter implements TrackerWriter {
+  readonly transitions: TrackerTransitionInput[] = [];
+  readonly comments: TrackerCommentInput[] = [];
+
+  constructor(private readonly setState: (state: string) => void) {}
+
+  async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+    this.transitions.push(input);
+    this.setState(input.toState);
+    return { status: "applied" };
+  }
+
+  async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    this.comments.push(input);
+    return { status: "applied" };
   }
 }

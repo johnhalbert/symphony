@@ -100,6 +100,35 @@ describe("doctor review-loop checks", () => {
     ]);
   });
 
+  it("allows PR handoff states to differ from reviewer-agent states", async () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.tracker.activeStates = ["Todo", "In Progress"];
+    config.tracker.handoffStates = ["Human Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = "Human Review";
+    config.agent.requireLabels = ["dogfood-ready"];
+
+    const checks = await reviewLoopDoctorChecks(config, {
+      workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
+      mcpToolLister: async ({ command }) => mcpToolsFor(command),
+      linearStateLister: async () => [linearTeam(["Todo", "In Progress", "Human Review", "In Review", "Blocked", "Ready to Merge", "Done"])],
+    });
+
+    expect(checks).toContainEqual({
+      id: "review_loop.states",
+      status: "ok",
+      message: "review_states: In Review; pass destination: Ready to Merge",
+    });
+    expect(checks).toContainEqual({
+      id: "review_loop.linear_states",
+      status: "ok",
+      message: "Linear project teams have configured review-loop states: Human Review, In Review, Blocked, Ready to Merge (Engineering (ENG))",
+    });
+  });
+
   it("warns when Blocked or required dispatch labels are missing", async () => {
     const config = testConfig("/tmp/symphony-doctor");
     config.tracker.activeStates = ["Todo", "In Progress"];
@@ -333,6 +362,7 @@ describe("doctor review-loop checks", () => {
           token: "legacy-github-token",
           api_base_url: "https://api.github.test",
           publish_pull_requests: true,
+          pr_handoff: { enabled: false },
         },
         credential_profiles: {
           profiles: {
@@ -374,6 +404,7 @@ describe("doctor review-loop checks", () => {
           repo: "symphony",
           token: "legacy-github-token",
           publish_pull_requests: true,
+          pr_handoff: { enabled: false },
         },
         credential_profiles: {
           profiles: {

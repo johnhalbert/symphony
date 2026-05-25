@@ -175,6 +175,22 @@ const rawConfigSchema = z
           })
           .passthrough()
           .optional(),
+        pr_handoff: z
+          .object({
+            enabled: z.boolean().optional(),
+            target_state: z.string().optional(),
+            allow_drafts: z.boolean().optional(),
+            required_checks: stringArray.optional(),
+            no_ci: z
+              .object({
+                allowed: z.boolean().optional(),
+                evidence: z.string().optional(),
+              })
+              .passthrough()
+              .optional(),
+          })
+          .passthrough()
+          .optional(),
       })
       .passthrough()
       .optional(),
@@ -278,6 +294,7 @@ export interface GitHubConfig {
   apiBaseUrl: string;
   publishPullRequests: boolean;
   operatorApproval?: GitHubOperatorApprovalConfig;
+  prHandoff: GitHubPullRequestHandoffConfig;
 }
 
 export interface GitHubOperatorApprovalConfig {
@@ -285,6 +302,15 @@ export interface GitHubOperatorApprovalConfig {
   rejectPolicy: "cancel" | "fail";
   pollIntervalMs: number;
   timeoutMs: number | null;
+}
+
+export interface GitHubPullRequestHandoffConfig {
+  enabled: boolean;
+  targetState: string | null;
+  allowDrafts: boolean;
+  requiredChecks: string[];
+  noCiAllowed: boolean;
+  noCiEvidence: string | null;
 }
 
 export interface ReviewLoopConfig {
@@ -458,6 +484,11 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const reviewStates = raw.review_loop?.review_states ?? handoffStates;
   const blockedStates = raw.review_loop?.blocked_states ?? [];
   const reviewPassState = raw.review_loop?.review_pass_state ?? null;
+  const pullRequestHandoff = normalizePullRequestHandoff(raw, {
+    publishPullRequests,
+    handoffStates,
+    reviewStates,
+  });
   const mergePolicy = normalizeMergePolicy(raw, reviewPassState);
   validateStateBuckets({
     activeStates,
@@ -466,6 +497,14 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     reviewStates,
     blockedStates,
     reviewPassState,
+  });
+  validatePullRequestHandoffPolicy({
+    publishPullRequests,
+    handoffStates,
+    reviewStates,
+    blockedStates,
+    reviewPassState,
+    prHandoff: pullRequestHandoff,
   });
   const issueBoard = normalizeIssueBoardColumns(raw, {
     activeStates,
@@ -542,6 +581,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
       publishPullRequests,
       operatorApproval: githubOperatorApproval,
+      prHandoff: pullRequestHandoff,
     },
     credentialProfiles,
     reviewLoop: {
@@ -624,6 +664,83 @@ function normalizeMergePolicy(raw: RawWorkflowConfig, reviewPassState: string | 
     noCiAllowed: rawPolicy?.no_ci?.allowed ?? false,
     noCiEvidence,
   };
+}
+
+function normalizePullRequestHandoff(
+  raw: RawWorkflowConfig,
+  input: { publishPullRequests: boolean; handoffStates: string[]; reviewStates: string[] },
+): GitHubPullRequestHandoffConfig {
+  const rawPolicy = raw.github?.pr_handoff;
+  const noCiEvidence = normalizeOptionalConfigString(rawPolicy?.no_ci?.evidence);
+  if (rawPolicy?.no_ci?.allowed === true && noCiEvidence === null) {
+    throw new SymphonyError(
+      "config_validation_error",
+      "github.pr_handoff.no_ci.evidence is required when github.pr_handoff.no_ci.allowed is true",
+    );
+  }
+
+  return {
+    enabled: rawPolicy?.enabled ?? input.publishPullRequests,
+    targetState: normalizeOptionalConfigString(rawPolicy?.target_state) ?? input.handoffStates[0] ?? null,
+    allowDrafts: rawPolicy?.allow_drafts ?? false,
+    requiredChecks: normalizeRequiredChecks(rawPolicy?.required_checks ?? []),
+    noCiAllowed: rawPolicy?.no_ci?.allowed ?? false,
+    noCiEvidence,
+  };
+}
+
+function validatePullRequestHandoffPolicy(input: {
+  publishPullRequests: boolean;
+  handoffStates: string[];
+  reviewStates: string[];
+  blockedStates: string[];
+  reviewPassState: string | null;
+  prHandoff: GitHubPullRequestHandoffConfig;
+}): void {
+  if (!input.prHandoff.enabled) return;
+  if (!input.publishPullRequests) {
+    throw new SymphonyError(
+      "config_validation_error",
+      "github.pr_handoff.enabled requires github.publish_pull_requests until a service PR verifier is configured",
+    );
+  }
+  if (input.prHandoff.targetState === null) {
+    throw new SymphonyError("config_validation_error", "github.pr_handoff.target_state must resolve to a tracker.handoff_states value");
+  }
+  if (!input.handoffStates.some((state) => statesEqual(state, input.prHandoff.targetState ?? ""))) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `github.pr_handoff.target_state must be listed in tracker.handoff_states: ${input.prHandoff.targetState}`,
+    );
+  }
+
+  const reviewOverlap = overlappingStates(input.handoffStates, input.reviewStates);
+  if (reviewOverlap.length > 0) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `tracker.handoff_states must not overlap review_loop.review_states when github.pr_handoff is enabled: ${reviewOverlap.join(", ")}`,
+    );
+  }
+  const blockedOverlap = overlappingStates(input.handoffStates, input.blockedStates);
+  if (blockedOverlap.length > 0) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `tracker.handoff_states must not overlap review_loop.blocked_states when github.pr_handoff is enabled: ${blockedOverlap.join(", ")}`,
+    );
+  }
+  const passOverlap = input.reviewPassState === null ? [] : overlappingStates(input.handoffStates, [input.reviewPassState]);
+  if (passOverlap.length > 0) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `tracker.handoff_states must not overlap review_loop.review_pass_state when github.pr_handoff is enabled: ${passOverlap.join(", ")}`,
+    );
+  }
+  if (input.prHandoff.requiredChecks.length === 0 && !input.prHandoff.noCiAllowed) {
+    throw new SymphonyError(
+      "config_validation_error",
+      "github.pr_handoff.required_checks is required when PR publication handoff is enabled unless github.pr_handoff.no_ci.allowed is true",
+    );
+  }
 }
 
 const ISSUE_BOARD_COLUMN_IDS: IssueBoardColumnId[] = ["backlog", "todo", "progress", "review", "done", "canceled"];

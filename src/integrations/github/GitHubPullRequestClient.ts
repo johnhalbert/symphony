@@ -3,6 +3,7 @@ import type { GitHubConfig } from "../../core/config/Config.js";
 import { SymphonyError } from "../../core/errors.js";
 
 type FetchLike = typeof fetch;
+type GitHubPullRequestClientConfig = Omit<GitHubConfig, "prHandoff"> & Partial<Pick<GitHubConfig, "prHandoff">>;
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 
 export interface PullRequestBranchLookup {
@@ -16,6 +17,7 @@ export interface PullRequestMetadata {
   headBranch: string;
   headSha: string | null;
   lastPushedAt: string | null;
+  draft?: boolean;
 }
 
 export interface PullRequestDetails extends PullRequestMetadata {
@@ -140,6 +142,7 @@ interface GitHubPullRequestNode {
   merged?: unknown;
   merge_commit_sha?: unknown;
   merged_at?: unknown;
+  draft?: unknown;
   merged_by?: GitHubUserNode | null;
   updated_at?: unknown;
   head?: {
@@ -256,7 +259,7 @@ interface PullRequestReviewThreadMetadata {
 
 export class GitHubPullRequestClient {
   constructor(
-    private readonly config: GitHubConfig,
+    private readonly config: GitHubPullRequestClientConfig,
     private readonly fetchImpl: FetchLike = fetch,
   ) {}
 
@@ -799,6 +802,7 @@ function normalizePullRequest(node: GitHubPullRequestNode): PullRequestMetadata 
   const number = typeof node.number === "number" && Number.isInteger(node.number) ? node.number : null;
   const headBranch = asString(node.head?.ref);
   const headSha = asNullableString(node.head?.sha);
+  const draft = typeof node.draft === "boolean" ? node.draft : false;
   if (!url || number === null || !headBranch) return null;
   return {
     url,
@@ -806,6 +810,7 @@ function normalizePullRequest(node: GitHubPullRequestNode): PullRequestMetadata 
     headBranch,
     headSha,
     lastPushedAt: asNullableString(node.head?.repo?.pushed_at) ?? asNullableString(node.updated_at),
+    ...(draft ? { draft } : {}),
   };
 }
 
@@ -1098,7 +1103,7 @@ function assertSafePublishBranch(branchName: string): void {
   }
 }
 
-function pullRequestHeadRef(config: GitHubConfig, branchName: string): string {
+function pullRequestHeadRef(config: GitHubPullRequestClientConfig, branchName: string): string {
   const headOwner = config.headOwner ?? config.owner;
   return headOwner && headOwner !== config.owner ? `${headOwner}:${branchName}` : branchName;
 }

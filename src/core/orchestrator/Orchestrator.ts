@@ -97,6 +97,7 @@ export interface DiscoveredPullRequest {
   headBranch: string;
   headSha: string | null;
   lastPushedAt: string | null;
+  draft?: boolean;
 }
 
 export interface ContinuationSummaryCreationResult {
@@ -126,6 +127,7 @@ export interface RunningEntry {
   cleanupWorkspaceOnExit: boolean;
   suppressRetryOnExit: boolean;
   completionReportAccepted: boolean;
+  pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
   cancellationRequestedAt: Date | null;
@@ -938,6 +940,7 @@ export class Orchestrator {
       cleanupWorkspaceOnExit: false,
       suppressRetryOnExit: false,
       completionReportAccepted: false,
+      pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
       cancellationRequestedAt: null,
@@ -1171,7 +1174,7 @@ export class Orchestrator {
         });
         if (!terminal.updated) return;
         await this.discoverPullRequestForEntry(entry, context.workspace);
-        if (entry.role === "worker" && !(await this.reconcileCompletionReportHandoff(entry))) {
+        if (entry.role === "worker" && !(await this.reconcileCompletionReportHandoff(entry)) && !entry.pullRequestHandoffAccepted) {
           await this.recordIncompleteTurn(entry);
         }
         if (entry.role === "reviewer") {
@@ -1179,7 +1182,7 @@ export class Orchestrator {
         }
       }
       if (event.type === "failed") {
-        if (entry.role === "worker" && (await this.reconcileCompletionReportHandoff(entry))) {
+        if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
@@ -1200,7 +1203,7 @@ export class Orchestrator {
         throw new SymphonyError("agent_error", event.error);
       }
       if (event.type === "cancelled") {
-        if (entry.role === "worker" && (await this.reconcileCompletionReportHandoff(entry))) {
+        if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
@@ -1236,7 +1239,7 @@ export class Orchestrator {
     this.running.delete(issueId);
     this.endedRuntimeSeconds += (Date.now() - entry.startedAt.getTime()) / 1000;
 
-    if (entry.role === "worker" && (await this.reconcileCompletionReportHandoff(entry))) {
+    if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
       if (entry.runId) {
         const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
           status: "succeeded",

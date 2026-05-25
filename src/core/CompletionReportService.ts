@@ -22,6 +22,7 @@ import {
   planCompletionReportAcceptedWritebacks,
   planCompletionReportPublicationApprovalPendingWritebacks,
   planCompletionReportPublicationApprovalTerminalWritebacks,
+  planPullRequestHandoffWritebacks,
 } from "./writeback/TransitionPolicy.js";
 import type {
   FileWritebackOutboxStore,
@@ -94,6 +95,17 @@ export interface CompletionReportServiceOptions {
 
 export interface CompletionReportPullRequestPublisher {
   publishPullRequest(input: CompletionReportPullRequestPublicationInput): Promise<CompletionReportPullRequestPublication>;
+  getRequiredCheckResults?(input: {
+    headSha: string;
+    requiredChecks: string[];
+  }): Promise<CompletionReportPullRequestCheckResult[]>;
+}
+
+export interface CompletionReportPullRequestCheckResult {
+  name: string;
+  status: "success" | "failure" | "pending" | "missing";
+  conclusion: string | null;
+  url: string | null;
 }
 
 export interface CompletionReportPullRequestPublicationInput {
@@ -111,6 +123,7 @@ export interface CompletionReportPullRequestPublication {
   headBranch: string;
   headSha: string;
   lastPushedAt: string | null;
+  draft?: boolean | null;
   action: "reused" | "created";
   evidenceCursor: string;
 }
@@ -495,16 +508,41 @@ export class CompletionReportService {
     const pullRequest = input.publication
       ? pullRequestRefFromPublication(input.publication)
       : input.inputPullRequest;
+    const verifiedPullRequest =
+      input.publication && pullRequest
+        ? {
+            ...pullRequest,
+            draft: input.publication.draft ?? null,
+          }
+        : null;
+    const handoffChecks = await this.evaluatePullRequestHandoffChecks(verifiedPullRequest);
+    if (this.options.config.github.prHandoff.enabled && (!verifiedPullRequest || !handoffChecks)) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Completion report handoff requires a verified pull request that satisfies the handoff policy",
+      );
+    }
     const lifecycle = await this.options.lifecycleStore.ensureIssue(input.context.issue, {
       summaryPointers: summaryPointersFor(input.context, pullRequest, input.publication, input.lifecycle),
     });
-    const operations = planCompletionReportAcceptedWritebacks(
-      runWritebackContext(input.context, input.report.runId),
-      this.options.config,
-      completionReportWritebackDetails(input.report, input.context.issue, pullRequest),
-    );
+    const writebackContext = runWritebackContext(input.context, input.report.runId);
+    const writebackReport = completionReportWritebackDetails(input.report, input.context.issue, pullRequest);
+    const operations = this.options.config.github.prHandoff.enabled
+      ? verifiedPullRequest && handoffChecks
+        ? planPullRequestHandoffWritebacks(writebackContext, this.options.config, {
+            pullRequest: verifiedPullRequest,
+            report: writebackReport,
+            ci: handoffChecks,
+          })
+        : []
+      : planCompletionReportAcceptedWritebacks(writebackContext, this.options.config, writebackReport);
     if (operations.length === 0) {
-      throw new SymphonyError("invalid_request", "Completion report cannot be accepted for the current issue state");
+      throw new SymphonyError(
+        "invalid_request",
+        this.options.config.github.prHandoff.enabled
+          ? "Completion report handoff requires a verified pull request that satisfies the handoff policy"
+          : "Completion report cannot be accepted for the current issue state",
+      );
     }
 
     const storedReport = buildCompletionReportRecord({
@@ -569,6 +607,37 @@ export class CompletionReportService {
     }
     const publicationInput = this.buildPublicationInput(report, context, existingLifecycle);
     return this.options.pullRequestPublisher.publishPullRequest(publicationInput);
+  }
+
+  private async evaluatePullRequestHandoffChecks(
+    pullRequest: CompletionReportPullRequestRef | null,
+  ): Promise<{ requiredChecks: string[]; passedChecks: string[]; noCiEvidence: string | null } | null> {
+    if (!this.options.config.github.prHandoff.enabled) return null;
+    if (pullRequest?.draft === true && !this.options.config.github.prHandoff.allowDrafts) return null;
+    const requiredChecks = this.options.config.github.prHandoff.requiredChecks;
+    if (requiredChecks.length === 0) {
+      const noCiEvidence = this.options.config.github.prHandoff.noCiAllowed
+        ? this.options.config.github.prHandoff.noCiEvidence
+        : null;
+      return noCiEvidence === null
+        ? null
+        : {
+            requiredChecks: [],
+            passedChecks: [],
+            noCiEvidence,
+          };
+    }
+    if (pullRequest?.headSha === null || pullRequest?.headSha === undefined) return null;
+    if (!this.options.pullRequestPublisher?.getRequiredCheckResults) return null;
+
+    const results = await this.options.pullRequestPublisher.getRequiredCheckResults({
+      headSha: pullRequest.headSha,
+      requiredChecks,
+    });
+    const passedChecks = results.filter((check) => check.status === "success").map((check) => check.name);
+    const passed = new Set(passedChecks.map((check) => check.toLowerCase()));
+    const missing = requiredChecks.filter((check) => !passed.has(check.toLowerCase()));
+    return missing.length === 0 ? { requiredChecks, passedChecks, noCiEvidence: null } : null;
   }
 
   private async requestPublicationApproval(

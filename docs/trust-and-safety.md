@@ -19,7 +19,7 @@ Symphony may write:
 - Dispatch transition, such as `Todo` to `In Progress`, when policy allows.
 - Run-start and run-end comments.
 - Failure and cancellation comments.
-- Verified completion handoff transition, such as `In Progress` to `In Review`.
+- Verified PR handoff transition, such as `In Progress` to `Human Review`, after an accepted completion report and configured handoff checks.
 - Escalation transition to `Blocked` when review loops, incomplete turns, or other operator-required failures exceed policy limits.
 
 Symphony must not write:
@@ -56,13 +56,16 @@ Gate issues that touch those areas should be implemented manually through Cursor
 Dogfood uses these state groups:
 
 - Worker implementation queue: `Todo`, `In Progress`
+- PR-driven human review handoff: `Human Review`
 - Reviewer-agent queue: `In Review`
 - Human-required escalation: `Blocked`
 - Terminal: `Done`, `Closed`, `Cancelled`, `Canceled`, `Duplicate`
 
-`In Review` is not active and not terminal. Reaching `In Review` stops worker dispatch and queues the work for independent reviewer-agent review.
+`Human Review` is not active and not terminal. Reaching `Human Review` stops worker dispatch and leaves the lifecycle-bound pull request for human review. Handoff checks are evaluated at completion-report submission time; a PR can exist without a Linear handoff when those checks are still pending or failing. A human operator moves the issue to `In Review` when reviewer-agent review should start.
 
-Reviewer pass does not use a separate `Ready` or `Ready for Human` Linear state in the current dogfood loop. The reviewer records a structured pass verdict with supporting evidence, such as a Linear comment or PR review, while the issue remains `In Review`; after the PR is merged, Symphony transitions the issue to `Done`.
+`In Review` is not active and not terminal. Reaching `In Review` queues the work for independent reviewer-agent review and requires a stored worker completion report.
+
+Reviewer pass uses the configured `Ready to Merge` Linear state in the current dogfood loop. The reviewer records a structured pass verdict with supporting evidence, such as a Linear comment or PR review, and Symphony transitions the issue from `In Review` to `Ready to Merge`.
 
 Review failures continue through the review loop. Policy exhaustion, repeated incomplete worker turns, or other human-required escalation moves the issue to `Blocked`.
 

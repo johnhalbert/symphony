@@ -133,6 +133,7 @@ describe("MCP subprocess environment", () => {
           owner: "acme",
           repo: "symphony",
           publish_pull_requests: true,
+          pr_handoff: { enabled: false },
         },
       },
       "/repo/WORKFLOW.md",
@@ -160,6 +161,7 @@ describe("MCP subprocess environment", () => {
           owner: "acme",
           repo: "symphony",
           publish_pull_requests: true,
+          pr_handoff: { enabled: false },
         },
         credential_profiles: {
           profiles: {
@@ -207,6 +209,7 @@ describe("MCP subprocess environment", () => {
         api_base_url: "$GITHUB_API_BASE_URL",
         token: "$CUSTOM_GITHUB_TOKEN",
         publish_pull_requests: true,
+        pr_handoff: { enabled: false },
       },
     } as const;
     const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", {
@@ -254,6 +257,7 @@ describe("MCP subprocess environment", () => {
         owner: "$GITHUB_OWNER",
         repo: "$GITHUB_REPO",
         publish_pull_requests: true,
+        pr_handoff: { enabled: false },
       },
       credential_profiles: {
         profiles: {
@@ -309,6 +313,7 @@ describe("MCP subprocess environment", () => {
           repo: "symphony",
           token: "$CUSTOM_GITHUB_TOKEN",
           publish_pull_requests: true,
+          pr_handoff: { enabled: false },
         },
       },
       "/repo/WORKFLOW.md",
@@ -339,6 +344,7 @@ describe("MCP subprocess environment", () => {
           repo: "symphony",
           token: "literal-github-secret",
           publish_pull_requests: true,
+          pr_handoff: { enabled: false },
         },
       },
       "/repo/WORKFLOW.md",
@@ -417,6 +423,7 @@ describe("MCP subprocess environment", () => {
           repo: "symphony",
           token: "$CUSTOM_GITHUB_TOKEN",
           publish_pull_requests: true,
+          pr_handoff: { enabled: false },
         },
         credential_profiles: {
           profiles: {
@@ -457,6 +464,7 @@ describe("MCP subprocess environment", () => {
         api_base_url: "$GITHUB_API_BASE_URL",
         token: "$PUBLICATION_TOKEN_REF",
         publish_pull_requests: true,
+        pr_handoff: { enabled: false },
       },
       credential_profiles: {
         profiles: {
@@ -584,6 +592,7 @@ describe("MCP subprocess environment", () => {
           owner: "acme",
           repo: "symphony",
           publish_pull_requests: true,
+          pr_handoff: { enabled: false },
         },
         credential_profiles: {
           profiles: {

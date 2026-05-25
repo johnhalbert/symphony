@@ -276,7 +276,7 @@ describe("Orchestrator", () => {
 
   it("does not retry after a handoff state", async () => {
     const config = testConfig(root);
-    config.tracker.handoffStates = ["In Review"];
+    config.tracker.handoffStates = ["Human Review"];
     const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
     let refreshes = 0;
     const tracker: TrackerClient = {
@@ -288,7 +288,7 @@ describe("Orchestrator", () => {
       },
       async fetchIssueStatesByIds() {
         refreshes += 1;
-        return [refreshes === 1 ? candidate : { ...candidate, state: "In Review" }];
+        return [refreshes === 1 ? candidate : { ...candidate, state: "Human Review" }];
       },
     };
     const logger = new StructuredLogger(() => undefined);
@@ -315,7 +315,7 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    config.tracker.handoffStates = ["In Review"];
+    config.tracker.handoffStates = ["Human Review"];
     const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
     let currentState = "Todo";
     const tracker: TrackerClient = {
@@ -432,7 +432,7 @@ describe("Orchestrator", () => {
     config.agent.maxTurns = 5;
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    config.tracker.handoffStates = ["In Review"];
+    config.tracker.handoffStates = ["Human Review"];
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.blockedStates = ["Blocked"];
     config.reviewLoop.maxIncompleteTurns = 2;
@@ -1577,9 +1577,13 @@ describe("Orchestrator", () => {
     config.agent.maxTurns = 3;
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    config.tracker.handoffStates = ["In Review"];
+    config.tracker.handoffStates = ["Human Review"];
     config.reviewLoop.reviewStates = ["In Review"];
     config.github.publishPullRequests = true;
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = "Human Review";
+    config.github.prHandoff.noCiAllowed = true;
+    config.github.prHandoff.noCiEvidence = "No CI configured in unit test";
     config.github.owner = "acme";
     config.github.repo = "symphony";
     config.github.token = "github-token";
@@ -1636,10 +1640,10 @@ describe("Orchestrator", () => {
     expect(harness.prompts).toEqual(["Work on TEST-1"]);
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "report-run-1:run-started",
-      "report-run-1:completion-report:idem-1",
+      "pull-request-handoff:pr-42:abc123",
     ]);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
-    expect(currentState).toBe("In Review");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Human Review"]);
+    expect(currentState).toBe("Human Review");
     expect(writer.comments[1]?.body).toContain("https://github.com/acme/symphony/pull/42");
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
     expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
@@ -1669,9 +1673,13 @@ describe("Orchestrator", () => {
     config.agent.maxTurns = 3;
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    config.tracker.handoffStates = ["In Review"];
+    config.tracker.handoffStates = ["Human Review"];
     config.reviewLoop.reviewStates = ["In Review"];
     config.github.publishPullRequests = true;
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = "Human Review";
+    config.github.prHandoff.noCiAllowed = true;
+    config.github.prHandoff.noCiEvidence = "No CI configured in unit test";
     config.github.owner = "acme";
     config.github.repo = "symphony";
     config.github.token = "github-token";
@@ -1731,10 +1739,10 @@ describe("Orchestrator", () => {
     expect(harness.prompts).toEqual(["Work on TEST-1"]);
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "report-run-1:run-started",
-      "report-run-1:completion-report:idem-1",
+      "pull-request-handoff:pr-42:abc123",
     ]);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
-    expect(currentState).toBe("In Review");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Human Review"]);
+    expect(currentState).toBe("Human Review");
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-failed"))).toBe(false);
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-cancelled"))).toBe(false);
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
@@ -1771,9 +1779,13 @@ describe("Orchestrator", () => {
     config.agent.maxTurns = 3;
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    config.tracker.handoffStates = ["In Review"];
+    config.tracker.handoffStates = ["Human Review"];
     config.reviewLoop.reviewStates = ["In Review"];
     config.github.publishPullRequests = true;
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = "Human Review";
+    config.github.prHandoff.noCiAllowed = true;
+    config.github.prHandoff.noCiEvidence = "No CI configured in unit test";
     config.github.owner = "acme";
     config.github.repo = "symphony";
     config.github.token = "github-token";
@@ -1832,10 +1844,10 @@ describe("Orchestrator", () => {
     expect(harness.prompts).toEqual(["Work on TEST-1"]);
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "report-run-1:run-started",
-      "report-run-1:completion-report:idem-1",
+      "pull-request-handoff:pr-42:abc123",
     ]);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
-    expect(currentState).toBe("In Review");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Human Review"]);
+    expect(currentState).toBe("Human Review");
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-failed"))).toBe(false);
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-cancelled"))).toBe(false);
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
@@ -1872,9 +1884,13 @@ describe("Orchestrator", () => {
     config.agent.maxTurns = 3;
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    config.tracker.handoffStates = ["In Review"];
+    config.tracker.handoffStates = ["Human Review"];
     config.reviewLoop.reviewStates = ["In Review"];
     config.github.publishPullRequests = true;
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = "Human Review";
+    config.github.prHandoff.noCiAllowed = true;
+    config.github.prHandoff.noCiEvidence = "No CI configured in unit test";
     config.github.owner = "acme";
     config.github.repo = "symphony";
     config.github.token = "github-token";
@@ -1931,10 +1947,10 @@ describe("Orchestrator", () => {
     expect(harness.prompts).toEqual(["Work on TEST-1"]);
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "report-run-1:run-started",
-      "report-run-1:completion-report:idem-1",
+      "pull-request-handoff:pr-42:abc123",
     ]);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "In Review"]);
-    expect(currentState).toBe("In Review");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Human Review"]);
+    expect(currentState).toBe("Human Review");
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-failed"))).toBe(false);
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-cancelled"))).toBe(false);
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
