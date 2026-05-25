@@ -28,12 +28,12 @@ review_loop:
     - Check lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions when shared orchestration behavior is touched.
     - Check MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when the change crosses those systems.
     - Check approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when publication behavior is touched.
-    - Check dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active.
+    - "Check dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active."
   worker_prompt_extensions:
     - For Symphony orchestration, workflow, tracker, harness, API, approval, publication, or writeback changes, validate lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
     - Validate MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
     - Cover approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when applicable.
-    - Confirm dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active.
+    - "Confirm dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active."
 
 merge_policy:
   mode: gated
