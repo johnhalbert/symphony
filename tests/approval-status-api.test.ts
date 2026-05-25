@@ -280,7 +280,7 @@ describe("approval status API", () => {
 
       expect(issueResponse.status).toBe(200);
       expect(issueBody.capabilities.pendingApproval).toMatchObject({ active: true, requiresToken: false });
-      expect(response.status).toBe(200);
+      expect(response.status, JSON.stringify(body)).toBe(200);
       expect(body.request.status).toBe("approved");
     } finally {
       await server.stop();
@@ -655,7 +655,7 @@ describe("approval status API", () => {
       });
       const body = (await response.json()) as { replayed: boolean; request: { status: string } };
 
-      expect(response.status).toBe(200);
+      expect(response.status, JSON.stringify(body)).toBe(200);
       expect(body).toMatchObject({ replayed: false, request: { status: "approved" } });
       await waitFor(() => publisher.inputs.length === 1, "service-owned live publication");
       await waitFor(() => orchestrator.snapshot().counts.running === 0, "live worker approval exit");
