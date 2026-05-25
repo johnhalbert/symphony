@@ -25,6 +25,7 @@ import { approvalResolve } from "../core/approval/OperatorApprovalService.js";
 import {
   approvalMatchesReport,
   isAwaitingPublicationApprovalLifecycle,
+  isPendingPublicationApprovalLifecycle,
   pendingPublicationReport,
 } from "../core/CompletionReportService.js";
 import {
@@ -226,8 +227,9 @@ export class StatusServer {
               approval: existingApproval,
               lifecycleStore: this.options.lifecycleStore,
               runStore: this.options.runStore,
+              allowSetupIncomplete: decision === "reject",
             });
-            if (!currentApproval) {
+            if (!currentApproval && (await hasPendingPublicationLifecycle(existingApproval, this.options.lifecycleStore))) {
               throw new SymphonyError("conflict", "Approval request is not current pending publication approval");
             }
           }
@@ -713,17 +715,32 @@ async function currentPendingPublicationApproval(input: {
   approval: OperatorApprovalRecord;
   lifecycleStore: IssueLifecycleStore | undefined;
   runStore: RunTranscriptStore | undefined;
+  allowSetupIncomplete?: boolean;
 }): Promise<OperatorApprovalRecord | null> {
   if (input.approval.status !== "pending" || !input.lifecycleStore || !input.runStore) return null;
   const lifecycle =
     (await input.lifecycleStore.get(input.approval.issueId)) ??
     (await input.lifecycleStore.get(input.approval.issueIdentifier));
-  if (!isAwaitingPublicationApprovalLifecycle(lifecycle)) return null;
+  if (
+    !isAwaitingPublicationApprovalLifecycle(lifecycle) &&
+    !(input.allowSetupIncomplete === true && isPendingPublicationApprovalLifecycle(lifecycle))
+  ) {
+    return null;
+  }
   const report = pendingPublicationReport(lifecycle);
   if (!report || !approvalMatchesReport(input.approval, report)) return null;
   const run = await input.runStore.getRun(report.runId);
   if (run?.pendingApprovalRequestId !== input.approval.requestId) return null;
   return input.approval;
+}
+
+async function hasPendingPublicationLifecycle(
+  approval: OperatorApprovalRecord,
+  lifecycleStore: IssueLifecycleStore | undefined,
+): Promise<boolean> {
+  if (!lifecycleStore) return false;
+  const lifecycle = (await lifecycleStore.get(approval.issueId)) ?? (await lifecycleStore.get(approval.issueIdentifier));
+  return isPendingPublicationApprovalLifecycle(lifecycle);
 }
 
 function approvalMutationsRequireToken(enabled: boolean, openWorkspaceToken: string | null): boolean {
@@ -751,11 +768,27 @@ function isPublicationApprovalTerminal(
 
 type RuntimeSnapshot = ReturnType<Orchestrator["snapshot"]>;
 type RunningRow = RuntimeSnapshot["running"][number];
-type OperatorLivenessStatus = "running" | "possibly_stalled" | "cancelling" | "cancelled" | "blocked_human_required";
+type OperatorLivenessStatus =
+  | "running"
+  | "possibly_stalled"
+  | "cancelling"
+  | "cancelled"
+  | "blocked_human_required"
+  | "not_live";
 
 const OPERATOR_LIVENESS_CONTRACT = {
-  version: "eng-62-v1",
-  supportedStatuses: ["running", "possibly_stalled", "cancelling", "cancelled", "blocked_human_required"],
+  version: "sdk-run-lifecycle-v2",
+  supportedStatuses: ["running", "possibly_stalled", "cancelling", "cancelled", "blocked_human_required", "not_live"],
+  sdkRunLifecycle: {
+    tracked: true,
+    terminalSource: "run.wait",
+    streamStatusesAreDiagnostics: true,
+  },
+  idleAlert: {
+    tracked: true,
+    action: "observe_only",
+    deprecatedStatus: "possibly_stalled",
+  },
   cancelFailed: {
     tracked: true,
     sources: ["harness_stop", "cancel_ignored"],
@@ -1659,6 +1692,11 @@ async function renderDashboard(
               }</li>`,
           )
           .join("")}</ul></section>`;
+  const orphanedRows = await orphanedOperatorViews(snapshot, runStore);
+  const orphaned =
+    orphanedRows.length === 0
+      ? ""
+      : `<section><h2>Not Live Runs</h2><ul class="plain-list">${orphanedRows.map(renderOrphanedRunRow).join("")}</ul></section>`;
   return `<!doctype html>
 <html>
   <head>
@@ -1678,6 +1716,8 @@ async function renderDashboard(
       .operator-possibly_stalled .badge { background: #fff3e0; color: #e65100; }
       .operator-cancelling .badge { background: #fce4ec; color: #c62828; }
       .operator-blocked_human_required .badge { background: #f3e5f5; color: #6a1b9a; }
+      .operator-not_live { border-left-color: #607d8b; background: #f6f8f9; }
+      .operator-not_live .badge { background: #eceff1; color: #455a64; }
       .meta, .activity, .controls { color: #555; font-size: 0.9rem; }
       .cancellation, .blocked { margin-top: 0.25rem; font-size: 0.9rem; }
       .cancellation { color: #a31919; }
@@ -1695,6 +1735,7 @@ async function renderDashboard(
     </section>
     ${paused}
     ${retrying}
+    ${orphaned}
     <p class="meta">Snapshot generated at ${escapeHtml(snapshot.generatedAt)}</p>
   </body>
 </html>`;
@@ -1719,7 +1760,7 @@ function renderRunningRow(
   });
   const runId = row.liveness.activeRunId ?? row.runId ?? "n/a";
   const idle = `${Math.round(row.liveness.secondsSinceLastActivity)}s idle`;
-  const threshold = row.liveness.stallTimeoutMs === null ? "no stall threshold" : `${row.liveness.stallTimeoutMs}ms threshold`;
+  const threshold = row.liveness.stallTimeoutMs === null ? "no idle alert threshold" : `${row.liveness.stallTimeoutMs}ms idle alert`;
   const cancellation = cancellationSummary(row);
   const cancelFailed = cancelFailedSummary(liveCancelFailed(row));
   const activitySources = activitySummary(row);
@@ -1727,7 +1768,7 @@ function renderRunningRow(
   return `<li class="run-row operator-${operator.status}">
     <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.runKind)} · ${escapeHtml(row.state)}</span></div>
     <div class="meta">run <code>${escapeHtml(runId)}</code> · agent <code>${escapeHtml(agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
-    <div class="activity">last activity ${escapeHtml(row.liveness.lastActivityAt)} (${escapeHtml(idle)}, ${escapeHtml(threshold)}); event <code>${escapeHtml(row.lastEvent ?? "n/a")}</code>${row.lastEventAt ? ` at ${escapeHtml(row.lastEventAt)}` : ""}</div>
+    <div class="activity">last activity ${escapeHtml(row.liveness.lastActivityAt)} (${escapeHtml(idle)}, ${escapeHtml(threshold)}); SDK status <code>${escapeHtml(row.liveness.sdkRunStatus ?? "n/a")}</code>; event <code>${escapeHtml(row.lastEvent ?? "n/a")}</code>${row.lastEventAt ? ` at ${escapeHtml(row.lastEventAt)}` : ""}</div>
     ${activitySources ? `<div class="activity">${escapeHtml(activitySources)}</div>` : ""}
     ${row.lastMessage ? `<div>${escapeHtml(row.lastMessage)}</div>` : ""}
     <div><code>${escapeHtml(row.workspacePath ?? "")}</code></div>
@@ -1736,6 +1777,16 @@ function renderRunningRow(
     ${blockedReason ? `<div class="blocked">Blocked: ${escapeHtml(blockedReason)}</div>` : ""}
     <div class="controls">controls: ${formatControls(controls)}</div>
     ${formatAffordances(affordances)}
+  </li>`;
+}
+
+function renderOrphanedRunRow(row: Awaited<ReturnType<typeof orphanedOperatorViews>>[number]): string {
+  return `<li class="run-row operator-not_live">
+    <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">not_live</span> <span class="meta">${escapeHtml(row.role)}</span></div>
+    <div class="meta">run <code>${escapeHtml(row.runId)}</code> · agent <code>${escapeHtml(row.agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code></div>
+    <div class="activity">persisted running run is not present in the live orchestrator snapshot; SDK status <code>${escapeHtml(row.sdkRunStatus ?? "n/a")}</code>${row.lastActivityAt ? `; last activity ${escapeHtml(row.lastActivityAt)}` : ""}</div>
+    <div><code>${escapeHtml(row.workspacePath ?? "")}</code></div>
+    <div class="controls">controls: none</div>
   </li>`;
 }
 
@@ -1790,11 +1841,13 @@ async function operatorSnapshotView(
       };
     }),
   );
+  const orphaned = await orphanedOperatorViews(snapshot, runStore);
   return {
     generatedAt: snapshot.generatedAt,
     mutationsRequireToken: mutationsConfigured,
     operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
     running,
+    orphaned,
     paused: await pausedOperatorViews(
       snapshot.paused,
       snapshot.running,
@@ -1807,6 +1860,32 @@ async function operatorSnapshotView(
     ),
     retrying: snapshot.retrying,
   };
+}
+
+async function orphanedOperatorViews(snapshot: RuntimeSnapshot, runStore?: RunTranscriptStore) {
+  if (!runStore) return [];
+  const runs = (await runStore.listRuns())
+    .filter((run) => isOrphanedPersistedRun(run, snapshot))
+    .sort(compareRunChronology)
+    .slice(-25)
+    .reverse();
+  return runs.map((run) => ({
+    issueId: run.issueId,
+    issueIdentifier: run.issueIdentifier,
+    role: run.role,
+    runId: run.runId,
+    agentId: run.agentId,
+    sessionId: run.sessionId,
+    workspacePath: run.workspacePath ?? null,
+    rawStatus: run.status,
+    tracking: "orphaned" as const,
+    status: "not_live" as const,
+    sdkRunStatus: run.sdkRunStatus ?? null,
+    sdkRunStatusUpdatedAt: run.sdkRunStatusObservedAt ?? null,
+    sdkRunStatusSource: run.sdkRunStatusSource ?? null,
+    lastActivityAt: run.activitySnapshot?.lastHarnessActivityAt ?? run.updatedAt,
+    controls: { pause: false, resume: false, cancel: false, mutationsRequireToken: false },
+  }));
 }
 
 function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: IssueLifecycleRecord | null | undefined = row.lifecycle, agentId: string | null = null) {
@@ -1828,6 +1907,10 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
     lastMessage: row.lastMessage,
     secondsSinceLastActivity: row.liveness.secondsSinceLastActivity,
     stallTimeoutMs: row.liveness.stallTimeoutMs,
+    sdkRunStatus: row.liveness.sdkRunStatus ?? null,
+    sdkRunStatusUpdatedAt: row.liveness.sdkRunStatusUpdatedAt ?? null,
+    sdkRunStatusSource: row.liveness.sdkRunStatusSource ?? null,
+    idleAlert: row.liveness.idleAlert ?? null,
     cancellation: row.cancellation,
     paused,
     activity: liveActivity(row),
@@ -1917,6 +2000,9 @@ async function issueOperatorLiveness(input: {
   if (input.latestRun?.status === "cancelled" || input.latestRun?.cancellationRequestedAt || input.latestRun?.cancelFailed) {
     return terminalOperatorLiveness("cancelled", input.latestRun, input.lifecycle ?? null, input.paused, input.runStore);
   }
+  if (input.latestRun?.status === "running") {
+    return orphanedOperatorLiveness(input.latestRun, input.paused, input.runStore);
+  }
   return null;
 }
 
@@ -1937,6 +2023,9 @@ async function runOperatorLiveness(
   }
   if (run.status === "cancelled" || run.cancellationRequestedAt || run.cancelFailed) {
     return terminalOperatorLiveness("cancelled", run, null, false, runStore);
+  }
+  if (isOrphanedPersistedRun(run, snapshot)) {
+    return orphanedOperatorLiveness(run, false, runStore);
   }
   return null;
 }
@@ -2005,8 +2094,37 @@ function runLivenessSummary(
   }
   if (run.status === "cancelled" || run.cancellationRequestedAt || run.cancelFailed)
     return { tracking: "terminal", status: "cancelled" as const, paused: false, cancelFailed: terminalCancelFailed(run) };
-  if (run.status === "running") return { tracking: "orphaned", status: null, paused: false };
+  if (isOrphanedPersistedRun(run, snapshot)) return { tracking: "orphaned", status: "not_live" as const, rawStatus: "running" as const, paused: false };
   return { tracking: "terminal", status: null, paused: false };
+}
+
+async function orphanedOperatorLiveness(run: RunRecord, paused: boolean, runStore?: RunTranscriptStore) {
+  return {
+    status: "not_live" as const,
+    rawStatus: run.status,
+    tracking: "orphaned" as const,
+    cancelFailed: terminalCancelFailed(run),
+    linearAuditComments: OPERATOR_LIVENESS_CONTRACT.deferred.linearAuditComments,
+    runId: run.runId,
+    activeRunId: null,
+    agentId: run.agentId ?? null,
+    sessionId: run.sessionId ?? null,
+    workspacePath: run.workspacePath ?? null,
+    lastActivityAt: run.activitySnapshot?.lastHarnessActivityAt ?? run.updatedAt,
+    lastTranscriptEventAt: null,
+    lastTranscriptEvent: null,
+    lastMessage: "Persisted running run is not present in the live orchestrator snapshot",
+    secondsSinceLastActivity: null,
+    stallTimeoutMs: null,
+    sdkRunStatus: run.sdkRunStatus ?? null,
+    sdkRunStatusUpdatedAt: run.sdkRunStatusObservedAt ?? null,
+    sdkRunStatusSource: run.sdkRunStatusSource ?? null,
+    idleAlert: null,
+    cancellation: null,
+    paused,
+    activity: await terminalActivity(run, null, runStore),
+    timeline: [],
+  };
 }
 
 async function terminalOperatorLiveness(
@@ -2315,8 +2433,11 @@ function terminalTimeline(
 function liveOperatorStatus(row: RunningRow, lifecycle: IssueLifecycleRecord | null | undefined): OperatorLivenessStatus {
   if (row.cancellation.requested || row.liveness.status === "cancelling") return "cancelling";
   if (isLifecycleBlocked(lifecycle)) return "blocked_human_required";
-  if (row.liveness.status === "stalled") return "possibly_stalled";
   return "running";
+}
+
+function isOrphanedPersistedRun(run: RunRecord, snapshot: RuntimeSnapshot): boolean {
+  return run.status === "running" && findLiveRun(snapshot, run.runId) === null;
 }
 
 function findLiveRun(snapshot: RuntimeSnapshot, runId: string): RunningRow | null {

@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
-import type { AgentActivitySource, AgentEvent, AgentHarness } from "../harness/AgentHarness.js";
+import type { AgentActivitySource, AgentEvent, AgentHarness, AgentRunSdkStatus } from "../harness/AgentHarness.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import {
@@ -30,6 +30,12 @@ import {
 } from "../IssueBreakdownPlanService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
+  DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE,
+  DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE,
+  formatGeneralScenarioMatrix,
+  formatPromptExtensions,
+} from "../workflow/ReviewLoopPromptGuidance.js";
+import {
   compareRunChronology,
   type RunActivitySnapshot,
   type RunMetadata,
@@ -52,6 +58,7 @@ import {
 import { MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
 import {
   formatWorkerReviewEvidencePrompt,
+  isActiveReviewEvidenceItem,
   PullRequestReviewEvidenceService,
   type PullRequestReviewEvidenceClient,
 } from "../review/PullRequestReviewEvidenceService.js";
@@ -128,6 +135,14 @@ export interface RunningEntry {
   lastEventAt: Date | null;
   lastEvent: string | null;
   lastMessage: string | null;
+  sdkRunStatus: AgentRunSdkStatus | null;
+  sdkRunStatusUpdatedAt: Date | null;
+  sdkRunStatusSource: "initial" | "onDidChangeStatus" | "wait" | null;
+  failureKind: string | null;
+  failureDiagnosticCode: string | null;
+  failureDiagnosticMessage: string | null;
+  failureDiagnosticAt: Date | null;
+  failureDiagnosticPayload: unknown;
   turnCount: number;
   retryAttempt: number;
   tokens: TokenCounts;
@@ -217,7 +232,15 @@ export interface RuntimeSnapshot {
   rateLimits: unknown;
 }
 
-export type RunLivenessStatus = "starting" | "active" | "stalled" | "cancelling";
+export type RunLivenessStatus = "starting" | "active" | "terminal_pending" | "stalled" | "cancelling";
+
+export interface RunIdleAlertState {
+  active: boolean;
+  thresholdMs: number | null;
+  lastActivityAt: string;
+  secondsSinceLastActivity: number;
+  reason: "observe_only" | "suppressed" | null;
+}
 
 export interface RunLivenessState {
   status: RunLivenessStatus;
@@ -225,6 +248,10 @@ export interface RunLivenessState {
   lastActivityAt: string;
   secondsSinceLastActivity: number;
   stallTimeoutMs: number | null;
+  sdkRunStatus?: AgentRunSdkStatus | null;
+  sdkRunStatusUpdatedAt?: string | null;
+  sdkRunStatusSource?: "initial" | "onDidChangeStatus" | "wait" | null;
+  idleAlert?: RunIdleAlertState;
 }
 
 export type RunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
@@ -269,8 +296,10 @@ export interface IssueRunMetadata {
   baseRef: string | null;
 }
 
+const PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER = "[[SYMPHONY_PROJECT_REVIEWER_PROMPT_EXTENSIONS]]";
+
 const DEFAULT_REVIEWER_PROMPT_TEMPLATE = `
-You are a Symphony reviewer agent for {{ issue.identifier }}.
+You are a reviewer agent for {{ issue.identifier }}.
 
 Inspect only. Do not modify files, create commits, push branches, comment on Linear, transition Linear state, or otherwise change workspace or lifecycle state directly.
 
@@ -278,23 +307,11 @@ Use the linked GitHub pull request as the primary detailed review surface. Call 
 
 After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" for requested changes and "pass" only when all acceptance criteria are satisfied. The MCP servers supply the active run, issue, and lifecycle-bound PR context; include runId, issueId, PR number, repository, token, or commit identity only if a tool explicitly asks for it.
 
-Before submitting any verdict, perform a bounded sibling-risk sweep. Do not pass by checking only the happy path, and do not stop at the first valid blocker. For each unsatisfied acceptance criterion, identify all related blocking gaps you can find from the current evidence, then bundle them into one well-specified requested-change set.
+${DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE}
 
-For each fail finding, include the required behavior change, concrete evidence, required validation, sibling scenarios checked, and any related scenarios intentionally left unverified. Distinguish implementation defects, missing tests, ambiguous contracts, and out-of-scope follow-ups.
+${formatGeneralScenarioMatrix()}
 
-General software review matrix:
-- Happy path and negative/error paths.
-- Boundary/integration behavior, not only isolated unit behavior.
-- Persistence/durability, externally visible side effects, and recovery after interruption.
-- Authorization/security variants, including unset, empty, invalid, and valid credentials when applicable.
-- Idempotency/replay and already-terminal or repeated-operation behavior.
-- Whether required side effects are actually processed, not merely planned or enqueued.
-
-Symphony dogfood extension for shared orchestration work:
-- Check lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
-- Check MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
-- Check approval/publication variants: pending, approved, rejected, cancelled, stale, expired, already-terminal, replay; rejectPolicy cancel and fail; live worker wait and after-worker-exit resume.
-- Check dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active.
+${PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER}
 
 Tool payload guidance:
 - acceptanceResults: one entry per acceptance criterion with satisfied true/false and concrete evidence.
@@ -702,7 +719,6 @@ export class Orchestrator {
   }
 
   private async reconcileRunningIssues(): Promise<void> {
-    await this.reconcileStalledRuns();
     const runningIds = [...this.running.keys()];
     if (runningIds.length === 0) return;
     let refreshed: Issue[];
@@ -723,10 +739,7 @@ export class Orchestrator {
       if (isStateIn(latest.state, this.config.tracker.terminalStates)) {
         await this.terminateRunningIssue(issueId, true, "terminal state");
       } else if (preservePendingApprovalWorker) {
-        const now = new Date();
-        entry.lastEvent = "approval_request";
         entry.lastMessage = "Awaiting operator approval for push/PR";
-        entry.lastEventAt = now;
       } else if (entry.role === "worker" && isStateIn(latest.state, this.config.tracker.handoffStates)) {
         await this.terminateRunningIssue(issueId, false, "handoff state");
       } else if (entry.role === "worker" && !latest.assignedToWorker) {
@@ -737,34 +750,6 @@ export class Orchestrator {
         await this.terminateRunningIssue(issueId, false, "blocked state");
       } else if (entry.role === "reviewer" && !isStateIn(latest.state, this.config.reviewLoop.reviewStates)) {
         await this.terminateRunningIssue(issueId, false, "non-review state");
-      }
-    }
-  }
-
-  private async reconcileStalledRuns(): Promise<void> {
-    const stallTimeout = this.stallTimeoutMs();
-    if (stallTimeout === null) return;
-    const now = Date.now();
-    for (const [issueId, entry] of this.running) {
-      if ((await this.isAwaitingOperatorApproval(entry)) || (await this.hasPendingPublicationApprovalHandoff(entry))) {
-        entry.lastEvent = "approval_request";
-        entry.lastMessage = "Awaiting operator approval for push/PR";
-        entry.lastEventAt = new Date(now);
-        continue;
-      }
-      const lastActivity = entry.lastEventAt?.getTime() ?? entry.startedAt.getTime();
-      if (now - lastActivity > stallTimeout) {
-        entry.suppressRetryOnExit = true;
-        this.markCancellationRequested(entry, {
-          source: "stalled",
-          reason: "run stalled",
-          abortSignalled: true,
-        });
-        entry.abortController.abort();
-        this.options.logger.warn("run stalled", {
-          issue_id: issueId,
-          issue_identifier: entry.issue.identifier,
-        });
       }
     }
   }
@@ -1037,6 +1022,14 @@ export class Orchestrator {
       lastEventAt: null,
       lastEvent: null,
       lastMessage: null,
+      sdkRunStatus: null,
+      sdkRunStatusUpdatedAt: null,
+      sdkRunStatusSource: null,
+      failureKind: null,
+      failureDiagnosticCode: null,
+      failureDiagnosticMessage: null,
+      failureDiagnosticAt: null,
+      failureDiagnosticPayload: undefined,
       turnCount: 0,
       retryAttempt,
       tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
@@ -1215,16 +1208,20 @@ export class Orchestrator {
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
 
       entry.turnCount = 1;
-      const prompt = await this.promptRenderer.render(this.reviewerPromptTemplate(), {
-        issue: entry.issue,
-        attempt: null,
-        role: "reviewer",
-        completionReport: evidence.completionReport,
-        acceptanceCriteria: acceptanceCriteriaForReport(evidence.completionReport),
-        workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
-        validationEvidence: evidence.completionReport.validationEvidence,
-        runDigest: evidence.runDigest,
-      });
+      const prompt = this.formatRenderedReviewerPrompt(
+        await this.promptRenderer.render(this.reviewerPromptTemplate(), {
+          issue: entry.issue,
+          attempt: null,
+          role: "reviewer",
+          completionReport: evidence.completionReport,
+          acceptanceCriteria: acceptanceCriteriaForReport(evidence.completionReport),
+          workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
+          validationEvidence: evidence.completionReport.validationEvidence,
+          runDigest: evidence.runDigest,
+          reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
+          workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+        }),
+      );
       await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
         workspace,
         prompt,
@@ -1244,10 +1241,24 @@ export class Orchestrator {
     context: { workspace: Workspace; prompt: string; attempt: number | null; turnNumber: number },
   ): Promise<void> {
     for await (const event of events) {
+      const eventAt = new Date(event.at ?? Date.now());
+      if (event.type === "run_status") {
+        entry.sdkRunStatus = event.sdkStatus;
+        entry.sdkRunStatusUpdatedAt = eventAt;
+        entry.sdkRunStatusSource = event.source;
+        await this.options.runStore?.updateRun(event.runId, {
+          metadata: {
+            sdkRunStatus: event.sdkStatus,
+            sdkRunStatusObservedAt: eventAt.toISOString(),
+            sdkRunStatusSource: event.source,
+          },
+        });
+        continue;
+      }
       entry.lastEvent = event.type;
-      entry.lastEventAt = new Date(event.at ?? Date.now());
+      entry.lastEventAt = eventAt;
       if (event.type === "progress") {
-        recordActivitySource(entry, event.activitySource ?? "stream", entry.lastEventAt);
+        recordActivitySource(entry, event.activitySource ?? "stream", eventAt);
       }
       if (event.type === "session_started") {
         entry.sessionId = event.sessionId;
@@ -1298,7 +1309,14 @@ export class Orchestrator {
           );
         }
       }
-      if (event.type === "progress") entry.lastMessage = event.message;
+      if (event.type === "progress" || event.type === "run_diagnostic") entry.lastMessage = event.message;
+      if (event.type === "run_diagnostic") {
+        entry.failureKind = failureKindForDiagnostic(event.code);
+        entry.failureDiagnosticCode = event.code;
+        entry.failureDiagnosticMessage = event.message;
+        entry.failureDiagnosticAt = eventAt;
+        entry.failureDiagnosticPayload = event.payload;
+      }
       if (event.type === "tokens") this.applyTokenUpdate(entry, event.tokens);
       if (event.type === "rate_limits") this.rateLimits = event.payload;
       await this.persistHarnessEvent(entry, event);
@@ -1582,6 +1600,15 @@ export class Orchestrator {
         ),
         "run failed",
       );
+      const sdkErrorFailures = await this.consecutiveSdkErrorFailures(entry.issue);
+      if (sdkErrorFailures >= 1 + this.config.agent.maxSdkErrorRetries) {
+        await this.escalateEntryBlocked(
+          entry,
+          `consecutive Cursor SDK wait errors reached limit (${sdkErrorFailures} failures; max_sdk_error_retries=${this.config.agent.maxSdkErrorRetries})`,
+        );
+        this.claimed.delete(issueId);
+        return;
+      }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
       this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error, entry.runPhase);
@@ -1626,6 +1653,20 @@ export class Orchestrator {
 
     const delayMs = planningRetryDelayMs(nextCount, this.config);
     this.scheduleRetry(issueId, entry.issue.identifier, nextCount, delayMs, error, "issue_breakdown");
+  }
+
+  private async consecutiveSdkErrorFailures(issue: Issue): Promise<number> {
+    const runs = (await this.options.runStore?.listRunsForIssue(issue.id)) ?? [];
+    const seen = new Set<string>();
+    const workerRuns = runs
+      .filter((run) => run.role === "worker" && !seen.has(run.runId) && seen.add(run.runId))
+      .sort(compareRunChronology);
+    let count = 0;
+    for (const run of workerRuns.slice().reverse()) {
+      if (!isCountedSdkWaitErrorFailure(run)) break;
+      count += 1;
+    }
+    return count;
   }
 
   private async applyWritebacks(
@@ -1823,7 +1864,8 @@ export class Orchestrator {
   private async persistHarnessEvent(entry: RunningEntry, event: AgentEvent): Promise<void> {
     const runId = entry.activeRunId ?? entry.runId;
     if (!runId) return;
-    const message = event.type === "progress" || event.type === "completed" ? event.message : undefined;
+    const message =
+      event.type === "progress" || event.type === "completed" || event.type === "run_diagnostic" ? event.message : undefined;
     await this.options.runStore?.appendEvent({
       runId,
       at: new Date(event.at ?? Date.now()).toISOString(),
@@ -2148,16 +2190,35 @@ export class Orchestrator {
 
   private reviewerPromptTemplate(): string {
     const configured = this.config.reviewLoop.reviewerPromptTemplate;
-    return configured === null || configured.trim().length === 0 ? DEFAULT_REVIEWER_PROMPT_TEMPLATE : configured;
+    if (configured !== null && configured.trim().length > 0) return configured;
+    return DEFAULT_REVIEWER_PROMPT_TEMPLATE;
+  }
+
+  private formatRenderedReviewerPrompt(prompt: string): string {
+    const configured = this.config.reviewLoop.reviewerPromptTemplate;
+    if (configured !== null && configured.trim().length > 0) return prompt;
+    return prompt
+      .replace(
+        PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER,
+        formatPromptExtensions("Project-specific reviewer extensions:", this.config.reviewLoop.reviewerPromptExtensions) ??
+          "",
+      )
+      .trim();
   }
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
-    const basePrompt = await this.promptRenderer.render(this.promptTemplate, { issue: entry.issue, attempt });
+    const basePrompt = await this.promptRenderer.render(this.promptTemplate, {
+      issue: entry.issue,
+      attempt,
+      reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
+      workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+    });
     const issueBreakdownPlan = await this.loadIssueBreakdownPlanPrompt(entry);
+    const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
-    return [basePrompt, issueBreakdownPlan, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
+    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
   }
@@ -2183,15 +2244,27 @@ export class Orchestrator {
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
     const continuationBrief = await this.renderContinuationBrief(entry);
+    const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
     return [
       continuationBrief,
+      reviewHardening,
       handoff,
       reviewVerdict,
       reviewEvidence,
       this.cursorWorkerMcpPrompt(entry),
+    ]
+      .filter((item): item is string => item !== null)
+      .join("\n");
+  }
+
+  private workerReviewHardeningPrompt(): string {
+    return [
+      "",
+      DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE,
+      formatPromptExtensions("Project-specific worker extensions:", this.config.reviewLoop.workerPromptExtensions),
     ]
       .filter((item): item is string => item !== null)
       .join("\n");
@@ -2317,9 +2390,7 @@ export class Orchestrator {
     const packet = buildWorkerHandoffPacket(lifecycle);
     const transcriptPointers = transcriptPointersForRuns(runs);
     const statusPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
-    const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(
-      (item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true,
-    );
+    const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(isActiveReviewEvidenceItem);
     return [
       "",
       "Compact Symphony handoff packet:",
@@ -2437,23 +2508,34 @@ export class Orchestrator {
   }
 
   private livenessForEntry(entry: RunningEntry, now: number): RunLivenessState {
-    const stallTimeoutMs = this.stallTimeoutMs();
+    const idleAlertThresholdMs = this.stallTimeoutMs();
     const lastActivityAt = entry.lastEventAt ?? entry.startedAt;
     const idleMs = Math.max(now - lastActivityAt.getTime(), 0);
+    const idleAlertSuppressed = entry.cancellationRequestedAt !== null || isLifecycleHumanBlocked(entry.lifecycle);
     const status: RunLivenessStatus =
       entry.cancellationRequestedAt !== null
         ? "cancelling"
-        : stallTimeoutMs !== null && idleMs > stallTimeoutMs
-          ? "stalled"
-          : entry.runId === null
-            ? "starting"
+        : entry.runId === null
+          ? "starting"
+          : entry.sdkRunStatus !== null && isTerminalSdkRunStatus(entry.sdkRunStatus)
+            ? "terminal_pending"
             : "active";
     return {
       status,
       activeRunId: entry.activeRunId,
       lastActivityAt: lastActivityAt.toISOString(),
       secondsSinceLastActivity: idleMs / 1000,
-      stallTimeoutMs,
+      stallTimeoutMs: idleAlertThresholdMs,
+      sdkRunStatus: entry.sdkRunStatus,
+      sdkRunStatusUpdatedAt: entry.sdkRunStatusUpdatedAt?.toISOString() ?? null,
+      sdkRunStatusSource: entry.sdkRunStatusSource,
+      idleAlert: {
+        active: !idleAlertSuppressed && idleAlertThresholdMs !== null && idleMs > idleAlertThresholdMs,
+        thresholdMs: idleAlertThresholdMs,
+        lastActivityAt: lastActivityAt.toISOString(),
+        secondsSinceLastActivity: idleMs / 1000,
+        reason: idleAlertSuppressed ? "suppressed" : "observe_only",
+      },
     };
   }
 
@@ -2500,6 +2582,14 @@ export function sortIssuesForDispatch(issues: Issue[]): Issue[] {
 
 function isStateIn(state: string, states: string[]): boolean {
   return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
+}
+
+function isTerminalSdkRunStatus(status: AgentRunSdkStatus): boolean {
+  return status === "finished" || status === "error" || status === "cancelled";
+}
+
+function isLifecycleHumanBlocked(lifecycle: IssueLifecycleRecord | null): boolean {
+  return lifecycle !== null && (lifecycle.phase === "blocked" || lifecycle.blockedReason !== null);
 }
 
 function hasOpenBlocker(issue: Issue, terminalStates: string[]): boolean {
@@ -2614,7 +2704,7 @@ function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[
     lifecycle.reviewRound > 0 ||
     lifecycle.incompleteTurnCount > 0 ||
     lifecycle.summaryReferences.length > 0 ||
-    lifecycle.reviewEvidence.items.some((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true) ||
+    lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem) ||
     lifecycle.merge !== null ||
     lifecycle.phase !== "implementation"
   );
@@ -2623,7 +2713,7 @@ function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[
 function nextWorkerAction(lifecycle: IssueLifecycleRecord): string {
   if (lifecycle.handoff.lastReviewerOutput?.verdict === "fail") return "Address the latest reviewer findings, validate, and submit a new completion report.";
   if (lifecycle.incompleteTurnCount > 0) return "Continue the incomplete implementation using the memo and pointers before rediscovering context.";
-  if (lifecycle.reviewEvidence.items.some((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true)) {
+  if (lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem)) {
     return "Address active unresolved PR review evidence before submitting another completion report.";
   }
   return "Continue implementation using the compact memo and stable pointers.";
@@ -2792,7 +2882,36 @@ function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | 
     cancelFailedReason,
     cancelFailedSource,
     activitySnapshot: terminalActivitySnapshot(entry),
+    sdkRunStatus: entry.sdkRunStatus,
+    sdkRunStatusObservedAt: entry.sdkRunStatusUpdatedAt?.toISOString() ?? null,
+    sdkRunStatusSource: entry.sdkRunStatusSource,
+    failureKind: terminalStatus === "failed" ? entry.failureKind : null,
+    failureDiagnosticCode: terminalStatus === "failed" ? entry.failureDiagnosticCode : null,
+    failureDiagnosticMessage: terminalStatus === "failed" ? entry.failureDiagnosticMessage : null,
+    failureDiagnosticAt: terminalStatus === "failed" ? entry.failureDiagnosticAt?.toISOString() ?? null : null,
+    failureDiagnosticPayload: terminalStatus === "failed" ? entry.failureDiagnosticPayload : null,
   };
+}
+
+function failureKindForDiagnostic(code: string): string {
+  if (code === "cursor_run_wait_terminal_error") return "cursor_sdk_terminal_error";
+  if (code === "cursor_run_wait_threw") return "cursor_sdk_wait_error";
+  if (code === "cursor_stream_error" || code.startsWith("cursor_stream_status_")) return "cursor_stream_error";
+  return "harness_diagnostic";
+}
+
+function isCountedSdkWaitErrorFailure(run: RunRecord): boolean {
+  return (
+    run.role === "worker" &&
+    run.status === "failed" &&
+    run.completedAt !== null &&
+    run.sdkRunStatus === "error" &&
+    run.sdkRunStatusSource === "wait" &&
+    run.cancellationRequestedAt == null &&
+    (run.cancellationOutcome ?? "none") === "none" &&
+    run.cancelFailed !== true &&
+    run.error !== OPERATOR_REJECTED_PUBLICATION_ERROR
+  );
 }
 
 function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {

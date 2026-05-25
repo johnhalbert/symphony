@@ -6,6 +6,8 @@ export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type PersistedRunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
 export type PersistedCancelFailedSource = "harness_stop" | "cancel_ignored";
 export type PersistedCancellationOutcome = "none" | "requested" | "cancelled" | "harness_stop_failed" | "cancel_ignored";
+export type PersistedSdkRunStatus = "running" | "finished" | "error" | "cancelled";
+export type PersistedSdkRunStatusSource = "initial" | "onDidChangeStatus" | "wait";
 
 export interface RunActivitySnapshot {
   lastHarnessActivityAt: string | null;
@@ -55,6 +57,14 @@ export interface RunMetadata {
   cancelFailedReason?: string | null;
   cancelFailedSource?: PersistedCancelFailedSource | null;
   activitySnapshot?: RunActivitySnapshot;
+  sdkRunStatus?: PersistedSdkRunStatus | null;
+  sdkRunStatusObservedAt?: string | null;
+  sdkRunStatusSource?: PersistedSdkRunStatusSource | null;
+  failureKind?: string | null;
+  failureDiagnosticCode?: string | null;
+  failureDiagnosticMessage?: string | null;
+  failureDiagnosticAt?: string | null;
+  failureDiagnosticPayload?: unknown;
   pendingApprovalRequestId?: string | null;
   pendingApprovalRequestedAt?: string | null;
 }
@@ -108,6 +118,14 @@ export interface RunRecord {
   cancelFailedReason?: string | null;
   cancelFailedSource?: PersistedCancelFailedSource | null;
   activitySnapshot?: RunActivitySnapshot;
+  sdkRunStatus?: PersistedSdkRunStatus | null;
+  sdkRunStatusObservedAt?: string | null;
+  sdkRunStatusSource?: PersistedSdkRunStatusSource | null;
+  failureKind?: string | null;
+  failureDiagnosticCode?: string | null;
+  failureDiagnosticMessage?: string | null;
+  failureDiagnosticAt?: string | null;
+  failureDiagnosticPayload?: unknown;
   pendingApprovalRequestId?: string | null;
   pendingApprovalRequestedAt?: string | null;
 }
@@ -178,7 +196,7 @@ export interface CiStatusTranscriptInput extends RunMetadata {
 }
 
 export class FileRunTranscriptStore {
-  private readonly runWriteQueues = new Map<string, Promise<void>>();
+  private readonly runUpdateLocks = new Map<string, Promise<void>>();
 
   constructor(private readonly stateDir: string) {}
 
@@ -263,7 +281,7 @@ export class FileRunTranscriptStore {
   }
 
   async updateRun(runId: string, input: UpdateRunInput): Promise<RunRecord | null> {
-    return this.withRunWriteLock(runId, async () => {
+    return this.withRunUpdateLock(runId, async () => {
       const existing = await this.getRun(runId);
       if (!existing) return null;
       const updated: RunRecord = {
@@ -369,20 +387,20 @@ export class FileRunTranscriptStore {
     await writeJson(this.metaPath(record.runId), record);
   }
 
-  private async withRunWriteLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.runWriteQueues.get(runId) ?? Promise.resolve();
+  private async withRunUpdateLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.runUpdateLocks.get(runId) ?? Promise.resolve();
     let release!: () => void;
-    const next = new Promise<void>((resolve) => {
+    const current = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const tail = previous.catch(() => undefined).then(() => next);
-    this.runWriteQueues.set(runId, tail);
+    const chained = previous.catch(() => undefined).then(() => current);
+    this.runUpdateLocks.set(runId, chained);
     await previous.catch(() => undefined);
     try {
       return await operation();
     } finally {
       release();
-      if (this.runWriteQueues.get(runId) === tail) this.runWriteQueues.delete(runId);
+      if (this.runUpdateLocks.get(runId) === chained) this.runUpdateLocks.delete(runId);
     }
   }
 
@@ -495,6 +513,14 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.cancelFailedReason === undefined ? {} : { cancelFailedReason: metadata.cancelFailedReason }),
     ...(metadata.cancelFailedSource === undefined ? {} : { cancelFailedSource: metadata.cancelFailedSource }),
     ...(metadata.activitySnapshot === undefined ? {} : { activitySnapshot: metadata.activitySnapshot }),
+    ...(metadata.sdkRunStatus === undefined ? {} : { sdkRunStatus: metadata.sdkRunStatus }),
+    ...(metadata.sdkRunStatusObservedAt === undefined ? {} : { sdkRunStatusObservedAt: metadata.sdkRunStatusObservedAt }),
+    ...(metadata.sdkRunStatusSource === undefined ? {} : { sdkRunStatusSource: metadata.sdkRunStatusSource }),
+    ...(metadata.failureKind === undefined ? {} : { failureKind: metadata.failureKind }),
+    ...(metadata.failureDiagnosticCode === undefined ? {} : { failureDiagnosticCode: metadata.failureDiagnosticCode }),
+    ...(metadata.failureDiagnosticMessage === undefined ? {} : { failureDiagnosticMessage: metadata.failureDiagnosticMessage }),
+    ...(metadata.failureDiagnosticAt === undefined ? {} : { failureDiagnosticAt: metadata.failureDiagnosticAt }),
+    ...(metadata.failureDiagnosticPayload === undefined ? {} : { failureDiagnosticPayload: metadata.failureDiagnosticPayload }),
     ...(metadata.pendingApprovalRequestId === undefined ? {} : { pendingApprovalRequestId: metadata.pendingApprovalRequestId }),
     ...(metadata.pendingApprovalRequestedAt === undefined ? {} : { pendingApprovalRequestedAt: metadata.pendingApprovalRequestedAt }),
   };
@@ -514,32 +540,43 @@ function formatPullRequestMessage(input: PullRequestTranscriptInput): string {
 }
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {
+  const previous = writeJsonLocks.get(filePath) ?? Promise.resolve();
+  const write = previous.catch(() => undefined).then(() => writeJsonUnlocked(filePath, value));
+  writeJsonLocks.set(filePath, write);
+  try {
+    await write;
+  } finally {
+    if (writeJsonLocks.get(filePath) === write) writeJsonLocks.delete(filePath);
+  }
+}
+
+async function writeJsonUnlocked(filePath: string, value: unknown): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   await fs.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await renameWithWindowsRetry(tempPath, filePath);
+  if (process.platform === "win32") {
+    await fs.copyFile(tempPath, filePath);
+    await fs.rm(tempPath, { force: true });
+    return;
+  }
+  await fs.rename(tempPath, filePath);
 }
 
-async function renameWithWindowsRetry(source: string, destination: string): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      await fs.rename(source, destination);
-      return;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if ((code !== "EPERM" && code !== "EACCES") || attempt >= 4) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt));
-    }
-  }
-}
+const writeJsonLocks = new Map<string, Promise<void>>();
 
 async function readJsonIfExists<T>(filePath: string): Promise<T | null> {
-  try {
-    return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return null;
+      const retryable = code === "EBUSY" || code === "EPERM" || error instanceof SyntaxError;
+      if (!retryable || attempt === 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
   }
+  return null;
 }
 
 async function readLinesIfExists(filePath: string): Promise<string[]> {

@@ -35,6 +35,7 @@ Work on {{ issue.identifier }}.`,
     expect(config.tracker.projectSlug).toBe("TEST");
     expect(config.tracker.assignee).toBe("me");
     expect(config.agent.harness).toBe("cursor");
+    expect(config.agent.maxSdkErrorRetries).toBe(2);
     expect(config.cursor.model).toBe("gpt-5.5");
     expect(config.cursor.mode).toBeNull();
     expect(config.cursor.modelParams).toEqual([
@@ -81,6 +82,8 @@ Work on {{ issue.identifier }}.`,
       planningRetryBaseMs: 5_000,
       planningRetryMaxMs: 60_000,
     });
+    expect(config.reviewLoop.reviewerPromptExtensions).toEqual([]);
+    expect(config.reviewLoop.workerPromptExtensions).toEqual([]);
     expect(config.mergePolicy).toEqual({
       mode: "disabled",
       sourceStates: [],
@@ -99,6 +102,29 @@ Work on {{ issue.identifier }}.`,
       canceled: ["Cancelled", "Canceled", "Duplicate"],
     });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
+  });
+
+  it("parses bounded SDK error retry configuration", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { max_sdk_error_retries: 4 },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.agent.maxSdkErrorRetries).toBe(4);
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          agent: { max_sdk_error_retries: -1 },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow(SymphonyError);
   });
 
   it("parses PR handoff policy for human review transitions", () => {
@@ -347,6 +373,8 @@ Work on {{ issue.identifier }}.`,
           blocked_states: ["Blocked"],
           review_pass_state: "Review Passed",
           reviewer_prompt: "Review {{ issue.identifier }}",
+          reviewer_prompt_extensions: [" Check database transactions. ", " ", "Check API boundaries."],
+          worker_prompt_extensions: [" Fix shared invariants. ", "\t", "Validate replay."],
           max_review_rounds: 4,
           max_incomplete_turns: 2,
           continuation_history_threshold: 7,
@@ -389,6 +417,8 @@ Work on {{ issue.identifier }}.`,
       blockedStates: ["Blocked"],
       reviewPassState: "Review Passed",
       reviewerPromptTemplate: "Review {{ issue.identifier }}",
+      reviewerPromptExtensions: ["Check database transactions.", "Check API boundaries."],
+      workerPromptExtensions: ["Fix shared invariants.", "Validate replay."],
       maxReviewRounds: 4,
       maxIncompleteTurns: 2,
       continuationHistoryThreshold: 7,

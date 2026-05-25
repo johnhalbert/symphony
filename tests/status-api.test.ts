@@ -690,6 +690,96 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("labels persisted running runs that are not live as not_live without mutating history", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-orphaned",
+      sessionId: "session-orphaned",
+      agentId: "agent-orphaned",
+      role: "worker",
+      issueId: "issue-orphaned",
+      issueIdentifier: "TEST-ORPHANED",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-ORPHANED",
+      workspacePath: path.join(config.workspace.root, "TEST-ORPHANED"),
+    });
+    await runStore.updateRun("run-orphaned", {
+      metadata: {
+        sdkRunStatus: "running",
+        sdkRunStatusObservedAt: "2026-01-01T00:00:01.000Z",
+        sdkRunStatusSource: "initial",
+      },
+    });
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-ORPHANED`);
+      const issueRunsResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-ORPHANED/runs`);
+      const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-orphaned`);
+      const dashboardResponse = await fetch(`${baseUrl}/`);
+      const stateBody = (await stateResponse.json()) as {
+        operatorView: { orphaned: Array<{ runId: string; status: string; tracking: string; controls: { cancel: boolean } }> };
+        operatorLivenessContract: { version: string; supportedStatuses: string[] };
+      };
+      const issueBody = (await issueResponse.json()) as { operatorLiveness: { status: string; tracking: string; rawStatus: string } };
+      const issueRunsBody = (await issueRunsResponse.json()) as {
+        runs: Array<{
+          runId: string;
+          status: string;
+          livenessSummary: { status: string; tracking: string; rawStatus: string };
+          operatorLiveness: { status: string; tracking: string; rawStatus: string };
+        }>;
+      };
+      const runBody = (await runResponse.json()) as { status: string; operatorLiveness: { status: string; tracking: string; rawStatus: string } };
+      const html = await dashboardResponse.text();
+
+      expect(stateBody.operatorLivenessContract.version).toBe("sdk-run-lifecycle-v2");
+      expect(stateBody.operatorLivenessContract.supportedStatuses).toContain("not_live");
+      expect(stateBody.operatorView.orphaned[0]).toMatchObject({
+        runId: "run-orphaned",
+        status: "not_live",
+        tracking: "orphaned",
+        controls: { cancel: false },
+      });
+      expect(issueBody.operatorLiveness).toMatchObject({ status: "not_live", tracking: "orphaned", rawStatus: "running" });
+      const issueRun = issueRunsBody.runs.find((run) => run.runId === "run-orphaned");
+      expect(issueRun).toMatchObject({
+        status: "running",
+        livenessSummary: { status: "not_live", tracking: "orphaned", rawStatus: "running" },
+        operatorLiveness: { status: "not_live", tracking: "orphaned", rawStatus: "running" },
+      });
+      expect(runBody).toMatchObject({
+        status: "running",
+        operatorLiveness: { status: "not_live", tracking: "orphaned", rawStatus: "running" },
+      });
+      expect(html).toContain("Not Live Runs");
+      expect(html).toContain("TEST-ORPHANED");
+      expect(html).toContain("controls: none");
+      await expect(runStore.getRun("run-orphaned")).resolves.toMatchObject({ status: "running" });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves an empty activity feed when no run store is configured", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const server = new StatusServer({

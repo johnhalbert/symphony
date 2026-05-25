@@ -365,7 +365,15 @@ describe("MCP subprocess environment", () => {
 
   it("does not expose publication credentials to completion report MCP when publication approval is required", () => {
     const rawConfig = {
-      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_API_KEY",
+        project_slug: "TEST",
+        handoff_states: ["Human Review"],
+      },
+      review_loop: {
+        review_states: ["In Review"],
+      },
       github: {
         owner: "$GITHUB_OWNER",
         repo: "$GITHUB_REPO",
@@ -373,7 +381,8 @@ describe("MCP subprocess environment", () => {
         token: "$CUSTOM_GITHUB_TOKEN",
         publish_pull_requests: true,
         pr_handoff: {
-          enabled: false,
+          target_state: "Human Review",
+          required_checks: ["Typecheck and test"],
         },
         operator_approval: {
           required_for_publication: true,
