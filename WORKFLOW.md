@@ -25,6 +25,16 @@ review_loop:
   max_review_rounds: 3
   max_incomplete_turns: 3
   continuation_history_threshold: 5
+  reviewer_prompt_extensions:
+    - Check lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions when shared orchestration behavior is touched.
+    - Check MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when the change crosses those systems.
+    - Check approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when publication behavior is touched.
+    - Check dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active.
+  worker_prompt_extensions:
+    - For Symphony orchestration, workflow, tracker, harness, API, approval, publication, or writeback changes, validate lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
+    - Validate MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
+    - Cover approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when applicable.
+    - Confirm dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active.
 
 merge_policy:
   mode: gated
@@ -158,25 +168,15 @@ Transcript search is available through the bounded, read-only `search_transcript
 6. When `github.publish_pull_requests` and `github.operator_approval.required_for_publication` are enabled, do not run `git push` or create/update GitHub pull requests yourself. Call `submit_completion_report` when ready; Symphony will create an `approval_request` transcript event and wait for operator approval before service-owned commit, push, and PR publication.
 7. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will handle the Linear handoff to `Human Review` after verifying the lifecycle-bound pull request.
 
-## Review-Cycle Hardening
+## Prompt Extension Layers
 
-When fixing review feedback, address the underlying invariant behind the finding, not only the literal failing case. Before calling `submit_completion_report`, build a small scenario matrix for the touched behavior and use it to guide implementation and validation.
+Global defaults are owned by Symphony code and apply generic review-loop hardening to reviewer and worker prompts. They cover bounded sibling-risk sweeps, fail-verdict completeness, invariant-focused worker repairs, and the general software change matrix.
 
-After a failed review, treat the reviewer findings as the minimum required scope. Also inspect adjacent cases that share the same invariant, contract, or side-effect path, and either fix them in the same pass or call out why they are unrelated or out of scope.
+Workflow/project configuration owns static project-specific extensions. This workflow uses `review_loop.reviewer_prompt_extensions` and `review_loop.worker_prompt_extensions` for Symphony-specific lifecycle, writeback, MCP/API, publication, and dispatch invariants.
 
-Cover the smallest meaningful set from this general matrix:
-- Happy path and negative/error paths.
-- Boundary and integration behavior, not only isolated unit behavior.
-- Persistence/durability, externally visible side effects, and recovery after interruption.
-- Authorization/security variants, including unset, empty, invalid, and valid credentials when applicable.
-- Idempotency/replay and already-terminal or repeated-operation behavior.
-- Whether required side effects are actually processed, not merely planned or enqueued.
+If `review_loop.reviewer_prompt` is set to a nonblank value, it is a full reviewer prompt override. Override authors own the complete reviewer prompt, including any generic matrix or project extension variables they choose to render.
 
-For Symphony orchestration, workflow, tracker, harness, API, approval, publication, or writeback changes, also check the relevant project-specific cases:
-- Lifecycle phase, `blockedReason`, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
-- MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
-- Approval/publication variants: pending, approved, rejected, cancelled, stale, expired, already-terminal, replay; `rejectPolicy` cancel and fail; live worker wait and after-worker-exit resume.
-- Dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active.
+Future templated extensions should use named insertion points for reusable dynamic context rather than adding project architecture to global defaults. Expected future sections include reviewer project matrix extensions, worker project matrix extensions, dynamic review findings, and dynamic completion handoff context.
 
 In the completion report, summarize the scenario matrix you covered, the validation evidence for the high-risk cases, and any related scenarios intentionally left unverified or out of scope.
 

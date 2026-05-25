@@ -23,6 +23,7 @@ import { approvalResolve } from "../core/approval/OperatorApprovalService.js";
 import {
   approvalMatchesReport,
   isAwaitingPublicationApprovalLifecycle,
+  isPendingPublicationApprovalLifecycle,
   pendingPublicationReport,
 } from "../core/CompletionReportService.js";
 import {
@@ -224,8 +225,9 @@ export class StatusServer {
               approval: existingApproval,
               lifecycleStore: this.options.lifecycleStore,
               runStore: this.options.runStore,
+              allowSetupIncomplete: decision === "reject",
             });
-            if (!currentApproval) {
+            if (!currentApproval && (await hasPendingPublicationLifecycle(existingApproval, this.options.lifecycleStore))) {
               throw new SymphonyError("conflict", "Approval request is not current pending publication approval");
             }
           }
@@ -695,17 +697,32 @@ async function currentPendingPublicationApproval(input: {
   approval: OperatorApprovalRecord;
   lifecycleStore: IssueLifecycleStore | undefined;
   runStore: RunTranscriptStore | undefined;
+  allowSetupIncomplete?: boolean;
 }): Promise<OperatorApprovalRecord | null> {
   if (input.approval.status !== "pending" || !input.lifecycleStore || !input.runStore) return null;
   const lifecycle =
     (await input.lifecycleStore.get(input.approval.issueId)) ??
     (await input.lifecycleStore.get(input.approval.issueIdentifier));
-  if (!isAwaitingPublicationApprovalLifecycle(lifecycle)) return null;
+  if (
+    !isAwaitingPublicationApprovalLifecycle(lifecycle) &&
+    !(input.allowSetupIncomplete === true && isPendingPublicationApprovalLifecycle(lifecycle))
+  ) {
+    return null;
+  }
   const report = pendingPublicationReport(lifecycle);
   if (!report || !approvalMatchesReport(input.approval, report)) return null;
   const run = await input.runStore.getRun(report.runId);
   if (run?.pendingApprovalRequestId !== input.approval.requestId) return null;
   return input.approval;
+}
+
+async function hasPendingPublicationLifecycle(
+  approval: OperatorApprovalRecord,
+  lifecycleStore: IssueLifecycleStore | undefined,
+): Promise<boolean> {
+  if (!lifecycleStore) return false;
+  const lifecycle = (await lifecycleStore.get(approval.issueId)) ?? (await lifecycleStore.get(approval.issueIdentifier));
+  return isPendingPublicationApprovalLifecycle(lifecycle);
 }
 
 function approvalMutationsRequireToken(enabled: boolean, openWorkspaceToken: string | null): boolean {

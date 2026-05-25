@@ -2,7 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FileIssueLifecycleStore, type IssueCompletionReportRecord } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileIssueLifecycleStore,
+  type IssueCompletionReportRecord,
+  type PullRequestReviewEvidenceItem,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import {
   formatWorkerReviewEvidencePrompt,
   PullRequestReviewEvidenceService,
@@ -134,6 +138,94 @@ describe("PullRequestReviewEvidenceService", () => {
       reviewEvidence: { items: [{ pullRequestNumber: 99, githubId: "second-comment" }] },
     });
   });
+
+  it("ignores Linear linkback issue comments while preserving high-level PR comments", async () => {
+    const candidate = issue({ branchName: "symphony/TEST-1" });
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(candidate, {
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [completionReport(candidate.id, candidate.identifier, 42)],
+    });
+    const service = new PullRequestReviewEvidenceService({
+      lifecycleStore: store,
+      client: new FakeReviewEvidenceClient({
+        42: [
+          remoteEvidence({
+            source: "issue_comment",
+            githubId: "linear-linkback",
+            reviewer: "linear-code[bot]",
+            body: linearLinkbackComment(),
+            url: "https://github.com/acme/symphony/pull/42#issuecomment-1",
+            updatedAt: "2026-01-01T00:00:02Z",
+          }),
+          remoteEvidence({
+            source: "issue_comment",
+            githubId: "high-level-comment",
+            reviewer: "reviewer-b",
+            body: "High-level PR concern.",
+            url: "https://github.com/acme/symphony/pull/42#issuecomment-2",
+            updatedAt: "2026-01-01T00:00:03Z",
+          }),
+        ],
+      }),
+      fullHistoryThreshold: 5,
+    });
+
+    const context = await service.prepareWorkerPromptContext(candidate);
+    const prompt = context ? formatWorkerReviewEvidencePrompt(context) : "";
+
+    expect(context?.evidence.map((item) => item.githubId)).toEqual(["high-level-comment"]);
+    expect(prompt).toContain("High-level PR concern.");
+    expect(prompt).not.toContain("linear-linkback");
+    expect(prompt).not.toContain("Linear linkback");
+    await expect(store.get(candidate.identifier)).resolves.toMatchObject({
+      reviewEvidence: {
+        items: [{ githubId: "high-level-comment", source: "issue_comment" }],
+      },
+    });
+  });
+
+  it("prunes persisted Linear linkback evidence on replay", async () => {
+    const candidate = issue({ branchName: "symphony/TEST-1" });
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(candidate, {
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [completionReport(candidate.id, candidate.identifier, 42)],
+      reviewEvidence: {
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "abc123",
+          branch: "symphony/TEST-1",
+        },
+        lastIngestedCursor: "2026-01-01T00:00:02Z",
+        lastWorkerEvidenceCursor: "2026-01-01T00:00:02Z",
+        items: [
+          reviewEvidenceItem({
+            source: "issue_comment",
+            githubId: "linear-linkback",
+            reviewer: "linear-code[bot]",
+            body: linearLinkbackComment(),
+            cursor: "2026-01-01T00:00:02Z",
+          }),
+        ],
+        updatedAt: "2026-01-01T00:00:02Z",
+      },
+    });
+    const service = new PullRequestReviewEvidenceService({
+      lifecycleStore: store,
+      client: new FakeReviewEvidenceClient({ 42: [] }),
+      fullHistoryThreshold: 5,
+    });
+
+    await expect(service.prepareWorkerPromptContext(candidate)).resolves.toBeNull();
+    await expect(store.get(candidate.identifier)).resolves.toMatchObject({
+      reviewEvidence: {
+        lastIngestedCursor: null,
+        items: [],
+      },
+    });
+  });
 });
 
 function completionReport(issueId: string, issueIdentifier: string, pullRequestNumber: number): IssueCompletionReportRecord {
@@ -189,6 +281,43 @@ function remoteEvidence(
     submittedAt: null,
     ...overrides,
   };
+}
+
+function reviewEvidenceItem(overrides: Partial<PullRequestReviewEvidenceItem> = {}): PullRequestReviewEvidenceItem {
+  return {
+    id: "issue_comment:42:linear-linkback",
+    source: "issue_comment",
+    githubId: "linear-linkback",
+    pullRequestNumber: 42,
+    pullRequestUrl: "https://api.github.test/repos/acme/symphony/pulls/42",
+    url: "https://github.com/acme/symphony/pull/42#issuecomment-1",
+    reviewer: "linear-code[bot]",
+    body: linearLinkbackComment(),
+    state: null,
+    path: null,
+    line: null,
+    originalLine: null,
+    side: null,
+    threadId: null,
+    inReplyToId: null,
+    isResolved: null,
+    isOutdated: null,
+    createdAt: "2026-01-01T00:00:02Z",
+    updatedAt: "2026-01-01T00:00:02Z",
+    submittedAt: null,
+    cursor: "2026-01-01T00:00:02Z",
+    ...overrides,
+  };
+}
+
+function linearLinkbackComment(): string {
+  return [
+    "<!-- linear-linkback -->",
+    "<details>",
+    "<summary>Linear linkback</summary>",
+    "</details>",
+    "<!-- linear-review-link -->",
+  ].join("\n");
 }
 
 class FakeReviewEvidenceClient {

@@ -23,6 +23,12 @@ import {
 } from "../CompletionReportService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
+  DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE,
+  DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE,
+  formatGeneralScenarioMatrix,
+  formatPromptExtensions,
+} from "../workflow/ReviewLoopPromptGuidance.js";
+import {
   compareRunChronology,
   type RunActivitySnapshot,
   type RunMetadata,
@@ -45,6 +51,7 @@ import {
 import { MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
 import {
   formatWorkerReviewEvidencePrompt,
+  isActiveReviewEvidenceItem,
   PullRequestReviewEvidenceService,
   type PullRequestReviewEvidenceClient,
 } from "../review/PullRequestReviewEvidenceService.js";
@@ -253,8 +260,10 @@ export interface IssueRunMetadata {
   baseRef: string | null;
 }
 
+const PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER = "[[SYMPHONY_PROJECT_REVIEWER_PROMPT_EXTENSIONS]]";
+
 const DEFAULT_REVIEWER_PROMPT_TEMPLATE = `
-You are a Symphony reviewer agent for {{ issue.identifier }}.
+You are a reviewer agent for {{ issue.identifier }}.
 
 Inspect only. Do not modify files, create commits, push branches, comment on Linear, transition Linear state, or otherwise change workspace or lifecycle state directly.
 
@@ -262,23 +271,11 @@ Use the linked GitHub pull request as the primary detailed review surface. Call 
 
 After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" for requested changes and "pass" only when all acceptance criteria are satisfied. The MCP servers supply the active run, issue, and lifecycle-bound PR context; include runId, issueId, PR number, repository, token, or commit identity only if a tool explicitly asks for it.
 
-Before submitting any verdict, perform a bounded sibling-risk sweep. Do not pass by checking only the happy path, and do not stop at the first valid blocker. For each unsatisfied acceptance criterion, identify all related blocking gaps you can find from the current evidence, then bundle them into one well-specified requested-change set.
+${DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE}
 
-For each fail finding, include the required behavior change, concrete evidence, required validation, sibling scenarios checked, and any related scenarios intentionally left unverified. Distinguish implementation defects, missing tests, ambiguous contracts, and out-of-scope follow-ups.
+${formatGeneralScenarioMatrix()}
 
-General software review matrix:
-- Happy path and negative/error paths.
-- Boundary/integration behavior, not only isolated unit behavior.
-- Persistence/durability, externally visible side effects, and recovery after interruption.
-- Authorization/security variants, including unset, empty, invalid, and valid credentials when applicable.
-- Idempotency/replay and already-terminal or repeated-operation behavior.
-- Whether required side effects are actually processed, not merely planned or enqueued.
-
-Symphony dogfood extension for shared orchestration work:
-- Check lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
-- Check MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
-- Check approval/publication variants: pending, approved, rejected, cancelled, stale, expired, already-terminal, replay; rejectPolicy cancel and fail; live worker wait and after-worker-exit resume.
-- Check dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active.
+${PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER}
 
 Tool payload guidance:
 - acceptanceResults: one entry per acceptance criterion with satisfied true/false and concrete evidence.
@@ -1083,16 +1080,20 @@ export class Orchestrator {
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
 
       entry.turnCount = 1;
-      const prompt = await this.promptRenderer.render(this.reviewerPromptTemplate(), {
-        issue: entry.issue,
-        attempt: null,
-        role: "reviewer",
-        completionReport: evidence.completionReport,
-        acceptanceCriteria: acceptanceCriteriaForReport(evidence.completionReport),
-        workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
-        validationEvidence: evidence.completionReport.validationEvidence,
-        runDigest: evidence.runDigest,
-      });
+      const prompt = this.formatRenderedReviewerPrompt(
+        await this.promptRenderer.render(this.reviewerPromptTemplate(), {
+          issue: entry.issue,
+          attempt: null,
+          role: "reviewer",
+          completionReport: evidence.completionReport,
+          acceptanceCriteria: acceptanceCriteriaForReport(evidence.completionReport),
+          workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
+          validationEvidence: evidence.completionReport.validationEvidence,
+          runDigest: evidence.runDigest,
+          reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
+          workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+        }),
+      );
       await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
         workspace,
         prompt,
@@ -1824,30 +1825,61 @@ export class Orchestrator {
 
   private reviewerPromptTemplate(): string {
     const configured = this.config.reviewLoop.reviewerPromptTemplate;
-    return configured === null || configured.trim().length === 0 ? DEFAULT_REVIEWER_PROMPT_TEMPLATE : configured;
+    if (configured !== null && configured.trim().length > 0) return configured;
+    return DEFAULT_REVIEWER_PROMPT_TEMPLATE;
+  }
+
+  private formatRenderedReviewerPrompt(prompt: string): string {
+    const configured = this.config.reviewLoop.reviewerPromptTemplate;
+    if (configured !== null && configured.trim().length > 0) return prompt;
+    return prompt
+      .replace(
+        PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER,
+        formatPromptExtensions("Project-specific reviewer extensions:", this.config.reviewLoop.reviewerPromptExtensions) ??
+          "",
+      )
+      .trim();
   }
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
-    const basePrompt = await this.promptRenderer.render(this.promptTemplate, { issue: entry.issue, attempt });
+    const basePrompt = await this.promptRenderer.render(this.promptTemplate, {
+      issue: entry.issue,
+      attempt,
+      reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
+      workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+    });
+    const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
-    return [basePrompt, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
+    return [basePrompt, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
   }
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
     const continuationBrief = await this.renderContinuationBrief(entry);
+    const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
     return [
       continuationBrief,
+      reviewHardening,
       handoff,
       reviewVerdict,
       reviewEvidence,
       this.cursorWorkerMcpPrompt(entry),
+    ]
+      .filter((item): item is string => item !== null)
+      .join("\n");
+  }
+
+  private workerReviewHardeningPrompt(): string {
+    return [
+      "",
+      DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE,
+      formatPromptExtensions("Project-specific worker extensions:", this.config.reviewLoop.workerPromptExtensions),
     ]
       .filter((item): item is string => item !== null)
       .join("\n");
@@ -1955,9 +1987,7 @@ export class Orchestrator {
     const packet = buildWorkerHandoffPacket(lifecycle);
     const transcriptPointers = transcriptPointersForRuns(runs);
     const statusPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
-    const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(
-      (item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true,
-    );
+    const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(isActiveReviewEvidenceItem);
     return [
       "",
       "Compact Symphony handoff packet:",
@@ -2225,7 +2255,7 @@ function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[
     lifecycle.reviewRound > 0 ||
     lifecycle.incompleteTurnCount > 0 ||
     lifecycle.summaryReferences.length > 0 ||
-    lifecycle.reviewEvidence.items.some((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true) ||
+    lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem) ||
     lifecycle.merge !== null ||
     lifecycle.phase !== "implementation"
   );
@@ -2234,7 +2264,7 @@ function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[
 function nextWorkerAction(lifecycle: IssueLifecycleRecord): string {
   if (lifecycle.handoff.lastReviewerOutput?.verdict === "fail") return "Address the latest reviewer findings, validate, and submit a new completion report.";
   if (lifecycle.incompleteTurnCount > 0) return "Continue the incomplete implementation using the memo and pointers before rediscovering context.";
-  if (lifecycle.reviewEvidence.items.some((item) => item.body.trim().length > 0 && item.isResolved !== true && item.isOutdated !== true)) {
+  if (lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem)) {
     return "Address active unresolved PR review evidence before submitting another completion report.";
   }
   return "Continue implementation using the compact memo and stable pointers.";

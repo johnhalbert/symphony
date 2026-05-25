@@ -1,6 +1,7 @@
 import { Liquid } from "liquidjs";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { AgentRunRole, Issue, RunAttempt } from "../types.js";
+import { GENERAL_REVIEW_SCENARIO_MATRIX } from "./ReviewLoopPromptGuidance.js";
 
 export interface PromptRenderInput {
   issue: Issue;
@@ -11,6 +12,9 @@ export interface PromptRenderInput {
   workspaceEvidence?: string[];
   validationEvidence?: string[];
   runDigest?: string[];
+  genericScenarioMatrix?: string[];
+  reviewerPromptExtensions?: string[];
+  workerPromptExtensions?: string[];
 }
 
 export class PromptRenderer {
@@ -38,6 +42,9 @@ export class PromptRenderer {
         workspaceEvidence: input.workspaceEvidence ?? [],
         validationEvidence: input.validationEvidence ?? [],
         runDigest: input.runDigest ?? [],
+        genericScenarioMatrix: input.genericScenarioMatrix ?? GENERAL_REVIEW_SCENARIO_MATRIX,
+        reviewerPromptExtensions: input.reviewerPromptExtensions ?? [],
+        workerPromptExtensions: input.workerPromptExtensions ?? [],
       });
       return rendered.trim();
     } catch (error) {
