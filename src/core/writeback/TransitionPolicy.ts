@@ -69,8 +69,9 @@ export interface PublicationApprovalActionDetails {
 
 export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewWritebackOperation | null {
   if (!config.writeback.enabled || !sameName(issue.state, "Todo")) return null;
+  const dispatchStateVersion = safeKeySegment(issue.updatedAt ?? issue.createdAt ?? issue.state);
   return {
-    idempotencyKey: `transition:${issue.id}:dispatch:${config.writeback.dispatchState}`,
+    idempotencyKey: `transition:${issue.id}:dispatch:${dispatchStateVersion}:${config.writeback.dispatchState}`,
     kind: "transition",
     issueId: issue.id,
     payload: {
@@ -211,7 +212,8 @@ export function planCompletionReportPublicationApprovalPendingWritebacks(
           "",
           "Recovery:",
           "- Symphony will retry this setup and create the operator approval request after the audit writebacks are durable.",
-          "- No operator approval request exists yet for this persisted report.",
+          "- At the time this setup audit is written, no operator approval request exists yet for this persisted report.",
+          "- If Symphony status later shows awaiting operator approval, use the current approval request surfaced by the service.",
           "",
           blockedState === null
             ? "No blocked state is configured, so Symphony recorded a lifecycle-level blocked phase without changing the tracker state."

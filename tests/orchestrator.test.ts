@@ -775,11 +775,11 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
 
       expect(orchestrator.snapshot().counts.running).toBe(1);
-      await expect(runStore.getRun(runId)).resolves.toMatchObject({
-        status: "running",
-        pendingApprovalRequestId: null,
-      });
       const runningRun = await runStore.getRun(runId);
+      expect(runningRun).toMatchObject({
+        status: "running",
+      });
+      expect(runningRun?.pendingApprovalRequestId ?? null).toBeNull();
       expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
@@ -1498,6 +1498,78 @@ describe("Orchestrator", () => {
       incompleteTurnCount: 0,
       blockedReason: null,
     });
+  });
+
+  it("reapplies Todo dispatch transitions after a prior dispatch writeback already succeeded", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Todo", updatedAt: "2026-01-01T01:00:00Z" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const oldDispatchRecord = await outboxStore.enqueueOnce({
+      idempotencyKey: `transition:${candidate.id}:dispatch:In Progress`,
+      kind: "transition",
+      issueId: candidate.id,
+      payload: {
+        fromStates: ["Todo"],
+        toState: "In Progress",
+        reason: "Symphony dispatch",
+      },
+    });
+    await outboxStore.markSucceeded(oldDispatchRecord);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      incompleteTurnCount: 2,
+      blockedReason: "max review rounds reached (3/3)",
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "worker dispatch after human Todo unblock");
+    await orchestrator.stop();
+
+    expect(writer.transitions).toEqual([
+      expect.objectContaining({
+        issueId: candidate.id,
+        fromStates: ["Todo"],
+        toState: "In Progress",
+      }),
+    ]);
+    expect(currentState).toBe("In Progress");
+    expect(harness.runs[0]?.ctx.issue.state).toBe("In Progress");
   });
 
   it("treats accepted completion reports as live handoff and suppresses continuation/no-report writeback", async () => {

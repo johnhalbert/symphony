@@ -205,6 +205,12 @@ describe("CompletionReportService", () => {
     expect(pendingComment?.kind === "comment" ? pendingComment.payload.body : "").toContain(
       "Status: worker completion report persisted; Symphony is preparing",
     );
+    expect(pendingComment?.kind === "comment" ? pendingComment.payload.body : "").toContain(
+      "At the time this setup audit is written, no operator approval request exists yet",
+    );
+    expect(pendingComment?.kind === "comment" ? pendingComment.payload.body : "").toContain(
+      "use the current approval request surfaced by the service",
+    );
     expect(pendingComment?.kind === "comment" ? pendingComment.payload.body : "").not.toContain(
       "Approve the pending operator request",
     );
