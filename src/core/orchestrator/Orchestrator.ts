@@ -260,6 +260,24 @@ Use the linked GitHub pull request as the primary detailed review surface. Call 
 
 After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" for requested changes and "pass" only when all acceptance criteria are satisfied. The MCP servers supply the active run, issue, and lifecycle-bound PR context; include runId, issueId, PR number, repository, token, or commit identity only if a tool explicitly asks for it.
 
+Before submitting any verdict, perform a bounded sibling-risk sweep. Do not pass by checking only the happy path, and do not stop at the first valid blocker. For each unsatisfied acceptance criterion, identify all related blocking gaps you can find from the current evidence, then bundle them into one well-specified requested-change set.
+
+For each fail finding, include the required behavior change, concrete evidence, required validation, sibling scenarios checked, and any related scenarios intentionally left unverified. Distinguish implementation defects, missing tests, ambiguous contracts, and out-of-scope follow-ups.
+
+General software review matrix:
+- Happy path and negative/error paths.
+- Boundary/integration behavior, not only isolated unit behavior.
+- Persistence/durability, externally visible side effects, and recovery after interruption.
+- Authorization/security variants, including unset, empty, invalid, and valid credentials when applicable.
+- Idempotency/replay and already-terminal or repeated-operation behavior.
+- Whether required side effects are actually processed, not merely planned or enqueued.
+
+Symphony dogfood extension for shared orchestration work:
+- Check lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
+- Check MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
+- Check approval/publication variants: pending, approved, rejected, cancelled, stale, expired, already-terminal, replay; rejectPolicy cancel and fail; live worker wait and after-worker-exit resume.
+- Check dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active.
+
 Tool payload guidance:
 - acceptanceResults: one entry per acceptance criterion with satisfied true/false and concrete evidence.
 - findings: required for fail verdicts, empty for pass verdicts.

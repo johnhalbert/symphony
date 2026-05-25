@@ -152,6 +152,28 @@ Transcript search is available through the bounded, read-only `search_transcript
 6. When `github.publish_pull_requests` and `github.operator_approval.required_for_publication` are enabled, do not run `git push` or create/update GitHub pull requests yourself. Call `submit_completion_report` when ready; Symphony will create an `approval_request` transcript event and wait for operator approval before service-owned commit, push, and PR publication.
 7. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will handle the Linear handoff to `In Review`.
 
+## Review-Cycle Hardening
+
+When fixing review feedback, address the underlying invariant behind the finding, not only the literal failing case. Before calling `submit_completion_report`, build a small scenario matrix for the touched behavior and use it to guide implementation and validation.
+
+After a failed review, treat the reviewer findings as the minimum required scope. Also inspect adjacent cases that share the same invariant, contract, or side-effect path, and either fix them in the same pass or call out why they are unrelated or out of scope.
+
+Cover the smallest meaningful set from this general matrix:
+- Happy path and negative/error paths.
+- Boundary and integration behavior, not only isolated unit behavior.
+- Persistence/durability, externally visible side effects, and recovery after interruption.
+- Authorization/security variants, including unset, empty, invalid, and valid credentials when applicable.
+- Idempotency/replay and already-terminal or repeated-operation behavior.
+- Whether required side effects are actually processed, not merely planned or enqueued.
+
+For Symphony orchestration, workflow, tracker, harness, API, approval, publication, or writeback changes, also check the relevant project-specific cases:
+- Lifecycle phase, `blockedReason`, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
+- MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
+- Approval/publication variants: pending, approved, rejected, cancelled, stale, expired, already-terminal, replay; `rejectPolicy` cancel and fail; live worker wait and after-worker-exit resume.
+- Dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active.
+
+In the completion report, summarize the scenario matrix you covered, the validation evidence for the high-risk cases, and any related scenarios intentionally left unverified or out of scope.
+
 ## Protected Areas
 
 Issues that touch orchestration, workflow parsing, Linear integration, Cursor harness, dogfood workflow, or dogfood safety docs require explicit operator oversight and must carry the expected dogfood routing labels before dispatch.
