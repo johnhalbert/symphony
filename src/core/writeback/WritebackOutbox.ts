@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
+import type { IssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import type { TrackerWriter } from "../tracker/TrackerWriter.js";
 import { errorMessage } from "../errors.js";
 
@@ -143,6 +144,7 @@ export class WritebackProcessor {
     private readonly writer: TrackerWriter,
     private readonly logger: Logger,
     private readonly maxBackoffMs: number,
+    private readonly lifecycleStore?: Pick<IssueLifecycleStore, "get">,
   ) {}
 
   async enqueueAndProcess(operation: NewWritebackOperation, options: { retrySkipped?: boolean } = {}): Promise<WritebackOperation> {
@@ -158,6 +160,11 @@ export class WritebackProcessor {
   async processDue(): Promise<void> {
     for (const record of await this.store.claimDue()) {
       try {
+        const guard = await this.verifyLifecycleBoundHandoff(record);
+        if (guard.status === "blocked") {
+          await this.store.markSkipped(record, guard.message);
+          continue;
+        }
         const result = await this.execute(record);
         if (result.status === "applied" || result.status === "verified") {
           await this.store.markSucceeded(record);
@@ -178,6 +185,19 @@ export class WritebackProcessor {
     }
   }
 
+  private async verifyLifecycleBoundHandoff(record: WritebackOperation): Promise<{ status: "ready" } | { status: "blocked"; message: string }> {
+    if (!isPullRequestHandoffOperation(record) || !this.lifecycleStore) return { status: "ready" };
+    const lifecycle = await this.lifecycleStore.get(record.issueId);
+    const acceptedReport = lifecycle?.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
+    if (!acceptedReport || !acceptedReport.writebackOperationKeys.includes(record.idempotencyKey) || acceptedReport.pullRequest === null) {
+      return {
+        status: "blocked",
+        message: "pull request handoff requires a durable accepted completion report with matching PR evidence",
+      };
+    }
+    return { status: "ready" };
+  }
+
   private async execute(record: WritebackOperation) {
     if (record.kind === "transition") {
       return this.writer.transitionIssueState({
@@ -193,6 +213,11 @@ export class WritebackProcessor {
       dedupeKey: record.payload.dedupeKey,
     });
   }
+}
+
+function isPullRequestHandoffOperation(record: WritebackOperation): boolean {
+  if (record.idempotencyKey.includes(":pull-request-handoff:")) return true;
+  return record.kind === "comment" && record.payload.dedupeKey.startsWith("pull-request-handoff:");
 }
 
 export function computeWritebackBackoffMs(attempt: number, maxBackoffMs: number): number {

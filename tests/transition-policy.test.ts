@@ -5,6 +5,7 @@ import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbo
 import {
   planBlockedEscalationWritebacks,
   planCompletionReportAcceptedWritebacks,
+  planPullRequestHandoffWritebacks,
   planReviewFailWritebacks,
   planReviewPassWritebacks,
 } from "../src/core/writeback/TransitionPolicy.js";
@@ -64,6 +65,58 @@ describe("TransitionPolicy review-loop planners", () => {
         config,
       ),
     ).toEqual([]);
+  });
+
+  it("plans verified PR handoff comment and transition to the configured handoff state", () => {
+    const config = reviewLoopConfig();
+    config.tracker.handoffStates = ["Human Review"];
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = "Human Review";
+    const operations = planPullRequestHandoffWritebacks(
+      {
+        issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+        runId: "run-1",
+        sessionId: "session-1",
+        workspacePath: "/tmp/workspace",
+      },
+      config,
+      {
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "abc123",
+          branch: "symphony/TEST-1",
+          draft: false,
+        },
+        ci: {
+          requiredChecks: ["Typecheck and test"],
+          passedChecks: ["Typecheck and test"],
+          noCiEvidence: null,
+        },
+      },
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:pull-request-handoff:pr-42:abc123",
+      kind: "comment",
+      payload: {
+        dedupeKey: "pull-request-handoff:pr-42:abc123",
+      },
+    });
+    expect(commentBody(operations, 0)).toContain("## Symphony PR Handoff");
+    expect(commentBody(operations, 0)).toContain("Status: verified PR ready for human review");
+    expect(commentBody(operations, 0)).toContain("Next state: Human Review (PR review handoff)");
+    expect(commentBody(operations, 0)).toContain("PR: #42 https://github.com/acme/symphony/pull/42");
+    expect(commentBody(operations, 0)).toContain("Required checks: Typecheck and test");
+    expect(operations[1]).toMatchObject({
+      idempotencyKey: "transition:issue-1:pull-request-handoff:pr-42:abc123:Human Review",
+      kind: "transition",
+      payload: {
+        fromStates: ["In Progress"],
+        toState: "Human Review",
+      },
+    });
   });
 
   it("plans review fail comment with requested revisions and review to active transition", () => {
@@ -195,6 +248,29 @@ describe("TransitionPolicy review-loop planners", () => {
       kind: "transition",
       payload: {
         fromStates: ["Todo", "In Progress", "In Review"],
+        toState: "Blocked",
+      },
+    });
+  });
+
+  it("plans blocked escalation transitions from PR handoff states", () => {
+    const config = reviewLoopConfig();
+    config.tracker.handoffStates = ["Human Review"];
+
+    const operations = planBlockedEscalationWritebacks(
+      {
+        issue: issue({ state: "Human Review" }),
+        runId: "run-blocked-1",
+        reason: "human review ceiling reached",
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        fromStates: ["Todo", "In Progress", "Human Review", "In Review"],
         toState: "Blocked",
       },
     });

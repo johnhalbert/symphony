@@ -93,7 +93,8 @@ Expected result:
 - A git worktree is created.
 - The run transcript is persisted.
 - The worker calls `submit_completion_report` with summary, validation evidence, acceptance checklist, changed files, branch/PR details, risks, and an idempotency key.
-- The issue reaches `In Review` through service-owned writeback for reviewer-agent review.
+- The issue reaches `Human Review` through service-owned PR handoff after the completion report and configured checks are accepted. Handoff checks are evaluated when the completion report is submitted; the worker MCP call does not poll or wait for newly queued CI checks.
+- A human operator moves the issue from `Human Review` to `In Review` when reviewer-agent review should start.
 - The reviewer records a fail verdict with concrete requested revisions.
 - Symphony transitions the issue back to `In Progress` and the next worker turn addresses the requested revisions.
 - The worker submits a new completion report before any second handoff.
@@ -110,12 +111,13 @@ Before the smoke:
 - [ ] The target issue is the only issue with `dogfood-ready` and no `dogfood-blocked` or `safety-blocked` label.
 - [ ] `Ready to Merge` exists in Linear and is not listed as an active, review, blocked, or terminal state.
 - [ ] `Blocked` exists in Linear and is not listed as an active or review state.
-- [ ] `In Review` is understood as the agent review queue, not human review.
+- [ ] `Human Review` is understood as the PR handoff state; `In Review` is understood as the agent review queue.
 
 During the smoke:
 
 - [ ] No issue becomes a worker candidate until an operator intentionally moves it to `Todo` with the required label.
-- [ ] No issue enters `In Review` until the lifecycle record has a last completion report.
+- [ ] No issue enters `Human Review` through Symphony writeback until the lifecycle record has a last completion report and verified PR.
+- [ ] No issue enters `In Review` until a human operator promotes it from `Human Review`.
 - [ ] No reviewer dispatch occurs without a last completion report.
 - [ ] A fail verdict returns the issue to `In Progress`, increments the review round, and includes a revision-request comment.
 - [ ] A pass verdict is recorded before the configured pass destination is applied.

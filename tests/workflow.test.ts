@@ -56,6 +56,14 @@ Work on {{ issue.identifier }}.`,
         pollIntervalMs: 2000,
         timeoutMs: null,
       },
+      prHandoff: {
+        enabled: false,
+        targetState: null,
+        allowDrafts: false,
+        requiredChecks: [],
+        noCiAllowed: false,
+        noCiEvidence: null,
+      },
     });
     expect(config.continuationContext).toEqual({
       searchEnabled: false,
@@ -79,6 +87,225 @@ Work on {{ issue.identifier }}.`,
       canceled: ["Cancelled", "Canceled", "Duplicate"],
     });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
+  });
+
+  it("parses PR handoff policy for human review transitions", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: {
+          kind: "linear",
+          api_key: "$LINEAR_API_KEY",
+          project_slug: "TEST",
+          handoff_states: ["Human Review"],
+        },
+        github: {
+          publish_pull_requests: true,
+          pr_handoff: {
+            target_state: "Human Review",
+            allow_drafts: true,
+            required_checks: ["Typecheck and test"],
+            no_ci: { allowed: false },
+          },
+        },
+        review_loop: {
+          review_states: ["In Review"],
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.github.prHandoff).toEqual({
+      enabled: true,
+      targetState: "Human Review",
+      allowDrafts: true,
+      requiredChecks: ["Typecheck and test"],
+      noCiAllowed: false,
+      noCiEvidence: null,
+    });
+  });
+
+  it("rejects PR handoff policies that collapse human and agent review queues", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            handoff_states: ["In Review"],
+          },
+          review_loop: {
+            review_states: ["In Review"],
+          },
+          github: {
+            publish_pull_requests: true,
+            pr_handoff: {
+              enabled: true,
+              target_state: "In Review",
+              required_checks: ["Typecheck and test"],
+            },
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("tracker.handoff_states must not overlap review_loop.review_states");
+  });
+
+  it("rejects PR handoff targets outside tracker handoff states", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            handoff_states: ["Human Review"],
+          },
+          review_loop: {
+            review_states: ["In Review"],
+          },
+          github: {
+            publish_pull_requests: true,
+            pr_handoff: {
+              enabled: true,
+              target_state: "In Review",
+              required_checks: ["Typecheck and test"],
+            },
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("github.pr_handoff.target_state must be listed in tracker.handoff_states");
+  });
+
+  it("requires explicit handoff checks for published PR handoff policies", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            handoff_states: ["Human Review"],
+          },
+          review_loop: {
+            review_states: ["In Review"],
+          },
+          github: {
+            publish_pull_requests: true,
+            pr_handoff: {
+              enabled: true,
+              target_state: "Human Review",
+            },
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("github.pr_handoff.required_checks is required");
+  });
+
+  it("validates implicit PR handoff when PR publication is enabled", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            handoff_states: ["Human Review"],
+          },
+          github: {
+            publish_pull_requests: true,
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("tracker.handoff_states must not overlap review_loop.review_states");
+  });
+
+  it("requires checks or no-CI evidence for implicit PR handoff", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            handoff_states: ["Human Review"],
+          },
+          review_loop: {
+            review_states: ["In Review"],
+          },
+          github: {
+            publish_pull_requests: true,
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("github.pr_handoff.required_checks is required");
+  });
+
+  it("rejects PR handoff states that collapse into the reviewer pass state", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            handoff_states: ["Ready to Merge"],
+          },
+          review_loop: {
+            review_states: ["In Review"],
+            review_pass_state: "Ready to Merge",
+          },
+          github: {
+            publish_pull_requests: true,
+            pr_handoff: {
+              enabled: true,
+              target_state: "Ready to Merge",
+              required_checks: ["Typecheck and test"],
+            },
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("tracker.handoff_states must not overlap review_loop.review_pass_state");
+  });
+
+  it("rejects PR handoff without service-owned PR publication", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            handoff_states: ["Human Review"],
+          },
+          review_loop: {
+            review_states: ["In Review"],
+          },
+          github: {
+            publish_pull_requests: false,
+            pr_handoff: {
+              enabled: true,
+              target_state: "Human Review",
+              required_checks: ["Typecheck and test"],
+            },
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("github.pr_handoff.enabled requires github.publish_pull_requests");
   });
 
   it("parses handoff states and dispatch label guardrails", () => {
@@ -441,6 +668,14 @@ Work on {{ issue.identifier }}.`,
         rejectPolicy: "cancel",
         pollIntervalMs: 2000,
         timeoutMs: null,
+      },
+      prHandoff: {
+        enabled: false,
+        targetState: null,
+        allowDrafts: false,
+        requiredChecks: [],
+        noCiAllowed: false,
+        noCiEvidence: null,
       },
     });
   });

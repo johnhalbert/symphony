@@ -9,6 +9,7 @@ import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptSto
 import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
 import type {
+  CompletionReportPullRequestCheckResult,
   CompletionReportPullRequestPublication,
   CompletionReportPullRequestPublicationInput,
   CompletionReportPullRequestPublisher,
@@ -161,12 +162,152 @@ describe("CompletionReportService", () => {
     expect(transcript.events.filter((event) => event.eventType === "pr_opened")).toHaveLength(1);
   });
 
+  it("rejects reused draft PRs when draft handoff is disabled", async () => {
+    const publisher = new FakePublisher({
+      action: "reused",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+      draft: true,
+    });
+    const { service, lifecycleStore, outbox, runStore } = fixture({ publisher });
+    await startRun(runStore);
+
+    await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+
+    expect(await lifecycleStore.get("issue-1")).toBeNull();
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
+  it("accepts service-owned PR handoff after configured required checks pass", async () => {
+    const publisher = new FakePublisher(
+      {
+        action: "created",
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headBranch: "symphony/TEST-1",
+        headSha: "abc123",
+        lastPushedAt: "2026-01-01T00:00:01Z",
+        evidenceCursor: "idem-1",
+      },
+      null,
+      [{ name: "Typecheck and test", status: "success", conclusion: "success", url: null }],
+    );
+    const { service, outbox, runStore } = fixture({
+      publisher,
+      configure(config) {
+        config.github.prHandoff.requiredChecks = ["Typecheck and test"];
+      },
+    });
+    await startRun(runStore);
+
+    await service.submitCompletionReport(report(), contextWithWorkspace());
+
+    expect(publisher.checkInputs).toEqual([{ headSha: "abc123", requiredChecks: ["Typecheck and test"] }]);
+    const comment = (await outbox.list()).find((operation) => operation.kind === "comment");
+    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("Required checks: Typecheck and test");
+    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("Passing checks: Typecheck and test");
+  });
+
+  it("rejects service-owned PR handoff while configured required checks are not passing", async () => {
+    const publisher = new FakePublisher(
+      {
+        action: "created",
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headBranch: "symphony/TEST-1",
+        headSha: "abc123",
+        lastPushedAt: "2026-01-01T00:00:01Z",
+        evidenceCursor: "idem-1",
+      },
+      null,
+      [{ name: "Typecheck and test", status: "pending", conclusion: null, url: null }],
+    );
+    const { service, lifecycleStore, outbox, runStore } = fixture({
+      publisher,
+      configure(config) {
+        config.github.prHandoff.requiredChecks = ["Typecheck and test"];
+      },
+    });
+    await startRun(runStore);
+
+    await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+
+    expect(publisher.checkInputs).toEqual([{ headSha: "abc123", requiredChecks: ["Typecheck and test"] }]);
+    expect(await lifecycleStore.get("issue-1")).toBeNull();
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
+  it("rejects service-owned PR handoff when checks and no-CI evidence are absent", async () => {
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const { service, lifecycleStore, outbox, runStore } = fixture({
+      publisher,
+      configure(config) {
+        config.github.prHandoff.requiredChecks = [];
+        config.github.prHandoff.noCiAllowed = false;
+        config.github.prHandoff.noCiEvidence = null;
+      },
+    });
+    await startRun(runStore);
+
+    await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+
+    expect(await lifecycleStore.get("issue-1")).toBeNull();
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
   it("rejects completion handoff when service-owned PR publication fails", async () => {
     const publisher = new FakePublisher(null, new SymphonyError("tracker_error", "GitHub branch push failed"));
     const { service, lifecycleStore, outbox } = fixture({ publisher });
 
     await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
       code: "tracker_error",
+    });
+
+    expect(await lifecycleStore.get("issue-1")).toBeNull();
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
+  it("does not accept self-reported PR metadata as PR-driven handoff evidence", async () => {
+    const { service, lifecycleStore, outbox } = fixture({
+      configure(config) {
+        config.github.prHandoff.enabled = true;
+        config.tracker.handoffStates = ["Human Review"];
+        config.github.prHandoff.targetState = "Human Review";
+      },
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report({
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "abc123",
+            branch: "symphony/TEST-1",
+          },
+        }),
+        contextWithWorkspace(),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
     });
 
     expect(await lifecycleStore.get("issue-1")).toBeNull();
@@ -239,17 +380,23 @@ describe("CompletionReportService", () => {
     });
   });
 
-  function fixture(options: { publisher?: CompletionReportPullRequestPublisher } = {}) {
+  function fixture(options: { publisher?: CompletionReportPullRequestPublisher; configure?: (config: ReturnType<typeof testConfig>) => void } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.reviewStates = ["In Review"];
     if (options.publisher) {
       config.github.publishPullRequests = true;
+      config.github.prHandoff.enabled = true;
+      config.tracker.handoffStates = ["Human Review"];
+      config.github.prHandoff.targetState = "Human Review";
+      config.github.prHandoff.noCiAllowed = true;
+      config.github.prHandoff.noCiEvidence = "No CI configured in unit test";
       config.github.owner = "acme";
       config.github.repo = "symphony";
       config.github.token = "github-token";
     }
+    options.configure?.(config);
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
@@ -346,10 +493,12 @@ class FailingOutbox {
 
 class FakePublisher implements CompletionReportPullRequestPublisher {
   readonly inputs: CompletionReportPullRequestPublicationInput[] = [];
+  readonly checkInputs: Array<{ headSha: string; requiredChecks: string[] }> = [];
 
   constructor(
     private readonly publication: CompletionReportPullRequestPublication | null,
     private readonly failure: Error | null = null,
+    private readonly checks: CompletionReportPullRequestCheckResult[] = [],
   ) {}
 
   async publishPullRequest(
@@ -359,5 +508,13 @@ class FakePublisher implements CompletionReportPullRequestPublisher {
     if (this.failure) throw this.failure;
     if (!this.publication) throw new Error("missing fake publication");
     return this.publication;
+  }
+
+  async getRequiredCheckResults(input: {
+    headSha: string;
+    requiredChecks: string[];
+  }): Promise<CompletionReportPullRequestCheckResult[]> {
+    this.checkInputs.push(input);
+    return this.checks;
   }
 }

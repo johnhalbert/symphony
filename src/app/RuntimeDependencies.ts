@@ -3,6 +3,7 @@ import type { AgentRunRole, TrackerStateLists } from "../core/types.js";
 import type { ServiceConfig } from "../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../core/config/CredentialProfiles.js";
 import { SymphonyError } from "../core/errors.js";
+import { FileIssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../core/writeback/WritebackOutbox.js";
 import { createLinearTrackerClientForCapability } from "../integrations/linear/LinearCredentialResolver.js";
 
@@ -23,6 +24,7 @@ export function createRuntimeWritebackProcessor(
     createLinearTrackerClientForCapability(config, "linear.writeback", fetchImpl),
     logger,
     config.writeback.maxBackoffMs,
+    new FileIssueLifecycleStore(config.workspace.stateDir),
   );
 }
 

@@ -13,7 +13,10 @@ import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { OperatorApprovalService } from "./approval/OperatorApprovalService.js";
 import type { Issue, Workspace } from "./types.js";
-import { planCompletionReportAcceptedWritebacks } from "./writeback/TransitionPolicy.js";
+import {
+  planCompletionReportAcceptedWritebacks,
+  planPullRequestHandoffWritebacks,
+} from "./writeback/TransitionPolicy.js";
 import type { FileWritebackOutboxStore, WritebackOperation } from "./writeback/WritebackOutbox.js";
 
 const completionReportSchema = z.object({
@@ -70,6 +73,17 @@ export interface CompletionReportServiceOptions {
 
 export interface CompletionReportPullRequestPublisher {
   publishPullRequest(input: CompletionReportPullRequestPublicationInput): Promise<CompletionReportPullRequestPublication>;
+  getRequiredCheckResults?(input: {
+    headSha: string;
+    requiredChecks: string[];
+  }): Promise<CompletionReportPullRequestCheckResult[]>;
+}
+
+export interface CompletionReportPullRequestCheckResult {
+  name: string;
+  status: "success" | "failure" | "pending" | "missing";
+  conclusion: string | null;
+  url: string | null;
 }
 
 export interface CompletionReportPullRequestPublicationInput {
@@ -87,6 +101,7 @@ export interface CompletionReportPullRequestPublication {
   headBranch: string;
   headSha: string;
   lastPushedAt: string | null;
+  draft?: boolean | null;
   action: "reused" | "created";
   evidenceCursor: string;
 }
@@ -118,9 +133,15 @@ export class CompletionReportService {
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
     this.validateIssueIsAcceptingReports(context, lifecyclePhase);
     const publication = await this.publishPullRequestIfNeeded(report, context, existingLifecycle);
-    const pullRequest = publication
-      ? pullRequestRefFromPublication(publication)
-      : normalizeInputPullRequest(report.pullRequest, report.branchName);
+    const verifiedPullRequest = publication ? pullRequestRefFromPublication(publication) : null;
+    const pullRequest = verifiedPullRequest ?? normalizeInputPullRequest(report.pullRequest, report.branchName);
+    const handoffChecks = await this.evaluatePullRequestHandoffChecks(verifiedPullRequest);
+    if (this.options.config.github.prHandoff.enabled && (verifiedPullRequest === null || handoffChecks === null)) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Completion report handoff requires a verified pull request that satisfies the handoff policy",
+      );
+    }
 
     const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
       phase: lifecyclePhase,
@@ -139,30 +160,42 @@ export class CompletionReportService {
         lastEvidenceCursor: publication?.evidenceCursor ?? existingLifecycle?.summaryPointers.lastEvidenceCursor ?? null,
       },
     });
+    const lifecycleBeforeAcceptance = lifecycle;
 
-    const operations = planCompletionReportAcceptedWritebacks(
-      {
-        issue: context.issue,
-        runId: report.runId,
-        sessionId: context.sessionId ?? null,
-        workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
-        workspace: context.workspace ?? null,
-      },
-      this.options.config,
-      {
-        reportId: reportIdFor(context.issue.id, report.idempotencyKey),
-        idempotencyKey: report.idempotencyKey,
-        summary: report.summary,
-        validationEvidence: report.validationEvidence,
-        acceptanceChecklist: report.acceptanceChecklist,
-        changedFiles: report.changedFiles,
-        branchName: report.branchName,
-        pullRequest,
-        risks: report.risks,
-      },
-    );
+    const writebackContext = {
+      issue: context.issue,
+      runId: report.runId,
+      sessionId: context.sessionId ?? null,
+      workspacePath: context.workspacePath ?? context.workspace?.path ?? null,
+      workspace: context.workspace ?? null,
+    };
+    const writebackReport = {
+      reportId: reportIdFor(context.issue.id, report.idempotencyKey),
+      idempotencyKey: report.idempotencyKey,
+      summary: report.summary,
+      validationEvidence: report.validationEvidence,
+      acceptanceChecklist: report.acceptanceChecklist,
+      changedFiles: report.changedFiles,
+      branchName: report.branchName,
+      pullRequest,
+      risks: report.risks,
+    };
+    const operations = this.options.config.github.prHandoff.enabled
+      ? verifiedPullRequest === null || handoffChecks === null
+        ? []
+        : planPullRequestHandoffWritebacks(writebackContext, this.options.config, {
+            pullRequest: verifiedPullRequest,
+            report: writebackReport,
+            ci: handoffChecks,
+          })
+      : planCompletionReportAcceptedWritebacks(writebackContext, this.options.config, writebackReport);
     if (operations.length === 0) {
-      throw new SymphonyError("invalid_request", "Completion report cannot be accepted for the current issue state");
+      throw new SymphonyError(
+        "invalid_request",
+        this.options.config.github.prHandoff.enabled
+          ? "Completion report handoff requires a verified pull request that satisfies the handoff policy"
+          : "Completion report cannot be accepted for the current issue state",
+      );
     }
 
     const storedReport: IssueCompletionReportRecord = {
@@ -181,12 +214,6 @@ export class CompletionReportService {
       acceptedAt: new Date().toISOString(),
       writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
     };
-    const enqueued: WritebackOperation[] = [];
-    for (const operation of operations) {
-      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
-    }
-    await this.recordPullRequestMetadata(context, publication);
-
     const updatedLifecycle = await this.options.lifecycleStore.updateIssue(context.issue, {
       phase: "review",
       incompleteTurnCount: 0,
@@ -207,6 +234,23 @@ export class CompletionReportService {
         lastEvidenceCursor: publication?.evidenceCursor ?? existingLifecycle?.summaryPointers.lastEvidenceCursor ?? null,
       },
     });
+
+    const enqueued: WritebackOperation[] = [];
+    try {
+      for (const operation of operations) {
+        enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+      }
+    } catch (error) {
+      await this.options.lifecycleStore.updateIssue(context.issue, {
+        phase: lifecycleBeforeAcceptance.phase,
+        incompleteTurnCount: lifecycleBeforeAcceptance.incompleteTurnCount,
+        lastCompletionReportId: lifecycleBeforeAcceptance.lastCompletionReportId,
+        completionReports: lifecycleBeforeAcceptance.completionReports,
+        summaryPointers: lifecycleBeforeAcceptance.summaryPointers,
+      });
+      throw error;
+    }
+    await this.recordPullRequestMetadata(context, publication);
     await appendLaneMemoTelemetry(this.options.runStore, context.activeRunId, updatedLifecycle, "completion_report");
 
     return { accepted: true, replayed: false, report: storedReport, writebackOperations: enqueued };
@@ -290,6 +334,37 @@ export class CompletionReportService {
     return this.options.pullRequestPublisher.publishPullRequest(publicationInput);
   }
 
+  private async evaluatePullRequestHandoffChecks(
+    pullRequest: CompletionReportPullRequestRef | null,
+  ): Promise<{ requiredChecks: string[]; passedChecks: string[]; noCiEvidence: string | null } | null> {
+    if (!this.options.config.github.prHandoff.enabled) return null;
+    if (pullRequest?.draft === true && !this.options.config.github.prHandoff.allowDrafts) return null;
+    const requiredChecks = this.options.config.github.prHandoff.requiredChecks;
+    if (requiredChecks.length === 0) {
+      const noCiEvidence = this.options.config.github.prHandoff.noCiAllowed
+        ? this.options.config.github.prHandoff.noCiEvidence
+        : null;
+      return noCiEvidence === null
+        ? null
+        : {
+            requiredChecks: [],
+            passedChecks: [],
+            noCiEvidence,
+          };
+    }
+    if (pullRequest?.headSha === null || pullRequest?.headSha === undefined) return null;
+    if (!this.options.pullRequestPublisher?.getRequiredCheckResults) return null;
+
+    const results = await this.options.pullRequestPublisher.getRequiredCheckResults({
+      headSha: pullRequest.headSha,
+      requiredChecks,
+    });
+    const passedChecks = results.filter((check) => check.status === "success").map((check) => check.name);
+    const passed = new Set(passedChecks.map((check) => check.toLowerCase()));
+    const missing = requiredChecks.filter((check) => !passed.has(check.toLowerCase()));
+    return missing.length === 0 ? { requiredChecks, passedChecks, noCiEvidence: null } : null;
+  }
+
   private async recordPullRequestMetadata(
     context: CompletionReportActiveContext,
     publication: CompletionReportPullRequestPublication | null,
@@ -360,6 +435,7 @@ function pullRequestRefFromPublication(publication: CompletionReportPullRequestP
     number: publication.number,
     headSha: publication.headSha,
     branch: publication.headBranch,
+    ...(publication.draft === undefined ? {} : { draft: publication.draft }),
   };
 }
 

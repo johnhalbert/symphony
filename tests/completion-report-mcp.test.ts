@@ -117,7 +117,7 @@ describe("completion report MCP handoff", () => {
     );
     expect(transition).toMatchObject({
       kind: "transition",
-      payload: { toState: "In Review" },
+      payload: { toState: "Human Review" },
     });
     await expect(new FileIssueLifecycleStore(stateDir).get("TEST-1")).resolves.toMatchObject({
       phase: "review",
@@ -355,7 +355,7 @@ tracker:
     - Todo
     - In Progress
   handoff_states:
-    - In Review
+    - Human Review
 writeback:
   enabled: true
   mode: dry_run
@@ -371,6 +371,12 @@ github:
   repo: symphony
   token: github-token
   publish_pull_requests: ${publishPullRequests}
+  pr_handoff:
+    enabled: ${publishPullRequests}
+    target_state: Human Review
+    no_ci:
+      allowed: true
+      evidence: No CI configured in MCP test
 ---
 Work on {{ issue.identifier }}.
 `;
@@ -386,7 +392,7 @@ tracker:
     - Todo
     - In Progress
   handoff_states:
-    - In Review
+    - Human Review
 writeback:
   enabled: true
   mode: dry_run
@@ -403,6 +409,12 @@ github:
   token: legacy-github-token
   api_base_url: https://api.github.test
   publish_pull_requests: true
+  pr_handoff:
+    enabled: true
+    target_state: Human Review
+    no_ci:
+      allowed: true
+      evidence: No CI configured in MCP test
 credential_profiles:
   profiles:
     publication:

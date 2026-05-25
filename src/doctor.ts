@@ -222,14 +222,6 @@ function reviewLoopStateCheck(config: ServiceConfig): DoctorCheck {
   if (config.reviewLoop.reviewStates.length === 0) {
     return { id: "review_loop.states", status: "error", message: "review_loop.review_states must include an agent review queue state" };
   }
-  const missingHandoff = config.reviewLoop.reviewStates.filter((state) => !stateIn(state, config.tracker.handoffStates));
-  if (missingHandoff.length > 0) {
-    return {
-      id: "review_loop.states",
-      status: "warn",
-      message: `review states are not tracker handoff states: ${missingHandoff.join(", ")}`,
-    };
-  }
   if (config.reviewLoop.reviewPassState === null) {
     return {
       id: "review_loop.states",
@@ -249,6 +241,7 @@ async function linearStateAvailabilityCheck(
   options: ReviewLoopDoctorCheckOptions,
 ): Promise<DoctorCheck> {
   const requiredStates = uniqueStates([
+    ...config.tracker.handoffStates,
     ...config.reviewLoop.reviewStates,
     ...config.reviewLoop.blockedStates,
     ...(config.reviewLoop.reviewPassState === null ? [] : [config.reviewLoop.reviewPassState]),

@@ -8,7 +8,7 @@ tracker:
     - Todo
     - In Progress
   handoff_states:
-    - In Review
+    - Human Review
   terminal_states:
     - Done
     - Closed
@@ -100,6 +100,12 @@ github:
   token: $GITHUB_TOKEN
   head_owner: johnhalbert
   publish_pull_requests: true
+  pr_handoff:
+    enabled: true
+    target_state: Human Review
+    allow_drafts: false
+    required_checks:
+      - Typecheck and test
   operator_approval:
     required_for_publication: true
     reject_policy: cancel
@@ -134,7 +140,7 @@ Use Linear only as read context unless the prompt explicitly asks for a non-life
 
 ## State Contract
 
-`Todo` and `In Progress` are the worker implementation queue. `In Review` is the independent reviewer-agent queue, not a human review handoff. `Blocked` is the human-required escalation state for exhausted review loops, repeated incomplete worker turns, or other conditions that require operator intervention.
+`Todo` and `In Progress` are the worker implementation queue. `Human Review` is the PR-driven human review handoff state and stops worker dispatch/retry behavior after Symphony accepts the worker completion report, publishes or reuses the lifecycle-bound pull request, and verifies the configured handoff checks. Publication-mode PR discovery refreshes PR metadata only; it does not move Linear state without an accepted completion report. Handoff checks are evaluated at completion-report submission time; Symphony does not poll or wait for newly queued checks in the worker MCP call. `In Review` is the independent reviewer-agent queue, not the worker handoff. A human operator moves the issue from `Human Review` to `In Review` when reviewer-agent review should start. `Blocked` is the human-required escalation state for exhausted review loops, repeated incomplete worker turns, or other conditions that require operator intervention.
 
 A passing review is recorded with structured reviewer verdict evidence, such as a Linear comment or PR review, and Symphony transitions the issue from `In Review` to `Ready to Merge`. Review failures continue through the review loop, and escalation failures transition to `Blocked`.
 
@@ -150,7 +156,7 @@ Transcript search is available through the bounded, read-only `search_transcript
 4. Run the smallest meaningful validation for the change, and run broader tests when touching shared orchestration, workflow, tracker, harness, or persistence code.
 5. Do not push directly to `main`, merge PRs, force-push protected branches, or remove dirty worktrees.
 6. When `github.publish_pull_requests` and `github.operator_approval.required_for_publication` are enabled, do not run `git push` or create/update GitHub pull requests yourself. Call `submit_completion_report` when ready; Symphony will create an `approval_request` transcript event and wait for operator approval before service-owned commit, push, and PR publication.
-7. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will handle the Linear handoff to `In Review`.
+7. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will handle the Linear handoff to `Human Review` after verifying the lifecycle-bound pull request.
 
 ## Protected Areas
 

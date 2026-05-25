@@ -60,6 +60,22 @@ export interface CompletionReportWritebackDetails {
   risks: string[];
 }
 
+export interface PullRequestHandoffWritebackDetails {
+  pullRequest: {
+    url: string | null;
+    number: number | null;
+    headSha?: string | null;
+    branch?: string | null;
+    draft?: boolean | null;
+  };
+  report?: CompletionReportWritebackDetails | null;
+  ci?: {
+    requiredChecks: string[];
+    passedChecks: string[];
+    noCiEvidence: string | null;
+  } | null;
+}
+
 export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewWritebackOperation | null {
   if (!config.writeback.enabled || !sameName(issue.state, "Todo")) return null;
   return {
@@ -162,6 +178,63 @@ export function planCompletionReportAcceptedWritebacks(
         fromStates: [config.writeback.dispatchState],
         toState: reviewState,
         reason: "Symphony completion report accepted",
+      },
+    },
+  ];
+}
+
+export function planPullRequestHandoffWritebacks(
+  context: RunWritebackContext,
+  config: ServiceConfig,
+  details: PullRequestHandoffWritebackDetails,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || !config.github.prHandoff.enabled) return [];
+  if (!isStateIn(context.issue.state, [config.writeback.dispatchState])) return [];
+
+  const targetState = config.github.prHandoff.targetState;
+  if (targetState === null) return [];
+
+  const pullRequestKey = pullRequestIdempotencySegment(details.pullRequest);
+  const headKey = safeKeySegment(details.pullRequest.headSha ?? "no-head-sha");
+  const eventKey = `pull-request-handoff:${pullRequestKey}:${headKey}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony PR Handoff",
+          "",
+          "Status: verified PR ready for human review",
+          "Symphony verified the lifecycle-bound pull request before handing off the issue.",
+          `Next state: ${targetState} (PR review handoff)`,
+          "",
+          `Run: ${context.runId}`,
+          `Session: ${context.sessionId ?? "n/a"}`,
+          `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
+          `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? details.pullRequest.branch ?? "n/a"}`,
+          "",
+          "Pull request:",
+          `- PR: ${formatPullRequest(details.pullRequest)}`,
+          ...(details.pullRequest.headSha ? [`- PR head SHA: ${details.pullRequest.headSha}`] : []),
+          `- Draft: ${details.pullRequest.draft === true ? "yes" : "no"}`,
+          ...formatPullRequestHandoffChecks(details.ci ?? null),
+          ...(details.report ? formatCompletionReportForComment(details.report) : []),
+        ].join("\n"),
+      },
+    },
+    {
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${targetState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        fromStates: [config.writeback.dispatchState],
+        toState: targetState,
+        reason: "Symphony verified pull request handoff",
       },
     },
   ];
@@ -279,7 +352,11 @@ export function planBlockedEscalationWritebacks(
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
 
-  const fromStates = uniqueStates([...config.tracker.activeStates, ...config.reviewLoop.reviewStates]);
+  const fromStates = uniqueStates([
+    ...config.tracker.activeStates,
+    ...config.tracker.handoffStates,
+    ...config.reviewLoop.reviewStates,
+  ]);
   if (!isStateIn(context.issue.state, fromStates)) return [];
 
   const blockedState = config.reviewLoop.blockedStates[0] ?? null;
@@ -509,6 +586,17 @@ function formatPullRequest(pullRequest: CompletionReportWritebackDetails["pullRe
   return parts.length === 0 ? "n/a" : parts.join(" ");
 }
 
+function formatPullRequestHandoffChecks(ci: NonNullable<PullRequestHandoffWritebackDetails["ci"]> | null): string[] {
+  if (ci === null) return ["- Required checks: n/a"];
+  if (ci.requiredChecks.length === 0) {
+    return ci.noCiEvidence === null ? ["- Required checks: none configured"] : [`- No-CI evidence: ${ci.noCiEvidence}`];
+  }
+  return [
+    `- Required checks: ${ci.requiredChecks.join(", ")}`,
+    `- Passing checks: ${ci.passedChecks.length === 0 ? "none" : ci.passedChecks.join(", ")}`,
+  ];
+}
+
 function formatReviewEvidenceForLinearComment(evidence: PullRequestReviewEvidenceItem[]): string[] {
   const active = evidence.filter((item) => item.isResolved !== true && item.isOutdated !== true);
   if (active.length === 0) return [];
@@ -532,6 +620,11 @@ function formatReviewEvidenceSummary(item: PullRequestReviewEvidenceItem): strin
 
 function safeKeySegment(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "report";
+}
+
+function pullRequestIdempotencySegment(pullRequest: PullRequestHandoffWritebackDetails["pullRequest"]): string {
+  if (pullRequest.number !== null) return `pr-${pullRequest.number}`;
+  return safeKeySegment(pullRequest.url ?? pullRequest.branch ?? "pull-request");
 }
 
 function oneLine(value: string): string {
