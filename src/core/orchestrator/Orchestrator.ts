@@ -17,7 +17,8 @@ import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
 import {
   CompletionReportService,
   isFinalizedCompletionReport,
-  isPendingPublicationApprovalLifecycle,
+  isPendingPublicationApprovalReason,
+  pendingPublicationHandoffForRun,
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
@@ -714,11 +715,8 @@ export class Orchestrator {
     const runId = entry.activeRunId ?? entry.runId;
     if (!store || !runId) return false;
     const lifecycle = await store.get(entry.issue.id);
-    if (!isPendingPublicationApprovalLifecycle(lifecycle)) return false;
-    const pendingReport = lifecycle.completionReports.find(
-      (report) => report.runId === runId && !isFinalizedCompletionReport(report),
-    );
-    if (!pendingReport) return false;
+    const handoff = pendingPublicationHandoffForRun(lifecycle, { runId });
+    if (!handoff) return false;
     entry.lifecycle = lifecycle;
     return true;
   }
@@ -782,7 +780,7 @@ export class Orchestrator {
     const phase = phaseForIssueState(issue.state, this.config);
     const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
     if (blockedByLifecycle) {
-      if (isPendingPublicationApprovalLifecycle(lifecycle)) {
+      if (isPendingPublicationApprovalReason(lifecycle.blockedReason)) {
         return false;
       }
       if (this.config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
@@ -1612,7 +1610,7 @@ export class Orchestrator {
     const report = lifecycle?.completionReports.find((item) => item.runId === runId) ?? null;
     if (!lifecycle || !report) return entry.completionReportAccepted;
     if (!isFinalizedCompletionReport(report)) {
-      if (!isPendingPublicationApprovalLifecycle(lifecycle)) return false;
+      if (!pendingPublicationHandoffForRun(lifecycle, { runId })) return false;
       entry.lifecycle = lifecycle;
       entry.completionReportAccepted = true;
       return true;
@@ -2410,7 +2408,7 @@ function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {
 }
 
 function hasRecoverablePendingPublicationApproval(lifecycle: IssueLifecycleRecord): boolean {
-  return isPendingPublicationApprovalLifecycle(lifecycle) && lifecycle.completionReports.some((report) => !isFinalizedCompletionReport(report));
+  return pendingPublicationHandoffForRun(lifecycle) !== null;
 }
 
 function issueFromPendingPublicationLifecycle(lifecycle: IssueLifecycleRecord, state: string): Issue {

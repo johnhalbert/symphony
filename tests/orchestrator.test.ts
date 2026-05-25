@@ -516,6 +516,7 @@ describe("Orchestrator", () => {
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     await lifecycleStore.ensureIssue(candidate, {
       ...pendingApprovalLifecyclePatch(candidate, root, "run-1", blockedReason),
+      phase: "implementation",
       incompleteTurnCount: 1,
     });
     const writer = new StateChangingWriter(() => undefined);
@@ -542,7 +543,7 @@ describe("Orchestrator", () => {
       });
 
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-        phase: "blocked",
+        phase: "implementation",
         blockedReason,
         incompleteTurnCount: 1,
       });
@@ -672,10 +673,13 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("does not redispatch issues with pending publication approval before Linear reaches Blocked", async () => {
+  it.each([
+    ["setup-incomplete", PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON],
+    ["awaiting operator", PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON],
+  ] as const)("does not redispatch issues with %s pending publication approval before Linear reaches Blocked", async (_name, blockedReason) => {
     const config = testConfig(root);
     config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "In Progress" });
+    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -690,8 +694,8 @@ describe("Orchestrator", () => {
     const logger = new StructuredLogger(() => undefined);
     const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
     await lifecycleStore.ensureIssue(candidate, {
-      phase: "blocked",
-      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      ...pendingApprovalLifecyclePatch(candidate, root, "run-1", blockedReason),
+      phase: "implementation",
     });
     const harness = new FakeHarness();
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
@@ -711,8 +715,8 @@ describe("Orchestrator", () => {
 
     expect(harness.runs).toHaveLength(0);
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
-      phase: "blocked",
-      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      phase: "implementation",
+      blockedReason,
     });
   });
 

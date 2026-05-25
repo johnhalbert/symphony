@@ -288,6 +288,106 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("creates setup-incomplete retry approval from the stored pending report", async () => {
+    const operatorApproval = new DeferredOperatorApproval();
+    const { service, lifecycleStore, outbox, runStore, config } = fixture({
+      operatorApproval,
+      requirePublicationApproval: true,
+      writer: new FailingWriter(),
+      maxBackoffMs: 0,
+    });
+    await startRun(runStore);
+
+    await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
+      code: "tracker_error",
+    });
+    expect(operatorApproval.requests).toHaveLength(0);
+
+    const retryService = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: outbox,
+      writebackProcessor: new WritebackProcessor(
+        outbox,
+        new StateChangingWriter(),
+        new StructuredLogger(() => undefined),
+        config.writeback.maxBackoffMs,
+      ),
+      runStore,
+      operatorApproval,
+    });
+
+    const submission = retryService.submitCompletionReport(report(), contextWithWorkspace());
+    const approvalRequest = await operatorApproval.waitForRequest();
+    await operatorApproval.waitForWaiter();
+
+    expect(approvalRequest.action).toMatchObject({
+      summaryPreview: "Implemented the service contract.",
+      changedFiles: ["src/core/CompletionReportService.ts"],
+      branchName: "symphony/TEST-1",
+      baseBranch: "main",
+      workspacePath: "/tmp/workspace",
+    });
+    expect(operatorApproval.requests).toHaveLength(1);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      completionReports: [
+        expect.objectContaining({
+          summary: "Implemented the service contract.",
+          changedFiles: ["src/core/CompletionReportService.ts"],
+          branchName: "symphony/TEST-1",
+        }),
+      ],
+    });
+
+    operatorApproval.approve();
+    await expect(submission).resolves.toMatchObject({ accepted: true });
+  });
+
+  it("rejects setup-incomplete retries that change publication approval inputs", async () => {
+    const operatorApproval = new DeferredOperatorApproval();
+    const { service, lifecycleStore, outbox, runStore, config } = fixture({
+      operatorApproval,
+      requirePublicationApproval: true,
+      writer: new FailingWriter(),
+      maxBackoffMs: 0,
+    });
+    await startRun(runStore);
+
+    await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
+      code: "tracker_error",
+    });
+    const lifecycleBefore = await lifecycleStore.get("issue-1");
+
+    const retryService = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: outbox,
+      writebackProcessor: new WritebackProcessor(
+        outbox,
+        new StateChangingWriter(),
+        new StructuredLogger(() => undefined),
+        config.writeback.maxBackoffMs,
+      ),
+      runStore,
+      operatorApproval,
+    });
+
+    await expect(
+      retryService.submitCompletionReport(
+        report({
+          summary: "Changed summary on retry.",
+          changedFiles: ["src/changed.ts"],
+          branchName: "symphony/changed",
+        }),
+        contextWithWorkspace({ workspacePath: "/tmp/changed-workspace" }),
+      ),
+    ).rejects.toMatchObject({ code: "conflict" });
+
+    expect(operatorApproval.requests).toHaveLength(0);
+    await expect(lifecycleStore.get("issue-1")).resolves.toEqual(lifecycleBefore);
+  });
+
   it.each([
     ["comment fails after Blocked transition succeeds", () => new CommentFailingWriter()],
     ["Blocked transition fails after comment succeeds", () => new TransitionFailingWriter()],
