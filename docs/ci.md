@@ -7,8 +7,16 @@ Default validation uses the repository lockfile and does not need live service c
 - Install with `npm ci`.
 - Typecheck with `npm run typecheck`.
 - Test with `npm test`.
+- Install extension dependencies with `npm run extension:ci`.
+- Typecheck the extension with `npm run extension:typecheck`.
+- Test the extension with `npm run extension:test`.
+- Build the extension with `npm run extension:build`.
 
 Local contributors should use Node `22.12` or newer on the Node 22 line, then run the same commands from the repository root.
+
+## Extension Package
+
+The Cursor extension under `extension/` has its own lockfile and install step. `npm run extension:ci` runs `npm ci --prefix extension`; extension tests are unit tests with mocked HTTP and do not launch Cursor.
 
 ## Optional Real Smoke
 

@@ -1,0 +1,87 @@
+{
+  "name": "symphony-extension",
+  "displayName": "Symphony",
+  "description": "Symphony orchestration status panel for Cursor.",
+  "version": "0.1.0",
+  "publisher": "symphony",
+  "private": true,
+  "type": "commonjs",
+  "main": "./dist/extension.js",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:symphony.panel",
+    "onCommand:symphony.openPanel",
+    "onCommand:symphony.openSettings",
+    "onCommand:symphony.refresh"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Symphony",
+      "properties": {
+        "symphony.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:7331",
+          "description": "Symphony status API base URL."
+        },
+        "symphony.token": {
+          "type": "string",
+          "default": "",
+          "description": "Optional token for mutating Symphony API calls. Sent as X-Symphony-Token only when a mutation is used."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "symphony",
+          "title": "Symphony",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "symphony": [
+        {
+          "type": "webview",
+          "id": "symphony.panel",
+          "name": "Symphony"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "symphony.openPanel",
+        "title": "Symphony: Open Panel",
+        "category": "Symphony"
+      },
+      {
+        "command": "symphony.openSettings",
+        "title": "Symphony: Open Settings",
+        "category": "Symphony"
+      },
+      {
+        "command": "symphony.refresh",
+        "title": "Symphony: Refresh Connection",
+        "category": "Symphony"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run -c vitest.config.ts",
+    "test:watch": "vitest -c vitest.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/vscode": "^1.120.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  }
+}
