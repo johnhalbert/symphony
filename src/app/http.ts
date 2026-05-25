@@ -227,7 +227,7 @@ export class StatusServer {
               runStore: this.options.runStore,
               allowSetupIncomplete: decision === "reject",
             });
-            if (!currentApproval) {
+            if (!currentApproval && (await hasPendingPublicationLifecycle(existingApproval, this.options.lifecycleStore))) {
               throw new SymphonyError("conflict", "Approval request is not current pending publication approval");
             }
           }
@@ -714,6 +714,15 @@ async function currentPendingPublicationApproval(input: {
   const run = await input.runStore.getRun(report.runId);
   if (run?.pendingApprovalRequestId !== input.approval.requestId) return null;
   return input.approval;
+}
+
+async function hasPendingPublicationLifecycle(
+  approval: OperatorApprovalRecord,
+  lifecycleStore: IssueLifecycleStore | undefined,
+): Promise<boolean> {
+  if (!lifecycleStore) return false;
+  const lifecycle = (await lifecycleStore.get(approval.issueId)) ?? (await lifecycleStore.get(approval.issueIdentifier));
+  return isPendingPublicationApprovalLifecycle(lifecycle);
 }
 
 function approvalMutationsRequireToken(enabled: boolean, openWorkspaceToken: string | null): boolean {

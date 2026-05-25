@@ -25,7 +25,7 @@ import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
-import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileRunTranscriptStore, type RunRecord } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import type { Issue } from "../src/core/types.js";
@@ -684,7 +684,13 @@ describe("approval status API", () => {
           }),
         ],
       });
-      await expect(runStore.getRun("live-report-run")).resolves.toMatchObject({
+      const completedRun = await waitForRunMatch(
+        runStore,
+        "live-report-run",
+        (run) => run.status === "succeeded" && run.prHeadSha === "abc123",
+        "live approval PR metadata",
+      );
+      expect(completedRun).toMatchObject({
         status: "succeeded",
         pendingApprovalRequestId: null,
         prUrl: "https://github.com/acme/symphony/pull/42",
@@ -1557,6 +1563,22 @@ describe("approval status API", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     throw new Error(`run did not become terminal: ${runId}`);
+  }
+
+  async function waitForRunMatch(
+    transcriptStore: FileRunTranscriptStore,
+    runId: string,
+    predicate: (run: RunRecord) => boolean,
+    description: string,
+    timeoutMs = 5_000,
+  ) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const run = await transcriptStore.getRun(runId);
+      if (run && predicate(run)) return run;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`run did not match ${description}: ${runId}`);
   }
 
   async function waitFor(predicate: () => boolean, description: string, timeoutMs = 5_000): Promise<void> {
