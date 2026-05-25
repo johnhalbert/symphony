@@ -62,6 +62,7 @@ export class IssueBreakdownPlanApplyService {
       return { status: "blocked", plan: updated, operations: [], reason: updated.applicationBlockedReason ?? "writeback unavailable" };
     }
 
+    const replayPlan = plan;
     let workingPlan = await this.updatePlan(issue, plan, {
       applicationStatus: "pending",
       applicationOperationKeys: mergeOperationKeys(plan.applicationOperationKeys, childOperations),
@@ -70,7 +71,7 @@ export class IssueBreakdownPlanApplyService {
 
     const processed: WritebackOperation[] = [];
     for (const operation of childOperations) {
-      const result = await this.options.writeback.enqueueAndProcess(operation, { retrySkipped: isDryRunReplay(operation, workingPlan) });
+      const result = await this.options.writeback.enqueueAndProcess(operation, { retrySkipped: isDryRunReplay(operation, replayPlan) });
       processed.push(result);
       const ref = createdIssueRefFromOperation(result);
       if (ref) {
@@ -107,7 +108,7 @@ export class IssueBreakdownPlanApplyService {
       applicationOperationKeys: mergeOperationKeys(workingPlan.applicationOperationKeys, finalOperations),
     });
     for (const operation of finalOperations) {
-      processed.push(await this.options.writeback.enqueueAndProcess(operation, { retrySkipped: isDryRunReplay(operation, workingPlan) }));
+      processed.push(await this.options.writeback.enqueueAndProcess(operation, { retrySkipped: isDryRunReplay(operation, replayPlan) }));
     }
 
     const blocked = processed.find((operation) => operation.status === "skipped" || operation.status === "dead_letter");
@@ -252,8 +253,11 @@ function createdIssueRefFromOperation(operation: WritebackOperation): IssueBreak
   };
 }
 
-function isDryRunReplay(operation: NewWritebackOperation, plan: IssueBreakdownPlanRecord): boolean {
-  return plan.applicationOperationKeys.includes(operation.idempotencyKey) && plan.applicationBlockedReason === "Writeback dry_run";
+function isDryRunReplay(operation: NewWritebackOperation, replayPlan: IssueBreakdownPlanRecord): boolean {
+  return (
+    replayPlan.applicationOperationKeys.includes(operation.idempotencyKey) &&
+    replayPlan.applicationBlockedReason === "Writeback dry_run"
+  );
 }
 
 function mergeOperationKeys(existing: string[], operations: NewWritebackOperation[]): string[] {
