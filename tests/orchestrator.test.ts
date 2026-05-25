@@ -20,6 +20,7 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import { issueBreakdownConfigFingerprint, renderIssueBreakdownPlanSummary } from "../src/core/IssueBreakdownPlanService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
 import {
@@ -107,9 +108,10 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.issueBreakdown.enabled = true;
     config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    const candidate = issue({ state: "Todo", updatedAt: "2026-01-02T00:00:00Z" });
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -123,10 +125,10 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const harness = new FakeHarness();
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
@@ -153,11 +155,12 @@ describe("Orchestrator", () => {
 
     expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
-    expect(harness.runs[0]?.prompt).toBe("Plan TEST-1");
+    expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
+    expect(harness.runs[0]?.prompt).toContain("submit_issue_breakdown_plan");
     expect(harness.runs[1]?.ctx.runPhase).toBe("implementation");
     expect(harness.runs[1]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[1]?.prompt).toContain("Issue breakdown plan:");
-    expect(harness.runs[1]?.prompt).toContain("fake completed");
+    expect(harness.runs[1]?.prompt).toContain("Create implementation task");
     await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "implementation" })).resolves.toMatchObject({
       runPhase: "implementation",
     });
@@ -4579,6 +4582,66 @@ class CursorPromptHarness implements AgentHarness {
   async *run(_ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.prompts.push(prompt);
     yield { type: "session_started", sessionId: "cursor-session-1", runId: "cursor-run-1" };
+    yield { type: "completed" };
+  }
+}
+
+class IssueBreakdownAcceptingHarness implements AgentHarness {
+  readonly id = "issue-breakdown-accepting";
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(private readonly lifecycleStore: FileIssueLifecycleStore) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    const runId = `${ctx.runPhase ?? "implementation"}-run-${this.runs.length}`;
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    if (ctx.runPhase === "issue_breakdown") {
+      const acceptedAt = new Date().toISOString();
+      const plan = {
+        id: `issue-breakdown-plan:${ctx.issue.id}:test-plan`,
+        idempotencyKey: "test-plan",
+        runId,
+        issueId: ctx.issue.id,
+        issueIdentifier: ctx.issue.identifier,
+        summary: "Break implementation into one task.",
+        proposedIssues: [
+          {
+            title: "Create implementation task",
+            description: "Implement the requested behavior.",
+            acceptanceCriteria: ["Behavior is implemented and tested."],
+            dependencies: [],
+            labels: ["planning"],
+          },
+        ],
+        transcriptPointers: [`/api/v1/runs/${runId}/transcript`],
+        statusApiPointers: [`/api/v1/issues/${ctx.issue.identifier}`, `/api/v1/runs/${runId}`],
+        issueUpdatedAt: ctx.issue.updatedAt,
+        configFingerprint: issueBreakdownConfigFingerprint(ctx.config),
+        cursorMode: ctx.config.issueBreakdown.cursorMode,
+        acceptedAt,
+      };
+      await this.lifecycleStore.ensureIssue(ctx.issue, {
+        lastIssueBreakdownPlanId: plan.id,
+        issueBreakdownPlans: [plan],
+        summaryReferences: [
+          {
+            id: `issue-breakdown-${runId}`,
+            kind: "issue_breakdown_plan",
+            planId: plan.id,
+            summary: renderIssueBreakdownPlanSummary(plan),
+            runIds: [runId],
+            transcriptEventCount: 1,
+            transcriptPointers: plan.transcriptPointers,
+            statusApiPointers: plan.statusApiPointers,
+            issueUpdatedAt: plan.issueUpdatedAt,
+            configFingerprint: plan.configFingerprint,
+            cursorMode: plan.cursorMode,
+            createdAt: acceptedAt,
+          },
+        ],
+      });
+    }
     yield { type: "completed" };
   }
 }

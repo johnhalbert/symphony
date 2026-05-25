@@ -29,6 +29,7 @@ export interface IssueLifecycleSummaryReference {
   id: string;
   kind: IssueLifecycleSummaryReferenceKind;
   summary: string;
+  planId?: string;
   runIds: string[];
   transcriptEventCount: number;
   transcriptPointers: string[];
@@ -37,6 +38,30 @@ export interface IssueLifecycleSummaryReference {
   configFingerprint?: string | null;
   cursorMode?: string | null;
   createdAt: string;
+}
+
+export interface ProposedIssueRecord {
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  dependencies: string[];
+  labels: string[];
+}
+
+export interface IssueBreakdownPlanRecord {
+  id: string;
+  idempotencyKey: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  summary: string;
+  proposedIssues: ProposedIssueRecord[];
+  transcriptPointers: string[];
+  statusApiPointers: string[];
+  issueUpdatedAt: string | null;
+  configFingerprint: string;
+  cursorMode: string;
+  acceptedAt: string;
 }
 
 export interface CompletionReportChecklistItem {
@@ -229,11 +254,13 @@ export interface IssueLifecycleRecord {
   phase: IssueLifecyclePhase;
   reviewRound: number;
   incompleteTurnCount: number;
+  lastIssueBreakdownPlanId: string | null;
   lastCompletionReportId: string | null;
   lastReviewVerdictId: string | null;
   blockedReason: string | null;
   summaryPointers: IssueLifecycleSummaryPointers;
   summaryReferences: IssueLifecycleSummaryReference[];
+  issueBreakdownPlans: IssueBreakdownPlanRecord[];
   completionReports: IssueCompletionReportRecord[];
   reviewVerdicts: IssueReviewVerdictRecord[];
   reviewFeedback: IssueReviewFeedbackRecord[];
@@ -248,11 +275,13 @@ export interface IssueLifecyclePatch {
   phase?: IssueLifecyclePhase;
   reviewRound?: number;
   incompleteTurnCount?: number;
+  lastIssueBreakdownPlanId?: string | null;
   lastCompletionReportId?: string | null;
   lastReviewVerdictId?: string | null;
   blockedReason?: string | null;
   summaryPointers?: Partial<IssueLifecycleSummaryPointers>;
   summaryReferences?: IssueLifecycleSummaryReference[];
+  issueBreakdownPlans?: IssueBreakdownPlanRecord[];
   completionReports?: IssueCompletionReportRecord[];
   reviewVerdicts?: IssueReviewVerdictRecord[];
   reviewFeedback?: IssueReviewFeedbackRecord[];
@@ -275,6 +304,11 @@ export class FileIssueLifecycleStore {
       phase: patch.phase ?? existing?.phase ?? "implementation",
       reviewRound: patch.reviewRound ?? existing?.reviewRound ?? 0,
       incompleteTurnCount: patch.incompleteTurnCount ?? existing?.incompleteTurnCount ?? 0,
+      lastIssueBreakdownPlanId: patchValue(
+        patch,
+        "lastIssueBreakdownPlanId",
+        existing?.lastIssueBreakdownPlanId ?? null,
+      ),
       lastCompletionReportId: patchValue(patch, "lastCompletionReportId", existing?.lastCompletionReportId ?? null),
       lastReviewVerdictId: patchValue(patch, "lastReviewVerdictId", existing?.lastReviewVerdictId ?? null),
       blockedReason: patchValue(patch, "blockedReason", existing?.blockedReason ?? null),
@@ -284,6 +318,7 @@ export class FileIssueLifecycleStore {
         ...patch.summaryPointers,
       },
       summaryReferences: patch.summaryReferences ?? existing?.summaryReferences ?? [],
+      issueBreakdownPlans: patch.issueBreakdownPlans ?? existing?.issueBreakdownPlans ?? [],
       completionReports: patch.completionReports ?? existing?.completionReports ?? [],
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
       reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
@@ -547,11 +582,17 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     phase: value.phase,
     reviewRound: nonNegativeInteger(value.reviewRound, filePath, "reviewRound"),
     incompleteTurnCount: nonNegativeInteger(value.incompleteTurnCount, filePath, "incompleteTurnCount"),
+    lastIssueBreakdownPlanId: optionalNullableString(
+      value.lastIssueBreakdownPlanId,
+      filePath,
+      "lastIssueBreakdownPlanId",
+    ),
     lastCompletionReportId: nullableString(value.lastCompletionReportId, filePath, "lastCompletionReportId"),
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
     summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
+    issueBreakdownPlans: normalizeIssueBreakdownPlans(value.issueBreakdownPlans, filePath),
     completionReports: normalizeCompletionReports(value.completionReports, filePath),
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
     reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
@@ -619,6 +660,9 @@ function normalizeSummaryReference(value: unknown, filePath: string, index: numb
     ),
     createdAt: requiredString(value.createdAt, filePath, `summaryReferences[${index}].createdAt`),
   };
+  if (value.planId !== undefined) {
+    normalized.planId = requiredString(value.planId, filePath, `summaryReferences[${index}].planId`);
+  }
   if (value.issueUpdatedAt !== undefined) {
     normalized.issueUpdatedAt = optionalNullableString(value.issueUpdatedAt, filePath, `summaryReferences[${index}].issueUpdatedAt`);
   }
@@ -629,6 +673,59 @@ function normalizeSummaryReference(value: unknown, filePath: string, index: numb
     normalized.cursorMode = optionalNullableString(value.cursorMode, filePath, `summaryReferences[${index}].cursorMode`);
   }
   return normalized;
+}
+
+function normalizeIssueBreakdownPlans(value: unknown, filePath: string): IssueBreakdownPlanRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "issueBreakdownPlans is invalid");
+  return value.map((item, index) => normalizeIssueBreakdownPlan(item, filePath, index));
+}
+
+function normalizeIssueBreakdownPlan(value: unknown, filePath: string, index: number): IssueBreakdownPlanRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `issueBreakdownPlans[${index}] is invalid`);
+  return {
+    id: requiredString(value.id, filePath, `issueBreakdownPlans[${index}].id`),
+    idempotencyKey: requiredString(value.idempotencyKey, filePath, `issueBreakdownPlans[${index}].idempotencyKey`),
+    runId: requiredString(value.runId, filePath, `issueBreakdownPlans[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `issueBreakdownPlans[${index}].issueId`),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, `issueBreakdownPlans[${index}].issueIdentifier`),
+    summary: requiredString(value.summary, filePath, `issueBreakdownPlans[${index}].summary`),
+    proposedIssues: normalizeProposedIssues(value.proposedIssues, filePath, index),
+    transcriptPointers: requiredStringArray(value.transcriptPointers, filePath, `issueBreakdownPlans[${index}].transcriptPointers`),
+    statusApiPointers: requiredStringArray(value.statusApiPointers, filePath, `issueBreakdownPlans[${index}].statusApiPointers`),
+    issueUpdatedAt: nullableString(value.issueUpdatedAt, filePath, `issueBreakdownPlans[${index}].issueUpdatedAt`),
+    configFingerprint: requiredString(value.configFingerprint, filePath, `issueBreakdownPlans[${index}].configFingerprint`),
+    cursorMode: requiredString(value.cursorMode, filePath, `issueBreakdownPlans[${index}].cursorMode`),
+    acceptedAt: requiredString(value.acceptedAt, filePath, `issueBreakdownPlans[${index}].acceptedAt`),
+  };
+}
+
+function normalizeProposedIssues(value: unknown, filePath: string, planIndex: number): ProposedIssueRecord[] {
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, `issueBreakdownPlans[${planIndex}].proposedIssues is invalid`);
+  return value.map((item, index) => {
+    if (!isRecord(item)) {
+      throw corruptLifecycle(filePath, `issueBreakdownPlans[${planIndex}].proposedIssues[${index}] is invalid`);
+    }
+    return {
+      title: requiredString(item.title, filePath, `issueBreakdownPlans[${planIndex}].proposedIssues[${index}].title`),
+      description: requiredString(
+        item.description,
+        filePath,
+        `issueBreakdownPlans[${planIndex}].proposedIssues[${index}].description`,
+      ),
+      acceptanceCriteria: requiredStringArray(
+        item.acceptanceCriteria,
+        filePath,
+        `issueBreakdownPlans[${planIndex}].proposedIssues[${index}].acceptanceCriteria`,
+      ),
+      dependencies: requiredStringArray(
+        item.dependencies,
+        filePath,
+        `issueBreakdownPlans[${planIndex}].proposedIssues[${index}].dependencies`,
+      ),
+      labels: requiredStringArray(item.labels, filePath, `issueBreakdownPlans[${planIndex}].proposedIssues[${index}].labels`),
+    };
+  });
 }
 
 function normalizeCompletionReports(value: unknown, filePath: string): IssueCompletionReportRecord[] {

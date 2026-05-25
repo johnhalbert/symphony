@@ -86,6 +86,7 @@ const rawConfigSchema = z
         enabled: z.boolean().optional(),
         cursor_mode: z.enum(["agent", "plan"]).optional(),
         prompt: z.string().optional(),
+        planning_labels: stringArray.optional(),
       })
       .passthrough()
       .optional(),
@@ -355,6 +356,7 @@ export interface IssueBreakdownConfig {
   enabled: boolean;
   cursorMode: CursorConversationMode;
   promptTemplate: string;
+  planningLabels: string[];
 }
 
 export interface IssueBoardConfig {
@@ -405,7 +407,9 @@ const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
   "",
   "Inspect the issue and repository context only. Do not edit files, create commits, push branches, comment on Linear, transition Linear state, or submit a completion report.",
   "",
-  "Return a concise implementation plan with scope, assumptions, likely files, risks, and validation steps.",
+  "Before ending the run, call submit_issue_breakdown_plan with a concise summary, an idempotencyKey, and proposedIssues[].",
+  "Each proposed issue must include title, description, acceptanceCriteria[], dependencies[], and labels[].",
+  "Symphony persists these proposals locally; do not create or modify Linear issues.",
 ].join("\n");
 
 export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
@@ -633,6 +637,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       enabled: raw.issue_breakdown?.enabled ?? false,
       cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
       promptTemplate: raw.issue_breakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
+      planningLabels: normalizeLabels(raw.issue_breakdown?.planning_labels),
     },
     raw,
   };

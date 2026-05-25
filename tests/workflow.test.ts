@@ -74,6 +74,7 @@ Work on {{ issue.identifier }}.`,
       enabled: false,
       cursorMode: "plan",
       promptTemplate: expect.stringContaining("Break down {{ issue.identifier }}"),
+      planningLabels: [],
     });
     expect(config.mergePolicy).toEqual({
       mode: "disabled",
@@ -361,6 +362,7 @@ Work on {{ issue.identifier }}.`,
           enabled: true,
           cursor_mode: "plan",
           prompt: "Plan {{ issue.identifier }}",
+          planning_labels: ["Planning"],
         },
       },
       "/repo/WORKFLOW.md",
@@ -396,6 +398,7 @@ Work on {{ issue.identifier }}.`,
       enabled: true,
       cursorMode: "plan",
       promptTemplate: "Plan {{ issue.identifier }}",
+      planningLabels: ["planning"],
     });
     expect(config.mergePolicy).toEqual({
       mode: "gated",

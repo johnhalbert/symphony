@@ -113,6 +113,51 @@ export class WorkspaceManager {
     };
   }
 
+  async createForPlanning(issueInput: WorkspaceIssueInput): Promise<Workspace> {
+    const issue = normalizeIssueInput(issueInput);
+    const issueIdentifier = issue.identifier;
+    const workspaceKey = `${sanitizeWorkspaceKey(issueIdentifier)}-planning`;
+    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    assertPathInsideRoot(workspacePath, this.options.workspace.root);
+
+    await fs.mkdir(this.options.workspace.root, { recursive: true });
+    await fs.mkdir(this.options.workspace.stateDir, { recursive: true });
+    await assertWorkspaceParentInsideRoot(workspacePath, this.options.workspace.root);
+    const createdNow = !(await pathExists(workspacePath));
+    await ensureDirectory(workspacePath);
+    await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+
+    if (createdNow && this.options.workspace.source.kind !== "git_worktree") {
+      await this.bootstrapWorkspace(workspacePath);
+      await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+    }
+
+    const existing = await this.store.getWorkspace(workspaceKey);
+    const metadata: WorkspaceMetadata = {
+      workspaceKey,
+      issueId: issue.id,
+      issueIdentifier,
+      path: workspacePath,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      sourceKind: this.options.workspace.source.kind,
+      ...(existing?.repoPath === undefined ? {} : { repoPath: existing.repoPath }),
+      ...(existing?.baseRef === undefined ? {} : { baseRef: existing.baseRef }),
+    };
+    await this.writeMetadata(metadata);
+
+    return {
+      path: workspacePath,
+      workspaceKey,
+      createdNow,
+      issueIdentifier,
+      sourceKind: metadata.sourceKind,
+      ...(issue.id === null ? {} : { issueId: issue.id }),
+      ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
+      ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),
+    };
+  }
+
   async beforeRun(workspacePath: string): Promise<void> {
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
     await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);

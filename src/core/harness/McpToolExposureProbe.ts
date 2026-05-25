@@ -1321,6 +1321,8 @@ function mcpSdkServerNameForCommand(command: McpSubprocessCommand): string {
   switch (command) {
     case "completion-report-mcp":
       return "symphony-completion-report";
+    case "issue-breakdown-plan-mcp":
+      return "symphony-issue-breakdown-plan";
     case "review-verdict-mcp":
       return "symphony-review-verdict";
     case "review-feedback-mcp":

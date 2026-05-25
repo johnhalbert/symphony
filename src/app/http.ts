@@ -344,6 +344,21 @@ export class StatusServer {
         return;
       }
 
+      const issueBreakdownMatch = /^\/api\/v1\/issues\/([^/]+)\/planning-run$/.exec(url.pathname);
+      if (request.method === "POST" && issueBreakdownMatch) {
+        this.requireMutationToken(request);
+        const issueId = decodeURIComponent(issueBreakdownMatch[1] ?? "");
+        const result = await this.options.orchestrator.requestIssueBreakdown(issueId);
+        sendJson(response, result.queued ? 202 : 200, {
+          queued: result.queued,
+          issue: result.issue.identifier,
+          issueId: result.issue.id,
+          runPhase: "issue_breakdown",
+          reason: result.reason,
+        });
+        return;
+      }
+
       const issueMatch = /^\/api\/v1\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && issueMatch) {
         const issueId = decodeURIComponent(issueMatch[1] ?? "");

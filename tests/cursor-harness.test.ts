@@ -184,7 +184,7 @@ describe("Cursor event mapping", () => {
     expect(events).toContainEqual({ type: "completed" });
   });
 
-  it("uses plan mode without completion MCP for issue breakdown runs", () => {
+  it("uses plan mode with planning MCP for issue breakdown runs", () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     const ctx: AgentRunContext = {
       ...agentContext(config, "worker"),
@@ -195,7 +195,7 @@ describe("Cursor event mapping", () => {
     const mcpServers = cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" });
     const createOptions = cursorAgentCreateOptions(ctx, "cursor-test-key", { mcpServers });
 
-    expect(Object.keys(mcpServers)).toEqual([]);
+    expect(Object.keys(mcpServers)).toEqual(["symphony_planning"]);
     expect(createOptions).toMatchObject({ mode: "plan" });
   });
 

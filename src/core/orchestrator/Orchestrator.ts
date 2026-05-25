@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
@@ -23,6 +22,10 @@ import {
   pendingPublicationHandoffForRun,
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
+import {
+  issueBreakdownConfigFingerprint,
+  renderIssueBreakdownPlanSummary,
+} from "../IssueBreakdownPlanService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
   compareRunChronology,
@@ -41,6 +44,7 @@ import {
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
   type IssueLifecycleSummaryReference,
+  type IssueBreakdownPlanRecord,
   type IssueLifecycleStore,
   type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
@@ -130,6 +134,7 @@ export interface RunningEntry {
   cleanupWorkspaceOnExit: boolean;
   suppressRetryOnExit: boolean;
   completionReportAccepted: boolean;
+  issueBreakdownPlanAccepted: boolean;
   pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
@@ -423,6 +428,28 @@ export class Orchestrator {
     });
     running.abortController.abort();
     if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
+  }
+
+  async requestIssueBreakdown(issueIdOrIdentifier: string): Promise<{ queued: boolean; issue: Issue; reason: string }> {
+    if (!this.config.issueBreakdown.enabled) {
+      throw new SymphonyError("invalid_request", "Issue breakdown planning is disabled");
+    }
+    if (this.availableSlots() <= 0) {
+      throw new SymphonyError("conflict", "No agent slots are available for issue breakdown planning");
+    }
+    const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
+    const issue = refreshed[0];
+    if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    if (this.running.has(issue.id)) throw new SymphonyError("conflict", "Issue already has a running Symphony agent");
+    if (!this.shouldDispatchWorker(issue, false)) {
+      throw new SymphonyError("conflict", "Issue is not currently eligible for worker dispatch");
+    }
+    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    if (latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) !== null) {
+      return { queued: false, issue, reason: "fresh_plan_exists" };
+    }
+    this.dispatchIssue(issue, null, "worker", null, "issue_breakdown");
+    return { queued: true, issue, reason: "explicit_request" };
   }
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
@@ -914,9 +941,16 @@ export class Orchestrator {
 
   private async workerRunPhaseForIssue(issue: Issue): Promise<AgentRunPhase> {
     if (!this.config.issueBreakdown.enabled) return "implementation";
+    if (!this.passesIssueBreakdownRouting(issue)) return "implementation";
     if (!this.options.lifecycleStore) return "implementation";
     const lifecycle = await this.options.lifecycleStore?.get(issue.id);
     return latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) === null ? "issue_breakdown" : "implementation";
+  }
+
+  private passesIssueBreakdownRouting(issue: Issue): boolean {
+    if (this.config.issueBreakdown.planningLabels.length === 0) return false;
+    const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
+    return this.config.issueBreakdown.planningLabels.some((label) => labels.has(label));
   }
 
   private dispatchIssue(
@@ -951,6 +985,7 @@ export class Orchestrator {
       cleanupWorkspaceOnExit: false,
       suppressRetryOnExit: false,
       completionReportAccepted: false,
+      issueBreakdownPlanAccepted: false,
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
@@ -999,7 +1034,10 @@ export class Orchestrator {
   private async runWorker(entry: RunningEntry, attempt: number | null): Promise<void> {
     let workspace: Workspace | null = null;
     try {
-      workspace = await this.options.workspaceManager.createForIssue(entry.issue);
+      workspace =
+        entry.runPhase === "issue_breakdown"
+          ? await this.options.workspaceManager.createForPlanning(entry.issue)
+          : await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
       await this.updateLifecycle(entry, {
@@ -1013,7 +1051,9 @@ export class Orchestrator {
           baseRef: workspace.baseRef ?? null,
         },
       });
-      await this.options.workspaceManager.beforeRun(workspace.path);
+      if (entry.runPhase !== "issue_breakdown") {
+        await this.options.workspaceManager.beforeRun(workspace.path);
+      }
       await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, 1));
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, 1));
 
@@ -1069,7 +1109,9 @@ export class Orchestrator {
       }
     } finally {
       if (workspace) {
-        await this.options.workspaceManager.afterRun(workspace.path);
+        if (entry.runPhase !== "issue_breakdown") {
+          await this.options.workspaceManager.afterRun(workspace.path);
+        }
         if (entry.cleanupWorkspaceOnExit) await this.options.workspaceManager.removeForIssue(entry.issue);
       }
     }
@@ -1194,6 +1236,18 @@ export class Orchestrator {
       if (event.type === "rate_limits") this.rateLimits = event.payload;
       await this.persistHarnessEvent(entry, event);
       if (event.type === "completed") {
+        if (entry.runPhase === "issue_breakdown") {
+          const accepted = await this.reconcileIssueBreakdownPlanHandoff(entry);
+          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
+            status: accepted ? "succeeded" : "failed",
+            completedAt: new Date().toISOString(),
+            ...(accepted ? {} : { error: "Planning run completed without submit_issue_breakdown_plan" }),
+            tokens: entry.activeRunTokens,
+            metadata: terminalRunMetadata(entry, accepted ? "succeeded" : "failed"),
+          });
+          if (!terminal.updated) return;
+          continue;
+        }
         const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
           status: "succeeded",
           completedAt: new Date().toISOString(),
@@ -1201,10 +1255,6 @@ export class Orchestrator {
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
         if (!terminal.updated) return;
-        if (entry.runPhase === "issue_breakdown") {
-          await this.persistIssueBreakdownPlan(entry, context.workspace, event.message ?? "Planning completed without a final summary.");
-          continue;
-        }
         await this.discoverPullRequestForEntry(entry, context.workspace);
         if (entry.role === "worker" && !(await this.reconcileCompletionReportHandoff(entry)) && !entry.pullRequestHandoffAccepted) {
           await this.recordIncompleteTurn(entry);
@@ -1693,6 +1743,18 @@ export class Orchestrator {
     return true;
   }
 
+  private async reconcileIssueBreakdownPlanHandoff(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return entry.issueBreakdownPlanAccepted;
+    const lifecycle = await store.get(entry.issue.id);
+    const plan = lifecycle?.issueBreakdownPlans.find((item) => item.runId === runId) ?? null;
+    if (!lifecycle || !plan) return entry.issueBreakdownPlanAccepted;
+    entry.lifecycle = lifecycle;
+    entry.issueBreakdownPlanAccepted = true;
+    return true;
+  }
+
   private async reconcileReviewVerdictHandoff(entry: RunningEntry): Promise<boolean> {
     const store = this.options.lifecycleStore;
     const runId = entry.activeRunId ?? entry.runId;
@@ -1878,7 +1940,22 @@ export class Orchestrator {
   }
 
   private async renderIssueBreakdownPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
-    return this.promptRenderer.render(this.config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
+    const basePrompt = await this.promptRenderer.render(this.config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
+    return [basePrompt, this.cursorIssueBreakdownMcpPrompt(entry)].join("\n");
+  }
+
+  private cursorIssueBreakdownMcpPrompt(entry: RunningEntry): string {
+    return [
+      "",
+      "Symphony MCP issue-breakdown handoff:",
+      `- Active issue: ${entry.issue.identifier} (${entry.issue.id})`,
+      "- Active role: worker",
+      "- Active phase: issue_breakdown",
+      "- Before ending the run, call the submit_issue_breakdown_plan MCP tool with summary, proposedIssues, and idempotencyKey.",
+      "- Each proposed issue must include title, description, acceptanceCriteria, dependencies, and labels.",
+      "- Do not call submit_completion_report, comment on Linear, transition Linear state, or create child issues.",
+      "- Symphony persists the plan locally and injects it into the later implementation prompt after validation.",
+    ].join("\n");
   }
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
@@ -2001,12 +2078,12 @@ export class Orchestrator {
     return [
       "",
       "Issue breakdown plan:",
-      `- Source: ${plan.id}; created at ${plan.createdAt}`,
+      `- Source: ${plan.id}; accepted at ${plan.acceptedAt}`,
       `- Cursor mode: ${plan.cursorMode ?? this.config.issueBreakdown.cursorMode}`,
       `- Transcript pointers: ${formatList(plan.transcriptPointers)}`,
       `- Status pointers: ${formatList(plan.statusApiPointers)}`,
       "",
-      plan.summary,
+      renderIssueBreakdownPlanSummary(plan),
     ].join("\n");
   }
 
@@ -2326,31 +2403,17 @@ function latestFreshIssueBreakdownPlan(
   lifecycle: IssueLifecycleRecord | null | undefined,
   issue: Issue,
   config: ServiceConfig,
-): IssueLifecycleSummaryReference | null {
+): IssueBreakdownPlanRecord | null {
   const fingerprint = issueBreakdownConfigFingerprint(config);
-  const summaries =
-    lifecycle?.summaryReferences.filter(
-      (summary) =>
-        summary.kind === "issue_breakdown_plan" &&
-        summary.configFingerprint === fingerprint &&
-        (issue.updatedAt === null || summary.issueUpdatedAt === issue.updatedAt),
+  const plans =
+    lifecycle?.issueBreakdownPlans.filter(
+      (plan) =>
+        plan.configFingerprint === fingerprint &&
+        (issue.updatedAt === null || plan.issueUpdatedAt === issue.updatedAt),
     ) ?? [];
   return (
-    [...summaries].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))[
-      summaries.length - 1
-    ] ?? null
+    [...plans].sort((left, right) => Date.parse(left.acceptedAt) - Date.parse(right.acceptedAt))[plans.length - 1] ?? null
   );
-}
-
-function issueBreakdownConfigFingerprint(config: ServiceConfig): string {
-  return createHash("sha256")
-    .update(
-      JSON.stringify({
-        promptTemplate: config.issueBreakdown.promptTemplate,
-        cursorMode: config.issueBreakdown.cursorMode,
-      }),
-    )
-    .digest("hex");
 }
 
 function effectiveCursorModeForEntry(entry: RunningEntry, config: ServiceConfig): "agent" | "plan" | null {

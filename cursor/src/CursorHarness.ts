@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
+import { writeIssueBreakdownPlanMcpContext } from "../../src/core/harness/IssueBreakdownPlanMcpServer.js";
 import { writeReviewFeedbackMcpContext } from "../../src/core/harness/ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
 import { writeTranscriptRecallMcpContext } from "../../src/core/harness/TranscriptRecallMcpServer.js";
@@ -95,6 +96,16 @@ export class CursorHarness implements AgentHarness {
           workspacePath: ctx.workspace.path,
           workspace: ctx.workspace,
           phase: "implementation",
+        });
+      }
+      if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
+        await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
+          issue: ctx.issue,
+          activeRunId: run.id,
+          role: "worker",
+          workspacePath: ctx.workspace.path,
+          workspace: ctx.workspace,
+          phase: "issue_breakdown",
         });
       }
       if (ctx.config.continuationContext.searchEnabled) {
@@ -382,8 +393,9 @@ export function cursorRoleMcpServers(
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
-  if (ctx.role === "worker") {
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
     return {
+      symphony_planning: applyCwd(issueBreakdownPlanMcpServerConfig(ctx, issueBreakdownPlanContextFilePath(ctx), options)),
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
@@ -417,6 +429,18 @@ export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise
     });
     return;
   }
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
+    await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: "worker",
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "issue_breakdown",
+    });
+    return;
+  }
+  if (ctx.role !== "reviewer") return;
   await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
     issue: ctx.issue,
     activeRunId: null,
@@ -473,6 +497,20 @@ export function completionReportMcpServerConfig(
   });
 }
 
+export function issueBreakdownPlanMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "issue-breakdown-plan-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
+}
+
 export function reviewVerdictMcpServerConfig(
   ctx: AgentRunContext,
   contextFile: string,
@@ -519,6 +557,14 @@ export function completionReportContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
     "completion-report-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
+export function issueBreakdownPlanContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "issue-breakdown-plan-mcp",
     `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
   );
 }

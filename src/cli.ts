@@ -14,6 +14,7 @@ import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
+import { runIssueBreakdownPlanMcpServer } from "./core/harness/IssueBreakdownPlanMcpServer.js";
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
 import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcpServer.js";
@@ -58,6 +59,18 @@ program
   .requiredOption("--context-file <path>", "path to the active worker context file")
   .action(async (options: { workflow: string; contextFile: string }) => {
     await runCompletionReportMcpServer({
+      workflowPath: path.resolve(process.cwd(), options.workflow),
+      contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
+  });
+
+program
+  .command("issue-breakdown-plan-mcp")
+  .description("Run the internal Symphony issue-breakdown-plan MCP server")
+  .requiredOption("--workflow <path>", "path to WORKFLOW.md")
+  .requiredOption("--context-file <path>", "path to the active planning worker context file")
+  .action(async (options: { workflow: string; contextFile: string }) => {
+    await runIssueBreakdownPlanMcpServer({
       workflowPath: path.resolve(process.cwd(), options.workflow),
       contextFile: path.resolve(process.cwd(), options.contextFile),
     });
