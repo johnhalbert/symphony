@@ -387,9 +387,6 @@ describe("MCP subprocess environment", () => {
         operator_approval: {
           required_for_publication: true,
         },
-        pr_handoff: {
-          enabled: false,
-        },
       },
       credential_profiles: {
         profiles: {
