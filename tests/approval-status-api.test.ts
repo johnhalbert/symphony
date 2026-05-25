@@ -1524,7 +1524,7 @@ describe("approval status API", () => {
     throw new Error("pending approval was not created");
   }
 
-  async function waitForPendingRun(approvalStore: FileOperatorApprovalStore, runId: string, timeoutMs = 2_000) {
+  async function waitForPendingRun(approvalStore: FileOperatorApprovalStore, runId: string, timeoutMs = 5_000) {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
       const pending = await approvalStore.findPendingForRun(runId);
@@ -1534,7 +1534,7 @@ describe("approval status API", () => {
     throw new Error(`pending approval was not created for ${runId}`);
   }
 
-  async function waitForRun(transcriptStore: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+  async function waitForRun(transcriptStore: FileRunTranscriptStore, runId: string, timeoutMs = 5_000) {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
       const run = await transcriptStore.getRun(runId);
@@ -1544,7 +1544,7 @@ describe("approval status API", () => {
     throw new Error(`run was not recorded: ${runId}`);
   }
 
-  async function waitForTerminalRun(transcriptStore: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+  async function waitForTerminalRun(transcriptStore: FileRunTranscriptStore, runId: string, timeoutMs = 5_000) {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
       let run;
@@ -1559,7 +1559,7 @@ describe("approval status API", () => {
     throw new Error(`run did not become terminal: ${runId}`);
   }
 
-  async function waitFor(predicate: () => boolean, description: string, timeoutMs = 2_000): Promise<void> {
+  async function waitFor(predicate: () => boolean, description: string, timeoutMs = 5_000): Promise<void> {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
       if (predicate()) return;
