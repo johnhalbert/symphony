@@ -70,6 +70,11 @@ Work on {{ issue.identifier }}.`,
       searchEnabled: false,
       summarizationEnabled: false,
     });
+    expect(config.issueBreakdown).toEqual({
+      enabled: false,
+      cursorMode: "plan",
+      promptTemplate: expect.stringContaining("Break down {{ issue.identifier }}"),
+    });
     expect(config.mergePolicy).toEqual({
       mode: "disabled",
       sourceStates: [],
@@ -352,6 +357,11 @@ Work on {{ issue.identifier }}.`,
           search_enabled: true,
           summarization_enabled: true,
         },
+        issue_breakdown: {
+          enabled: true,
+          cursor_mode: "plan",
+          prompt: "Plan {{ issue.identifier }}",
+        },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
@@ -381,6 +391,11 @@ Work on {{ issue.identifier }}.`,
     expect(config.continuationContext).toEqual({
       searchEnabled: true,
       summarizationEnabled: true,
+    });
+    expect(config.issueBreakdown).toEqual({
+      enabled: true,
+      cursorMode: "plan",
+      promptTemplate: "Plan {{ issue.identifier }}",
     });
     expect(config.mergePolicy).toEqual({
       mode: "gated",

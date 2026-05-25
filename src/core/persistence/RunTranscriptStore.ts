@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { AgentRunRole, TokenCounts } from "../types.js";
+import type { AgentRunPhase, AgentRunRole, TokenCounts } from "../types.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type PersistedRunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
@@ -64,6 +64,7 @@ export interface RunRecord {
   sessionId: string | null;
   agentId: string | null;
   role: AgentRunRole;
+  runPhase?: AgentRunPhase;
   issueId: string;
   issueIdentifier: string;
   attempt: number | null;
@@ -133,6 +134,7 @@ export interface StartRunInput {
   sessionId?: string | null;
   agentId?: string | null;
   role: AgentRunRole;
+  runPhase?: AgentRunPhase;
   issueId: string;
   issueIdentifier: string;
   attempt: number | null;
@@ -174,6 +176,8 @@ export interface CiStatusTranscriptInput extends RunMetadata {
 }
 
 export class FileRunTranscriptStore {
+  private readonly runWriteQueues = new Map<string, Promise<void>>();
+
   constructor(private readonly stateDir: string) {}
 
   async upsertWorkspace(record: WorkspaceRecord): Promise<void> {
@@ -226,6 +230,7 @@ export class FileRunTranscriptStore {
       sessionId: input.sessionId ?? existing?.sessionId ?? null,
       agentId: input.agentId ?? existing?.agentId ?? null,
       role: input.role,
+      runPhase: input.runPhase ?? existing?.runPhase ?? defaultRunPhase(input.role),
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
       attempt: input.attempt,
@@ -255,21 +260,23 @@ export class FileRunTranscriptStore {
   }
 
   async updateRun(runId: string, input: UpdateRunInput): Promise<RunRecord | null> {
-    const existing = await this.getRun(runId);
-    if (!existing) return null;
-    const updated: RunRecord = {
-      ...existing,
-      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
-      ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
-      ...(input.status === undefined ? {} : { status: input.status }),
-      ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
-      ...(input.error === undefined ? {} : { error: input.error }),
-      ...(input.tokens === undefined ? {} : { tokens: input.tokens }),
-      ...metadataPatch(input.metadata),
-      updatedAt: new Date().toISOString(),
-    };
-    await this.writeRun(updated);
-    return updated;
+    return this.withRunWriteLock(runId, async () => {
+      const existing = await this.getRun(runId);
+      if (!existing) return null;
+      const updated: RunRecord = {
+        ...existing,
+        ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+        ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+        ...(input.status === undefined ? {} : { status: input.status }),
+        ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
+        ...(input.error === undefined ? {} : { error: input.error }),
+        ...(input.tokens === undefined ? {} : { tokens: input.tokens }),
+        ...metadataPatch(input.metadata),
+        updatedAt: new Date().toISOString(),
+      };
+      await this.writeRun(updated);
+      return updated;
+    });
   }
 
   async recordPullRequestEvent(input: PullRequestTranscriptInput): Promise<TranscriptEvent | null> {
@@ -311,7 +318,8 @@ export class FileRunTranscriptStore {
   }
 
   async getRun(runId: string): Promise<RunRecord | null> {
-    return readJsonIfExists<RunRecord>(this.metaPath(runId));
+    const record = await readJsonIfExists<RunRecord>(this.metaPath(runId));
+    return record === null ? null : normalizeRunRecord(record);
   }
 
   async listRunsForIssue(issueIdOrIdentifier: string): Promise<RunRecord[]> {
@@ -321,9 +329,16 @@ export class FileRunTranscriptStore {
       .sort(compareRunChronology);
   }
 
-  async latestRunForIssue(issueIdOrIdentifier: string, options: { role?: AgentRunRole } = {}): Promise<RunRecord | null> {
+  async latestRunForIssue(
+    issueIdOrIdentifier: string,
+    options: { role?: AgentRunRole; runPhase?: AgentRunPhase } = {},
+  ): Promise<RunRecord | null> {
     const records = await this.listRunsForIssue(issueIdOrIdentifier);
-    const filtered = options.role === undefined ? records : records.filter((record) => record.role === options.role);
+    const filtered = records.filter(
+      (record) =>
+        (options.role === undefined || record.role === options.role) &&
+        (options.runPhase === undefined || record.runPhase === options.runPhase),
+    );
     return filtered[filtered.length - 1] ?? null;
   }
 
@@ -342,12 +357,29 @@ export class FileRunTranscriptStore {
     await fs.mkdir(this.runsDir(), { recursive: true });
     const entries = await fs.readdir(this.runsDir());
     const records = await Promise.all(entries.map((entry) => readJsonIfExists<RunRecord>(this.metaPath(entry))));
-    return records.filter((record): record is RunRecord => record !== null);
+    return records.filter((record): record is RunRecord => record !== null).map(normalizeRunRecord);
   }
 
   private async writeRun(record: RunRecord): Promise<void> {
     await fs.mkdir(this.runDir(record.runId), { recursive: true });
     await writeJson(this.metaPath(record.runId), record);
+  }
+
+  private async withRunWriteLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.runWriteQueues.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => undefined).then(() => next);
+    this.runWriteQueues.set(runId, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.runWriteQueues.get(runId) === tail) this.runWriteQueues.delete(runId);
+    }
   }
 
   private async nextSequence(runId: string): Promise<number> {
@@ -421,6 +453,17 @@ function promptPreview(prompt: string): string {
   return oneLine.length <= 240 ? oneLine : `${oneLine.slice(0, 225)}...[truncated]`;
 }
 
+function normalizeRunRecord(record: RunRecord): RunRecord {
+  return {
+    ...record,
+    runPhase: record.runPhase ?? defaultRunPhase(record.role),
+  };
+}
+
+function defaultRunPhase(role: AgentRunRole): AgentRunPhase {
+  return role === "reviewer" ? "review" : "implementation";
+}
+
 function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
   if (!metadata) return {};
   return {
@@ -468,7 +511,20 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   await fs.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await fs.rename(tempPath, filePath);
+  await renameWithWindowsRetry(tempPath, filePath);
+}
+
+async function renameWithWindowsRetry(source: string, destination: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fs.rename(source, destination);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if ((code !== "EPERM" && code !== "EACCES") || attempt >= 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10 * 2 ** attempt));
+    }
+  }
 }
 
 async function readJsonIfExists<T>(filePath: string): Promise<T | null> {

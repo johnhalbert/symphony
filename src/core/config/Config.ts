@@ -81,6 +81,14 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    issue_breakdown: z
+      .object({
+        enabled: z.boolean().optional(),
+        cursor_mode: z.enum(["agent", "plan"]).optional(),
+        prompt: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
     polling: z
       .object({
         interval_ms: z.number().int().positive().optional(),
@@ -343,6 +351,12 @@ export interface ContinuationContextConfig {
   summarizationEnabled: boolean;
 }
 
+export interface IssueBreakdownConfig {
+  enabled: boolean;
+  cursorMode: CursorConversationMode;
+  promptTemplate: string;
+}
+
 export interface IssueBoardConfig {
   columns: IssueBoardColumnMapping;
 }
@@ -366,6 +380,7 @@ export interface ServiceConfig {
   mergePolicy: MergePolicyConfig;
   issueBoard: IssueBoardConfig;
   continuationContext: ContinuationContextConfig;
+  issueBreakdown: IssueBreakdownConfig;
   raw: RawWorkflowConfig;
 }
 
@@ -385,6 +400,13 @@ const DEFAULT_CURSOR_MODEL_PARAMS: CursorModelParameter[] = [
   { id: "context", value: "272k" },
   { id: "reasoning", value: "extra-high" },
 ];
+const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
+  "Break down {{ issue.identifier }} before implementation.",
+  "",
+  "Inspect the issue and repository context only. Do not edit files, create commits, push branches, comment on Linear, transition Linear state, or submit a completion report.",
+  "",
+  "Return a concise implementation plan with scope, assumptions, likely files, risks, and validation steps.",
+].join("\n");
 
 export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
@@ -606,6 +628,11 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     continuationContext: {
       searchEnabled: raw.continuation_context?.search_enabled ?? false,
       summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
+    },
+    issueBreakdown: {
+      enabled: raw.issue_breakdown?.enabled ?? false,
+      cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
+      promptTemplate: raw.issue_breakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
     },
     raw,
   };

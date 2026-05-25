@@ -184,6 +184,21 @@ describe("Cursor event mapping", () => {
     expect(events).toContainEqual({ type: "completed" });
   });
 
+  it("uses plan mode without completion MCP for issue breakdown runs", () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const ctx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      runPhase: "issue_breakdown",
+      cursorModeOverride: "plan",
+    };
+
+    const mcpServers = cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" });
+    const createOptions = cursorAgentCreateOptions(ctx, "cursor-test-key", { mcpServers });
+
+    expect(Object.keys(mcpServers)).toEqual([]);
+    expect(createOptions).toMatchObject({ mode: "plan" });
+  });
+
   it("mounts read-only transcript recall as a separate MCP server when search is enabled", () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     config.continuationContext.searchEnabled = true;

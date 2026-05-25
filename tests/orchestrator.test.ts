@@ -103,6 +103,66 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.running).toBe(0);
   });
 
+  it("runs issue breakdown planning before implementation and injects the plan", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    const candidate = issue({ state: "Todo", updatedAt: "2026-01-02T00:00:00Z" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    expect(writer.transitions).toEqual([]);
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2);
+    await orchestrator.stop();
+
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[0]?.prompt).toBe("Plan TEST-1");
+    expect(harness.runs[1]?.ctx.runPhase).toBe("implementation");
+    expect(harness.runs[1]?.prompt).toContain("Work on TEST-1");
+    expect(harness.runs[1]?.prompt).toContain("Issue breakdown plan:");
+    expect(harness.runs[1]?.prompt).toContain("fake completed");
+    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "implementation" })).resolves.toMatchObject({
+      runPhase: "implementation",
+    });
+  });
+
   it("adds scoped Symphony MCP completion instructions to Cursor worker prompts", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });

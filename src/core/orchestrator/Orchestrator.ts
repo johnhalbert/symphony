@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
@@ -6,6 +7,7 @@ import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import {
   toIssueStatusView,
+  type AgentRunPhase,
   type AgentRunRole,
   type Issue,
   type IssueStatusView,
@@ -108,6 +110,7 @@ export interface ContinuationSummaryCreationResult {
 export interface RunningEntry {
   issue: Issue;
   role: AgentRunRole;
+  runPhase: AgentRunPhase;
   workspacePath: string | null;
   workspace: Workspace | null;
   sessionId: string | null;
@@ -867,16 +870,15 @@ export class Orchestrator {
     if (!this.shouldDispatchWorker(latest, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(latest, "worker"))) return false;
 
-    const dispatchWriteback = planDispatchWriteback(latest, this.config);
+    const runPhase = await this.workerRunPhaseForIssue(latest);
+    const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, this.config) : null;
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
-    const afterWriteback = dispatchWriteback
-      ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0]
-      : latest;
+    const afterWriteback = dispatchWriteback ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] : latest;
     if (!afterWriteback) return false;
     if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker"))) return false;
 
-    this.dispatchIssue(afterWriteback, attempt, "worker", null);
+    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase);
     return true;
   }
 
@@ -910,17 +912,26 @@ export class Orchestrator {
     return true;
   }
 
+  private async workerRunPhaseForIssue(issue: Issue): Promise<AgentRunPhase> {
+    if (!this.config.issueBreakdown.enabled) return "implementation";
+    if (!this.options.lifecycleStore) return "implementation";
+    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    return latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) === null ? "issue_breakdown" : "implementation";
+  }
+
   private dispatchIssue(
     issue: Issue,
     attempt: number | null,
     role: AgentRunRole,
     reviewEvidence: ReviewerDispatchEvidence | null,
+    runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
   ): void {
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
     const entry: RunningEntry = {
       issue,
       role,
+      runPhase,
       workspacePath: null,
       workspace: null,
       sessionId: null,
@@ -1005,6 +1016,19 @@ export class Orchestrator {
       await this.options.workspaceManager.beforeRun(workspace.path);
       await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, 1));
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, 1));
+
+      if (entry.runPhase === "issue_breakdown") {
+        entry.turnCount = 1;
+        const prompt = await this.renderIssueBreakdownPrompt(entry, attempt);
+        const context = this.buildRunContext(entry, workspace, attempt, 1);
+        await this.consumeHarnessEvents(entry, this.options.harness.run(context, prompt), {
+          workspace,
+          prompt,
+          attempt,
+          turnNumber: 1,
+        });
+        return;
+      }
 
       for (let turnNumber = 1; turnNumber <= this.config.agent.maxTurns; turnNumber += 1) {
         if (entry.abortController.signal.aborted) throw new SymphonyError("agent_error", "Run was cancelled");
@@ -1128,6 +1152,7 @@ export class Orchestrator {
           sessionId: event.sessionId,
           agentId: event.threadId ?? null,
           role: entry.role,
+          runPhase: entry.runPhase,
           issueId: entry.issue.id,
           issueIdentifier: entry.issue.identifier,
           attempt: context.attempt,
@@ -1136,7 +1161,7 @@ export class Orchestrator {
           cursorModel: this.config.cursor.model,
           cursorModelParams: this.config.cursor.modelParams,
           cursorSettingSources: this.config.cursor.settingSources,
-          cursorMode: this.config.cursor.mode,
+          cursorMode: effectiveCursorModeForEntry(entry, this.config),
           cursorAllowLargeContext: this.config.cursor.allowLargeContext,
           cursorWorkerAgentLifecycle: this.config.cursor.workerAgentLifecycle,
           workspaceKey: context.workspace.workspaceKey,
@@ -1145,8 +1170,10 @@ export class Orchestrator {
           ...(context.workspace.repoPath === undefined ? {} : { repoPath: context.workspace.repoPath }),
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
         });
-        await this.discoverPullRequestForEntry(entry, context.workspace);
-        if (entry.role === "worker") {
+        if (entry.runPhase !== "issue_breakdown") {
+          await this.discoverPullRequestForEntry(entry, context.workspace);
+        }
+        if (entry.role === "worker" && entry.runPhase === "implementation") {
           await this.applyWriteback(
             planRunStartedComment(
               {
@@ -1174,6 +1201,10 @@ export class Orchestrator {
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
         if (!terminal.updated) return;
+        if (entry.runPhase === "issue_breakdown") {
+          await this.persistIssueBreakdownPlan(entry, context.workspace, event.message ?? "Planning completed without a final summary.");
+          continue;
+        }
         await this.discoverPullRequestForEntry(entry, context.workspace);
         if (entry.role === "worker" && !(await this.reconcileCompletionReportHandoff(entry)) && !entry.pullRequestHandoffAccepted) {
           await this.recordIncompleteTurn(entry);
@@ -1183,7 +1214,7 @@ export class Orchestrator {
         }
       }
       if (event.type === "failed") {
-        if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
+        if (entry.role === "worker" && entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
@@ -1204,7 +1235,7 @@ export class Orchestrator {
         throw new SymphonyError("agent_error", event.error);
       }
       if (event.type === "cancelled") {
-        if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
+        if (entry.role === "worker" && entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
@@ -1239,6 +1270,11 @@ export class Orchestrator {
     if (!entry) return;
     this.running.delete(issueId);
     this.endedRuntimeSeconds += (Date.now() - entry.startedAt.getTime()) / 1000;
+
+    if (entry.runPhase === "issue_breakdown") {
+      this.claimed.delete(issueId);
+      return;
+    }
 
     if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
       if (entry.runId) {
@@ -1478,10 +1514,12 @@ export class Orchestrator {
     return {
       issue: entry.issue,
       role: entry.role,
+      runPhase: entry.runPhase,
       attempt,
       workspace,
       config: this.config,
       turnNumber,
+      ...(entry.runPhase === "issue_breakdown" ? { cursorModeOverride: this.config.issueBreakdown.cursorMode } : {}),
       abortSignal: entry.abortController.signal,
       logger: this.options.logger,
     };
@@ -1830,12 +1868,17 @@ export class Orchestrator {
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
     const basePrompt = await this.promptRenderer.render(this.promptTemplate, { issue: entry.issue, attempt });
+    const issueBreakdownPlan = await this.loadIssueBreakdownPlanPrompt(entry);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
-    return [basePrompt, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
+    return [basePrompt, issueBreakdownPlan, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
+  }
+
+  private async renderIssueBreakdownPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
+    return this.promptRenderer.render(this.config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
   }
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
@@ -1928,6 +1971,7 @@ export class Orchestrator {
 
   private cursorWorkerMcpPrompt(entry: RunningEntry): string | null {
     if (this.options.harness.id !== "cursor") return null;
+    if (entry.runPhase !== "implementation") return null;
     const workspace = entry.workspace;
     return [
       "",
@@ -1947,6 +1991,66 @@ export class Orchestrator {
   private async loadWorkerReviewVerdictPrompt(entry: RunningEntry): Promise<string | null> {
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
     return lifecycle === undefined || lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
+  }
+
+  private async loadIssueBreakdownPlanPrompt(entry: RunningEntry): Promise<string | null> {
+    if (!this.config.issueBreakdown.enabled) return null;
+    const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+    const plan = latestFreshIssueBreakdownPlan(lifecycle, entry.issue, this.config);
+    if (plan === null) return null;
+    return [
+      "",
+      "Issue breakdown plan:",
+      `- Source: ${plan.id}; created at ${plan.createdAt}`,
+      `- Cursor mode: ${plan.cursorMode ?? this.config.issueBreakdown.cursorMode}`,
+      `- Transcript pointers: ${formatList(plan.transcriptPointers)}`,
+      `- Status pointers: ${formatList(plan.statusApiPointers)}`,
+      "",
+      plan.summary,
+    ].join("\n");
+  }
+
+  private async persistIssueBreakdownPlan(entry: RunningEntry, workspace: Workspace, summary: string): Promise<void> {
+    if (!this.options.lifecycleStore || !entry.runId) return;
+    const lifecycle = (await this.options.lifecycleStore.get(entry.issue.id)) ?? entry.lifecycle;
+    const run = entry.runId;
+    const reference: IssueLifecycleSummaryReference = {
+      id: `issue-breakdown-${run}`,
+      kind: "issue_breakdown_plan",
+      summary: summary.trim().length === 0 ? "Planning completed without a final summary." : summary.trim(),
+      runIds: [run],
+      transcriptEventCount: 1,
+      transcriptPointers: [`/api/v1/runs/${encodeURIComponent(run)}/transcript`],
+      statusApiPointers: statusApiPointersForIssue(entry.issue.identifier, [
+        {
+          runId: run,
+          issueId: entry.issue.id,
+          issueIdentifier: entry.issue.identifier,
+          role: "worker",
+          runPhase: "issue_breakdown",
+          sessionId: entry.sessionId,
+          agentId: null,
+          attempt: null,
+          turnNumber: entry.turnCount,
+          prompt: "",
+          workspaceKey: workspace.workspaceKey,
+          workspacePath: workspace.path,
+          status: "succeeded",
+          startedAt: entry.startedAt.toISOString(),
+          updatedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+          error: null,
+          tokens: entry.tokens,
+        },
+      ]),
+      issueUpdatedAt: entry.issue.updatedAt,
+      configFingerprint: issueBreakdownConfigFingerprint(this.config),
+      cursorMode: this.config.issueBreakdown.cursorMode,
+      createdAt: new Date().toISOString(),
+    };
+    entry.lifecycle = await this.options.lifecycleStore.updateIssue(entry.issue, {
+      summaryReferences: upsertSummaryReference(lifecycle?.summaryReferences ?? [], reference),
+    });
   }
 
   private async loadWorkerHandoffPrompt(entry: RunningEntry): Promise<string | null> {
@@ -2216,6 +2320,41 @@ function latestContinuationSummaryReference(
       summaries.length - 1
     ] ?? null
   );
+}
+
+function latestFreshIssueBreakdownPlan(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  issue: Issue,
+  config: ServiceConfig,
+): IssueLifecycleSummaryReference | null {
+  const fingerprint = issueBreakdownConfigFingerprint(config);
+  const summaries =
+    lifecycle?.summaryReferences.filter(
+      (summary) =>
+        summary.kind === "issue_breakdown_plan" &&
+        summary.configFingerprint === fingerprint &&
+        (issue.updatedAt === null || summary.issueUpdatedAt === issue.updatedAt),
+    ) ?? [];
+  return (
+    [...summaries].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))[
+      summaries.length - 1
+    ] ?? null
+  );
+}
+
+function issueBreakdownConfigFingerprint(config: ServiceConfig): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        promptTemplate: config.issueBreakdown.promptTemplate,
+        cursorMode: config.issueBreakdown.cursorMode,
+      }),
+    )
+    .digest("hex");
+}
+
+function effectiveCursorModeForEntry(entry: RunningEntry, config: ServiceConfig): "agent" | "plan" | null {
+  return entry.runPhase === "issue_breakdown" ? config.issueBreakdown.cursorMode : config.cursor.mode;
 }
 
 function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[]): boolean {

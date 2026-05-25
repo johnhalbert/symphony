@@ -372,6 +372,9 @@ describe("MCP subprocess environment", () => {
         api_base_url: "$GITHUB_API_BASE_URL",
         token: "$CUSTOM_GITHUB_TOKEN",
         publish_pull_requests: true,
+        pr_handoff: {
+          enabled: false,
+        },
         operator_approval: {
           required_for_publication: true,
         },

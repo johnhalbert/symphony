@@ -84,7 +84,7 @@ export class CursorHarness implements AgentHarness {
     if (ctx.abortSignal.aborted) abort();
 
     try {
-      if (ctx.role === "worker") {
+      if (ctx.role === "worker" && cursorRunPhase(ctx) === "implementation") {
         await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
           issue: ctx.issue,
           activeRunId: run.id,
@@ -102,7 +102,7 @@ export class CursorHarness implements AgentHarness {
           issue: ctx.issue,
           activeRunId: run.id,
           role: ctx.role,
-          phase: ctx.role === "reviewer" ? "review" : "implementation",
+          phase: cursorRunPhase(ctx),
         });
       }
       if (ctx.role === "reviewer") {
@@ -237,8 +237,8 @@ export class CursorHarness implements AgentHarness {
       mcpServers,
     });
     const latestRun =
-      options.allowResume && ctx.role === "worker"
-        ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker" })
+      options.allowResume && ctx.role === "worker" && cursorRunPhase(ctx) === "implementation"
+        ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker", runPhase: "implementation" })
         : null;
     let agent: SDKAgent;
     if (latestRun?.agentId) {
@@ -280,7 +280,7 @@ export class CursorHarness implements AgentHarness {
 }
 
 function shouldReuseAgent(ctx: AgentRunContext): boolean {
-  return ctx.role === "worker" && ctx.config.cursor.workerAgentLifecycle === "resume_by_issue";
+  return ctx.role === "worker" && cursorRunPhase(ctx) === "implementation" && ctx.config.cursor.workerAgentLifecycle === "resume_by_issue";
 }
 
 function flush(events: AgentEvent[]): AgentEvent[] {
@@ -366,7 +366,8 @@ export function cursorAgentSendOptions(
 }
 
 function cursorConversationModeOption(ctx: AgentRunContext): { mode?: "agent" | "plan" } {
-  return ctx.config.cursor.mode === null ? {} : { mode: ctx.config.cursor.mode };
+  const mode = ctx.cursorModeOverride ?? ctx.config.cursor.mode;
+  return mode === null ? {} : { mode };
 }
 
 export function cursorRoleMcpServers(
@@ -375,9 +376,14 @@ export function cursorRoleMcpServers(
 ): Record<string, McpSubprocessServerConfig> {
   const applyCwd = (server: McpSubprocessServerConfig): McpSubprocessServerConfig =>
     options.mcpCwd === undefined ? server : { ...server, cwd: options.mcpCwd };
-  if (ctx.role === "worker") {
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "implementation") {
     return {
       symphony: applyCwd(completionReportMcpServerConfig(ctx, completionReportContextFilePath(ctx), options)),
+      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
+    };
+  }
+  if (ctx.role === "worker") {
+    return {
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
@@ -394,10 +400,10 @@ export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise
       issue: ctx.issue,
       activeRunId: null,
       role: ctx.role,
-      phase: ctx.role === "reviewer" ? "review" : "implementation",
+      phase: cursorRunPhase(ctx),
     });
   }
-  if (ctx.role === "worker") {
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "implementation") {
     await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
       issue: ctx.issue,
       activeRunId: null,
@@ -542,7 +548,11 @@ export function transcriptRecallContextFilePath(ctx: AgentRunContext): string {
 }
 
 function agentKey(ctx: AgentRunContext): string {
-  return ctx.role === "reviewer" ? `${ctx.workspace.path}:reviewer` : `${ctx.workspace.path}:worker`;
+  return ctx.role === "reviewer" ? `${ctx.workspace.path}:reviewer` : `${ctx.workspace.path}:worker:${cursorRunPhase(ctx)}`;
+}
+
+function cursorRunPhase(ctx: AgentRunContext): "issue_breakdown" | "implementation" | "review" {
+  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
 }
 
 function safeFileName(value: string): string {

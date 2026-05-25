@@ -144,6 +144,7 @@ export interface Workspace {
 }
 
 export type AgentRunRole = "worker" | "reviewer";
+export type AgentRunPhase = "issue_breakdown" | "implementation" | "review";
 
 export type RunAttempt = number | null;
 

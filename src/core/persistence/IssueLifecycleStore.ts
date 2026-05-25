@@ -23,7 +23,7 @@ export interface IssueLifecycleSummaryPointers {
   lastEvidenceCursor: string | null;
 }
 
-export type IssueLifecycleSummaryReferenceKind = "continuation_history";
+export type IssueLifecycleSummaryReferenceKind = "continuation_history" | "issue_breakdown_plan";
 
 export interface IssueLifecycleSummaryReference {
   id: string;
@@ -33,6 +33,9 @@ export interface IssueLifecycleSummaryReference {
   transcriptEventCount: number;
   transcriptPointers: string[];
   statusApiPointers: string[];
+  issueUpdatedAt?: string | null;
+  configFingerprint?: string | null;
+  cursorMode?: string | null;
   createdAt: string;
 }
 
@@ -591,10 +594,10 @@ function normalizeSummaryReferences(value: unknown, filePath: string): IssueLife
 
 function normalizeSummaryReference(value: unknown, filePath: string, index: number): IssueLifecycleSummaryReference {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `summaryReferences[${index}] is invalid`);
-  if (value.kind !== "continuation_history") {
+  if (value.kind !== "continuation_history" && value.kind !== "issue_breakdown_plan") {
     throw corruptLifecycle(filePath, `summaryReferences[${index}].kind is invalid`);
   }
-  return {
+  const normalized: IssueLifecycleSummaryReference = {
     id: requiredString(value.id, filePath, `summaryReferences[${index}].id`),
     kind: value.kind,
     summary: requiredString(value.summary, filePath, `summaryReferences[${index}].summary`),
@@ -616,6 +619,16 @@ function normalizeSummaryReference(value: unknown, filePath: string, index: numb
     ),
     createdAt: requiredString(value.createdAt, filePath, `summaryReferences[${index}].createdAt`),
   };
+  if (value.issueUpdatedAt !== undefined) {
+    normalized.issueUpdatedAt = optionalNullableString(value.issueUpdatedAt, filePath, `summaryReferences[${index}].issueUpdatedAt`);
+  }
+  if (value.configFingerprint !== undefined) {
+    normalized.configFingerprint = optionalNullableString(value.configFingerprint, filePath, `summaryReferences[${index}].configFingerprint`);
+  }
+  if (value.cursorMode !== undefined) {
+    normalized.cursorMode = optionalNullableString(value.cursorMode, filePath, `summaryReferences[${index}].cursorMode`);
+  }
+  return normalized;
 }
 
 function normalizeCompletionReports(value: unknown, filePath: string): IssueCompletionReportRecord[] {
