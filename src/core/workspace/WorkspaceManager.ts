@@ -6,7 +6,7 @@ import type { HookConfig, WorkspaceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue, Workspace } from "../types.js";
 import type { Logger } from "../logging/StructuredLogger.js";
-import { createGitWorktree, removeGitWorktree } from "./GitWorktreeManager.js";
+import { createGitPlanningCheckout, createGitWorktree, removeGitWorktree } from "./GitWorktreeManager.js";
 import { FileRunTranscriptStore, type WorkspaceRecord } from "../persistence/RunTranscriptStore.js";
 
 export interface WorkspaceManagerOptions {
@@ -123,16 +123,43 @@ export class WorkspaceManager {
     await fs.mkdir(this.options.workspace.root, { recursive: true });
     await fs.mkdir(this.options.workspace.stateDir, { recursive: true });
     await assertWorkspaceParentInsideRoot(workspacePath, this.options.workspace.root);
+    const source = this.options.workspace.source;
     const createdNow = !(await pathExists(workspacePath));
-    await ensureDirectory(workspacePath);
-    await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+    const existing = await this.store.getWorkspace(workspaceKey);
+    let repoPath = existing?.repoPath;
+    let baseRef = existing?.baseRef;
+    let sourceKind: string = source.kind;
 
-    if (createdNow && this.options.workspace.source.kind !== "git_worktree") {
-      await this.bootstrapWorkspace(workspacePath);
+    if (source.kind === "git_worktree") {
+      if (!createdNow) {
+        await this.removePlanningWorkspace(workspaceKey, workspacePath, existing);
+      }
+      const result = await createGitPlanningCheckout({
+        source,
+        stateDir: this.options.workspace.stateDir,
+        workspacePath,
+        timeoutMs: this.options.hooks.timeoutMs,
+        logger: this.options.logger,
+      });
+      repoPath = result.repoPath;
+      baseRef = result.baseRef;
+      sourceKind = "planning_readonly";
       await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+      await applyPlanningReadOnly(workspacePath, this.options.logger);
+    } else {
+      await ensureDirectory(workspacePath);
+      await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+
+      if (createdNow) {
+        await this.bootstrapWorkspace(workspacePath);
+        await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+      }
+      if (source.kind !== "none") {
+        sourceKind = "planning_readonly";
+        await applyPlanningReadOnly(workspacePath, this.options.logger);
+      }
     }
 
-    const existing = await this.store.getWorkspace(workspaceKey);
     const metadata: WorkspaceMetadata = {
       workspaceKey,
       issueId: issue.id,
@@ -140,9 +167,9 @@ export class WorkspaceManager {
       path: workspacePath,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      sourceKind: this.options.workspace.source.kind,
-      ...(existing?.repoPath === undefined ? {} : { repoPath: existing.repoPath }),
-      ...(existing?.baseRef === undefined ? {} : { baseRef: existing.baseRef }),
+      sourceKind,
+      ...(repoPath === undefined ? {} : { repoPath }),
+      ...(baseRef === undefined ? {} : { baseRef }),
     };
     await this.writeMetadata(metadata);
 
@@ -156,6 +183,16 @@ export class WorkspaceManager {
       ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
       ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),
     };
+  }
+
+  async removeForPlanning(issueInput: WorkspaceIssueInput): Promise<void> {
+    const issue = normalizeIssueInput(issueInput);
+    const issueIdentifier = issue.identifier;
+    const workspaceKey = `${sanitizeWorkspaceKey(issueIdentifier)}-planning`;
+    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    assertPathInsideRoot(workspacePath, this.options.workspace.root);
+    const metadata = await this.store.getWorkspace(workspaceKey);
+    await this.removePlanningWorkspace(workspaceKey, workspacePath, metadata);
   }
 
   async beforeRun(workspacePath: string): Promise<void> {
@@ -209,6 +246,34 @@ export class WorkspaceManager {
       issue_identifier: issueIdentifier,
       workspace_path: workspacePath,
     });
+  }
+
+  private async removePlanningWorkspace(
+    workspaceKey: string,
+    workspacePath: string,
+    metadata: WorkspaceRecord | null,
+  ): Promise<void> {
+    if (!(await pathExists(workspacePath))) {
+      await this.store.deleteWorkspace(workspaceKey);
+      return;
+    }
+    await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+    await applyPlanningWritable(workspacePath, this.options.logger);
+    if (metadata?.sourceKind === "planning_readonly" && metadata.repoPath && this.options.workspace.source.kind === "git_worktree") {
+      await removeGitWorktree({
+        repoPath: metadata.repoPath,
+        workspacePath,
+        cleanup: "force",
+        timeoutMs: this.options.hooks.timeoutMs,
+        logger: this.options.logger,
+      });
+    } else if (this.options.workspace.source.kind === "git_worktree") {
+      await fs.rm(workspacePath, { recursive: true, force: true });
+    } else {
+      await applyPlanningReadOnly(workspacePath, this.options.logger);
+      return;
+    }
+    await this.store.deleteWorkspace(workspaceKey);
   }
 
   getPathForIssue(issueIdentifier: string): string {
@@ -374,6 +439,54 @@ async function pathExists(targetPath: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function applyPlanningReadOnly(workspacePath: string, logger: Logger): Promise<void> {
+  await applyModeRecursive(workspacePath, { directoryMode: 0o555, fileMode: 0o444 }, logger, "read_only");
+}
+
+async function applyPlanningWritable(workspacePath: string, logger: Logger): Promise<void> {
+  await applyModeRecursive(workspacePath, { directoryMode: 0o755, fileMode: 0o644 }, logger, "writable");
+}
+
+async function applyModeRecursive(
+  targetPath: string,
+  mode: { directoryMode: number; fileMode: number },
+  logger: Logger,
+  operation: "read_only" | "writable",
+): Promise<void> {
+  let stats;
+  try {
+    stats = await fs.lstat(targetPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+
+  if (stats.isDirectory()) {
+    const entries = await fs.readdir(targetPath);
+    await Promise.all(entries.map((entry) => applyModeRecursive(path.join(targetPath, entry), mode, logger, operation)));
+    await chmodBestEffort(targetPath, mode.directoryMode, logger, operation);
+    return;
+  }
+  await chmodBestEffort(targetPath, mode.fileMode, logger, operation);
+}
+
+async function chmodBestEffort(
+  targetPath: string,
+  mode: number,
+  logger: Logger,
+  operation: "read_only" | "writable",
+): Promise<void> {
+  try {
+    await fs.chmod(targetPath, mode);
+  } catch (error) {
+    logger.warn("planning workspace chmod failed", {
+      workspace_path: targetPath,
+      operation,
+      error: errorMessage(error),
+    });
   }
 }
 

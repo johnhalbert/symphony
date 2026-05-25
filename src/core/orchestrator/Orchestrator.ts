@@ -5,8 +5,10 @@ import type { AgentActivitySource, AgentEvent, AgentHarness } from "../harness/A
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import {
+  runKindForPhase,
   toIssueStatusView,
   type AgentRunPhase,
+  type AgentRunKind,
   type AgentRunRole,
   type Issue,
   type IssueStatusView,
@@ -157,6 +159,10 @@ interface ReviewerDispatchEvidence {
   runDigest: string[];
 }
 
+type WorkerDispatchDecision =
+  | { action: "dispatch"; runPhase: AgentRunPhase }
+  | { action: "skip"; reason: "planning_required_no_lifecycle_store" };
+
 export interface RetryEntry {
   issueId: string;
   identifier: string;
@@ -180,6 +186,8 @@ export interface RuntimeSnapshot {
     issueId: string;
     issueIdentifier: string;
     role: AgentRunRole;
+    runPhase: AgentRunPhase;
+    runKind: AgentRunKind;
     state: string;
     workspacePath: string | null;
     sessionId: string | null;
@@ -434,6 +442,9 @@ export class Orchestrator {
     if (!this.config.issueBreakdown.enabled) {
       throw new SymphonyError("invalid_request", "Issue breakdown planning is disabled");
     }
+    if (!this.options.lifecycleStore) {
+      throw new SymphonyError("invalid_request", "Issue breakdown planning requires a lifecycle store");
+    }
     if (this.availableSlots() <= 0) {
       throw new SymphonyError("conflict", "No agent slots are available for issue breakdown planning");
     }
@@ -444,7 +455,10 @@ export class Orchestrator {
     if (!this.shouldDispatchWorker(issue, false)) {
       throw new SymphonyError("conflict", "Issue is not currently eligible for worker dispatch");
     }
-    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    if (!(await this.lifecycleAllowsDispatch(issue, "worker", "issue_breakdown"))) {
+      throw new SymphonyError("conflict", "Issue lifecycle does not currently allow issue breakdown planning");
+    }
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
     if (latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) !== null) {
       return { queued: false, issue, reason: "fresh_plan_exists" };
     }
@@ -536,6 +550,8 @@ export class Orchestrator {
         issueId,
         issueIdentifier: entry.issue.identifier,
         role: entry.role,
+        runPhase: entry.runPhase,
+        runKind: runKindForPhase(entry.runPhase),
         state: entry.issue.state,
         workspacePath: entry.workspacePath,
         sessionId: entry.sessionId,
@@ -821,7 +837,11 @@ export class Orchestrator {
     return this.hasStateSlot(issue.state);
   }
 
-  private async lifecycleAllowsDispatch(issue: Issue, role: AgentRunRole): Promise<boolean> {
+  private async lifecycleAllowsDispatch(
+    issue: Issue,
+    role: AgentRunRole,
+    runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
+  ): Promise<boolean> {
     const store = this.options.lifecycleStore;
     if (!store) return true;
     const lifecycle = await store.get(issue.id);
@@ -845,7 +865,11 @@ export class Orchestrator {
       return true;
     }
 
-    if (role === "worker" && lifecycle.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns) {
+    if (
+      role === "worker" &&
+      runPhase === "implementation" &&
+      lifecycle.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns
+    ) {
       await this.escalateLifecycleBlocked(
         issue,
         lifecycle,
@@ -877,7 +901,6 @@ export class Orchestrator {
   private async tryDispatchWorkerIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (!this.shouldDispatchWorker(issue, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(issue, "worker"))) return false;
 
     let refreshed: Issue[];
     try {
@@ -895,15 +918,24 @@ export class Orchestrator {
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
     if (!this.shouldDispatchWorker(latest, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(latest, "worker"))) return false;
 
-    const runPhase = await this.workerRunPhaseForIssue(latest);
+    const decision = await this.resolveWorkerDispatchDecision(latest);
+    if (decision.action === "skip") {
+      this.options.logger.warn("worker dispatch skipped", {
+        issue_id: latest.id,
+        issue_identifier: latest.identifier,
+        reason: decision.reason,
+      });
+      return false;
+    }
+    const runPhase = decision.runPhase;
+    if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase))) return false;
     const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, this.config) : null;
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
     const afterWriteback = dispatchWriteback ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] : latest;
     if (!afterWriteback) return false;
     if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker"))) return false;
+    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase))) return false;
 
     this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase);
     return true;
@@ -939,12 +971,15 @@ export class Orchestrator {
     return true;
   }
 
-  private async workerRunPhaseForIssue(issue: Issue): Promise<AgentRunPhase> {
-    if (!this.config.issueBreakdown.enabled) return "implementation";
-    if (!this.passesIssueBreakdownRouting(issue)) return "implementation";
-    if (!this.options.lifecycleStore) return "implementation";
-    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
-    return latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) === null ? "issue_breakdown" : "implementation";
+  private async resolveWorkerDispatchDecision(issue: Issue): Promise<WorkerDispatchDecision> {
+    if (!this.config.issueBreakdown.enabled) return { action: "dispatch", runPhase: "implementation" };
+    if (!this.passesIssueBreakdownRouting(issue)) return { action: "dispatch", runPhase: "implementation" };
+    if (!this.options.lifecycleStore) return { action: "skip", reason: "planning_required_no_lifecycle_store" };
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    return {
+      action: "dispatch",
+      runPhase: latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) === null ? "issue_breakdown" : "implementation",
+    };
   }
 
   private passesIssueBreakdownRouting(issue: Issue): boolean {
@@ -1040,17 +1075,22 @@ export class Orchestrator {
           : await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
-      await this.updateLifecycle(entry, {
-        phase: phaseForIssueState(entry.issue.state, this.config),
-        summaryPointers: {
-          workspaceKey: workspace.workspaceKey,
-          workspacePath: workspace.path,
-          branchName: workspace.gitBranchName ?? null,
-          gitBranchName: workspace.gitBranchName ?? null,
-          repoPath: workspace.repoPath ?? null,
-          baseRef: workspace.baseRef ?? null,
-        },
-      });
+      await this.updateLifecycle(
+        entry,
+        entry.runPhase === "issue_breakdown"
+          ? { phase: phaseForIssueState(entry.issue.state, this.config) }
+          : {
+              phase: phaseForIssueState(entry.issue.state, this.config),
+              summaryPointers: {
+                workspaceKey: workspace.workspaceKey,
+                workspacePath: workspace.path,
+                branchName: workspace.gitBranchName ?? null,
+                gitBranchName: workspace.gitBranchName ?? null,
+                repoPath: workspace.repoPath ?? null,
+                baseRef: workspace.baseRef ?? null,
+              },
+            },
+      );
       if (entry.runPhase !== "issue_breakdown") {
         await this.options.workspaceManager.beforeRun(workspace.path);
       }
@@ -1111,6 +1151,8 @@ export class Orchestrator {
       if (workspace) {
         if (entry.runPhase !== "issue_breakdown") {
           await this.options.workspaceManager.afterRun(workspace.path);
+        } else {
+          await this.options.workspaceManager.removeForPlanning(entry.issue);
         }
         if (entry.cleanupWorkspaceOnExit) await this.options.workspaceManager.removeForIssue(entry.issue);
       }
@@ -1195,6 +1237,7 @@ export class Orchestrator {
           agentId: event.threadId ?? null,
           role: entry.role,
           runPhase: entry.runPhase,
+          runKind: runKindForPhase(entry.runPhase),
           issueId: entry.issue.id,
           issueIdentifier: entry.issue.identifier,
           attempt: context.attempt,
@@ -2085,49 +2128,6 @@ export class Orchestrator {
       "",
       renderIssueBreakdownPlanSummary(plan),
     ].join("\n");
-  }
-
-  private async persistIssueBreakdownPlan(entry: RunningEntry, workspace: Workspace, summary: string): Promise<void> {
-    if (!this.options.lifecycleStore || !entry.runId) return;
-    const lifecycle = (await this.options.lifecycleStore.get(entry.issue.id)) ?? entry.lifecycle;
-    const run = entry.runId;
-    const reference: IssueLifecycleSummaryReference = {
-      id: `issue-breakdown-${run}`,
-      kind: "issue_breakdown_plan",
-      summary: summary.trim().length === 0 ? "Planning completed without a final summary." : summary.trim(),
-      runIds: [run],
-      transcriptEventCount: 1,
-      transcriptPointers: [`/api/v1/runs/${encodeURIComponent(run)}/transcript`],
-      statusApiPointers: statusApiPointersForIssue(entry.issue.identifier, [
-        {
-          runId: run,
-          issueId: entry.issue.id,
-          issueIdentifier: entry.issue.identifier,
-          role: "worker",
-          runPhase: "issue_breakdown",
-          sessionId: entry.sessionId,
-          agentId: null,
-          attempt: null,
-          turnNumber: entry.turnCount,
-          prompt: "",
-          workspaceKey: workspace.workspaceKey,
-          workspacePath: workspace.path,
-          status: "succeeded",
-          startedAt: entry.startedAt.toISOString(),
-          updatedAt: new Date().toISOString(),
-          completedAt: new Date().toISOString(),
-          error: null,
-          tokens: entry.tokens,
-        },
-      ]),
-      issueUpdatedAt: entry.issue.updatedAt,
-      configFingerprint: issueBreakdownConfigFingerprint(this.config),
-      cursorMode: this.config.issueBreakdown.cursorMode,
-      createdAt: new Date().toISOString(),
-    };
-    entry.lifecycle = await this.options.lifecycleStore.updateIssue(entry.issue, {
-      summaryReferences: upsertSummaryReference(lifecycle?.summaryReferences ?? [], reference),
-    });
   }
 
   private async loadWorkerHandoffPrompt(entry: RunningEntry): Promise<string | null> {

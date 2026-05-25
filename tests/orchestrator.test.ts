@@ -161,9 +161,122 @@ describe("Orchestrator", () => {
     expect(harness.runs[1]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[1]?.prompt).toContain("Issue breakdown plan:");
     expect(harness.runs[1]?.prompt).toContain("Create implementation task");
+    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "issue_breakdown" })).resolves.toMatchObject({
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
     await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "implementation" })).resolves.toMatchObject({
       runPhase: "implementation",
+      runKind: "implementation",
     });
+  });
+
+  it("allows issue breakdown planning when implementation incomplete-turn limits are exhausted", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.reviewLoop.maxIncompleteTurns = 2;
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, { incompleteTurnCount: 2 });
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
+  });
+
+  it("does not route planning-labeled issues to implementation when planning persistence is missing", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    const candidate = issue({ state: "Todo", labels: ["planning"] });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+  });
+
+  it("rejects explicit issue breakdown requests without lifecycle persistence", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await expect(orchestrator.requestIssueBreakdown(candidate.id)).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    await orchestrator.stop();
   });
 
   it("adds scoped Symphony MCP completion instructions to Cursor worker prompts", async () => {

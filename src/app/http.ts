@@ -5,7 +5,9 @@ import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { CursorWorkspaceOpener } from "../../cursor/src/CursorWorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
+  runKindForPhase,
   toIssueStatusView,
+  type AgentRunPhase,
   type AgentRunRole,
   type Issue,
   type IssueBoardColumnId,
@@ -354,6 +356,7 @@ export class StatusServer {
           issue: result.issue.identifier,
           issueId: result.issue.id,
           runPhase: "issue_breakdown",
+          runKind: "planning",
           reason: result.reason,
         });
         return;
@@ -827,6 +830,8 @@ interface ActivityItem {
   run: {
     runId: string;
     role: AgentRunRole;
+    runPhase: AgentRunPhase | null;
+    runKind: string | null;
     status: RunRecord["status"];
     agentId: string | null;
     sessionId: string | null;
@@ -861,7 +866,7 @@ interface IssueBoardCard {
   lane: IssueBoardColumnId;
   issueDetails: IssueDetailsEnvelope;
   paused: boolean;
-  live: { role: AgentRunRole; state: string; runId: string | null } | null;
+  live: { role: AgentRunRole; runPhase: AgentRunPhase; runKind: string; state: string; runId: string | null } | null;
   operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>;
   reviewLoop: ReturnType<typeof reviewLoopStatus>;
   metadata: ReturnType<typeof statusMetadata>;
@@ -1225,9 +1230,12 @@ function activityIssue(run: RunRecord): ActivityItem["issue"] {
 }
 
 function activityRun(run: RunRecord): ActivityItem["run"] {
+  const runPhase = run.runPhase ?? null;
   return {
     runId: run.runId,
     role: run.role,
+    runPhase,
+    runKind: runPhase === null ? null : runKindForPhase(runPhase),
     status: run.status,
     agentId: run.agentId,
     sessionId: run.sessionId,
@@ -1425,6 +1433,8 @@ async function buildBoardCard(input: {
     live: input.live
       ? {
           role: input.live.role,
+          runPhase: input.live.runPhase,
+          runKind: input.live.runKind,
           state: input.live.state,
           runId: input.live.liveness.activeRunId ?? input.live.runId,
         }
@@ -1715,7 +1725,7 @@ function renderRunningRow(
   const activitySources = activitySummary(row);
   const blockedReason = row.lifecycle?.blockedReason ?? null;
   return `<li class="run-row operator-${operator.status}">
-    <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.state)}</span></div>
+    <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.runKind)} · ${escapeHtml(row.state)}</span></div>
     <div class="meta">run <code>${escapeHtml(runId)}</code> · agent <code>${escapeHtml(agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
     <div class="activity">last activity ${escapeHtml(row.liveness.lastActivityAt)} (${escapeHtml(idle)}, ${escapeHtml(threshold)}); event <code>${escapeHtml(row.lastEvent ?? "n/a")}</code>${row.lastEventAt ? ` at ${escapeHtml(row.lastEventAt)}` : ""}</div>
     ${activitySources ? `<div class="activity">${escapeHtml(activitySources)}</div>` : ""}
@@ -1757,6 +1767,8 @@ async function operatorSnapshotView(
         issueId: row.issueId,
         issueIdentifier: row.issueIdentifier,
         role: row.role,
+        runPhase: row.runPhase,
+        runKind: row.runKind,
         state: row.state,
         runId: row.liveness.activeRunId ?? row.runId,
         workspacePath: row.workspacePath,
@@ -2458,10 +2470,15 @@ function buildIssueWorkspaceSummary(
   },
   metadata: ReturnType<typeof statusMetadata>,
 ): IssueWorkspaceSummary {
+  const latestWorkspaceRun = input.latestRun?.runPhase === "issue_breakdown" ? null : input.latestRun;
+  const workspaceRecord =
+    input.workspace?.workspaceKey.endsWith("-planning") === true && input.live?.runPhase !== "issue_breakdown"
+      ? null
+      : input.workspace;
   return {
-    workspaceKey: input.workspace?.workspaceKey ?? input.latestRun?.workspaceKey ?? input.lifecycle?.summaryPointers.workspaceKey ?? null,
-    path: input.workspace?.path ?? input.live?.workspacePath ?? input.latestRun?.workspacePath ?? input.lifecycle?.summaryPointers.workspacePath ?? null,
-    sourceKind: input.workspace?.sourceKind ?? null,
+    workspaceKey: workspaceRecord?.workspaceKey ?? latestWorkspaceRun?.workspaceKey ?? input.lifecycle?.summaryPointers.workspaceKey ?? null,
+    path: workspaceRecord?.path ?? input.live?.workspacePath ?? latestWorkspaceRun?.workspacePath ?? input.lifecycle?.summaryPointers.workspacePath ?? null,
+    sourceKind: workspaceRecord?.sourceKind ?? null,
     branchName: metadata.branchName,
     gitBranchName: metadata.gitBranchName,
     repoPath: metadata.repoPath,
@@ -2481,8 +2498,11 @@ function buildIssuePullRequestSummary(metadata: ReturnType<typeof statusMetadata
 }
 
 function buildIssueLatestRunSummary(run: RunRecord | null | undefined): IssueLatestRunSummary {
+  const runPhase = run?.runPhase ?? null;
   return {
     runId: run?.runId ?? null,
+    runPhase,
+    runKind: runPhase === null ? null : runKindForPhase(runPhase),
     status: run?.status ?? null,
     terminalReason: deriveRunTerminalReason(run ?? null),
     error: run?.error ?? null,
@@ -2703,6 +2723,9 @@ function reviewLoopStatus(input: {
   return {
     phase: lifecycle?.phase ?? null,
     role: input.live?.role ?? input.latestRun?.role ?? null,
+    runPhase: input.live?.runPhase ?? input.latestRun?.runPhase ?? null,
+    runKind:
+      input.live?.runKind ?? (input.latestRun?.runPhase === undefined ? null : runKindForPhase(input.latestRun.runPhase)),
     reviewRound: lifecycle?.reviewRound ?? null,
     incompleteTurnCount: lifecycle?.incompleteTurnCount ?? null,
     lastCompletionReport: latestCompletionReport(lifecycle),

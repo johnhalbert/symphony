@@ -96,6 +96,8 @@ export interface IssuePullRequestSummary {
 
 export interface IssueLatestRunSummary {
   runId: string | null;
+  runPhase: AgentRunPhase | null;
+  runKind: AgentRunKind | null;
   status: "running" | "succeeded" | "failed" | "cancelled" | null;
   terminalReason: RunTerminalReason | null;
   error: string | null;
@@ -145,6 +147,18 @@ export interface Workspace {
 
 export type AgentRunRole = "worker" | "reviewer";
 export type AgentRunPhase = "issue_breakdown" | "implementation" | "review";
+export type AgentRunKind = "planning" | "implementation" | "review";
+
+export function runKindForPhase(runPhase: AgentRunPhase): AgentRunKind {
+  switch (runPhase) {
+    case "issue_breakdown":
+      return "planning";
+    case "review":
+      return "review";
+    case "implementation":
+      return "implementation";
+  }
+}
 
 export type RunAttempt = number | null;
 

@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { AgentRunPhase, AgentRunRole, TokenCounts } from "../types.js";
+import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type PersistedRunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
@@ -65,6 +65,7 @@ export interface RunRecord {
   agentId: string | null;
   role: AgentRunRole;
   runPhase?: AgentRunPhase;
+  runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
   attempt: number | null;
@@ -135,6 +136,7 @@ export interface StartRunInput {
   agentId?: string | null;
   role: AgentRunRole;
   runPhase?: AgentRunPhase;
+  runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
   attempt: number | null;
@@ -231,6 +233,7 @@ export class FileRunTranscriptStore {
       agentId: input.agentId ?? existing?.agentId ?? null,
       role: input.role,
       runPhase: input.runPhase ?? existing?.runPhase ?? defaultRunPhase(input.role),
+      runKind: input.runKind ?? existing?.runKind ?? runKindForPhase(input.runPhase ?? existing?.runPhase ?? defaultRunPhase(input.role)),
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
       attempt: input.attempt,
@@ -331,13 +334,14 @@ export class FileRunTranscriptStore {
 
   async latestRunForIssue(
     issueIdOrIdentifier: string,
-    options: { role?: AgentRunRole; runPhase?: AgentRunPhase } = {},
+    options: { role?: AgentRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
   ): Promise<RunRecord | null> {
     const records = await this.listRunsForIssue(issueIdOrIdentifier);
     const filtered = records.filter(
       (record) =>
         (options.role === undefined || record.role === options.role) &&
-        (options.runPhase === undefined || record.runPhase === options.runPhase),
+        (options.runPhase === undefined || record.runPhase === options.runPhase) &&
+        (options.runKind === undefined || record.runKind === options.runKind),
     );
     return filtered[filtered.length - 1] ?? null;
   }
@@ -454,9 +458,11 @@ function promptPreview(prompt: string): string {
 }
 
 function normalizeRunRecord(record: RunRecord): RunRecord {
+  const runPhase = record.runPhase ?? defaultRunPhase(record.role);
   return {
     ...record,
-    runPhase: record.runPhase ?? defaultRunPhase(record.role),
+    runPhase,
+    runKind: record.runKind ?? runKindForPhase(runPhase),
   };
 }
 
