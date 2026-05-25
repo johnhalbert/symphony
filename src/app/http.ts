@@ -367,6 +367,20 @@ export class StatusServer {
         return;
       }
 
+      const issueBreakdownApplyMatch = /^\/api\/v1\/issues\/([^/]+)\/planning-run\/apply$/.exec(url.pathname);
+      if (request.method === "POST" && issueBreakdownApplyMatch) {
+        this.requireIssueBreakdownApplyToken(request);
+        const issueId = decodeURIComponent(issueBreakdownApplyMatch[1] ?? "");
+        const options = parseIssueBreakdownApplyRequest(await readJsonBody(request));
+        const result = await this.options.orchestrator.applyIssueBreakdownPlan(issueId, options);
+        sendJson(response, result.status === "pending" ? 202 : 200, {
+          issue: issueId,
+          mode: options.dryRun ? "preview" : "apply",
+          ...result,
+        });
+        return;
+      }
+
       const issueMatch = /^\/api\/v1\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && issueMatch) {
         const issueId = decodeURIComponent(issueMatch[1] ?? "");
@@ -584,6 +598,17 @@ export class StatusServer {
     }
   }
 
+  private requireIssueBreakdownApplyToken(request: IncomingMessage): void {
+    const expected = this.options.openWorkspaceToken?.trim() ?? "";
+    if (!expected) {
+      throw new SymphonyError("invalid_request", "Issue breakdown apply requires a configured X-Symphony-Token");
+    }
+    const provided = request.headers["x-symphony-token"];
+    if (typeof provided !== "string" || provided.trim().length === 0 || provided !== expected) {
+      throw new SymphonyError("invalid_request", "Missing or invalid issue breakdown apply token");
+    }
+  }
+
   private async fetchIssueBoard(forceRefresh: boolean): Promise<IssueBoardResponse> {
     const issueBoardColumns = this.options.issueBoardColumns ?? defaultIssueBoardColumns(this.options.trackerStateLists);
     const trackerProjection = await this.fetchIssueBoardTrackerProjection(issueBoardColumns, forceRefresh);
@@ -701,6 +726,23 @@ function parseApprovalDecision(body: unknown): "approve" | "reject" {
     throw new SymphonyError("invalid_request", "Approval decision must be approve or reject");
   }
   return decision;
+}
+
+function parseIssueBreakdownApplyRequest(body: unknown): { dryRun: boolean } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new SymphonyError("invalid_request", "Issue breakdown apply body must be an object");
+  }
+  const input = body as { dryRun?: unknown; mode?: unknown };
+  if (input.mode !== undefined) {
+    if (input.mode === "preview") return { dryRun: true };
+    if (input.mode === "apply") return { dryRun: false };
+    throw new SymphonyError("invalid_request", "Issue breakdown apply mode must be preview or apply");
+  }
+  if (input.dryRun === undefined) return { dryRun: true };
+  if (typeof input.dryRun !== "boolean") {
+    throw new SymphonyError("invalid_request", "Issue breakdown apply dryRun must be a boolean");
+  }
+  return { dryRun: input.dryRun };
 }
 
 function approvalResponse(record: OperatorApprovalRecord, enabled: boolean): Record<string, unknown> {

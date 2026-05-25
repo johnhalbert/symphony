@@ -500,6 +500,73 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("protects issue breakdown preview/apply with a fail-closed token", async () => {
+    const config = testConfig(path.join(root, "apply-token"));
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    let applyCalls = 0;
+    const applyOptions: Array<{ dryRun?: boolean }> = [];
+    const orchestrator = Object.assign(fakeOrchestrator(), {
+      async applyIssueBreakdownPlan(_issueId: string, options: { dryRun?: boolean }) {
+        applyCalls += 1;
+        applyOptions.push(options);
+        return { status: "preview", plan: { id: "plan-1" }, operations: [] };
+      },
+    }) as unknown as Orchestrator;
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const noConfiguredToken = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        body: JSON.stringify({ dryRun: true }),
+      });
+      expect(noConfiguredToken.status).toBe(401);
+      expect(applyCalls).toBe(0);
+      (server as unknown as { options: { openWorkspaceToken: string } }).options.openWorkspaceToken = "secret";
+      const missing = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        body: JSON.stringify({ dryRun: true }),
+      });
+      const invalid = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        headers: { "x-symphony-token": "wrong" },
+        body: JSON.stringify({ dryRun: false }),
+      });
+      const valid = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+        body: JSON.stringify({ mode: "preview" }),
+      });
+      const validApply = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+        body: JSON.stringify({ dryRun: false }),
+      });
+
+      expect(missing.status).toBe(401);
+      expect(invalid.status).toBe(401);
+      expect(valid.status).toBe(200);
+      expect(validApply.status).toBe(200);
+      expect(applyCalls).toBe(2);
+      expect(applyOptions).toEqual([{ dryRun: true }, { dryRun: false }]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves a redacted globally sorted activity feed from persisted transcripts", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);

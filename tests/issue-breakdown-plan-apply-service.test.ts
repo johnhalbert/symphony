@@ -53,7 +53,12 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(writeback.operations[0]).toMatchObject({
       kind: "issue_create",
       issueId: candidate.id,
-      payload: { title: "Build child", parentIssueId: candidate.id },
+      payload: { title: "Build child", parentIssueId: candidate.id, planId: expect.any(String) },
+    });
+    expect(writeback.operations[1]).toMatchObject({
+      kind: "comment",
+      issueId: candidate.id,
+      payload: { body: expect.stringContaining("TEST-2"), issueBreakdownPlanId: expect.any(String) },
     });
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
     expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs[0]).toMatchObject({
@@ -71,6 +76,63 @@ describe("IssueBreakdownPlanApplyService", () => {
 
     expect(result.status).toBe("not_required");
   });
+
+  it("previews fresh plans without enqueueing writebacks", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-1",
+        issueId: candidate.id,
+        summary: "Split into child issues.",
+        proposedIssues: [
+          { title: "Build child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+        ],
+        idempotencyKey: "plan-1",
+      },
+      { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
+    );
+    const writeback = new CapturingWriteback();
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback }).previewLatestFreshPlan(candidate);
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(result.status).toBe("preview");
+    expect(writeback.operations).toEqual([]);
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("not_requested");
+  });
+
+  it("durably blocks unresolved dependency references before enqueueing writebacks", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-1",
+        issueId: candidate.id,
+        summary: "Split into child issues.",
+        proposedIssues: [
+          { title: "Build child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: ["Missing"], labels: [] },
+        ],
+        idempotencyKey: "plan-1",
+      },
+      { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
+    );
+    const writeback = new CapturingWriteback();
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback }).applyLatestFreshPlan(candidate);
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(result.status).toBe("blocked");
+    expect(writeback.operations).toEqual([]);
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("blocked");
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationBlockedReason).toContain("Missing");
+  });
 });
 
 class CapturingWriteback implements Pick<WritebackProcessor, "enqueueAndProcess"> {
@@ -78,7 +140,20 @@ class CapturingWriteback implements Pick<WritebackProcessor, "enqueueAndProcess"
 
   async enqueueAndProcess(operation: NewWritebackOperation): Promise<WritebackOperation> {
     this.operations.push(operation);
-    if (operation.kind !== "issue_create") throw new Error("unexpected operation");
+    if (operation.kind !== "issue_create") {
+      return {
+        ...operation,
+        status: "succeeded",
+        attempt: 0,
+        createdAt: "2026-01-02T00:00:00.000Z",
+        updatedAt: "2026-01-02T00:00:00.000Z",
+        nextAttemptAt: "2026-01-02T00:00:00.000Z",
+        lastError: null,
+        resultStatus: "applied",
+        resultMessage: null,
+        resultEvidence: null,
+      };
+    }
     return {
       ...operation,
       status: "succeeded",

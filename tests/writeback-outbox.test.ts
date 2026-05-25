@@ -262,10 +262,12 @@ describe("FileWritebackOutboxStore", () => {
   it("processes issue creation writebacks and persists child issue evidence", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
-    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const operationKey = "issue-create:issue-1:plan-1:0:hash";
+    const lifecycleStore = { get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey] }) };
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000, lifecycleStore);
 
     const result = await processor.enqueueAndProcess({
-      idempotencyKey: "issue-create:issue-1:plan-1:0:hash",
+      idempotencyKey: operationKey,
       kind: "issue_create",
       issueId: "issue-1",
       runId: "run-plan-1",
@@ -290,6 +292,35 @@ describe("FileWritebackOutboxStore", () => {
       issue: { id: "child-1", identifier: "TEST-2" },
     });
     expect(writer.issueCreates).toHaveLength(1);
+  });
+
+  it("skips issue breakdown writebacks that are not bound to the current plan", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const lifecycleStore = { get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [] }) };
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000, lifecycleStore);
+
+    const result = await processor.enqueueAndProcess({
+      idempotencyKey: "issue-create:issue-1:plan-1:0:hash",
+      kind: "issue_create",
+      issueId: "issue-1",
+      runId: "run-plan-1",
+      payload: {
+        parentIssueId: "issue-1",
+        title: "Child issue",
+        description: "Description",
+        acceptanceCriteria: ["Done"],
+        requestedLabels: ["planning"],
+        dependencies: [],
+        dedupeKey: "issue-breakdown:plan-1:0:hash",
+        payloadHash: "hash",
+        planId: "plan-1",
+        proposedIssueIndex: 0,
+      },
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(writer.issueCreates).toEqual([]);
   });
 });
 
@@ -418,5 +449,47 @@ function lifecycleWithReports(overrides: { lastCompletionReportId: string; compl
     },
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function lifecycleWithIssueBreakdownPlan(overrides: { operationKeys: string[] }): IssueLifecycleRecord {
+  const lifecycle = lifecycleWithReports({ lastCompletionReportId: "report-1", completionReports: [] });
+  return {
+    ...lifecycle,
+    phase: "implementation",
+    lastCompletionReportId: null,
+    lastIssueBreakdownPlanId: "plan-1",
+    issueBreakdownPlans: [
+      {
+        id: "plan-1",
+        idempotencyKey: "plan-key",
+        requestHash: "request-hash",
+        runId: "run-plan-1",
+        issueId: "issue-1",
+        issueIdentifier: "ENG-1",
+        summary: "Split issue",
+        proposedIssues: [
+          {
+            title: "Child issue",
+            description: "Description",
+            acceptanceCriteria: ["Done"],
+            dependencies: [],
+            labels: ["planning"],
+          },
+        ],
+        transcriptPointers: [],
+        statusApiPointers: [],
+        issueUpdatedAt: "2026-01-01T00:00:00.000Z",
+        issueContentFingerprint: "fingerprint",
+        configFingerprint: "config",
+        cursorMode: "plan",
+        acceptedAt: "2026-01-01T00:00:00.000Z",
+        applicationStatus: "pending",
+        applicationOperationKeys: overrides.operationKeys,
+        createdIssueRefs: [],
+        appliedAt: null,
+        applicationBlockedReason: null,
+      },
+    ],
   };
 }

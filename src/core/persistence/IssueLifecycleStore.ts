@@ -412,7 +412,13 @@ export class FileIssueLifecycleStore {
 
   private async write(record: IssueLifecycleRecord): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
-    await fs.writeFile(this.recordPath(record.issueId), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    const target = this.recordPath(record.issueId);
+    const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    if (process.platform === "win32") {
+      await fs.rm(target, { force: true });
+    }
+    await fs.rename(temp, target);
   }
 
   private recordsDir(): string {

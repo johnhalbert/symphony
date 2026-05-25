@@ -38,7 +38,7 @@ export type WritebackOperation =
       resultStatus: TrackerWriteResult["status"] | null;
       resultMessage: string | null;
       resultEvidence: TrackerWriteEvidence | null;
-      payload: { body: string; dedupeKey: string };
+      payload: { body: string; dedupeKey: string; issueBreakdownPlanId?: string };
     }
   | {
       idempotencyKey: string;
@@ -56,6 +56,8 @@ export type WritebackOperation =
       resultEvidence: TrackerWriteEvidence | null;
       payload: {
         parentIssueId: string;
+        planId: string;
+        proposedIssueIndex: number;
         title: string;
         description: string;
         acceptanceCriteria: string[];
@@ -63,8 +65,33 @@ export type WritebackOperation =
         dependencies: string[];
         dedupeKey: string;
         payloadHash: string;
+      };
+    }
+  | {
+      idempotencyKey: string;
+      kind: "issue_relation";
+      issueId: string;
+      runId?: string;
+      status: WritebackStatus;
+      attempt: number;
+      createdAt: string;
+      updatedAt: string;
+      nextAttemptAt: string;
+      lastError: string | null;
+      resultStatus: TrackerWriteResult["status"] | null;
+      resultMessage: string | null;
+      resultEvidence: TrackerWriteEvidence | null;
+      payload: {
         planId: string;
-        proposedIssueIndex: number;
+        sourceIssueId: string;
+        sourceIssueIdentifier: string | null;
+        targetIssueId: string;
+        targetIssueIdentifier: string | null;
+        type: "blocks";
+        dependency: string;
+        dedupeKey: string;
+        sourceProposedIssueIndex: number;
+        targetProposedIssueIndex: number;
       };
     };
 
@@ -82,7 +109,8 @@ type PersistedWritebackFields =
 export type NewWritebackOperation =
   | Omit<Extract<WritebackOperation, { kind: "transition" }>, PersistedWritebackFields>
   | Omit<Extract<WritebackOperation, { kind: "comment" }>, PersistedWritebackFields>
-  | Omit<Extract<WritebackOperation, { kind: "issue_create" }>, PersistedWritebackFields>;
+  | Omit<Extract<WritebackOperation, { kind: "issue_create" }>, PersistedWritebackFields>
+  | Omit<Extract<WritebackOperation, { kind: "issue_relation" }>, PersistedWritebackFields>;
 
 export class FileWritebackOutboxStore {
   constructor(private readonly stateDir: string) {}
@@ -184,7 +212,13 @@ export class FileWritebackOutboxStore {
 
   private async write(record: WritebackOperation): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
-    await fs.writeFile(this.recordPath(record.idempotencyKey), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    const target = this.recordPath(record.idempotencyKey);
+    const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    if (process.platform === "win32") {
+      await fs.rm(target, { force: true });
+    }
+    await fs.rename(temp, target);
   }
 
   private recordsDir(): string {
@@ -219,7 +253,7 @@ export class WritebackProcessor {
   async processDue(): Promise<void> {
     for (const record of await this.store.claimDue()) {
       try {
-        const guard = await this.verifyLifecycleBoundHandoff(record);
+        const guard = await this.verifyLifecycleBoundOperation(record);
         if (guard.status === "blocked") {
           await this.store.markSkipped(record, guard.message);
           continue;
@@ -244,7 +278,23 @@ export class WritebackProcessor {
     }
   }
 
-  private async verifyLifecycleBoundHandoff(record: WritebackOperation): Promise<{ status: "ready" } | { status: "blocked"; message: string }> {
+  private async verifyLifecycleBoundOperation(record: WritebackOperation): Promise<{ status: "ready" } | { status: "blocked"; message: string }> {
+    const issueBreakdownPlanId = issueBreakdownPlanIdForOperation(record);
+    if (issueBreakdownPlanId) {
+      if (!this.lifecycleStore) return { status: "blocked", message: "issue breakdown writeback requires lifecycle guard" };
+      const lifecycle = await this.lifecycleStore.get(record.issueId);
+      const plan = lifecycle?.issueBreakdownPlans.find((candidate) => candidate.id === issueBreakdownPlanId);
+      if (!lifecycle || !plan || lifecycle.lastIssueBreakdownPlanId !== issueBreakdownPlanId) {
+        return { status: "blocked", message: "issue breakdown writeback is not bound to the current plan" };
+      }
+      if (plan.applicationStatus === "stale" || !plan.applicationOperationKeys.includes(record.idempotencyKey)) {
+        return { status: "blocked", message: "issue breakdown writeback is not registered on the current plan" };
+      }
+      if ((record.kind === "comment" || record.kind === "issue_relation") && plan.createdIssueRefs.length < plan.proposedIssues.length) {
+        return { status: "blocked", message: "issue breakdown relation/comment writeback requires durable child refs" };
+      }
+      return { status: "ready" };
+    }
     if (!isPullRequestHandoffOperation(record) || !this.lifecycleStore) return { status: "ready" };
     const lifecycle = await this.lifecycleStore.get(record.issueId);
     const acceptedReport = lifecycle?.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
@@ -276,11 +326,26 @@ export class WritebackProcessor {
         dedupeKey: record.payload.dedupeKey,
       });
     }
+    if (record.kind === "issue_relation") {
+      if (!this.writer.createIssueRelation) {
+        throw new Error("Tracker writer does not support issue_relation writeback operations");
+      }
+      return this.writer.createIssueRelation({
+        sourceIssueId: record.payload.sourceIssueId,
+        targetIssueId: record.payload.targetIssueId,
+        type: record.payload.type,
+        dedupeKey: record.payload.dedupeKey,
+        planId: record.payload.planId,
+        dependency: record.payload.dependency,
+      });
+    }
     if (!this.writer.createIssueFromPlan) {
       throw new Error("Tracker writer does not support issue_create writeback operations");
     }
     return this.writer.createIssueFromPlan({
       parentIssueId: record.payload.parentIssueId,
+      planId: record.payload.planId,
+      proposedIssueIndex: record.payload.proposedIssueIndex,
       title: record.payload.title,
       description: record.payload.description,
       acceptanceCriteria: record.payload.acceptanceCriteria,
@@ -315,6 +380,13 @@ function isPullRequestHandoffOperation(record: WritebackOperation): boolean {
   return record.kind === "comment" && record.payload.dedupeKey.startsWith("pull-request-handoff:");
 }
 
+function issueBreakdownPlanIdForOperation(record: WritebackOperation): string | null {
+  if (record.kind === "issue_create") return record.payload.planId;
+  if (record.kind === "issue_relation") return record.payload.planId;
+  if (record.kind === "comment") return record.payload.issueBreakdownPlanId ?? null;
+  return null;
+}
+
 export function computeWritebackBackoffMs(attempt: number, maxBackoffMs: number): number {
   return Math.min(1_000 * 2 ** Math.max(attempt - 1, 0), maxBackoffMs);
 }
@@ -339,6 +411,9 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
     return record.payload.body === operation.payload.body && record.payload.dedupeKey === operation.payload.dedupeKey;
   }
   if (record.kind === "issue_create" && operation.kind === "issue_create") {
+    return JSON.stringify(record.payload) === JSON.stringify(operation.payload);
+  }
+  if (record.kind === "issue_relation" && operation.kind === "issue_relation") {
     return JSON.stringify(record.payload) === JSON.stringify(operation.payload);
   }
   return false;

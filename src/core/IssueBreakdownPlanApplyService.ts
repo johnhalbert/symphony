@@ -12,9 +12,10 @@ import type { NewWritebackOperation, WritebackOperation, WritebackProcessor } fr
 export type IssueBreakdownPlanApplyResult =
   | { status: "not_required"; reason: string }
   | { status: "no_fresh_plan"; reason: string }
+  | { status: "preview"; plan: IssueBreakdownPlanRecord; operations: NewWritebackOperation[] }
   | { status: "pending"; plan: IssueBreakdownPlanRecord; operations: WritebackOperation[] }
   | { status: "applied"; plan: IssueBreakdownPlanRecord; operations: WritebackOperation[] }
-  | { status: "blocked"; plan: IssueBreakdownPlanRecord; operations: WritebackOperation[]; reason: string };
+  | { status: "blocked"; plan: IssueBreakdownPlanRecord; operations: WritebackOperation[] | NewWritebackOperation[]; reason: string };
 
 export interface IssueBreakdownPlanApplyServiceOptions {
   config: ServiceConfig;
@@ -25,7 +26,14 @@ export interface IssueBreakdownPlanApplyServiceOptions {
 export class IssueBreakdownPlanApplyService {
   constructor(private readonly options: IssueBreakdownPlanApplyServiceOptions) {}
 
-  async applyLatestFreshPlan(issue: Issue): Promise<IssueBreakdownPlanApplyResult> {
+  async previewLatestFreshPlan(issue: Issue): Promise<IssueBreakdownPlanApplyResult> {
+    return this.applyLatestFreshPlan(issue, { dryRun: true });
+  }
+
+  async applyLatestFreshPlan(
+    issue: Issue,
+    options: { dryRun?: boolean } = {},
+  ): Promise<IssueBreakdownPlanApplyResult> {
     if (!this.options.config.issueBreakdown.applyToLinear.enabled) {
       return { status: "not_required", reason: "apply_to_linear_disabled" };
     }
@@ -33,6 +41,19 @@ export class IssueBreakdownPlanApplyService {
     const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.options.config);
     if (!plan) return { status: "no_fresh_plan", reason: "no_fresh_plan" };
     if (plan.applicationStatus === "applied") return { status: "applied", plan, operations: [] };
+    const childOperations = planIssueBreakdownApplicationWritebacks(issue, plan);
+    const dependencyValidation = validatePlanDependencies(plan);
+    if (dependencyValidation.length > 0) {
+      const reason = `Issue breakdown dependencies are unresolved: ${dependencyValidation.join("; ")}`;
+      if (options.dryRun === true) return { status: "blocked", plan, operations: childOperations, reason };
+      const updated = await this.updatePlan(issue, plan, {
+        applicationStatus: "blocked",
+        applicationBlockedReason: reason,
+        applicationOperationKeys: [],
+      });
+      return { status: "blocked", plan: updated, operations: [], reason };
+    }
+    if (options.dryRun === true) return { status: "preview", plan, operations: childOperations };
     if (!this.options.writeback || !this.options.config.writeback.enabled) {
       const updated = await this.updatePlan(issue, plan, {
         applicationStatus: "blocked",
@@ -41,35 +62,66 @@ export class IssueBreakdownPlanApplyService {
       return { status: "blocked", plan: updated, operations: [], reason: updated.applicationBlockedReason ?? "writeback unavailable" };
     }
 
-    const operations = planIssueBreakdownApplicationWritebacks(issue, plan);
-    await this.updatePlan(issue, plan, {
+    let workingPlan = await this.updatePlan(issue, plan, {
       applicationStatus: "pending",
-      applicationOperationKeys: operations.map((operation) => operation.idempotencyKey),
+      applicationOperationKeys: mergeOperationKeys(plan.applicationOperationKeys, childOperations),
       applicationBlockedReason: null,
     });
 
     const processed: WritebackOperation[] = [];
-    for (const operation of operations) {
-      processed.push(await this.options.writeback.enqueueAndProcess(operation, { retrySkipped: isDryRunReplay(operation, plan) }));
+    for (const operation of childOperations) {
+      const result = await this.options.writeback.enqueueAndProcess(operation, { retrySkipped: isDryRunReplay(operation, workingPlan) });
+      processed.push(result);
+      const ref = createdIssueRefFromOperation(result);
+      if (ref) {
+        workingPlan = await this.updatePlan(issue, workingPlan, {
+          createdIssueRefs: mergeCreatedIssueRefs(workingPlan.createdIssueRefs, [ref]),
+        });
+      }
     }
 
-    const succeeded = processed.filter((operation) => operation.status === "succeeded");
-    const refs = succeeded
-      .map((operation) => createdIssueRefFromOperation(operation))
-      .filter((ref): ref is IssueBreakdownCreatedIssueRef => ref !== null);
-    if (refs.length === operations.length) {
+    const childBlocked = processed.find((operation) => operation.status === "skipped" || operation.status === "dead_letter");
+    if (childBlocked) {
+      const updated = await this.updatePlan(issue, workingPlan, {
+        applicationStatus: "blocked",
+        applicationBlockedReason: childBlocked.resultMessage ?? childBlocked.lastError ?? "issue breakdown child creation did not succeed",
+      });
+      return {
+        status: "blocked",
+        plan: updated,
+        operations: processed,
+        reason: updated.applicationBlockedReason ?? "issue breakdown apply blocked",
+      };
+    }
+
+    if (workingPlan.createdIssueRefs.length < workingPlan.proposedIssues.length) {
+      const pending = await this.updatePlan(issue, workingPlan, {
+        applicationStatus: "pending",
+        applicationBlockedReason: null,
+      });
+      return { status: "pending", plan: pending, operations: processed };
+    }
+
+    const finalOperations = planIssueBreakdownFinalizationWritebacks(issue, workingPlan);
+    workingPlan = await this.updatePlan(issue, workingPlan, {
+      applicationOperationKeys: mergeOperationKeys(workingPlan.applicationOperationKeys, finalOperations),
+    });
+    for (const operation of finalOperations) {
+      processed.push(await this.options.writeback.enqueueAndProcess(operation, { retrySkipped: isDryRunReplay(operation, workingPlan) }));
+    }
+
+    const blocked = processed.find((operation) => operation.status === "skipped" || operation.status === "dead_letter");
+    if (!blocked && processed.every((operation) => operation.status === "succeeded")) {
       const applied = await this.updatePlan(issue, plan, {
         applicationStatus: "applied",
-        createdIssueRefs: refs,
         appliedAt: new Date().toISOString(),
         applicationBlockedReason: null,
       });
       return { status: "applied", plan: applied, operations: processed };
     }
 
-    const blocked = processed.find((operation) => operation.status === "skipped" || operation.status === "dead_letter");
     if (blocked) {
-      const updated = await this.updatePlan(issue, plan, {
+      const updated = await this.updatePlan(issue, workingPlan, {
         applicationStatus: "blocked",
         applicationBlockedReason: blocked.resultMessage ?? blocked.lastError ?? "issue breakdown apply writeback did not succeed",
       });
@@ -81,7 +133,7 @@ export class IssueBreakdownPlanApplyService {
       };
     }
 
-    const pending = await this.updatePlan(issue, plan, {
+    const pending = await this.updatePlan(issue, workingPlan, {
       applicationStatus: "pending",
       applicationBlockedReason: null,
     });
@@ -104,7 +156,8 @@ export class IssueBreakdownPlanApplyService {
   ): Promise<IssueBreakdownPlanRecord> {
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
     const plans = lifecycle?.issueBreakdownPlans ?? [];
-    const updatedPlan: IssueBreakdownPlanRecord = { ...plan, ...patch };
+    const currentPlan = plans.find((candidate) => candidate.id === plan.id) ?? plan;
+    const updatedPlan: IssueBreakdownPlanRecord = { ...currentPlan, ...patch };
     await this.options.lifecycleStore.updateIssue(issue, {
       issueBreakdownPlans: plans.map((candidate) => (candidate.id === plan.id ? updatedPlan : candidate)),
       lastIssueBreakdownPlanId: lifecycle?.lastIssueBreakdownPlanId ?? plan.id,
@@ -127,6 +180,8 @@ export function planIssueBreakdownApplicationWritebacks(
       runId: plan.runId,
       payload: {
         parentIssueId: issue.id,
+        planId: plan.id,
+        proposedIssueIndex: index,
         title: proposedIssue.title,
         description: proposedIssue.description,
         acceptanceCriteria: proposedIssue.acceptanceCriteria,
@@ -134,11 +189,52 @@ export function planIssueBreakdownApplicationWritebacks(
         dependencies: proposedIssue.dependencies,
         dedupeKey,
         payloadHash,
-        planId: plan.id,
-        proposedIssueIndex: index,
       },
     };
   });
+}
+
+export function planIssueBreakdownFinalizationWritebacks(
+  issue: Issue,
+  plan: IssueBreakdownPlanRecord,
+): NewWritebackOperation[] {
+  const operations: NewWritebackOperation[] = [];
+  const refsByIndex = new Map(plan.createdIssueRefs.map((ref) => [ref.proposedIssueIndex, ref]));
+  for (const relation of dependencyRelations(plan)) {
+    const source = refsByIndex.get(relation.sourceProposedIssueIndex);
+    const target = refsByIndex.get(relation.targetProposedIssueIndex);
+    if (!source || !target) continue;
+    operations.push({
+      idempotencyKey: `issue-relation:${issue.id}:${plan.id}:${relation.sourceProposedIssueIndex}:${relation.targetProposedIssueIndex}`,
+      kind: "issue_relation",
+      issueId: issue.id,
+      runId: plan.runId,
+      payload: {
+        planId: plan.id,
+        sourceIssueId: source.id,
+        sourceIssueIdentifier: source.identifier,
+        targetIssueId: target.id,
+        targetIssueIdentifier: target.identifier,
+        type: "blocks",
+        dependency: relation.dependency,
+        dedupeKey: `issue-breakdown-relation:${plan.id}:${relation.sourceProposedIssueIndex}:${relation.targetProposedIssueIndex}`,
+        sourceProposedIssueIndex: relation.sourceProposedIssueIndex,
+        targetProposedIssueIndex: relation.targetProposedIssueIndex,
+      },
+    });
+  }
+  operations.push({
+    idempotencyKey: `comment:${issue.id}:issue-breakdown:${plan.id}:children`,
+    kind: "comment",
+    issueId: issue.id,
+    runId: plan.runId,
+    payload: {
+      issueBreakdownPlanId: plan.id,
+      dedupeKey: `issue-breakdown-children:${plan.id}`,
+      body: renderParentComment(issue, plan),
+    },
+  });
+  return operations;
 }
 
 function createdIssueRefFromOperation(operation: WritebackOperation): IssueBreakdownCreatedIssueRef | null {
@@ -158,6 +254,80 @@ function createdIssueRefFromOperation(operation: WritebackOperation): IssueBreak
 
 function isDryRunReplay(operation: NewWritebackOperation, plan: IssueBreakdownPlanRecord): boolean {
   return plan.applicationOperationKeys.includes(operation.idempotencyKey) && plan.applicationBlockedReason === "Writeback dry_run";
+}
+
+function mergeOperationKeys(existing: string[], operations: NewWritebackOperation[]): string[] {
+  const keys = new Set(existing);
+  for (const operation of operations) keys.add(operation.idempotencyKey);
+  return [...keys];
+}
+
+function mergeCreatedIssueRefs(
+  existing: IssueBreakdownCreatedIssueRef[],
+  incoming: IssueBreakdownCreatedIssueRef[],
+): IssueBreakdownCreatedIssueRef[] {
+  const byIndex = new Map(existing.map((ref) => [ref.proposedIssueIndex, ref]));
+  for (const ref of incoming) byIndex.set(ref.proposedIssueIndex, ref);
+  return [...byIndex.values()].sort((left, right) => left.proposedIssueIndex - right.proposedIssueIndex);
+}
+
+function validatePlanDependencies(plan: IssueBreakdownPlanRecord): string[] {
+  const byTitle = new Map<string, number[]>();
+  plan.proposedIssues.forEach((proposedIssue, index) => {
+    const key = proposedIssue.title.trim().toLowerCase();
+    byTitle.set(key, [...(byTitle.get(key) ?? []), index]);
+  });
+  const errors: string[] = [];
+  plan.proposedIssues.forEach((proposedIssue, index) => {
+    for (const dependency of proposedIssue.dependencies) {
+      const key = dependency.trim().toLowerCase();
+      if (!key) continue;
+      const matches = byTitle.get(key) ?? [];
+      if (matches.length === 0) {
+        errors.push(`"${proposedIssue.title}" references missing dependency "${dependency}"`);
+      } else if (matches.length > 1) {
+        errors.push(`"${proposedIssue.title}" references ambiguous dependency "${dependency}"`);
+      } else if (matches[0] === index) {
+        errors.push(`"${proposedIssue.title}" cannot depend on itself`);
+      }
+    }
+  });
+  return errors;
+}
+
+function dependencyRelations(plan: IssueBreakdownPlanRecord): Array<{
+  sourceProposedIssueIndex: number;
+  targetProposedIssueIndex: number;
+  dependency: string;
+}> {
+  const byTitle = new Map(plan.proposedIssues.map((proposedIssue, index) => [proposedIssue.title.trim().toLowerCase(), index]));
+  const relations: Array<{ sourceProposedIssueIndex: number; targetProposedIssueIndex: number; dependency: string }> = [];
+  plan.proposedIssues.forEach((proposedIssue, targetProposedIssueIndex) => {
+    for (const dependency of proposedIssue.dependencies) {
+      const sourceProposedIssueIndex = byTitle.get(dependency.trim().toLowerCase());
+      if (sourceProposedIssueIndex === undefined) continue;
+      relations.push({ sourceProposedIssueIndex, targetProposedIssueIndex, dependency });
+    }
+  });
+  return relations;
+}
+
+function renderParentComment(issue: Issue, plan: IssueBreakdownPlanRecord): string {
+  const refs = plan.createdIssueRefs
+    .slice()
+    .sort((left, right) => left.proposedIssueIndex - right.proposedIssueIndex)
+    .map((ref) => {
+      const proposed = plan.proposedIssues[ref.proposedIssueIndex];
+      const label = ref.identifier ?? ref.id;
+      const link = ref.url ? `[${label}](${ref.url})` : label;
+      return `- ${link}: ${proposed?.title ?? `Proposed issue ${ref.proposedIssueIndex + 1}`}`;
+    });
+  return [
+    `Applied issue breakdown plan ${plan.id} for ${issue.identifier}.`,
+    "",
+    "Created child issues:",
+    ...refs,
+  ].join("\n");
 }
 
 function proposalHash(value: unknown): string {

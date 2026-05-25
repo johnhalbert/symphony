@@ -484,6 +484,24 @@ export class Orchestrator {
     return { queued: true, issue, reason: "explicit_request" };
   }
 
+  async applyIssueBreakdownPlan(issueIdOrIdentifier: string, options: { dryRun?: boolean } = {}) {
+    if (!this.config.issueBreakdown.enabled || !this.config.issueBreakdown.applyToLinear.enabled) {
+      throw new SymphonyError("invalid_request", "Issue breakdown Linear application is disabled");
+    }
+    if (!this.options.lifecycleStore) {
+      throw new SymphonyError("invalid_request", "Issue breakdown Linear application requires a lifecycle store");
+    }
+    const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
+    const issue = refreshed[0];
+    if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    const service = new IssueBreakdownPlanApplyService({
+      config: this.config,
+      lifecycleStore: this.options.lifecycleStore,
+      writeback: this.options.writeback,
+    });
+    return options.dryRun === true ? service.previewLatestFreshPlan(issue) : service.applyLatestFreshPlan(issue);
+  }
+
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
@@ -989,17 +1007,14 @@ export class Orchestrator {
     const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.config);
     if (plan === null) return { action: "dispatch", runPhase: "issue_breakdown" };
     if (this.config.issueBreakdown.applyToLinear.enabled) {
-      const result = await new IssueBreakdownPlanApplyService({
-        config: this.config,
-        lifecycleStore: this.options.lifecycleStore,
-        writeback: this.options.writeback,
-      }).applyLatestFreshPlan(issue);
       return {
         action: "skip",
         reason:
-          result.status === "applied"
+          plan.applicationStatus === "applied"
             ? "issue_breakdown_applied_to_linear"
-            : `issue_breakdown_apply_${result.status}`,
+            : plan.applicationStatus === "blocked"
+              ? "issue_breakdown_apply_blocked"
+              : "issue_breakdown_apply_required",
       };
     }
     return {

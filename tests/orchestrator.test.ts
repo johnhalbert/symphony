@@ -190,7 +190,7 @@ describe("Orchestrator", () => {
     });
   }, 10_000);
 
-  it("applies accepted issue breakdown plans to Linear child issues and skips parent implementation", async () => {
+  it("does not apply accepted issue breakdown plans during normal dispatch", async () => {
     const config = testConfig(root);
     config.issueBreakdown.enabled = true;
     config.issueBreakdown.applyToLinear.enabled = true;
@@ -235,10 +235,10 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     const lifecycle = await lifecycleStore.get(candidate.id);
-    expect(writer.issueCreates).toHaveLength(1);
+    expect(writer.issueCreates).toEqual([]);
     expect(harness.runs.filter((run) => run.ctx.runPhase === "implementation")).toHaveLength(0);
-    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
-    expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs[0]).toMatchObject({ id: "child-1", status: "created" });
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("not_requested");
+    expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs).toEqual([]);
   }, 10_000);
 
   it("reroutes implementation dispatch to planning when writeback reveals stale issue content", async () => {
@@ -438,8 +438,8 @@ describe("Orchestrator", () => {
     config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
     config.issueBreakdown.planningLabels = ["planning"];
     config.issueBreakdown.maxPlanningFailures = 3;
-    config.issueBreakdown.planningRetryBaseMs = 200;
-    config.issueBreakdown.planningRetryMaxMs = 200;
+    config.issueBreakdown.planningRetryBaseMs = 10_000;
+    config.issueBreakdown.planningRetryMaxMs = 10_000;
     const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -485,7 +485,7 @@ describe("Orchestrator", () => {
     await second.refreshNow();
     await settleOrchestratorExit();
     expect(harness.runs).toHaveLength(1);
-    await new Promise((resolve) => setTimeout(resolve, 240));
+    await lifecycleStore.updateIssue(candidate, { lastPlanningFailureAt: "2000-01-01T00:00:00.000Z" });
     await second.refreshNow();
     await waitFor(() => harness.runs.length === 2, "planning retry after durable backoff");
     await waitFor(() => second.snapshot().counts.running === 0);

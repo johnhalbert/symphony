@@ -4,6 +4,7 @@ import type { TrackerClient } from "../../core/tracker/TrackerClient.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
+  TrackerIssueRelationInput,
   TrackerIssueRef,
   TrackerTransitionInput,
   TrackerWriteResult,
@@ -110,6 +111,16 @@ interface LinearIssueCreateContext {
       description?: unknown;
       url?: unknown;
       parent?: { id?: unknown } | null;
+    }>;
+  } | null;
+}
+
+interface LinearIssueRelationContext {
+  id?: unknown;
+  relations?: {
+    nodes?: Array<{
+      type?: unknown;
+      relatedIssue?: { id?: unknown } | null;
     }>;
   } | null;
 }
@@ -295,6 +306,24 @@ const ISSUE_CREATE_MUTATION = `
   }
 `;
 
+const ISSUE_RELATION_CONTEXT_QUERY = `
+  query SymphonyIssueRelationContext($id: String!) {
+    issue(id: $id) {
+      id
+      relations(first: 100) { nodes { type relatedIssue { id } } }
+    }
+  }
+`;
+
+const ISSUE_RELATION_CREATE_MUTATION = `
+  mutation SymphonyIssueRelationCreate($input: IssueRelationCreateInput!) {
+    issueRelationCreate(input: $input) {
+      success
+      issueRelation { id type }
+    }
+  }
+`;
+
 export class LinearTrackerClient implements TrackerClient, TrackerWriter {
   constructor(
     private readonly config: TrackerConfig,
@@ -476,6 +505,22 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
         },
       };
     }
+    if (resolvedLabels.unresolved.length > 0) {
+      return {
+        status: "skipped",
+        message: `Linear label resolution failed: ${resolvedLabels.unresolved.join(", ")}`,
+        evidence: {
+          kind: "issue_create",
+          issue: null,
+          issueCreateStatus: "conflict",
+          parentIssueId: input.parentIssueId,
+          dedupeKey: input.dedupeKey,
+          payloadHash: input.payloadHash,
+          unresolvedLabelNames: resolvedLabels.unresolved,
+          message: "Unresolved Linear label names",
+        },
+      };
+    }
 
     const response = await this.graphql<{ issueCreate: { success?: unknown; issue?: { id?: unknown; identifier?: unknown; url?: unknown } | null } }>(
       ISSUE_CREATE_MUTATION,
@@ -494,6 +539,27 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       throw new SymphonyError("tracker_error", `Linear issueCreate did not report success for ${input.parentIssueId}`);
     }
     return issueCreateResult("created", input, issueRefFromNode(response.issueCreate.issue));
+  }
+
+  async createIssueRelation(input: TrackerIssueRelationInput): Promise<TrackerWriteResult> {
+    const context = await this.fetchIssueRelationContext(input.sourceIssueId);
+    const existing = (context.relations?.nodes ?? []).some(
+      (relation) =>
+        asString(relation.type)?.toLowerCase() === input.type &&
+        asString(relation.relatedIssue?.id) === input.targetIssueId,
+    );
+    if (existing) return { status: "verified", message: `Issue relation already exists for ${input.dedupeKey}` };
+    const response = await this.graphql<{ issueRelationCreate: { success?: unknown } }>(ISSUE_RELATION_CREATE_MUTATION, {
+      input: {
+        issueId: input.sourceIssueId,
+        relatedIssueId: input.targetIssueId,
+        type: input.type,
+      },
+    });
+    if (response.issueRelationCreate.success !== true) {
+      throw new SymphonyError("tracker_error", `Linear issueRelationCreate did not report success for ${input.sourceIssueId}`);
+    }
+    return { status: "applied", message: input.dedupeKey };
   }
 
   private async fetchPagedIssues(
@@ -551,6 +617,14 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
 
   private async fetchIssueCreateContext(issueId: string): Promise<LinearIssueCreateContext> {
     const response = await this.graphql<{ issue?: LinearIssueCreateContext | null }>(ISSUE_CREATE_CONTEXT_QUERY, {
+      id: issueId,
+    });
+    if (!response.issue) throw new SymphonyError("tracker_error", `Linear issue not found: ${issueId}`);
+    return response.issue;
+  }
+
+  private async fetchIssueRelationContext(issueId: string): Promise<LinearIssueRelationContext> {
+    const response = await this.graphql<{ issue?: LinearIssueRelationContext | null }>(ISSUE_RELATION_CONTEXT_QUERY, {
       id: issueId,
     });
     if (!response.issue) throw new SymphonyError("tracker_error", `Linear issue not found: ${issueId}`);
