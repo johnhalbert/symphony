@@ -199,4 +199,60 @@ describe("IssueBreakdownPlanService", () => {
       ),
     ).rejects.toBeInstanceOf(SymphonyError);
   });
+
+  it("rejects proposed issues with omitted dependencies before persistence", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-1",
+          issueId: candidate.id,
+          summary: "Dependencies must be explicit.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: "Description",
+              acceptanceCriteria: ["Done"],
+              labels: [],
+            },
+          ],
+          idempotencyKey: "plan-missing-dependencies",
+        },
+        { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+  });
+
+  it("rejects proposed issues with omitted labels before persistence", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-1",
+          issueId: candidate.id,
+          summary: "Labels must be explicit.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: "Description",
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+            },
+          ],
+          idempotencyKey: "plan-missing-labels",
+        },
+        { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+  });
 });

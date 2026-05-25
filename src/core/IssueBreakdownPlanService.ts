@@ -24,8 +24,8 @@ const issueBreakdownPlanSchema = z.object({
         title: z.string().trim().min(1),
         description: z.string().trim().min(1),
         acceptanceCriteria: z.array(z.string().trim().min(1)).min(1),
-        dependencies: z.array(z.string().trim().min(1)).default([]),
-        labels: z.array(z.string().trim().min(1)).default([]),
+        dependencies: z.array(z.string().trim().min(1)),
+        labels: z.array(z.string().trim().min(1)),
       }),
     )
     .min(1),

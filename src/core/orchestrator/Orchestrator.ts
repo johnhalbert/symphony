@@ -1331,6 +1331,13 @@ export class Orchestrator {
         }
       }
       if (event.type === "failed") {
+        if (
+          entry.role === "worker" &&
+          entry.runPhase === "issue_breakdown" &&
+          (await this.terminalizeAcceptedIssueBreakdownPlan(entry))
+        ) {
+          return;
+        }
         if (entry.role === "worker" && entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
@@ -1352,6 +1359,13 @@ export class Orchestrator {
         throw new SymphonyError("agent_error", event.error);
       }
       if (event.type === "cancelled") {
+        if (
+          entry.role === "worker" &&
+          entry.runPhase === "issue_breakdown" &&
+          (await this.terminalizeAcceptedIssueBreakdownPlan(entry))
+        ) {
+          return;
+        }
         if (entry.role === "worker" && entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
@@ -1382,6 +1396,21 @@ export class Orchestrator {
     return { updated: true, record: await runStore.updateRun(runId, patch) };
   }
 
+  private async terminalizeAcceptedIssueBreakdownPlan(entry: RunningEntry): Promise<boolean> {
+    const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
+    if (!accepted) return false;
+    const runId = entry.activeRunId ?? entry.runId ?? "";
+    if (runId.length > 0) {
+      await this.updateRunTerminalStateIfRunning(runId, {
+        status: "succeeded",
+        completedAt: new Date().toISOString(),
+        tokens: entry.activeRunTokens,
+        metadata: terminalRunMetadata(entry, "succeeded"),
+      });
+    }
+    return true;
+  }
+
   private async onWorkerExit(issueId: string, kind: "normal" | "abnormal", error: string | null): Promise<void> {
     const entry = this.running.get(issueId);
     if (!entry) return;
@@ -1391,6 +1420,7 @@ export class Orchestrator {
     if (entry.runPhase === "issue_breakdown") {
       const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
       if (accepted) {
+        await this.terminalizeAcceptedIssueBreakdownPlan(entry);
         await this.options.lifecycleStore?.updateIssue(entry.issue, {
           planningFailureCount: 0,
           planningDispatchRetryCount: 0,
