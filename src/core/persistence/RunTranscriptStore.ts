@@ -172,6 +172,8 @@ export interface CiStatusTranscriptInput extends RunMetadata {
 }
 
 export class FileRunTranscriptStore {
+  private readonly runUpdateLocks = new Map<string, Promise<void>>();
+
   constructor(private readonly stateDir: string) {}
 
   async upsertWorkspace(record: WorkspaceRecord): Promise<void> {
@@ -252,21 +254,23 @@ export class FileRunTranscriptStore {
   }
 
   async updateRun(runId: string, input: UpdateRunInput): Promise<RunRecord | null> {
-    const existing = await this.getRun(runId);
-    if (!existing) return null;
-    const updated: RunRecord = {
-      ...existing,
-      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
-      ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
-      ...(input.status === undefined ? {} : { status: input.status }),
-      ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
-      ...(input.error === undefined ? {} : { error: input.error }),
-      ...(input.tokens === undefined ? {} : { tokens: input.tokens }),
-      ...metadataPatch(input.metadata),
-      updatedAt: new Date().toISOString(),
-    };
-    await this.writeRun(updated);
-    return updated;
+    return this.withRunUpdateLock(runId, async () => {
+      const existing = await this.getRun(runId);
+      if (!existing) return null;
+      const updated: RunRecord = {
+        ...existing,
+        ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+        ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+        ...(input.status === undefined ? {} : { status: input.status }),
+        ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
+        ...(input.error === undefined ? {} : { error: input.error }),
+        ...(input.tokens === undefined ? {} : { tokens: input.tokens }),
+        ...metadataPatch(input.metadata),
+        updatedAt: new Date().toISOString(),
+      };
+      await this.writeRun(updated);
+      return updated;
+    });
   }
 
   async recordPullRequestEvent(input: PullRequestTranscriptInput): Promise<TranscriptEvent | null> {
@@ -345,6 +349,23 @@ export class FileRunTranscriptStore {
   private async writeRun(record: RunRecord): Promise<void> {
     await fs.mkdir(this.runDir(record.runId), { recursive: true });
     await writeJson(this.metaPath(record.runId), record);
+  }
+
+  private async withRunUpdateLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.runUpdateLocks.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = previous.catch(() => undefined).then(() => current);
+    this.runUpdateLocks.set(runId, chained);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.runUpdateLocks.get(runId) === chained) this.runUpdateLocks.delete(runId);
+    }
   }
 
   private async nextSequence(runId: string): Promise<number> {
