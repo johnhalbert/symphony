@@ -23,7 +23,7 @@ The extension has its own lockfile and dependency install under `extension/`.
 - `symphony.baseUrl`: defaults to `http://127.0.0.1:7331`.
 - `symphony.token`: optional token for future mutating API calls. Read-only probes do not send it. Mutating calls will send it as `X-Symphony-Token`.
 
-The scaffold validates connectivity with `GET /api/v1/state` only. It uses a 5 second timeout.
+The extension validates connectivity with `GET /api/v1/state`. When connected, it also renders read-only dashboard sections from `operatorView`, `GET /api/v1/board`, and `GET /api/v1/activity?offset=0&limit=20`. Read-only requests do not send `symphony.token`.
 
 Connection states:
 
@@ -45,4 +45,4 @@ Start Symphony separately with the status server listening on the configured bas
 
 ## Scope
 
-This scaffold includes the webview shell, connection status, settings, scripts, docs, and unit tests. Board views, transcript views, activity views, and operator mutation controls are intentionally deferred.
+This extension includes the webview shell, connection status, read-only operator queue cards, board counts, activity feed, settings, scripts, docs, and unit tests. Transcript views, issue drill-down, and operator mutation controls are intentionally deferred.

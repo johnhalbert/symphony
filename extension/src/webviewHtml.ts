@@ -1,13 +1,13 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
-import type { ConnectionState } from "./connectionState";
+import type { DashboardViewState } from "./dashboardTypes";
 
 export interface WebviewHtmlOptions {
   nonce: string;
   cspSource: string;
   scriptUri: string;
   styleUri: string;
-  initialState: ConnectionState | null;
+  initialState: DashboardViewState | null;
 }
 
 export interface ConfiguredWebview {
@@ -18,7 +18,7 @@ export interface ConfiguredWebview {
 export function configureSymphonyWebview(
   webview: vscode.Webview,
   extensionUri: vscode.Uri,
-  initialState: ConnectionState | null,
+  initialState: DashboardViewState | null,
 ): ConfiguredWebview {
   const webviewRoot = vscode.Uri.joinPath(extensionUri, "dist", "webview");
   webview.options = {

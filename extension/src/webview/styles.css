@@ -62,6 +62,71 @@ body {
   font-family: var(--vscode-editor-font-family), monospace;
 }
 
+.subsection {
+  border-top: 1px solid var(--border);
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.subsection-title {
+  align-items: center;
+  color: var(--text);
+  display: flex;
+  font-size: 12px;
+  font-weight: 600;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.badge {
+  background: #1f2937;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 7px;
+}
+
+.row-list {
+  display: grid;
+  gap: 6px;
+}
+
+.data-row,
+.activity-row {
+  display: grid;
+  gap: 2px;
+}
+
+.row-main {
+  color: var(--text);
+  font-family: var(--vscode-editor-font-family), monospace;
+  font-size: 12px;
+}
+
+.row-meta {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.chip {
+  background: #0f172a;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
 .actions {
   display: flex;
   gap: 8px;
