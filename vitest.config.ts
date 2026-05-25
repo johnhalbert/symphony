@@ -5,5 +5,8 @@ export default defineConfig({
     environment: "node",
     include: ["tests/**/*.test.ts"],
     clearMocks: true,
+    // Orchestration tests mutate process-wide fetch/env and run local servers.
+    fileParallelism: false,
+    testTimeout: 15_000,
   },
 });
