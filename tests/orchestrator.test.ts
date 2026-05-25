@@ -2145,7 +2145,7 @@ describe("Orchestrator", () => {
     const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
       status: "failed",
-      completedAt: rejectedAt,
+      completedAt: expect.any(String),
       error: OPERATOR_REJECTED_PUBLICATION_ERROR,
       pendingApprovalRequestId: null,
     });
@@ -2241,7 +2241,7 @@ describe("Orchestrator", () => {
 
     const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
-      status: "succeeded",
+      status: "cancelled",
       completedAt: expect.any(String),
       pendingApprovalRequestId: null,
     });

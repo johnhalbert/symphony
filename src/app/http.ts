@@ -19,7 +19,7 @@ import type {
 } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
 import type { OperatorApprovalService, OperatorApprovalRecord } from "../core/approval/OperatorApprovalService.js";
-import { approvalResolve } from "../core/approval/OperatorApprovalService.js";
+import { OPERATOR_REJECTED_PUBLICATION_ERROR, approvalResolve } from "../core/approval/OperatorApprovalService.js";
 import {
   approvalMatchesReport,
   isAwaitingPublicationApprovalLifecycle,
@@ -239,6 +239,9 @@ export class StatusServer {
             throw error;
           }
           if (!result) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
+          if (decision === "reject") {
+            await this.recordRejectedApprovalRunTerminal(result.request);
+          }
           if (decision === "reject" && !result.replayed && this.options.operatorApproval?.rejectPolicy === "cancel") {
             await this.options.orchestrator.cancelIssue(result.request.issueId);
           }
@@ -536,6 +539,22 @@ export class StatusServer {
     } catch {
       // Recovery must not mask the approval API's original conflict response.
     }
+  }
+
+  private async recordRejectedApprovalRunTerminal(request: OperatorApprovalRecord): Promise<void> {
+    if (!this.options.runStore) return;
+    const existing = await this.options.runStore.getRun(request.runId);
+    const completedAt = existing?.completedAt ?? request.resolvedAt ?? new Date().toISOString();
+    const cancelPolicy = this.options.operatorApproval?.rejectPolicy === "cancel";
+    await this.options.runStore.updateRun(request.runId, {
+      status: cancelPolicy ? "cancelled" : "failed",
+      completedAt,
+      error: cancelPolicy ? "Operator cancelled issue" : OPERATOR_REJECTED_PUBLICATION_ERROR,
+      metadata: {
+        pendingApprovalRequestId: null,
+        pendingApprovalRequestedAt: null,
+      },
+    });
   }
 
   private requireMutationToken(request: IncomingMessage): void {
