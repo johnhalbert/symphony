@@ -1,0 +1,83 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0d12;
+  --panel: #111827;
+  --border: #263244;
+  --text: #f8fafc;
+  --muted: #94a3b8;
+  --accent: #fbbf24;
+  --ok: #22c55e;
+  --offline: #64748b;
+  --error: #ef4444;
+  font-family: var(--vscode-font-family);
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.shell {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.title {
+  align-items: center;
+  display: flex;
+  font-size: 15px;
+  font-weight: 600;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.dot {
+  border-radius: 999px;
+  display: inline-block;
+  height: 9px;
+  width: 9px;
+}
+
+.dot.connected { background: var(--ok); }
+.dot.offline { background: var(--offline); }
+.dot.error { background: var(--error); }
+
+.meta {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.mono {
+  font-family: var(--vscode-editor-font-family), monospace;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+button {
+  background: #1f2937;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  padding: 6px 10px;
+}
+
+button:hover {
+  border-color: var(--accent);
+}

@@ -35,6 +35,10 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: npm run extension:ci
+      - run: npm run extension:typecheck
+      - run: npm run extension:test
+      - run: npm run extension:build
 
   real-smoke:
     name: Real integration smoke
