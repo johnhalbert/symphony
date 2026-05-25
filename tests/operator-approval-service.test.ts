@@ -81,6 +81,26 @@ describe("OperatorApprovalService", () => {
     expect(transcript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
   });
 
+  it("repairs run metadata when reusing an existing pending approval", async () => {
+    const pending = await service.requestPublicationApproval(request());
+    await runStore.updateRun("run-1", {
+      metadata: {
+        pendingApprovalRequestId: null,
+        pendingApprovalRequestedAt: null,
+      },
+    });
+
+    const reused = await service.requestPublicationApproval(request());
+
+    expect(reused.requestId).toBe(pending.requestId);
+    await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+      pendingApprovalRequestId: pending.requestId,
+      pendingApprovalRequestedAt: pending.requestedAt,
+    });
+    const transcript = await runStore.readTranscript("run-1");
+    expect(transcript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
+  });
+
   it("fails the waiter when the operator rejects publication", async () => {
     config.github.operatorApproval!.rejectPolicy = "fail";
     const wait = service.waitForPublicationApproval(request());
@@ -100,15 +120,16 @@ describe("OperatorApprovalService", () => {
     expect(transcript.events.at(-1)).toMatchObject({ eventType: "approval_resolved" });
   });
 
-  it("marks approvals stale when the run is no longer active", async () => {
+  it("allows approvals to be resolved after the worker run exits", async () => {
     const wait = service.waitForPublicationApproval(request());
     const pending = await waitForPending();
-    const waiterError = wait.catch((error: unknown) => error);
-    await runStore.updateRun("run-1", { status: "failed", completedAt: "2026-01-01T00:00:00Z" });
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00Z" });
 
-    await expect(service.resolve(pending.requestId, "approve")).rejects.toMatchObject({ code: "conflict" });
-    await expect(waiterError).resolves.toMatchObject({ code: "invalid_request" });
-    await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "stale" });
+    await expect(service.resolve(pending.requestId, "approve")).resolves.toMatchObject({
+      request: { status: "approved" },
+    });
+    await expect(wait).resolves.toMatchObject({ status: "approved" });
+    await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "approved" });
   });
 
   async function waitForPending() {

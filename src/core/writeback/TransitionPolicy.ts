@@ -76,10 +76,18 @@ export interface PullRequestHandoffWritebackDetails {
   } | null;
 }
 
+export interface PublicationApprovalActionDetails {
+  branchName: string;
+  baseBranch: string;
+  workspacePath: string;
+  title: string;
+}
+
 export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewWritebackOperation | null {
   if (!config.writeback.enabled || !sameName(issue.state, "Todo")) return null;
+  const dispatchStateVersion = safeKeySegment(issue.updatedAt ?? issue.createdAt ?? issue.state);
   return {
-    idempotencyKey: `transition:${issue.id}:dispatch:${config.writeback.dispatchState}`,
+    idempotencyKey: `transition:${issue.id}:dispatch:${dispatchStateVersion}:${config.writeback.dispatchState}`,
     kind: "transition",
     issueId: issue.id,
     payload: {
@@ -137,7 +145,12 @@ export function planCompletionReportAcceptedWritebacks(
   config: ServiceConfig,
   report: string | CompletionReportWritebackDetails | null = null,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled || !isStateIn(context.issue.state, [config.writeback.dispatchState])) return [];
+  if (
+    !config.writeback.enabled ||
+    !isStateIn(context.issue.state, [config.writeback.dispatchState, ...config.reviewLoop.blockedStates])
+  ) {
+    return [];
+  }
 
   const reviewState = config.reviewLoop.reviewStates[0];
   if (!reviewState) return [];
@@ -175,7 +188,7 @@ export function planCompletionReportAcceptedWritebacks(
       issueId: context.issue.id,
       runId: context.runId,
       payload: {
-        fromStates: [config.writeback.dispatchState],
+        fromStates: uniqueStates([config.writeback.dispatchState, ...config.reviewLoop.blockedStates]),
         toState: reviewState,
         reason: "Symphony completion report accepted",
       },
@@ -235,6 +248,107 @@ export function planPullRequestHandoffWritebacks(
         fromStates: [config.writeback.dispatchState],
         toState: targetState,
         reason: "Symphony verified pull request handoff",
+      },
+    },
+  ];
+}
+
+export function planCompletionReportPublicationApprovalPendingWritebacks(
+  context: RunWritebackContext,
+  config: ServiceConfig,
+  report: CompletionReportWritebackDetails,
+  action: PublicationApprovalActionDetails,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || !isStateIn(context.issue.state, [config.writeback.dispatchState])) return [];
+
+  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  const eventKey = `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}:publication-approval-pending`;
+  const operations: NewWritebackOperation[] = [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Publication Approval Setup Incomplete",
+          "",
+          "Status: worker completion report persisted; Symphony is preparing service-owned push/PR publication approval.",
+          "Symphony will not dispatch another worker while publication approval setup is pending.",
+          "",
+          `Run: ${context.runId}`,
+          `Workspace: ${context.workspacePath ?? context.workspace?.path ?? action.workspacePath}`,
+          `Branch: ${action.branchName}`,
+          `Base branch: ${action.baseBranch}`,
+          `PR title: ${action.title}`,
+          "",
+          "Recovery:",
+          "- Symphony will retry this setup and create the operator approval request after the audit writebacks are durable.",
+          "- At the time this setup audit is written, no operator approval request exists yet for this persisted report.",
+          "- If Symphony status later shows awaiting operator approval, use the current approval request surfaced by the service.",
+          "",
+          blockedState === null
+            ? "No blocked state is configured, so Symphony recorded a lifecycle-level blocked phase without changing the tracker state."
+            : `Transitioning to non-dispatch state: ${blockedState}`,
+          ...formatCompletionReportForComment(report),
+        ].join("\n"),
+      },
+    },
+  ];
+
+  if (blockedState !== null) {
+    operations.push({
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        fromStates: [config.writeback.dispatchState],
+        toState: blockedState,
+        reason: "Symphony publication approval setup incomplete",
+      },
+    });
+  }
+
+  return operations;
+}
+
+export function planCompletionReportPublicationApprovalTerminalWritebacks(
+  context: RunWritebackContext,
+  config: ServiceConfig,
+  report: CompletionReportWritebackDetails,
+  status: "rejected" | "stale" | "expired" | "cancelled",
+  reason: string | null,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+
+  const fromStates = uniqueStates([config.writeback.dispatchState, ...config.reviewLoop.blockedStates]);
+  if (!isStateIn(context.issue.state, fromStates)) return [];
+
+  const eventKey = `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}:publication-approval-${status}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Publication Approval Not Completed",
+          "",
+          `Status: ${status}`,
+          `Reason: ${reason ?? "n/a"}`,
+          "",
+          "The worker completion report remains stored, but Symphony did not publish a PR.",
+          "",
+          "Recovery:",
+          "- Inspect the stored completion report and worktree before retrying.",
+          "- Move the issue back to the implementation state when Symphony should run another worker.",
+          "- Submit a new completion report or approve a fresh publication request when ready.",
+          ...formatCompletionReportForComment(report),
+        ].join("\n"),
       },
     },
   ];

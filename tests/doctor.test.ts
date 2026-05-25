@@ -352,7 +352,7 @@ describe("doctor review-loop checks", () => {
     expect(continuationContextDoctorChecks(config)).toEqual([]);
   });
 
-  it("validates GitHub publication with the resolved worker publication profile", async () => {
+  it("validates GitHub publication with the resolved service publication profile", async () => {
     const config = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -369,7 +369,7 @@ describe("doctor review-loop checks", () => {
             publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
           },
           roles: {
-            worker: {
+            service: {
               "github.publication": "publication",
             },
           },
@@ -430,7 +430,7 @@ describe("doctor review-loop checks", () => {
       message: expect.stringContaining("github.publication"),
     });
     await expect(githubPublicationDoctorCheck(config)).resolves.toMatchObject({
-      message: expect.stringContaining("credential_profiles.roles.worker.github.publication"),
+      message: expect.stringContaining("credential_profiles.roles.service.github.publication"),
     });
   });
 

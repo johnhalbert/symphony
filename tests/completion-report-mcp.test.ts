@@ -138,7 +138,7 @@ describe("completion report MCP handoff", () => {
     });
   });
 
-  it("uses worker GitHub publication profile for default PR publication", async () => {
+  it("uses service GitHub publication profile for default PR publication", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "context.json");
@@ -422,7 +422,7 @@ credential_profiles:
       capabilities:
         - github.publication
   roles:
-    worker:
+    service:
       github.publication: publication
 ---
 Work on {{ issue.identifier }}.

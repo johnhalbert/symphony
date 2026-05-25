@@ -1,5 +1,5 @@
 import type { ServiceConfig } from "../config/Config.js";
-import type { AgentRunRole } from "../types.js";
+import type { CredentialRole } from "../config/CredentialProfiles.js";
 
 export type McpSubprocessCommand =
   | "completion-report-mcp"
@@ -137,7 +137,9 @@ function addCommandCapabilitySlice(
 ): void {
   if (command === "completion-report-mcp" && config.github.publishPullRequests) {
     addGitHubParseRefs(env, config);
-    addGitHubCapabilityEnvironment(env, config, "worker", "github.publication");
+    if (!(config.github.operatorApproval?.requiredForPublication ?? false)) {
+      addGitHubCapabilityEnvironment(env, config, "service", "github.publication");
+    }
   }
   if (command === "review-feedback-mcp") {
     addGitHubParseRefs(env, config);
@@ -164,7 +166,7 @@ function addGitHubParseRefs(env: Record<string, string>, config: ServiceConfig):
 function addGitHubCapabilityEnvironment(
   env: Record<string, string>,
   config: ServiceConfig,
-  role: AgentRunRole,
+  role: CredentialRole,
   capability: "github.publication" | "github.review_feedback_write",
 ): void {
   if (config.credentialProfiles.hasAssignment(role, capability)) {

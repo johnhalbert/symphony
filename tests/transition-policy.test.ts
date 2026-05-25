@@ -45,7 +45,7 @@ describe("TransitionPolicy review-loop planners", () => {
       idempotencyKey: "transition:issue-1:run-1:completion-report-accepted:In Review",
       kind: "transition",
       payload: {
-        fromStates: ["In Progress"],
+        fromStates: ["In Progress", "Blocked"],
         toState: "In Review",
       },
     });

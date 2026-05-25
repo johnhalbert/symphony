@@ -489,6 +489,10 @@ class FailingOutbox {
     this.attempted += 1;
     throw new Error("enqueue failed");
   }
+
+  async get(_idempotencyKey: string): Promise<WritebackOperation | null> {
+    return null;
+  }
 }
 
 class FakePublisher implements CompletionReportPullRequestPublisher {

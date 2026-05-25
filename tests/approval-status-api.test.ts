@@ -4,23 +4,41 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
 import {
+  CompletionReportService,
+  PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+  PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+  type CompletionReportPullRequestPublication,
+  type CompletionReportPullRequestPublicationInput,
+  type CompletionReportPullRequestPublisher,
+} from "../src/core/CompletionReportService.js";
+import {
   FileOperatorApprovalStore,
   OPERATOR_REJECTED_PUBLICATION_ERROR,
   OperatorApprovalService,
   type OperatorApprovalAction,
+  type OperatorApprovalRecord,
 } from "../src/core/approval/OperatorApprovalService.js";
 import type { ServiceConfig } from "../src/core/config/Config.js";
+import { SymphonyError } from "../src/core/errors.js";
+import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
+import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
+import type { Issue } from "../src/core/types.js";
+import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { testConfig } from "./helpers.js";
+import { issue, testConfig } from "./helpers.js";
 
 describe("approval status API", () => {
   let root: string;
   let config: ServiceConfig;
   let runStore: FileRunTranscriptStore;
+  let lifecycleStore: FileIssueLifecycleStore;
   let store: FileOperatorApprovalStore;
   let service: OperatorApprovalService;
 
@@ -31,6 +49,7 @@ describe("approval status API", () => {
     config.github.operatorApproval!.requiredForPublication = true;
     config.github.operatorApproval!.rejectPolicy = "cancel";
     runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     store = new FileOperatorApprovalStore(config.workspace.stateDir);
     service = new OperatorApprovalService({ config, store, runStore });
     await runStore.startRun({
@@ -49,12 +68,13 @@ describe("approval status API", () => {
   });
 
   afterEach(async () => {
-    await rm(root, { recursive: true, force: true });
+    await rmWithRetry(root);
   });
 
   it("requires the mutation token and approves pending requests", async () => {
     const pending = await createPending("idem-1");
-    const server = statusServer();
+    const resumed: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed });
     const address = await server.start();
     try {
       const baseUrl = `http://${address.host}:${address.port}`;
@@ -81,6 +101,120 @@ describe("approval status API", () => {
       expect(approved.status).toBe(200);
       expect(approvedBody.request.status).toBe("approved");
       expect(issueBody.capabilities.pendingApproval.active).toBe(false);
+      expect(resumed).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it.each([
+    ["false", false],
+    ["null", null],
+  ] as const)("returns conflict when approved publication resume returns %s", async (_label, resumeResult) => {
+    const pending = await createPending(`idem-resume-${_label}`);
+    const resumed: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed, resumeResult });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({
+        code: "conflict",
+        message: "Approved publication could not be resumed from a pending completion report",
+      });
+      expect(resumed).toHaveLength(1);
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "approved" });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("does not expose approval controls for setup-incomplete pending publication records", async () => {
+    const pending = await createPending("idem-setup-incomplete");
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+    });
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed, terminalRecords });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const issueBody = (await issueResponse.json()) as {
+        capabilities: {
+          pendingApproval: { active: boolean; requestId: string | null; status: string | null };
+          humanRequired: { active: boolean; reason: string | null; continuationSummaryRecommended: boolean };
+        };
+        pendingApproval: unknown;
+      };
+      const approvalPost = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const approvalBody = (await approvalPost.json()) as { error: { code: string; message: string } };
+
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.pendingApproval).toBeNull();
+      expect(issueBody.capabilities.pendingApproval).toMatchObject({
+        active: false,
+        requestId: null,
+        status: null,
+      });
+      expect(issueBody.capabilities.humanRequired).toMatchObject({
+        active: true,
+        reason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+        continuationSummaryRecommended: true,
+      });
+      expect(approvalPost.status).toBe(409);
+      expect(approvalBody.error).toMatchObject({
+        code: "conflict",
+        message: "Approval request is not current pending publication approval",
+      });
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toEqual([]);
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "pending" });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+        pendingApprovalRequestId: pending.requestId,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("fails closed when approving a non-current pending publication approval request", async () => {
+    const oldPending = await createPending("idem-old");
+    const currentPending = await createPending("idem-current");
+    const resumed: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${oldPending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({
+        code: "conflict",
+        message: "Approval request is not current pending publication approval",
+      });
+      expect(resumed).toEqual([]);
+      await expect(store.get(oldPending.requestId)).resolves.toMatchObject({ status: "pending" });
+      await expect(store.get(currentPending.requestId)).resolves.toMatchObject({ status: "pending" });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+        pendingApprovalRequestId: currentPending.requestId,
+      });
     } finally {
       await server.stop();
     }
@@ -241,7 +375,8 @@ describe("approval status API", () => {
     config.github.operatorApproval!.rejectPolicy = rejectPolicy;
     const pending = await createPending(`idem-replay-${rejectPolicy}`);
     const cancelled: string[] = [];
-    const server = statusServer({ cancelled });
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ cancelled, terminalRecords });
     const address = await server.start();
     try {
       const url = `http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`;
@@ -279,15 +414,829 @@ describe("approval status API", () => {
       });
       expect(replayResolvedEvents).toBe(firstResolvedEvents);
       expect(cancelled).toHaveLength(rejectPolicy === "cancel" ? 1 : 0);
+      expect(terminalRecords.map((record) => record.status)).toEqual(["rejected"]);
     } finally {
       await server.stop();
     }
   });
 
-  it("expires pending requests before status API rejection can resolve them", async () => {
+  it("rejects publication approval through a real orchestrator without reconciling pending reports as success", async () => {
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-live",
+    });
+    const harness = new LiveCompletionReportHarness(lifecycleStore, outboxStore, runStore, publisher, service, writeback);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      writebackOutbox: outboxStore,
+      operatorApproval: service,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: {
+        activeStates: ["Todo", "In Progress"],
+        handoffStates: ["In Review"],
+        reviewStates: ["In Review"],
+        blockedStates: ["Blocked"],
+        terminalStates: ["Done"],
+      },
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      await orchestrator.refreshNow();
+      const pending = await waitForPendingRun(store, "live-report-run");
+      expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Setup Incomplete"))).toBe(true);
+      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+
+      const url = `http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`;
+      const first = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const firstBody = (await first.json()) as { replayed: boolean; request: { status: string } };
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "live approval rejection");
+      const firstRun = await waitForTerminalRun(runStore, "live-report-run");
+      await waitFor(() => writer.comments.filter((comment) => comment.body.includes("Status: rejected")).length === 1, "terminal rejection comment");
+
+      const replay = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const replayBody = (await replay.json()) as { replayed: boolean; request: { status: string } };
+      const replayRun = await waitForTerminalRun(runStore, "live-report-run");
+
+      expect(first.status).toBe(200);
+      expect(firstBody).toMatchObject({ replayed: false, request: { status: "rejected" } });
+      expect(replay.status).toBe(200);
+      expect(replayBody).toMatchObject({ replayed: true, request: { status: "rejected" } });
+      expect(replayRun).toMatchObject({
+        status: "cancelled",
+        completedAt: firstRun.completedAt,
+        pendingApprovalRequestId: null,
+      });
+      expect(replayRun.status).not.toBe("succeeded");
+      expect(publisher.inputs).toEqual([]);
+      expect(writer.comments.filter((comment) => comment.body.includes("Status: rejected"))).toHaveLength(1);
+      expect(writer.comments.some((comment) => comment.dedupeKey === "live-report-run:completion-report:idem-live")).toBe(false);
+      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+      await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: "publication approval rejected",
+        incompleteTurnCount: 0,
+        completionReports: [
+          {
+            runId: "live-report-run",
+            idempotencyKey: "idem-live",
+            writebackOperationKeys: [],
+          },
+        ],
+      });
+      await orchestrator.refreshNow();
+      expect(harness.prompts).toHaveLength(1);
+      expect(orchestrator.snapshot().counts.retrying).toBe(0);
+    } finally {
+      await server.stop();
+      await orchestrator.stop();
+    }
+  });
+
+  it("approves live pending publication after a Blocked reconciliation tick without cancelling the worker", async () => {
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-live",
+    });
+    const harness = new LiveCompletionReportHarness(lifecycleStore, outboxStore, runStore, publisher, service, writeback);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      completionReportPublisher: publisher,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      writebackOutbox: outboxStore,
+      operatorApproval: service,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: {
+        activeStates: ["Todo", "In Progress"],
+        handoffStates: ["In Review"],
+        reviewStates: ["In Review"],
+        blockedStates: ["Blocked"],
+        terminalStates: ["Done"],
+      },
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      await orchestrator.refreshNow();
+      const pending = await waitForPendingRun(store, "live-report-run");
+      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+      expect(orchestrator.snapshot().counts.running).toBe(1);
+
+      await orchestrator.refreshNow();
+      expect(orchestrator.snapshot().counts.running).toBe(1);
+      const runningRun = await runStore.getRun("live-report-run");
+      expect(runningRun).toMatchObject({ status: "running", pendingApprovalRequestId: pending.requestId });
+      expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+        incompleteTurnCount: 0,
+      });
+
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as { replayed: boolean; request: { status: string } };
+
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({ replayed: false, request: { status: "approved" } });
+      await waitFor(() => publisher.inputs.length === 1, "service-owned live publication");
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "live worker approval exit");
+      expect(publisher.inputs[0]).toMatchObject({
+        branchName: "symphony/TEST-1",
+        baseBranch: "main",
+        evidenceCursor: "idem-live",
+      });
+      const transitionStates = writer.transitions.map((transition) => transition.toState);
+      expect(transitionStates.slice(0, 2)).toEqual(["Todo", "Blocked"]);
+      expect(transitionStates).toContain("In Review");
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "review",
+        blockedReason: null,
+        incompleteTurnCount: 0,
+        completionReports: [
+          expect.objectContaining({
+            runId: "live-report-run",
+            idempotencyKey: "idem-live",
+            pullRequest: {
+              url: "https://github.com/acme/symphony/pull/42",
+              number: 42,
+              headSha: "abc123",
+              branch: "symphony/TEST-1",
+            },
+          }),
+        ],
+      });
+      await expect(runStore.getRun("live-report-run")).resolves.toMatchObject({
+        status: "succeeded",
+        pendingApprovalRequestId: null,
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+      });
+
+      await orchestrator.refreshNow();
+      expect(harness.roles.filter((role) => role === "worker")).toHaveLength(1);
+      expect(orchestrator.snapshot().counts.retrying).toBe(0);
+    } finally {
+      await server.stop();
+      await orchestrator.stop();
+    }
+  });
+
+  it("preserves a live worker when pending audit writeback partially fails after Blocked transition", async () => {
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new FailingCommentWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    let releaseGatedProcessDue: () => void = () => undefined;
+    let gatedProcessDueCompleted = false;
+    const gatedProcessDue = new Promise<void>((resolve) => {
+      releaseGatedProcessDue = resolve;
+    });
+    const completionReportWriteback = {
+      async processDue() {
+        await writeback.processDue();
+        gatedProcessDueCompleted = true;
+        await gatedProcessDue;
+      },
+    };
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-live",
+    });
+    const harness = new LiveCompletionReportHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+      publisher,
+      service,
+      completionReportWriteback,
+    );
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      completionReportPublisher: publisher,
+    });
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => currentState === "Blocked" && gatedProcessDueCompleted, "partial pending audit writeback");
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+        incompleteTurnCount: 0,
+        completionReports: [
+          expect.objectContaining({
+            runId: "live-report-run",
+            idempotencyKey: "idem-live",
+            writebackOperationKeys: [],
+          }),
+        ],
+      });
+      await expect(store.findPendingForRun("live-report-run")).resolves.toBeNull();
+
+      await (
+        orchestrator as unknown as {
+          reconcileRunningIssues(): Promise<void>;
+        }
+      ).reconcileRunningIssues();
+
+      expect(orchestrator.snapshot().counts.running).toBe(1);
+      const runningRun = await runStore.getRun("live-report-run");
+      expect(runningRun).toMatchObject({ status: "running" });
+      expect(runningRun?.pendingApprovalRequestId ?? null).toBeNull();
+      expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
+      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+    } finally {
+      releaseGatedProcessDue();
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "partial failure worker exit").catch(() => undefined);
+      await orchestrator.stop();
+    }
+  });
+
+  it("approves persisted publication through a real orchestrator after the worker exits", async () => {
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.pollIntervalMs = 5;
+    config.workspace.source.baseRef = "main";
+
+    const runId = "run-1";
+    const evidenceCursor = "idem-1";
+    const workspacePath = path.join(root, "workspace");
+    const reportSummary = "Implemented the requested change.";
+    const pullRequestUrl = "https://github.com/acme/symphony/pull/42";
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: pullRequestUrl,
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor,
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      completionReportPublisher: publisher,
+      operatorApproval: service,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      writebackOutbox: outboxStore,
+      operatorApproval: service,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: {
+        activeStates: ["Todo", "In Progress"],
+        handoffStates: ["In Review"],
+        reviewStates: ["In Review"],
+        blockedStates: ["Blocked"],
+        terminalStates: ["Done"],
+      },
+      staleThresholdMs: 300_000,
+    });
+
+    await runStore.updateRun(runId, {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:00.000Z",
+      metadata: {
+        gitBranchName: "symphony/TEST-1",
+        repoPath: root,
+        baseRef: "main",
+      },
+    });
+    const preApprovalRun = await runStore.getRun(runId);
+    expect(preApprovalRun).toMatchObject({
+      status: "succeeded",
+      workspacePath,
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    expect(preApprovalRun?.status).not.toBe("running");
+
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      lastCompletionReportId: `completion-report:${candidate.id}:${evidenceCursor}`,
+      completionReports: [
+        {
+          id: `completion-report:${candidate.id}:${evidenceCursor}`,
+          idempotencyKey: evidenceCursor,
+          runId,
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          summary: reportSummary,
+          validationEvidence: ["npm test -- orchestrator"],
+          acceptanceChecklist: [
+            {
+              text: "Reviewer dispatch is covered.",
+              satisfied: true,
+              evidence: "Approval status API integration test",
+            },
+          ],
+          changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
+          branchName: candidate.branchName,
+          pullRequest: null,
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      summaryPointers: {
+        workspaceKey: candidate.identifier,
+        workspacePath,
+        branchName: candidate.branchName,
+        gitBranchName: candidate.branchName,
+        repoPath: root,
+        baseRef: "main",
+        lastRunId: runId,
+      },
+    });
+    await orchestrator.refreshNow();
+    const pending = await waitForPendingRun(store, runId);
+    await orchestrator.refreshNow();
+
+    await expect(store.findPendingForRun(runId)).resolves.toMatchObject({
+      status: "pending",
+      runId,
+      evidenceCursor,
+    });
+    expect((await store.list()).filter((approval) => approval.runId === runId)).toHaveLength(1);
+    await expect(runStore.getRun(runId)).resolves.toMatchObject({
+      status: "succeeded",
+      pendingApprovalRequestId: pending.requestId,
+      pendingApprovalRequestedAt: expect.any(String),
+    });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      completionReports: [
+        expect.objectContaining({
+          runId,
+          idempotencyKey: evidenceCursor,
+          summary: reportSummary,
+          pullRequest: null,
+          writebackOperationKeys: [],
+        }),
+      ],
+    });
+    expect(publisher.inputs).toEqual([]);
+    expect(orchestrator.snapshot().counts.running).toBe(0);
+    expect(harness.runs).toEqual([]);
+    const preApprovalTranscript = await runStore.readTranscript(runId);
+    expect(preApprovalTranscript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
+    const pendingAuditOperations = (await outboxStore.list()).filter((operation) =>
+      operation.idempotencyKey.includes("publication-approval-pending"),
+    );
+    expect(pendingAuditOperations).toHaveLength(2);
+    expect(pendingAuditOperations.map((operation) => operation.status)).toEqual(["succeeded", "succeeded"]);
+
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const approve = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const approveBody = (await approve.json()) as { request: { status: string }; replayed: boolean };
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const issueBody = (await issueResponse.json()) as {
+        capabilities: { pendingApproval: { active: boolean } };
+        issueDetails: { pullRequest: { url: string | null; number: number | null; headSha: string | null; branch: string | null } };
+      };
+
+      expect(approve.status).toBe(200);
+      expect(approveBody).toMatchObject({ request: { status: "approved" }, replayed: false });
+      expect(issueBody.capabilities.pendingApproval.active).toBe(false);
+      expect(issueBody.issueDetails.pullRequest).toMatchObject({
+        url: pullRequestUrl,
+        number: 42,
+        headSha: "abc123",
+        branch: "symphony/TEST-1",
+      });
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "approved" });
+
+      expect(publisher.inputs).toHaveLength(1);
+      expect(publisher.inputs[0]).toMatchObject({
+        workspacePath,
+        branchName: "symphony/TEST-1",
+        baseBranch: "main",
+        evidenceCursor,
+      });
+      const acceptedComments = writer.comments.filter((comment) => comment.body.includes("## Symphony Completion Report"));
+      expect(acceptedComments).toHaveLength(1);
+      expect(acceptedComments[0]?.body).toContain("Status: accepted");
+      expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Publication Approval Setup Incomplete"))).toHaveLength(1);
+      expect(writer.transitions.filter((transition) => transition.toState === "Blocked")).toHaveLength(1);
+      const reviewTransitions = writer.transitions.filter((transition) => transition.toState === "In Review");
+      expect(reviewTransitions).toHaveLength(1);
+      expect(currentState).toBe("In Review");
+
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "review",
+        blockedReason: null,
+        completionReports: [
+          expect.objectContaining({
+            runId,
+            idempotencyKey: evidenceCursor,
+            pullRequest: {
+              url: pullRequestUrl,
+              number: 42,
+              headSha: "abc123",
+              branch: "symphony/TEST-1",
+            },
+            writebackOperationKeys: [
+              "comment:issue-1:run-1:completion-report:idem-1",
+              "transition:issue-1:run-1:completion-report:idem-1:In Review",
+            ],
+          }),
+        ],
+      });
+      await expect(runStore.getRun(runId)).resolves.toMatchObject({
+        status: "succeeded",
+        pendingApprovalRequestId: null,
+        prUrl: pullRequestUrl,
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+      });
+
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          harness.runs.filter((run) => run.ctx.role === "reviewer").length === 1 &&
+          harness.runs.filter((run) => run.ctx.role === "worker").length === 0,
+        "reviewer dispatch from stored completion report",
+      );
+      const workerRuns = harness.runs.filter((run) => run.ctx.role === "worker");
+      const reviewerRuns = harness.runs.filter((run) => run.ctx.role === "reviewer");
+      expect(workerRuns).toHaveLength(0);
+      expect(reviewerRuns).toHaveLength(1);
+      expect(reviewerRuns[0]?.prompt).toContain(reportSummary);
+      expect(reviewerRuns[0]?.prompt).toContain(`Pull request: ${pullRequestUrl}`);
+
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "post-approve reviewer quiescence");
+
+      // Approve replays still enter the publication resume hook; finalized report state must keep that path idempotent.
+      const approvedCommentBeforeReplay = writer.comments.find((comment) => comment.body.includes("Status: accepted"));
+      const approvedTransitionBeforeReplay = writer.transitions.find((transition) => transition.toState === "In Review");
+      const lifecycleBeforeReplay = await lifecycleStore.get(candidate.id);
+      const completionReportBeforeReplay = lifecycleBeforeReplay?.completionReports.find(
+        (report) => report.idempotencyKey === evidenceCursor,
+      );
+      const workerRunBeforeReplay = await runStore.getRun(runId);
+      const run1TranscriptBeforeReplay = await runStore.readTranscript(runId);
+      const approvalRequestCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
+        (event) => event.eventType === "approval_request",
+      ).length;
+      const approvalResolvedCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
+        (event) => event.eventType === "approval_resolved",
+      ).length;
+      const prOpenedCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
+        (event) => event.eventType === "pr_opened",
+      ).length;
+      const prUpdatedCountBeforeReplay = run1TranscriptBeforeReplay.events.filter(
+        (event) => event.eventType === "pr_updated",
+      ).length;
+      const replayBaseline = {
+        publisherCallCount: publisher.inputs.length,
+        commentCount: writer.comments.length,
+        transitionCount: writer.transitions.length,
+        acceptedWriteback: {
+          commentBodyIncludesStatusAccepted: approvedCommentBeforeReplay?.body.includes("Status: accepted") ?? false,
+          commentDedupeKey: approvedCommentBeforeReplay?.dedupeKey ?? null,
+          transitionToState: approvedTransitionBeforeReplay?.toState ?? null,
+        },
+        currentState,
+        lifecycle: {
+          phase: lifecycleBeforeReplay?.phase,
+          blockedReason: lifecycleBeforeReplay?.blockedReason,
+          lastPushedAt: lifecycleBeforeReplay?.summaryPointers.lastPushedAt,
+          lastEvidenceCursor: lifecycleBeforeReplay?.summaryPointers.lastEvidenceCursor,
+          pullRequest: completionReportBeforeReplay?.pullRequest ?? null,
+          writebackOperationKeys: completionReportBeforeReplay?.writebackOperationKeys ?? [],
+        },
+        workerRun: {
+          status: workerRunBeforeReplay?.status,
+          completedAt: workerRunBeforeReplay?.completedAt,
+          pendingApprovalRequestId: workerRunBeforeReplay?.pendingApprovalRequestId,
+          prUrl: workerRunBeforeReplay?.prUrl,
+          prNumber: workerRunBeforeReplay?.prNumber,
+          prHeadSha: workerRunBeforeReplay?.prHeadSha,
+          prBranch: workerRunBeforeReplay?.prBranch,
+          lastPushedAt: workerRunBeforeReplay?.lastPushedAt,
+          lastEvidenceCursor: workerRunBeforeReplay?.lastEvidenceCursor,
+        },
+        workerRunCount: harness.runs.filter((run) => run.ctx.role === "worker").length,
+        reviewerRunCount: harness.runs.filter((run) => run.ctx.role === "reviewer").length,
+        persistedRunCount: (await runStore.listRunsForIssue(candidate.id)).length,
+        approvalRequestCount: approvalRequestCountBeforeReplay,
+        approvalResolvedCount: approvalResolvedCountBeforeReplay,
+        prOpenedCount: prOpenedCountBeforeReplay,
+        prUpdatedCount: prUpdatedCountBeforeReplay,
+      };
+      expect(replayBaseline.lifecycle.lastPushedAt).toBe("2026-01-01T00:00:01Z");
+      expect(replayBaseline.lifecycle.lastEvidenceCursor).toBe(evidenceCursor);
+      expect(replayBaseline.workerRun.lastPushedAt).toBe("2026-01-01T00:00:01Z");
+      expect(replayBaseline.workerRun.lastEvidenceCursor).toBe(evidenceCursor);
+      expect(replayBaseline.approvalRequestCount).toBe(1);
+      expect(replayBaseline.approvalResolvedCount).toBe(1);
+      expect(replayBaseline.prOpenedCount).toBe(1);
+      expect(replayBaseline.prUpdatedCount).toBe(0);
+
+      const replay = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const replayBody = (await replay.json()) as { request: { status: string }; replayed: boolean };
+
+      expect(replay.status).toBe(200);
+      expect(replayBody).toMatchObject({ request: { status: "approved" }, replayed: true });
+      const replayIssueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const replayIssueBody = (await replayIssueResponse.json()) as {
+        issueDetails: { pullRequest: { url: string | null; number: number | null; headSha: string | null; branch: string | null } };
+      };
+      expect(replayIssueBody.issueDetails.pullRequest).toEqual(issueBody.issueDetails.pullRequest);
+      expect(publisher.inputs).toHaveLength(replayBaseline.publisherCallCount);
+      expect(writer.comments).toHaveLength(replayBaseline.commentCount);
+      expect(writer.transitions).toHaveLength(replayBaseline.transitionCount);
+      const approvedCommentAfterReplay = writer.comments.find((comment) => comment.body.includes("Status: accepted"));
+      const approvedTransitionAfterReplay = writer.transitions.find((transition) => transition.toState === "In Review");
+      expect({
+        commentBodyIncludesStatusAccepted: approvedCommentAfterReplay?.body.includes("Status: accepted") ?? false,
+        commentDedupeKey: approvedCommentAfterReplay?.dedupeKey ?? null,
+        transitionToState: approvedTransitionAfterReplay?.toState ?? null,
+      }).toEqual(replayBaseline.acceptedWriteback);
+      expect(approvedCommentAfterReplay?.dedupeKey).toBe(`${runId}:completion-report:${evidenceCursor}`);
+      expect(approvedTransitionAfterReplay).toMatchObject({ toState: "In Review" });
+      expect(currentState).toBe(replayBaseline.currentState);
+
+      const lifecycleAfterReplay = await lifecycleStore.get(candidate.id);
+      const completionReportAfterReplay = lifecycleAfterReplay?.completionReports.find(
+        (report) => report.idempotencyKey === evidenceCursor,
+      );
+      expect({
+        phase: lifecycleAfterReplay?.phase,
+        blockedReason: lifecycleAfterReplay?.blockedReason,
+        lastPushedAt: lifecycleAfterReplay?.summaryPointers.lastPushedAt,
+        lastEvidenceCursor: lifecycleAfterReplay?.summaryPointers.lastEvidenceCursor,
+        pullRequest: completionReportAfterReplay?.pullRequest ?? null,
+        writebackOperationKeys: completionReportAfterReplay?.writebackOperationKeys ?? [],
+      }).toEqual(replayBaseline.lifecycle);
+
+      const workerRunAfterReplay = await runStore.getRun(runId);
+      expect({
+        status: workerRunAfterReplay?.status,
+        completedAt: workerRunAfterReplay?.completedAt,
+        pendingApprovalRequestId: workerRunAfterReplay?.pendingApprovalRequestId,
+        prUrl: workerRunAfterReplay?.prUrl,
+        prNumber: workerRunAfterReplay?.prNumber,
+        prHeadSha: workerRunAfterReplay?.prHeadSha,
+        prBranch: workerRunAfterReplay?.prBranch,
+        lastPushedAt: workerRunAfterReplay?.lastPushedAt,
+        lastEvidenceCursor: workerRunAfterReplay?.lastEvidenceCursor,
+      }).toEqual(replayBaseline.workerRun);
+
+      const run1TranscriptAfterReplay = await runStore.readTranscript(runId);
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_request")).toHaveLength(
+        replayBaseline.approvalRequestCount,
+      );
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_request")).toHaveLength(
+        1,
+      );
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_resolved")).toHaveLength(
+        replayBaseline.approvalResolvedCount,
+      );
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "approval_resolved")).toHaveLength(
+        1,
+      );
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "pr_opened")).toHaveLength(
+        replayBaseline.prOpenedCount,
+      );
+      expect(run1TranscriptAfterReplay.events.filter((event) => event.eventType === "pr_updated")).toHaveLength(
+        replayBaseline.prUpdatedCount,
+      );
+      expect(
+        run1TranscriptAfterReplay.events.filter((event) => ["pr_opened", "pr_updated"].includes(event.eventType)),
+      ).toHaveLength(1);
+      expect(harness.runs.filter((run) => run.ctx.role === "worker")).toHaveLength(replayBaseline.workerRunCount);
+      expect(harness.runs.filter((run) => run.ctx.role === "reviewer")).toHaveLength(replayBaseline.reviewerRunCount);
+      await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(replayBaseline.persistedRunCount);
+    } finally {
+      await server.stop();
+      await orchestrator.stop();
+    }
+  });
+
+  it("records terminal recovery when pending requests expire during status API resolution after worker exit", async () => {
     const pending = await createPending("idem-expired", -1);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
     const cancelled: string[] = [];
-    const server = statusServer({ cancelled });
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ cancelled, resumed, terminalRecords });
     const address = await server.start();
     try {
       const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
@@ -300,6 +1249,13 @@ describe("approval status API", () => {
       expect(response.status).toBe(409);
       expect(body.error).toMatchObject({ code: "conflict", message: "Approval request is expired" });
       expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toHaveLength(1);
+      expect(terminalRecords[0]).toMatchObject({
+        requestId: pending.requestId,
+        status: "expired",
+        staleReason: "approval request expired",
+      });
       await expect(store.get(pending.requestId)).resolves.toMatchObject({
         status: "expired",
         resolvedBy: "system",
@@ -313,6 +1269,156 @@ describe("approval status API", () => {
         eventType: "approval_resolved",
         payload: { status: "expired", staleReason: "approval request expired" },
       });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("records terminal recovery when pending requests become stale during status API resolution after worker exit", async () => {
+    const pending = await createPending("idem-stale");
+    await runStore.updateRun("run-1", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:00.000Z",
+      metadata: {
+        cancellationRequestedAt: "2026-01-01T00:00:01.000Z",
+        cancellationSource: "operator",
+        cancellationReason: "operator cancelled publication after worker exit",
+      },
+    });
+    const cancelled: string[] = [];
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ cancelled, resumed, terminalRecords });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({
+        code: "conflict",
+        message: "Approval request is stale: run cancellation has been requested",
+      });
+      expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toHaveLength(1);
+      expect(terminalRecords[0]).toMatchObject({
+        requestId: pending.requestId,
+        status: "stale",
+        staleReason: "run cancellation has been requested",
+      });
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({
+        status: "stale",
+        resolvedBy: "system",
+        decision: null,
+        staleReason: "run cancellation has been requested",
+      });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({ pendingApprovalRequestId: null });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("recovers already-terminal approval conflicts by refetching the approval record", async () => {
+    const pending = await createPending("idem-terminal-before-post");
+    const expired = await store.markExpired(pending.requestId);
+    const cancelled: string[] = [];
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({ cancelled, resumed, terminalRecords });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({ code: "conflict", message: "Approval request is expired" });
+      expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toHaveLength(1);
+      expect(terminalRecords[0]).toMatchObject({ requestId: expired.requestId, status: "expired" });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("preserves the original conflict response when terminal recovery writeback fails", async () => {
+    const pending = await createPending("idem-terminal-recorder-fails", -1);
+    const cancelled: string[] = [];
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({
+      cancelled,
+      resumed,
+      terminalRecords,
+      terminalError: new Error("writeback failed"),
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({ code: "conflict", message: "Approval request is expired" });
+      expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("preserves the original conflict response when fallback approval lookup fails", async () => {
+    const cancelled: string[] = [];
+    const resumed: OperatorApprovalRecord[] = [];
+    const terminalRecords: OperatorApprovalRecord[] = [];
+    const server = statusServer({
+      cancelled,
+      resumed,
+      terminalRecords,
+      operatorApproval: {
+        rejectPolicy: "cancel",
+        isRequired: () => true,
+        async get() {
+          throw new Error("approval store read failed");
+        },
+        async resolve() {
+          throw new SymphonyError("conflict", "Approval request is stale");
+        },
+        async findPendingForIssue() {
+          return null;
+        },
+        async findPendingForRun() {
+          return null;
+        },
+      },
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/request-without-details`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({ code: "conflict", message: "Approval request is stale" });
+      expect(cancelled).toEqual([]);
+      expect(resumed).toEqual([]);
+      expect(terminalRecords).toEqual([]);
     } finally {
       await server.stop();
     }
@@ -332,28 +1438,177 @@ describe("approval status API", () => {
     await runStore.updateRun("run-1", {
       metadata: { pendingApprovalRequestId: record.requestId, pendingApprovalRequestedAt: record.requestedAt },
     });
+    await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      lastCompletionReportId: `completion-report:issue-1:${evidenceCursor}`,
+      completionReports: [
+        {
+          id: `completion-report:issue-1:${evidenceCursor}`,
+          idempotencyKey: evidenceCursor,
+          runId: "run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Implemented the service contract.",
+          validationEvidence: ["npm test -- approval-status-api"],
+          acceptanceChecklist: [
+            {
+              text: "Approval controls are linked to the pending report.",
+              satisfied: true,
+              evidence: "approval status API test",
+            },
+          ],
+          changedFiles: ["src/core/CompletionReportService.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: null,
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      summaryPointers: {
+        workspacePath: path.join(root, "workspace"),
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: root,
+        baseRef: "main",
+      },
+    });
     return record;
   }
 
   async function waitForPending() {
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const pending = await store.findPendingForRun("run-1");
-      if (pending) return pending;
+      if (pending) {
+        await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
+          phase: "blocked",
+          blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          lastCompletionReportId: `completion-report:issue-1:${pending.evidenceCursor}`,
+          completionReports: [
+            {
+              id: `completion-report:issue-1:${pending.evidenceCursor}`,
+              idempotencyKey: pending.evidenceCursor,
+              runId: "run-1",
+              issueId: "issue-1",
+              issueIdentifier: "TEST-1",
+              summary: "Implemented the service contract.",
+              validationEvidence: ["npm test -- approval-status-api"],
+              acceptanceChecklist: [
+                {
+                  text: "Approval controls are linked to the pending report.",
+                  satisfied: true,
+                  evidence: "approval status API test",
+                },
+              ],
+              changedFiles: ["src/core/CompletionReportService.ts"],
+              branchName: "symphony/TEST-1",
+              pullRequest: null,
+              risks: [],
+              acceptedAt: "2026-01-01T00:00:00.000Z",
+              writebackOperationKeys: [],
+            },
+          ],
+          summaryPointers: {
+            workspacePath: path.join(root, "workspace"),
+            branchName: "symphony/TEST-1",
+            gitBranchName: "symphony/TEST-1",
+            repoPath: root,
+            baseRef: "main",
+          },
+        });
+        return pending;
+      }
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     throw new Error("pending approval was not created");
   }
 
-  function statusServer(options: { cancelled?: string[]; openWorkspaceToken?: string | null } = {}) {
+  async function waitForPendingRun(approvalStore: FileOperatorApprovalStore, runId: string, timeoutMs = 2_000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const pending = await approvalStore.findPendingForRun(runId);
+      if (pending) return pending;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`pending approval was not created for ${runId}`);
+  }
+
+  async function waitForRun(transcriptStore: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const run = await transcriptStore.getRun(runId);
+      if (run) return run;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`run was not recorded: ${runId}`);
+  }
+
+  async function waitForTerminalRun(transcriptStore: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      let run;
+      try {
+        run = await transcriptStore.getRun(runId);
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+      if (run && run.status !== "running") return run;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`run did not become terminal: ${runId}`);
+  }
+
+  async function waitFor(predicate: () => boolean, description: string, timeoutMs = 2_000): Promise<void> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(predicate(), `Timed out waiting for ${description}`).toBe(true);
+  }
+
+  async function rmWithRetry(target: string): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await rm(target, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if (attempt === 2) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  }
+
+  function statusServer(
+    options: {
+      cancelled?: string[];
+      resumed?: OperatorApprovalRecord[];
+      terminalRecords?: OperatorApprovalRecord[];
+      terminalError?: Error;
+      openWorkspaceToken?: string | null;
+      operatorApproval?: ConstructorParameters<typeof StatusServer>[0]["operatorApproval"];
+      resumeResult?: boolean | null;
+    } = {},
+  ) {
     const cancelled = options.cancelled ?? [];
+    const resumed = options.resumed ?? [];
+    const terminalRecords = options.terminalRecords ?? [];
     return new StatusServer({
-      orchestrator: fakeOrchestrator(cancelled, async () => {
-        await runStore.updateRun("run-1", {
-          status: "cancelled",
-          completedAt: new Date().toISOString(),
-          error: "Operator cancelled issue",
-        });
-      }),
+      orchestrator: fakeOrchestrator(
+        cancelled,
+        async () => {
+          await runStore.updateRun("run-1", {
+            status: "cancelled",
+            completedAt: new Date().toISOString(),
+            error: "Operator cancelled issue",
+          });
+        },
+        resumed,
+        terminalRecords,
+        options.terminalError,
+        options.resumeResult,
+      ),
       workspaceManager: new WorkspaceManager({
         workspace: config.workspace,
         hooks: config.hooks,
@@ -361,7 +1616,8 @@ describe("approval status API", () => {
       }),
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
       runStore,
-      operatorApproval: service,
+      lifecycleStore,
+      operatorApproval: options.operatorApproval ?? service,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: options.openWorkspaceToken === undefined ? "secret" : options.openWorkspaceToken,
@@ -391,7 +1647,14 @@ function action(evidenceCursor: string): OperatorApprovalAction {
   };
 }
 
-function fakeOrchestrator(cancelled: string[], onCancel?: (issueId: string) => Promise<void>): Orchestrator {
+function fakeOrchestrator(
+  cancelled: string[],
+  onCancel?: (issueId: string) => Promise<void>,
+  resumed: OperatorApprovalRecord[] = [],
+  terminalRecords: OperatorApprovalRecord[] = [],
+  terminalError?: Error,
+  resumeResult: boolean | null = true,
+): Orchestrator {
   return {
     snapshot() {
       return {
@@ -420,8 +1683,118 @@ function fakeOrchestrator(cancelled: string[], onCancel?: (issueId: string) => P
       cancelled.push(issueId);
       await onCancel?.(issueId);
     },
+    async resumeApprovedPublication(request: OperatorApprovalRecord) {
+      resumed.push(request);
+      return resumeResult as boolean;
+    },
+    async recordPublicationApprovalTerminal(request: OperatorApprovalRecord) {
+      terminalRecords.push(request);
+      if (terminalError) throw terminalError;
+      return false;
+    },
     async createContinuationSummary() {
       throw new Error("not implemented");
     },
   } as unknown as Orchestrator;
+}
+
+class LiveCompletionReportHarness implements AgentHarness {
+  readonly id = "live-completion-report";
+  readonly prompts: string[] = [];
+  readonly roles: string[] = [];
+
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly outboxStore: FileWritebackOutboxStore,
+    private readonly runStore: FileRunTranscriptStore,
+    private readonly publisher: CompletionReportPullRequestPublisher,
+    private readonly operatorApproval: OperatorApprovalService,
+    private readonly writebackProcessor: Pick<WritebackProcessor, "processDue">,
+  ) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.prompts.push(prompt);
+    this.roles.push(ctx.role);
+    if (ctx.role === "reviewer") {
+      yield { type: "session_started", sessionId: "live-review-session", runId: "live-review-run" };
+      yield { type: "completed" };
+      return;
+    }
+    yield { type: "session_started", sessionId: "live-report-session", runId: "live-report-run" };
+    await new CompletionReportService({
+      config: ctx.config,
+      lifecycleStore: this.lifecycleStore,
+      writebackOutbox: this.outboxStore,
+      writebackProcessor: this.writebackProcessor,
+      runStore: this.runStore,
+      pullRequestPublisher: this.publisher,
+      operatorApproval: this.operatorApproval,
+    }).submitCompletionReport(
+      {
+        runId: "live-report-run",
+        issueId: ctx.issue.id,
+        summary: "Implemented the requested handoff.",
+        validationEvidence: ["npm test"],
+        acceptanceChecklist: [
+          {
+            text: "Completion report handoff is live.",
+            satisfied: true,
+            evidence: "Approval status API integration test",
+          },
+        ],
+        changedFiles: ["src/core/CompletionReportService.ts"],
+        branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
+        pullRequest: null,
+        risks: [],
+        idempotencyKey: "idem-live",
+      },
+      {
+        issue: ctx.issue,
+        activeRunId: "live-report-run",
+        role: "worker",
+        sessionId: "live-report-session",
+        workspacePath: ctx.workspace.path,
+        workspace: ctx.workspace,
+        phase: "implementation",
+      },
+    );
+    yield { type: "completed" };
+  }
+}
+
+class FakeCompletionReportPublisher implements CompletionReportPullRequestPublisher {
+  readonly inputs: CompletionReportPullRequestPublicationInput[] = [];
+
+  constructor(private readonly publication: CompletionReportPullRequestPublication) {}
+
+  async publishPullRequest(
+    input: CompletionReportPullRequestPublicationInput,
+  ): Promise<CompletionReportPullRequestPublication> {
+    this.inputs.push(input);
+    return this.publication;
+  }
+}
+
+class StateChangingWriter implements TrackerWriter {
+  readonly transitions: TrackerTransitionInput[] = [];
+  readonly comments: TrackerCommentInput[] = [];
+
+  constructor(private readonly setState: (state: string) => void) {}
+
+  async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+    this.transitions.push(input);
+    this.setState(input.toState);
+    return { status: "applied" };
+  }
+
+  async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    this.comments.push(input);
+    return { status: "applied" };
+  }
+}
+
+class FailingCommentWriter extends StateChangingWriter {
+  async createIssueComment(_input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    throw new Error("linear comment failed");
+  }
 }
