@@ -4,7 +4,13 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
-import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
+import type {
+  TrackerCommentInput,
+  TrackerIssueCreateInput,
+  TrackerTransitionInput,
+  TrackerWriteResult,
+  TrackerWriter,
+} from "../src/core/tracker/TrackerWriter.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 
 describe("FileWritebackOutboxStore", () => {
@@ -252,11 +258,45 @@ describe("FileWritebackOutboxStore", () => {
     ).resolves.toMatchObject({ status: "skipped" });
     expect(writer.transitions).toHaveLength(0);
   });
+
+  it("processes issue creation writebacks and persists child issue evidence", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+
+    const result = await processor.enqueueAndProcess({
+      idempotencyKey: "issue-create:issue-1:plan-1:0:hash",
+      kind: "issue_create",
+      issueId: "issue-1",
+      runId: "run-plan-1",
+      payload: {
+        parentIssueId: "issue-1",
+        title: "Child issue",
+        description: "Description",
+        acceptanceCriteria: ["Done"],
+        requestedLabels: ["planning"],
+        dependencies: [],
+        dedupeKey: "issue-breakdown:plan-1:0:hash",
+        payloadHash: "hash",
+        planId: "plan-1",
+        proposedIssueIndex: 0,
+      },
+    });
+
+    expect(result.status).toBe("succeeded");
+    expect(result.resultEvidence).toMatchObject({
+      kind: "issue_create",
+      issueCreateStatus: "created",
+      issue: { id: "child-1", identifier: "TEST-2" },
+    });
+    expect(writer.issueCreates).toHaveLength(1);
+  });
 });
 
 class FakeWriter implements TrackerWriter {
   readonly transitions: TrackerTransitionInput[] = [];
   readonly comments: TrackerCommentInput[] = [];
+  readonly issueCreates: TrackerIssueCreateInput[] = [];
 
   constructor(private readonly options: { transitionStatus?: TrackerWriteResult["status"] } = {}) {}
 
@@ -269,6 +309,22 @@ class FakeWriter implements TrackerWriter {
   async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
     this.comments.push(input);
     return { status: "applied" };
+  }
+
+  async createIssueFromPlan(input: TrackerIssueCreateInput): Promise<TrackerWriteResult> {
+    this.issueCreates.push(input);
+    return {
+      status: "applied",
+      evidence: {
+        kind: "issue_create",
+        issue: { id: "child-1", identifier: "TEST-2", url: "https://linear.test/TEST-2" },
+        issueCreateStatus: "created",
+        parentIssueId: input.parentIssueId,
+        dedupeKey: input.dedupeKey,
+        payloadHash: input.payloadHash,
+        unresolvedLabelNames: [],
+      },
+    };
   }
 }
 

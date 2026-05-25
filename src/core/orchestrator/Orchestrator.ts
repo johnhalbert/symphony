@@ -28,6 +28,7 @@ import {
   latestFreshIssueBreakdownPlan,
   renderIssueBreakdownPlanSummary,
 } from "../IssueBreakdownPlanService.js";
+import { IssueBreakdownPlanApplyService } from "../IssueBreakdownPlanApplyService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
   DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE,
@@ -175,7 +176,7 @@ interface ReviewerDispatchEvidence {
 
 type WorkerDispatchDecision =
   | { action: "dispatch"; runPhase: AgentRunPhase }
-  | { action: "skip"; reason: "planning_required_no_lifecycle_store" };
+  | { action: "skip"; reason: string };
 
 export interface RetryEntry {
   issueId: string;
@@ -985,9 +986,25 @@ export class Orchestrator {
     if (!this.passesIssueBreakdownRouting(issue)) return { action: "dispatch", runPhase: "implementation" };
     if (!this.options.lifecycleStore) return { action: "skip", reason: "planning_required_no_lifecycle_store" };
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.config);
+    if (plan === null) return { action: "dispatch", runPhase: "issue_breakdown" };
+    if (this.config.issueBreakdown.applyToLinear.enabled) {
+      const result = await new IssueBreakdownPlanApplyService({
+        config: this.config,
+        lifecycleStore: this.options.lifecycleStore,
+        writeback: this.options.writeback,
+      }).applyLatestFreshPlan(issue);
+      return {
+        action: "skip",
+        reason:
+          result.status === "applied"
+            ? "issue_breakdown_applied_to_linear"
+            : `issue_breakdown_apply_${result.status}`,
+      };
+    }
     return {
       action: "dispatch",
-      runPhase: latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) === null ? "issue_breakdown" : "implementation",
+      runPhase: "implementation",
     };
   }
 

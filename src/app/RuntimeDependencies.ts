@@ -25,6 +25,7 @@ export function createRuntimeWritebackProcessor(
     logger,
     config.writeback.maxBackoffMs,
     new FileIssueLifecycleStore(config.workspace.stateDir),
+    config.writeback.mode === "dry_run",
   );
 }
 

@@ -34,7 +34,13 @@ import type {
   RemotePullRequestReviewEvidence,
 } from "../src/core/review/PullRequestReviewEvidenceService.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
-import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
+import type {
+  TrackerCommentInput,
+  TrackerIssueCreateInput,
+  TrackerTransitionInput,
+  TrackerWriteResult,
+  TrackerWriter,
+} from "../src/core/tracker/TrackerWriter.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -182,6 +188,57 @@ describe("Orchestrator", () => {
       runPhase: "implementation",
       runKind: "implementation",
     });
+  }, 10_000);
+
+  it("applies accepted issue breakdown plans to Linear child issues and skips parent implementation", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const writer = new StateChangingWriter(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      writeback: new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
+    await orchestrator.refreshNow();
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(writer.issueCreates).toHaveLength(1);
+    expect(harness.runs.filter((run) => run.ctx.runPhase === "implementation")).toHaveLength(0);
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
+    expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs[0]).toMatchObject({ id: "child-1", status: "created" });
   }, 10_000);
 
   it("reroutes implementation dispatch to planning when writeback reveals stale issue content", async () => {
@@ -5756,6 +5813,7 @@ class FakePullRequestReviewEvidenceClient implements PullRequestReviewEvidenceCl
 class StateChangingWriter implements TrackerWriter {
   readonly transitions: TrackerTransitionInput[] = [];
   readonly comments: TrackerCommentInput[] = [];
+  readonly issueCreates: TrackerIssueCreateInput[] = [];
 
   constructor(private readonly setState: (state: string) => void) {}
 
@@ -5768,6 +5826,22 @@ class StateChangingWriter implements TrackerWriter {
   async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
     this.comments.push(input);
     return { status: "applied" };
+  }
+
+  async createIssueFromPlan(input: TrackerIssueCreateInput): Promise<TrackerWriteResult> {
+    this.issueCreates.push(input);
+    return {
+      status: "applied",
+      evidence: {
+        kind: "issue_create",
+        issue: { id: "child-1", identifier: "TEST-2", url: "https://linear.test/TEST-2" },
+        issueCreateStatus: "created",
+        parentIssueId: input.parentIssueId,
+        dedupeKey: input.dedupeKey,
+        payloadHash: input.payloadHash,
+        unresolvedLabelNames: [],
+      },
+    };
   }
 }
 

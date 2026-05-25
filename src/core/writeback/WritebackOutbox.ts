@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { IssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
-import type { TrackerWriter } from "../tracker/TrackerWriter.js";
+import type { TrackerWriteEvidence, TrackerWriteResult, TrackerWriter } from "../tracker/TrackerWriter.js";
 import { errorMessage } from "../errors.js";
 
 export type WritebackStatus = "pending" | "in_flight" | "succeeded" | "skipped" | "retrying" | "dead_letter";
@@ -19,6 +19,9 @@ export type WritebackOperation =
       updatedAt: string;
       nextAttemptAt: string;
       lastError: string | null;
+      resultStatus: TrackerWriteResult["status"] | null;
+      resultMessage: string | null;
+      resultEvidence: TrackerWriteEvidence | null;
       payload: { toState: string; fromStates?: string[]; reason?: string };
     }
   | {
@@ -32,14 +35,54 @@ export type WritebackOperation =
       updatedAt: string;
       nextAttemptAt: string;
       lastError: string | null;
+      resultStatus: TrackerWriteResult["status"] | null;
+      resultMessage: string | null;
+      resultEvidence: TrackerWriteEvidence | null;
       payload: { body: string; dedupeKey: string };
+    }
+  | {
+      idempotencyKey: string;
+      kind: "issue_create";
+      issueId: string;
+      runId?: string;
+      status: WritebackStatus;
+      attempt: number;
+      createdAt: string;
+      updatedAt: string;
+      nextAttemptAt: string;
+      lastError: string | null;
+      resultStatus: TrackerWriteResult["status"] | null;
+      resultMessage: string | null;
+      resultEvidence: TrackerWriteEvidence | null;
+      payload: {
+        parentIssueId: string;
+        title: string;
+        description: string;
+        acceptanceCriteria: string[];
+        requestedLabels: string[];
+        dependencies: string[];
+        dedupeKey: string;
+        payloadHash: string;
+        planId: string;
+        proposedIssueIndex: number;
+      };
     };
 
-type PersistedWritebackFields = "status" | "attempt" | "createdAt" | "updatedAt" | "nextAttemptAt" | "lastError";
+type PersistedWritebackFields =
+  | "status"
+  | "attempt"
+  | "createdAt"
+  | "updatedAt"
+  | "nextAttemptAt"
+  | "lastError"
+  | "resultStatus"
+  | "resultMessage"
+  | "resultEvidence";
 
 export type NewWritebackOperation =
   | Omit<Extract<WritebackOperation, { kind: "transition" }>, PersistedWritebackFields>
-  | Omit<Extract<WritebackOperation, { kind: "comment" }>, PersistedWritebackFields>;
+  | Omit<Extract<WritebackOperation, { kind: "comment" }>, PersistedWritebackFields>
+  | Omit<Extract<WritebackOperation, { kind: "issue_create" }>, PersistedWritebackFields>;
 
 export class FileWritebackOutboxStore {
   constructor(private readonly stateDir: string) {}
@@ -56,6 +99,9 @@ export class FileWritebackOutboxStore {
       updatedAt: now,
       nextAttemptAt: now,
       lastError: null,
+      resultStatus: null,
+      resultMessage: null,
+      resultEvidence: null,
     } as WritebackOperation;
     await this.write(record);
     return record;
@@ -75,12 +121,24 @@ export class FileWritebackOutboxStore {
     return due;
   }
 
-  async markSucceeded(record: WritebackOperation): Promise<WritebackOperation> {
-    return this.update(record, { status: "succeeded", lastError: null });
+  async markSucceeded(record: WritebackOperation, result?: TrackerWriteResult): Promise<WritebackOperation> {
+    return this.update(record, {
+      status: "succeeded",
+      lastError: null,
+      resultStatus: result?.status ?? null,
+      resultMessage: result?.message ?? null,
+      resultEvidence: result?.evidence ?? null,
+    });
   }
 
-  async markSkipped(record: WritebackOperation, message: string): Promise<WritebackOperation> {
-    return this.update(record, { status: "skipped", lastError: message });
+  async markSkipped(record: WritebackOperation, message: string, result?: TrackerWriteResult): Promise<WritebackOperation> {
+    return this.update(record, {
+      status: "skipped",
+      lastError: message,
+      resultStatus: result?.status ?? null,
+      resultMessage: result?.message ?? message,
+      resultEvidence: result?.evidence ?? null,
+    });
   }
 
   async requeueSkipped(record: WritebackOperation): Promise<WritebackOperation> {
@@ -145,6 +203,7 @@ export class WritebackProcessor {
     private readonly logger: Logger,
     private readonly maxBackoffMs: number,
     private readonly lifecycleStore?: Pick<IssueLifecycleStore, "get">,
+    private readonly dryRun = false,
   ) {}
 
   async enqueueAndProcess(operation: NewWritebackOperation, options: { retrySkipped?: boolean } = {}): Promise<WritebackOperation> {
@@ -167,9 +226,9 @@ export class WritebackProcessor {
         }
         const result = await this.execute(record);
         if (result.status === "applied" || result.status === "verified") {
-          await this.store.markSucceeded(record);
+          await this.store.markSucceeded(record, result);
         } else {
-          await this.store.markSkipped(record, result.message ?? `Writeback ${result.status}`);
+          await this.store.markSkipped(record, result.message ?? `Writeback ${result.status}`, result);
         }
       } catch (error) {
         const message = errorMessage(error);
@@ -199,6 +258,9 @@ export class WritebackProcessor {
   }
 
   private async execute(record: WritebackOperation) {
+    if (this.dryRun) {
+      return dryRunResult(record);
+    }
     if (record.kind === "transition") {
       return this.writer.transitionIssueState({
         issueId: record.issueId,
@@ -207,12 +269,45 @@ export class WritebackProcessor {
         ...(record.payload.reason === undefined ? {} : { reason: record.payload.reason }),
       });
     }
-    return this.writer.createIssueComment({
-      issueId: record.issueId,
-      body: record.payload.body,
+    if (record.kind === "comment") {
+      return this.writer.createIssueComment({
+        issueId: record.issueId,
+        body: record.payload.body,
+        dedupeKey: record.payload.dedupeKey,
+      });
+    }
+    if (!this.writer.createIssueFromPlan) {
+      throw new Error("Tracker writer does not support issue_create writeback operations");
+    }
+    return this.writer.createIssueFromPlan({
+      parentIssueId: record.payload.parentIssueId,
+      title: record.payload.title,
+      description: record.payload.description,
+      acceptanceCriteria: record.payload.acceptanceCriteria,
+      requestedLabels: record.payload.requestedLabels,
+      dependencies: record.payload.dependencies,
       dedupeKey: record.payload.dedupeKey,
+      payloadHash: record.payload.payloadHash,
     });
   }
+}
+
+function dryRunResult(record: WritebackOperation): TrackerWriteResult {
+  if (record.kind !== "issue_create") return { status: "dry_run", message: "Writeback dry_run" };
+  return {
+    status: "dry_run",
+    message: "Writeback dry_run",
+    evidence: {
+      kind: "issue_create",
+      issue: null,
+      issueCreateStatus: "dry_run",
+      parentIssueId: record.payload.parentIssueId,
+      dedupeKey: record.payload.dedupeKey,
+      payloadHash: record.payload.payloadHash,
+      unresolvedLabelNames: record.payload.requestedLabels,
+      message: "Writeback dry_run",
+    },
+  };
 }
 
 function isPullRequestHandoffOperation(record: WritebackOperation): boolean {
@@ -242,6 +337,9 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
   }
   if (record.kind === "comment" && operation.kind === "comment") {
     return record.payload.body === operation.payload.body && record.payload.dedupeKey === operation.payload.dedupeKey;
+  }
+  if (record.kind === "issue_create" && operation.kind === "issue_create") {
+    return JSON.stringify(record.payload) === JSON.stringify(operation.payload);
   }
   return false;
 }

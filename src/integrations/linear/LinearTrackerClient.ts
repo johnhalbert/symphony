@@ -1,7 +1,14 @@
 import type { TrackerConfig } from "../../core/config/Config.js";
 import { SymphonyError } from "../../core/errors.js";
 import type { TrackerClient } from "../../core/tracker/TrackerClient.js";
-import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../../core/tracker/TrackerWriter.js";
+import type {
+  TrackerCommentInput,
+  TrackerIssueCreateInput,
+  TrackerIssueRef,
+  TrackerTransitionInput,
+  TrackerWriteResult,
+  TrackerWriter,
+} from "../../core/tracker/TrackerWriter.js";
 import type { Issue, IssueBlockerRef } from "../../core/types.js";
 
 type FetchLike = typeof fetch;
@@ -83,6 +90,28 @@ interface LinearIssueWriteContext {
   state?: { id?: unknown; name?: unknown } | null;
   team?: { states?: { nodes?: LinearWorkflowStateNode[] } } | null;
   comments?: { nodes?: Array<{ id?: unknown; body?: unknown }> } | null;
+}
+
+interface LinearIssueLabelNode {
+  id?: unknown;
+  name?: unknown;
+}
+
+interface LinearIssueCreateContext {
+  id?: unknown;
+  identifier?: unknown;
+  team?: { id?: unknown; labels?: { nodes?: LinearIssueLabelNode[] } | null } | null;
+  project?: { id?: unknown } | null;
+  children?: {
+    nodes?: Array<{
+      id?: unknown;
+      identifier?: unknown;
+      title?: unknown;
+      description?: unknown;
+      url?: unknown;
+      parent?: { id?: unknown } | null;
+    }>;
+  } | null;
 }
 
 export interface AssigneeFilter {
@@ -184,6 +213,18 @@ const ISSUE_WRITE_CONTEXT_QUERY = `
   }
 `;
 
+const ISSUE_CREATE_CONTEXT_QUERY = `
+  query SymphonyIssueCreateContext($id: String!) {
+    issue(id: $id) {
+      id
+      identifier
+      team { id labels(first: 100) { nodes { id name } } }
+      project { id }
+      children(first: 100) { nodes { id identifier title description url parent { id } } }
+    }
+  }
+`;
+
 const PROJECT_WORKFLOW_STATES_QUERY = `
   query SymphonyProjectWorkflowStates($projectSlug: String!, $teamsAfter: String) {
     projects(first: 1, filter: { slugId: { eq: $projectSlug } }) {
@@ -241,6 +282,15 @@ const COMMENT_CREATE_MUTATION = `
     commentCreate(input: $input) {
       success
       comment { id body createdAt }
+    }
+  }
+`;
+
+const ISSUE_CREATE_MUTATION = `
+  mutation SymphonyIssueCreate($input: IssueCreateInput!) {
+    issueCreate(input: $input) {
+      success
+      issue { id identifier url }
     }
   }
 `;
@@ -380,6 +430,72 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     return { status: "applied" };
   }
 
+  async createIssueFromPlan(input: TrackerIssueCreateInput): Promise<TrackerWriteResult> {
+    const marker = issueBreakdownMarker(input.dedupeKey, input.payloadHash);
+    const context = await this.fetchIssueCreateContext(input.parentIssueId);
+    const existing = (context.children?.nodes ?? []).filter((child) => asString(child.description)?.includes(marker));
+    const matchingChildren = existing.filter(
+      (child) => asString(child.title) === input.title && asString(child.parent?.id) === input.parentIssueId,
+    );
+    if (matchingChildren.length === 1) {
+      return issueCreateResult("verified", input, issueRefFromNode(matchingChildren[0] ?? {}));
+    }
+    if (existing.length > 0) {
+      return {
+        status: "skipped",
+        message: `Issue breakdown child marker conflict for ${input.dedupeKey}`,
+        evidence: {
+          kind: "issue_create",
+          issue: null,
+          issueCreateStatus: "conflict",
+          parentIssueId: input.parentIssueId,
+          dedupeKey: input.dedupeKey,
+          payloadHash: input.payloadHash,
+          unresolvedLabelNames: input.requestedLabels,
+          message: "Marker exists on a non-child, wrong-title, or duplicate Linear issue",
+        },
+      };
+    }
+
+    const teamId = asString(context.team?.id);
+    if (!teamId) throw new SymphonyError("tracker_error", `Linear issue ${input.parentIssueId} is missing team`);
+    const resolvedLabels = resolveIssueCreateLabels(input.requestedLabels, context.team?.labels?.nodes ?? []);
+    if (resolvedLabels.conflicts.length > 0) {
+      return {
+        status: "skipped",
+        message: `Linear label resolution is ambiguous: ${resolvedLabels.conflicts.join(", ")}`,
+        evidence: {
+          kind: "issue_create",
+          issue: null,
+          issueCreateStatus: "conflict",
+          parentIssueId: input.parentIssueId,
+          dedupeKey: input.dedupeKey,
+          payloadHash: input.payloadHash,
+          unresolvedLabelNames: [...resolvedLabels.unresolved, ...resolvedLabels.conflicts],
+          message: "Ambiguous Linear label names",
+        },
+      };
+    }
+
+    const response = await this.graphql<{ issueCreate: { success?: unknown; issue?: { id?: unknown; identifier?: unknown; url?: unknown } | null } }>(
+      ISSUE_CREATE_MUTATION,
+      {
+        input: {
+          teamId,
+          parentId: input.parentIssueId,
+          title: input.title,
+          description: renderIssueCreateDescription(input, marker, resolvedLabels.unresolved),
+          ...(asString(context.project?.id) ? { projectId: asString(context.project?.id) } : {}),
+          ...(resolvedLabels.labelIds.length > 0 ? { labelIds: resolvedLabels.labelIds } : {}),
+        },
+      },
+    );
+    if (response.issueCreate.success !== true || !response.issueCreate.issue) {
+      throw new SymphonyError("tracker_error", `Linear issueCreate did not report success for ${input.parentIssueId}`);
+    }
+    return issueCreateResult("created", input, issueRefFromNode(response.issueCreate.issue));
+  }
+
   private async fetchPagedIssues(
     query: string,
     variables: Record<string, unknown>,
@@ -427,6 +543,14 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
 
   private async fetchIssueWriteContext(issueId: string): Promise<LinearIssueWriteContext> {
     const response = await this.graphql<{ issue?: LinearIssueWriteContext | null }>(ISSUE_WRITE_CONTEXT_QUERY, {
+      id: issueId,
+    });
+    if (!response.issue) throw new SymphonyError("tracker_error", `Linear issue not found: ${issueId}`);
+    return response.issue;
+  }
+
+  private async fetchIssueCreateContext(issueId: string): Promise<LinearIssueCreateContext> {
+    const response = await this.graphql<{ issue?: LinearIssueCreateContext | null }>(ISSUE_CREATE_CONTEXT_QUERY, {
       id: issueId,
     });
     if (!response.issue) throw new SymphonyError("tracker_error", `Linear issue not found: ${issueId}`);
@@ -594,4 +718,81 @@ function uniqueStrings(values: string[]): string[] {
 
 function commentMarker(dedupeKey: string): string {
   return `<!-- symphony-writeback:${dedupeKey} -->`;
+}
+
+function issueBreakdownMarker(dedupeKey: string, payloadHash: string): string {
+  return `<!-- symphony-issue-breakdown:${dedupeKey}:${payloadHash} -->`;
+}
+
+function issueCreateResult(
+  status: "created" | "verified",
+  input: TrackerIssueCreateInput,
+  issueRef: TrackerIssueRef,
+): TrackerWriteResult {
+  return {
+    status: status === "created" ? "applied" : "verified",
+    evidence: {
+      kind: "issue_create",
+      issue: issueRef,
+      issueCreateStatus: status,
+      parentIssueId: input.parentIssueId,
+      dedupeKey: input.dedupeKey,
+      payloadHash: input.payloadHash,
+      unresolvedLabelNames: [],
+    },
+  };
+}
+
+function issueRefFromNode(node: { id?: unknown; identifier?: unknown; url?: unknown }): TrackerIssueRef {
+  const id = asString(node.id);
+  if (!id) throw new SymphonyError("tracker_error", "Linear issue create response is missing issue id");
+  return {
+    id,
+    identifier: asNullableString(node.identifier),
+    url: asNullableString(node.url),
+  };
+}
+
+function resolveIssueCreateLabels(
+  requestedLabels: string[],
+  availableLabels: LinearIssueLabelNode[],
+): { labelIds: string[]; unresolved: string[]; conflicts: string[] } {
+  const requested = uniqueStrings(requestedLabels.map((label) => label.trim()).filter((label) => label.length > 0));
+  const byName = new Map<string, Array<{ id: string; name: string }>>();
+  for (const label of availableLabels) {
+    const id = asString(label.id);
+    const name = asString(label.name);
+    if (!id || !name) continue;
+    const key = name.toLowerCase();
+    byName.set(key, [...(byName.get(key) ?? []), { id, name }]);
+  }
+  const labelIds: string[] = [];
+  const unresolved: string[] = [];
+  const conflicts: string[] = [];
+  for (const label of requested) {
+    const matches = byName.get(label.toLowerCase()) ?? [];
+    if (matches.length === 0) {
+      unresolved.push(label);
+    } else if (matches.length > 1) {
+      conflicts.push(label);
+    } else {
+      labelIds.push(matches[0]?.id ?? "");
+    }
+  }
+  return { labelIds: labelIds.filter((id) => id.length > 0), unresolved, conflicts };
+}
+
+function renderIssueCreateDescription(input: TrackerIssueCreateInput, marker: string, unresolvedLabels: string[]): string {
+  return [
+    input.description,
+    "",
+    "Acceptance criteria:",
+    ...input.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+    "",
+    `Dependencies: ${input.dependencies.length === 0 ? "None" : input.dependencies.join(", ")}`,
+    `Requested labels: ${input.requestedLabels.length === 0 ? "None" : input.requestedLabels.join(", ")}`,
+    ...(unresolvedLabels.length === 0 ? [] : [`Unresolved labels: ${unresolvedLabels.join(", ")}`]),
+    "",
+    marker,
+  ].join("\n");
 }

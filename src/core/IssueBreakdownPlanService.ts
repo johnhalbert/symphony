@@ -116,6 +116,11 @@ export class IssueBreakdownPlanService {
       configFingerprint,
       cursorMode: this.options.config.issueBreakdown.cursorMode,
       acceptedAt,
+      applicationStatus: "not_requested",
+      applicationOperationKeys: [],
+      createdIssueRefs: [],
+      appliedAt: null,
+      applicationBlockedReason: null,
     };
 
     const reference: IssueLifecycleSummaryReference = {
@@ -171,6 +176,7 @@ export function issueBreakdownConfigFingerprint(config: ServiceConfig): string {
         promptTemplate: config.issueBreakdown.promptTemplate,
         cursorMode: config.issueBreakdown.cursorMode,
         planningLabels: config.issueBreakdown.planningLabels,
+        applyToLinear: config.issueBreakdown.applyToLinear,
         workspaceMode: config.issueBreakdown.workspaceMode,
       }),
     )
