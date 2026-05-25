@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { errorMessage } from "./connectionState";
 import type { DashboardRefreshTrigger, DashboardViewState } from "./dashboardTypes";
+import { openWorkspaceProviderBlockedReason } from "./openWorkspaceGate";
 import { readSymphonySettings } from "./settings";
 import type { SymphonyClient } from "./symphonyClient";
 import { configureSymphonyWebview } from "./webviewHtml";
@@ -105,6 +106,12 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
 
   private async openWorkspace(issueKey: string): Promise<void> {
     const settings = readSymphonySettings();
+    const blockedReason = openWorkspaceProviderBlockedReason(this.currentDashboardState, issueKey, settings.token);
+    if (blockedReason) {
+      void vscode.window.showWarningMessage(`Unable to open Symphony workspace: ${blockedReason}`);
+      return;
+    }
+
     try {
       await this.client.openWorkspace(settings.baseUrl, settings.token, issueKey);
       void vscode.window.showInformationMessage(`Opened Symphony workspace for ${issueKey}.`);

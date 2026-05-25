@@ -12,6 +12,7 @@ import type {
   WorkspaceRow,
   WorkspaceSection,
 } from "../dashboardTypes";
+import { openWorkspaceDisabledReason } from "../openWorkspaceGate";
 
 export function renderDashboardHtml(state: DashboardViewState | null): string {
   if (!state) {
@@ -30,6 +31,7 @@ export function renderDashboardHtml(state: DashboardViewState | null): string {
   }
 
   const running = connection.summary.runningCount === null ? "unknown" : String(connection.summary.runningCount);
+  const retrying = connection.summary.retryingCount === null ? "unknown" : String(connection.summary.retryingCount);
   const token = connection.summary.tokenConfigured ? "configured" : "not configured";
   const tokenWarning =
     connection.summary.mutationsRequireToken === true && !connection.summary.tokenConfigured
@@ -42,7 +44,7 @@ export function renderDashboardHtml(state: DashboardViewState | null): string {
       "Symphony connected",
       `<p class="meta mono">${escapeHtml(connection.baseUrl)}</p>
        <p class="meta">Snapshot: <span class="mono">${escapeHtml(connection.generatedAt)}</span></p>
-       <p class="meta">Running agents: <span class="mono">${escapeHtml(running)}</span></p>
+       <p class="meta">Running agents: <span class="mono">${escapeHtml(running)}</span> / Retrying: <span class="mono">${escapeHtml(retrying)}</span></p>
        <p class="meta">Token: <span class="mono">${escapeHtml(token)}</span></p>
        ${tokenWarning}
        ${actions()}`,
@@ -252,14 +254,6 @@ function renderOpenWorkspaceAction(issueKey: string | null, workspace: Workspace
   return `<div class="row-actions">
     <button type="button" data-action="openWorkspace" data-issue-key="${escapeHtml(issueKey ?? "")}">Open workspace</button>
   </div>`;
-}
-
-function openWorkspaceDisabledReason(issueKey: string | null, workspace: WorkspaceContext | null, summary: MutationSummary): string | null {
-  if (!issueKey) return "Missing issue key.";
-  if (!workspace || (!workspace.path && !workspace.workspaceKey)) return "No workspace context.";
-  if (summary.mutationsRequireToken === null) return "Mutation policy unavailable.";
-  if (summary.mutationsRequireToken && !summary.tokenConfigured) return "Configure symphony.token to enable.";
-  return null;
 }
 
 function sectionCard(title: string, status: string, detail: string): string {

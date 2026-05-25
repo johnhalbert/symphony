@@ -6,6 +6,8 @@ describe("webview dashboard rendering", () => {
   it("renders connected dashboard surfaces and enabled workspace actions", () => {
     const html = renderDashboardHtml(connectedState({ tokenConfigured: true, mutationsRequireToken: true }));
 
+    expect(html).toContain("Running agents:");
+    expect(html).toContain("Retrying:");
     expect(html).toContain("Planning, Orchestrator, and Chat");
     expect(html).toContain("Planning");
     expect(html).toContain("Orchestrator");
@@ -49,6 +51,31 @@ describe("webview dashboard rendering", () => {
     expect(html).toContain("Activity");
     expect(html).toContain("HTTP 500");
   });
+
+  it("co-locates health counts and preserves operator retrying rows independently", () => {
+    const state = connectedState({ tokenConfigured: true, mutationsRequireToken: false });
+    if (!state.sections || state.connection.kind !== "connected") throw new Error("expected connected sections");
+    state.connection.summary.runningCount = 5;
+    state.connection.summary.retryingCount = 2;
+    state.sections.operatorQueues.data.retrying = [
+      { issueIdentifier: "TEST-4", attempt: 1, dueAt: "2026-01-01T00:05:00.000Z", error: "rate limited" },
+    ];
+
+    const html = renderDashboardHtml(state);
+    const connectedStart = html.indexOf("Symphony connected");
+    const planningStart = html.indexOf("Planning, Orchestrator, and Chat");
+    const connectedCard = html.slice(connectedStart, planningStart);
+    const operatorSection = html.slice(html.indexOf("Operator queues"));
+
+    expect(connectedCard).toContain("Running agents:");
+    expect(connectedCard).toContain(">5<");
+    expect(connectedCard).toContain("Retrying:");
+    expect(connectedCard).toContain(">2<");
+    expect(operatorSection).toContain("Retrying");
+    expect(operatorSection).toContain("TEST-4");
+    expect(operatorSection).toContain("attempt 1");
+    expect(operatorSection).toContain("rate limited");
+  });
 });
 
 function connectedState(summary: { tokenConfigured: boolean; mutationsRequireToken: boolean | null }): DashboardViewState {
@@ -59,6 +86,7 @@ function connectedState(summary: { tokenConfigured: boolean; mutationsRequireTok
       generatedAt: "2026-01-01T00:00:00.000Z",
       summary: {
         runningCount: 1,
+        retryingCount: 0,
         tokenConfigured: summary.tokenConfigured,
         mutationsRequireToken: summary.mutationsRequireToken,
       },
