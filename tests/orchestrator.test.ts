@@ -3336,6 +3336,125 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).not.toContain("Linear linkback");
   });
 
+  it("omits linkback-only PR review evidence from worker prompts and persisted lifecycle", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "In Progress", branchName: null });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "implementation",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      completionReports: [completionReportRecord(candidate)],
+      reviewEvidence: {
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "abc123",
+          branch: null,
+        },
+        lastIngestedCursor: "2026-01-01T00:00:00Z",
+        lastWorkerEvidenceCursor: "2026-01-01T00:00:00Z",
+        items: [
+          {
+            id: "issue_comment:42:stale-linear-linkback",
+            source: "issue_comment",
+            githubId: "stale-linear-linkback",
+            pullRequestNumber: 42,
+            pullRequestUrl: "https://github.com/acme/symphony/pull/42",
+            url: "https://github.com/acme/symphony/pull/42#issuecomment-0",
+            reviewer: "linear-code[bot]",
+            body: linearLinkbackComment(),
+            state: null,
+            path: null,
+            line: null,
+            originalLine: null,
+            side: null,
+            threadId: null,
+            inReplyToId: null,
+            isResolved: null,
+            isOutdated: null,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            submittedAt: null,
+            cursor: "2026-01-01T00:00:00Z",
+          },
+        ],
+        updatedAt: "2026-01-01T00:00:00Z",
+      },
+    });
+    const pullRequestReviewClient = new FakePullRequestReviewEvidenceClient([
+      {
+        source: "issue_comment",
+        githubId: "linear-linkback",
+        pullRequestNumber: 42,
+        pullRequestUrl: null,
+        url: "https://github.com/acme/symphony/pull/42#issuecomment-1",
+        reviewer: "linear-code[bot]",
+        body: linearLinkbackComment(),
+        state: null,
+        path: null,
+        line: null,
+        originalLine: null,
+        side: null,
+        threadId: null,
+        inReplyToId: null,
+        isResolved: null,
+        isOutdated: null,
+        createdAt: "2026-01-01T00:00:01Z",
+        updatedAt: "2026-01-01T00:00:01Z",
+        submittedAt: null,
+      },
+    ]);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      pullRequestReviewClient,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    const prompt = harness.runs[0]?.prompt ?? "";
+    expect(pullRequestReviewClient.calls).toEqual([42]);
+    expect(prompt).toContain("Work on TEST-1");
+    expect(prompt).not.toContain("PR review feedback to address before submitting another completion report:");
+    expect(prompt).not.toContain("Reviewer findings to address before submitting another completion report:");
+    expect(prompt).not.toContain("Reviewer verdict: fail / requested changes");
+    expect(prompt).not.toContain("linear-linkback");
+    expect(prompt).not.toContain("Linear linkback");
+    expect(prompt).not.toContain("<!-- linear-review-link -->");
+    expect(prompt).not.toContain("Address active unresolved PR review evidence before submitting another completion report.");
+    if (prompt.includes("Compact Symphony handoff packet:")) {
+      expect(prompt).toContain("Active unresolved PR review evidence:\n- None");
+    }
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      reviewEvidence: {
+        lastIngestedCursor: null,
+        items: [],
+      },
+    });
+  });
+
   it("lazy-resolves reviewer GitHub review-evidence credentials for worker feedback prompts", async () => {
     const config = githubProfileConfig(root, {
       profiles: {
