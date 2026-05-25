@@ -116,7 +116,7 @@ credential_profiles:
       capabilities:
         - github.review_feedback_write
   roles:
-    worker:
+    service:
       github.publication: publication
     reviewer:
       github.review_feedback_write: feedback

@@ -47,7 +47,6 @@ describe("credential profile config", () => {
           roles: {
             worker: {
               "github.discovery": "github-read",
-              "github.publication": "github-publish",
               "linear.writeback": "linear-write",
               "cursor.runtime": "cursor-runtime",
               "server.open_workspace": "workspace-open",
@@ -60,6 +59,7 @@ describe("credential profile config", () => {
               "cursor.runtime": "cursor-runtime",
             },
             service: {
+              "github.publication": "github-publish",
               "github.merge": "github-merge",
               "linear.writeback": "linear-write",
             },
@@ -86,7 +86,7 @@ describe("credential profile config", () => {
       source: "profile",
       profileName: "github-read",
     });
-    expect(config.credentialProfiles.resolveForRole("worker", "github.publication")).toMatchObject({
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
       value: "github-publish-secret",
       source: "profile",
       profileName: "github-publish",
@@ -113,7 +113,11 @@ describe("credential profile config", () => {
       "linear.writeback",
       "cursor.runtime",
     ]);
-    expect(config.credentialProfiles.capabilitiesForRole("service")).toEqual(["github.merge", "linear.writeback"]);
+    expect(config.credentialProfiles.capabilitiesForRole("service")).toEqual([
+      "github.publication",
+      "github.merge",
+      "linear.writeback",
+    ]);
 
     const serialized = JSON.stringify(config.credentialProfiles);
     expect(serialized).toContain("GITHUB_READ_TOKEN");
@@ -184,7 +188,7 @@ describe("credential profile config", () => {
       source: "legacy",
       profileName: null,
     });
-    expect(config.credentialProfiles.resolveForRole("worker", "github.publication")?.value).toBe(
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")?.value).toBe(
       "legacy-github-secret",
     );
     expect(config.credentialProfiles.resolveForRole("reviewer", "github.review_evidence_read")?.value).toBe(

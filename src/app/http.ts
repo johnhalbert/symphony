@@ -21,6 +21,11 @@ import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExp
 import type { OperatorApprovalService, OperatorApprovalRecord } from "../core/approval/OperatorApprovalService.js";
 import { approvalResolve } from "../core/approval/OperatorApprovalService.js";
 import {
+  approvalMatchesReport,
+  isAwaitingPublicationApprovalLifecycle,
+  pendingPublicationReport,
+} from "../core/CompletionReportService.js";
+import {
   compareRunChronology,
   type RunRecord,
   type RunTranscriptStore,
@@ -208,10 +213,44 @@ export class StatusServer {
         if (request.method === "POST") {
           this.requireApprovalMutationToken(request);
           const decision = parseApprovalDecision(await readJsonBody(request));
-          const result = await this.options.operatorApproval?.resolve(requestId, decision);
+          let existingApproval: OperatorApprovalRecord | null = null;
+          try {
+            existingApproval = (await this.options.operatorApproval?.get(requestId)) ?? null;
+          } catch {
+            existingApproval = null;
+          }
+          if (existingApproval?.status === "pending") {
+            const currentApproval = await currentPendingPublicationApproval({
+              approval: existingApproval,
+              lifecycleStore: this.options.lifecycleStore,
+              runStore: this.options.runStore,
+            });
+            if (!currentApproval) {
+              throw new SymphonyError("conflict", "Approval request is not current pending publication approval");
+            }
+          }
+          let result;
+          try {
+            result = await this.options.operatorApproval?.resolve(requestId, decision);
+          } catch (error) {
+            await this.recordPublicationApprovalTerminalConflict(requestId, error);
+            throw error;
+          }
           if (!result) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
           if (decision === "reject" && !result.replayed && this.options.operatorApproval?.rejectPolicy === "cancel") {
             await this.options.orchestrator.cancelIssue(result.request.issueId);
+          }
+          if (decision === "approve" && result.request.status === "approved") {
+            const resumed = await this.options.orchestrator.resumeApprovedPublication(result.request);
+            if (resumed !== true) {
+              throw new SymphonyError(
+                "conflict",
+                "Approved publication could not be resumed from a pending completion report",
+              );
+            }
+          }
+          if (decision === "reject" && !result.replayed) {
+            await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
           }
           sendJson(response, 200, {
             request: approvalResponse(result.request, this.options.operatorApproval?.isRequired() ?? false),
@@ -319,7 +358,14 @@ export class StatusServer {
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
-        const pendingApproval = await this.options.operatorApproval?.findPendingForIssue(keys);
+        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys);
+        const pendingApproval = pendingApprovalCandidate
+          ? await currentPendingPublicationApproval({
+              approval: pendingApprovalCandidate,
+              lifecycleStore: this.options.lifecycleStore,
+              runStore: this.options.runStore,
+            })
+          : null;
         const operatorLiveness = await issueOperatorLiveness({
           live,
           latestRun,
@@ -478,6 +524,18 @@ export class StatusServer {
     }
   }
 
+  private async recordPublicationApprovalTerminalConflict(requestId: string, error: unknown): Promise<void> {
+    if (!(error instanceof SymphonyError) || error.code !== "conflict") return;
+    try {
+      const approval =
+        approvalRecordFromDetails(error.details) ?? (await this.options.operatorApproval?.get(requestId)) ?? null;
+      if (!approval || !isPublicationApprovalTerminal(approval)) return;
+      await this.options.orchestrator.recordPublicationApprovalTerminal(approval);
+    } catch {
+      // Recovery must not mask the approval API's original conflict response.
+    }
+  }
+
   private requireMutationToken(request: IncomingMessage): void {
     const expected = this.options.openWorkspaceToken;
     if (!expected) return;
@@ -633,8 +691,44 @@ function approvalCapability(
   };
 }
 
+async function currentPendingPublicationApproval(input: {
+  approval: OperatorApprovalRecord;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  runStore: RunTranscriptStore | undefined;
+}): Promise<OperatorApprovalRecord | null> {
+  if (input.approval.status !== "pending" || !input.lifecycleStore || !input.runStore) return null;
+  const lifecycle =
+    (await input.lifecycleStore.get(input.approval.issueId)) ??
+    (await input.lifecycleStore.get(input.approval.issueIdentifier));
+  if (!isAwaitingPublicationApprovalLifecycle(lifecycle)) return null;
+  const report = pendingPublicationReport(lifecycle);
+  if (!report || !approvalMatchesReport(input.approval, report)) return null;
+  const run = await input.runStore.getRun(report.runId);
+  if (run?.pendingApprovalRequestId !== input.approval.requestId) return null;
+  return input.approval;
+}
+
 function approvalMutationsRequireToken(enabled: boolean, openWorkspaceToken: string | null): boolean {
   return enabled || Boolean(openWorkspaceToken?.trim());
+}
+
+function approvalRecordFromDetails(details: unknown): OperatorApprovalRecord | null {
+  if (typeof details !== "object" || details === null) return null;
+  const record = details as Partial<OperatorApprovalRecord>;
+  return typeof record.requestId === "string" && typeof record.status === "string"
+    ? (record as OperatorApprovalRecord)
+    : null;
+}
+
+function isPublicationApprovalTerminal(
+  record: OperatorApprovalRecord,
+): record is OperatorApprovalRecord & { status: "rejected" | "stale" | "expired" | "cancelled" } {
+  return (
+    record.status === "rejected" ||
+    record.status === "stale" ||
+    record.status === "expired" ||
+    record.status === "cancelled"
+  );
 }
 
 type RuntimeSnapshot = ReturnType<Orchestrator["snapshot"]>;

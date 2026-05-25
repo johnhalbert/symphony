@@ -109,6 +109,7 @@ credential_profiles:
   roles:
     worker:
       github.discovery: github-read
+    service:
       github.publication: github-publish
     reviewer:
       github.review_evidence_read: github-read

@@ -207,7 +207,7 @@ export class OperatorApprovalService {
     return operatorApprovalConfig(this.options.config).rejectPolicy;
   }
 
-  async waitForPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
+  async requestPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
     if (!this.isRequired()) {
       return {
         requestId: "",
@@ -232,17 +232,22 @@ export class OperatorApprovalService {
       input,
       operatorApprovalConfig(this.options.config).timeoutMs,
     );
+    if (record.status === "pending") {
+      await this.recordPendingRun(record);
+    }
     if (created) {
-      await this.options.runStore.updateRun(input.runId, {
-        metadata: {
-          pendingApprovalRequestId: record.requestId,
-          pendingApprovalRequestedAt: record.requestedAt,
-        },
-      });
       await this.appendApprovalRequestEvent(record);
     }
 
+    return record;
+  }
+
+  async waitForPublicationApprovalRequest(record: OperatorApprovalRecord): Promise<OperatorApprovalRecord> {
     return this.waitForResolution(record);
+  }
+
+  async waitForPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
+    return this.waitForPublicationApprovalRequest(await this.requestPublicationApproval(input));
   }
 
   async resolve(requestId: string, decision: OperatorApprovalDecision): Promise<OperatorApprovalResolution> {
@@ -280,6 +285,10 @@ export class OperatorApprovalService {
 
   async get(requestId: string): Promise<OperatorApprovalRecord | null> {
     return this.options.store.get(requestId);
+  }
+
+  async getByDedupe(runId: string, evidenceCursor: string): Promise<OperatorApprovalRecord | null> {
+    return this.options.store.getByDedupe(runId, evidenceCursor);
   }
 
   async findPendingForRun(runId: string): Promise<OperatorApprovalRecord | null> {
@@ -339,7 +348,6 @@ export class OperatorApprovalService {
   private async staleReason(record: OperatorApprovalRecord): Promise<string | null> {
     const run = await this.getRun(record.runId);
     if (!run) return "run record is missing";
-    if (run.status !== "running") return `run status is ${run.status}`;
     if (run.cancellationRequestedAt) return "run cancellation has been requested";
     const latest = await this.options.store.findPendingForRun(record.runId);
     if (latest && latest.requestId !== record.requestId) return "approval request was superseded";
@@ -363,6 +371,22 @@ export class OperatorApprovalService {
         await sleep(5);
       }
     }
+  }
+
+  private async recordPendingRun(record: OperatorApprovalRecord): Promise<void> {
+    const run = await this.getRun(record.runId);
+    if (
+      run?.pendingApprovalRequestId === record.requestId &&
+      run.pendingApprovalRequestedAt === record.requestedAt
+    ) {
+      return;
+    }
+    await this.options.runStore.updateRun(record.runId, {
+      metadata: {
+        pendingApprovalRequestId: record.requestId,
+        pendingApprovalRequestedAt: record.requestedAt,
+      },
+    });
   }
 
   private async getRun(runId: string) {

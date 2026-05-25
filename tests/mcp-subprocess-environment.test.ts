@@ -152,7 +152,7 @@ describe("MCP subprocess environment", () => {
     expect(githubEnvKeys(env)).toEqual(["GITHUB_TOKEN"]);
   });
 
-  it("prefers the assigned worker publication profile and excludes a decoy parent GITHUB_TOKEN", () => {
+  it("prefers the assigned service publication profile and excludes a decoy parent GITHUB_TOKEN", () => {
     const config = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -167,7 +167,7 @@ describe("MCP subprocess environment", () => {
             feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
           },
           roles: {
-            worker: {
+            service: {
               "github.publication": "publication",
             },
             reviewer: {
@@ -247,7 +247,7 @@ describe("MCP subprocess environment", () => {
     });
   });
 
-  it("keeps profile credentials exclusive while carrying env-backed GitHub metadata refs", () => {
+  it("keeps service publication profile credentials exclusive while carrying env-backed GitHub metadata refs", () => {
     const rawConfig = {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
       github: {
@@ -260,7 +260,7 @@ describe("MCP subprocess environment", () => {
           publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
         },
         roles: {
-          worker: {
+          service: {
             "github.publication": "publication",
           },
         },
@@ -289,7 +289,7 @@ describe("MCP subprocess environment", () => {
     expect(env).not.toHaveProperty("CUSTOM_GITHUB_TOKEN");
 
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
-    expect(childConfig.credentialProfiles.resolveForRole("worker", "github.publication")).toMatchObject({
+    expect(childConfig.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
       source: "profile",
       value: "publication-secret",
     });
@@ -357,6 +357,57 @@ describe("MCP subprocess environment", () => {
     expect(githubEnvKeys(env)).toEqual([]);
   });
 
+  it("does not expose publication credentials to completion report MCP when publication approval is required", () => {
+    const rawConfig = {
+      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      github: {
+        owner: "$GITHUB_OWNER",
+        repo: "$GITHUB_REPO",
+        api_base_url: "$GITHUB_API_BASE_URL",
+        token: "$CUSTOM_GITHUB_TOKEN",
+        publish_pull_requests: true,
+        operator_approval: {
+          required_for_publication: true,
+        },
+      },
+      credential_profiles: {
+        profiles: {
+          publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+        },
+        roles: {
+          service: {
+            "github.publication": "publication",
+          },
+        },
+      },
+    } as const;
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", {
+      LINEAR_API_KEY: "linear-secret",
+      GITHUB_OWNER: "acme",
+      GITHUB_REPO: "symphony",
+      GITHUB_API_BASE_URL: "https://api.github.test",
+      CUSTOM_GITHUB_TOKEN: "custom-github-secret",
+      GITHUB_PUBLICATION_TOKEN: "publication-secret",
+      GITHUB_TOKEN: "decoy-github-secret",
+    });
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "completion-report-mcp",
+      parentEnv: { PATH: "/bin", GITHUB_TOKEN: "decoy-parent-github-secret" },
+    });
+
+    expect(env).toMatchObject({
+      GITHUB_OWNER: "acme",
+      GITHUB_REPO: "symphony",
+      GITHUB_API_BASE_URL: "https://api.github.test",
+    });
+    expect(env).not.toHaveProperty("CUSTOM_GITHUB_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_PUBLICATION_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(githubEnvKeys(env)).toEqual(["GITHUB_API_BASE_URL", "GITHUB_OWNER", "GITHUB_REPO"]);
+  });
+
   it("keeps reviewer verdict MCP free of GitHub credentials even when reviewer profiles are configured", () => {
     const config = parseServiceConfig(
       {
@@ -414,7 +465,7 @@ describe("MCP subprocess environment", () => {
           reviewRead: { value: "$GITHUB_REVIEW_READ_TOKEN", capabilities: ["github.review_evidence_read"] },
         },
         roles: {
-          worker: {
+          service: {
             "github.publication": "publication",
           },
           reviewer: {
@@ -539,7 +590,7 @@ describe("MCP subprocess environment", () => {
             publication: { value: "$MISSING_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
           },
           roles: {
-            worker: {
+            service: {
               "github.publication": "publication",
             },
           },
