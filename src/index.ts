@@ -22,6 +22,7 @@ export * from "./core/types.js";
 export * from "./core/writeback/TransitionPolicy.js";
 export * from "./core/writeback/WritebackOutbox.js";
 export * from "./core/workflow/PromptRenderer.js";
+export * from "./core/workflow/ReviewLoopPromptGuidance.js";
 export * from "./core/workflow/WorkflowLoader.js";
 export * from "./core/workspace/WorkspaceManager.js";
 export * from "./integrations/github/GitHubCredentialResolver.js";

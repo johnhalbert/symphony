@@ -32,6 +32,8 @@ const rawConfigSchema = z
         blocked_states: stringArray.optional(),
         review_pass_state: z.string().optional(),
         reviewer_prompt: z.string().optional(),
+        reviewer_prompt_extensions: stringArray.optional(),
+        worker_prompt_extensions: stringArray.optional(),
         max_review_rounds: z.number().int().positive().optional(),
         max_incomplete_turns: z.number().int().positive().optional(),
         continuation_history_threshold: z.number().int().nonnegative().optional(),
@@ -318,6 +320,8 @@ export interface ReviewLoopConfig {
   blockedStates: string[];
   reviewPassState: string | null;
   reviewerPromptTemplate: string | null;
+  reviewerPromptExtensions: string[];
+  workerPromptExtensions: string[];
   maxReviewRounds: number;
   maxIncompleteTurns: number;
   continuationHistoryThreshold: number;
@@ -589,6 +593,8 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       blockedStates,
       reviewPassState,
       reviewerPromptTemplate: raw.review_loop?.reviewer_prompt ?? null,
+      reviewerPromptExtensions: normalizePromptExtensions(raw.review_loop?.reviewer_prompt_extensions),
+      workerPromptExtensions: normalizePromptExtensions(raw.review_loop?.worker_prompt_extensions),
       maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
       maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
       continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
@@ -635,6 +641,10 @@ function normalizeStateLimitMap(input: Record<string, number> | undefined): Map<
 
 function normalizeLabels(input: string[] | undefined): string[] {
   return [...new Set((input ?? []).map((label) => label.trim().toLowerCase()).filter((label) => label.length > 0))];
+}
+
+function normalizePromptExtensions(input: string[] | undefined): string[] {
+  return (input ?? []).map((item) => item.trim()).filter((item) => item.length > 0);
 }
 
 function normalizeOptionalConfigString(value: string | undefined): string | null {

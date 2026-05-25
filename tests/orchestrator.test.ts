@@ -97,7 +97,9 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
-    expect(harness.runs[0]?.prompt).toBe("Work on TEST-1");
+    expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
+    expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
+    expect(harness.runs[0]?.prompt).toContain("address the underlying invariant");
     expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
     expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
@@ -880,7 +882,8 @@ describe("Orchestrator", () => {
       await waitFor(() => firstOrchestrator.snapshot().counts.running === 0, "partial audit worker exit");
       await firstOrchestrator.stop();
 
-      expect(harness.prompts).toEqual(["Work on TEST-1"]);
+      expect(harness.prompts).toHaveLength(1);
+      expect(harness.prompts[0]).toContain("Work on TEST-1");
       expect(currentState).toBe(stateBeforeRecovery);
       await expect(approvalStore.findPendingForRun("report-run-1")).resolves.toBeNull();
       const runBeforeRecovery = await waitForTerminalRunRecord(runStore, "report-run-1");
@@ -1637,7 +1640,8 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
-    expect(harness.prompts).toEqual(["Work on TEST-1"]);
+    expect(harness.prompts).toHaveLength(1);
+    expect(harness.prompts[0]).toContain("Work on TEST-1");
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "report-run-1:run-started",
       "pull-request-handoff:pr-42:abc123",
@@ -1736,7 +1740,8 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
-    expect(harness.prompts).toEqual(["Work on TEST-1"]);
+    expect(harness.prompts).toHaveLength(1);
+    expect(harness.prompts[0]).toContain("Work on TEST-1");
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "report-run-1:run-started",
       "pull-request-handoff:pr-42:abc123",
@@ -1841,7 +1846,8 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
-    expect(harness.prompts).toEqual(["Work on TEST-1"]);
+    expect(harness.prompts).toHaveLength(1);
+    expect(harness.prompts[0]).toContain("Work on TEST-1");
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "report-run-1:run-started",
       "pull-request-handoff:pr-42:abc123",
@@ -1944,7 +1950,8 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
-    expect(harness.prompts).toEqual(["Work on TEST-1"]);
+    expect(harness.prompts).toHaveLength(1);
+    expect(harness.prompts[0]).toContain("Work on TEST-1");
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "report-run-1:run-started",
       "pull-request-handoff:pr-42:abc123",
@@ -2516,6 +2523,7 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewerPromptTemplate =
       "Review {{ issue.identifier }} as {{ role }}: {{ completionReport.summary }}\n{% for item in workspaceEvidence %}{{ item }}\n{% endfor %}{% for item in runDigest %}{{ item }}\n{% endfor %}";
+    config.reviewLoop.reviewerPromptExtensions = ["Custom project reviewer extension."];
     const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
     const fetchedReviewStates: string[][] = [];
     const tracker: TrackerClient = {
@@ -2594,6 +2602,8 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Implemented the requested change.");
     expect(harness.runs[0]?.prompt).toContain("Pull request: https://github.com/acme/symphony/pull/42");
     expect(harness.runs[0]?.prompt).toContain("Implemented the reviewer dispatch lane.");
+    expect(harness.runs[0]?.prompt).not.toContain("Custom project reviewer extension.");
+    expect(harness.runs[0]?.prompt).not.toContain("General software review matrix:");
     const runs = await runStore.listRunsForIssue(candidate.identifier);
     expect(runs.find((run) => run.runId === "fake-issue-1-1")).toMatchObject({ role: "reviewer" });
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 0 });
@@ -2603,6 +2613,7 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.tracker.handoffStates = ["In Review"];
     config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptExtensions = ["Check project-specific billing boundaries."];
     const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -2654,6 +2665,18 @@ describe("Orchestrator", () => {
     expect(prompt).toContain("submit_review_verdict.evidence");
     expect(prompt.indexOf("submit_pull_request_review_feedback")).toBeLessThan(prompt.indexOf("submit_review_verdict"));
     expect(prompt).toContain("PR number, repository, token, or commit identity");
+    expect(prompt).toContain("Before any fail verdict, perform a bounded sibling-risk sweep");
+    expect(prompt).toContain("Include every known blocking gap");
+    expect(prompt).toContain("required behavior, concrete evidence, expected validation");
+    expect(prompt).toContain("General software review matrix:");
+    expect(prompt).toContain("Persistence/durability");
+    expect(prompt).toContain("Project-specific reviewer extensions:");
+    expect(prompt).toContain("Check project-specific billing boundaries.");
+    expect(prompt.indexOf("General software review matrix:")).toBeLessThan(
+      prompt.indexOf("Project-specific reviewer extensions:"),
+    );
+    expect(prompt).not.toContain("Symphony dogfood extension");
+    expect(prompt).not.toContain("writeback/outbox");
   });
 
   it("processes a live fail verdict submitted by a reviewer harness run", async () => {
@@ -3186,6 +3209,7 @@ describe("Orchestrator", () => {
   it("injects PR review evidence into the next worker prompt after requested changes", async () => {
     const config = testConfig(root);
     config.reviewLoop.continuationHistoryThreshold = 5;
+    config.reviewLoop.workerPromptExtensions = ["Check project-specific publication replay."];
     const candidate = issue({ state: "In Progress", branchName: null });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -3269,6 +3293,11 @@ describe("Orchestrator", () => {
 
     expect(pullRequestReviewClient.calls).toEqual([42]);
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
+    expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
+    expect(harness.runs[0]?.prompt).toContain("address the underlying invariant");
+    expect(harness.runs[0]?.prompt).toContain("General software change matrix:");
+    expect(harness.runs[0]?.prompt).toContain("Project-specific worker extensions:");
+    expect(harness.runs[0]?.prompt).toContain("Check project-specific publication replay.");
     expect(harness.runs[0]?.prompt).toContain("PR review feedback to address");
     expect(harness.runs[0]?.prompt).toContain("Compact Symphony handoff packet:");
     expect(harness.runs[0]?.prompt).toContain("Active unresolved PR review evidence:");
@@ -3866,7 +3895,8 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await orchestrator.stop();
 
-    expect(harness.prompts).toEqual(["Work on TEST-1"]);
+    expect(harness.prompts).toHaveLength(1);
+    expect(harness.prompts[0]).toContain("Work on TEST-1");
   });
 
   it("accounts tokens per fresh active run across continuation turns", async () => {
@@ -3983,6 +4013,7 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
     config.reviewLoop.continuationHistoryThreshold = 5;
+    config.reviewLoop.workerPromptExtensions = ["Check continuation-specific project invariants."];
     const candidate = issue({ state: "Todo" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -4018,6 +4049,9 @@ describe("Orchestrator", () => {
 
     expect(harness.runs).toHaveLength(2);
     expect(harness.runs[1]?.prompt).toContain("Structured continuation brief:");
+    expect(harness.runs[1]?.prompt).toContain("Review-cycle hardening:");
+    expect(harness.runs[1]?.prompt).toContain("address the underlying invariant");
+    expect(harness.runs[1]?.prompt).toContain("Check continuation-specific project invariants.");
     expect(harness.runs[1]?.prompt).toContain("Mode: summary");
     expect(harness.runs[1]?.prompt).toContain("Transcript/status pointers:");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/fake-issue-1-1/transcript");
