@@ -20,7 +20,7 @@ import { resolveCursorRuntimeApiKey } from "../../app/RuntimeDependencies.js";
 import {
   completionReportContextFilePath,
   cursorAgentCreateOptions,
-  cursorModelSelection,
+  cursorAgentSendOptions,
   cursorRoleMcpServers,
   reviewFeedbackContextFilePath,
   reviewVerdictContextFilePath,
@@ -87,6 +87,7 @@ export interface McpToolExposureProbeConfig {
   agentCwd: string;
   mcpCwd: string;
   settingSources: CursorSettingSource[];
+  cursorMode: string | null;
 }
 
 export interface McpToolExposureReport {
@@ -127,6 +128,7 @@ export interface SdkToolDiagnostics {
   agentCwd: string;
   mcpCwd: string;
   settingSources: CursorSettingSource[];
+  cursorMode: string | null;
   sdkTimeoutMs: number;
   waitTimeoutMs: number;
   postCancelWaitMs: number;
@@ -197,6 +199,7 @@ export async function runMcpToolExposureProbe(options: McpToolExposureProbeOptio
     agentCwd: options.sdkCwd ?? options.config.workflowDir,
     mcpCwd: options.mcpCwd ?? options.config.workflowDir,
     settingSources: options.settingSources ?? options.config.cursor.settingSources,
+    cursorMode: options.config.cursor.mode,
   };
   const subprocess = await runSubprocessMcpToolExposureProbe(options.config, {
     cliPath: probeConfig.cliPath,
@@ -587,11 +590,10 @@ async function runSdkRoleProbe(
       settingSources: options.settingSources as SettingSource[],
     };
     agent = await Agent.create(createOptions);
-    run = await agent.send("Reply with the MCP tools you can see for this run. Do not call any tools.", {
-      model: cursorModelSelection(ctx),
-      local: { force: true },
-      mcpServers: roleMcpServers,
-    });
+    run = await agent.send(
+      "Reply with the MCP tools you can see for this run. Do not call any tools.",
+      cursorAgentSendOptions(ctx, { mcpServers: roleMcpServers }),
+    );
   } catch (error) {
     const roleRun = sdkRoleRunFromObservation(
       options.role,
@@ -602,6 +604,7 @@ async function runSdkRoleProbe(
         agentCwd: options.cwd,
         mcpCwd: options.mcpCwd,
         settingSources: options.settingSources,
+        cursorMode: config.cursor.mode,
         sdkTimeoutMs: options.timeoutMs,
         waitTimeoutMs: options.waitTimeoutMs,
         postCancelWaitMs: options.postCancelWaitMs,
@@ -635,6 +638,7 @@ async function runSdkRoleProbe(
       agentCwd: options.cwd,
       mcpCwd: options.mcpCwd,
       settingSources: options.settingSources,
+      cursorMode: config.cursor.mode,
       sdkTimeoutMs: options.timeoutMs,
       waitTimeoutMs: options.waitTimeoutMs,
       postCancelWaitMs: options.postCancelWaitMs,
@@ -671,6 +675,7 @@ export async function observeSdkRoleRun(input: {
   agentCwd: string;
   mcpCwd: string;
   settingSources: CursorSettingSource[];
+  cursorMode?: string | null;
   sdkTimeoutMs: number;
   waitTimeoutMs: number;
   postCancelWaitMs: number;
@@ -681,6 +686,7 @@ export async function observeSdkRoleRun(input: {
     agentCwd: input.agentCwd,
     mcpCwd: input.mcpCwd,
     settingSources: input.settingSources,
+    cursorMode: input.cursorMode ?? null,
     sdkTimeoutMs: input.sdkTimeoutMs,
     waitTimeoutMs: input.waitTimeoutMs,
     postCancelWaitMs: input.postCancelWaitMs,
@@ -1129,6 +1135,7 @@ function syntheticSdkRoleRun(input: {
   agentCwd: string;
   mcpCwd: string;
   settingSources: CursorSettingSource[];
+  cursorMode?: string | null;
   sdkTimeoutMs: number;
   waitTimeoutMs: number;
   postCancelWaitMs: number;
@@ -1138,6 +1145,7 @@ function syntheticSdkRoleRun(input: {
     agentCwd: input.agentCwd,
     mcpCwd: input.mcpCwd,
     settingSources: input.settingSources,
+    cursorMode: input.cursorMode ?? null,
     sdkTimeoutMs: input.sdkTimeoutMs,
     waitTimeoutMs: input.waitTimeoutMs,
     postCancelWaitMs: input.postCancelWaitMs,
@@ -1200,6 +1208,7 @@ function sdkDiagnostics(input: {
   agentCwd: string;
   mcpCwd: string;
   settingSources: CursorSettingSource[];
+  cursorMode?: string | null;
   sdkTimeoutMs: number;
   waitTimeoutMs: number;
   postCancelWaitMs: number;
@@ -1210,6 +1219,7 @@ function sdkDiagnostics(input: {
     agentCwd: input.agentCwd,
     mcpCwd: input.mcpCwd,
     settingSources: input.settingSources,
+    cursorMode: input.cursorMode ?? null,
     sdkTimeoutMs: input.sdkTimeoutMs,
     waitTimeoutMs: input.waitTimeoutMs,
     postCancelWaitMs: input.postCancelWaitMs,

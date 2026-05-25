@@ -73,6 +73,7 @@ export interface RunRecord {
   cursorModel?: string | null;
   cursorModelParams?: PersistedCursorModelParam[];
   cursorSettingSources?: string[];
+  cursorMode?: string | null;
   cursorAllowLargeContext?: boolean;
   cursorWorkerAgentLifecycle?: string;
   workspaceKey: string;
@@ -140,6 +141,7 @@ export interface StartRunInput {
   cursorModel?: string | null;
   cursorModelParams?: PersistedCursorModelParam[];
   cursorSettingSources?: string[];
+  cursorMode?: string | null;
   cursorAllowLargeContext?: boolean;
   cursorWorkerAgentLifecycle?: string;
   workspaceKey: string;
@@ -233,6 +235,7 @@ export class FileRunTranscriptStore {
       ...(input.cursorModel === undefined ? {} : { cursorModel: input.cursorModel }),
       ...(input.cursorModelParams === undefined ? {} : { cursorModelParams: input.cursorModelParams }),
       ...(input.cursorSettingSources === undefined ? {} : { cursorSettingSources: input.cursorSettingSources }),
+      ...(input.cursorMode === undefined ? {} : { cursorMode: input.cursorMode }),
       ...(input.cursorAllowLargeContext === undefined ? {} : { cursorAllowLargeContext: input.cursorAllowLargeContext }),
       ...(input.cursorWorkerAgentLifecycle === undefined ? {} : { cursorWorkerAgentLifecycle: input.cursorWorkerAgentLifecycle }),
       workspaceKey: input.workspaceKey,

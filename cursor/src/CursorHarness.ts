@@ -51,14 +51,12 @@ export class CursorHarness implements AgentHarness {
     const agent = lease.agent;
     const deltaEvents: AgentEvent[] = [];
     const cliPath = currentSymphonyCliPath();
-    const runOptions: NonNullable<Parameters<SDKAgent["send"]>[1]> = {
-      model: cursorModelSelection(ctx),
-      local: { force: true },
+    const runOptions = cursorAgentSendOptions(ctx, {
+      mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
       onDelta: ({ update }) => {
         deltaEvents.push(...mapCursorDelta(update));
       },
-      mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
-    };
+    });
     let run: Run;
     try {
       run = await agent.send(prompt, runOptions);
@@ -231,8 +229,12 @@ export class CursorHarness implements AgentHarness {
   private async createAgent(ctx: AgentRunContext, options: { allowResume: boolean }): Promise<CursorAgentLease> {
     const cliPath = currentSymphonyCliPath();
     await writeInitialRoleMcpContexts(ctx);
-    const agentOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
-      mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
+    const mcpServers = cursorRoleMcpServers(ctx, { cliPath });
+    const createOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
+      mcpServers,
+    });
+    const resumeOptions = cursorAgentBaseOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
+      mcpServers,
     });
     const latestRun =
       options.allowResume && ctx.role === "worker"
@@ -241,7 +243,7 @@ export class CursorHarness implements AgentHarness {
     let agent: SDKAgent;
     if (latestRun?.agentId) {
       try {
-        agent = await Agent.resume(latestRun.agentId, agentOptions);
+        agent = await Agent.resume(latestRun.agentId, resumeOptions);
         return { agent, created: false, resumeAttempted: true, resumeUsed: true, outcome: "resumed" };
       } catch (error) {
         ctx.logger.warn("cursor agent resume failed; creating a new agent", {
@@ -249,11 +251,11 @@ export class CursorHarness implements AgentHarness {
           workspace_path: ctx.workspace.path,
           error: errorMessage(error),
         });
-        agent = await Agent.create(agentOptions);
+        agent = await Agent.create(createOptions);
         return { agent, created: true, resumeAttempted: true, resumeUsed: false, outcome: "created" };
       }
     } else {
-      agent = await Agent.create(agentOptions);
+      agent = await Agent.create(createOptions);
       return { agent, created: true, resumeAttempted: false, resumeUsed: false, outcome: "created" };
     }
   }
@@ -325,6 +327,17 @@ export function cursorAgentCreateOptions(
   options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
 ): Parameters<typeof Agent.create>[0] {
   return {
+    ...cursorAgentBaseOptions(ctx, apiKey, options),
+    ...cursorConversationModeOption(ctx),
+  };
+}
+
+function cursorAgentBaseOptions(
+  ctx: AgentRunContext,
+  apiKey: string | null | undefined,
+  options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
+): Parameters<typeof Agent.create>[0] {
+  return {
     model: cursorModelSelection(ctx),
     local: {
       cwd: ctx.workspace.path,
@@ -334,6 +347,26 @@ export function cursorAgentCreateOptions(
     ...(apiKey ? { apiKey } : {}),
     ...(options.mcpServers === undefined ? {} : { mcpServers: options.mcpServers }),
   };
+}
+
+export function cursorAgentSendOptions(
+  ctx: AgentRunContext,
+  options: {
+    mcpServers?: Record<string, McpSubprocessServerConfig>;
+    onDelta?: NonNullable<Parameters<SDKAgent["send"]>[1]>["onDelta"];
+  } = {},
+): NonNullable<Parameters<SDKAgent["send"]>[1]> {
+  return {
+    model: cursorModelSelection(ctx),
+    ...cursorConversationModeOption(ctx),
+    local: { force: true },
+    ...(options.onDelta === undefined ? {} : { onDelta: options.onDelta }),
+    ...(options.mcpServers === undefined ? {} : { mcpServers: options.mcpServers }),
+  };
+}
+
+function cursorConversationModeOption(ctx: AgentRunContext): { mode?: "agent" | "plan" } {
+  return ctx.config.cursor.mode === null ? {} : { mode: ctx.config.cursor.mode };
 }
 
 export function cursorRoleMcpServers(

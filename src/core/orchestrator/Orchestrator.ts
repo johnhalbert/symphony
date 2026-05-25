@@ -1136,6 +1136,7 @@ export class Orchestrator {
           cursorModel: this.config.cursor.model,
           cursorModelParams: this.config.cursor.modelParams,
           cursorSettingSources: this.config.cursor.settingSources,
+          cursorMode: this.config.cursor.mode,
           cursorAllowLargeContext: this.config.cursor.allowLargeContext,
           cursorWorkerAgentLifecycle: this.config.cursor.workerAgentLifecycle,
           workspaceKey: context.workspace.workspaceKey,

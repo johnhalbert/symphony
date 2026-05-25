@@ -169,6 +169,7 @@ describe("StatusServer durable API", () => {
         agentCwd: "/repo",
         mcpCwd: "/repo",
         settingSources: ["project", "user"],
+        cursorMode: "plan",
       },
       ok: false,
       stages: [
@@ -189,6 +190,7 @@ describe("StatusServer durable API", () => {
                 agentCwd: "/repo",
                 mcpCwd: "/repo",
                 settingSources: ["project", "user"],
+                cursorMode: "plan",
                 sdkTimeoutMs: 45_000,
                 waitTimeoutMs: 5_000,
                 postCancelWaitMs: 1_500,

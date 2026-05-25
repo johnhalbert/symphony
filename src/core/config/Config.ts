@@ -133,6 +133,7 @@ const rawConfigSchema = z
     cursor: z
       .object({
         model: z.string().optional(),
+        mode: z.enum(["agent", "plan"]).optional(),
         model_params: z.record(z.string(), z.string()).optional(),
         setting_sources: z.array(z.string()).optional(),
         opener_command: z.string().optional(),
@@ -259,6 +260,7 @@ export type CursorSettingSource =
 
 export interface CursorConfig {
   model: string;
+  mode: CursorConversationMode | null;
   modelParams: CursorModelParameter[];
   settingSources: CursorSettingSource[];
   openerCommand: string | null;
@@ -266,6 +268,7 @@ export interface CursorConfig {
   workerAgentLifecycle: CursorWorkerAgentLifecycle;
 }
 
+export type CursorConversationMode = "agent" | "plan";
 export type CursorWorkerAgentLifecycle = "fresh_per_run" | "resume_by_issue";
 
 export interface CursorModelParameter {
@@ -556,6 +559,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     },
     cursor: {
       model: cursorModel,
+      mode: raw.cursor?.mode ?? null,
       modelParams: cursorModelParams,
       settingSources: normalizeCursorSettingSources(raw.cursor?.setting_sources),
       openerCommand: raw.cursor?.opener_command ?? null,

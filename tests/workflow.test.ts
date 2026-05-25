@@ -36,6 +36,7 @@ Work on {{ issue.identifier }}.`,
     expect(config.tracker.assignee).toBe("me");
     expect(config.agent.harness).toBe("cursor");
     expect(config.cursor.model).toBe("gpt-5.5");
+    expect(config.cursor.mode).toBeNull();
     expect(config.cursor.modelParams).toEqual([
       { id: "context", value: "272k" },
       { id: "reasoning", value: "extra-high" },
@@ -562,6 +563,38 @@ Work on {{ issue.identifier }}.`,
 
     expect(configured.cursor.model).toBe("composer-2.5");
     expect(configured.cursor.modelParams).toEqual([{ id: "reasoning", value: "high" }]);
+  });
+
+  it("parses explicit Cursor conversation modes and rejects unsupported modes", () => {
+    const planMode = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        cursor: { mode: "plan" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+    const agentMode = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        cursor: { mode: "agent" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(planMode.cursor.mode).toBe("plan");
+    expect(agentMode.cursor.mode).toBe("agent");
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          cursor: { mode: "ask" },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow(SymphonyError);
   });
 
   it("requires bounded gpt-5.5 context unless large context is explicitly allowed", () => {

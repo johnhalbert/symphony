@@ -322,16 +322,22 @@ describe("MCP tool exposure probe helpers", () => {
   it("disposes a created SDK agent when send fails during startup", async () => {
     vi.resetModules();
     const dispose = vi.fn(async () => undefined);
-    const send = vi.fn(async () => {
+    const createOptions: unknown[] = [];
+    const sendOptions: unknown[] = [];
+    const send = vi.fn(async (_prompt: string, options: unknown) => {
+      sendOptions.push(options);
       throw new Error("send failed after create");
     });
     vi.doMock("@cursor/sdk", () => ({
       Agent: {
-        create: vi.fn(async () => ({
-          agentId: "agent-after-create",
-          send,
-          [Symbol.asyncDispose]: dispose,
-        })),
+        create: vi.fn(async (options: unknown) => {
+          createOptions.push(options);
+          return {
+            agentId: "agent-after-create",
+            send,
+            [Symbol.asyncDispose]: dispose,
+          };
+        }),
       },
     }));
     vi.stubEnv("CURSOR_API_KEY", "cursor_test_key_for_send_failure");
@@ -344,6 +350,7 @@ describe("MCP tool exposure probe helpers", () => {
         {
           tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
           workspace: { root: path.join(root, "workspaces") },
+          cursor: { mode: "plan" },
         },
         path.join(root, "WORKFLOW.md"),
         {
@@ -379,6 +386,8 @@ describe("MCP tool exposure probe helpers", () => {
         ],
       });
       expect(send).toHaveBeenCalledTimes(1);
+      expect(createOptions[0]).toMatchObject({ mode: "plan" });
+      expect(sendOptions[0]).toMatchObject({ mode: "plan" });
       expect(dispose).toHaveBeenCalledTimes(1);
     } finally {
       vi.unstubAllEnvs();
@@ -484,6 +493,7 @@ function sdkObservation(overrides: Partial<SdkToolDiagnostics> = {}): SdkToolDia
     agentCwd: overrides.agentCwd ?? "/repo",
     mcpCwd: overrides.mcpCwd ?? "/repo",
     settingSources: overrides.settingSources ?? ["project", "user"],
+    cursorMode: overrides.cursorMode ?? null,
     sdkTimeoutMs: overrides.sdkTimeoutMs ?? 45_000,
     waitTimeoutMs: overrides.waitTimeoutMs ?? 5_000,
     postCancelWaitMs: overrides.postCancelWaitMs ?? 1_500,

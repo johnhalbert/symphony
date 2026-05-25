@@ -33,6 +33,11 @@ describe("doctor review-loop checks", () => {
         status: "ok",
         message: "Managed Cursor runs do not load project/user setting sources by default",
       },
+      {
+        id: "cursor.mode",
+        status: "ok",
+        message: "Managed Cursor runs use the SDK default conversation mode",
+      },
     ]);
 
     const ambient = parseServiceConfig(
@@ -51,6 +56,12 @@ describe("doctor review-loop checks", () => {
       id: "cursor.setting_sources",
       status: "warn",
       message: "Managed Cursor runs load setting sources: project, user",
+    });
+    ambient.cursor.mode = "plan";
+    expect(cursorPolicyDoctorChecks(ambient)).toContainEqual({
+      id: "cursor.mode",
+      status: "warn",
+      message: "Managed Cursor runs request plan conversation mode",
     });
   });
 
