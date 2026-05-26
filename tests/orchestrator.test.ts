@@ -395,6 +395,99 @@ describe("Orchestrator", () => {
     expect(lifecycle?.planningFailureCount).toBe(0);
   }, 10_000);
 
+  it("routes worker dispatch to planning when only a superseded plan matches the issue", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      title: "Original work",
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    const changed = { ...candidate, title: "Changed work", updatedAt: "2026-01-02T00:05:00Z" };
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await submitTwoChildPlan(config, lifecycleStore, candidate, "plan-a", "run-plan-a");
+    await submitTwoChildPlan(config, lifecycleStore, changed, "plan-b", "run-plan-b");
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
+    expect(harness.runs[0]?.prompt).not.toContain("Issue breakdown plan:");
+  });
+
+  it("queues explicit issue breakdown planning when the only matching plan is superseded", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    const candidate = issue({
+      state: "Todo",
+      title: "Original work",
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    const changed = { ...candidate, title: "Changed work", updatedAt: "2026-01-02T00:05:00Z" };
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await submitTwoChildPlan(config, lifecycleStore, candidate, "plan-a", "run-plan-a");
+    await submitTwoChildPlan(config, lifecycleStore, changed, "plan-b", "run-plan-b");
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    const result = await orchestrator.requestIssueBreakdown(candidate.id);
+    await waitFor(() => harness.runs.length === 1);
+    await orchestrator.stop();
+
+    expect(result).toMatchObject({ queued: true, reason: "explicit_request" });
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+  });
+
   it("allows issue breakdown planning when implementation incomplete-turn limits are exhausted", async () => {
     const config = testConfig(root);
     config.issueBreakdown.enabled = true;

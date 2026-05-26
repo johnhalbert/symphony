@@ -125,6 +125,68 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("not_requested");
   });
 
+  it("does not apply a superseded plan even when its fingerprints match", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const original = issue({ labels: ["planning"], title: "Original title", updatedAt: "2026-01-02T00:00:00Z" });
+    const changed = issue({ ...original, title: "Changed title", updatedAt: "2026-01-02T00:05:00Z" });
+    const planA = await submitSingleChildPlan(config, lifecycleStore, original, {
+      idempotencyKey: "plan-a",
+      runId: "run-plan-a",
+    });
+    const planB = await submitSingleChildPlan(config, lifecycleStore, changed, {
+      idempotencyKey: "plan-b",
+      runId: "run-plan-b",
+    });
+    const seeded = await lifecycleStore.get(original.id);
+    await lifecycleStore.updateIssue(changed, {
+      issueBreakdownPlans:
+        seeded?.issueBreakdownPlans.map((plan) => (plan.id === planA.id ? { ...plan, applicationStatus: "pending" } : plan)) ?? [],
+      lastIssueBreakdownPlanId: planB.id,
+    });
+    const writeback = new CapturingWriteback();
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback }).applyLatestFreshPlan(original);
+    const lifecycle = await lifecycleStore.get(original.id);
+
+    expect(result).toMatchObject({ status: "no_fresh_plan", reason: "no_fresh_plan" });
+    expect(writeback.operations).toEqual([]);
+    expect(lifecycle?.lastIssueBreakdownPlanId).toBe(planB.id);
+    expect(lifecycle?.issueBreakdownPlans.find((plan) => plan.id === planA.id)?.applicationStatus).toBe("pending");
+  });
+
+  it("does not mutate lifecycle when previewing a current plan with a superseded pending plan", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const planA = await submitSingleChildPlan(config, lifecycleStore, candidate, {
+      idempotencyKey: "plan-a",
+      runId: "run-plan-a",
+    });
+    const planB = await submitSingleChildPlan(config, lifecycleStore, candidate, {
+      idempotencyKey: "plan-b",
+      runId: "run-plan-b",
+    });
+    const seeded = await lifecycleStore.get(candidate.id);
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans:
+        seeded?.issueBreakdownPlans.map((plan) => (plan.id === planA.id ? { ...plan, applicationStatus: "pending" } : plan)) ?? [],
+      lastIssueBreakdownPlanId: planB.id,
+    });
+    const before = await lifecycleStore.get(candidate.id);
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore }).previewLatestFreshPlan(candidate);
+    const after = await lifecycleStore.get(candidate.id);
+
+    expect(result).toMatchObject({ status: "preview", plan: { id: planB.id } });
+    expect(after?.issueBreakdownPlans).toEqual(before?.issueBreakdownPlans);
+    expect(after?.lastIssueBreakdownPlanId).toBe(planB.id);
+  });
+
   it("durably blocks unresolved dependency references before enqueueing writebacks", async () => {
     const config = testConfig(root);
     config.issueBreakdown.applyToLinear.enabled = true;
@@ -270,6 +332,31 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(after?.issueBreakdownPlans[0]?.applicationStatus).toBe("pending");
     expect(after?.issueBreakdownPlans[0]?.applicationBlockedReason).toBeNull();
     expect(after?.issueBreakdownPlans[0]).toEqual(before?.issueBreakdownPlans[0]);
+  });
+
+  it("preserves a null current plan pointer when marking drifted legacy work stale", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const original = issue({ labels: ["planning"], title: "Original title", updatedAt: "2026-01-02T00:00:00Z" });
+    const plan = await submitSingleChildPlan(config, lifecycleStore, original);
+    const operation = planIssueBreakdownApplicationWritebacks(original, plan)[0]!;
+    await lifecycleStore.updateIssue(original, {
+      issueBreakdownPlans: [{ ...plan, applicationStatus: "pending", applicationOperationKeys: [operation.idempotencyKey] }],
+      lastIssueBreakdownPlanId: null,
+    });
+    const drifted = { ...original, title: "Changed title", updatedAt: "2026-01-03T00:00:00Z" };
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore }).applyLatestFreshPlan(drifted);
+    const lifecycle = await lifecycleStore.get(original.id);
+
+    expect(result).toMatchObject({ status: "no_fresh_plan", reason: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
+    expect(lifecycle?.lastIssueBreakdownPlanId).toBeNull();
+    expect(lifecycle?.issueBreakdownPlans[0]).toMatchObject({
+      applicationStatus: "stale",
+      applicationBlockedReason: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+    });
   });
 
   it("blocks stale pending outbox work after parent drift without tracker writes", async () => {
@@ -508,10 +595,16 @@ class FakeWriter implements TrackerWriter {
   }
 }
 
-async function submitSingleChildPlan(config: ServiceConfig, lifecycleStore: FileIssueLifecycleStore, candidate: Issue) {
+async function submitSingleChildPlan(
+  config: ServiceConfig,
+  lifecycleStore: FileIssueLifecycleStore,
+  candidate: Issue,
+  options: { idempotencyKey?: string; runId?: string } = {},
+) {
+  const runId = options.runId ?? "run-plan-1";
   const result = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
     {
-      runId: "run-plan-1",
+      runId,
       issueId: candidate.id,
       summary: "Split into child issues.",
       proposedIssues: [
@@ -523,9 +616,9 @@ async function submitSingleChildPlan(config: ServiceConfig, lifecycleStore: File
           labels: ["planning"],
         },
       ],
-      idempotencyKey: "plan-1",
+      idempotencyKey: options.idempotencyKey ?? "plan-1",
     },
-    { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
+    { issue: candidate, activeRunId: runId, role: "worker", phase: "issue_breakdown" },
   );
   return result.plan;
 }

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ServiceConfig } from "./config/Config.js";
-import { isFreshIssueBreakdownPlan, latestFreshIssueBreakdownPlan } from "./IssueBreakdownPlanService.js";
+import { issueBreakdownPlanFingerprintsMatch, latestFreshIssueBreakdownPlan } from "./IssueBreakdownPlanService.js";
 import type {
   IssueBreakdownCreatedIssueRef,
   IssueBreakdownPlanRecord,
@@ -174,7 +174,7 @@ export class IssueBreakdownPlanApplyService {
     const updatedPlan: IssueBreakdownPlanRecord = { ...currentPlan, ...patch };
     await this.options.lifecycleStore.updateIssue(issue, {
       issueBreakdownPlans: plans.map((candidate) => (candidate.id === plan.id ? updatedPlan : candidate)),
-      lastIssueBreakdownPlanId: lifecycle?.lastIssueBreakdownPlanId ?? plan.id,
+      lastIssueBreakdownPlanId: lifecycle?.lastIssueBreakdownPlanId ?? null,
     });
     return updatedPlan;
   }
@@ -184,7 +184,7 @@ export class IssueBreakdownPlanApplyService {
     let markedStale = false;
     for (const plan of lifecycle.issueBreakdownPlans) {
       if (plan.applicationStatus !== "pending" && plan.applicationStatus !== "blocked") continue;
-      if (isFreshIssueBreakdownPlan(plan, issue, this.options.config)) continue;
+      if (issueBreakdownPlanFingerprintsMatch(plan, issue, this.options.config)) continue;
       await this.updatePlan(issue, plan, {
         applicationStatus: "stale",
         applicationBlockedReason: ISSUE_BREAKDOWN_PLAN_STALE_REASON,

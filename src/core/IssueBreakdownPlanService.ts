@@ -208,7 +208,7 @@ export function issueContentFingerprint(issue: Issue): string {
     .digest("hex");
 }
 
-export function isFreshIssueBreakdownPlan(
+export function issueBreakdownPlanFingerprintsMatch(
   plan: IssueBreakdownPlanRecord,
   issue: Issue,
   config: ServiceConfig,
@@ -218,16 +218,26 @@ export function isFreshIssueBreakdownPlan(
   return plan.issueContentFingerprint === issueContentFingerprint(issue);
 }
 
+export function isCurrentFreshIssueBreakdownPlan(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  plan: IssueBreakdownPlanRecord,
+  issue: Issue,
+  config: ServiceConfig,
+): boolean {
+  if (!lifecycle || lifecycle.lastIssueBreakdownPlanId !== plan.id) return false;
+  if (plan.applicationStatus === "stale") return false;
+  return issueBreakdownPlanFingerprintsMatch(plan, issue, config);
+}
+
 export function latestFreshIssueBreakdownPlan(
   lifecycle: IssueLifecycleRecord | null | undefined,
   issue: Issue,
   config: ServiceConfig,
 ): IssueBreakdownPlanRecord | null {
-  const plans = lifecycle?.issueBreakdownPlans.filter((plan) => isFreshIssueBreakdownPlan(plan, issue, config)) ?? [];
-  return (
-    [...plans].sort((left, right) => Date.parse(left.acceptedAt) - Date.parse(right.acceptedAt))[plans.length - 1] ??
-    null
-  );
+  if (!lifecycle?.lastIssueBreakdownPlanId) return null;
+  const plan = lifecycle.issueBreakdownPlans.find((candidate) => candidate.id === lifecycle.lastIssueBreakdownPlanId);
+  if (!plan) return null;
+  return isCurrentFreshIssueBreakdownPlan(lifecycle, plan, issue, config) ? plan : null;
 }
 
 export function issueBreakdownPlanRequestHash(input: IssueBreakdownPlanInput): string {

@@ -2,7 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { IssueBreakdownPlanService, isFreshIssueBreakdownPlan } from "../src/core/IssueBreakdownPlanService.js";
+import {
+  IssueBreakdownPlanService,
+  issueBreakdownPlanFingerprintsMatch,
+  latestFreshIssueBreakdownPlan,
+} from "../src/core/IssueBreakdownPlanService.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { issue, testConfig } from "./helpers.js";
@@ -155,8 +159,69 @@ describe("IssueBreakdownPlanService", () => {
 
     expect(replay.replayed).toBe(true);
     expect(replay.plan.runId).toBe("run-plan-1");
-    expect(isFreshIssueBreakdownPlan(first.plan, { ...candidate, updatedAt: "2026-01-02T00:05:00Z" }, config)).toBe(true);
-    expect(isFreshIssueBreakdownPlan(first.plan, drifted, config)).toBe(false);
+    expect(issueBreakdownPlanFingerprintsMatch(first.plan, { ...candidate, updatedAt: "2026-01-02T00:05:00Z" }, config)).toBe(
+      true,
+    );
+    expect(issueBreakdownPlanFingerprintsMatch(first.plan, drifted, config)).toBe(false);
+  });
+
+  it("only treats the current non-stale plan as fresh", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const original = issue({ updatedAt: "2026-01-02T00:00:00Z", title: "Original title" });
+    const changed = issue({
+      ...original,
+      title: "Changed title",
+      updatedAt: "2026-01-02T00:05:00Z",
+    });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+    const planA = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-a",
+        issueId: original.id,
+        summary: "Split original work.",
+        proposedIssues: [
+          { title: "Build original child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+        ],
+        idempotencyKey: "plan-a",
+      },
+      { issue: original, activeRunId: "run-plan-a", role: "worker", phase: "issue_breakdown" },
+    );
+    const planB = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-b",
+        issueId: changed.id,
+        summary: "Split changed work.",
+        proposedIssues: [
+          { title: "Build changed child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+        ],
+        idempotencyKey: "plan-b",
+      },
+      { issue: changed, activeRunId: "run-plan-b", role: "worker", phase: "issue_breakdown" },
+    );
+    const lifecycle = await lifecycleStore.get(original.id);
+
+    expect(lifecycle?.lastIssueBreakdownPlanId).toBe(planB.plan.id);
+    expect(issueBreakdownPlanFingerprintsMatch(planA.plan, original, config)).toBe(true);
+    expect(latestFreshIssueBreakdownPlan(lifecycle, original, config)).toBeNull();
+    expect(latestFreshIssueBreakdownPlan(lifecycle, changed, config)?.id).toBe(planB.plan.id);
+
+    await lifecycleStore.updateIssue(changed, {
+      issueBreakdownPlans:
+        lifecycle?.issueBreakdownPlans.map((plan) =>
+          plan.id === planB.plan.id ? { ...plan, applicationStatus: "stale", applicationBlockedReason: "stale" } : plan,
+        ) ?? [],
+      lastIssueBreakdownPlanId: planB.plan.id,
+    });
+    const staleLifecycle = await lifecycleStore.get(original.id);
+    expect(latestFreshIssueBreakdownPlan(staleLifecycle, changed, config)).toBeNull();
+
+    await lifecycleStore.updateIssue(changed, {
+      issueBreakdownPlans: staleLifecycle?.issueBreakdownPlans ?? [],
+      lastIssueBreakdownPlanId: null,
+    });
+    const nullPointerLifecycle = await lifecycleStore.get(original.id);
+    expect(latestFreshIssueBreakdownPlan(nullPointerLifecycle, original, config)).toBeNull();
   });
 
   it("rejects invalid schema and mismatched active run context", async () => {
