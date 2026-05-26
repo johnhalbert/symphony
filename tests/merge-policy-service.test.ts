@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { MergePolicyService, type MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
@@ -156,6 +156,199 @@ describe("MergePolicyService", () => {
     });
   });
 
+  it("persists conflict metadata when the conflict writeback succeeds but tracker verification is stale", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({ mergeable: false, mergeableState: "dirty" });
+    const writer = new MemoryWriter(currentIssue, "verified");
+    const logger = mockLogger();
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+      logger,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result).toMatchObject({ status: "blocked_conflicts", headSha: "head-sha-1", mergeableState: "dirty" });
+    expect(client.mergeInput).toBeNull();
+    expect(currentIssue.state).toBe("Ready to Merge");
+    expect(writer.transitions).toEqual([
+      expect.objectContaining({
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge"],
+        toState: "Approved with Conflicts",
+      }),
+    ]);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Gated merge conflicts writeback verification is stale",
+      expect.objectContaining({
+        issue_id: "issue-1",
+        expected_state: "Approved with Conflicts",
+        observed_state: "Ready to Merge",
+      }),
+    );
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "head-sha-1",
+        prBranch: "symphony/TEST-1",
+      },
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        approvedHeadSha: "head-sha-1",
+        currentHeadSha: "head-sha-1",
+        baseBranch: "main",
+        baseHeadSha: "base-sha-1",
+        conflictsState: "Approved with Conflicts",
+        writebackOperationKeys: expect.arrayContaining([expect.stringContaining("merge-conflicts")]),
+      },
+    });
+  });
+
+  it("persists conflict metadata when conflict writeback verification has no tracker row", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const writer = new MemoryWriter(currentIssue);
+    const logger = mockLogger();
+    const service = new MergePolicyService({
+      config,
+      tracker: missingStateTracker(),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient({ mergeable: false, mergeableState: "dirty" }),
+      logger,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "blocked_conflicts" });
+
+    expect(currentIssue.state).toBe("Approved with Conflicts");
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Gated merge conflicts writeback verification is stale",
+      expect.objectContaining({
+        issue_id: "issue-1",
+        expected_state: "Approved with Conflicts",
+        observed_state: null,
+      }),
+    );
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      phase: "merge_conflict_resolution",
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "head-sha-1",
+        prBranch: "symphony/TEST-1",
+      },
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        currentHeadSha: "head-sha-1",
+        baseBranch: "main",
+        baseHeadSha: "base-sha-1",
+      },
+    });
+  });
+
+  it("does not persist conflict metadata when the conflict transition writeback is skipped", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue, "skipped"),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient({ mergeable: false, mergeableState: "dirty" }),
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/conflicts writeback did not succeed/);
+    const stored = await lifecycleStore.get(currentIssue.id);
+    expect(stored).toMatchObject({
+      phase: "passed",
+      summaryPointers: {
+        prHeadSha: "head-sha-1",
+      },
+    });
+    expect(stored?.mergeConflict).toBeNull();
+  });
+
+  it("returns blocked_conflicts idempotently while tracker remains stale after conflict metadata is persisted", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const writer = new MemoryWriter(currentIssue, "verified");
+    const client = new FakeMergeClient({ mergeable: false, mergeableState: "dirty" });
+    const logger = mockLogger();
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+      logger,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "blocked_conflicts" });
+    await expect(service.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "blocked_conflicts" });
+
+    expect(writer.transitions).toHaveLength(1);
+    expect(client.mergeInput).toBeNull();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
   it("defers merge while GitHub mergeability is unknown", async () => {
     const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
@@ -300,6 +493,67 @@ describe("MergePolicyService", () => {
 
     await expect(cleanService.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "merged" });
     expect(cleanClient.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-3" });
+  });
+
+  it("keeps reopened conflict metadata durable when tracker lags behind the conflict state", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Approved with Conflicts", labels: ["dogfood-ready"] });
+    const staleSourceIssue = { ...currentIssue, state: "Ready to Merge" };
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "passed",
+      mergeConflict: mergeConflictRecord({ resolutionStatus: "resolved", resolvedHeadSha: "head-sha-2" }),
+    });
+    const writer = new MemoryWriter(currentIssue, "verified");
+    const client = new FakeMergeClient({ headSha: "head-sha-2", mergeable: false, mergeableState: "dirty" });
+    const logger = mockLogger();
+    const service = new MergePolicyService({
+      config,
+      tracker: sequenceTracker([currentIssue, staleSourceIssue, staleSourceIssue]),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+      logger,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).resolves.toMatchObject({
+      status: "blocked_conflicts",
+      headSha: "head-sha-2",
+    });
+    await expect(service.reconcileIssue(currentIssue)).resolves.toMatchObject({
+      status: "blocked_conflicts",
+      headSha: "head-sha-2",
+    });
+
+    expect(writer.transitions).toHaveLength(1);
+    expect(client.mergeInput).toBeNull();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      phase: "merge_conflict_resolution",
+      summaryPointers: {
+        prHeadSha: "head-sha-2",
+      },
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        approvedHeadSha: "head-sha-1",
+        currentHeadSha: "head-sha-2",
+        resolvedHeadSha: null,
+        sourceState: "Approved with Conflicts",
+        conflictsState: "Approved with Conflicts",
+      },
+    });
   });
 
   it("rejects conflict approval carry-forward when the resolved head is not a descendant", async () => {
@@ -923,6 +1177,47 @@ function mergeConflictRecord(input: { resolutionStatus?: "pending" | "resolved";
     writebackOperationKeys: [],
     blockedAt: null,
     blockedReason: null,
+  };
+}
+
+function mockLogger() {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  };
+}
+
+function missingStateTracker(): TrackerClient {
+  return {
+    async fetchCandidateIssues() {
+      return [];
+    },
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssueStatesByIds() {
+      return [];
+    },
+  };
+}
+
+function sequenceTracker(issues: Issue[]): TrackerClient {
+  let fetchIndex = 0;
+  return {
+    async fetchCandidateIssues() {
+      return [];
+    },
+    async fetchIssuesByStates(states) {
+      const current = issues[Math.min(fetchIndex, issues.length - 1)];
+      return current && states.includes(current.state) ? [{ ...current }] : [];
+    },
+    async fetchIssueStatesByIds() {
+      const current = issues[Math.min(fetchIndex, issues.length - 1)];
+      fetchIndex += 1;
+      return current ? [{ ...current }] : [];
+    },
   };
 }
 

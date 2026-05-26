@@ -11,7 +11,7 @@ import type {
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
 import type { ResolvedCredential } from "../config/CredentialProfiles.js";
-import { SymphonyError } from "../errors.js";
+import { SymphonyError, errorMessage } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type {
   CompletionReportPullRequestRef,
@@ -88,6 +88,8 @@ export class MergePolicyService {
     }
 
     const sourceState = this.mergeSourceState(latestIssue, lifecycle);
+    const staleConflictResult = this.pendingConflictsWhileTrackerCatchesUp(latestIssue, lifecycle);
+    if (staleConflictResult !== null) return staleConflictResult;
     if (sourceState === null) return { status: "skipped", reason: `issue is not in a merge source state: ${latestIssue.state}` };
 
     const report = latestCompletionReport(lifecycle);
@@ -211,6 +213,33 @@ export class MergePolicyService {
     return null;
   }
 
+  private pendingConflictsWhileTrackerCatchesUp(issue: Issue, lifecycle: IssueLifecycleRecord): MergePolicyResult | null {
+    const conflict = lifecycle.mergeConflict;
+    if (
+      lifecycle.phase !== "merge_conflict_resolution" ||
+      conflict === null ||
+      conflict.status !== "open" ||
+      conflict.resolutionStatus !== "pending" ||
+      statesEqual(issue.state, conflict.conflictsState)
+    ) {
+      return null;
+    }
+    const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+    if (
+      reportPullRequest === null ||
+      conflict.pullRequest.number !== reportPullRequest.number ||
+      conflict.pullRequest.url !== reportPullRequest.url ||
+      conflict.pullRequest.branch !== reportPullRequest.branch
+    ) {
+      return null;
+    }
+    return {
+      status: "blocked_conflicts",
+      headSha: conflict.currentHeadSha,
+      mergeableState: conflict.mergeableState,
+    };
+  }
+
   private async ensureConflictsTransition(
     issue: Issue,
     lifecycle: IssueLifecycleRecord,
@@ -251,27 +280,24 @@ export class MergePolicyService {
         );
       }
     }
-    const latest = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? null;
-    if (!latest || !statesEqual(latest.state, conflictsState)) {
-      throw new SymphonyError("invalid_request", "Gated merge conflicts writeback could not be verified");
-    }
-    await this.options.lifecycleStore.updateIssue(latest, {
+    const mergeConflict = buildMergeConflictMetadata({
+      config: this.options.config,
+      lifecycle,
+      issue,
+      pullRequest,
+      headSha,
+      sourceState,
+      conflictsState,
+      reason,
+      mergeableState,
+      baseBranch: livePullRequest.baseBranch,
+      baseHeadSha: livePullRequest.baseHeadSha,
+      writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+    });
+    await this.options.lifecycleStore.updateIssue(issue, {
       phase: "merge_conflict_resolution",
       blockedReason: null,
-      mergeConflict: buildMergeConflictMetadata({
-        config: this.options.config,
-        lifecycle,
-        issue,
-        pullRequest,
-        headSha,
-        sourceState,
-        conflictsState,
-        reason,
-        mergeableState,
-        baseBranch: livePullRequest.baseBranch,
-        baseHeadSha: livePullRequest.baseHeadSha,
-        writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
-      }),
+      mergeConflict,
       summaryPointers: {
         prUrl: pullRequest.url,
         prNumber: pullRequest.number,
@@ -279,6 +305,24 @@ export class MergePolicyService {
         prBranch: pullRequest.branch ?? null,
       },
     });
+    try {
+      const latest = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? null;
+      if (!latest || !statesEqual(latest.state, conflictsState)) {
+        this.options.logger?.warn("Gated merge conflicts writeback verification is stale", {
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          expected_state: conflictsState,
+          observed_state: latest?.state ?? null,
+        });
+      }
+    } catch (error) {
+      this.options.logger?.warn("Gated merge conflicts writeback verification failed after lifecycle persist", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        expected_state: conflictsState,
+        error: errorMessage(error),
+      });
+    }
   }
 
   private validateLifecycle(
