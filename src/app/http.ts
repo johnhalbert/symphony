@@ -262,7 +262,11 @@ export class StatusServer {
             }
           }
           if (decision === "reject" && !result.replayed) {
-            await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
+            try {
+              await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
+            } catch {
+              // The approval decision is already durable; worker exit recovery will retry terminal writeback.
+            }
             if (this.options.operatorApproval?.rejectPolicy === "cancel") {
               await this.options.orchestrator.cancelIssue(result.request.issueId);
             }
