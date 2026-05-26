@@ -7,7 +7,6 @@ tracker:
   active_states:
     - Todo
     - In Progress
-    - Approved with Conflicts
   handoff_states: []
   terminal_states:
     - Done

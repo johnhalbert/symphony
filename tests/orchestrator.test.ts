@@ -192,14 +192,16 @@ describe("Orchestrator", () => {
     config.mergePolicy.mode = "gated";
     config.mergePolicy.conflictsState = "Approved with Conflicts";
     config.mergePolicy.maxConflictFixTurns = 3;
-    config.tracker.activeStates = ["Todo", "In Progress", "Approved with Conflicts"];
+    config.tracker.activeStates = ["Todo", "In Progress"];
     const candidate = issue({ state: "Approved with Conflicts", labels: ["planning"] });
+    const requestedStates: string[][] = [];
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return [candidate];
-      },
-      async fetchIssuesByStates() {
         return [];
+      },
+      async fetchIssuesByStates(states) {
+        requestedStates.push(states);
+        return states.includes("Approved with Conflicts") ? [candidate] : [];
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -235,6 +237,7 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("previousHeadSha");
     expect(harness.runs[0]?.prompt).toContain("baseHeadSha");
     expect(harness.runs[0]?.prompt).not.toContain("submit_issue_breakdown_plan");
+    expect(requestedStates).toContainEqual(["Approved with Conflicts"]);
     await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "merge_conflict_resolution" })).resolves.toMatchObject({
       runPhase: "merge_conflict_resolution",
       runKind: "implementation",
@@ -253,14 +256,14 @@ describe("Orchestrator", () => {
     config.mergePolicy.conflictsState = "Approved with Conflicts";
     config.mergePolicy.maxConflictFixTurns = 3;
     config.reviewLoop.blockedStates = ["Blocked"];
-    config.tracker.activeStates = ["Todo", "In Progress", "Approved with Conflicts"];
+    config.tracker.activeStates = ["Todo", "In Progress"];
     const candidate = issue({ state: "Approved with Conflicts" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return [candidate];
-      },
-      async fetchIssuesByStates() {
         return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Approved with Conflicts") ? [candidate] : [];
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -308,6 +311,96 @@ describe("Orchestrator", () => {
       },
     });
   });
+
+  it("blocks after three conflict-fix runs that exit without MCP handoff", async () => {
+    const config = testConfig(root);
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Approved with Conflicts";
+    config.mergePolicy.maxConflictFixTurns = 3;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.tracker.activeStates = ["Todo", "In Progress"];
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    const candidate = issue({ state: "Approved with Conflicts" });
+    let currentState = "Approved with Conflicts";
+    const conflictStateQueries: string[][] = [];
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        conflictStateQueries.push(states);
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "merge_conflict_resolution",
+      mergeConflict: mergeConflictRecord(),
+    });
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const harness = new ConflictNoReportHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 3 && currentState === "Blocked", "conflict loop blocked", 6_000);
+      await settleOrchestratorExit();
+      await orchestrator.refreshNow();
+      await settleOrchestratorExit();
+    } finally {
+      await orchestrator.stop();
+    }
+
+    expect(config.tracker.activeStates).not.toContain("Approved with Conflicts");
+    expect(conflictStateQueries).toContainEqual(["Approved with Conflicts"]);
+    expect(harness.runs.map((run) => run.ctx.runPhase)).toEqual([
+      "merge_conflict_resolution",
+      "merge_conflict_resolution",
+      "merge_conflict_resolution",
+    ]);
+    expect(harness.runs).toHaveLength(3);
+    expect(writer.comments.some((comment) => comment.body.includes("Merge conflicts remain unresolved"))).toBe(true);
+    expect(writer.transitions).toEqual([
+      expect.objectContaining({
+        fromStates: expect.arrayContaining(["Approved with Conflicts"]),
+        toState: "Blocked",
+      }),
+    ]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+      mergeConflict: {
+        status: "blocked",
+        resolutionStatus: "blocked",
+        fixTurnCount: 3,
+        maxFixTurns: 3,
+        lastConflictFixRunId: "conflict-run-3",
+        attemptRunIds: ["conflict-run-1", "conflict-run-2", "conflict-run-3"],
+      },
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  }, 10_000);
 
   it("reroutes implementation dispatch to planning when writeback reveals stale issue content", async () => {
     const config = testConfig(root);
@@ -506,8 +599,8 @@ describe("Orchestrator", () => {
     config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
     config.issueBreakdown.planningLabels = ["planning"];
     config.issueBreakdown.maxPlanningFailures = 3;
-    config.issueBreakdown.planningRetryBaseMs = 200;
-    config.issueBreakdown.planningRetryMaxMs = 200;
+    config.issueBreakdown.planningRetryBaseMs = 1_000;
+    config.issueBreakdown.planningRetryMaxMs = 1_000;
     const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -553,7 +646,7 @@ describe("Orchestrator", () => {
     await second.refreshNow();
     await settleOrchestratorExit();
     expect(harness.runs).toHaveLength(1);
-    await new Promise((resolve) => setTimeout(resolve, 240));
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
     await second.refreshNow();
     await waitFor(() => harness.runs.length === 2, "planning retry after durable backoff");
     await waitFor(() => second.snapshot().counts.running === 0);
@@ -5597,6 +5690,18 @@ class TokenSequenceHarness implements AgentHarness {
     const tokens = this.tokenEvents[runNumber - 1];
     if (tokens) yield { type: "tokens", tokens };
     yield { type: "completed" };
+  }
+}
+
+class ConflictNoReportHarness implements AgentHarness {
+  readonly id = "conflict-no-report";
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string; runId: string }> = [];
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    const runId = `conflict-run-${this.runs.length + 1}`;
+    this.runs.push({ ctx, prompt, runId });
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    yield { type: "completed", message: "conflict worker exited without MCP handoff" };
   }
 }
 

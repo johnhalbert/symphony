@@ -865,6 +865,7 @@ function normalizeIssueBoardColumns(
       ...input.reviewStates,
       ...(input.reviewPassState === null ? [] : [input.reviewPassState]),
       ...input.mergePolicy.sourceStates,
+      ...(input.mergePolicy.conflictsState === null ? [] : [input.mergePolicy.conflictsState]),
     ]),
     done: uniqueStateNames([
       input.mergePolicy.doneState,
@@ -983,14 +984,8 @@ function validateMergePolicyStateBuckets(input: {
   const conflictsState = mergePolicy.conflictsState;
   if (mergePolicy.mode === "disabled" || conflictsState === null) return;
 
-  if (!input.activeStates.some((state) => statesEqual(state, conflictsState))) {
-    throw new SymphonyError(
-      "config_validation_error",
-      `merge_policy.conflicts_state must be listed in tracker.active_states: ${conflictsState}`,
-    );
-  }
-
   const conflictOverlaps: Array<[string, string[]]> = [
+    ["tracker.active_states", input.activeStates],
     ["merge_policy.source_states", mergePolicy.sourceStates],
     ["merge_policy.done_state", [mergePolicy.doneState]],
     ["tracker.handoff_states", input.handoffStates],

@@ -761,7 +761,7 @@ function mergeConfig(input: {
         kind: "linear",
         api_key: "$LINEAR_API_KEY",
         project_slug: "TEST",
-        ...(input.conflictsState === undefined ? {} : { active_states: ["Todo", "In Progress", input.conflictsState] }),
+        ...(input.conflictsState === undefined ? {} : { active_states: ["Todo", "In Progress"] }),
       },
       workspace: { root },
       writeback: { enabled: true, mode: input.writebackMode ?? "live" },

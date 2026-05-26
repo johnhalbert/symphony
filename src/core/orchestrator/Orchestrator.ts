@@ -469,7 +469,10 @@ export class Orchestrator {
     const issue = refreshed[0];
     if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
     if (this.running.has(issue.id)) throw new SymphonyError("conflict", "Issue already has a running Symphony agent");
-    if (!this.shouldDispatchWorker(issue, false)) {
+    if (this.isMergeConflictState(issue.state)) {
+      throw new SymphonyError("conflict", "Merge conflict states are only eligible for conflict-fix workers");
+    }
+    if (!this.shouldDispatchWorker(issue, false, "issue_breakdown")) {
       throw new SymphonyError("conflict", "Issue is not currently eligible for worker dispatch");
     }
     if (!(await this.lifecycleAllowsDispatch(issue, "worker", "issue_breakdown"))) {
@@ -630,6 +633,11 @@ export class Orchestrator {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchWorkerIssue(issue, null);
       }
+      const conflictFixCandidates = await this.fetchMergeConflictWorkerCandidates();
+      for (const issue of sortIssuesForDispatch(conflictFixCandidates)) {
+        if (this.availableSlots() <= 0) break;
+        await this.tryDispatchWorkerIssue(issue, null);
+      }
       const reviewerCandidates = await this.options.tracker.fetchIssuesByStates(this.config.reviewLoop.reviewStates);
       for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
         if (this.availableSlots() <= 0) break;
@@ -744,7 +752,7 @@ export class Orchestrator {
         await this.terminateRunningIssue(issueId, false, "handoff state");
       } else if (entry.role === "worker" && !latest.assignedToWorker) {
         await this.terminateRunningIssue(issueId, false, "assignee route changed");
-      } else if (entry.role === "worker" && !isStateIn(latest.state, this.config.tracker.activeStates)) {
+      } else if (entry.role === "worker" && !this.isWorkerStateActiveForRunPhase(latest, entry.runPhase)) {
         await this.terminateRunningIssue(issueId, false, "non-active state");
       } else if (entry.role === "reviewer" && isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
         await this.terminateRunningIssue(issueId, false, "blocked state");
@@ -793,7 +801,21 @@ export class Orchestrator {
     });
   }
 
-  private shouldDispatchWorker(issue: Issue, allowExistingClaim = false): boolean {
+  private async fetchMergeConflictWorkerCandidates(): Promise<Issue[]> {
+    if (this.config.mergePolicy.mode !== "gated" || this.config.mergePolicy.conflictsState === null) return [];
+    try {
+      return await this.options.tracker.fetchIssuesByStates([this.config.mergePolicy.conflictsState]);
+    } catch (error) {
+      this.options.logger.warn("merge conflict worker issue fetch failed", { error: errorMessage(error) });
+      return [];
+    }
+  }
+
+  private shouldDispatchWorker(
+    issue: Issue,
+    allowExistingClaim = false,
+    runPhase: AgentRunPhase = "implementation",
+  ): boolean {
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
@@ -801,13 +823,19 @@ export class Orchestrator {
     if (isStateIn(issue.state, this.config.tracker.handoffStates)) return false;
     if (isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
     if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
-    if (!isStateIn(issue.state, this.config.tracker.activeStates)) return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
+    if (!this.isWorkerStateActiveForRunPhase(issue, runPhase)) return false;
     if (!this.passesLabelGuardrails(issue)) return false;
     if (issue.state.toLowerCase() === "todo") {
       if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
     }
     return this.hasStateSlot(issue.state);
+  }
+
+  private isWorkerStateActiveForRunPhase(issue: Issue, runPhase: AgentRunPhase): boolean {
+    if (runPhase === "merge_conflict_resolution") return this.isMergeConflictState(issue.state);
+    if (this.isMergeConflictState(issue.state)) return false;
+    return isStateIn(issue.state, this.config.tracker.activeStates);
   }
 
   private shouldDispatchReviewer(issue: Issue, allowExistingClaim = false): boolean {
@@ -922,7 +950,8 @@ export class Orchestrator {
 
   private async tryDispatchWorkerIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
-    if (!this.shouldDispatchWorker(issue, allowExistingClaim)) return false;
+    const initialRunPhase = this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation";
+    if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase)) return false;
 
     let refreshed: Issue[];
     try {
@@ -939,7 +968,8 @@ export class Orchestrator {
     const latest = refreshed[0];
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
-    if (!this.shouldDispatchWorker(latest, allowExistingClaim)) return false;
+    const latestRunPhase = this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation";
+    if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase)) return false;
 
     const decision = await this.resolveWorkerDispatchDecision(latest);
     if (decision.action === "skip") {
@@ -968,7 +998,7 @@ export class Orchestrator {
       }
       runPhase = postWritebackDecision.runPhase;
     }
-    if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim)) return false;
+    if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, runPhase)) return false;
     if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase))) return false;
 
     this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase);
@@ -1529,11 +1559,15 @@ export class Orchestrator {
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
         if (!terminal.updated) {
-          this.claimed.delete(issueId);
-          return;
+          if (entry.runPhase !== "merge_conflict_resolution") {
+            this.claimed.delete(issueId);
+            return;
+          }
         }
       }
-      this.completed.add(issueId);
+      if (entry.runPhase !== "merge_conflict_resolution") {
+        this.completed.add(issueId);
+      }
       this.claimed.delete(issueId);
       return;
     }
@@ -1546,12 +1580,14 @@ export class Orchestrator {
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
-        if (!terminal.updated) {
+        if (!terminal.updated && entry.runPhase !== "merge_conflict_resolution") {
           this.claimed.delete(issueId);
           return;
         }
       }
-      this.completed.add(issueId);
+      if (entry.runPhase !== "merge_conflict_resolution") {
+        this.completed.add(issueId);
+      }
       if (entry.role === "reviewer") {
         await this.reconcileReviewVerdictHandoff(entry);
         this.claimed.delete(issueId);
@@ -1559,6 +1595,14 @@ export class Orchestrator {
       }
       if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) {
         this.claimed.delete(issueId);
+        return;
+      }
+      if (entry.runPhase === "merge_conflict_resolution") {
+        if (await this.shouldScheduleContinuation(entry)) {
+          this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
+        } else {
+          this.claimed.delete(issueId);
+        }
         return;
       }
       if (this.config.writeback.enabled) {
@@ -1778,7 +1822,7 @@ export class Orchestrator {
     const latest = refreshed[0];
     if (!latest) return false;
     entry.issue = latest;
-    return this.shouldDispatchWorker(latest, true);
+    return this.shouldDispatchWorker(latest, true, entry.runPhase);
   }
 
   private scheduleRetry(
@@ -1802,7 +1846,10 @@ export class Orchestrator {
     if (!retry) return;
     this.retryAttempts.delete(issueId);
     try {
-      const candidates = await this.options.tracker.fetchCandidateIssues();
+      const candidates =
+        retry.runPhase === "merge_conflict_resolution"
+          ? await this.options.tracker.fetchIssueStatesByIds([issueId])
+          : await this.options.tracker.fetchCandidateIssues();
       const issue = candidates.find((candidate) => candidate.id === issueId);
       if (!issue) {
         this.claimed.delete(issueId);

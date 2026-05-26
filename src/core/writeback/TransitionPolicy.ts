@@ -487,6 +487,7 @@ export function planBlockedEscalationWritebacks(
     ...config.tracker.activeStates,
     ...config.tracker.handoffStates,
     ...config.reviewLoop.reviewStates,
+    ...(config.mergePolicy.mode === "gated" && config.mergePolicy.conflictsState !== null ? [config.mergePolicy.conflictsState] : []),
   ]);
   if (!isStateIn(context.issue.state, fromStates)) return [];
 

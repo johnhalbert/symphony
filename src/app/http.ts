@@ -17,6 +17,7 @@ import type {
   IssueCompletionReportRecord,
   IssueLifecycleRecord,
   IssueLifecycleStore,
+  IssueMergeConflictMetadata,
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
@@ -1784,6 +1785,7 @@ function renderRunningRow(
   const cancelFailed = cancelFailedSummary(liveCancelFailed(row));
   const activitySources = activitySummary(row);
   const blockedReason = lifecycleBlockedReason(row.lifecycle);
+  const conflictSummary = mergeConflictDashboardSummary(row.lifecycle?.mergeConflict ?? null);
   return `<li class="run-row operator-${operator.status}">
     <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.runKind)} · ${escapeHtml(row.state)}</span></div>
     <div class="meta">run <code>${escapeHtml(runId)}</code> · agent <code>${escapeHtml(agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
@@ -1794,6 +1796,7 @@ function renderRunningRow(
     ${cancellation ? `<div class="cancellation">${escapeHtml(cancellation)}</div>` : ""}
     ${cancelFailed ? `<div class="cancellation">${escapeHtml(cancelFailed)}</div>` : ""}
     ${blockedReason ? `<div class="blocked">Blocked: ${escapeHtml(blockedReason)}</div>` : ""}
+    ${conflictSummary ? `<div class="blocked">Merge conflict: ${escapeHtml(conflictSummary)}</div>` : ""}
     <div class="controls">controls: ${formatControls(controls)}</div>
     ${formatAffordances(affordances)}
   </li>`;
@@ -1827,6 +1830,7 @@ async function operatorSnapshotView(
         (await runStore?.latestRunForIssue(row.issueId)) ?? (await runStore?.latestRunForIssue(row.issueIdentifier));
       const summaryRun = await resolveIssueDetailsSummaryRun(row, latestRun, runStore);
       const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
+      const mergeConflict = mergeConflictOperatorSummary(row.lifecycle?.mergeConflict ?? null);
       const affordances = operatorAffordances({
         issueKey: row.issueIdentifier,
         lifecycle: row.lifecycle,
@@ -1855,6 +1859,7 @@ async function operatorSnapshotView(
           lifecycle: row.lifecycle,
         }),
         liveness: runningOperatorLiveness(row, paused, row.lifecycle, agentId),
+        mergeConflict,
         controls,
         ...affordances,
       };
@@ -2477,6 +2482,53 @@ function isLifecycleBlocked(lifecycle: IssueLifecycleRecord | null | undefined):
 function lifecycleBlockedReason(lifecycle: IssueLifecycleRecord | null | undefined): string | null {
   if (lifecycle === null || lifecycle === undefined) return null;
   return lifecycle.blockedReason ?? lifecycle.mergeConflict?.blockedReason ?? null;
+}
+
+function mergeConflictOperatorSummary(conflict: IssueMergeConflictMetadata | null) {
+  if (conflict === null) return null;
+  return {
+    conflictState: conflict.conflictsState,
+    status: conflict.status,
+    resolutionStatus: conflict.resolutionStatus,
+    fixTurnCount: conflict.fixTurnCount,
+    maxFixTurns: conflict.maxFixTurns,
+    attemptsLabel: `${conflict.fixTurnCount}/${conflict.maxFixTurns}`,
+    attemptRunIds: conflict.attemptRunIds,
+    pullRequest: {
+      url: conflict.pullRequest.url,
+      number: conflict.pullRequest.number,
+      branch: conflict.pullRequest.branch,
+      headSha: conflict.pullRequest.headSha,
+    },
+    approvedHeadSha: conflict.approvedHeadSha,
+    currentHeadSha: conflict.currentHeadSha,
+    resolvedHeadSha: conflict.resolvedHeadSha,
+    baseBranch: conflict.baseBranch,
+    baseHeadSha: conflict.baseHeadSha,
+    lastConflictFixRunId: conflict.lastConflictFixRunId,
+    lastConflictResolutionReportId: conflict.lastConflictResolutionReportId,
+    blockedReason: conflict.blockedReason,
+  };
+}
+
+function mergeConflictDashboardSummary(conflict: IssueMergeConflictMetadata | null): string | null {
+  const summary = mergeConflictOperatorSummary(conflict);
+  if (summary === null) return null;
+  const pr =
+    summary.pullRequest.number === null
+      ? summary.pullRequest.url ?? "n/a"
+      : `#${summary.pullRequest.number}${summary.pullRequest.url === null ? "" : ` ${summary.pullRequest.url}`}`;
+  return [
+    `state=${summary.conflictState}`,
+    `status=${summary.status}/${summary.resolutionStatus}`,
+    `attempts=${summary.attemptsLabel}`,
+    `PR=${pr}`,
+    `branch=${summary.pullRequest.branch ?? "n/a"}`,
+    `head=${summary.pullRequest.headSha ?? summary.currentHeadSha}`,
+    `base=${summary.baseBranch ?? "n/a"}@${summary.baseHeadSha ?? "n/a"}`,
+    `lastRun=${summary.lastConflictFixRunId ?? "n/a"}`,
+    ...(summary.blockedReason === null ? [] : [`blocked=${summary.blockedReason}`]),
+  ].join("; ");
 }
 
 function liveIssueResponse(live: RunningRow, operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>) {
