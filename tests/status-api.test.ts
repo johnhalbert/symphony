@@ -790,6 +790,165 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("serves redacted cursor-derived transcript rows without backfilling counts during GET", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-cursor-secret",
+      sessionId: "session-cursor-secret",
+      agentId: "agent-cursor-secret",
+      role: "worker",
+      issueId: "issue-cursor-secret",
+      issueIdentifier: "TEST-CURSOR-SECRET",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-CURSOR-SECRET",
+      workspacePath: path.join(config.workspace.root, "TEST-CURSOR-SECRET"),
+    });
+    await runStore.appendEvent({
+      runId: "run-cursor-secret",
+      at: "2030-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message:
+        "assistant stream SECRET_STREAM token=stream-token access_token=stream-access github_token=stream-github client_secret: stream-client private_key=stream-private ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      payload: {
+        type: "progress",
+        activitySource: "stream",
+        message:
+          "assistant stream payload SECRET_STREAM_PAYLOAD token=stream-payload-token client_secret: stream-payload-client inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      },
+    });
+    await runStore.appendEvent({
+      runId: "run-cursor-secret",
+      at: "2030-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message:
+        "text delta SECRET_DELTA token=delta-token apiKey=delta-api private_key=delta-private sk-HIJKLMNO1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      payload: {
+        type: "progress",
+        activitySource: "delta",
+        message:
+          "text delta payload SECRET_DELTA_PAYLOAD refreshToken: delta-refresh github_token=delta-github inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      },
+    });
+    await runStore.appendEvent({
+      runId: "run-cursor-secret",
+      at: "2030-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "run_diagnostic",
+      message:
+        "status diagnostic SECRET_DIAGNOSTIC token=diagnostic-token client_secret: diagnostic-client private_key=diagnostic-private inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      payload: {
+        type: "run_diagnostic",
+        code: "cursor_stream_status_error",
+        status: "ERROR",
+        message:
+          "diagnostic payload SECRET_DIAGNOSTIC_PAYLOAD access_token=diagnostic-access github_token=diagnostic-github inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      },
+    });
+    await runStore.appendEvent({
+      runId: "run-cursor-secret",
+      at: "2030-01-01T00:00:03.000Z",
+      source: "cursor",
+      eventType: "status",
+      message: "Cursor status ERROR",
+      payload: {
+        kind: "status",
+        status: "ERROR",
+        messagePreview:
+          "cursor status SECRET_CURSOR_STATUS token=status-token access_token=status-access github_token=status-github client_secret: status-client private_key=status-private ghp_QRSTUVWX1 sk-QRSTUVWX1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+        truncated: false,
+      },
+    });
+    const metaPath = path.join(config.workspace.stateDir, "runs", "run-cursor-secret", "meta.json");
+    const metadata = JSON.parse(await readFile(metaPath, "utf8")) as { transcriptEventCount?: number };
+    delete metadata.transcriptEventCount;
+    await writeFile(metaPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    const beforeRead = await readFile(metaPath, "utf8");
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/run-cursor-secret/transcript`);
+      const activityResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-CURSOR-SECRET&limit=10`);
+      const transcriptText = await transcriptResponse.text();
+      const activityText = await activityResponse.text();
+      const combinedText = `${transcriptText}\n${activityText}`;
+
+      expect(transcriptResponse.status).toBe(200);
+      expect(activityResponse.status).toBe(200);
+      for (const rawValue of [
+        "SECRET_STREAM",
+        "stream-token",
+        "stream-access",
+        "stream-github",
+        "stream-client",
+        "stream-private",
+        "ghp_ABCDEFGH1",
+        "sk-ABCDEFGH1",
+        "SECRET_STREAM_PAYLOAD",
+        "stream-payload-token",
+        "stream-payload-client",
+        "SECRET_DELTA",
+        "delta-token",
+        "delta-api",
+        "delta-private",
+        "sk-HIJKLMNO1",
+        "SECRET_DELTA_PAYLOAD",
+        "delta-refresh",
+        "delta-github",
+        "SECRET_DIAGNOSTIC",
+        "diagnostic-token",
+        "diagnostic-client",
+        "diagnostic-private",
+        "SECRET_DIAGNOSTIC_PAYLOAD",
+        "diagnostic-access",
+        "diagnostic-github",
+        "SECRET_CURSOR_STATUS",
+        "status-token",
+        "status-access",
+        "status-github",
+        "status-client",
+        "status-private",
+        "ghp_QRSTUVWX1",
+        "sk-QRSTUVWX1",
+      ]) {
+        expect(combinedText).not.toContain(rawValue);
+      }
+      expect(combinedText).toContain("activitySource");
+      expect(combinedText).toContain("stream");
+      expect(combinedText).toContain("delta");
+      expect(combinedText).toContain("cursor_stream_status_error");
+      expect(combinedText).toContain("\"eventType\": \"status\"");
+      expect(combinedText).toContain("\"kind\": \"status\"");
+      expect(combinedText).toContain("inputTokens");
+      expect(combinedText).toContain("totalTokens");
+      expect(combinedText).toContain("tokenConfigured");
+      expect(combinedText).toContain("[redacted]");
+      expect(await readFile(metaPath, "utf8")).toBe(beforeRead);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("labels persisted running runs that are not live as not_live without mutating history", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);

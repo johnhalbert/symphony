@@ -350,7 +350,7 @@ function renderTranscriptEvent(event: TranscriptEvent): string {
   const payload = renderTranscriptPayload(event);
   return `<article class="transcript-event">
     <header><span class="badge">${escapeHtml(event.source)}</span><strong>${escapeHtml(event.eventType)}</strong><span class="meta mono">#${event.sequence} · ${escapeHtml(event.at)}</span></header>
-    ${event.message ? `<p>${escapeHtml(event.message)}</p>` : ""}
+    ${event.message ? `<p>${escapeHtml(sanitizeTranscriptPreview(event.message))}</p>` : ""}
     ${payload}
   </article>`;
 }
@@ -396,7 +396,7 @@ function renderActivityList(activity: ActivityItem[]): string {
     return `<button type="button" class="activity-row" ${runId ? `data-action="selectRun" data-run="${escapeAttr(runId)}"` : "disabled"}>
       <strong>${escapeHtml(item.kind)}</strong>
       <span class="meta">${escapeHtml([item.issue?.identifier ?? item.issue?.id, runId, item.source, item.at].filter(Boolean).join(" · "))}${escapeHtml(transcript)}</span>
-      ${item.transcript?.message ? `<span>${escapeHtml(item.transcript.message)}</span>` : ""}
+      ${item.transcript?.message ? `<span>${escapeHtml(sanitizeTranscriptPreview(item.transcript.message))}</span>` : ""}
     </button>`;
   }).join("")}</div>`;
 }
