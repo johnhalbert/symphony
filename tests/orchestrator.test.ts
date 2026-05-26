@@ -436,6 +436,8 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
     await orchestrator.stop();
 
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
@@ -482,6 +484,8 @@ describe("Orchestrator", () => {
 
     const result = await orchestrator.requestIssueBreakdown(candidate.id);
     await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
     await orchestrator.stop();
 
     expect(result).toMatchObject({ queued: true, reason: "explicit_request" });
