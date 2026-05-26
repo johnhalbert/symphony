@@ -34,7 +34,7 @@ import {
   type MergeGateCheckEvidence,
 } from "../writeback/TransitionPolicy.js";
 import type { WritebackOperation, WritebackProcessor } from "../writeback/WritebackOutbox.js";
-import { shouldSilentlyRetireMergeGate, silentlyRetireMergeGate } from "./MergeGateLifecycle.js";
+import { inactiveMergeGateLifecyclePatch, shouldSilentlyRetireMergeGate } from "./MergeGateLifecycle.js";
 
 const MERGE_GATE_REVIEWER = "symphony-merge-gate";
 
@@ -150,22 +150,23 @@ export class MergePolicyService {
     let activeLifecycle = lifecycle;
     if (shouldSilentlyRetireMergeGate(activeLifecycle.mergeGate, headSha, pullRequest.number)) {
       activeLifecycle = await this.options.lifecycleStore.updateIssue(latestIssue, {
-        mergeGate: silentlyRetireMergeGate(activeLifecycle.mergeGate, headSha),
+        ...inactiveMergeGateLifecyclePatch(activeLifecycle, activeLifecycle.mergeGate, "superseded", headSha),
       });
     }
     const gateId = mergeGateId(latestIssue.id, pullRequest, headSha);
     const approvalVerdict = latestApprovalPassVerdict(activeLifecycle);
     const existingGateVerdict = findMergeGateVerdict(activeLifecycle, gateId);
     const decision = await this.evaluateChecks(github, headSha, pullRequest, gateId, activeLifecycle);
-    if (existingGateVerdict && decision.kind === "passed" && approvalVerdict) {
+    if (decision.kind === "passed" && approvalVerdict && (existingGateVerdict || activeLifecycle.mergeGate?.id === gateId)) {
+      const inactiveGatePatch =
+        activeLifecycle.mergeGate?.id === gateId
+          ? inactiveMergeGateLifecyclePatch(activeLifecycle, activeLifecycle.mergeGate, "resolved")
+          : {};
       activeLifecycle = await this.options.lifecycleStore.updateIssue(latestIssue, {
+        ...inactiveGatePatch,
         phase: "passed",
         blockedReason: null,
         lastReviewVerdictId: approvalVerdict.id,
-        mergeGate:
-          activeLifecycle.mergeGate?.id === gateId
-            ? { ...activeLifecycle.mergeGate, status: "resolved", updatedAt: new Date().toISOString() }
-            : activeLifecycle.mergeGate ?? null,
         summaryPointers: { ciStatus: "success" },
       });
     } else if (existingGateVerdict && decision.kind === "failure") {
@@ -218,11 +219,11 @@ export class MergePolicyService {
 
     const merge = buildMergeMetadata(latestIssue, pullRequest, headSha, mergeResult, serviceMerge, checkStatus, doneTransition.idempotencyKey);
 
-    const mergeGate =
+    const mergeGatePatch =
       activeLifecycle.mergeGate && shouldSilentlyRetireMergeGate(activeLifecycle.mergeGate, headSha, pullRequest.number)
-        ? silentlyRetireMergeGate(activeLifecycle.mergeGate, headSha)
-        : activeLifecycle.mergeGate ?? null;
-    const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge, mergeGate });
+        ? inactiveMergeGateLifecyclePatch(activeLifecycle, activeLifecycle.mergeGate, "superseded", headSha)
+        : { mergeGate: activeLifecycle.mergeGate ?? null };
+    const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge, ...mergeGatePatch });
     const storedMerge = updated.merge ?? merge;
     await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
     return { status, merge: storedMerge };
@@ -366,33 +367,32 @@ export class MergePolicyService {
     const liveHeadSha = requireValue(livePullRequest.headSha, "Live PR head SHA is required for merge gate supersession");
     const gateId = mergeGateId(issue.id, pullRequest, previousHeadSha);
     const gate = lifecycle.mergeGate?.id === gateId ? lifecycle.mergeGate : null;
-    const supersededGate: IssueMergeGateState = gate
-      ? {
-          ...gate,
-          status: "superseded" as const,
-          supersededByHeadSha: liveHeadSha,
-          updatedAt: new Date().toISOString(),
-        }
-      : {
-          ...mergeGateStateFromStatus(
+    const supersededPatch = gate
+      ? inactiveMergeGateLifecyclePatch(lifecycle, gate, "superseded", liveHeadSha).mergeGate
+      : inactiveMergeGateLifecyclePatch(
+          lifecycle,
+          mergeGateStateFromStatus(
             emptyGateStatus(gateId, pullRequest, previousHeadSha, this.options.config.mergePolicy.requiredChecks),
             "superseded",
             lifecycle,
             report.runId,
             report.id,
           ),
-          supersededByHeadSha: liveHeadSha,
-        };
+          "superseded",
+          liveHeadSha,
+        ).mergeGate;
+    if (!supersededPatch) throw new SymphonyError("invalid_request", "Merge gate supersession could not build inactive gate state");
+    const supersededGate = supersededPatch;
     const operations = planMergeGateHeadSupersessionWritebacks(
       { issue, gateId, fromState: sourceState, pullRequest, liveHeadSha, reportId: report.id },
       this.options.config,
     );
     await this.requireMergeGateWritebacksSucceeded(issue, operations, this.options.config.writeback.dispatchState);
     await this.options.lifecycleStore.updateIssue(issue, {
+      ...(gate ? inactiveMergeGateLifecyclePatch(lifecycle, gate, "superseded", liveHeadSha) : { mergeGate: supersededGate }),
       phase: "implementation",
       blockedReason: null,
       lastReviewVerdictId: null,
-      mergeGate: supersededGate,
       summaryPointers: { ciStatus: "head_superseded" },
     });
     return {

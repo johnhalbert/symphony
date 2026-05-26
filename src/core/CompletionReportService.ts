@@ -25,7 +25,7 @@ import {
   planCompletionReportPublicationApprovalTerminalWritebacks,
   planPullRequestHandoffWritebacks,
 } from "./writeback/TransitionPolicy.js";
-import { shouldSilentlyRetireMergeGate, silentlyRetireMergeGate } from "./merge/MergeGateLifecycle.js";
+import { inactiveMergeGateLifecyclePatch, shouldSilentlyRetireMergeGate } from "./merge/MergeGateLifecycle.js";
 import type {
   FileWritebackOutboxStore,
   NewWritebackOperation,
@@ -572,7 +572,7 @@ export class CompletionReportService {
     const reportNumber = storedReport.pullRequest?.number ?? null;
     if (reportHeadSha !== null && reportNumber !== null && shouldSilentlyRetireMergeGate(currentLifecycle.mergeGate, reportHeadSha, reportNumber)) {
       currentLifecycle = await this.options.lifecycleStore.updateIssue(input.context.issue, {
-        mergeGate: silentlyRetireMergeGate(currentLifecycle.mergeGate, reportHeadSha),
+        ...inactiveMergeGateLifecyclePatch(currentLifecycle, currentLifecycle.mergeGate, "superseded", reportHeadSha),
       });
     }
     if (

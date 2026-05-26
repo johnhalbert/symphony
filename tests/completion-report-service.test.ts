@@ -75,7 +75,7 @@ describe("CompletionReportService", () => {
     });
   });
 
-  it("supersedes an old-head merge gate on new-head completion without binding repair IDs", async () => {
+  it("supersedes an old-head merge gate on new-head completion and scrubs stale repair state", async () => {
     const { service, lifecycleStore, outbox } = fixture();
     await lifecycleStore.ensureIssue(context().issue, {
       phase: "implementation",
@@ -84,8 +84,28 @@ describe("CompletionReportService", () => {
       summaryPointers: { ciStatus: "failure" },
       mergeGate: mergeGate({
         headSha: "head-sha-1",
-        repairRunId: null,
-        repairReportId: null,
+        repairRunId: "old-repair-run",
+        repairReportId: "completion-report:issue-1:old-repair",
+        checks: [
+          {
+            name: "test",
+            outcome: "failing",
+            rawStatus: "failure",
+            conclusion: "failure",
+            url: "https://ci.test/test",
+            firstObservedAt: null,
+            actionableSince: null,
+          },
+          {
+            name: "typecheck",
+            outcome: "missing_actionable",
+            rawStatus: "missing",
+            conclusion: null,
+            url: null,
+            firstObservedAt: "2026-01-01T00:00:00.000Z",
+            actionableSince: "2026-01-01T00:05:00.000Z",
+          },
+        ],
       }),
     });
 
@@ -105,15 +125,18 @@ describe("CompletionReportService", () => {
     const operations = await outbox.list();
     expect(lifecycle?.phase).toBe("review");
     expect(lifecycle?.reviewRound).toBe(1);
-    expect(lifecycle?.lastReviewVerdictId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
+    expect(lifecycle?.lastReviewVerdictId).toBeNull();
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
     expect(lifecycle?.summaryPointers.prHeadSha).toBe("head-sha-2");
     expect(lifecycle?.mergeGate).toMatchObject({
       status: "superseded",
       headSha: "head-sha-1",
       supersededByHeadSha: "head-sha-2",
+      checks: [],
       repairRunId: null,
       repairReportId: null,
+      blockerFingerprint: null,
+      writebackOperationKeys: [],
     });
     expect(operations).toHaveLength(2);
     expect(operations.map((operation) => operation.idempotencyKey).some((key) => key.includes("head-superseded"))).toBe(false);

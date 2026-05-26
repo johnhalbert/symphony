@@ -483,6 +483,126 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("scrubs inactive merge-gate blockers from durable status responses", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(
+      { id: "issue-2", identifier: "TEST-2" },
+      {
+        phase: "implementation",
+        reviewRound: 1,
+        lastReviewVerdictId: "merge-gate:issue-2:pr-7:old-head",
+        mergeGate: {
+          id: "merge-gate:issue-2:pr-7:old-head",
+          status: "superseded",
+          headSha: "old-head",
+          pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7, headSha: "old-head", branch: "symphony/TEST-2" },
+          requiredChecks: ["test", "typecheck"],
+          checks: [
+            {
+              name: "test",
+              outcome: "failing",
+              rawStatus: "failure",
+              conclusion: "failure",
+              url: "https://ci.test/test",
+              firstObservedAt: null,
+              actionableSince: null,
+            },
+            {
+              name: "typecheck",
+              outcome: "missing_actionable",
+              rawStatus: "missing",
+              conclusion: null,
+              url: null,
+              firstObservedAt: "2026-01-01T00:00:00.000Z",
+              actionableSince: "2026-01-01T00:05:00.000Z",
+            },
+          ],
+          reviewRound: 1,
+          gateRunId: "gate-run-1",
+          gateReportId: "completion-report:issue-2:gate-1",
+          repairRunId: "repair-run-1",
+          repairReportId: "completion-report:issue-2:repair-1",
+          blockerFingerprint: "old-head:test:failure|typecheck:missing",
+          writebackOperationKeys: ["comment:issue-2:merge-gate"],
+          supersededByHeadSha: "new-head",
+          updatedAt: "2026-01-01T00:10:00.000Z",
+        },
+        reviewVerdicts: [
+          {
+            id: "merge-gate:issue-2:pr-7:old-head",
+            idempotencyKey: "merge-gate:issue-2:pr-7:old-head",
+            runId: "gate-run-1",
+            issueId: "issue-2",
+            issueIdentifier: "TEST-2",
+            verdict: "fail",
+            acceptanceResults: [{ text: "All configured required checks are passing before gated merge", satisfied: false, evidence: "test: failure" }],
+            findings: ["Required check failed: test: failure"],
+            evidence: ["Merge gate blocked PR #7"],
+            reviewer: "symphony-merge-gate",
+            submittedAt: "2026-01-01T00:06:00.000Z",
+            writebackOperationKeys: ["comment:issue-2:merge-gate"],
+          },
+        ],
+      },
+    );
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-2`);
+      const body = (await response.json()) as {
+        lifecycle: {
+          lastReviewVerdictId: string | null;
+          mergeGate: { checks: unknown[]; repairRunId: string | null; repairReportId: string | null; blockerFingerprint: string | null; writebackOperationKeys: string[] };
+          reviewVerdicts: Array<{ id: string; acceptanceResults: unknown[]; findings: string[]; evidence: string[] }>;
+        };
+        mergeGate: { active: boolean; checks: unknown[]; repairRunId: string | null; repairReportId: string | null; blockerFingerprint: string | null; actionableCheckNames: string[] };
+        issueDetails: IssueDetailsEnvelope;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.lifecycle.lastReviewVerdictId).toBeNull();
+      expect(body.lifecycle.mergeGate).toMatchObject({
+        checks: [],
+        repairRunId: null,
+        repairReportId: null,
+        blockerFingerprint: null,
+        writebackOperationKeys: [],
+      });
+      expect(body.lifecycle.reviewVerdicts[0]).toMatchObject({
+        acceptanceResults: [],
+        findings: [],
+        evidence: [],
+      });
+      expect(body.mergeGate).toMatchObject({
+        active: false,
+        checks: [],
+        repairRunId: null,
+        repairReportId: null,
+        blockerFingerprint: null,
+        actionableCheckNames: [],
+      });
+      expect(body.issueDetails.mergeGate).toMatchObject({ active: false, checks: [], actionableCheckNames: [] });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("posts planning-run using internal id and records strict id lookup behavior", async () => {
     const candidate = issue({ id: "issue-1", identifier: "TEST-1", state: "Todo", labels: ["planning"] });
     const idFixture = await createPlanningRunApiFixture(path.join(root, "planning-id"), candidate);

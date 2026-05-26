@@ -205,6 +205,7 @@ interface GitHubCommitStatusNode {
   context?: unknown;
   state?: unknown;
   target_url?: unknown;
+  created_at?: unknown;
 }
 
 interface GitHubCheckRunNode {
@@ -215,6 +216,7 @@ interface GitHubCheckRunNode {
   html_url?: unknown;
   started_at?: unknown;
   completed_at?: unknown;
+  created_at?: unknown;
 }
 
 interface GraphQlPageInfoNode {
@@ -352,24 +354,11 @@ export class GitHubPullRequestClient {
     this.assertConfiguredForMerge();
     const headSha = requireNonEmpty(input.headSha, "A pull request head SHA is required for check validation");
     const requiredChecks = input.requiredChecks.map((check) => check.trim()).filter((check) => check.length > 0);
-    const [statusResponse, checkRuns] = await Promise.all([
-      this.fetchImpl(this.repoUrl(`commits/${encodeURIComponent(headSha)}/status`), {
-        method: "GET",
-        headers: requestHeaders(this.config.token ?? ""),
-      }),
-      this.fetchAllCheckRunsForCommit(headSha),
-    ]);
-    if (!statusResponse.ok) {
-      throw new SymphonyError("tracker_error", `GitHub commit status inspection returned HTTP ${statusResponse.status}`);
-    }
-    const statusBody = (await statusResponse.json()) as { statuses?: unknown };
-    const statuses = Array.isArray(statusBody.statuses) ? statusBody.statuses : [];
+    const [statuses, checkRuns] = await Promise.all([this.fetchAllCommitStatusesForCommit(headSha), this.fetchAllCheckRunsForCommit(headSha)]);
+    const statusByName = indexCommitStatusesByName(statuses);
     const checkRunByName = indexCheckRunsByName(checkRuns);
     return requiredChecks.map((required) => {
-      const status = statuses
-        .filter(isRecord)
-        .map((item) => normalizeCommitStatus(item as GitHubCommitStatusNode))
-        .find((item) => item?.name === required);
+      const status = statusByName.get(required);
       if (status) return status;
       const checkRun = checkRunByName.get(required);
       return checkRun ?? { name: required, status: "missing", conclusion: null, url: null };
@@ -745,6 +734,29 @@ export class GitHubPullRequestClient {
     return checkRuns;
   }
 
+  private async fetchAllCommitStatusesForCommit(headSha: string): Promise<GitHubCommitStatusNode[]> {
+    const firstUrl = this.repoUrl(`commits/${encodeURIComponent(headSha)}/status`);
+    firstUrl.searchParams.set("per_page", "100");
+    const statuses: GitHubCommitStatusNode[] = [];
+    let nextUrl: URL | null = firstUrl;
+    while (nextUrl) {
+      const response = await this.fetchImpl(nextUrl, {
+        method: "GET",
+        headers: requestHeaders(this.config.token ?? ""),
+      });
+      if (!response.ok) {
+        throw new SymphonyError("tracker_error", `GitHub commit status inspection returned HTTP ${response.status}`);
+      }
+      const body = (await response.json()) as { statuses?: unknown };
+      if (!Array.isArray(body.statuses)) {
+        throw new SymphonyError("tracker_error", "GitHub commit status inspection response is invalid");
+      }
+      statuses.push(...body.statuses.filter(isRecord).map((item) => item as GitHubCommitStatusNode));
+      nextUrl = nextLinkUrl(response.headers.get("link"));
+    }
+    return statuses;
+  }
+
   private async fetchReviewThreadMetadata(pullRequestNumber: number): Promise<PullRequestReviewThreadMetadata[]> {
     const threads: PullRequestReviewThreadMetadata[] = [];
     let after: string | null = null;
@@ -855,6 +867,34 @@ function normalizeCommitStatus(node: GitHubCommitStatusNode): PullRequestCheckRe
   };
 }
 
+function indexCommitStatusesByName(nodes: GitHubCommitStatusNode[]): Map<string, PullRequestCheckResult> {
+  const grouped = new Map<string, GitHubCommitStatusNode[]>();
+  for (const node of nodes) {
+    const name = asString(node.context);
+    if (!name) continue;
+    grouped.set(name, [...(grouped.get(name) ?? []), node]);
+  }
+  const indexed = new Map<string, PullRequestCheckResult>();
+  for (const [name, statuses] of grouped.entries()) {
+    const selected = selectAuthoritativeCommitStatus(statuses);
+    const normalized = selected ? normalizeCommitStatus(selected) : null;
+    if (normalized) indexed.set(name, normalized);
+  }
+  return indexed;
+}
+
+function selectAuthoritativeCommitStatus(nodes: GitHubCommitStatusNode[]): GitHubCommitStatusNode | null {
+  return [...nodes].sort(compareCommitStatusesByRecency)[0] ?? null;
+}
+
+function compareCommitStatusesByRecency(a: GitHubCommitStatusNode, b: GitHubCommitStatusNode): number {
+  return commitStatusSortValue(b) - commitStatusSortValue(a);
+}
+
+function commitStatusSortValue(node: GitHubCommitStatusNode): number {
+  return checkRunTimestamp(node.created_at) ?? 0;
+}
+
 function indexCheckRunsByName(nodes: GitHubCheckRunNode[]): Map<string, PullRequestCheckResult> {
   const grouped = new Map<string, GitHubCheckRunNode[]>();
   for (const node of nodes) {
@@ -872,9 +912,7 @@ function indexCheckRunsByName(nodes: GitHubCheckRunNode[]): Map<string, PullRequ
 }
 
 function selectAuthoritativeCheckRun(nodes: GitHubCheckRunNode[]): GitHubCheckRunNode | null {
-  const completed = nodes.filter((node) => asNullableString(node.status) === "completed");
-  const candidates = completed.length > 0 ? completed : nodes;
-  return [...candidates].sort(compareCheckRunsByRecency)[0] ?? null;
+  return [...nodes].sort(compareCheckRunsByRecency)[0] ?? null;
 }
 
 function compareCheckRunsByRecency(a: GitHubCheckRunNode, b: GitHubCheckRunNode): number {
@@ -882,7 +920,7 @@ function compareCheckRunsByRecency(a: GitHubCheckRunNode, b: GitHubCheckRunNode)
 }
 
 function checkRunSortValue(node: GitHubCheckRunNode): number {
-  return checkRunTimestamp(node.completed_at) ?? checkRunTimestamp(node.started_at) ?? checkRunId(node.id) ?? 0;
+  return checkRunTimestamp(node.completed_at) ?? checkRunTimestamp(node.started_at) ?? checkRunTimestamp(node.created_at) ?? checkRunId(node.id) ?? 0;
 }
 
 function checkRunTimestamp(value: unknown): number | null {

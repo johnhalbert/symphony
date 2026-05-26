@@ -695,6 +695,56 @@ describe("GitHubPullRequestClient", () => {
     expect(checkRunCalls.map((call) => call.accept)).toEqual(["application/vnd.github+json", "application/vnd.github+json"]);
   });
 
+  it("finds required commit statuses across paginated GitHub responses", async () => {
+    const calls: string[] = [];
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      calls.push(`${url.pathname}${url.search}`);
+      if (url.pathname.endsWith("/check-runs")) {
+        return jsonResponse({ check_runs: [] });
+      }
+      if (url.searchParams.get("page") === "2") {
+        return jsonResponse({
+          statuses: [{ context: "typecheck", state: "success", target_url: "https://ci.test/typecheck", created_at: "2026-01-01T00:02:00Z" }],
+        });
+      }
+      return jsonResponse(
+        { statuses: [{ context: "filler", state: "success", created_at: "2026-01-01T00:01:00Z" }] },
+        200,
+        { link: '<https://api.github.test/repos/octo-org/symphony/commits/head-sha-1/status?per_page=100&page=2>; rel="next"' },
+      );
+    });
+
+    await expect(client.getRequiredCheckResults({ headSha: "head-sha-1", requiredChecks: ["typecheck"] })).resolves.toEqual([
+      { name: "typecheck", status: "success", conclusion: "success", url: "https://ci.test/typecheck" },
+    ]);
+    expect(calls.filter((call) => call.includes("/status"))).toEqual([
+      "/repos/octo-org/symphony/commits/head-sha-1/status?per_page=100",
+      "/repos/octo-org/symphony/commits/head-sha-1/status?per_page=100&page=2",
+    ]);
+  });
+
+  it("uses the newest duplicate commit status before check-run fallback", async () => {
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/status")) {
+        return jsonResponse({
+          statuses: [
+            { context: "test", state: "failure", target_url: "https://ci.test/status-old", created_at: "2026-01-01T00:01:00Z" },
+            { context: "test", state: "success", target_url: "https://ci.test/status-new", created_at: "2026-01-01T00:02:00Z" },
+          ],
+        });
+      }
+      return jsonResponse({
+        check_runs: [{ id: 99, name: "test", status: "completed", conclusion: "failure", html_url: "https://ci.test/check-run" }],
+      });
+    });
+
+    await expect(client.getRequiredCheckResults({ headSha: "head-sha-1", requiredChecks: ["test"] })).resolves.toEqual([
+      { name: "test", status: "success", conclusion: "success", url: "https://ci.test/status-new" },
+    ]);
+  });
+
   it("uses the latest completed check run when duplicate names are paginated", async () => {
     const client = new GitHubPullRequestClient(config(), async (input) => {
       const url = new URL(String(input));
@@ -710,6 +760,74 @@ describe("GitHubPullRequestClient", () => {
             conclusion: "failure",
             html_url: "https://ci.test/test-old",
             completed_at: "2026-01-01T00:01:00Z",
+          },
+          {
+            id: 2,
+            name: "test",
+            status: "completed",
+            conclusion: "success",
+            html_url: "https://ci.test/test-new",
+            completed_at: "2026-01-01T00:02:00Z",
+          },
+        ],
+      });
+    });
+
+    await expect(client.getRequiredCheckResults({ headSha: "head-sha-1", requiredChecks: ["test"] })).resolves.toEqual([
+      { name: "test", status: "success", conclusion: "success", url: "https://ci.test/test-new" },
+    ]);
+  });
+
+  it("uses a newer pending check run over an older completed rerun", async () => {
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/status")) {
+        return jsonResponse({ statuses: [] });
+      }
+      return jsonResponse({
+        check_runs: [
+          {
+            id: 1,
+            name: "test",
+            status: "completed",
+            conclusion: "failure",
+            html_url: "https://ci.test/test-old",
+            completed_at: "2026-01-01T00:01:00Z",
+          },
+          {
+            id: 2,
+            name: "test",
+            status: "in_progress",
+            conclusion: null,
+            html_url: "https://ci.test/test-new",
+            started_at: "2026-01-01T00:02:00Z",
+            created_at: "2026-01-01T00:02:00Z",
+          },
+        ],
+      });
+    });
+
+    await expect(client.getRequiredCheckResults({ headSha: "head-sha-1", requiredChecks: ["test"] })).resolves.toEqual([
+      { name: "test", status: "pending", conclusion: null, url: "https://ci.test/test-new" },
+    ]);
+  });
+
+  it("uses a newer completed check run over an older pending rerun", async () => {
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/status")) {
+        return jsonResponse({ statuses: [] });
+      }
+      return jsonResponse({
+        check_runs: [
+          {
+            id: 1,
+            name: "test",
+            status: "in_progress",
+            conclusion: null,
+            html_url: "https://ci.test/test-old",
+            started_at: "2026-01-01T00:01:00Z",
+            created_at: "2026-01-01T00:01:00Z",
           },
           {
             id: 2,

@@ -28,6 +28,7 @@ import {
   isPendingPublicationApprovalLifecycle,
   pendingPublicationReport,
 } from "../core/CompletionReportService.js";
+import { sanitizeInactiveMergeGateLifecycle } from "../core/merge/MergeGateLifecycle.js";
 import {
   compareRunChronology,
   type RunRecord,
@@ -304,7 +305,7 @@ export class StatusServer {
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
-        const lifecycle = await this.options.lifecycleStore?.get(issueId);
+        const lifecycle = sanitizeInactiveMergeGateLifecycle(await this.options.lifecycleStore?.get(issueId));
         const enrichedRuns = await Promise.all(
           runs.map(async (run) => ({
             ...run,
@@ -376,7 +377,7 @@ export class StatusServer {
         const workspace = await this.options.runStore?.findWorkspace(issueId);
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
-        const lifecycle = await this.options.lifecycleStore?.get(issueId);
+        const lifecycle = sanitizeInactiveMergeGateLifecycle(await this.options.lifecycleStore?.get(issueId));
         if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
@@ -1052,7 +1053,7 @@ async function buildBoardIssueDetail(input: {
   const live = liveIssueByKeys(input.snapshot, keys);
   const workspace = await workspaceByKeys(input.runStore, keys);
   const latestRun = await latestRunByKeys(input.runStore, keys);
-  const lifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  const lifecycle = sanitizeInactiveMergeGateLifecycle(await lifecycleByKeys(input.lifecycleStore, keys));
   if (!input.card && !live && !workspace && !latestRun && !lifecycle) return null;
 
   const issueKey = input.card?.issueIdentifier ?? input.card?.issueId ?? input.requestKey;
@@ -2485,7 +2486,9 @@ function buildIssueDetailsEnvelope(input: {
   workspace: WorkspaceRecord | null | undefined;
   trackerIssue?: IssueStatusView;
 }): IssueDetailsEnvelope {
-  const metadata = statusMetadata(input);
+  const lifecycle = sanitizeInactiveMergeGateLifecycle(input.lifecycle);
+  const sanitizedInput = { ...input, lifecycle };
+  const metadata = statusMetadata(sanitizedInput);
   const issue = input.trackerIssue ?? input.live?.issueDetails ?? null;
   if (issue) {
     return {
@@ -2493,10 +2496,10 @@ function buildIssueDetailsEnvelope(input: {
       completeness: "full",
       issue,
       tracker: buildIssueTrackerMetadata(issue, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
-      blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists, input.lifecycle, issue.state),
-      workspace: buildIssueWorkspaceSummary(input, metadata),
+      blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists, lifecycle, issue.state),
+      workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
       pullRequest: buildIssuePullRequestSummary(metadata),
-      mergeGate: mergeGateStatus(input.lifecycle, buildIssuePullRequestSummary(metadata)),
+      mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
       latestRun: buildIssueLatestRunSummary(input.summaryRun),
     };
   }
@@ -2504,12 +2507,12 @@ function buildIssueDetailsEnvelope(input: {
   return {
     source: "durable",
     completeness: "partial",
-    issue: durableIssueStatusView(input),
+    issue: durableIssueStatusView(sanitizedInput),
     tracker: buildIssueTrackerMetadata(null, null, input.trackerStateLists, input.staleThresholdMs),
-    blockers: buildIssueBlockerSummary(null, input.trackerStateLists, input.lifecycle, null),
-    workspace: buildIssueWorkspaceSummary(input, metadata),
+    blockers: buildIssueBlockerSummary(null, input.trackerStateLists, lifecycle, null),
+    workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
     pullRequest: buildIssuePullRequestSummary(metadata),
-    mergeGate: mergeGateStatus(input.lifecycle, buildIssuePullRequestSummary(metadata)),
+    mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
     latestRun: buildIssueLatestRunSummary(input.summaryRun),
   };
 }
@@ -2646,7 +2649,8 @@ function mergeGateStatus(
   lifecycle: IssueLifecycleRecord | null | undefined,
   fallbackPullRequest: IssuePullRequestSummary,
 ): IssueMergeGateSummary | null {
-  const gate = lifecycle?.mergeGate ?? null;
+  const sanitizedLifecycle = sanitizeInactiveMergeGateLifecycle(lifecycle);
+  const gate = sanitizedLifecycle?.mergeGate ?? null;
   if (!gate) return null;
   const pullRequest: IssuePullRequestSummary = {
     url: gate.pullRequest.url ?? fallbackPullRequest.url,
