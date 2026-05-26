@@ -20,6 +20,7 @@ import type {
   IssueMergeConflictMetadata,
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
+import { latestCurrentApprovalPassVerdict } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
 import type { OperatorApprovalService, OperatorApprovalRecord } from "../core/approval/OperatorApprovalService.js";
 import { OPERATOR_REJECTED_PUBLICATION_ERROR, approvalResolve } from "../core/approval/OperatorApprovalService.js";
@@ -29,6 +30,7 @@ import {
   isPendingPublicationApprovalLifecycle,
   pendingPublicationReport,
 } from "../core/CompletionReportService.js";
+import { sanitizeInactiveMergeGateLifecycle, sanitizeStaleMergeGateLifecycle } from "../core/merge/MergeGateLifecycle.js";
 import {
   compareRunChronology,
   type RunRecord,
@@ -49,6 +51,7 @@ import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
   IssueLatestRunSummary,
+  IssueMergeGateSummary,
   IssuePullRequestSummary,
   IssueStateClassification,
   IssueStatusView,
@@ -316,7 +319,12 @@ export class StatusServer {
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
-        const lifecycle = await this.options.lifecycleStore?.get(issueId);
+        const lifecycle = sanitizeStatusLifecycle({
+          live,
+          workspace,
+          latestRun,
+          lifecycle: await this.options.lifecycleStore?.get(issueId),
+        });
         const enrichedRuns = await Promise.all(
           runs.map(async (run) => ({
             ...publicRunRecord(run),
@@ -402,7 +410,12 @@ export class StatusServer {
         const workspace = await this.options.runStore?.findWorkspace(issueId);
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
-        const lifecycle = await this.options.lifecycleStore?.get(issueId);
+        const lifecycle = sanitizeStatusLifecycle({
+          live,
+          workspace,
+          latestRun,
+          lifecycle: await this.options.lifecycleStore?.get(issueId),
+        });
         if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
@@ -449,6 +462,7 @@ export class StatusServer {
           latestRun: publicRunRecordOrNull(latestRun),
           lifecycle,
           reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
+          mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(statusMetadata({ live, workspace, latestRun, lifecycle }))),
           metadata: statusMetadata({ live, workspace, latestRun, lifecycle }),
           operatorLiveness,
           diagnostics: {
@@ -1111,7 +1125,8 @@ async function buildBoardIssueDetail(input: {
   const live = liveIssueByKeys(input.snapshot, keys);
   const workspace = await workspaceByKeys(input.runStore, keys);
   const latestRun = await latestRunByKeys(input.runStore, keys);
-  const lifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  const rawLifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
   if (!input.card && !live && !workspace && !latestRun && !lifecycle) return null;
 
   const issueKey = input.card?.issueIdentifier ?? input.card?.issueId ?? input.requestKey;
@@ -1439,7 +1454,8 @@ async function buildTrackerBoardCard(input: {
   const live = liveIssueByKeys(input.snapshot, keys);
   const workspace = await workspaceByKeys(input.runStore, keys);
   const latestRun = await latestRunByKeys(input.runStore, keys);
-  const lifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  const rawLifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
   const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
   const paused = isIssuePaused(input.snapshot, [
     ...keys,
@@ -1491,7 +1507,8 @@ async function buildSymphonyOnlyBoardCards(input: {
     const live = forcedLive ?? liveIssueByKeys(input.snapshot, keys);
     const workspace = await workspaceByKeys(input.runStore, keys);
     const latestRun = await latestRunByKeys(input.runStore, keys);
-    const lifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+    const rawLifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+    const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
     const isBlocked = isLifecycleBlocked(lifecycle);
     const isPaused = isIssuePaused(input.snapshot, [
       requestKey,
@@ -1556,18 +1573,24 @@ async function buildBoardCard(input: {
   continuationSummaryAvailable: boolean;
 }): Promise<IssueBoardCard> {
   const issueKey = input.issueDetails.issue.identifier ?? input.issueDetails.issue.id ?? input.key;
+  const lifecycle = sanitizeStatusLifecycle({
+    live: input.live,
+    workspace: input.workspace,
+    latestRun: input.latestRun,
+    lifecycle: input.lifecycle,
+  });
   const resolvedAgentId = input.live ? await resolveRunningAgentId(input.live, input.runStore) : null;
   const operatorLiveness = await issueOperatorLiveness({
     live: input.live,
     latestRun: input.latestRun,
-    lifecycle: input.lifecycle,
+    lifecycle,
     paused: input.paused,
     resolvedAgentId,
     runStore: input.runStore,
   });
   const affordances = operatorAffordances({
     issueKey,
-    lifecycle: input.lifecycle,
+    lifecycle,
     continuationSummaryAvailable: input.continuationSummaryAvailable,
     mutationsRequireToken: input.mutationsConfigured,
   });
@@ -1589,12 +1612,12 @@ async function buildBoardCard(input: {
         }
       : null,
     operatorLiveness,
-    reviewLoop: reviewLoopStatus({ live: input.live, latestRun: input.latestRun, lifecycle: input.lifecycle }),
+    reviewLoop: reviewLoopStatus({ live: input.live, latestRun: input.latestRun, lifecycle }),
     metadata: statusMetadata({
       live: input.live,
       workspace: input.workspace,
       latestRun: input.latestRun,
-      lifecycle: input.lifecycle,
+      lifecycle,
     }),
     capabilities: {
       detail: `/api/v1/issues/${encodeURIComponent(issueKey)}`,
@@ -2684,7 +2707,12 @@ function buildIssueDetailsEnvelope(input: {
   workspace: WorkspaceRecord | null | undefined;
   trackerIssue?: IssueStatusView;
 }): IssueDetailsEnvelope {
-  const metadata = statusMetadata(input);
+  const inactiveLifecycle = sanitizeInactiveMergeGateLifecycle(input.lifecycle);
+  const inactiveInput = { ...input, lifecycle: inactiveLifecycle };
+  const initialMetadata = statusMetadata(inactiveInput);
+  const lifecycle = sanitizeStaleMergeGateLifecycle(inactiveLifecycle, initialMetadata.prHeadSha, initialMetadata.prNumber);
+  const sanitizedInput = { ...input, lifecycle };
+  const metadata = statusMetadata(sanitizedInput);
   const issue = input.trackerIssue ?? input.live?.issueDetails ?? null;
   if (issue) {
     return {
@@ -2692,9 +2720,10 @@ function buildIssueDetailsEnvelope(input: {
       completeness: "full",
       issue,
       tracker: buildIssueTrackerMetadata(issue, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
-      blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists, input.lifecycle, issue.state),
-      workspace: buildIssueWorkspaceSummary(input, metadata),
+      blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists, lifecycle, issue.state),
+      workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
       pullRequest: buildIssuePullRequestSummary(metadata),
+      mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
       latestRun: buildIssueLatestRunSummary(input.summaryRun),
     };
   }
@@ -2702,11 +2731,12 @@ function buildIssueDetailsEnvelope(input: {
   return {
     source: "durable",
     completeness: "partial",
-    issue: durableIssueStatusView(input),
+    issue: durableIssueStatusView(sanitizedInput),
     tracker: buildIssueTrackerMetadata(null, null, input.trackerStateLists, input.staleThresholdMs),
-    blockers: buildIssueBlockerSummary(null, input.trackerStateLists, input.lifecycle, null),
-    workspace: buildIssueWorkspaceSummary(input, metadata),
+    blockers: buildIssueBlockerSummary(null, input.trackerStateLists, lifecycle, null),
+    workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
     pullRequest: buildIssuePullRequestSummary(metadata),
+    mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
     latestRun: buildIssueLatestRunSummary(input.summaryRun),
   };
 }
@@ -2787,6 +2817,7 @@ function buildIssueBlockerSummary(
 ) {
   const open = (blockedBy ?? []).filter((blocker) => blocker.state === null || !isStateNameIn(blocker.state, stateLists.terminalStates));
   const lifecycleBlocked = isLifecycleBlocked(lifecycle);
+  const mergeGateBlocked = lifecycle?.mergeGate?.status === "repair_dispatched" || lifecycle?.mergeGate?.status === "blocked";
   const stateBlocked = issueState !== null && isStateNameIn(issueState, stateLists.blockedStates);
   const dispatchBlocked =
     issueState !== null &&
@@ -2797,7 +2828,7 @@ function buildIssueBlockerSummary(
     totalCount: blockedBy?.length ?? 0,
     openCount: open.length,
     open,
-    blocked: lifecycleBlocked || stateBlocked || dispatchBlocked,
+    blocked: lifecycleBlocked || mergeGateBlocked || stateBlocked || dispatchBlocked,
     humanBlockedReason: lifecycleBlocked ? lifecycleBlockedReason(lifecycle) : null,
   };
 }
@@ -2835,6 +2866,54 @@ function buildIssuePullRequestSummary(metadata: ReturnType<typeof statusMetadata
     branch: metadata.prBranch ?? null,
     ciStatus: metadata.ciStatus ?? null,
     lastPushedAt: metadata.lastPushedAt ?? null,
+  };
+}
+
+function mergeGateStatus(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  fallbackPullRequest: IssuePullRequestSummary,
+): IssueMergeGateSummary | null {
+  const inactiveLifecycle = sanitizeInactiveMergeGateLifecycle(lifecycle);
+  const sanitizedLifecycle = sanitizeStaleMergeGateLifecycle(
+    inactiveLifecycle,
+    fallbackPullRequest.headSha,
+    fallbackPullRequest.number,
+  );
+  const gate = sanitizedLifecycle?.mergeGate ?? null;
+  if (!gate) return null;
+  const pullRequest: IssuePullRequestSummary = {
+    url: gate.pullRequest.url ?? fallbackPullRequest.url,
+    number: gate.pullRequest.number ?? fallbackPullRequest.number,
+    headSha: gate.headSha,
+    branch: gate.pullRequest.branch ?? fallbackPullRequest.branch,
+    ciStatus: fallbackPullRequest.ciStatus,
+    lastPushedAt: fallbackPullRequest.lastPushedAt,
+  };
+  const actionableCheckNames = gate.checks
+    .filter((check) => check.outcome === "failing" || check.outcome === "missing_actionable")
+    .map((check) => check.name);
+  const observingCheckNames = gate.checks
+    .filter((check) => check.outcome === "pending" || check.outcome === "missing_observed" || check.outcome === "unknown")
+    .map((check) => check.name);
+  return {
+    active: gate.status !== "resolved" && gate.status !== "superseded",
+    id: gate.id,
+    status: gate.status,
+    headSha: gate.headSha,
+    pullRequest,
+    repairRound: gate.reviewRound,
+    gateRunId: gate.gateRunId,
+    gateReportId: gate.gateReportId,
+    repairRunId: gate.repairRunId,
+    repairReportId: gate.repairReportId,
+    checks: gate.checks.map((check) => ({ ...check })),
+    actionableCheckNames,
+    observingCheckNames,
+    blockerFingerprint: gate.blockerFingerprint,
+    supersededByHeadSha: gate.supersededByHeadSha,
+    awaitingCi: gate.status === "observing",
+    automationBlocked: gate.status === "repair_dispatched" || gate.status === "blocked",
+    updatedAt: gate.updatedAt,
   };
 }
 
@@ -3056,6 +3135,17 @@ function statusMetadata(input: {
   };
 }
 
+function sanitizeStatusLifecycle(input: {
+  live: ReturnType<Orchestrator["getIssueDetails"]>;
+  workspace: WorkspaceRecord | null | undefined;
+  latestRun: RunRecord | null | undefined;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+}): IssueLifecycleRecord | null | undefined {
+  const inactiveLifecycle = sanitizeInactiveMergeGateLifecycle(input.lifecycle);
+  const metadata = statusMetadata({ ...input, lifecycle: inactiveLifecycle });
+  return sanitizeStaleMergeGateLifecycle(inactiveLifecycle, metadata.prHeadSha, metadata.prNumber);
+}
+
 function reviewLoopStatus(input: {
   live: ReturnType<Orchestrator["getIssueDetails"]>;
   latestRun: RunRecord | null | undefined;
@@ -3090,9 +3180,23 @@ function latestReviewVerdict(lifecycle: IssueLifecycleRecord | null): IssueRevie
   if (!lifecycle) return null;
   if (lifecycle.lastReviewVerdictId) {
     const exact = lifecycle.reviewVerdicts.find((verdict) => verdict.id === lifecycle.lastReviewVerdictId);
-    if (exact) return exact;
+    if (exact && !isMergeGateVerdict(exact)) {
+      if (exact.verdict !== "pass") return exact;
+      const currentPass = latestCurrentApprovalPassVerdict(lifecycle);
+      if (currentPass?.id === exact.id) return exact;
+    }
   }
-  return lifecycle.reviewVerdicts[lifecycle.reviewVerdicts.length - 1] ?? null;
+  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
+    if (isMergeGateVerdict(verdict)) continue;
+    if (verdict.verdict !== "pass") return verdict;
+    const currentPass = latestCurrentApprovalPassVerdict(lifecycle);
+    if (currentPass?.id === verdict.id) return verdict;
+  }
+  return null;
+}
+
+function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
+  return verdict.reviewer === "symphony-merge-gate" || verdict.id.startsWith("merge-gate:");
 }
 
 function metadataValue<K extends "prUrl" | "prNumber" | "prHeadSha" | "prBranch" | "ciStatus" | "lastPushedAt" | "lastEvidenceCursor">(

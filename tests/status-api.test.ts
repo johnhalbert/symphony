@@ -117,6 +117,47 @@ describe("StatusServer durable API", () => {
           mergeOperationKey: "github-merge:issue-1:7:head-sha-1",
           doneTransitionOperationKey: "transition:issue-1:merge:issue-1:head-sha-1:Done",
         },
+        mergeGate: {
+          id: "merge-gate:issue-1:pr-7:head-sha-1",
+          status: "repair_dispatched",
+          headSha: "head-sha-1",
+          pullRequest: {
+            url: "https://github.com/acme/repo/pull/7",
+            number: 7,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-1",
+          },
+          requiredChecks: ["test", "typecheck"],
+          checks: [
+            {
+              name: "test",
+              outcome: "failing",
+              rawStatus: "failure",
+              conclusion: "failure",
+              url: "https://ci.test/test",
+              firstObservedAt: null,
+              actionableSince: null,
+            },
+            {
+              name: "typecheck",
+              outcome: "missing_actionable",
+              rawStatus: "missing",
+              conclusion: null,
+              url: null,
+              firstObservedAt: "2026-01-01T00:00:01.000Z",
+              actionableSince: "2026-01-01T00:05:01.000Z",
+            },
+          ],
+          reviewRound: 2,
+          gateRunId: "run-1",
+          gateReportId: "completion-report:issue-1:report-1",
+          repairRunId: "repair-run-1",
+          repairReportId: "completion-report:issue-1:repair-1",
+          blockerFingerprint: "head-sha-1:test:failure|typecheck:missing",
+          writebackOperationKeys: ["comment:issue-1:merge-gate"],
+          supersededByHeadSha: null,
+          updatedAt: "2026-01-01T00:05:01.000Z",
+        },
         mergeConflict: {
           id: "merge-conflict:issue-1:head-sha-1",
           status: "open",
@@ -308,6 +349,7 @@ describe("StatusServer durable API", () => {
       });
       const issueBody = (await issueResponse.json()) as {
         issueDetails: IssueDetailsEnvelope;
+        mergeGate: IssueDetailsEnvelope["mergeGate"];
         latestRun: { runId: string };
         reviewLoop: {
           phase: string | null;
@@ -371,8 +413,22 @@ describe("StatusServer durable API", () => {
         issue: { id: "issue-1", identifier: "TEST-1", state: null, branchName: "symphony/TEST-1" },
         tracker: { generatedAt: null, stale: null, classification: null },
         pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7 },
+        mergeGate: {
+          active: true,
+          status: "repair_dispatched",
+          headSha: "head-sha-1",
+          repairRound: 2,
+          gateReportId: "completion-report:issue-1:report-1",
+          repairReportId: "completion-report:issue-1:repair-1",
+          actionableCheckNames: ["test", "typecheck"],
+          checks: [
+            { name: "test", outcome: "failing" },
+            { name: "typecheck", outcome: "missing_actionable" },
+          ],
+        },
         latestRun: { runId: "run-1", status: "running", terminalReason: null },
       });
+      expect(issueBody.mergeGate).toMatchObject({ status: "repair_dispatched", actionableCheckNames: ["test", "typecheck"] });
       expect(issueBody.latestRun.runId).toBe("run-1");
       expect(issueBody.reviewLoop).toMatchObject({
         phase: "review",
@@ -430,6 +486,7 @@ describe("StatusServer durable API", () => {
         source: "durable",
         completeness: "partial",
         issue: { id: "issue-1", identifier: "TEST-1", state: null, branchName: "symphony/TEST-1" },
+        mergeGate: { status: "repair_dispatched" },
         latestRun: { runId: "run-1", terminalReason: null },
       });
       expect(runResponse.status).toBe(200);
@@ -462,6 +519,278 @@ describe("StatusServer durable API", () => {
         transcriptPointers: ["/api/v1/runs/run-1/transcript"],
         statusApiPointers: ["/api/v1/issues/TEST-1"],
       });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("scrubs inactive merge-gate blockers from durable status responses", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(
+      { id: "issue-2", identifier: "TEST-2" },
+      {
+        phase: "implementation",
+        reviewRound: 1,
+        lastReviewVerdictId: "merge-gate:issue-2:pr-7:old-head",
+        mergeGate: {
+          id: "merge-gate:issue-2:pr-7:old-head",
+          status: "superseded",
+          headSha: "old-head",
+          pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7, headSha: "old-head", branch: "symphony/TEST-2" },
+          requiredChecks: ["test", "typecheck"],
+          checks: [
+            {
+              name: "test",
+              outcome: "failing",
+              rawStatus: "failure",
+              conclusion: "failure",
+              url: "https://ci.test/test",
+              firstObservedAt: null,
+              actionableSince: null,
+            },
+            {
+              name: "typecheck",
+              outcome: "missing_actionable",
+              rawStatus: "missing",
+              conclusion: null,
+              url: null,
+              firstObservedAt: "2026-01-01T00:00:00.000Z",
+              actionableSince: "2026-01-01T00:05:00.000Z",
+            },
+          ],
+          reviewRound: 1,
+          gateRunId: "gate-run-1",
+          gateReportId: "completion-report:issue-2:gate-1",
+          repairRunId: "repair-run-1",
+          repairReportId: "completion-report:issue-2:repair-1",
+          blockerFingerprint: "old-head:test:failure|typecheck:missing",
+          writebackOperationKeys: ["comment:issue-2:merge-gate"],
+          supersededByHeadSha: "new-head",
+          updatedAt: "2026-01-01T00:10:00.000Z",
+        },
+        reviewVerdicts: [
+          {
+            id: "merge-gate:issue-2:pr-7:old-head",
+            idempotencyKey: "merge-gate:issue-2:pr-7:old-head",
+            runId: "gate-run-1",
+            issueId: "issue-2",
+            issueIdentifier: "TEST-2",
+            verdict: "fail",
+            acceptanceResults: [{ text: "All configured required checks are passing before gated merge", satisfied: false, evidence: "test: failure" }],
+            findings: ["Required check failed: test: failure"],
+            evidence: ["Merge gate blocked PR #7"],
+            reviewer: "symphony-merge-gate",
+            submittedAt: "2026-01-01T00:06:00.000Z",
+            writebackOperationKeys: ["comment:issue-2:merge-gate"],
+          },
+        ],
+      },
+    );
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-2`);
+      const body = (await response.json()) as {
+        lifecycle: {
+          lastReviewVerdictId: string | null;
+          mergeGate: { checks: unknown[]; repairRunId: string | null; repairReportId: string | null; blockerFingerprint: string | null; writebackOperationKeys: string[] };
+          reviewVerdicts: Array<{ id: string; acceptanceResults: unknown[]; findings: string[]; evidence: string[] }>;
+        };
+        mergeGate: { active: boolean; checks: unknown[]; repairRunId: string | null; repairReportId: string | null; blockerFingerprint: string | null; actionableCheckNames: string[] };
+        issueDetails: IssueDetailsEnvelope;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.lifecycle.lastReviewVerdictId).toBeNull();
+      expect(body.lifecycle.mergeGate).toMatchObject({
+        checks: [],
+        repairRunId: null,
+        repairReportId: null,
+        blockerFingerprint: null,
+        writebackOperationKeys: [],
+      });
+      expect(body.lifecycle.reviewVerdicts[0]).toMatchObject({
+        acceptanceResults: [],
+        findings: [],
+        evidence: [],
+      });
+      expect(body.mergeGate).toMatchObject({
+        active: false,
+        checks: [],
+        repairRunId: null,
+        repairReportId: null,
+        blockerFingerprint: null,
+        actionableCheckNames: [],
+      });
+      expect(body.issueDetails.mergeGate).toMatchObject({ active: false, checks: [], actionableCheckNames: [] });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("projects active old-head merge gates and approvals as non-current after PR head advances", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(
+      { id: "issue-3", identifier: "TEST-3" },
+      {
+        phase: "implementation",
+        reviewRound: 1,
+        lastCompletionReportId: "completion-report:issue-3:head-a",
+        lastReviewVerdictId: "review-verdict:issue-3:head-a-pass",
+        summaryPointers: {
+          prUrl: "https://github.com/acme/repo/pull/7",
+          prNumber: 7,
+          prHeadSha: "new-head",
+          prBranch: "symphony/TEST-3",
+        },
+        completionReports: [
+          {
+            id: "completion-report:issue-3:head-a",
+            idempotencyKey: "head-a",
+            runId: "worker-run-1",
+            issueId: "issue-3",
+            issueIdentifier: "TEST-3",
+            summary: "Implemented head A.",
+            validationEvidence: ["npm test"],
+            acceptanceChecklist: [{ text: "Works", satisfied: true, evidence: "tests" }],
+            changedFiles: ["src/index.ts"],
+            branchName: "symphony/TEST-3",
+            pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7, headSha: "old-head", branch: "symphony/TEST-3" },
+            risks: [],
+            acceptedAt: "2026-01-01T00:00:00.000Z",
+            writebackOperationKeys: [],
+          },
+        ],
+        reviewVerdicts: [
+          {
+            id: "review-verdict:issue-3:head-a-pass",
+            idempotencyKey: "head-a-pass",
+            runId: "review-run-1",
+            issueId: "issue-3",
+            issueIdentifier: "TEST-3",
+            verdict: "pass",
+            acceptanceResults: [{ text: "Head A reviewed", satisfied: true, evidence: "approved" }],
+            findings: [],
+            evidence: ["https://github.com/acme/repo/pull/7#pullrequestreview-1"],
+            reviewer: "reviewer-1",
+            submittedAt: "2026-01-01T00:00:01.000Z",
+            writebackOperationKeys: [],
+          },
+        ],
+        reviewFeedback: [
+          {
+            id: "review-feedback:issue-3:review-run-1:approve",
+            idempotencyKey: "head-a-approve",
+            requestHash: "hash",
+            runId: "review-run-1",
+            issueId: "issue-3",
+            issueIdentifier: "TEST-3",
+            kind: "review",
+            event: "APPROVE",
+            body: "Approved.",
+            pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7, headSha: "old-head", branch: "symphony/TEST-3" },
+            reviewer: "reviewer-1",
+            reviewUrl: "https://github.com/acme/repo/pull/7#pullrequestreview-1",
+            commentUrls: [],
+            submittedAt: "2026-01-01T00:00:01.000Z",
+          },
+        ],
+        mergeGate: {
+          id: "merge-gate:issue-3:pr-7:old-head",
+          status: "repair_dispatched",
+          headSha: "old-head",
+          pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7, headSha: "old-head", branch: "symphony/TEST-3" },
+          requiredChecks: ["test"],
+          checks: [
+            {
+              name: "test",
+              outcome: "failing",
+              rawStatus: "failure",
+              conclusion: "failure",
+              url: "https://ci.test/test",
+              firstObservedAt: null,
+              actionableSince: null,
+            },
+          ],
+          reviewRound: 1,
+          gateRunId: "gate-run-1",
+          gateReportId: "completion-report:issue-3:head-a",
+          repairRunId: "repair-run-1",
+          repairReportId: "completion-report:issue-3:repair-1",
+          blockerFingerprint: "old-head:test:failure",
+          writebackOperationKeys: ["comment:issue-3:merge-gate"],
+          supersededByHeadSha: null,
+          updatedAt: "2026-01-01T00:10:00.000Z",
+        },
+      },
+    );
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-3`);
+      const body = (await response.json()) as {
+        lifecycle: { lastReviewVerdictId: string | null; handoff: { lastReviewerOutput: unknown } };
+        reviewLoop: { lastReviewVerdict: unknown };
+        blockers: unknown;
+        mergeGate: {
+          active: boolean;
+          checks: unknown[];
+          repairRunId: string | null;
+          repairReportId: string | null;
+          blockerFingerprint: string | null;
+          actionableCheckNames: string[];
+          automationBlocked: boolean;
+        };
+        issueDetails: IssueDetailsEnvelope;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.lifecycle.lastReviewVerdictId).toBeNull();
+      expect(body.lifecycle.handoff.lastReviewerOutput).toBeNull();
+      expect(body.reviewLoop.lastReviewVerdict).toBeNull();
+      expect(body.mergeGate).toMatchObject({
+        active: false,
+        checks: [],
+        repairRunId: null,
+        repairReportId: null,
+        blockerFingerprint: null,
+        actionableCheckNames: [],
+        automationBlocked: false,
+      });
+      expect(body.issueDetails.blockers).toMatchObject({ blocked: false });
+      expect(body.issueDetails.mergeGate).toMatchObject({ active: false, checks: [], actionableCheckNames: [] });
     } finally {
       await server.stop();
     }

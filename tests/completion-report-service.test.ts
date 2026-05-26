@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CompletionReportService, type CompletionReportActiveContext, type CompletionReportInput } from "../src/core/CompletionReportService.js";
 import { SymphonyError } from "../src/core/errors.js";
-import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileIssueLifecycleStore, buildWorkerHandoffPacket, type IssueMergeGateState } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
@@ -73,6 +73,173 @@ describe("CompletionReportService", () => {
         fromStates: ["In Progress"],
         toState: "In Review",
       },
+    });
+  });
+
+  it("supersedes an old-head merge gate on new-head completion and scrubs stale repair state", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+    await lifecycleStore.ensureIssue(context().issue, {
+      phase: "implementation",
+      reviewRound: 1,
+      lastCompletionReportId: "completion-report:issue-1:head-a",
+      lastReviewVerdictId: "review-verdict:issue-1:head-a-pass",
+      summaryPointers: { ciStatus: "failure" },
+      completionReports: [
+        {
+          id: "completion-report:issue-1:head-a",
+          idempotencyKey: "head-a",
+          runId: "worker-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Implemented head A.",
+          validationEvidence: ["npm test"],
+          acceptanceChecklist: [{ text: "Works", satisfied: true, evidence: "tests" }],
+          changedFiles: ["src/index.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-1",
+          },
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      reviewVerdicts: [
+        {
+          id: "review-verdict:issue-1:head-a-pass",
+          idempotencyKey: "head-a-pass",
+          runId: "review-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          verdict: "pass",
+          acceptanceResults: [{ text: "Head A reviewed", satisfied: true, evidence: "approved" }],
+          findings: [],
+          evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-1"],
+          reviewer: "reviewer-1",
+          submittedAt: "2026-01-01T00:00:01.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      reviewFeedback: [
+        {
+          id: "review-feedback:issue-1:review-run-1:approve",
+          idempotencyKey: "head-a-approve",
+          requestHash: "hash",
+          runId: "review-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          kind: "review",
+          event: "APPROVE",
+          body: "Approved.",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-1",
+          },
+          reviewer: "reviewer-1",
+          reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-1",
+          commentUrls: [],
+          submittedAt: "2026-01-01T00:00:01.000Z",
+        },
+      ],
+      mergeGate: mergeGate({
+        headSha: "head-sha-1",
+        repairRunId: "old-repair-run",
+        repairReportId: "completion-report:issue-1:old-repair",
+        checks: [
+          {
+            name: "test",
+            outcome: "failing",
+            rawStatus: "failure",
+            conclusion: "failure",
+            url: "https://ci.test/test",
+            firstObservedAt: null,
+            actionableSince: null,
+          },
+          {
+            name: "typecheck",
+            outcome: "missing_actionable",
+            rawStatus: "missing",
+            conclusion: null,
+            url: null,
+            firstObservedAt: "2026-01-01T00:00:00.000Z",
+            actionableSince: "2026-01-01T00:05:00.000Z",
+          },
+        ],
+      }),
+    });
+
+    await service.submitCompletionReport(
+      report({
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "head-sha-2",
+          branch: "symphony/TEST-1",
+        },
+      }),
+      context(),
+    );
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    const operations = await outbox.list();
+    expect(lifecycle?.phase).toBe("review");
+    expect(lifecycle?.reviewRound).toBe(1);
+    expect(lifecycle?.lastReviewVerdictId).toBeNull();
+    expect(lifecycle?.reviewVerdicts.find((verdict) => verdict.id === "review-verdict:issue-1:head-a-pass")).toBeDefined();
+    expect(lifecycle?.reviewFeedback).toHaveLength(1);
+    expect(buildWorkerHandoffPacket(lifecycle!).lastReviewerOutput).toBeNull();
+    expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
+    expect(lifecycle?.summaryPointers.prHeadSha).toBe("head-sha-2");
+    expect(lifecycle?.mergeGate).toMatchObject({
+      status: "superseded",
+      headSha: "head-sha-1",
+      supersededByHeadSha: "head-sha-2",
+      checks: [],
+      repairRunId: null,
+      repairReportId: null,
+      blockerFingerprint: null,
+      writebackOperationKeys: [],
+    });
+    expect(operations).toHaveLength(2);
+    expect(operations.map((operation) => operation.idempotencyKey).some((key) => key.includes("head-superseded"))).toBe(false);
+  });
+
+  it("binds and replaces same-head merge gate repair completion IDs", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(context().issue, {
+      phase: "implementation",
+      mergeGate: mergeGate({
+        headSha: "head-sha-1",
+        repairRunId: "run-1",
+        repairReportId: "completion-report:issue-1:repair-1",
+      }),
+    });
+
+    await service.submitCompletionReport(
+      report({
+        runId: "run-2",
+        idempotencyKey: "repair-2",
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
+      }),
+      context({ activeRunId: "run-2" }),
+    );
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle?.mergeGate).toMatchObject({
+      status: "repair_dispatched",
+      headSha: "head-sha-1",
+      repairRunId: "run-2",
+      repairReportId: "completion-report:issue-1:repair-2",
     });
   });
 
@@ -552,6 +719,42 @@ function contextWithWorkspace(overrides: Partial<CompletionReportActiveContext> 
     },
     ...overrides,
   });
+}
+
+function mergeGate(overrides: Partial<IssueMergeGateState> = {}): IssueMergeGateState {
+  return {
+    id: "merge-gate:issue-1:pr-42:head-sha-1",
+    status: "repair_dispatched",
+    headSha: "head-sha-1",
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "head-sha-1",
+      branch: "symphony/TEST-1",
+    },
+    requiredChecks: ["test"],
+    checks: [
+      {
+        name: "test",
+        outcome: "failing",
+        rawStatus: "failure",
+        conclusion: "failure",
+        url: "https://ci.test/test",
+        firstObservedAt: null,
+        actionableSince: null,
+      },
+    ],
+    reviewRound: 1,
+    gateRunId: "worker-run-1",
+    gateReportId: "completion-report:issue-1:report-1",
+    repairRunId: null,
+    repairReportId: null,
+    blockerFingerprint: "head-sha-1:test:failure",
+    writebackOperationKeys: [],
+    supersededByHeadSha: null,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
 }
 
 async function startRun(runStore: FileRunTranscriptStore): Promise<void> {

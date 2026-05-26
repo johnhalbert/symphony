@@ -59,13 +59,18 @@ import {
   type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import { MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
+import { sanitizeStaleMergeGateLifecycle, staleMergeGateLifecyclePatch } from "../merge/MergeGateLifecycle.js";
 import {
   formatWorkerReviewEvidencePrompt,
   isActiveReviewEvidenceItem,
   PullRequestReviewEvidenceService,
   type PullRequestReviewEvidenceClient,
 } from "../review/PullRequestReviewEvidenceService.js";
-import { formatWorkerReviewVerdictPrompt } from "../ReviewVerdictService.js";
+import {
+  formatWorkerMergeGatePromptResult,
+  formatWorkerReviewVerdictPrompt,
+  type WorkerMergeGatePromptResult,
+} from "../ReviewVerdictService.js";
 import {
   PlaceholderContinuationSummarizer,
   type ContinuationSummarizer,
@@ -1226,6 +1231,10 @@ export class Orchestrator {
         return;
       }
 
+      if (this.shouldDiscoverPullRequestBeforeFirstWorkerPrompt(entry.lifecycle)) {
+        await this.discoverPullRequestForEntry(entry, workspace);
+      }
+
       for (let turnNumber = 1; turnNumber <= this.config.agent.maxTurns; turnNumber += 1) {
         if (entry.abortController.signal.aborted) throw new SymphonyError("agent_error", "Run was cancelled");
         if (turnNumber > 1 && this.options.harness.supportsContinuation === false) {
@@ -2361,6 +2370,18 @@ export class Orchestrator {
           head_sha: result.headSha,
           mergeable_state: result.mergeableState,
         });
+      } else if (result.status !== "skipped") {
+        this.options.logger.info("merge policy reconciled issue", {
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          status: result.status,
+          merge_gate_id: result.gate.id,
+          pr_number: result.gate.pullRequest.number,
+          head_sha: result.gate.headSha,
+          failed_checks: result.gate.failedChecks.map((check) => check.name),
+          pending_checks: result.gate.pendingChecks.map((check) => check.name),
+          missing_checks: result.gate.missingChecks.map((check) => check.name),
+        });
       }
     } catch (error) {
       this.options.logger.warn("merge policy reconciliation failed", {
@@ -2376,6 +2397,11 @@ export class Orchestrator {
     if (!store) return;
     entry.lifecycle = await store.updateIssue(entry.issue, patch);
     await appendLaneMemoTelemetry(this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
+  }
+
+  private shouldDiscoverPullRequestBeforeFirstWorkerPrompt(lifecycle: IssueLifecycleRecord | null | undefined): boolean {
+    const gate = lifecycle?.mergeGate ?? null;
+    return gate?.status === "repair_dispatched" || gate?.status === "blocked";
   }
 
   private async discoverPullRequestForEntry(entry: RunningEntry, workspace: Workspace): Promise<void> {
@@ -2422,6 +2448,15 @@ export class Orchestrator {
         baseRef: metadata.baseRef,
       },
     });
+    const staleGatePatch = entry.lifecycle
+      ? staleMergeGateLifecyclePatch(entry.lifecycle, metadata.prHeadSha, metadata.prNumber)
+      : null;
+    if (staleGatePatch) {
+      await this.updateLifecycle(entry, {
+        ...staleGatePatch,
+        blockedReason: null,
+      });
+    }
 
     const runId = entry.activeRunId ?? entry.runId;
     if (!runId || !this.options.runStore) return;
@@ -2495,8 +2530,10 @@ export class Orchestrator {
     const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
-    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
-    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
+    const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
+    const mergeGate = mergeGateResult?.text ?? null;
+    const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
+    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), mergeGate, reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
   }
@@ -2555,11 +2592,14 @@ export class Orchestrator {
     const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
-    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
+    const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
+    const mergeGate = mergeGateResult?.text ?? null;
+    const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
     return [
       continuationBrief,
       reviewHardening,
       handoff,
+      mergeGate,
       reviewVerdict,
       reviewEvidence,
       this.cursorWorkerMcpPrompt(entry),
@@ -2691,8 +2731,20 @@ export class Orchestrator {
   }
 
   private async loadWorkerReviewVerdictPrompt(entry: RunningEntry): Promise<string | null> {
+    const lifecycle = await this.loadWorkerCurrentPromptLifecycle(entry);
+    return lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
+  }
+
+  private async loadWorkerMergeGatePromptResult(entry: RunningEntry): Promise<WorkerMergeGatePromptResult | null> {
+    const lifecycle = await this.loadWorkerCurrentPromptLifecycle(entry);
+    if (lifecycle === null) return null;
+    return formatWorkerMergeGatePromptResult(lifecycle);
+  }
+
+  private async loadWorkerCurrentPromptLifecycle(entry: RunningEntry): Promise<IssueLifecycleRecord | null> {
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
-    return lifecycle === undefined || lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
+    if (lifecycle === undefined || lifecycle === null) return null;
+    return currentPromptLifecycle(lifecycle);
   }
 
   private async loadIssueBreakdownPlanPrompt(entry: RunningEntry): Promise<string | null> {
@@ -2716,7 +2768,8 @@ export class Orchestrator {
     const lifecycle = (await this.options.lifecycleStore?.get(entry.issue.id)) ?? entry.lifecycle ?? null;
     const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id)) ?? [];
     if (!lifecycle || !hasRealHandoffContext(lifecycle, runs)) return null;
-    const packet = buildWorkerHandoffPacket(lifecycle);
+    const currentLifecycle = currentPromptLifecycle(lifecycle);
+    const packet = buildWorkerHandoffPacket(currentLifecycle);
     const transcriptPointers = transcriptPointersForRuns(runs);
     const statusPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
     const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(isActiveReviewEvidenceItem);
@@ -2726,7 +2779,7 @@ export class Orchestrator {
       `- Version: ${packet.version}; generatedAt: ${packet.generatedAt}`,
       `- Issue: ${packet.issueIdentifier} (${packet.issueId})`,
       `- Objective: ${entry.issue.title}`,
-      `- Next action: ${nextWorkerAction(lifecycle)}`,
+      `- Next action: ${nextWorkerAction(currentLifecycle)}`,
       "",
       "Lane memo:",
       ...packet.memo.entries.map((entryLine) => `- ${entryLine}`),
@@ -2832,7 +2885,7 @@ export class Orchestrator {
       entry.abortSignalledAt = entry.abortSignalledAt ?? now;
     }
     if (input.harnessStopRequested) {
-      entry.harnessStopRequestedAt = now;
+      entry.harnessStopRequestedAt = entry.harnessStopRequestedAt ?? now;
     }
   }
 
@@ -2876,6 +2929,7 @@ export class Orchestrator {
 
   private harnessStopRunId(entry: RunningEntry): string | null {
     if (typeof this.options.harness.stop !== "function") return null;
+    if (entry.harnessStopRequestedAt !== null) return null;
     return entry.activeRunId ?? entry.runId;
   }
 
@@ -3054,12 +3108,23 @@ function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[
     lifecycle.incompleteTurnCount > 0 ||
     lifecycle.summaryReferences.length > 0 ||
     lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem) ||
+    lifecycle.mergeGate !== null ||
     lifecycle.merge !== null ||
     lifecycle.phase !== "implementation"
   );
 }
 
+function currentPromptLifecycle(lifecycle: IssueLifecycleRecord): IssueLifecycleRecord {
+  return (
+    sanitizeStaleMergeGateLifecycle(lifecycle, lifecycle.summaryPointers.prHeadSha, lifecycle.summaryPointers.prNumber) ??
+    lifecycle
+  );
+}
+
 function nextWorkerAction(lifecycle: IssueLifecycleRecord): string {
+  if (lifecycle.mergeGate?.status === "repair_dispatched" || lifecycle.mergeGate?.status === "blocked") {
+    return "Repair the Symphony merge-gate checks on the lifecycle-bound PR, validate, and submit a new completion report.";
+  }
   if (lifecycle.handoff.lastReviewerOutput?.verdict === "fail") return "Address the latest reviewer findings, validate, and submit a new completion report.";
   if (lifecycle.incompleteTurnCount > 0) return "Continue the incomplete implementation using the memo and pointers before rediscovering context.";
   if (lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem)) {

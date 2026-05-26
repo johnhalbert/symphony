@@ -3,8 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SymphonyError } from "../src/core/errors.js";
-import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
-import { ReviewVerdictService, type ReviewVerdictActiveContext, type ReviewVerdictInput } from "../src/core/ReviewVerdictService.js";
+import { FileIssueLifecycleStore, type IssueLifecycleRecord, type IssueMergeGateState } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  formatWorkerMergeGatePromptResult,
+  ReviewVerdictService,
+  type ReviewVerdictActiveContext,
+  type ReviewVerdictInput,
+} from "../src/core/ReviewVerdictService.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
 
@@ -161,6 +166,96 @@ describe("ReviewVerdictService", () => {
     });
   });
 
+  it("formats merge-gate repair prompts with missing-check stabilization history", () => {
+    const result = formatWorkerMergeGatePromptResult(
+      lifecycle({
+        mergeGate: mergeGate({
+          checks: [
+            {
+              name: "typecheck",
+              outcome: "missing_actionable",
+              rawStatus: "missing",
+              conclusion: null,
+              url: null,
+              firstObservedAt: "2026-01-01T00:00:00.000Z",
+              actionableSince: "2026-01-01T00:05:00.000Z",
+            },
+            {
+              name: "lint",
+              outcome: "missing_observed",
+              rawStatus: "missing",
+              conclusion: null,
+              url: null,
+              firstObservedAt: "2026-01-01T00:00:01.000Z",
+              actionableSince: null,
+            },
+            {
+              name: "test",
+              outcome: "failing",
+              rawStatus: "failure",
+              conclusion: "failure",
+              url: "https://ci.test/test",
+              firstObservedAt: null,
+              actionableSince: null,
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(result?.kind).toBe("repair");
+    expect(result?.text).toContain(
+      "- typecheck: missing_actionable; firstObservedAt: 2026-01-01T00:00:00.000Z; actionableSince: 2026-01-01T00:05:00.000Z",
+    );
+    expect(result?.text).toContain("- lint: missing_observed; firstObservedAt: 2026-01-01T00:00:01.000Z; actionableSince: n/a");
+    expect(result?.text).toContain("- test: failing / failure (https://ci.test/test)");
+    expect(result?.text).not.toContain("- test: failing / failure (https://ci.test/test); firstObservedAt");
+  });
+
+  it("warns without stale repair details when a merge gate belongs to an older PR head", () => {
+    const result = formatWorkerMergeGatePromptResult(
+      lifecycle({
+        summaryPointers: { prHeadSha: "head-sha-2" },
+        mergeGate: mergeGate({
+          headSha: "head-sha-1",
+          repairRunId: "repair-run-1",
+          repairReportId: "completion-report:issue-1:repair-1",
+          blockerFingerprint: "head-sha-1:test:failure",
+        }),
+      }),
+    );
+
+    expect(result?.kind).toBe("stale_warning");
+    expect(result?.text).toContain("## Symphony Merge Gate Head Advanced");
+    expect(result?.text).toContain("Current PR head SHA: head-sha-2");
+    expect(result?.text).not.toContain("## Symphony Merge Gate Repair");
+    expect(result?.text).not.toContain("test: failing / failure");
+    expect(result?.text).not.toContain("Repair round");
+    expect(result?.text).not.toContain("Blocker fingerprint");
+    expect(result?.text).not.toContain("completion-report:issue-1:repair-1");
+  });
+
+  it("warns for a persisted superseded same-PR gate bound to the current head", () => {
+    const result = formatWorkerMergeGatePromptResult(
+      lifecycle({
+        summaryPointers: { prHeadSha: "head-sha-2" },
+        mergeGate: mergeGate({
+          status: "superseded",
+          headSha: "head-sha-1",
+          checks: [],
+          repairRunId: null,
+          repairReportId: null,
+          blockerFingerprint: null,
+          supersededByHeadSha: "head-sha-2",
+        }),
+      }),
+    );
+
+    expect(result?.kind).toBe("stale_warning");
+    expect(result?.text).toContain("## Symphony Merge Gate Head Advanced");
+    expect(result?.text).not.toContain("## Symphony Merge Gate Repair");
+  });
+
   function fixture() {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -173,6 +268,124 @@ describe("ReviewVerdictService", () => {
     return { service, lifecycleStore, outbox };
   }
 });
+
+function lifecycle(
+  overrides: Omit<Partial<IssueLifecycleRecord>, "summaryPointers"> & {
+    summaryPointers?: Partial<IssueLifecycleRecord["summaryPointers"]>;
+  } = {},
+): IssueLifecycleRecord {
+  const { summaryPointers: summaryPointerOverrides, ...recordOverrides } = overrides;
+  return {
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    phase: "implementation",
+    reviewRound: 1,
+    incompleteTurnCount: 0,
+    lastIssueBreakdownPlanId: null,
+    planningFailureCount: 0,
+    planningDispatchRetryCount: 0,
+    lastPlanningFailureRunId: null,
+    lastPlanningFailureAt: null,
+    lastCompletionReportId: null,
+    lastReviewVerdictId: null,
+    blockedReason: null,
+    summaryPointers: {
+      workspaceKey: null,
+      workspacePath: null,
+      branchName: "symphony/TEST-1",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+      lastRunId: null,
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "head-sha-1",
+      prBranch: "symphony/TEST-1",
+      ciStatus: null,
+      lastPushedAt: null,
+      lastEvidenceCursor: null,
+      ...summaryPointerOverrides,
+    },
+    summaryReferences: [],
+    issueBreakdownPlans: [],
+    completionReports: [],
+    reviewVerdicts: [],
+    reviewFeedback: [],
+    reviewEvidence: { pullRequest: null, lastIngestedCursor: null, lastWorkerEvidenceCursor: null, items: [], updatedAt: null },
+    mergeGate: mergeGate(),
+    mergeConflict: null,
+    mergeConflictResolutionReports: [],
+    merge: null,
+    handoff: {
+      version: 1,
+      memo: {
+        version: 1,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        reviewRound: 1,
+        incompleteTurnCount: 0,
+        sizeChars: 0,
+        entries: [],
+        openFindings: [],
+        pointers: {
+          workspaceKey: null,
+          workspacePath: null,
+          branchName: "symphony/TEST-1",
+          gitBranchName: "symphony/TEST-1",
+          repoPath: "/repo",
+          baseRef: "main",
+          lastRunId: null,
+          prUrl: "https://github.com/acme/symphony/pull/42",
+          prNumber: 42,
+          prHeadSha: "head-sha-1",
+          prBranch: "symphony/TEST-1",
+          ciStatus: null,
+          lastPushedAt: null,
+          lastEvidenceCursor: null,
+        },
+        lastWorkerRunId: null,
+        lastReviewerRunId: null,
+      },
+      lastWorkerOutput: null,
+      lastReviewerOutput: null,
+    },
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...recordOverrides,
+  };
+}
+
+function mergeGate(overrides: Partial<IssueMergeGateState> = {}): IssueMergeGateState {
+  return {
+    id: "merge-gate:issue-1:pr-42:head-sha-1",
+    status: "repair_dispatched",
+    headSha: "head-sha-1",
+    pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+    requiredChecks: ["test"],
+    checks: [
+      {
+        name: "test",
+        outcome: "failing",
+        rawStatus: "failure",
+        conclusion: "failure",
+        url: "https://ci.test/test",
+        firstObservedAt: null,
+        actionableSince: null,
+      },
+    ],
+    reviewRound: 1,
+    gateRunId: "worker-run-1",
+    gateReportId: "completion-report:issue-1:report-1",
+    repairRunId: null,
+    repairReportId: null,
+    blockerFingerprint: "head-sha-1:test:failure",
+    writebackOperationKeys: [],
+    supersededByHeadSha: null,
+    updatedAt: "2026-01-01T00:00:01.000Z",
+    ...overrides,
+  };
+}
 
 function failVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerdictInput {
   return {

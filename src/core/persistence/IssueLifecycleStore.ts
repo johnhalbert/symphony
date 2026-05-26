@@ -223,6 +223,44 @@ export interface IssueMergeMetadata {
   doneTransitionOperationKey: string;
 }
 
+export type IssueMergeGateStatus = "observing" | "repair_dispatched" | "blocked" | "resolved" | "superseded";
+export type IssueMergeGateCheckOutcome =
+  | "passing"
+  | "pending"
+  | "missing_observed"
+  | "missing_actionable"
+  | "failing"
+  | "unknown";
+export type IssueMergeGateRawCheckStatus = "success" | "failure" | "pending" | "missing" | "unknown";
+
+export interface IssueMergeGateCheckState {
+  name: string;
+  outcome: IssueMergeGateCheckOutcome;
+  rawStatus: IssueMergeGateRawCheckStatus;
+  conclusion: string | null;
+  url: string | null;
+  firstObservedAt: string | null;
+  actionableSince: string | null;
+}
+
+export interface IssueMergeGateState {
+  id: string;
+  status: IssueMergeGateStatus;
+  headSha: string;
+  pullRequest: CompletionReportPullRequestRef;
+  requiredChecks: string[];
+  checks: IssueMergeGateCheckState[];
+  reviewRound: number;
+  gateRunId: string | null;
+  gateReportId: string | null;
+  repairRunId: string | null;
+  repairReportId: string | null;
+  blockerFingerprint: string | null;
+  writebackOperationKeys: string[];
+  supersededByHeadSha: string | null;
+  updatedAt: string;
+}
+
 export type IssueMergeConflictResolutionStatus = "pending" | "still_conflicted" | "resolved" | "blocked";
 
 export interface IssueMergeConflictResolutionReportRecord {
@@ -348,6 +386,7 @@ export interface IssueLifecycleRecord {
   reviewVerdicts: IssueReviewVerdictRecord[];
   reviewFeedback: IssueReviewFeedbackRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
+  mergeGate?: IssueMergeGateState | null;
   merge: IssueMergeMetadata | null;
   mergeConflict: IssueMergeConflictMetadata | null;
   mergeConflictResolutionReports: IssueMergeConflictResolutionReportRecord[];
@@ -375,6 +414,7 @@ export interface IssueLifecyclePatch {
   reviewVerdicts?: IssueReviewVerdictRecord[];
   reviewFeedback?: IssueReviewFeedbackRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
+  mergeGate?: IssueMergeGateState | null;
   merge?: IssueMergeMetadata | null;
   mergeConflict?: IssueMergeConflictMetadata | null;
   mergeConflictResolutionReports?: IssueMergeConflictResolutionReportRecord[];
@@ -422,6 +462,7 @@ export class FileIssueLifecycleStore {
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
       reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
+      mergeGate: patchValue(patch, "mergeGate", existing?.mergeGate ?? null),
       merge: patchValue(patch, "merge", existing?.merge ?? null),
       mergeConflict: patchValue(patch, "mergeConflict", existing?.mergeConflict ?? null),
       mergeConflictResolutionReports:
@@ -523,7 +564,7 @@ export function buildWorkerHandoffPacket(
 
 export function buildIssueHandoffState(record: Omit<IssueLifecycleRecord, "handoff">): IssueHandoffState {
   const lastWorkerOutput = workerOutputFromReport(latestCompletionReport(record));
-  const lastReviewerOutput = reviewerOutputFromVerdict(latestReviewVerdict(record));
+  const lastReviewerOutput = reviewerOutputFromVerdict(latestHumanReviewVerdict(record));
   return {
     version: 1,
     memo: buildLaneMemo(record, lastWorkerOutput, lastReviewerOutput),
@@ -538,6 +579,7 @@ function buildLaneMemo(
   lastReviewerOutput: IssueReviewerOutputContract | null,
 ): IssueLaneMemo {
   const openFindings = lastReviewerOutput?.verdict === "fail" ? lastReviewerOutput.findings.slice(0, 8) : [];
+  const mergeGateEntry = mergeGateMemoEntry(record);
   const acceptedDecisions = [
     ...(lastReviewerOutput?.verdict === "pass"
       ? lastReviewerOutput.acceptanceResults
@@ -563,6 +605,7 @@ function buildLaneMemo(
     lastReviewerOutput
       ? `Latest reviewer output ${lastReviewerOutput.verdictId} (${lastReviewerOutput.runId}): ${lastReviewerOutput.verdict}.`
       : "No reviewer output is available yet.",
+    ...(mergeGateEntry === null ? [] : [mergeGateEntry]),
     ...acceptedDecisions.map((decision) => clip(decision)),
     ...openFindings.map((finding) => `Open reviewer finding: ${clip(finding)}`),
   ].slice(0, 12);
@@ -594,6 +637,27 @@ function latestCompletionReport(
   return record.completionReports.at(-1) ?? null;
 }
 
+export function latestCurrentApprovalPassVerdict(
+  record: Pick<
+    IssueLifecycleRecord,
+    | "issueId"
+    | "issueIdentifier"
+    | "completionReports"
+    | "lastCompletionReportId"
+    | "reviewVerdicts"
+    | "reviewFeedback"
+    | "summaryPointers"
+  >,
+): IssueReviewVerdictRecord | null {
+  const pullRequest = currentPullRequestForReview(record);
+  if (!pullRequest) return latestHumanPassVerdict(record);
+  for (const verdict of record.reviewVerdicts.slice().reverse()) {
+    if (!isHumanPassVerdictForIssue(record, verdict)) continue;
+    if (hasApprovalFeedback(record, verdict, pullRequest) || !hasAnyApprovalFeedbackForRun(record, verdict)) return verdict;
+  }
+  return null;
+}
+
 function latestReviewVerdict(
   record: Pick<IssueLifecycleRecord, "reviewVerdicts" | "lastReviewVerdictId">,
 ): IssueReviewVerdictRecord | null {
@@ -601,6 +665,133 @@ function latestReviewVerdict(
     return record.reviewVerdicts.find((verdict) => verdict.id === record.lastReviewVerdictId) ?? null;
   }
   return record.reviewVerdicts.at(-1) ?? null;
+}
+
+function latestHumanReviewVerdict(
+  record: Pick<
+    IssueLifecycleRecord,
+    | "issueId"
+    | "issueIdentifier"
+    | "completionReports"
+    | "lastCompletionReportId"
+    | "reviewVerdicts"
+    | "reviewFeedback"
+    | "lastReviewVerdictId"
+    | "summaryPointers"
+  >,
+): IssueReviewVerdictRecord | null {
+  const pointed = latestReviewVerdict(record);
+  if (pointed && !isMergeGateVerdict(pointed) && isCurrentHumanVerdict(record, pointed)) return pointed;
+  for (const verdict of record.reviewVerdicts.slice().reverse()) {
+    if (!isMergeGateVerdict(verdict) && isCurrentHumanVerdict(record, verdict)) return verdict;
+  }
+  return null;
+}
+
+function latestHumanPassVerdict(
+  record: Pick<IssueLifecycleRecord, "issueId" | "issueIdentifier" | "reviewVerdicts">,
+): IssueReviewVerdictRecord | null {
+  for (const verdict of record.reviewVerdicts.slice().reverse()) {
+    if (isHumanPassVerdictForIssue(record, verdict)) return verdict;
+  }
+  return null;
+}
+
+function isCurrentHumanVerdict(
+  record: Pick<
+    IssueLifecycleRecord,
+    | "issueId"
+    | "issueIdentifier"
+    | "completionReports"
+    | "lastCompletionReportId"
+    | "reviewFeedback"
+    | "summaryPointers"
+  >,
+  verdict: IssueReviewVerdictRecord,
+): boolean {
+  if (verdict.issueId !== record.issueId || verdict.issueIdentifier !== record.issueIdentifier) return false;
+  if (verdict.verdict !== "pass") return true;
+  const pullRequest = currentPullRequestForReview(record);
+  return pullRequest === null || hasApprovalFeedback(record, verdict, pullRequest) || !hasAnyApprovalFeedbackForRun(record, verdict);
+}
+
+function isHumanPassVerdictForIssue(
+  record: Pick<IssueLifecycleRecord, "issueId" | "issueIdentifier">,
+  verdict: IssueReviewVerdictRecord,
+): boolean {
+  return (
+    verdict.verdict === "pass" &&
+    !isMergeGateVerdict(verdict) &&
+    verdict.issueId === record.issueId &&
+    verdict.issueIdentifier === record.issueIdentifier
+  );
+}
+
+function currentPullRequestForReview(
+  record: Pick<IssueLifecycleRecord, "completionReports" | "lastCompletionReportId" | "summaryPointers">,
+): CompletionReportPullRequestRef | null {
+  const reportPullRequest = latestCompletionReport(record)?.pullRequest ?? null;
+  const pointerPullRequest =
+    record.summaryPointers.prNumber !== null && record.summaryPointers.prUrl !== null && record.summaryPointers.prHeadSha !== null
+      ? {
+          number: record.summaryPointers.prNumber,
+          url: record.summaryPointers.prUrl,
+          headSha: record.summaryPointers.prHeadSha,
+          branch: record.summaryPointers.prBranch,
+        }
+      : null;
+  if (
+    pointerPullRequest &&
+    reportPullRequest &&
+    pointerPullRequest.number === reportPullRequest.number &&
+    pointerPullRequest.headSha !== reportPullRequest.headSha
+  ) {
+    return pointerPullRequest;
+  }
+  return reportPullRequest ?? pointerPullRequest;
+}
+
+function hasApprovalFeedback(
+  record: Pick<IssueLifecycleRecord, "reviewFeedback">,
+  verdict: IssueReviewVerdictRecord,
+  pullRequest: CompletionReportPullRequestRef,
+): boolean {
+  return record.reviewFeedback.some(
+    (feedback) =>
+      feedback.runId === verdict.runId &&
+      feedback.kind === "review" &&
+      feedback.event === "APPROVE" &&
+      feedback.pullRequest.number === pullRequest.number &&
+      feedback.pullRequest.url === pullRequest.url &&
+      feedback.pullRequest.headSha === pullRequest.headSha,
+  );
+}
+
+function hasAnyApprovalFeedbackForRun(
+  record: Pick<IssueLifecycleRecord, "reviewFeedback">,
+  verdict: IssueReviewVerdictRecord,
+): boolean {
+  return record.reviewFeedback.some(
+    (feedback) => feedback.runId === verdict.runId && feedback.kind === "review" && feedback.event === "APPROVE",
+  );
+}
+
+function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
+  return verdict.reviewer === "symphony-merge-gate" || verdict.id.startsWith("merge-gate:");
+}
+
+function mergeGateMemoEntry(record: Pick<IssueLifecycleRecord, "mergeGate">): string | null {
+  const gate = record.mergeGate;
+  if (!gate || gate.status === "resolved" || gate.status === "superseded") return null;
+  const blockers = gate.checks
+    .filter((check) => check.outcome === "failing" || check.outcome === "missing_actionable")
+    .map((check) => `${check.name} (${check.outcome})`);
+  const observing = gate.checks
+    .filter((check) => check.outcome === "pending" || check.outcome === "missing_observed" || check.outcome === "unknown")
+    .map((check) => `${check.name} (${check.outcome})`);
+  return `Merge gate ${gate.status} on head ${gate.headSha}; blockers: ${
+    blockers.length === 0 ? "none" : blockers.join(", ")
+  }; observing: ${observing.length === 0 ? "none" : observing.join(", ")}.`;
 }
 
 function workerOutputFromReport(report: IssueCompletionReportRecord | null): IssueWorkerOutputContract | null {
@@ -729,6 +920,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
     reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
+    mergeGate: normalizeMergeGateState(value.mergeGate, filePath),
     merge: normalizeMergeMetadata(value.merge, filePath),
     mergeConflict: normalizeMergeConflictMetadata(value.mergeConflict, filePath),
     mergeConflictResolutionReports: normalizeMergeConflictResolutionReports(
@@ -1195,6 +1387,60 @@ function normalizeReviewFeedbackRecord(value: unknown, filePath: string, index: 
   };
 }
 
+function normalizeMergeGateState(value: unknown, filePath: string): IssueMergeGateState | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "mergeGate is invalid");
+  const status = value.status;
+  if (!isMergeGateStatus(status)) throw corruptLifecycle(filePath, "mergeGate.status is invalid");
+  return {
+    id: requiredString(value.id, filePath, "mergeGate.id"),
+    status,
+    headSha: requiredString(value.headSha, filePath, "mergeGate.headSha"),
+    pullRequest: normalizeMergeGatePullRequest(value.pullRequest, filePath),
+    requiredChecks: requiredStringArray(value.requiredChecks, filePath, "mergeGate.requiredChecks"),
+    checks: normalizeMergeGateChecks(value.checks, filePath),
+    reviewRound: nonNegativeInteger(value.reviewRound, filePath, "mergeGate.reviewRound"),
+    gateRunId: optionalNullableString(value.gateRunId, filePath, "mergeGate.gateRunId"),
+    gateReportId: optionalNullableString(value.gateReportId, filePath, "mergeGate.gateReportId"),
+    repairRunId: optionalNullableString(value.repairRunId, filePath, "mergeGate.repairRunId"),
+    repairReportId: optionalNullableString(value.repairReportId, filePath, "mergeGate.repairReportId"),
+    blockerFingerprint: optionalNullableString(value.blockerFingerprint, filePath, "mergeGate.blockerFingerprint"),
+    writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, "mergeGate.writebackOperationKeys"),
+    supersededByHeadSha: optionalNullableString(value.supersededByHeadSha, filePath, "mergeGate.supersededByHeadSha"),
+    updatedAt: requiredString(value.updatedAt, filePath, "mergeGate.updatedAt"),
+  };
+}
+
+function normalizeMergeGateChecks(value: unknown, filePath: string): IssueMergeGateCheckState[] {
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "mergeGate.checks is invalid");
+  return value.map((item, index) => {
+    if (!isRecord(item)) throw corruptLifecycle(filePath, `mergeGate.checks[${index}] is invalid`);
+    const outcome = item.outcome;
+    if (!isMergeGateCheckOutcome(outcome)) throw corruptLifecycle(filePath, `mergeGate.checks[${index}].outcome is invalid`);
+    const rawStatus = item.rawStatus;
+    if (!isMergeGateRawCheckStatus(rawStatus)) throw corruptLifecycle(filePath, `mergeGate.checks[${index}].rawStatus is invalid`);
+    return {
+      name: requiredString(item.name, filePath, `mergeGate.checks[${index}].name`),
+      outcome,
+      rawStatus,
+      conclusion: optionalNullableString(item.conclusion, filePath, `mergeGate.checks[${index}].conclusion`),
+      url: optionalNullableString(item.url, filePath, `mergeGate.checks[${index}].url`),
+      firstObservedAt: optionalNullableString(item.firstObservedAt, filePath, `mergeGate.checks[${index}].firstObservedAt`),
+      actionableSince: optionalNullableString(item.actionableSince, filePath, `mergeGate.checks[${index}].actionableSince`),
+    };
+  });
+}
+
+function normalizeMergeGatePullRequest(value: unknown, filePath: string): CompletionReportPullRequestRef {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "mergeGate.pullRequest is invalid");
+  return {
+    url: nullableString(value.url, filePath, "mergeGate.pullRequest.url"),
+    number: nullableNumber(value.number, filePath, "mergeGate.pullRequest.number"),
+    headSha: optionalNullableString(value.headSha, filePath, "mergeGate.pullRequest.headSha"),
+    branch: optionalNullableString(value.branch, filePath, "mergeGate.pullRequest.branch"),
+  };
+}
+
 function normalizeMergeMetadata(value: unknown, filePath: string): IssueMergeMetadata | null {
   if (value === undefined || value === null) return null;
   if (!isRecord(value)) throw corruptLifecycle(filePath, "merge is invalid");
@@ -1477,6 +1723,31 @@ function isLifecyclePhase(value: unknown): value is IssueLifecyclePhase {
     value === "terminal" ||
     value === "unknown"
   );
+}
+
+function isMergeGateStatus(value: unknown): value is IssueMergeGateStatus {
+  return (
+    value === "observing" ||
+    value === "repair_dispatched" ||
+    value === "blocked" ||
+    value === "resolved" ||
+    value === "superseded"
+  );
+}
+
+function isMergeGateCheckOutcome(value: unknown): value is IssueMergeGateCheckOutcome {
+  return (
+    value === "passing" ||
+    value === "pending" ||
+    value === "missing_observed" ||
+    value === "missing_actionable" ||
+    value === "failing" ||
+    value === "unknown"
+  );
+}
+
+function isMergeGateRawCheckStatus(value: unknown): value is IssueMergeGateRawCheckStatus {
+  return value === "success" || value === "failure" || value === "pending" || value === "missing" || value === "unknown";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
