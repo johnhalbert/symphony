@@ -11,6 +11,8 @@ import {
   completionReportMcpServerConfig,
   cursorAgentCreateOptions,
   cursorRoleMcpServers,
+  mergeConflictResolutionContextFilePath,
+  mergeConflictResolutionMcpServerConfig,
   reviewFeedbackContextFilePath,
   reviewFeedbackMcpServerConfig,
   reviewVerdictContextFilePath,
@@ -185,6 +187,39 @@ describe("Cursor event mapping", () => {
     expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key" });
     expect(server.env).not.toHaveProperty("GITHUB_TOKEN");
     expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
+  });
+
+  it("mounts only the merge conflict resolution MCP server for conflict-fix workers", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Approved with Conflicts";
+    const ctx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      runPhase: "merge_conflict_resolution",
+      issue: issue({ state: "Approved with Conflicts", branchName: "symphony/TEST-1" }),
+    };
+
+    const server = mergeConflictResolutionMcpServerConfig(ctx, "/tmp/conflict-context.json", { cliPath: "/repo/src/cli.ts" });
+    const mcpServers = cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" });
+    await new CursorHarness().prepare(ctx);
+
+    expect(Object.keys(mcpServers)).toEqual(["symphony_conflicts"]);
+    expect(server.args).toEqual(
+      expect.arrayContaining(["merge-conflict-resolution-mcp", "--workflow", config.workflowPath, "--context-file", "/tmp/conflict-context.json"]),
+    );
+    expect(mcpServers.symphony_conflicts?.args).toEqual(
+      expect.arrayContaining([
+        "merge-conflict-resolution-mcp",
+        "--workflow",
+        config.workflowPath,
+        "--context-file",
+        mergeConflictResolutionContextFilePath(ctx),
+      ]),
+    );
+    expect(mcpServers).not.toHaveProperty("symphony");
+    await expect(readFile(mergeConflictResolutionContextFilePath(ctx), "utf8")).resolves.toContain(
+      '"phase": "merge_conflict_resolution"',
+    );
   });
 
   it("mounts worker MCP servers on Cursor agent create/resume options", () => {

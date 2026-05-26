@@ -436,6 +436,8 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
     await orchestrator.stop();
 
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
@@ -482,6 +484,8 @@ describe("Orchestrator", () => {
 
     const result = await orchestrator.requestIssueBreakdown(candidate.id);
     await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
     await orchestrator.stop();
 
     expect(result).toMatchObject({ queued: true, reason: "explicit_request" });
@@ -649,6 +653,7 @@ describe("Orchestrator", () => {
     await waitFor(() => harness.runs.length === 1);
     await waitFor(() => first.snapshot().counts.running === 0);
     await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
+    await settleOrchestratorExit();
     await first.stop();
 
     const second = new Orchestrator({
@@ -670,6 +675,7 @@ describe("Orchestrator", () => {
     await waitFor(() => harness.runs.length === 2, "planning retry after durable backoff");
     await waitFor(() => second.snapshot().counts.running === 0);
     await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 2);
+    await settleOrchestratorExit();
     await second.stop();
 
     const lifecycle = await lifecycleStore.get(candidate.id);
@@ -2324,6 +2330,9 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "worker dispatch after human Todo unblock");
+    await waitFor(() => writer.transitions.length === 1, "dispatch transition writeback");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "worker dispatch exit");
+    await settleOrchestratorExit();
     await orchestrator.stop();
 
     expect(writer.transitions).toEqual([

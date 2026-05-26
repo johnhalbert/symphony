@@ -7,13 +7,17 @@ import type { CursorSettingSource, ServiceConfig } from "../config/Config.js";
 import type { AgentRunContext } from "./AgentHarness.js";
 import { COMPLETION_REPORT_TOOL_NAME, writeCompletionReportMcpContext } from "./CompletionReportMcpServer.js";
 import {
+  MERGE_CONFLICT_RESOLUTION_TOOL_NAME,
+  writeMergeConflictResolutionMcpContext,
+} from "./MergeConflictResolutionMcpServer.js";
+import {
   buildMcpSubprocessEnvironment,
   buildMcpSubprocessServerConfig,
   type McpSubprocessCommand,
 } from "./McpSubprocessEnvironment.js";
 import { REVIEW_FEEDBACK_TOOL_NAME, writeReviewFeedbackMcpContext } from "./ReviewFeedbackMcpServer.js";
 import { REVIEW_VERDICT_TOOL_NAME, writeReviewVerdictMcpContext } from "./ReviewVerdictMcpServer.js";
-import type { AgentRunRole, Issue, Workspace } from "../types.js";
+import type { AgentRunPhase, AgentRunRole, Issue, Workspace } from "../types.js";
 import { errorMessage } from "../errors.js";
 import { StructuredLogger } from "../logging/StructuredLogger.js";
 import { resolveCursorRuntimeApiKey } from "../../app/RuntimeDependencies.js";
@@ -21,6 +25,7 @@ import {
   completionReportContextFilePath,
   cursorAgentCreateOptions,
   cursorAgentSendOptions,
+  mergeConflictResolutionContextFilePath,
   cursorRoleMcpServers,
   reviewFeedbackContextFilePath,
   reviewVerdictContextFilePath,
@@ -48,7 +53,8 @@ export type McpToolExposureFailureCode =
 
 export interface McpToolExposureSpec {
   role: AgentRunRole;
-  serverKey: "symphony" | "symphony_review_verdict" | "symphony_review_feedback";
+  runPhase: AgentRunPhase;
+  serverKey: "symphony" | "symphony_conflicts" | "symphony_review_verdict" | "symphony_review_feedback";
   command: McpSubprocessCommand;
   expectedTool: string;
 }
@@ -65,6 +71,7 @@ export interface McpToolExposureServerResult {
   normalizedToolNames: string[];
   envKeyNames: string[];
   sdkRoleRunRole?: AgentRunRole;
+  sdkRoleRunPhase?: AgentRunPhase;
   sdkRoleRunIndex?: number;
 }
 
@@ -159,6 +166,7 @@ export interface SdkToolDiagnostics {
 
 export interface SdkRoleRunResult {
   role: AgentRunRole;
+  runPhase?: AgentRunPhase;
   agentId: string | null;
   runId: string | null;
   primaryFailureCode: McpToolExposureFailureCode | null;
@@ -169,18 +177,28 @@ export interface SdkRoleRunResult {
 export const MCP_TOOL_EXPOSURE_SPECS: readonly McpToolExposureSpec[] = [
   {
     role: "worker",
+    runPhase: "implementation",
     serverKey: "symphony",
     command: "completion-report-mcp",
     expectedTool: COMPLETION_REPORT_TOOL_NAME,
   },
   {
+    role: "worker",
+    runPhase: "merge_conflict_resolution",
+    serverKey: "symphony_conflicts",
+    command: "merge-conflict-resolution-mcp",
+    expectedTool: MERGE_CONFLICT_RESOLUTION_TOOL_NAME,
+  },
+  {
     role: "reviewer",
+    runPhase: "review",
     serverKey: "symphony_review_verdict",
     command: "review-verdict-mcp",
     expectedTool: REVIEW_VERDICT_TOOL_NAME,
   },
   {
     role: "reviewer",
+    runPhase: "review",
     serverKey: "symphony_review_feedback",
     command: "review-feedback-mcp",
     expectedTool: REVIEW_FEEDBACK_TOOL_NAME,
@@ -284,9 +302,11 @@ export async function runSdkMcpToolExposureProbe(
     postCancelWaitMs: options.postCancelWaitMs ?? 1_500,
   };
   if (!options.enabled) {
-    const sdkRoleRuns = uniqueRoles(specs).map((role) =>
+    const sdkTargets = uniqueSdkTargets(specs);
+    const sdkRoleRuns = sdkTargets.map((target) =>
       syntheticSdkRoleRun({
-        role,
+        role: target.role,
+        runPhase: target.runPhase,
         roleStatus: "skipped",
         primaryFailureCode: null,
         message: "Live SDK probe skipped",
@@ -299,7 +319,7 @@ export async function runSdkMcpToolExposureProbe(
       failureCode: null,
       message: "Live Cursor SDK MCP exposure smoke skipped because SYMPHONY_MCP_EXPOSURE_SMOKE is not 1",
       results: specs.map((spec) => {
-        const roleRunIndex = sdkRoleRuns.findIndex((roleRun) => roleRun.role === spec.role);
+        const roleRunIndex = sdkRoleRuns.findIndex((roleRun) => roleRunMatchesSpec(roleRun, spec));
         return skippedServerResult(spec, "Live SDK probe skipped", roleRunIndex);
       }),
       sdkRoleRuns,
@@ -334,14 +354,15 @@ export async function runSdkMcpToolExposureProbe(
 
   const results: McpToolExposureServerResult[] = [];
   const sdkRoleRuns: SdkRoleRunResult[] = [];
-  for (const role of uniqueRoles(specs)) {
-    const apiKey = roleApiKeys.get(role);
+  for (const target of uniqueSdkTargets(specs)) {
+    const apiKey = roleApiKeys.get(target.role);
     if (!apiKey) {
-      throw new Error(`cursor.runtime credential unexpectedly missing for ${role}`);
+      throw new Error(`cursor.runtime credential unexpectedly missing for ${target.role}`);
     }
     const roleRunIndex = sdkRoleRuns.length;
     const roleProbe = await runSdkRoleProbe(config, {
-      role,
+      role: target.role,
+      runPhase: target.runPhase,
       cliPath: options.cliPath,
       apiKey,
       timeoutMs: options.timeoutMs,
@@ -370,9 +391,10 @@ function missingCredentialsStage(
   },
   message: string,
 ): McpToolExposureStageResult {
-  const sdkRoleRuns = uniqueRoles(specs).map((role) =>
+  const sdkRoleRuns = uniqueSdkTargets(specs).map((target) =>
     syntheticSdkRoleRun({
-      role,
+      role: target.role,
+      runPhase: target.runPhase,
       roleStatus: "failure",
       primaryFailureCode: "sdk_credentials_missing",
       message,
@@ -385,7 +407,7 @@ function missingCredentialsStage(
     failureCode: "sdk_credentials_missing",
     message: `${message}; live Cursor SDK MCP exposure probe cannot run`,
     results: specs.map((spec) => {
-      const roleRunIndex = sdkRoleRuns.findIndex((roleRun) => roleRun.role === spec.role);
+      const roleRunIndex = sdkRoleRuns.findIndex((roleRun) => roleRunMatchesSpec(roleRun, spec));
       return failureServerResult(
         spec,
         "sdk_credentials_missing",
@@ -555,6 +577,7 @@ async function runSdkRoleProbe(
   config: ServiceConfig,
   options: {
     role: AgentRunRole;
+    runPhase: AgentRunPhase;
     cliPath: string;
     apiKey: string;
     timeoutMs: number;
@@ -566,8 +589,8 @@ async function runSdkRoleProbe(
     roleRunIndex: number;
   },
 ): Promise<SdkRoleProbeResult> {
-  const roleSpecs = specsForRoles([options.role]);
-  const ctx = probeAgentRunContext(config, options.role, options.cwd);
+  const roleSpecs = specsForSdkTarget(specsForRoles([options.role]), options.role, options.runPhase);
+  const ctx = probeAgentRunContext(config, options.role, options.cwd, options.runPhase);
   await writeRoleContexts(ctx);
   const envKeyNamesByServer = new Map(
     roleSpecs.map((spec) => [
@@ -575,7 +598,11 @@ async function runSdkRoleProbe(
       sortedKeys(buildMcpSubprocessEnvironment({ config, command: spec.command })),
     ]),
   );
-  const traceFile = path.join(config.workspace.stateDir, ".mcp-exposure-probe", `${options.role}-${randomUUID()}.trace.jsonl`);
+  const traceFile = path.join(
+    config.workspace.stateDir,
+    ".mcp-exposure-probe",
+    `${options.role}-${options.runPhase}-${randomUUID()}.trace.jsonl`,
+  );
   const previousTraceFile = process.env.SYMPHONY_MCP_TRACE_FILE;
   let agent: SDKAgent | null = null;
   let run: Run | null = null;
@@ -597,6 +624,7 @@ async function runSdkRoleProbe(
   } catch (error) {
     const roleRun = sdkRoleRunFromObservation(
       options.role,
+      options.runPhase,
       agentId(agent),
       runId(run),
       sdkDiagnostics({
@@ -631,6 +659,7 @@ async function runSdkRoleProbe(
   try {
     const observedRoleRun = await observeSdkRoleRun({
       role: options.role,
+      runPhase: options.runPhase,
       agentId: agentId(agent),
       runId: runId(run),
       run,
@@ -649,6 +678,7 @@ async function runSdkRoleProbe(
     await fs.rm(traceFile, { force: true });
     const roleRun = sdkRoleRunFromObservation(
       options.role,
+      options.runPhase,
       observedRoleRun.agentId,
       observedRoleRun.runId,
       observedRoleRun.sdkObservation,
@@ -668,6 +698,7 @@ async function runSdkRoleProbe(
 
 export async function observeSdkRoleRun(input: {
   role: AgentRunRole;
+  runPhase?: AgentRunPhase;
   agentId: string | null;
   runId: string | null;
   run: Pick<Run, "stream" | "wait" | "cancel">;
@@ -694,7 +725,7 @@ export async function observeSdkRoleRun(input: {
   if (typeof input.run.stream !== "function") {
     observation.supportsStream = false;
     observation.streamStatus = "unsupported";
-    return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
+    return sdkRoleRunFromObservation(input.role, input.runPhase ?? defaultRunPhaseForRole(input.role), input.agentId, input.runId, observation, input.roleSpecs);
   }
 
   observation.supportsStream = true;
@@ -703,22 +734,22 @@ export async function observeSdkRoleRun(input: {
     observation.timedOut = true;
     observation.streamStatus = "timeout";
     await cancelAndWaitAfterAbnormalStream(input.run, observation, input.postCancelWaitMs, true, input.secrets ?? []);
-    return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
+    return sdkRoleRunFromObservation(input.role, input.runPhase ?? defaultRunPhaseForRole(input.role), input.agentId, input.runId, observation, input.roleSpecs);
   }
   if (streamOutcome.status === "rejected") {
     observation.streamStatus = "error";
     observation.streamError = redactSensitiveText(errorMessage(streamOutcome.error), input.secrets ?? []);
-    return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
+    return sdkRoleRunFromObservation(input.role, input.runPhase ?? defaultRunPhaseForRole(input.role), input.agentId, input.runId, observation, input.roleSpecs);
   }
   if (observation.unexpectedToolCall) {
     observation.streamStatus = "unexpected_tool_call";
     await cancelAndWaitAfterAbnormalStream(input.run, observation, input.postCancelWaitMs, false, input.secrets ?? []);
-    return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
+    return sdkRoleRunFromObservation(input.role, input.runPhase ?? defaultRunPhaseForRole(input.role), input.agentId, input.runId, observation, input.roleSpecs);
   }
 
   observation.streamStatus = "drained";
   await observeSdkWait(input.run, observation, input.waitTimeoutMs, input.secrets ?? []);
-  return sdkRoleRunFromObservation(input.role, input.agentId, input.runId, observation, input.roleSpecs);
+  return sdkRoleRunFromObservation(input.role, input.runPhase ?? defaultRunPhaseForRole(input.role), input.agentId, input.runId, observation, input.roleSpecs);
 }
 
 async function drainSdkStream(
@@ -813,6 +844,20 @@ async function cancelAndWaitAfterAbnormalStream(
 }
 
 async function writeRoleContexts(ctx: AgentRunContext): Promise<void> {
+  if (ctx.role === "worker" && ctx.runPhase === "merge_conflict_resolution") {
+    await writeMergeConflictResolutionMcpContext(mergeConflictResolutionContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: null,
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "merge_conflict_resolution",
+    });
+    return;
+  }
   if (ctx.role === "worker") {
     await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
       issue: ctx.issue,
@@ -847,14 +892,19 @@ async function writeRoleContexts(ctx: AgentRunContext): Promise<void> {
   });
 }
 
-function probeAgentRunContext(config: ServiceConfig, role: AgentRunRole, cwd: string): AgentRunContext {
+function probeAgentRunContext(config: ServiceConfig, role: AgentRunRole, cwd: string, runPhase: AgentRunPhase): AgentRunContext {
   const issue: Issue = {
-    id: `mcp-exposure-probe-${role}`,
-    identifier: role === "worker" ? "MCP-WORKER" : "MCP-REVIEWER",
+    id: `mcp-exposure-probe-${role}-${runPhase}`,
+    identifier: role === "worker" ? (runPhase === "merge_conflict_resolution" ? "MCP-CONFLICT" : "MCP-WORKER") : "MCP-REVIEWER",
     title: "MCP exposure probe",
     description: null,
     priority: null,
-    state: role === "worker" ? "In Progress" : "In Review",
+    state:
+      runPhase === "merge_conflict_resolution"
+        ? config.mergePolicy.conflictsState ?? "Approved with Conflicts"
+        : role === "worker"
+          ? "In Progress"
+          : "In Review",
     branchName: null,
     url: null,
     assigneeId: null,
@@ -877,6 +927,7 @@ function probeAgentRunContext(config: ServiceConfig, role: AgentRunRole, cwd: st
   return {
     issue,
     role,
+    runPhase,
     attempt: null,
     workspace,
     config,
@@ -951,6 +1002,34 @@ function uniqueRoles(specs: readonly McpToolExposureSpec[]): AgentRunRole[] {
   return unique(specs.map((spec) => spec.role));
 }
 
+function uniqueSdkTargets(specs: readonly McpToolExposureSpec[]): Array<{ role: AgentRunRole; runPhase: AgentRunPhase }> {
+  const seen = new Set<string>();
+  const targets: Array<{ role: AgentRunRole; runPhase: AgentRunPhase }> = [];
+  for (const spec of specs) {
+    const key = `${spec.role}:${spec.runPhase}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    targets.push({ role: spec.role, runPhase: spec.runPhase });
+  }
+  return targets;
+}
+
+function specsForSdkTarget(
+  specs: readonly McpToolExposureSpec[],
+  role: AgentRunRole,
+  runPhase: AgentRunPhase,
+): McpToolExposureSpec[] {
+  return specs.filter((spec) => spec.role === role && spec.runPhase === runPhase);
+}
+
+function roleRunMatchesSpec(roleRun: SdkRoleRunResult, spec: McpToolExposureSpec): boolean {
+  return roleRun.role === spec.role && (roleRun.runPhase ?? defaultRunPhaseForRole(roleRun.role)) === spec.runPhase;
+}
+
+function defaultRunPhaseForRole(role: AgentRunRole): AgentRunPhase {
+  return role === "reviewer" ? "review" : "implementation";
+}
+
 export function extractSdkSystemToolNames(tools: unknown): SdkSystemToolExtraction {
   const extraction: SdkSystemToolExtraction = {
     rawToolNames: [],
@@ -998,7 +1077,11 @@ export function extractSdkSystemToolNames(tools: unknown): SdkSystemToolExtracti
 
 export function classifySdkRoleFailureCode(
   observation: SdkToolDiagnostics,
-  roleSpecs: readonly McpToolExposureSpec[] = specsForRoles([observation.role]),
+  roleSpecs: readonly McpToolExposureSpec[] = specsForSdkTarget(
+    MCP_TOOL_EXPOSURE_SPECS,
+    observation.role,
+    defaultRunPhaseForRole(observation.role),
+  ),
 ): McpToolExposureFailureCode | null {
   if (observation.startupSendError) return "sdk_startup_send_failure";
   if (observation.supportsStream === false) return "sdk_stream_unsupported";
@@ -1031,7 +1114,11 @@ export function classifySdkRoleFailureCode(
 
 export function classifySdkRoleObservation(
   observation: SdkToolDiagnostics,
-  roleSpecs: readonly McpToolExposureSpec[] = specsForRoles([observation.role]),
+  roleSpecs: readonly McpToolExposureSpec[] = specsForSdkTarget(
+    MCP_TOOL_EXPOSURE_SPECS,
+    observation.role,
+    defaultRunPhaseForRole(observation.role),
+  ),
 ): Pick<SdkRoleRunResult, "primaryFailureCode" | "roleStatus"> {
   const primaryFailureCode = classifySdkRoleFailureCode(observation, roleSpecs);
   if (primaryFailureCode === null) return { primaryFailureCode, roleStatus: "success" };
@@ -1060,7 +1147,7 @@ export function classifySdkDiagnosticsForSpec(
   spec: McpToolExposureSpec,
   observation: SdkToolDiagnostics,
 ): Pick<McpToolExposureServerResult, "status" | "failureCode" | "message" | "rawToolNames" | "normalizedToolNames"> {
-  const primaryFailureCode = classifySdkRoleFailureCode(observation, specsForRoles([spec.role]));
+  const primaryFailureCode = classifySdkRoleFailureCode(observation, [spec]);
   const tracedToolsList = mcpTraceMethodsForSpec(observation, spec).includes("tools/list");
   if (
     primaryFailureCode === null ||
@@ -1105,20 +1192,23 @@ export function deriveSdkPerSpecResult(
     normalizedToolNames: classified.normalizedToolNames,
     envKeyNames: sortedKeysFromList(envKeyNames),
     sdkRoleRunRole: roleRun.role,
+    sdkRoleRunPhase: roleRun.runPhase ?? defaultRunPhaseForRole(roleRun.role),
     sdkRoleRunIndex,
   };
 }
 
 function sdkRoleRunFromObservation(
   role: AgentRunRole,
+  runPhase: AgentRunPhase,
   agentIdValue: string | null,
   runIdValue: string | null,
   sdkObservation: SdkToolDiagnostics,
-  roleSpecs: readonly McpToolExposureSpec[] = specsForRoles([role]),
+  roleSpecs: readonly McpToolExposureSpec[] = specsForSdkTarget(MCP_TOOL_EXPOSURE_SPECS, role, runPhase),
 ): SdkRoleRunResult {
   const classified = classifySdkRoleObservation(sdkObservation, roleSpecs);
   return {
     role,
+    runPhase,
     agentId: agentIdValue,
     runId: runIdValue,
     primaryFailureCode: classified.primaryFailureCode,
@@ -1129,6 +1219,7 @@ function sdkRoleRunFromObservation(
 
 function syntheticSdkRoleRun(input: {
   role: AgentRunRole;
+  runPhase: AgentRunPhase;
   roleStatus: SdkRoleStatus;
   primaryFailureCode: McpToolExposureFailureCode | null;
   message: string;
@@ -1153,6 +1244,7 @@ function syntheticSdkRoleRun(input: {
   });
   return {
     role: input.role,
+    runPhase: input.runPhase,
     agentId: null,
     runId: null,
     primaryFailureCode: input.primaryFailureCode,
@@ -1177,7 +1269,9 @@ function skippedServerResult(
     rawToolNames: [],
     normalizedToolNames: [],
     envKeyNames: [],
-    ...(sdkRoleRunIndex === undefined ? {} : { sdkRoleRunRole: spec.role, sdkRoleRunIndex }),
+    ...(sdkRoleRunIndex === undefined
+      ? {}
+      : { sdkRoleRunRole: spec.role, sdkRoleRunPhase: spec.runPhase, sdkRoleRunIndex }),
   };
 }
 
@@ -1199,7 +1293,9 @@ function failureServerResult(
     rawToolNames: [],
     normalizedToolNames: [],
     envKeyNames: sortedKeysFromList(envKeyNames),
-    ...(sdkRoleRunIndex === undefined ? {} : { sdkRoleRunRole: spec.role, sdkRoleRunIndex }),
+    ...(sdkRoleRunIndex === undefined
+      ? {}
+      : { sdkRoleRunRole: spec.role, sdkRoleRunPhase: spec.runPhase, sdkRoleRunIndex }),
   };
 }
 
@@ -1321,6 +1417,8 @@ function mcpSdkServerNameForCommand(command: McpSubprocessCommand): string {
   switch (command) {
     case "completion-report-mcp":
       return "symphony-completion-report";
+    case "merge-conflict-resolution-mcp":
+      return "symphony-merge-conflict-resolution";
     case "issue-breakdown-plan-mcp":
       return "symphony-issue-breakdown-plan";
     case "review-verdict-mcp":

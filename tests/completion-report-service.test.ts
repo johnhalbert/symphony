@@ -439,6 +439,28 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("rejects ordinary completion reports from the configured merge conflicts state", async () => {
+    const { service, lifecycleStore, outbox } = fixture({
+      configure(config) {
+        config.mergePolicy.mode = "gated";
+        config.mergePolicy.conflictsState = "Approved with Conflicts";
+        config.tracker.activeStates = ["Todo", "In Progress", "Approved with Conflicts"];
+      },
+    });
+
+    await lifecycleStore.ensureIssue(issue({ state: "Approved with Conflicts" }), {
+      phase: "merge_conflict_resolution",
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report(),
+        context({ issue: issue({ state: "Approved with Conflicts", branchName: "symphony/TEST-1" }) }),
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
   it("rejects missing required report fields", async () => {
     const { service } = fixture();
     const { summary: _summary, ...missingSummary } = report();

@@ -292,7 +292,6 @@ function activityPage(offset: number, nextOffset: number | null, ids: string[]):
     filter: { issue: null },
   };
 }
-
 function activityItem(id: string): ActivityItem {
   return {
     id,
@@ -306,4 +305,3 @@ function activityItem(id: string): ActivityItem {
     links: {},
   };
 }
-

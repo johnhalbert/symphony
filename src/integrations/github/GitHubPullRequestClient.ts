@@ -26,6 +26,10 @@ export interface PullRequestDetails extends PullRequestMetadata {
   mergeCommitSha: string | null;
   mergedAt: string | null;
   mergedBy: string | null;
+  mergeable: boolean | null;
+  mergeableState: string | null;
+  baseBranch: string;
+  baseHeadSha: string;
 }
 
 export interface PullRequestCheckResult {
@@ -51,6 +55,11 @@ export interface PullRequestMergeResult {
   mergeCommitSha: string;
   mergedAt: string;
   mergedBy: string | null;
+}
+
+export interface CommitAncestryInput {
+  ancestorSha: string;
+  descendantSha: string;
 }
 
 export interface PullRequestPublicationInput {
@@ -140,6 +149,8 @@ interface GitHubPullRequestNode {
   number?: unknown;
   state?: unknown;
   merged?: unknown;
+  mergeable?: unknown;
+  mergeable_state?: unknown;
   merge_commit_sha?: unknown;
   merged_at?: unknown;
   draft?: unknown;
@@ -151,6 +162,10 @@ interface GitHubPullRequestNode {
     repo?: {
       pushed_at?: unknown;
     } | null;
+  } | null;
+  base?: {
+    ref?: unknown;
+    sha?: unknown;
   } | null;
 }
 
@@ -415,6 +430,25 @@ export class GitHubPullRequestClient {
       mergedAt: new Date().toISOString(),
       mergedBy: await this.getAuthenticatedLogin(),
     };
+  }
+
+  async isAncestor(input: CommitAncestryInput): Promise<boolean> {
+    this.assertConfiguredForMerge();
+    const ancestorSha = requireNonEmpty(input.ancestorSha, "An ancestor commit SHA is required for approval carry-forward");
+    const descendantSha = requireNonEmpty(input.descendantSha, "A descendant commit SHA is required for approval carry-forward");
+    const response = await this.fetchImpl(
+      this.repoUrl(`compare/${encodeURIComponent(ancestorSha)}...${encodeURIComponent(descendantSha)}`),
+      {
+        method: "GET",
+        headers: requestHeaders(this.config.token ?? ""),
+      },
+    );
+    if (!response.ok) {
+      throw new SymphonyError("tracker_error", `GitHub commit comparison returned HTTP ${response.status}`);
+    }
+    const body = (await response.json()) as Record<string, unknown>;
+    const status = asNullableString(body.status);
+    return status === "identical" || status === "ahead";
   }
 
   async submitPullRequestReviewFeedback(
@@ -816,7 +850,9 @@ function normalizePullRequest(node: GitHubPullRequestNode): PullRequestMetadata 
 
 function normalizePullRequestDetails(node: GitHubPullRequestNode): PullRequestDetails | null {
   const metadata = normalizePullRequest(node);
-  if (!metadata) return null;
+  const baseBranch = asString(node.base?.ref);
+  const baseHeadSha = asString(node.base?.sha);
+  if (!metadata || !baseBranch || !baseHeadSha) return null;
   return {
     ...metadata,
     state: asNullableString(node.state),
@@ -824,6 +860,10 @@ function normalizePullRequestDetails(node: GitHubPullRequestNode): PullRequestDe
     mergeCommitSha: asNullableString(node.merge_commit_sha),
     mergedAt: asNullableString(node.merged_at),
     mergedBy: asNullableString(node.merged_by?.login),
+    mergeable: typeof node.mergeable === "boolean" ? node.mergeable : null,
+    mergeableState: asNullableString(node.mergeable_state),
+    baseBranch,
+    baseHeadSha,
   };
 }
 

@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServiceConfig } from "../src/core/config/Config.js";
 import {
   planIssueBreakdownApplicationWritebacks,
@@ -49,6 +49,7 @@ describe("FileWritebackOutboxStore", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -74,6 +75,52 @@ describe("FileWritebackOutboxStore", () => {
     expect(records).toHaveLength(1);
     expect(records[0]?.status).toBe("succeeded");
     expect(writer.transitions).toHaveLength(1);
+  });
+
+  it("uses collision-resistant temp files for concurrent record updates", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_779_817_298_603);
+    const store = new FileWritebackOutboxStore(root);
+    const record = await store.enqueueOnce({
+      idempotencyKey: "comment:issue-1:report-run-1:completion-report:idem-1:publication-approval-rejected",
+      kind: "comment",
+      issueId: "issue-1",
+      payload: {
+        body: "Publication approval was rejected.",
+        dedupeKey: "report-run-1:publication-approval-rejected",
+      },
+    });
+
+    await Promise.all([
+      store.markRetry(record, "retryable", new Date().toISOString()),
+      store.markDeadLetter(record, "terminal"),
+    ]);
+
+    const persisted = await store.get(record.idempotencyKey);
+    expect(persisted?.status).toMatch(/retrying|dead_letter/);
+  });
+
+  it("claims the same due record only once across concurrent processors", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter({ commentDelayMs: 20 });
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const operation = {
+      idempotencyKey: "comment:issue-1:publication-approval-rejected",
+      kind: "comment" as const,
+      issueId: "issue-1",
+      payload: {
+        body: "Status: rejected",
+        dedupeKey: "publication-approval-rejected",
+      },
+    };
+    await store.enqueueOnce(operation);
+
+    await Promise.all([
+      processor.processDue({ idempotencyKeys: [operation.idempotencyKey] }),
+      processor.processDue({ idempotencyKeys: [operation.idempotencyKey] }),
+    ]);
+
+    expect(writer.comments).toHaveLength(1);
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
   });
 
   it("marks verified writeback results as succeeded", async () => {
@@ -714,7 +761,7 @@ class FakeWriter implements TrackerWriter {
   readonly issueCreates: TrackerIssueCreateInput[] = [];
   readonly issueRelations: TrackerIssueRelationInput[] = [];
 
-  constructor(private readonly options: { transitionStatus?: TrackerWriteResult["status"] } = {}) {}
+  constructor(private readonly options: { transitionStatus?: TrackerWriteResult["status"]; commentDelayMs?: number } = {}) {}
 
   async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
     this.transitions.push(input);
@@ -723,6 +770,7 @@ class FakeWriter implements TrackerWriter {
   }
 
   async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    if (this.options.commentDelayMs) await new Promise((resolve) => setTimeout(resolve, this.options.commentDelayMs));
     this.comments.push(input);
     return { status: "applied" };
   }
@@ -818,6 +866,8 @@ function lifecycleWithReports(overrides: { lastCompletionReportId: string; compl
       updatedAt: null,
     },
     merge: null,
+    mergeConflict: null,
+    mergeConflictResolutionReports: [],
     handoff: {
       version: 1,
       memo: {

@@ -11,20 +11,21 @@ import type {
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
 import type { ResolvedCredential } from "../config/CredentialProfiles.js";
-import { SymphonyError } from "../errors.js";
+import { SymphonyError, errorMessage } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type {
   CompletionReportPullRequestRef,
   IssueCompletionReportRecord,
   IssueLifecycleRecord,
   IssueLifecycleStore,
+  IssueMergeConflictMetadata,
   IssueMergeMetadata,
   IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import type { RunRecord, RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { Issue } from "../types.js";
-import { planMergeCompletedWritebacks } from "../writeback/TransitionPolicy.js";
+import { planMergeCompletedWritebacks, planMergeConflictsWritebacks } from "../writeback/TransitionPolicy.js";
 import type { WritebackOperation, WritebackProcessor } from "../writeback/WritebackOutbox.js";
 
 export interface MergePolicyGitHubClient {
@@ -32,12 +33,14 @@ export interface MergePolicyGitHubClient {
   getRequiredCheckResults(input: { headSha: string; requiredChecks: string[] }): Promise<PullRequestCheckResult[]>;
   mergePullRequest(input: PullRequestMergeInput): Promise<PullRequestMergeResult>;
   getAuthenticatedLogin(): Promise<string | null>;
+  isAncestor(input: { ancestorSha: string; descendantSha: string }): Promise<boolean>;
 }
 
 export type MergePolicyResult =
   | { status: "skipped"; reason: string }
   | { status: "merged"; merge: IssueMergeMetadata }
-  | { status: "already_merged"; merge: IssueMergeMetadata };
+  | { status: "already_merged"; merge: IssueMergeMetadata }
+  | { status: "blocked_conflicts"; headSha: string; mergeableState: string | null };
 
 export interface MergePolicyServiceOptions {
   config: ServiceConfig;
@@ -76,7 +79,7 @@ export class MergePolicyService {
       if (statesEqual(latestIssue.state, config.mergePolicy.doneState)) {
         return { status: "already_merged", merge: lifecycle.merge };
       }
-      const recoverySourceState = this.mergeSourceState(latestIssue);
+      const recoverySourceState = this.mergeSourceState(latestIssue, lifecycle);
       if (recoverySourceState === null) {
         throw new SymphonyError("invalid_request", "Gated merge Done recovery requires issue in Done or a merge source state");
       }
@@ -84,7 +87,9 @@ export class MergePolicyService {
       return { status: "already_merged", merge: lifecycle.merge };
     }
 
-    const sourceState = this.mergeSourceState(latestIssue);
+    const sourceState = this.mergeSourceState(latestIssue, lifecycle);
+    const staleConflictResult = this.pendingConflictsWhileTrackerCatchesUp(latestIssue, lifecycle);
+    if (staleConflictResult !== null) return staleConflictResult;
     if (sourceState === null) return { status: "skipped", reason: `issue is not in a merge source state: ${latestIssue.state}` };
 
     const report = latestCompletionReport(lifecycle);
@@ -93,35 +98,66 @@ export class MergePolicyService {
     this.validateLifecycle(lifecycle, report, verdict, workerRun, latestIssue);
     if (!report) throw new SymphonyError("invalid_request", "Gated merge requires a latest completion report");
 
-    const pullRequest = requirePullRequest(report);
+    const approvedPullRequest = requirePullRequest(report);
+    const approvedHeadSha = requireValue(approvedPullRequest.headSha, "Completion report pull request head SHA is required for gated merge");
+    const resolvedConflict = resolvedMergeConflictForIssue(latestIssue, lifecycle, config);
+    const pullRequest = resolvedConflict ? pullRequestRefForResolvedConflict(resolvedConflict) : approvedPullRequest;
     const headSha = requireValue(pullRequest.headSha, "Completion report pull request head SHA is required for gated merge");
     const github = this.options.client ?? createGitHubPullRequestClientForCapability(config, "github.merge");
     const livePullRequest = await github.getPullRequest({ pullRequestNumber: requireNumber(pullRequest.number) });
     validateLivePullRequestMetadata(livePullRequest, pullRequest, headSha);
+    if (resolvedConflict) {
+      await validateConflictApprovalCarryForward(github, resolvedConflict, approvedPullRequest, approvedHeadSha, headSha);
+    }
 
-    const checkStatus = await this.validateChecks(github, headSha);
     const mergeId = `merge:${latestIssue.id}:${headSha}`;
-    const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
     let status: "merged" | "already_merged" = "merged";
     let mergeResult: PullRequestMergeResult;
     if (isOpenPullRequest(livePullRequest)) {
+      const mergeability = classifyMergeability(livePullRequest);
+      if (mergeability.kind === "unknown") {
+        return { status: "skipped", reason: "pull request mergeability is still being computed" };
+      }
+      if (mergeability.kind === "conflicts") {
+        await this.ensureConflictsTransition(
+          latestIssue,
+          lifecycle,
+          pullRequest,
+          headSha,
+          sourceState,
+          mergeability.reason,
+          livePullRequest.mergeableState,
+          livePullRequest,
+        );
+        return { status: "blocked_conflicts", headSha, mergeableState: livePullRequest.mergeableState };
+      }
+      if (mergeability.kind === "blocked") {
+        throw new SymphonyError("invalid_request", mergeability.reason);
+      }
+      const checkStatus = await this.validateChecks(github, headSha);
+      const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
       mergeResult = await github.mergePullRequest({
         pullRequestNumber: requireNumber(pullRequest.number),
         expectedHeadSha: headSha,
         method: config.mergePolicy.mergeMethod,
       });
+      const merge = buildMergeMetadata(latestIssue, pullRequest, headSha, mergeResult, serviceMerge, checkStatus, doneTransition.idempotencyKey);
+      const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge });
+      const storedMerge = updated.merge ?? merge;
+      await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
+      return { status, merge: storedMerge };
     } else {
+      const checkStatus = await this.validateChecks(github, headSha);
+      const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
       const serviceLogin = await github.getAuthenticatedLogin();
       mergeResult = recoverAlreadyMergedPullRequest(livePullRequest, serviceLogin);
       status = "already_merged";
+      const merge = buildMergeMetadata(latestIssue, pullRequest, headSha, mergeResult, serviceMerge, checkStatus, doneTransition.idempotencyKey);
+      const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge });
+      const storedMerge = updated.merge ?? merge;
+      await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
+      return { status, merge: storedMerge };
     }
-
-    const merge = buildMergeMetadata(latestIssue, pullRequest, headSha, mergeResult, serviceMerge, checkStatus, doneTransition.idempotencyKey);
-
-    const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge });
-    const storedMerge = updated.merge ?? merge;
-    await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
-    return { status, merge: storedMerge };
   }
 
   private async ensureDoneTransition(issue: Issue, merge: IssueMergeMetadata, sourceState: string): Promise<void> {
@@ -163,8 +199,130 @@ export class MergePolicyService {
     return operation;
   }
 
-  private mergeSourceState(issue: Issue): string | null {
-    return this.options.config.mergePolicy.sourceStates.find((state) => statesEqual(state, issue.state)) ?? null;
+  private mergeSourceState(issue: Issue, lifecycle: IssueLifecycleRecord | null = null): string | null {
+    const sourceState = this.options.config.mergePolicy.sourceStates.find((state) => statesEqual(state, issue.state)) ?? null;
+    if (sourceState !== null) return sourceState;
+    const conflictsState = this.options.config.mergePolicy.conflictsState;
+    if (
+      conflictsState !== null &&
+      statesEqual(issue.state, conflictsState) &&
+      lifecycle?.mergeConflict?.resolutionStatus === "resolved"
+    ) {
+      return conflictsState;
+    }
+    return null;
+  }
+
+  private pendingConflictsWhileTrackerCatchesUp(issue: Issue, lifecycle: IssueLifecycleRecord): MergePolicyResult | null {
+    const conflict = lifecycle.mergeConflict;
+    if (
+      lifecycle.phase !== "merge_conflict_resolution" ||
+      conflict === null ||
+      conflict.status !== "open" ||
+      conflict.resolutionStatus !== "pending" ||
+      statesEqual(issue.state, conflict.conflictsState)
+    ) {
+      return null;
+    }
+    const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+    if (
+      reportPullRequest === null ||
+      conflict.pullRequest.number !== reportPullRequest.number ||
+      conflict.pullRequest.url !== reportPullRequest.url ||
+      conflict.pullRequest.branch !== reportPullRequest.branch
+    ) {
+      return null;
+    }
+    return {
+      status: "blocked_conflicts",
+      headSha: conflict.currentHeadSha,
+      mergeableState: conflict.mergeableState,
+    };
+  }
+
+  private async ensureConflictsTransition(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    pullRequest: CompletionReportPullRequestRef,
+    headSha: string,
+    sourceState: string,
+    reason: string,
+    mergeableState: string | null,
+    livePullRequest: PullRequestDetails,
+  ): Promise<void> {
+    const conflictsState = this.options.config.mergePolicy.conflictsState;
+    if (conflictsState === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${reason}; configure merge_policy.conflicts_state to route approved-but-conflicting pull requests to a fix state`,
+      );
+    }
+    const writeback = this.options.writeback;
+    if (!writeback) throw new SymphonyError("invalid_request", "Gated merge conflicts transition requires service-owned writeback");
+    const operations = planMergeConflictsWritebacks(
+      {
+        issue,
+        mergeId: `merge:${issue.id}:${headSha}`,
+        fromState: sourceState,
+        conflictsState,
+        pullRequest,
+        mergeableState,
+        reason,
+      },
+      this.options.config,
+    );
+    for (const operation of operations) {
+      const result = await writeback.enqueueAndProcess(operation, { retrySkipped: true });
+      if (operation.kind === "transition" && result.status !== "succeeded") {
+        throw new SymphonyError(
+          "invalid_request",
+          `Gated merge conflicts writeback did not succeed: ${result.status}${result.lastError ? ` (${result.lastError})` : ""}`,
+        );
+      }
+    }
+    const mergeConflict = buildMergeConflictMetadata({
+      config: this.options.config,
+      lifecycle,
+      issue,
+      pullRequest,
+      headSha,
+      sourceState,
+      conflictsState,
+      reason,
+      mergeableState,
+      baseBranch: livePullRequest.baseBranch,
+      baseHeadSha: livePullRequest.baseHeadSha,
+      writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+    });
+    await this.options.lifecycleStore.updateIssue(issue, {
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      mergeConflict,
+      summaryPointers: {
+        prUrl: pullRequest.url,
+        prNumber: pullRequest.number,
+        prHeadSha: headSha,
+        prBranch: pullRequest.branch ?? null,
+      },
+    });
+    try {
+      const latest = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? null;
+      if (!latest || !statesEqual(latest.state, conflictsState)) {
+        this.options.logger?.warn("Gated merge conflicts writeback verification is stale", {
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          expected_state: conflictsState,
+          observed_state: latest?.state ?? null,
+        });
+      }
+    } catch (error) {
+      this.options.logger?.warn("Gated merge conflicts writeback verification failed after lifecycle persist", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        expected_state: conflictsState,
+        error: errorMessage(error),
+      });
+    }
   }
 
   private validateLifecycle(
@@ -239,7 +397,11 @@ function validateRunMetadata(
   requireMatches("worker run PR branch", run.prBranch, pullRequest.branch);
   requireMatches("lifecycle PR number", lifecycle.summaryPointers.prNumber, pullRequest.number);
   requireMatches("lifecycle PR URL", lifecycle.summaryPointers.prUrl, pullRequest.url);
-  requireMatches("lifecycle PR head SHA", lifecycle.summaryPointers.prHeadSha, pullRequest.headSha);
+  requireMatchesAny("lifecycle PR head SHA", lifecycle.summaryPointers.prHeadSha, [
+    pullRequest.headSha,
+    lifecycle.mergeConflict?.currentHeadSha,
+    lifecycle.mergeConflict?.resolvedHeadSha,
+  ]);
   requireMatches("lifecycle PR branch", lifecycle.summaryPointers.prBranch, pullRequest.branch);
 }
 
@@ -262,6 +424,106 @@ function validateApprovalFeedback(
   }
 }
 
+function resolvedMergeConflictForIssue(
+  issue: Issue,
+  lifecycle: IssueLifecycleRecord,
+  config: ServiceConfig,
+): IssueMergeConflictMetadata | null {
+  const conflictsState = config.mergePolicy.conflictsState;
+  if (
+    conflictsState === null ||
+    !statesEqual(issue.state, conflictsState) ||
+    lifecycle.mergeConflict?.resolutionStatus !== "resolved"
+  ) {
+    return null;
+  }
+  return lifecycle.mergeConflict;
+}
+
+function pullRequestRefForResolvedConflict(mergeConflict: IssueMergeConflictMetadata): CompletionReportPullRequestRef {
+  const resolvedHeadSha = requireValue(
+    mergeConflict.resolvedHeadSha,
+    "Resolved merge conflict metadata requires a pull request head SHA",
+  );
+  return {
+    ...mergeConflict.pullRequest,
+    headSha: resolvedHeadSha,
+  };
+}
+
+async function validateConflictApprovalCarryForward(
+  github: MergePolicyGitHubClient,
+  mergeConflict: IssueMergeConflictMetadata,
+  approvedPullRequest: CompletionReportPullRequestRef,
+  approvedHeadSha: string,
+  resolvedHeadSha: string,
+): Promise<void> {
+  requireMatches("merge conflict PR number", mergeConflict.pullRequest.number, approvedPullRequest.number);
+  requireMatches("merge conflict PR URL", mergeConflict.pullRequest.url, approvedPullRequest.url);
+  requireMatches("merge conflict PR branch", mergeConflict.pullRequest.branch, approvedPullRequest.branch);
+  if (mergeConflict.approvedHeadSha !== approvedHeadSha) {
+    throw new SymphonyError("invalid_request", "Merge conflict approved head does not match review approval metadata");
+  }
+  const approvedHeadIsAncestor = await github.isAncestor({ ancestorSha: approvedHeadSha, descendantSha: resolvedHeadSha });
+  if (!approvedHeadIsAncestor) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Resolved merge conflict head does not descend from the approved head; approval cannot be carried forward",
+    );
+  }
+}
+
+function buildMergeConflictMetadata(input: {
+  config: ServiceConfig;
+  lifecycle: IssueLifecycleRecord;
+  issue: Issue;
+  pullRequest: CompletionReportPullRequestRef;
+  headSha: string;
+  sourceState: string;
+  conflictsState: string;
+  reason: string;
+  mergeableState: string | null;
+  baseBranch: string;
+  baseHeadSha: string;
+  writebackOperationKeys: string[];
+}): IssueMergeConflictMetadata {
+  const existing = input.lifecycle.mergeConflict;
+  const now = new Date().toISOString();
+  const sameConflictLineage =
+    existing !== null &&
+    existing !== undefined &&
+    existing.pullRequest.number === input.pullRequest.number &&
+    existing.pullRequest.url === input.pullRequest.url &&
+    existing.pullRequest.branch === input.pullRequest.branch &&
+    existing.conflictsState === input.conflictsState;
+  const id = sameConflictLineage ? existing.id : `merge-conflict:${input.issue.id}:${input.headSha}`;
+  return {
+    id,
+    status: "open",
+    resolutionStatus: "pending",
+    pullRequest: { ...input.pullRequest, headSha: input.headSha },
+    approvedHeadSha: sameConflictLineage ? existing.approvedHeadSha : input.headSha,
+    currentHeadSha: input.headSha,
+    resolvedHeadSha: null,
+    baseBranch: input.baseBranch,
+    baseHeadSha: input.baseHeadSha,
+    sourceState: input.sourceState,
+    conflictsState: input.conflictsState,
+    reason: input.reason,
+    mergeableState: input.mergeableState,
+    detectedAt: sameConflictLineage ? existing.detectedAt : now,
+    updatedAt: now,
+    fixTurnCount: sameConflictLineage ? existing.fixTurnCount : 0,
+    maxFixTurns: input.config.mergePolicy.maxConflictFixTurns,
+    lastConflictFixRunId: sameConflictLineage ? existing.lastConflictFixRunId : null,
+    lastConflictResolutionReportId: sameConflictLineage ? existing.lastConflictResolutionReportId : null,
+    attemptRunIds: sameConflictLineage ? existing.attemptRunIds : [],
+    writebackOperationKeys: input.writebackOperationKeys,
+    blockedAt: null,
+    blockedReason: null,
+  };
+}
+
 function validateLivePullRequestMetadata(
   livePullRequest: PullRequestDetails,
   expected: CompletionReportPullRequestRef,
@@ -275,6 +537,19 @@ function validateLivePullRequestMetadata(
 
 function isOpenPullRequest(livePullRequest: PullRequestDetails): boolean {
   return livePullRequest.state === null || livePullRequest.state.toLowerCase() === "open";
+}
+
+function classifyMergeability(
+  livePullRequest: PullRequestDetails,
+): { kind: "mergeable" } | { kind: "conflicts"; reason: string } | { kind: "unknown" } | { kind: "blocked"; reason: string } {
+  const mergeableState = livePullRequest.mergeableState?.toLowerCase() ?? null;
+  if (livePullRequest.mergeable === null || mergeableState === "unknown") return { kind: "unknown" };
+  if (livePullRequest.mergeable === true) return { kind: "mergeable" };
+  if (mergeableState === "dirty") {
+    return { kind: "conflicts", reason: "Pull request has merge conflicts with the base branch" };
+  }
+  const stateDescription = mergeableState === null ? "unknown" : mergeableState;
+  return { kind: "blocked", reason: `Pull request is not currently mergeable: ${stateDescription}` };
 }
 
 function recoverAlreadyMergedPullRequest(
@@ -335,6 +610,15 @@ function requirePullRequest(report: IssueCompletionReportRecord): CompletionRepo
 
 function requireMatches(label: string, actual: string | number | null | undefined, expected: string | number | null | undefined): void {
   if (actual === expected) return;
+  throw new SymphonyError("invalid_request", `${label} does not match gated merge metadata`);
+}
+
+function requireMatchesAny(
+  label: string,
+  actual: string | number | null | undefined,
+  expected: Array<string | number | null | undefined>,
+): void {
+  if (expected.some((item) => actual === item)) return;
   throw new SymphonyError("invalid_request", `${label} does not match gated merge metadata`);
 }
 
