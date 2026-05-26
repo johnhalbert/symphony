@@ -76,6 +76,21 @@ export interface MergeGateWritebackContext {
   maxReviewRounds: number;
 }
 
+export interface MergeConflictsWritebackContext {
+  issue: Issue;
+  mergeId: string;
+  fromState: string;
+  conflictsState: string;
+  pullRequest: {
+    url: string | null;
+    number: number | null;
+    headSha?: string | null;
+    branch?: string | null;
+  };
+  mergeableState: string | null;
+  reason: string;
+}
+
 export interface MergeGateHeadSupersessionWritebackContext {
   issue: Issue;
   gateId: string;
@@ -187,9 +202,10 @@ export function planCompletionReportAcceptedWritebacks(
   config: ServiceConfig,
   report: string | CompletionReportWritebackDetails | null = null,
 ): NewWritebackOperation[] {
+  const completionReportFromStates = completionReportAcceptedFromStates(config);
   if (
     !config.writeback.enabled ||
-    !isStateIn(context.issue.state, [config.writeback.dispatchState, ...config.reviewLoop.blockedStates])
+    !isStateIn(context.issue.state, completionReportFromStates)
   ) {
     return [];
   }
@@ -230,7 +246,7 @@ export function planCompletionReportAcceptedWritebacks(
       issueId: context.issue.id,
       runId: context.runId,
       payload: {
-        fromStates: uniqueStates([config.writeback.dispatchState, ...config.reviewLoop.blockedStates]),
+        fromStates: completionReportFromStates,
         toState: reviewState,
         reason: "Symphony completion report accepted",
       },
@@ -244,7 +260,8 @@ export function planPullRequestHandoffWritebacks(
   details: PullRequestHandoffWritebackDetails,
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled || !config.github.prHandoff.enabled) return [];
-  if (!isStateIn(context.issue.state, [config.writeback.dispatchState])) return [];
+  const handoffFromStates = pullRequestHandoffFromStates(config);
+  if (!isStateIn(context.issue.state, handoffFromStates)) return [];
 
   const targetState = config.github.prHandoff.targetState;
   if (targetState === null) return [];
@@ -287,7 +304,7 @@ export function planPullRequestHandoffWritebacks(
       issueId: context.issue.id,
       runId: context.runId,
       payload: {
-        fromStates: [config.writeback.dispatchState],
+        fromStates: handoffFromStates,
         toState: targetState,
         reason: "Symphony verified pull request handoff",
       },
@@ -512,6 +529,7 @@ export function planBlockedEscalationWritebacks(
     ...config.tracker.activeStates,
     ...config.tracker.handoffStates,
     ...config.reviewLoop.reviewStates,
+    ...(config.mergePolicy.mode === "gated" && config.mergePolicy.conflictsState !== null ? [config.mergePolicy.conflictsState] : []),
   ]);
   if (!isStateIn(context.issue.state, fromStates)) return [];
 
@@ -698,6 +716,48 @@ export function planMergeGateHeadSupersessionWritebacks(
   ];
 }
 
+export function planMergeConflictsWritebacks(
+  context: MergeConflictsWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const headSha = context.pullRequest.headSha ?? "unknown";
+  const eventKey = `${context.mergeId}:merge-conflicts:${safeKeySegment(headSha)}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Gated Merge Blocked",
+          "",
+          "Status: approved pull request has merge conflicts",
+          context.reason,
+          "",
+          `Pull request: ${formatPullRequest(context.pullRequest)}`,
+          `PR head SHA: ${headSha}`,
+          `GitHub mergeable_state: ${context.mergeableState ?? "unknown"}`,
+          "",
+          `Transitioning to conflict-fix state: ${context.conflictsState}`,
+          "A scoped conflict-fix worker must resolve the conflict and call submit_merge_conflict_resolution before merge can continue.",
+        ].join("\n"),
+      },
+    },
+    {
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${context.conflictsState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      payload: {
+        fromStates: [context.fromState],
+        toState: context.conflictsState,
+        reason: `Symphony gated merge blocked: ${context.reason}`,
+      },
+    },
+  ];
+}
+
 export function planRunFailedComment(context: RunWritebackContext, config: ServiceConfig, error: string | null): NewWritebackOperation | null {
   if (!config.writeback.enabled) return null;
   return {
@@ -744,6 +804,14 @@ function uniqueStates(states: string[]): string[] {
     result.push(state);
   }
   return result;
+}
+
+function completionReportAcceptedFromStates(config: ServiceConfig): string[] {
+  return uniqueStates([config.writeback.dispatchState, ...config.reviewLoop.blockedStates]);
+}
+
+function pullRequestHandoffFromStates(config: ServiceConfig): string[] {
+  return uniqueStates([config.writeback.dispatchState]);
 }
 
 function formatCompletionReportForComment(report: string | CompletionReportWritebackDetails | null): string[] {

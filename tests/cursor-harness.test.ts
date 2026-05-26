@@ -11,6 +11,8 @@ import {
   completionReportMcpServerConfig,
   cursorAgentCreateOptions,
   cursorRoleMcpServers,
+  mergeConflictResolutionContextFilePath,
+  mergeConflictResolutionMcpServerConfig,
   reviewFeedbackContextFilePath,
   reviewFeedbackMcpServerConfig,
   reviewVerdictContextFilePath,
@@ -104,6 +106,51 @@ describe("Cursor event mapping", () => {
     ]);
   });
 
+  it("redacts secret-like assistant, status, and text-delta stream messages", () => {
+    const assistantEvents = mapCursorMessage({
+      type: "assistant",
+      agent_id: "agent",
+      run_id: "run",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: "assistant saw SECRET_ASSISTANT token=abc123 access_token=access-123 refreshToken: refresh-123 ghp_ABCDEFGH1",
+          },
+        ],
+      },
+    });
+    const statusEvents = mapCursorMessage({
+      type: "status",
+      agent_id: "agent",
+      run_id: "run",
+      status: "ERROR",
+      message: "status leaked Authorization: Bearer SECRET_STATUS github_token=github-123 client_secret: client-123",
+    } as never);
+    const deltaEvents = mapCursorDelta({
+      type: "text-delta",
+      text: "delta apiKey=SECRET_DELTA private_key=private-123 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+    });
+    const serialized = JSON.stringify([...assistantEvents, ...statusEvents, ...deltaEvents]);
+
+    expect(serialized).not.toContain("SECRET_ASSISTANT");
+    expect(serialized).not.toContain("abc123");
+    expect(serialized).not.toContain("access-123");
+    expect(serialized).not.toContain("refresh-123");
+    expect(serialized).not.toContain("ghp_ABCDEFGH1");
+    expect(serialized).not.toContain("SECRET_STATUS");
+    expect(serialized).not.toContain("github-123");
+    expect(serialized).not.toContain("client-123");
+    expect(serialized).not.toContain("SECRET_DELTA");
+    expect(serialized).not.toContain("private-123");
+    expect(serialized).not.toContain("sk-ABCDEFGH1");
+    expect(serialized).toContain("inputTokens: 7");
+    expect(serialized).toContain("totalTokens: 9");
+    expect(serialized).toContain("tokenConfigured: true");
+    expect(serialized).toContain("[redacted]");
+  });
+
   it("wires the Symphony completion report MCP server into Cursor runs", () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     const ctx: AgentRunContext = {
@@ -140,6 +187,39 @@ describe("Cursor event mapping", () => {
     expect(server.env).toMatchObject({ LINEAR_API_KEY: "linear-test-key" });
     expect(server.env).not.toHaveProperty("GITHUB_TOKEN");
     expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
+  });
+
+  it("mounts only the merge conflict resolution MCP server for conflict-fix workers", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Approved with Conflicts";
+    const ctx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      runPhase: "merge_conflict_resolution",
+      issue: issue({ state: "Approved with Conflicts", branchName: "symphony/TEST-1" }),
+    };
+
+    const server = mergeConflictResolutionMcpServerConfig(ctx, "/tmp/conflict-context.json", { cliPath: "/repo/src/cli.ts" });
+    const mcpServers = cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" });
+    await new CursorHarness().prepare(ctx);
+
+    expect(Object.keys(mcpServers)).toEqual(["symphony_conflicts"]);
+    expect(server.args).toEqual(
+      expect.arrayContaining(["merge-conflict-resolution-mcp", "--workflow", config.workflowPath, "--context-file", "/tmp/conflict-context.json"]),
+    );
+    expect(mcpServers.symphony_conflicts?.args).toEqual(
+      expect.arrayContaining([
+        "merge-conflict-resolution-mcp",
+        "--workflow",
+        config.workflowPath,
+        "--context-file",
+        mergeConflictResolutionContextFilePath(ctx),
+      ]),
+    );
+    expect(mcpServers).not.toHaveProperty("symphony");
+    await expect(readFile(mergeConflictResolutionContextFilePath(ctx), "utf8")).resolves.toContain(
+      '"phase": "merge_conflict_resolution"',
+    );
   });
 
   it("mounts worker MCP servers on Cursor agent create/resume options", () => {
@@ -526,10 +606,18 @@ describe("Cursor event mapping", () => {
       send: vi.fn(async () => ({
         id: "sdk-run-sanitize",
         async *stream(): AsyncIterable<unknown> {
-          yield { type: "user", message: { content: "SECRET_PROMPT" } };
-          yield { type: "thinking", text: "SECRET_THINKING" };
-          yield { type: "task", text: "SECRET_TASK" };
-          yield { type: "tool_call", name: "shell", status: "completed", arguments: "SECRET_ARGS" };
+          yield { type: "user", message: { content: "SECRET_PROMPT access_token=user-access-token" } };
+          yield { type: "thinking", text: "SECRET_THINKING refreshToken=thinking-refresh-token" };
+          yield { type: "task", text: "SECRET_TASK github_token=task-github-token" };
+          yield {
+            type: "tool_call",
+            name: "shell",
+            status: "completed",
+            arguments: "SECRET_ARGS client_secret=args-client-secret",
+            result: "SECRET_RESULT private_key=result-private-key",
+            output: "SECRET_OUTPUT ghp_ABCDEFGH1",
+            error: "SECRET_ERROR sk-ABCDEFGH1",
+          };
         },
         wait: async () => ({ status: "finished" as const, result: undefined }),
         cancel: vi.fn(async () => undefined),
@@ -554,11 +642,74 @@ describe("Cursor event mapping", () => {
     expect(persisted).not.toContain("SECRET_THINKING");
     expect(persisted).not.toContain("SECRET_TASK");
     expect(persisted).not.toContain("SECRET_ARGS");
-    expect(runStore.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "thinking", message: "Cursor thinking event" }));
-    expect(runStore.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "task", message: "Cursor task event" }));
-    expect(runStore.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "tool_call", message: "tool shell completed" }));
+    expect(persisted).not.toContain("SECRET_RESULT");
+    expect(persisted).not.toContain("SECRET_OUTPUT");
+    expect(persisted).not.toContain("SECRET_ERROR");
+    expect(persisted).not.toContain("user-access-token");
+    expect(persisted).not.toContain("thinking-refresh-token");
+    expect(persisted).not.toContain("task-github-token");
+    expect(persisted).not.toContain("args-client-secret");
+    expect(persisted).not.toContain("result-private-key");
+    expect(persisted).not.toContain("ghp_ABCDEFGH1");
+    expect(persisted).not.toContain("sk-ABCDEFGH1");
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "thinking",
+        message: "Cursor thinking event",
+        payload: expect.objectContaining({ kind: "thinking", summary: expect.stringContaining("[redacted]") }),
+      }),
+    );
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "task",
+        message: "Cursor task event",
+        payload: expect.objectContaining({ kind: "task", summary: expect.stringContaining("[redacted]") }),
+      }),
+    );
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "tool_call",
+        message: "tool shell completed",
+        payload: expect.objectContaining({
+          kind: "tool_call",
+          name: "shell",
+          status: "completed",
+          argumentsPreview: expect.stringContaining("[redacted]"),
+          resultPreview: expect.stringContaining("[redacted]"),
+          outputPreview: expect.stringContaining("[redacted]"),
+          errorPreview: expect.stringContaining("[redacted]"),
+        }),
+      }),
+    );
     expect(events).toContainEqual({ type: "progress", message: "Cursor thinking event", activitySource: "stream" });
     expect(events).toContainEqual({ type: "progress", message: "Cursor task event", activitySource: "stream" });
+  });
+
+  it("redacts terminal wait results before emitting public events", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-terminal-secret",
+      send: vi.fn(async () => ({
+        id: "sdk-run-terminal-secret",
+        async *stream(): AsyncIterable<unknown> {},
+        wait: async () => ({ status: "error" as const, result: "terminal failed with SECRET_TERMINAL token=raw-token" }),
+        cancel: vi.fn(async () => undefined),
+      })),
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const harness = new CursorHarness();
+    const events: unknown[] = [];
+
+    for await (const event of harness.run(agentContext(config, "worker"), "Work on TEST-1")) {
+      events.push(event);
+    }
+
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain("SECRET_TERMINAL");
+    expect(serialized).not.toContain("raw-token");
+    expect(serialized).toContain("[redacted]");
+    expect(events.at(-1)).toEqual({ type: "failed", error: "terminal failed with [redacted] token=[redacted]" });
   });
 
   it("only resumes worker agents when resume_by_issue compatibility mode is explicit", async () => {

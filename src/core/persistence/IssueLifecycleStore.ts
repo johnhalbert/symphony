@@ -4,7 +4,14 @@ import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue } from "../types.js";
 
-export type IssueLifecyclePhase = "implementation" | "review" | "passed" | "blocked" | "terminal" | "unknown";
+export type IssueLifecyclePhase =
+  | "implementation"
+  | "merge_conflict_resolution"
+  | "review"
+  | "passed"
+  | "blocked"
+  | "terminal"
+  | "unknown";
 
 export interface IssueLifecycleSummaryPointers {
   workspaceKey: string | null;
@@ -49,6 +56,22 @@ export interface ProposedIssueRecord {
   labels: string[];
 }
 
+export type IssueBreakdownPlanApplicationStatus =
+  | "not_requested"
+  | "pending"
+  | "applied"
+  | "blocked"
+  | "stale";
+
+export interface IssueBreakdownCreatedIssueRef {
+  proposedIssueIndex: number;
+  operationKey: string;
+  status: "created" | "verified";
+  id: string;
+  identifier: string | null;
+  url: string | null;
+}
+
 export interface IssueBreakdownPlanRecord {
   id: string;
   idempotencyKey: string;
@@ -65,6 +88,11 @@ export interface IssueBreakdownPlanRecord {
   configFingerprint: string;
   cursorMode: string;
   acceptedAt: string;
+  applicationStatus: IssueBreakdownPlanApplicationStatus;
+  applicationOperationKeys: string[];
+  createdIssueRefs: IssueBreakdownCreatedIssueRef[];
+  appliedAt: string | null;
+  applicationBlockedReason: string | null;
 }
 
 export interface CompletionReportChecklistItem {
@@ -233,6 +261,54 @@ export interface IssueMergeGateState {
   updatedAt: string;
 }
 
+export type IssueMergeConflictResolutionStatus = "pending" | "still_conflicted" | "resolved" | "blocked";
+
+export interface IssueMergeConflictResolutionReportRecord {
+  id: string;
+  idempotencyKey: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  resolutionStatus: "resolved" | "still_conflicted" | "blocked";
+  summary: string;
+  validationEvidence: string[];
+  changedFiles: string[];
+  pullRequest: CompletionReportPullRequestRef;
+  previousHeadSha: string | null;
+  newHeadSha: string | null;
+  baseBranch: string | null;
+  baseHeadSha: string | null;
+  blockedReason: string | null;
+  risks: string[];
+  submittedAt: string;
+}
+
+export interface IssueMergeConflictMetadata {
+  id: string;
+  status: "open" | "resolved" | "blocked";
+  resolutionStatus: IssueMergeConflictResolutionStatus;
+  pullRequest: CompletionReportPullRequestRef;
+  approvedHeadSha: string;
+  currentHeadSha: string;
+  resolvedHeadSha: string | null;
+  baseBranch: string | null;
+  baseHeadSha: string | null;
+  sourceState: string;
+  conflictsState: string;
+  reason: string;
+  mergeableState: string | null;
+  detectedAt: string;
+  updatedAt: string;
+  fixTurnCount: number;
+  maxFixTurns: number;
+  lastConflictFixRunId: string | null;
+  lastConflictResolutionReportId: string | null;
+  attemptRunIds: string[];
+  writebackOperationKeys: string[];
+  blockedAt: string | null;
+  blockedReason: string | null;
+}
+
 export interface IssueWorkerOutputContract {
   version: 1;
   reportId: string;
@@ -312,6 +388,8 @@ export interface IssueLifecycleRecord {
   reviewEvidence: PullRequestReviewEvidenceState;
   mergeGate?: IssueMergeGateState | null;
   merge: IssueMergeMetadata | null;
+  mergeConflict: IssueMergeConflictMetadata | null;
+  mergeConflictResolutionReports: IssueMergeConflictResolutionReportRecord[];
   handoff: IssueHandoffState;
   createdAt: string;
   updatedAt: string;
@@ -338,6 +416,8 @@ export interface IssueLifecyclePatch {
   reviewEvidence?: PullRequestReviewEvidenceState;
   mergeGate?: IssueMergeGateState | null;
   merge?: IssueMergeMetadata | null;
+  mergeConflict?: IssueMergeConflictMetadata | null;
+  mergeConflictResolutionReports?: IssueMergeConflictResolutionReportRecord[];
   handoff?: IssueHandoffState;
 }
 
@@ -384,6 +464,9 @@ export class FileIssueLifecycleStore {
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
       mergeGate: patchValue(patch, "mergeGate", existing?.mergeGate ?? null),
       merge: patchValue(patch, "merge", existing?.merge ?? null),
+      mergeConflict: patchValue(patch, "mergeConflict", existing?.mergeConflict ?? null),
+      mergeConflictResolutionReports:
+        patch.mergeConflictResolutionReports ?? existing?.mergeConflictResolutionReports ?? [],
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
@@ -432,7 +515,13 @@ export class FileIssueLifecycleStore {
 
   private async write(record: IssueLifecycleRecord): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
-    await fs.writeFile(this.recordPath(record.issueId), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    const target = this.recordPath(record.issueId);
+    const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    if (process.platform === "win32") {
+      await fs.rm(target, { force: true });
+    }
+    await fs.rename(temp, target);
   }
 
   private recordsDir(): string {
@@ -445,6 +534,9 @@ export class FileIssueLifecycleStore {
 }
 
 export function phaseForIssueState(state: string, config: ServiceConfig): IssueLifecyclePhase {
+  if (config.mergePolicy.mode === "gated" && config.mergePolicy.conflictsState !== null && statesEqual(state, config.mergePolicy.conflictsState)) {
+    return "merge_conflict_resolution";
+  }
   if (isStateIn(state, config.reviewLoop.blockedStates)) return "blocked";
   if (isStateIn(state, config.tracker.handoffStates)) return "review";
   if (isStateIn(state, config.reviewLoop.reviewStates)) return "review";
@@ -495,6 +587,11 @@ function buildLaneMemo(
           .map((result) => `Accepted by reviewer: ${clip(result.text)}`)
       : []),
     ...(record.merge ? [`Merged PR ${record.merge.pullRequest.number === null ? record.merge.pullRequest.url : `#${record.merge.pullRequest.number}`}.`] : []),
+    ...(record.mergeConflict
+      ? [
+          `Merge conflict status: ${record.mergeConflict.resolutionStatus}; attempts ${record.mergeConflict.fixTurnCount}/${record.mergeConflict.maxFixTurns}.`,
+        ]
+      : []),
     ...record.reviewEvidence.items
       .filter((item) => item.isResolved === true && item.isOutdated !== true)
       .slice(0, 4)
@@ -825,6 +922,11 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
     mergeGate: normalizeMergeGateState(value.mergeGate, filePath),
     merge: normalizeMergeMetadata(value.merge, filePath),
+    mergeConflict: normalizeMergeConflictMetadata(value.mergeConflict, filePath),
+    mergeConflictResolutionReports: normalizeMergeConflictResolutionReports(
+      value.mergeConflictResolutionReports,
+      filePath,
+    ),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
   };
@@ -943,6 +1045,28 @@ function normalizeIssueBreakdownPlan(value: unknown, filePath: string, index: nu
     configFingerprint: requiredString(value.configFingerprint, filePath, `issueBreakdownPlans[${index}].configFingerprint`),
     cursorMode: requiredString(value.cursorMode, filePath, `issueBreakdownPlans[${index}].cursorMode`),
     acceptedAt: requiredString(value.acceptedAt, filePath, `issueBreakdownPlans[${index}].acceptedAt`),
+    applicationStatus: normalizeIssueBreakdownPlanApplicationStatus(
+      value.applicationStatus,
+      filePath,
+      `issueBreakdownPlans[${index}].applicationStatus`,
+    ),
+    applicationOperationKeys:
+      value.applicationOperationKeys === undefined
+        ? []
+        : requiredStringArray(value.applicationOperationKeys, filePath, `issueBreakdownPlans[${index}].applicationOperationKeys`),
+    createdIssueRefs: normalizeCreatedIssueRefs(value.createdIssueRefs, filePath, index),
+    appliedAt:
+      value.appliedAt === undefined
+        ? null
+        : nullableString(value.appliedAt, filePath, `issueBreakdownPlans[${index}].appliedAt`),
+    applicationBlockedReason:
+      value.applicationBlockedReason === undefined
+        ? null
+        : nullableString(
+            value.applicationBlockedReason,
+            filePath,
+            `issueBreakdownPlans[${index}].applicationBlockedReason`,
+          ),
   };
 }
 
@@ -974,6 +1098,50 @@ function normalizeProposedIssues(value: unknown, filePath: string, planIndex: nu
   });
 }
 
+function normalizeIssueBreakdownPlanApplicationStatus(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssueBreakdownPlanApplicationStatus {
+  if (value === undefined) return "not_requested";
+  if (value === "not_requested" || value === "pending" || value === "applied" || value === "blocked" || value === "stale") {
+    return value;
+  }
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizeCreatedIssueRefs(value: unknown, filePath: string, planIndex: number): IssueBreakdownCreatedIssueRef[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs is invalid`);
+  return value.map((item, index) => {
+    if (!isRecord(item)) throw corruptLifecycle(filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}] is invalid`);
+    const status = item.status;
+    if (status !== "created" && status !== "verified") {
+      throw corruptLifecycle(filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].status is invalid`);
+    }
+    return {
+      proposedIssueIndex: nonNegativeInteger(
+        item.proposedIssueIndex,
+        filePath,
+        `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].proposedIssueIndex`,
+      ),
+      operationKey: requiredString(
+        item.operationKey,
+        filePath,
+        `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].operationKey`,
+      ),
+      status,
+      id: requiredString(item.id, filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].id`),
+      identifier: nullableString(
+        item.identifier,
+        filePath,
+        `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].identifier`,
+      ),
+      url: nullableString(item.url, filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].url`),
+    };
+  });
+}
+
 function normalizeCompletionReports(value: unknown, filePath: string): IssueCompletionReportRecord[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "completionReports is invalid");
@@ -990,6 +1158,15 @@ function normalizeReviewFeedback(value: unknown, filePath: string): IssueReviewF
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewFeedback is invalid");
   return value.map((item, index) => normalizeReviewFeedbackRecord(item, filePath, index));
+}
+
+function normalizeMergeConflictResolutionReports(
+  value: unknown,
+  filePath: string,
+): IssueMergeConflictResolutionReportRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "mergeConflictResolutionReports is invalid");
+  return value.map((item, index) => normalizeMergeConflictResolutionReport(item, filePath, index));
 }
 
 function defaultReviewEvidence(): PullRequestReviewEvidenceState {
@@ -1297,13 +1474,121 @@ function normalizeMergeMetadata(value: unknown, filePath: string): IssueMergeMet
   };
 }
 
-function normalizeMergePullRequest(value: unknown, filePath: string): CompletionReportPullRequestRef {
-  if (!isRecord(value)) throw corruptLifecycle(filePath, "merge.pullRequest is invalid");
+function normalizeMergeConflictMetadata(value: unknown, filePath: string): IssueMergeConflictMetadata | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "mergeConflict is invalid");
+  const status = value.status;
+  if (status !== "open" && status !== "resolved" && status !== "blocked") {
+    throw corruptLifecycle(filePath, "mergeConflict.status is invalid");
+  }
+  const resolutionStatus = value.resolutionStatus;
+  if (
+    resolutionStatus !== "pending" &&
+    resolutionStatus !== "still_conflicted" &&
+    resolutionStatus !== "resolved" &&
+    resolutionStatus !== "blocked"
+  ) {
+    throw corruptLifecycle(filePath, "mergeConflict.resolutionStatus is invalid");
+  }
   return {
-    url: nullableString(value.url, filePath, "merge.pullRequest.url"),
-    number: nullableNumber(value.number, filePath, "merge.pullRequest.number"),
-    headSha: optionalNullableString(value.headSha, filePath, "merge.pullRequest.headSha"),
-    branch: optionalNullableString(value.branch, filePath, "merge.pullRequest.branch"),
+    id: requiredString(value.id, filePath, "mergeConflict.id"),
+    status,
+    resolutionStatus,
+    pullRequest: normalizeMergePullRequest(value.pullRequest, filePath, "mergeConflict.pullRequest"),
+    approvedHeadSha: requiredString(value.approvedHeadSha, filePath, "mergeConflict.approvedHeadSha"),
+    currentHeadSha: requiredString(value.currentHeadSha, filePath, "mergeConflict.currentHeadSha"),
+    resolvedHeadSha: optionalNullableString(value.resolvedHeadSha, filePath, "mergeConflict.resolvedHeadSha"),
+    baseBranch: optionalNullableString(value.baseBranch, filePath, "mergeConflict.baseBranch"),
+    baseHeadSha: optionalNullableString(value.baseHeadSha, filePath, "mergeConflict.baseHeadSha"),
+    sourceState: requiredString(value.sourceState, filePath, "mergeConflict.sourceState"),
+    conflictsState: requiredString(value.conflictsState, filePath, "mergeConflict.conflictsState"),
+    reason: requiredString(value.reason, filePath, "mergeConflict.reason"),
+    mergeableState: optionalNullableString(value.mergeableState, filePath, "mergeConflict.mergeableState"),
+    detectedAt: requiredString(value.detectedAt, filePath, "mergeConflict.detectedAt"),
+    updatedAt: requiredString(value.updatedAt, filePath, "mergeConflict.updatedAt"),
+    fixTurnCount: nonNegativeInteger(value.fixTurnCount, filePath, "mergeConflict.fixTurnCount"),
+    maxFixTurns: nonNegativeInteger(value.maxFixTurns, filePath, "mergeConflict.maxFixTurns"),
+    lastConflictFixRunId: optionalNullableString(
+      value.lastConflictFixRunId,
+      filePath,
+      "mergeConflict.lastConflictFixRunId",
+    ),
+    lastConflictResolutionReportId: optionalNullableString(
+      value.lastConflictResolutionReportId,
+      filePath,
+      "mergeConflict.lastConflictResolutionReportId",
+    ),
+    attemptRunIds: value.attemptRunIds === undefined ? [] : requiredStringArray(value.attemptRunIds, filePath, "mergeConflict.attemptRunIds"),
+    writebackOperationKeys:
+      value.writebackOperationKeys === undefined
+        ? []
+        : requiredStringArray(value.writebackOperationKeys, filePath, "mergeConflict.writebackOperationKeys"),
+    blockedAt: optionalNullableString(value.blockedAt, filePath, "mergeConflict.blockedAt"),
+    blockedReason: optionalNullableString(value.blockedReason, filePath, "mergeConflict.blockedReason"),
+  };
+}
+
+function normalizeMergeConflictResolutionReport(
+  value: unknown,
+  filePath: string,
+  index: number,
+): IssueMergeConflictResolutionReportRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `mergeConflictResolutionReports[${index}] is invalid`);
+  const resolutionStatus = value.resolutionStatus;
+  if (resolutionStatus !== "resolved" && resolutionStatus !== "still_conflicted" && resolutionStatus !== "blocked") {
+    throw corruptLifecycle(filePath, `mergeConflictResolutionReports[${index}].resolutionStatus is invalid`);
+  }
+  return {
+    id: requiredString(value.id, filePath, `mergeConflictResolutionReports[${index}].id`),
+    idempotencyKey: requiredString(value.idempotencyKey, filePath, `mergeConflictResolutionReports[${index}].idempotencyKey`),
+    runId: requiredString(value.runId, filePath, `mergeConflictResolutionReports[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `mergeConflictResolutionReports[${index}].issueId`),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, `mergeConflictResolutionReports[${index}].issueIdentifier`),
+    resolutionStatus,
+    summary: requiredString(value.summary, filePath, `mergeConflictResolutionReports[${index}].summary`),
+    validationEvidence: requiredStringArray(value.validationEvidence, filePath, `mergeConflictResolutionReports[${index}].validationEvidence`),
+    changedFiles: requiredStringArray(value.changedFiles, filePath, `mergeConflictResolutionReports[${index}].changedFiles`),
+    pullRequest: normalizeMergePullRequest(
+      value.pullRequest,
+      filePath,
+      `mergeConflictResolutionReports[${index}].pullRequest`,
+    ),
+    previousHeadSha: optionalNullableString(
+      value.previousHeadSha,
+      filePath,
+      `mergeConflictResolutionReports[${index}].previousHeadSha`,
+    ),
+    newHeadSha:
+      value.newHeadSha === undefined
+        ? normalizeMergePullRequest(
+            value.pullRequest,
+            filePath,
+            `mergeConflictResolutionReports[${index}].pullRequest`,
+          ).headSha
+        : optionalNullableString(value.newHeadSha, filePath, `mergeConflictResolutionReports[${index}].newHeadSha`),
+    baseBranch: optionalNullableString(value.baseBranch, filePath, `mergeConflictResolutionReports[${index}].baseBranch`),
+    baseHeadSha: optionalNullableString(value.baseHeadSha, filePath, `mergeConflictResolutionReports[${index}].baseHeadSha`),
+    blockedReason: optionalNullableString(
+      value.blockedReason,
+      filePath,
+      `mergeConflictResolutionReports[${index}].blockedReason`,
+    ),
+    risks: requiredStringArray(value.risks, filePath, `mergeConflictResolutionReports[${index}].risks`),
+    submittedAt: requiredString(value.submittedAt, filePath, `mergeConflictResolutionReports[${index}].submittedAt`),
+  };
+}
+
+function normalizeMergePullRequest(
+  value: unknown,
+  filePath: string,
+  field = "merge.pullRequest",
+): CompletionReportPullRequestRef {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
+  return {
+    url: nullableString(value.url, filePath, `${field}.url`),
+    number: nullableNumber(value.number, filePath, `${field}.number`),
+    headSha: optionalNullableString(value.headSha, filePath, `${field}.headSha`),
+    branch: optionalNullableString(value.branch, filePath, `${field}.branch`),
   };
 }
 
@@ -1431,6 +1716,7 @@ function corruptLifecycle(filePath: string, reason: string): SymphonyError {
 function isLifecyclePhase(value: unknown): value is IssueLifecyclePhase {
   return (
     value === "implementation" ||
+    value === "merge_conflict_resolution" ||
     value === "review" ||
     value === "passed" ||
     value === "blocked" ||

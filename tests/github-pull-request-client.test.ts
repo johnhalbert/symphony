@@ -582,6 +582,8 @@ describe("GitHubPullRequestClient", () => {
         number: 42,
         state: "closed",
         merged: true,
+        mergeable: false,
+        mergeable_state: "dirty",
         merge_commit_sha: "merge-sha-1",
         merged_at: "2026-01-01T00:00:02Z",
         merged_by: { login: "symphony-bot" },
@@ -589,6 +591,10 @@ describe("GitHubPullRequestClient", () => {
           ref: "symphony/TEST-1",
           sha: "head-sha-1",
           repo: { pushed_at: "2026-01-01T00:00:00Z" },
+        },
+        base: {
+          ref: "main",
+          sha: "base-sha-1",
         },
       }),
     );
@@ -598,11 +604,15 @@ describe("GitHubPullRequestClient", () => {
       number: 42,
       state: "closed",
       merged: true,
+      mergeable: false,
+      mergeableState: "dirty",
       mergeCommitSha: "merge-sha-1",
       mergedAt: "2026-01-01T00:00:02Z",
       mergedBy: "symphony-bot",
       headBranch: "symphony/TEST-1",
       headSha: "head-sha-1",
+      baseBranch: "main",
+      baseHeadSha: "base-sha-1",
     });
   });
 
@@ -626,6 +636,18 @@ describe("GitHubPullRequestClient", () => {
       pathname: "/repos/octo-org/symphony/pulls/42/merge",
       body: { sha: "head-sha-1", merge_method: "squash" },
     });
+  });
+
+  it("checks commit ancestry for approval carry-forward", async () => {
+    const calls: string[] = [];
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      calls.push(url.pathname);
+      return jsonResponse({ status: "ahead" });
+    });
+
+    await expect(client.isAncestor({ ancestorSha: "approved-sha", descendantSha: "resolved-sha" })).resolves.toBe(true);
+    expect(calls).toEqual(["/repos/octo-org/symphony/compare/approved-sha...resolved-sha"]);
   });
 
   it("checks required commit statuses and check runs by name", async () => {

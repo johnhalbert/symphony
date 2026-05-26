@@ -23,7 +23,11 @@ The extension has its own lockfile and dependency install under `extension/`.
 - `symphony.baseUrl`: defaults to `http://127.0.0.1:7331`.
 - `symphony.token`: optional token for future mutating API calls. Read-only probes do not send it. Mutating calls will send it as `X-Symphony-Token`.
 
-The scaffold validates connectivity with `GET /api/v1/state` only. It uses a 5 second timeout.
+The extension validates connectivity with `GET /api/v1/state`. When connected, it also renders read-only dashboard sections from `operatorView`, `GET /api/v1/board`, `GET /api/v1/workspaces`, and `GET /api/v1/activity?offset=0&limit=20`. Read-only requests do not send `symphony.token`.
+
+Connected dashboards show active agent sessions, durable workspace rows, board counts, the activity feed, and disabled Planning / Orchestrator / Chat placeholders until those APIs exist. Workspace actions call `POST /api/v1/issues/:id/open-workspace` through Symphony; they are disabled when the status API reports that mutations require a token and `symphony.token` is empty, or when the mutation policy is unavailable.
+
+The sidebar and fallback webview panel share one live polling loop. Opening the fallback panel starts refresh polling even when the sidebar view is unavailable, and polling stops after all dashboard surfaces are hidden or disposed.
 
 Connection states:
 
@@ -45,4 +49,12 @@ Start Symphony separately with the status server listening on the configured bas
 
 ## Scope
 
-This scaffold includes the webview shell, connection status, settings, scripts, docs, and unit tests. Board views, transcript views, activity views, and operator mutation controls are intentionally deferred.
+This extension includes the webview shell, connection status, read-only active session cards, operator queue cards, workspace/open-workspace affordances, board counts, disabled planning/orchestrator/chat placeholders, activity feed, settings, scripts, docs, and unit tests. Transcript views, issue drill-down, and broader operator mutation controls are intentionally deferred.
+
+## Validation Matrix
+
+- Happy path: connected state renders health, active sessions, workspace rows, board counts, activity, disabled Planning / Orchestrator / Chat placeholders, and enabled open-workspace buttons when mutation policy and token allow it.
+- Offline/error: failed state probes render retry/settings only and skip dashboard section reads and mutation controls.
+- Partial failure: board, workspace, or activity failures degrade their own section while the connected dashboard remains usable.
+- Token/security: public GET reads omit `X-Symphony-Token`; only `open-workspace` POST sends it, and disabled buttons do not post webview messages.
+- Idempotent refresh: rapid retries and polling suppress stale dashboard generations and keep one polling timer across sidebar/fallback surfaces.

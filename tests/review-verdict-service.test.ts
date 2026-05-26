@@ -313,6 +313,8 @@ function lifecycle(
     reviewFeedback: [],
     reviewEvidence: { pullRequest: null, lastIngestedCursor: null, lastWorkerEvidenceCursor: null, items: [], updatedAt: null },
     mergeGate: mergeGate(),
+    mergeConflict: null,
+    mergeConflictResolutionReports: [],
     merge: null,
     handoff: {
       version: 1,

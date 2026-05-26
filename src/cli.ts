@@ -15,6 +15,7 @@ import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
 import { runIssueBreakdownPlanMcpServer } from "./core/harness/IssueBreakdownPlanMcpServer.js";
+import { runMergeConflictResolutionMcpServer } from "./core/harness/MergeConflictResolutionMcpServer.js";
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
 import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcpServer.js";
@@ -59,6 +60,18 @@ program
   .requiredOption("--context-file <path>", "path to the active worker context file")
   .action(async (options: { workflow: string; contextFile: string }) => {
     await runCompletionReportMcpServer({
+      workflowPath: path.resolve(process.cwd(), options.workflow),
+      contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
+  });
+
+program
+  .command("merge-conflict-resolution-mcp")
+  .description("Run the internal Symphony merge-conflict-resolution MCP server")
+  .requiredOption("--workflow <path>", "path to WORKFLOW.md")
+  .requiredOption("--context-file <path>", "path to the active conflict-fix worker context file")
+  .action(async (options: { workflow: string; contextFile: string }) => {
+    await runMergeConflictResolutionMcpServer({
       workflowPath: path.resolve(process.cwd(), options.workflow),
       contextFile: path.resolve(process.cwd(), options.contextFile),
     });
@@ -129,6 +142,7 @@ program
         host: options.host ?? loaded.serviceConfig.server.host,
       },
     };
+    const configRef = { value: config };
 
     const tracker = createRuntimeTrackerClient(config);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
@@ -137,7 +151,7 @@ program
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
     const operatorApproval = new OperatorApprovalService({ config, store: operatorApprovalStore, runStore });
-    const writeback = createRuntimeWritebackProcessor(config, logger);
+    const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger);
     const workspaceManager = new WorkspaceManager({
       workspace: config.workspace,
       hooks: config.hooks,
@@ -160,6 +174,7 @@ program
 
     loader.watch((event) => {
       if (event.loaded) {
+        configRef.value = event.loaded.serviceConfig;
         orchestrator.updateConfig(event.loaded.serviceConfig, event.loaded.definition.promptTemplate);
         logger.info("workflow reloaded", { workflow_path: event.loaded.definition.workflowPath });
       } else if (event.error) {

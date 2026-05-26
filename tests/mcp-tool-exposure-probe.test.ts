@@ -25,6 +25,10 @@ describe("MCP tool exposure probe helpers", () => {
     expect(normalizeMcpToolName("submit_completion_report")).toBe("submit_completion_report");
     expect(normalizeMcpToolName("symphony.submit_completion_report")).toBe("submit_completion_report");
     expect(normalizeMcpToolName("mcp_symphony_submit_completion_report")).toBe("submit_completion_report");
+    expect(normalizeMcpToolName("symphony_conflicts.submit_merge_conflict_resolution")).toBe("submit_merge_conflict_resolution");
+    expect(normalizeMcpToolName("merge-conflict-resolution-mcp:submit_merge_conflict_resolution")).toBe(
+      "submit_merge_conflict_resolution",
+    );
     expect(normalizeMcpToolName("review-verdict-mcp:submit_review_verdict")).toBe("submit_review_verdict");
     expect(normalizeMcpToolName("mcp_symphony_review_feedback_submit_pull_request_review_feedback")).toBe(
       "submit_pull_request_review_feedback",
@@ -286,13 +290,15 @@ describe("MCP tool exposure probe helpers", () => {
     ).resolves.toMatchObject({
       status: "skipped",
       sdkRoleRuns: [
-        { role: "worker", roleStatus: "skipped", primaryFailureCode: null },
-        { role: "reviewer", roleStatus: "skipped", primaryFailureCode: null },
+        { role: "worker", runPhase: "implementation", roleStatus: "skipped", primaryFailureCode: null },
+        { role: "worker", runPhase: "merge_conflict_resolution", roleStatus: "skipped", primaryFailureCode: null },
+        { role: "reviewer", runPhase: "review", roleStatus: "skipped", primaryFailureCode: null },
       ],
       results: [
-        { status: "skipped", sdkRoleRunRole: "worker", sdkRoleRunIndex: 0 },
-        { status: "skipped", sdkRoleRunRole: "reviewer", sdkRoleRunIndex: 1 },
-        { status: "skipped", sdkRoleRunRole: "reviewer", sdkRoleRunIndex: 1 },
+        { status: "skipped", sdkRoleRunRole: "worker", sdkRoleRunPhase: "implementation", sdkRoleRunIndex: 0 },
+        { status: "skipped", sdkRoleRunRole: "worker", sdkRoleRunPhase: "merge_conflict_resolution", sdkRoleRunIndex: 1 },
+        { status: "skipped", sdkRoleRunRole: "reviewer", sdkRoleRunPhase: "review", sdkRoleRunIndex: 2 },
+        { status: "skipped", sdkRoleRunRole: "reviewer", sdkRoleRunPhase: "review", sdkRoleRunIndex: 2 },
       ],
     });
 
@@ -307,13 +313,39 @@ describe("MCP tool exposure probe helpers", () => {
       status: "failure",
       failureCode: "sdk_credentials_missing",
       sdkRoleRuns: [
-        { role: "worker", roleStatus: "failure", primaryFailureCode: "sdk_credentials_missing" },
-        { role: "reviewer", roleStatus: "failure", primaryFailureCode: "sdk_credentials_missing" },
+        { role: "worker", runPhase: "implementation", roleStatus: "failure", primaryFailureCode: "sdk_credentials_missing" },
+        { role: "worker", runPhase: "merge_conflict_resolution", roleStatus: "failure", primaryFailureCode: "sdk_credentials_missing" },
+        { role: "reviewer", runPhase: "review", roleStatus: "failure", primaryFailureCode: "sdk_credentials_missing" },
       ],
       results: [
-        { status: "failure", failureCode: "sdk_credentials_missing", sdkRoleRunRole: "worker", sdkRoleRunIndex: 0 },
-        { status: "failure", failureCode: "sdk_credentials_missing", sdkRoleRunRole: "reviewer", sdkRoleRunIndex: 1 },
-        { status: "failure", failureCode: "sdk_credentials_missing", sdkRoleRunRole: "reviewer", sdkRoleRunIndex: 1 },
+        {
+          status: "failure",
+          failureCode: "sdk_credentials_missing",
+          sdkRoleRunRole: "worker",
+          sdkRoleRunPhase: "implementation",
+          sdkRoleRunIndex: 0,
+        },
+        {
+          status: "failure",
+          failureCode: "sdk_credentials_missing",
+          sdkRoleRunRole: "worker",
+          sdkRoleRunPhase: "merge_conflict_resolution",
+          sdkRoleRunIndex: 1,
+        },
+        {
+          status: "failure",
+          failureCode: "sdk_credentials_missing",
+          sdkRoleRunRole: "reviewer",
+          sdkRoleRunPhase: "review",
+          sdkRoleRunIndex: 2,
+        },
+        {
+          status: "failure",
+          failureCode: "sdk_credentials_missing",
+          sdkRoleRunRole: "reviewer",
+          sdkRoleRunPhase: "review",
+          sdkRoleRunIndex: 2,
+        },
       ],
     });
     vi.unstubAllEnvs();
@@ -371,6 +403,15 @@ describe("MCP tool exposure probe helpers", () => {
         sdkRoleRuns: [
           {
             role: "worker",
+            runPhase: "implementation",
+            agentId: "agent-after-create",
+            runId: null,
+            primaryFailureCode: "sdk_startup_send_failure",
+            roleStatus: "failure",
+          },
+          {
+            role: "worker",
+            runPhase: "merge_conflict_resolution",
             agentId: "agent-after-create",
             runId: null,
             primaryFailureCode: "sdk_startup_send_failure",
@@ -381,14 +422,21 @@ describe("MCP tool exposure probe helpers", () => {
           {
             failureCode: "sdk_startup_send_failure",
             sdkRoleRunRole: "worker",
+            sdkRoleRunPhase: "implementation",
             sdkRoleRunIndex: 0,
+          },
+          {
+            failureCode: "sdk_startup_send_failure",
+            sdkRoleRunRole: "worker",
+            sdkRoleRunPhase: "merge_conflict_resolution",
+            sdkRoleRunIndex: 1,
           },
         ],
       });
-      expect(send).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledTimes(2);
       expect(createOptions[0]).toMatchObject({ mode: "plan" });
       expect(sendOptions[0]).toMatchObject({ mode: "plan" });
-      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(dispose).toHaveBeenCalledTimes(2);
     } finally {
       vi.unstubAllEnvs();
       vi.doUnmock("@cursor/sdk");
@@ -451,9 +499,9 @@ describe("MCP tool exposure probe helpers", () => {
         timeoutMs: 45_000,
       });
 
-      expect(apiKeys).toEqual(["worker-cursor-secret", "reviewer-cursor-secret"]);
-      expect(send).toHaveBeenCalledTimes(2);
-      expect(dispose).toHaveBeenCalledTimes(2);
+      expect(apiKeys).toEqual(["worker-cursor-secret", "worker-cursor-secret", "reviewer-cursor-secret"]);
+      expect(send).toHaveBeenCalledTimes(3);
+      expect(dispose).toHaveBeenCalledTimes(3);
     } finally {
       vi.doUnmock("@cursor/sdk");
       await rm(root, { recursive: true, force: true });

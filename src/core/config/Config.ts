@@ -47,6 +47,8 @@ const rawConfigSchema = z
         enabled: z.boolean().optional(),
         mode: z.enum(["disabled", "manual", "gated"]).optional(),
         source_states: stringArray.optional(),
+        conflicts_state: z.string().optional(),
+        max_conflict_fix_turns: z.number().int().positive().optional(),
         done_state: z.string().optional(),
         merge_method: z.enum(["merge", "squash", "rebase"]).optional(),
         required_checks: stringArray.optional(),
@@ -90,6 +92,13 @@ const rawConfigSchema = z
         cursor_mode: z.enum(["agent", "plan"]).optional(),
         prompt: z.string().optional(),
         planning_labels: stringArray.optional(),
+        apply_to_linear: z
+          .object({
+            enabled: z.boolean().optional(),
+            mode: z.enum(["child_issues"]).optional(),
+          })
+          .passthrough()
+          .optional(),
         workspace_mode: z.enum(["none", "readonly_checkout"]).optional(),
         max_planning_failures: z.number().int().positive().optional(),
         max_planning_dispatch_retries: z.number().int().positive().optional(),
@@ -352,6 +361,8 @@ export interface ReviewLoopConfig {
 export interface MergePolicyConfig {
   mode: "disabled" | "manual" | "gated";
   sourceStates: string[];
+  conflictsState: string | null;
+  maxConflictFixTurns: number;
   doneState: string;
   mergeMethod: "merge" | "squash" | "rebase";
   requiredChecks: string[];
@@ -370,6 +381,10 @@ export interface IssueBreakdownConfig {
   cursorMode: CursorConversationMode;
   promptTemplate: string;
   planningLabels: string[];
+  applyToLinear: {
+    enabled: boolean;
+    mode: "child_issues";
+  };
   workspaceMode: "none" | "readonly_checkout";
   maxPlanningFailures: number;
   maxPlanningDispatchRetries: number;
@@ -560,6 +575,15 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     blockedStates,
     reviewPassState,
   });
+  validateMergePolicyStateBuckets({
+    activeStates,
+    handoffStates,
+    terminalStates,
+    reviewStates,
+    blockedStates,
+    reviewPassState,
+    mergePolicy,
+  });
   validatePullRequestHandoffPolicy({
     publishPullRequests,
     handoffStates,
@@ -674,6 +698,10 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
       promptTemplate: raw.issue_breakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
       planningLabels: normalizeLabels(raw.issue_breakdown?.planning_labels),
+      applyToLinear: {
+        enabled: raw.issue_breakdown?.apply_to_linear?.enabled ?? false,
+        mode: raw.issue_breakdown?.apply_to_linear?.mode ?? "child_issues",
+      },
       workspaceMode: issueBreakdownWorkspaceMode,
       maxPlanningFailures: raw.issue_breakdown?.max_planning_failures ?? 3,
       maxPlanningDispatchRetries:
@@ -740,6 +768,8 @@ function normalizeMergePolicy(raw: RawWorkflowConfig, reviewPassState: string | 
   return {
     mode,
     sourceStates: rawPolicy?.source_states ?? (reviewPassState === null ? [] : [reviewPassState]),
+    conflictsState: normalizeOptionalConfigString(rawPolicy?.conflicts_state),
+    maxConflictFixTurns: rawPolicy?.max_conflict_fix_turns ?? 3,
     doneState: rawPolicy?.done_state ?? "Done",
     mergeMethod: rawPolicy?.merge_method ?? "merge",
     requiredChecks,
@@ -853,6 +883,7 @@ function normalizeIssueBoardColumns(
       ...input.reviewStates,
       ...(input.reviewPassState === null ? [] : [input.reviewPassState]),
       ...input.mergePolicy.sourceStates,
+      ...(input.mergePolicy.conflictsState === null ? [] : [input.mergePolicy.conflictsState]),
     ]),
     done: uniqueStateNames([
       input.mergePolicy.doneState,
@@ -954,6 +985,40 @@ function validateStateBuckets(input: {
           `${leftName} must not overlap ${rightName}: ${overlap.join(", ")}`,
         );
       }
+    }
+  }
+}
+
+function validateMergePolicyStateBuckets(input: {
+  activeStates: string[];
+  handoffStates: string[];
+  terminalStates: string[];
+  reviewStates: string[];
+  blockedStates: string[];
+  reviewPassState: string | null;
+  mergePolicy: MergePolicyConfig;
+}): void {
+  const { mergePolicy } = input;
+  const conflictsState = mergePolicy.conflictsState;
+  if (mergePolicy.mode === "disabled" || conflictsState === null) return;
+
+  const conflictOverlaps: Array<[string, string[]]> = [
+    ["tracker.active_states", input.activeStates],
+    ["merge_policy.source_states", mergePolicy.sourceStates],
+    ["merge_policy.done_state", [mergePolicy.doneState]],
+    ["tracker.handoff_states", input.handoffStates],
+    ["tracker.terminal_states", input.terminalStates],
+    ["review_loop.blocked_states", input.blockedStates],
+    ["review_loop.review_states", input.reviewStates],
+    ["review_loop.review_pass_state", input.reviewPassState === null ? [] : [input.reviewPassState]],
+  ];
+  for (const [name, states] of conflictOverlaps) {
+    const overlap = overlappingStates([conflictsState], states);
+    if (overlap.length > 0) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `merge_policy.conflicts_state must not overlap ${name}: ${overlap.join(", ")}`,
+      );
     }
   }
 }

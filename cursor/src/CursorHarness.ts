@@ -2,8 +2,10 @@ import { Agent, type Run, type SDKAgent, type SDKMessage, type SettingSource } f
 import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 import type { AgentEvent, AgentHarness, AgentRunContext, AgentRunSdkStatus } from "../../src/core/harness/AgentHarness.js";
+import type { AgentRunPhase } from "../../src/core/types.js";
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
 import { writeIssueBreakdownPlanMcpContext } from "../../src/core/harness/IssueBreakdownPlanMcpServer.js";
+import { writeMergeConflictResolutionMcpContext } from "../../src/core/harness/MergeConflictResolutionMcpServer.js";
 import { writeReviewFeedbackMcpContext } from "../../src/core/harness/ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
 import { writeTranscriptRecallMcpContext } from "../../src/core/harness/TranscriptRecallMcpServer.js";
@@ -14,6 +16,10 @@ import {
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { resolveCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
+import {
+  sanitizeAgentEventForPublicOutput,
+  sanitizedPreviewValue,
+} from "../../src/core/transcript/TranscriptProjection.js";
 import { mapCursorDelta, mapCursorMessage } from "./CursorEventMapper.js";
 
 export interface CursorHarnessOptions {
@@ -85,6 +91,7 @@ export class CursorHarness implements AgentHarness {
     if (ctx.abortSignal.aborted) abort();
 
     const queue = new AsyncEventQueue<AgentEvent>();
+    const enqueueEvent = (event: AgentEvent) => queue.push(sanitizeAgentEventForPublicOutput(event));
     let sessionStarted = false;
     let waitStarted = false;
     let waitSettled = false;
@@ -107,7 +114,7 @@ export class CursorHarness implements AgentHarness {
         at: new Date().toISOString(),
       };
       if (sessionStarted) {
-        queue.push(event);
+        enqueueEvent(event);
       } else {
         bufferedStatusEvents.push(event);
       }
@@ -139,7 +146,7 @@ export class CursorHarness implements AgentHarness {
         };
       });
     const emitTerminalEvents = (events: AgentEvent[]) => {
-      for (const event of contextualizeTerminalEvents(events)) queue.push(event);
+      for (const event of contextualizeTerminalEvents(events)) enqueueEvent(event);
       queue.close();
     };
     const finalizeFromWait = async () => {
@@ -240,6 +247,19 @@ export class CursorHarness implements AgentHarness {
           phase: "implementation",
         });
       }
+      if (ctx.role === "worker" && cursorRunPhase(ctx) === "merge_conflict_resolution") {
+        await writeMergeConflictResolutionMcpContext(mergeConflictResolutionContextFilePath(ctx), {
+          issue: ctx.issue,
+          activeRunId: run.id,
+          role: "worker",
+          token: null,
+          expectedToken: null,
+          sessionId: `${agent.agentId}:${run.id}`,
+          workspacePath: ctx.workspace.path,
+          workspace: ctx.workspace,
+          phase: "merge_conflict_resolution",
+        });
+      }
       if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
         await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
           issue: ctx.issue,
@@ -306,7 +326,7 @@ export class CursorHarness implements AgentHarness {
       });
 
       sessionStarted = true;
-      for (const event of bufferedStatusEvents.splice(0, bufferedStatusEvents.length)) queue.push(event);
+      for (const event of bufferedStatusEvents.splice(0, bufferedStatusEvents.length)) enqueueEvent(event);
       void finalizeFromWait();
       const streamTask = (async () => {
         try {
@@ -326,11 +346,11 @@ export class CursorHarness implements AgentHarness {
                 ...transcriptEvent,
               });
             }
-            for (const event of flush(deltaEvents)) queue.push(event);
-            for (const event of mapCursorMessage(message as SDKMessage)) queue.push(event);
+            for (const event of flush(deltaEvents)) enqueueEvent(event);
+            for (const event of mapCursorMessage(message as SDKMessage)) enqueueEvent(event);
           }
         } catch (error) {
-          queue.push({
+          enqueueEvent({
             type: "run_diagnostic",
             code: "cursor_stream_error",
             message: `Cursor stream failed: ${errorMessage(error)}`,
@@ -347,7 +367,7 @@ export class CursorHarness implements AgentHarness {
           });
         } finally {
           streamSettled = true;
-          for (const event of flush(deltaEvents)) queue.push(event);
+          for (const event of flush(deltaEvents)) enqueueEvent(event);
           if (pendingTerminalEvents) emitTerminalEvents(pendingTerminalEvents);
         }
       })();
@@ -532,28 +552,90 @@ function cursorTranscriptEvent(message: unknown): { eventType: string; message?:
     case "user":
       return null;
     case "thinking":
-      return { eventType: "thinking", message: "Cursor thinking event" };
+      return {
+        eventType: "thinking",
+        message: "Cursor thinking event",
+        payload: summaryPayload("thinking", message.text ?? message.message ?? message.content, 240),
+      };
     case "tool_call":
       return {
         eventType: "tool_call",
         message: `tool ${typeof message.name === "string" ? message.name : "unknown"} ${typeof message.status === "string" ? message.status : "unknown"}`,
+        payload: toolCallPayload(message),
       };
     case "assistant":
-      return { eventType: "assistant", message: "Cursor assistant message" };
+      return {
+        eventType: "assistant",
+        message: "Cursor assistant message",
+        payload: textPayload("assistant", message.text ?? message.message ?? message.content, 500),
+      };
     case "task":
-      return { eventType: "task", message: "Cursor task event" };
+      return {
+        eventType: "task",
+        message: "Cursor task event",
+        payload: summaryPayload("task", message.text ?? message.message ?? message.content, 240),
+      };
     case "status":
-      return { eventType: "status", message: typeof message.status === "string" ? `Cursor status ${message.status}` : "Cursor status event" };
+      return {
+        eventType: "status",
+        message: typeof message.status === "string" ? `Cursor status ${message.status}` : "Cursor status event",
+        payload: {
+          kind: "status",
+          status: sanitizedPreviewValue(message.status, 160).preview ?? "unknown",
+          messagePreview: sanitizedPreviewValue(message.message ?? message.text, 500).preview,
+          truncated: sanitizedPreviewValue(message.message ?? message.text, 500).truncated,
+        },
+      };
     case "system":
       return {
         eventType: "system",
         message: `Cursor system event: ${typeof message.subtype === "string" ? message.subtype : "system"}`,
+        payload: {
+          kind: "system",
+          subtype: sanitizedPreviewValue(message.subtype, 160).preview ?? "system",
+          messagePreview: sanitizedPreviewValue(message.message ?? message.text, 500).preview,
+          truncated: sanitizedPreviewValue(message.message ?? message.text, 500).truncated,
+        },
       };
     case "request":
       return { eventType: "request", message: "Cursor requested external input" };
     default:
       return { eventType: message.type };
   }
+}
+
+function summaryPayload(kind: "thinking" | "task", value: unknown, maxLength: number): unknown {
+  const preview = sanitizedPreviewValue(value, maxLength);
+  return { kind, summary: preview.preview ?? "", truncated: preview.truncated, redacted: true };
+}
+
+function textPayload(kind: "assistant", value: unknown, maxLength: number): unknown {
+  const preview = sanitizedPreviewValue(value, maxLength);
+  return { kind, textPreview: preview.preview ?? "", truncated: preview.truncated };
+}
+
+function toolCallPayload(message: { [key: string]: unknown }): unknown {
+  const payload: Record<string, unknown> = {
+    kind: "tool_call",
+    name: sanitizedPreviewValue(message.name, 160).preview ?? "unknown",
+    status: sanitizedPreviewValue(message.status, 160).preview ?? "unknown",
+    callId: sanitizedPreviewValue(message.callId ?? message.call_id ?? message.id, 160).preview,
+    argumentsPreview: sanitizedPreviewValue(message.arguments ?? message.args ?? message.input, 500).preview,
+    redacted: true,
+    truncated: false,
+  };
+  for (const [field, outputField] of [
+    ["result", "resultPreview"],
+    ["output", "outputPreview"],
+    ["error", "errorPreview"],
+  ] as const) {
+    const preview = sanitizedPreviewValue(message[field], 500);
+    if (preview.preview !== null) payload[outputField] = preview.preview;
+    payload.truncated = Boolean(payload.truncated) || preview.truncated;
+  }
+  const argumentPreview = sanitizedPreviewValue(message.arguments ?? message.args ?? message.input, 500);
+  payload.truncated = Boolean(payload.truncated) || argumentPreview.truncated;
+  return payload;
 }
 
 function cursorLastToolContext(message: unknown): CursorLastToolContext | null {
@@ -645,6 +727,14 @@ export function cursorRoleMcpServers(
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "merge_conflict_resolution") {
+    return {
+      symphony_conflicts: applyCwd(
+        mergeConflictResolutionMcpServerConfig(ctx, mergeConflictResolutionContextFilePath(ctx), options),
+      ),
+      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
+    };
+  }
   if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
     return {
       symphony_planning: applyCwd(issueBreakdownPlanMcpServerConfig(ctx, issueBreakdownPlanContextFilePath(ctx), options)),
@@ -678,6 +768,20 @@ export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise
       workspacePath: ctx.workspace.path,
       workspace: ctx.workspace,
       phase: "implementation",
+    });
+    return;
+  }
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "merge_conflict_resolution") {
+    await writeMergeConflictResolutionMcpContext(mergeConflictResolutionContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: null,
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "merge_conflict_resolution",
     });
     return;
   }
@@ -749,6 +853,20 @@ export function completionReportMcpServerConfig(
   });
 }
 
+export function mergeConflictResolutionMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "merge-conflict-resolution-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
+}
+
 export function issueBreakdownPlanMcpServerConfig(
   ctx: AgentRunContext,
   contextFile: string,
@@ -813,6 +931,14 @@ export function completionReportContextFilePath(ctx: AgentRunContext): string {
   );
 }
 
+export function mergeConflictResolutionContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "merge-conflict-resolution-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
 export function issueBreakdownPlanContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
@@ -849,7 +975,7 @@ function agentKey(ctx: AgentRunContext): string {
   return ctx.role === "reviewer" ? `${ctx.workspace.path}:reviewer` : `${ctx.workspace.path}:worker:${cursorRunPhase(ctx)}`;
 }
 
-function cursorRunPhase(ctx: AgentRunContext): "issue_breakdown" | "implementation" | "review" {
+function cursorRunPhase(ctx: AgentRunContext): AgentRunPhase {
   return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
 }
 

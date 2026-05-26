@@ -187,7 +187,7 @@ export interface Workspace {
 }
 
 export type AgentRunRole = "worker" | "reviewer";
-export type AgentRunPhase = "issue_breakdown" | "implementation" | "review";
+export type AgentRunPhase = "issue_breakdown" | "implementation" | "merge_conflict_resolution" | "review";
 export type AgentRunKind = "planning" | "implementation" | "review";
 
 export function runKindForPhase(runPhase: AgentRunPhase): AgentRunKind {
@@ -196,6 +196,7 @@ export function runKindForPhase(runPhase: AgentRunPhase): AgentRunKind {
       return "planning";
     case "review":
       return "review";
+    case "merge_conflict_resolution":
     case "implementation":
       return "implementation";
   }
