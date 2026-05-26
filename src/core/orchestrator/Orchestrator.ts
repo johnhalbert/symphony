@@ -63,7 +63,11 @@ import {
   PullRequestReviewEvidenceService,
   type PullRequestReviewEvidenceClient,
 } from "../review/PullRequestReviewEvidenceService.js";
-import { formatWorkerMergeGatePrompt, formatWorkerReviewVerdictPrompt } from "../ReviewVerdictService.js";
+import {
+  formatWorkerMergeGatePromptResult,
+  formatWorkerReviewVerdictPrompt,
+  type WorkerMergeGatePromptResult,
+} from "../ReviewVerdictService.js";
 import {
   PlaceholderContinuationSummarizer,
   type ContinuationSummarizer,
@@ -2238,8 +2242,9 @@ export class Orchestrator {
     const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
-    const mergeGate = await this.loadWorkerMergeGatePrompt(entry);
-    const reviewVerdict = mergeGate === null ? await this.loadWorkerReviewVerdictPrompt(entry) : null;
+    const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
+    const mergeGate = mergeGateResult?.text ?? null;
+    const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
     return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), mergeGate, reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
@@ -2269,8 +2274,9 @@ export class Orchestrator {
     const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
-    const mergeGate = await this.loadWorkerMergeGatePrompt(entry);
-    const reviewVerdict = mergeGate === null ? await this.loadWorkerReviewVerdictPrompt(entry) : null;
+    const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
+    const mergeGate = mergeGateResult?.text ?? null;
+    const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
     return [
       continuationBrief,
       reviewHardening,
@@ -2386,14 +2392,20 @@ export class Orchestrator {
   }
 
   private async loadWorkerReviewVerdictPrompt(entry: RunningEntry): Promise<string | null> {
-    const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
-    return lifecycle === undefined || lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
+    const lifecycle = await this.loadWorkerCurrentPromptLifecycle(entry);
+    return lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
   }
 
-  private async loadWorkerMergeGatePrompt(entry: RunningEntry): Promise<string | null> {
+  private async loadWorkerMergeGatePromptResult(entry: RunningEntry): Promise<WorkerMergeGatePromptResult | null> {
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
     if (lifecycle === undefined || lifecycle === null) return null;
-    return formatWorkerMergeGatePrompt(currentPromptLifecycle(lifecycle));
+    return formatWorkerMergeGatePromptResult(lifecycle);
+  }
+
+  private async loadWorkerCurrentPromptLifecycle(entry: RunningEntry): Promise<IssueLifecycleRecord | null> {
+    const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+    if (lifecycle === undefined || lifecycle === null) return null;
+    return currentPromptLifecycle(lifecycle);
   }
 
   private async loadIssueBreakdownPlanPrompt(entry: RunningEntry): Promise<string | null> {

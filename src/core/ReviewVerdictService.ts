@@ -4,12 +4,14 @@ import { SymphonyError } from "./errors.js";
 import type {
   IssueLifecyclePhase,
   IssueLifecycleRecord,
+  IssueMergeGateState,
   IssueLifecycleStore,
   IssueReviewVerdictRecord,
   ReviewVerdictAcceptanceResult,
 } from "./persistence/IssueLifecycleStore.js";
 import { phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
 import { isMergeGateVerdict } from "./merge/MergePolicyService.js";
+import { shouldSilentlyRetireMergeGate } from "./merge/MergeGateLifecycle.js";
 import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
@@ -64,6 +66,10 @@ export interface ReviewVerdictResult {
   verdict: IssueReviewVerdictRecord;
   writebackOperations: WritebackOperation[];
 }
+
+export type WorkerMergeGatePromptResult =
+  | { kind: "repair"; text: string }
+  | { kind: "stale_warning"; text: string };
 
 export class ReviewVerdictService {
   constructor(private readonly options: ReviewVerdictServiceOptions) {}
@@ -231,39 +237,47 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
 }
 
 export function formatWorkerMergeGatePrompt(lifecycle: IssueLifecycleRecord): string | null {
+  return formatWorkerMergeGatePromptResult(lifecycle)?.text ?? null;
+}
+
+export function formatWorkerMergeGatePromptResult(lifecycle: IssueLifecycleRecord): WorkerMergeGatePromptResult | null {
+  if (isStaleActiveMergeGate(lifecycle.mergeGate, lifecycle.summaryPointers.prHeadSha, lifecycle.summaryPointers.prNumber)) {
+    return { kind: "stale_warning", text: formatWorkerMergeGateHeadAdvancedWarning(lifecycle) };
+  }
+  if (isCurrentHeadSupersededGate(lifecycle.mergeGate, lifecycle.summaryPointers.prHeadSha, lifecycle.summaryPointers.prNumber)) {
+    return { kind: "stale_warning", text: formatWorkerMergeGateHeadAdvancedWarning(lifecycle) };
+  }
   const gate = lifecycle.mergeGate;
   if (!gate || (gate.status !== "repair_dispatched" && gate.status !== "blocked")) return null;
-  if (
-    lifecycle.summaryPointers.prNumber !== null &&
-    lifecycle.summaryPointers.prHeadSha !== null &&
-    gate.pullRequest.number === lifecycle.summaryPointers.prNumber &&
-    gate.headSha !== lifecycle.summaryPointers.prHeadSha
-  ) {
-    return null;
-  }
   const actionable = gate.checks.filter((check) => check.outcome === "failing" || check.outcome === "missing_actionable");
   const observing = gate.checks.filter((check) => check.outcome === "pending" || check.outcome === "missing_observed" || check.outcome === "unknown");
-  return [
-    "",
-    "## Symphony Merge Gate Repair",
-    "",
-    `Status: ${gate.status}`,
-    `PR: ${formatPullRequest(gate.pullRequest.number, gate.pullRequest.url)}`,
-    `PR head SHA: ${gate.headSha}`,
-    `Branch: ${gate.pullRequest.branch ?? "n/a"}`,
-    `Repair round: ${gate.reviewRound}`,
-    `Gate report: ${gate.gateReportId ?? "n/a"}`,
-    `Repair report: ${gate.repairReportId ?? "n/a"}`,
-    "",
-    "Actionable required checks:",
-    ...formatMergeGatePromptChecks(actionable, "No actionable checks recorded."),
-    "",
-    "Awaiting CI / observation:",
-    ...formatMergeGatePromptChecks(observing, "No pending, missing-observed, or unknown checks recorded."),
-    "",
-    "Required action:",
-    "Fix failing checks or restore missing actionable required checks on the lifecycle-bound PR branch, then submit a completion report. Symphony will re-fetch GitHub checks before clearing this blocker.",
-  ].join("\n");
+  return {
+    kind: "repair",
+    text: [
+      "",
+      "## Symphony Merge Gate Repair",
+      "",
+      `Gate ID: ${gate.id}`,
+      `Status: ${gate.status}`,
+      `PR: ${formatPullRequest(gate.pullRequest.number, gate.pullRequest.url)}`,
+      `PR head SHA: ${gate.headSha}`,
+      `Branch: ${gate.pullRequest.branch ?? "n/a"}`,
+      `Required checks: ${formatList(gate.requiredChecks)}`,
+      `Blocker fingerprint: ${gate.blockerFingerprint ?? "n/a"}`,
+      `Repair round: ${gate.reviewRound}`,
+      `Gate report: ${gate.gateReportId ?? "n/a"}`,
+      `Repair report: ${gate.repairReportId ?? "n/a"}`,
+      "",
+      "Actionable required checks:",
+      ...formatMergeGatePromptChecks(actionable, "No actionable checks recorded."),
+      "",
+      "Awaiting CI / observation:",
+      ...formatMergeGatePromptChecks(observing, "No pending, missing-observed, or unknown checks recorded."),
+      "",
+      "Required action:",
+      "Fix failing checks or restore missing actionable required checks on the lifecycle-bound PR branch, then submit a completion report. Symphony will re-fetch GitHub checks before clearing this blocker.",
+    ].join("\n"),
+  };
 }
 
 function parseReviewVerdict(input: unknown): ReviewVerdictInput {
@@ -314,9 +328,56 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord) {
   return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
 }
 
+function isCurrentHeadSupersededGate(
+  gate: IssueMergeGateState | null | undefined,
+  currentHeadSha: string | null | undefined,
+  pullRequestNumber: number | null | undefined,
+): boolean {
+  return (
+    gate !== null &&
+    gate !== undefined &&
+    gate.status === "superseded" &&
+    typeof currentHeadSha === "string" &&
+    currentHeadSha.length > 0 &&
+    pullRequestNumber !== null &&
+    pullRequestNumber !== undefined &&
+    gate.pullRequest.number === pullRequestNumber &&
+    gate.supersededByHeadSha === currentHeadSha
+  );
+}
+
+function isStaleActiveMergeGate(
+  gate: IssueMergeGateState | null | undefined,
+  currentHeadSha: string | null | undefined,
+  pullRequestNumber: number | null | undefined,
+): boolean {
+  return shouldSilentlyRetireMergeGate(gate, currentHeadSha, pullRequestNumber);
+}
+
 function formatPullRequest(number: number | null, url: string | null): string {
   const parts = [number === null ? null : `#${number}`, url].filter((value): value is string => value !== null);
   return parts.length === 0 ? "n/a" : parts.join(" ");
+}
+
+function formatList(values: string[]): string {
+  return values.length === 0 ? "n/a" : values.join(", ");
+}
+
+function formatWorkerMergeGateHeadAdvancedWarning(lifecycle: IssueLifecycleRecord): string {
+  const pointers = lifecycle.summaryPointers;
+  return [
+    "",
+    "## Symphony Merge Gate Head Advanced",
+    "",
+    "A previous merge-gate blocker was recorded for an older PR head. The lifecycle-bound PR now points at a newer head, so this worker turn should proceed through the normal completion and review path for the current head.",
+    "",
+    `Current PR: ${formatPullRequest(pointers.prNumber, pointers.prUrl)}`,
+    `Current PR head SHA: ${pointers.prHeadSha ?? "n/a"}`,
+    `Current branch: ${pointers.prBranch ?? pointers.gitBranchName ?? pointers.branchName ?? "n/a"}`,
+    "",
+    "Required action:",
+    "Address any current reviewer findings, validate the current PR head, and submit a fresh completion report. Symphony will require normal review approval for this head before merge.",
+  ].join("\n");
 }
 
 function formatMergeGatePromptChecks(checks: NonNullable<IssueLifecycleRecord["mergeGate"]>["checks"], fallback: string): string[] {
@@ -324,8 +385,15 @@ function formatMergeGatePromptChecks(checks: NonNullable<IssueLifecycleRecord["m
   return checks.map((check) => {
     const conclusion = check.conclusion === null ? "" : ` / ${check.conclusion}`;
     const url = check.url === null ? "" : ` (${check.url})`;
-    return `- ${check.name}: ${check.outcome}${conclusion}${url}`;
+    return `- ${check.name}: ${check.outcome}${conclusion}${url}${formatMissingCheckStabilization(check)}`;
   });
+}
+
+function formatMissingCheckStabilization(check: IssueMergeGateState["checks"][number]): string {
+  if (check.rawStatus !== "missing" && check.outcome !== "missing_observed" && check.outcome !== "missing_actionable") {
+    return "";
+  }
+  return `; firstObservedAt: ${check.firstObservedAt ?? "n/a"}; actionableSince: ${check.actionableSince ?? "n/a"}`;
 }
 
 function formatAcceptanceGaps(results: ReviewVerdictAcceptanceResult[]): string[] {
