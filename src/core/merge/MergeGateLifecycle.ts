@@ -4,6 +4,7 @@ import {
   type IssueLifecycleRecord,
   type IssueMergeGateState,
   type IssueReviewVerdictRecord,
+  latestCurrentApprovalPassVerdict,
 } from "../persistence/IssueLifecycleStore.js";
 
 export function shouldSilentlyRetireMergeGate(
@@ -12,9 +13,7 @@ export function shouldSilentlyRetireMergeGate(
   pullRequestNumber: number | null | undefined,
 ): gate is IssueMergeGateState {
   return (
-    gate !== null &&
-    gate !== undefined &&
-    gate.status !== "superseded" &&
+    isActiveMergeGate(gate) &&
     typeof currentHeadSha === "string" &&
     currentHeadSha.length > 0 &&
     pullRequestNumber !== null &&
@@ -22,6 +21,17 @@ export function shouldSilentlyRetireMergeGate(
     gate.pullRequest.number === pullRequestNumber &&
     gate.headSha !== currentHeadSha
   );
+}
+
+export function staleMergeGateLifecyclePatch(
+  lifecycle: IssueLifecycleRecord,
+  currentHeadSha: string | null | undefined,
+  pullRequestNumber: number | null | undefined,
+): IssueLifecyclePatch | null {
+  const gate = lifecycle.mergeGate ?? null;
+  if (!shouldSilentlyRetireMergeGate(gate, currentHeadSha, pullRequestNumber)) return null;
+  if (typeof currentHeadSha !== "string") return null;
+  return supersededMergeGateLifecyclePatch(lifecycle, gate, currentHeadSha);
 }
 
 export function silentlyRetireMergeGate(gate: IssueMergeGateState, currentHeadSha: string): IssueMergeGateState {
@@ -53,6 +63,21 @@ export function inactiveMergeGateLifecyclePatch(
   };
 }
 
+export function supersededMergeGateLifecyclePatch(
+  lifecycle: IssueLifecycleRecord,
+  gate: IssueMergeGateState,
+  supersededByHeadSha: string,
+): IssueLifecyclePatch {
+  const mergeGate = inactiveMergeGate(gate, "superseded", supersededByHeadSha);
+  const reviewVerdicts = scrubMergeGateVerdicts(lifecycle.reviewVerdicts, gate.id);
+  const patchedLifecycle = { ...lifecycle, mergeGate, reviewVerdicts };
+  return {
+    mergeGate,
+    reviewVerdicts,
+    lastReviewVerdictId: latestCurrentApprovalPassVerdict(patchedLifecycle)?.id ?? null,
+  };
+}
+
 export function sanitizeInactiveMergeGateLifecycle(lifecycle: IssueLifecycleRecord | null | undefined): IssueLifecycleRecord | null | undefined {
   const gate = lifecycle?.mergeGate ?? null;
   if (!lifecycle || !gate) return lifecycle;
@@ -65,6 +90,27 @@ export function sanitizeInactiveMergeGateLifecycle(lifecycle: IssueLifecycleReco
     mergeGate: scrubbedGate,
     reviewVerdicts,
     lastReviewVerdictId,
+  };
+  return {
+    ...sanitized,
+    handoff: buildIssueHandoffState(sanitized),
+  };
+}
+
+export function sanitizeStaleMergeGateLifecycle(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  currentHeadSha: string | null | undefined,
+  pullRequestNumber: number | null | undefined,
+): IssueLifecycleRecord | null | undefined {
+  if (!lifecycle) return lifecycle;
+  const patch = staleMergeGateLifecyclePatch(lifecycle, currentHeadSha, pullRequestNumber);
+  if (!patch) return lifecycle;
+  const sanitized: IssueLifecycleRecord = {
+    ...lifecycle,
+    mergeGate: patch.mergeGate ?? lifecycle.mergeGate ?? null,
+    reviewVerdicts: patch.reviewVerdicts ?? lifecycle.reviewVerdicts,
+    lastReviewVerdictId:
+      patch.lastReviewVerdictId === undefined ? lifecycle.lastReviewVerdictId : patch.lastReviewVerdictId,
   };
   return {
     ...sanitized,

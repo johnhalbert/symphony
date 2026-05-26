@@ -56,6 +56,7 @@ import {
   type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import { MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
+import { sanitizeStaleMergeGateLifecycle, staleMergeGateLifecyclePatch } from "../merge/MergeGateLifecycle.js";
 import {
   formatWorkerReviewEvidencePrompt,
   isActiveReviewEvidenceItem,
@@ -2156,6 +2157,15 @@ export class Orchestrator {
         baseRef: metadata.baseRef,
       },
     });
+    const staleGatePatch = entry.lifecycle
+      ? staleMergeGateLifecyclePatch(entry.lifecycle, metadata.prHeadSha, metadata.prNumber)
+      : null;
+    if (staleGatePatch) {
+      await this.updateLifecycle(entry, {
+        ...staleGatePatch,
+        blockedReason: null,
+      });
+    }
 
     const runId = entry.activeRunId ?? entry.runId;
     if (!runId || !this.options.runStore) return;
@@ -2382,7 +2392,8 @@ export class Orchestrator {
 
   private async loadWorkerMergeGatePrompt(entry: RunningEntry): Promise<string | null> {
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
-    return lifecycle === undefined || lifecycle === null ? null : formatWorkerMergeGatePrompt(lifecycle);
+    if (lifecycle === undefined || lifecycle === null) return null;
+    return formatWorkerMergeGatePrompt(currentPromptLifecycle(lifecycle));
   }
 
   private async loadIssueBreakdownPlanPrompt(entry: RunningEntry): Promise<string | null> {
@@ -2406,7 +2417,8 @@ export class Orchestrator {
     const lifecycle = (await this.options.lifecycleStore?.get(entry.issue.id)) ?? entry.lifecycle ?? null;
     const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id)) ?? [];
     if (!lifecycle || !hasRealHandoffContext(lifecycle, runs)) return null;
-    const packet = buildWorkerHandoffPacket(lifecycle);
+    const currentLifecycle = currentPromptLifecycle(lifecycle);
+    const packet = buildWorkerHandoffPacket(currentLifecycle);
     const transcriptPointers = transcriptPointersForRuns(runs);
     const statusPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
     const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(isActiveReviewEvidenceItem);
@@ -2416,7 +2428,7 @@ export class Orchestrator {
       `- Version: ${packet.version}; generatedAt: ${packet.generatedAt}`,
       `- Issue: ${packet.issueIdentifier} (${packet.issueId})`,
       `- Objective: ${entry.issue.title}`,
-      `- Next action: ${nextWorkerAction(lifecycle)}`,
+      `- Next action: ${nextWorkerAction(currentLifecycle)}`,
       "",
       "Lane memo:",
       ...packet.memo.entries.map((entryLine) => `- ${entryLine}`),
@@ -2727,6 +2739,13 @@ function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[
     lifecycle.mergeGate !== null ||
     lifecycle.merge !== null ||
     lifecycle.phase !== "implementation"
+  );
+}
+
+function currentPromptLifecycle(lifecycle: IssueLifecycleRecord): IssueLifecycleRecord {
+  return (
+    sanitizeStaleMergeGateLifecycle(lifecycle, lifecycle.summaryPointers.prHeadSha, lifecycle.summaryPointers.prNumber) ??
+    lifecycle
   );
 }
 

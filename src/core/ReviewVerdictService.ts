@@ -233,6 +233,14 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
 export function formatWorkerMergeGatePrompt(lifecycle: IssueLifecycleRecord): string | null {
   const gate = lifecycle.mergeGate;
   if (!gate || (gate.status !== "repair_dispatched" && gate.status !== "blocked")) return null;
+  if (
+    lifecycle.summaryPointers.prNumber !== null &&
+    lifecycle.summaryPointers.prHeadSha !== null &&
+    gate.pullRequest.number === lifecycle.summaryPointers.prNumber &&
+    gate.headSha !== lifecycle.summaryPointers.prHeadSha
+  ) {
+    return null;
+  }
   const actionable = gate.checks.filter((check) => check.outcome === "failing" || check.outcome === "missing_actionable");
   const observing = gate.checks.filter((check) => check.outcome === "pending" || check.outcome === "missing_observed" || check.outcome === "unknown");
   return [

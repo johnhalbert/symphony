@@ -23,6 +23,7 @@ import type {
   IssueMergeGateState,
   IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
+import { latestCurrentApprovalPassVerdict } from "../persistence/IssueLifecycleStore.js";
 import type { RunRecord, RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { Issue } from "../types.js";
@@ -34,7 +35,7 @@ import {
   type MergeGateCheckEvidence,
 } from "../writeback/TransitionPolicy.js";
 import type { WritebackOperation, WritebackProcessor } from "../writeback/WritebackOutbox.js";
-import { inactiveMergeGateLifecyclePatch, shouldSilentlyRetireMergeGate } from "./MergeGateLifecycle.js";
+import { inactiveMergeGateLifecyclePatch, shouldSilentlyRetireMergeGate, supersededMergeGateLifecyclePatch } from "./MergeGateLifecycle.js";
 
 const MERGE_GATE_REVIEWER = "symphony-merge-gate";
 
@@ -150,11 +151,11 @@ export class MergePolicyService {
     let activeLifecycle = lifecycle;
     if (shouldSilentlyRetireMergeGate(activeLifecycle.mergeGate, headSha, pullRequest.number)) {
       activeLifecycle = await this.options.lifecycleStore.updateIssue(latestIssue, {
-        ...inactiveMergeGateLifecyclePatch(activeLifecycle, activeLifecycle.mergeGate, "superseded", headSha),
+        ...supersededMergeGateLifecyclePatch(activeLifecycle, activeLifecycle.mergeGate, headSha),
       });
     }
     const gateId = mergeGateId(latestIssue.id, pullRequest, headSha);
-    const approvalVerdict = latestApprovalPassVerdict(activeLifecycle);
+    const approvalVerdict = latestCurrentApprovalPassVerdict(activeLifecycle);
     const existingGateVerdict = findMergeGateVerdict(activeLifecycle, gateId);
     const decision = await this.evaluateChecks(github, headSha, pullRequest, gateId, activeLifecycle);
     if (decision.kind === "passed" && approvalVerdict && (existingGateVerdict || activeLifecycle.mergeGate?.id === gateId)) {
@@ -193,7 +194,7 @@ export class MergePolicyService {
       return { status: "checks_pending", gate: decision.gate };
     }
 
-    const verdict = latestApprovalPassVerdict(activeLifecycle);
+    const verdict = latestCurrentApprovalPassVerdict(activeLifecycle);
     const workerRun = report && this.options.runStore ? await this.options.runStore.getRun(report.runId) : null;
     this.validateLifecycle(activeLifecycle, report, verdict, workerRun, latestIssue);
     if (decision.kind === "failure") {
@@ -221,7 +222,7 @@ export class MergePolicyService {
 
     const mergeGatePatch =
       activeLifecycle.mergeGate && shouldSilentlyRetireMergeGate(activeLifecycle.mergeGate, headSha, pullRequest.number)
-        ? inactiveMergeGateLifecyclePatch(activeLifecycle, activeLifecycle.mergeGate, "superseded", headSha)
+        ? supersededMergeGateLifecyclePatch(activeLifecycle, activeLifecycle.mergeGate, headSha)
         : { mergeGate: activeLifecycle.mergeGate ?? null };
     const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge, ...mergeGatePatch });
     const storedMerge = updated.merge ?? merge;
@@ -276,7 +277,7 @@ export class MergePolicyService {
     sourceState: string,
     existingVerdict: IssueReviewVerdictRecord | null,
   ): Promise<MergePolicyResult> {
-    const approvalVerdict = latestApprovalPassVerdict(lifecycle);
+    const approvalVerdict = latestCurrentApprovalPassVerdict(lifecycle);
     const newRepairCycle =
       existingVerdict === null ||
       lifecycle.phase === "passed" ||
@@ -512,14 +513,6 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletio
     if (exact) return exact;
   }
   return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
-}
-
-function latestApprovalPassVerdict(lifecycle: IssueLifecycleRecord): IssueReviewVerdictRecord | null {
-  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
-    if (verdict.verdict !== "pass" || isMergeGateVerdict(verdict)) continue;
-    if (verdict.issueId === lifecycle.issueId && verdict.issueIdentifier === lifecycle.issueIdentifier) return verdict;
-  }
-  return null;
 }
 
 function findMergeGateVerdict(lifecycle: IssueLifecycleRecord, gateId: string): IssueReviewVerdictRecord | null {

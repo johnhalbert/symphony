@@ -196,6 +196,68 @@ describe("MergePolicyService", () => {
     });
   });
 
+  it("does not treat a prior head approval as current after a new-head completion report", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const seeded = await lifecycleStore.get(currentIssue.id);
+    const report = {
+      ...seeded!.completionReports[0]!,
+      id: "completion-report:issue-1:report-2",
+      idempotencyKey: "report-2",
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-2",
+        branch: "symphony/TEST-1",
+      },
+    };
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "passed",
+      reviewRound: 1,
+      lastCompletionReportId: report.id,
+      lastReviewVerdictId: "review-verdict:issue-1:verdict-pass-1",
+      completionReports: [report],
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "head-sha-2",
+        prBranch: "symphony/TEST-1",
+      },
+      mergeGate: mergeGateState({ status: "repair_dispatched", headSha: "head-sha-1", reviewRound: 1 }),
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const client = new FakeMergeClient({ headSha: "head-sha-2" });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, new StructuredLogger(() => undefined), 60_000),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/pass verdict/);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(client.mergeInput).toBeNull();
+    expect(writer.transitions).toEqual([]);
+    expect(lifecycle?.phase).toBe("passed");
+    expect(lifecycle?.lastReviewVerdictId).toBeNull();
+    expect(lifecycle?.mergeGate).toMatchObject({
+      status: "superseded",
+      headSha: "head-sha-1",
+      supersededByHeadSha: "head-sha-2",
+      checks: [],
+      repairRunId: null,
+      repairReportId: null,
+      blockerFingerprint: null,
+      writebackOperationKeys: [],
+    });
+  });
+
   it("requires live writeback mode before gated merge", async () => {
     const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test.", writebackMode: "dry_run" });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });

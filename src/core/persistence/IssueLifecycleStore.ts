@@ -540,6 +540,27 @@ function latestCompletionReport(
   return record.completionReports.at(-1) ?? null;
 }
 
+export function latestCurrentApprovalPassVerdict(
+  record: Pick<
+    IssueLifecycleRecord,
+    | "issueId"
+    | "issueIdentifier"
+    | "completionReports"
+    | "lastCompletionReportId"
+    | "reviewVerdicts"
+    | "reviewFeedback"
+    | "summaryPointers"
+  >,
+): IssueReviewVerdictRecord | null {
+  const pullRequest = currentPullRequestForReview(record);
+  if (!pullRequest) return latestHumanPassVerdict(record);
+  for (const verdict of record.reviewVerdicts.slice().reverse()) {
+    if (!isHumanPassVerdictForIssue(record, verdict)) continue;
+    if (hasApprovalFeedback(record, verdict, pullRequest) || !hasAnyApprovalFeedbackForRun(record, verdict)) return verdict;
+  }
+  return null;
+}
+
 function latestReviewVerdict(
   record: Pick<IssueLifecycleRecord, "reviewVerdicts" | "lastReviewVerdictId">,
 ): IssueReviewVerdictRecord | null {
@@ -550,14 +571,112 @@ function latestReviewVerdict(
 }
 
 function latestHumanReviewVerdict(
-  record: Pick<IssueLifecycleRecord, "reviewVerdicts" | "lastReviewVerdictId">,
+  record: Pick<
+    IssueLifecycleRecord,
+    | "issueId"
+    | "issueIdentifier"
+    | "completionReports"
+    | "lastCompletionReportId"
+    | "reviewVerdicts"
+    | "reviewFeedback"
+    | "lastReviewVerdictId"
+    | "summaryPointers"
+  >,
 ): IssueReviewVerdictRecord | null {
   const pointed = latestReviewVerdict(record);
-  if (pointed && !isMergeGateVerdict(pointed)) return pointed;
+  if (pointed && !isMergeGateVerdict(pointed) && isCurrentHumanVerdict(record, pointed)) return pointed;
   for (const verdict of record.reviewVerdicts.slice().reverse()) {
-    if (!isMergeGateVerdict(verdict)) return verdict;
+    if (!isMergeGateVerdict(verdict) && isCurrentHumanVerdict(record, verdict)) return verdict;
   }
   return null;
+}
+
+function latestHumanPassVerdict(
+  record: Pick<IssueLifecycleRecord, "issueId" | "issueIdentifier" | "reviewVerdicts">,
+): IssueReviewVerdictRecord | null {
+  for (const verdict of record.reviewVerdicts.slice().reverse()) {
+    if (isHumanPassVerdictForIssue(record, verdict)) return verdict;
+  }
+  return null;
+}
+
+function isCurrentHumanVerdict(
+  record: Pick<
+    IssueLifecycleRecord,
+    | "issueId"
+    | "issueIdentifier"
+    | "completionReports"
+    | "lastCompletionReportId"
+    | "reviewFeedback"
+    | "summaryPointers"
+  >,
+  verdict: IssueReviewVerdictRecord,
+): boolean {
+  if (verdict.issueId !== record.issueId || verdict.issueIdentifier !== record.issueIdentifier) return false;
+  if (verdict.verdict !== "pass") return true;
+  const pullRequest = currentPullRequestForReview(record);
+  return pullRequest === null || hasApprovalFeedback(record, verdict, pullRequest) || !hasAnyApprovalFeedbackForRun(record, verdict);
+}
+
+function isHumanPassVerdictForIssue(
+  record: Pick<IssueLifecycleRecord, "issueId" | "issueIdentifier">,
+  verdict: IssueReviewVerdictRecord,
+): boolean {
+  return (
+    verdict.verdict === "pass" &&
+    !isMergeGateVerdict(verdict) &&
+    verdict.issueId === record.issueId &&
+    verdict.issueIdentifier === record.issueIdentifier
+  );
+}
+
+function currentPullRequestForReview(
+  record: Pick<IssueLifecycleRecord, "completionReports" | "lastCompletionReportId" | "summaryPointers">,
+): CompletionReportPullRequestRef | null {
+  const reportPullRequest = latestCompletionReport(record)?.pullRequest ?? null;
+  const pointerPullRequest =
+    record.summaryPointers.prNumber !== null && record.summaryPointers.prUrl !== null && record.summaryPointers.prHeadSha !== null
+      ? {
+          number: record.summaryPointers.prNumber,
+          url: record.summaryPointers.prUrl,
+          headSha: record.summaryPointers.prHeadSha,
+          branch: record.summaryPointers.prBranch,
+        }
+      : null;
+  if (
+    pointerPullRequest &&
+    reportPullRequest &&
+    pointerPullRequest.number === reportPullRequest.number &&
+    pointerPullRequest.headSha !== reportPullRequest.headSha
+  ) {
+    return pointerPullRequest;
+  }
+  return reportPullRequest ?? pointerPullRequest;
+}
+
+function hasApprovalFeedback(
+  record: Pick<IssueLifecycleRecord, "reviewFeedback">,
+  verdict: IssueReviewVerdictRecord,
+  pullRequest: CompletionReportPullRequestRef,
+): boolean {
+  return record.reviewFeedback.some(
+    (feedback) =>
+      feedback.runId === verdict.runId &&
+      feedback.kind === "review" &&
+      feedback.event === "APPROVE" &&
+      feedback.pullRequest.number === pullRequest.number &&
+      feedback.pullRequest.url === pullRequest.url &&
+      feedback.pullRequest.headSha === pullRequest.headSha,
+  );
+}
+
+function hasAnyApprovalFeedbackForRun(
+  record: Pick<IssueLifecycleRecord, "reviewFeedback">,
+  verdict: IssueReviewVerdictRecord,
+): boolean {
+  return record.reviewFeedback.some(
+    (feedback) => feedback.runId === verdict.runId && feedback.kind === "review" && feedback.event === "APPROVE",
+  );
 }
 
 function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {

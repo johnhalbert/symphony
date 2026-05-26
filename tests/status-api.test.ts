@@ -603,6 +603,158 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("projects active old-head merge gates and approvals as non-current after PR head advances", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(
+      { id: "issue-3", identifier: "TEST-3" },
+      {
+        phase: "implementation",
+        reviewRound: 1,
+        lastCompletionReportId: "completion-report:issue-3:head-a",
+        lastReviewVerdictId: "review-verdict:issue-3:head-a-pass",
+        summaryPointers: {
+          prUrl: "https://github.com/acme/repo/pull/7",
+          prNumber: 7,
+          prHeadSha: "new-head",
+          prBranch: "symphony/TEST-3",
+        },
+        completionReports: [
+          {
+            id: "completion-report:issue-3:head-a",
+            idempotencyKey: "head-a",
+            runId: "worker-run-1",
+            issueId: "issue-3",
+            issueIdentifier: "TEST-3",
+            summary: "Implemented head A.",
+            validationEvidence: ["npm test"],
+            acceptanceChecklist: [{ text: "Works", satisfied: true, evidence: "tests" }],
+            changedFiles: ["src/index.ts"],
+            branchName: "symphony/TEST-3",
+            pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7, headSha: "old-head", branch: "symphony/TEST-3" },
+            risks: [],
+            acceptedAt: "2026-01-01T00:00:00.000Z",
+            writebackOperationKeys: [],
+          },
+        ],
+        reviewVerdicts: [
+          {
+            id: "review-verdict:issue-3:head-a-pass",
+            idempotencyKey: "head-a-pass",
+            runId: "review-run-1",
+            issueId: "issue-3",
+            issueIdentifier: "TEST-3",
+            verdict: "pass",
+            acceptanceResults: [{ text: "Head A reviewed", satisfied: true, evidence: "approved" }],
+            findings: [],
+            evidence: ["https://github.com/acme/repo/pull/7#pullrequestreview-1"],
+            reviewer: "reviewer-1",
+            submittedAt: "2026-01-01T00:00:01.000Z",
+            writebackOperationKeys: [],
+          },
+        ],
+        reviewFeedback: [
+          {
+            id: "review-feedback:issue-3:review-run-1:approve",
+            idempotencyKey: "head-a-approve",
+            requestHash: "hash",
+            runId: "review-run-1",
+            issueId: "issue-3",
+            issueIdentifier: "TEST-3",
+            kind: "review",
+            event: "APPROVE",
+            body: "Approved.",
+            pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7, headSha: "old-head", branch: "symphony/TEST-3" },
+            reviewer: "reviewer-1",
+            reviewUrl: "https://github.com/acme/repo/pull/7#pullrequestreview-1",
+            commentUrls: [],
+            submittedAt: "2026-01-01T00:00:01.000Z",
+          },
+        ],
+        mergeGate: {
+          id: "merge-gate:issue-3:pr-7:old-head",
+          status: "repair_dispatched",
+          headSha: "old-head",
+          pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7, headSha: "old-head", branch: "symphony/TEST-3" },
+          requiredChecks: ["test"],
+          checks: [
+            {
+              name: "test",
+              outcome: "failing",
+              rawStatus: "failure",
+              conclusion: "failure",
+              url: "https://ci.test/test",
+              firstObservedAt: null,
+              actionableSince: null,
+            },
+          ],
+          reviewRound: 1,
+          gateRunId: "gate-run-1",
+          gateReportId: "completion-report:issue-3:head-a",
+          repairRunId: "repair-run-1",
+          repairReportId: "completion-report:issue-3:repair-1",
+          blockerFingerprint: "old-head:test:failure",
+          writebackOperationKeys: ["comment:issue-3:merge-gate"],
+          supersededByHeadSha: null,
+          updatedAt: "2026-01-01T00:10:00.000Z",
+        },
+      },
+    );
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-3`);
+      const body = (await response.json()) as {
+        lifecycle: { lastReviewVerdictId: string | null; handoff: { lastReviewerOutput: unknown } };
+        reviewLoop: { lastReviewVerdict: unknown };
+        blockers: unknown;
+        mergeGate: {
+          active: boolean;
+          checks: unknown[];
+          repairRunId: string | null;
+          repairReportId: string | null;
+          blockerFingerprint: string | null;
+          actionableCheckNames: string[];
+          automationBlocked: boolean;
+        };
+        issueDetails: IssueDetailsEnvelope;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.lifecycle.lastReviewVerdictId).toBeNull();
+      expect(body.lifecycle.handoff.lastReviewerOutput).toBeNull();
+      expect(body.reviewLoop.lastReviewVerdict).toBeNull();
+      expect(body.mergeGate).toMatchObject({
+        active: false,
+        checks: [],
+        repairRunId: null,
+        repairReportId: null,
+        blockerFingerprint: null,
+        actionableCheckNames: [],
+        automationBlocked: false,
+      });
+      expect(body.issueDetails.blockers).toMatchObject({ blocked: false });
+      expect(body.issueDetails.mergeGate).toMatchObject({ active: false, checks: [], actionableCheckNames: [] });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("posts planning-run using internal id and records strict id lookup behavior", async () => {
     const candidate = issue({ id: "issue-1", identifier: "TEST-1", state: "Todo", labels: ["planning"] });
     const idFixture = await createPlanningRunApiFixture(path.join(root, "planning-id"), candidate);
