@@ -11,6 +11,16 @@ describe("extension boundary", () => {
     expect(combined).not.toMatch(/(?:\.\.\/)+cursor\//);
     expect(combined).not.toMatch(/(?:\.\.\/)+src\/core\//);
   });
+
+  it("keeps webview messages in the shared contract module", async () => {
+    const provider = await readFile(path.resolve("src/webviewProvider.ts"), "utf8");
+    const webview = await readFile(path.resolve("src/webview/main.ts"), "utf8");
+
+    expect(provider).not.toMatch(/type ExtensionMessage =/);
+    expect(webview).not.toMatch(/type ExtensionMessage =/);
+    expect(provider).toContain("./webviewMessages");
+    expect(webview).toContain("../webviewMessages");
+  });
 });
 
 async function sourceFiles(dir: string): Promise<string[]> {

@@ -2,91 +2,76 @@ import {
   classifyNetworkError,
   classifyProbeResult,
   errorMessage,
-  isAbortLikeError,
   SYMPHONY_PROBE_TIMEOUT_MS,
   type ConnectionState,
   type ProbeResult,
 } from "./connectionState";
-import {
-  parseActiveSessions,
-  parseActivitySection,
-  parseBoardSection,
-  parseOperatorQueues,
-  parseWorkspaceSection,
-  type JsonEndpointResult,
-} from "./dashboardParsers";
-import type { DashboardViewState } from "./dashboardTypes";
 import { normalizeBaseUrl } from "./settings";
+import type { ActivityFeedResponse, BoardIssueDetailResponse, IssueBoardResponse, TranscriptPage } from "./statusApiTypes";
 
 export const MUTATION_TOKEN_HEADER = "X-Symphony-Token";
 
 export class SymphonyClient {
-  async fetchDashboard(
-    baseUrlSetting: string,
-    token: string,
-    signal?: AbortSignal,
-    options: { refreshBoard?: boolean } = {},
-  ): Promise<DashboardViewState> {
-    const tokenConfigured = token.trim().length > 0;
-    const stateResult = await this.fetchState(baseUrlSetting, signal);
-    const connection = classifyProbeResult(stateResult, tokenConfigured);
-    if (connection.kind !== "connected" || stateResult.kind !== "http") return { connection, sections: null };
-
-    const boardPath = options.refreshBoard ? "/api/v1/board?refresh=1" : "/api/v1/board";
-    const [board, activity, workspaces] = await Promise.all([
-      this.fetchJsonEndpoint(connection.baseUrl, boardPath, signal),
-      this.fetchJsonEndpoint(connection.baseUrl, "/api/v1/activity?offset=0&limit=20", signal),
-      this.fetchJsonEndpoint(connection.baseUrl, "/api/v1/workspaces", signal),
-    ]);
-
-    return {
-      connection,
-      sections: {
-        activeSessions: parseActiveSessions(stateResult.body),
-        operatorQueues: parseOperatorQueues(stateResult.body),
-        board: parseBoardSection(board),
-        workspaces: parseWorkspaceSection(workspaces),
-        activity: parseActivitySection(activity),
-      },
-    };
-  }
-
   async probeState(baseUrlSetting: string, token: string, signal?: AbortSignal): Promise<ConnectionState> {
     const tokenConfigured = token.trim().length > 0;
     const result = await this.fetchState(baseUrlSetting, signal);
     return classifyProbeResult(result, tokenConfigured);
   }
 
+  async fetchBoard(baseUrlSetting: string, options: { refresh?: boolean; signal?: AbortSignal | undefined } = {}): Promise<IssueBoardResponse> {
+    return this.fetchJson(baseUrlSetting, `/api/v1/board${options.refresh ? "?refresh=1" : ""}`, { signal: options.signal });
+  }
+
+  async fetchBoardIssue(
+    baseUrlSetting: string,
+    issueKey: string,
+    options: { refresh?: boolean; signal?: AbortSignal | undefined } = {},
+  ): Promise<BoardIssueDetailResponse> {
+    const query = options.refresh ? "?refresh=1" : "";
+    return this.fetchJson(baseUrlSetting, `/api/v1/board/issues/${encodeURIComponent(issueKey)}${query}`, { signal: options.signal });
+  }
+
+  async fetchActivity(
+    baseUrlSetting: string,
+    options: { issue?: string; offset?: number; limit?: number; signal?: AbortSignal | undefined } = {},
+  ): Promise<ActivityFeedResponse> {
+    const params = new URLSearchParams();
+    if (options.issue) params.set("issue", options.issue);
+    if (options.offset !== undefined) params.set("offset", String(options.offset));
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const queryString = params.toString();
+    const query = queryString ? `?${queryString}` : "";
+    return this.fetchJson(baseUrlSetting, `/api/v1/activity${query}`, { signal: options.signal });
+  }
+
+  async fetchRun(baseUrlSetting: string, runId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.fetchJson(baseUrlSetting, `/api/v1/runs/${encodeURIComponent(runId)}`, { signal });
+  }
+
+  async fetchTranscript(
+    baseUrlSetting: string,
+    runId: string,
+    options: { offset?: number; limit?: number; signal?: AbortSignal | undefined } = {},
+  ): Promise<TranscriptPage> {
+    const params = new URLSearchParams();
+    if (options.offset !== undefined) params.set("offset", String(options.offset));
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const queryString = params.toString();
+    const query = queryString ? `?${queryString}` : "";
+    return this.fetchJson(baseUrlSetting, `/api/v1/runs/${encodeURIComponent(runId)}/transcript${query}`, { signal: options.signal });
+  }
+
+  async openWorkspace(baseUrlSetting: string, issueKey: string, token: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.fetchJson(baseUrlSetting, `/api/v1/issues/${encodeURIComponent(issueKey)}/open-workspace`, {
+      method: "POST",
+      token,
+      signal,
+    });
+  }
+
   buildMutationHeaders(token: string): Record<string, string> {
     const trimmed = token.trim();
     return trimmed ? { [MUTATION_TOKEN_HEADER]: trimmed } : {};
-  }
-
-  async openWorkspace(baseUrlSetting: string, token: string, issueKey: string, signal?: AbortSignal): Promise<void> {
-    const baseUrl = normalizeBaseUrl(baseUrlSetting);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), SYMPHONY_PROBE_TIMEOUT_MS);
-    const abortFromCaller = () => controller.abort();
-    signal?.addEventListener("abort", abortFromCaller, { once: true });
-
-    try {
-      const response = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(issueKey)}/open-workspace`, {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          ...this.buildMutationHeaders(token),
-        },
-        signal: controller.signal,
-      });
-      if (response.status < 200 || response.status >= 300) {
-        throw new Error(`Symphony returned HTTP ${response.status} for open-workspace.`);
-      }
-    } catch (error) {
-      throw new Error(isAbortLikeError(error) ? "Open workspace request timed out." : errorMessage(error));
-    } finally {
-      clearTimeout(timeout);
-      signal?.removeEventListener("abort", abortFromCaller);
-    }
   }
 
   private async fetchState(baseUrlSetting: string, signal?: AbortSignal): Promise<ProbeResult> {
@@ -124,30 +109,56 @@ export class SymphonyClient {
     }
   }
 
-  private async fetchJsonEndpoint(baseUrl: string, path: string, signal?: AbortSignal): Promise<JsonEndpointResult> {
+  private async fetchJson<T>(
+    baseUrlSetting: string,
+    path: string,
+    options: { method?: "GET" | "POST"; token?: string; signal?: AbortSignal | undefined } = {},
+  ): Promise<T> {
+    const baseUrl = normalizeBaseUrl(baseUrlSetting);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), SYMPHONY_PROBE_TIMEOUT_MS);
     const abortFromCaller = () => controller.abort();
-    signal?.addEventListener("abort", abortFromCaller, { once: true });
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
 
     try {
       const response = await fetch(`${baseUrl}${path}`, {
-        headers: { Accept: "application/json" },
+        method: options.method ?? "GET",
+        headers: {
+          Accept: "application/json",
+          ...(options.method === "POST" ? { "Content-Type": "application/json" } : {}),
+          ...(options.method === "POST" ? this.buildMutationHeaders(options.token ?? "") : {}),
+        },
         signal: controller.signal,
       });
       const text = await response.text();
-      let body: unknown;
-      try {
-        body = text ? JSON.parse(text) : null;
-      } catch (error) {
-        return { kind: "parse_failure", status: response.status, detail: errorMessage(error) };
+      const body = parseJsonResponse(text);
+      if (!response.ok) {
+        throw new Error(`Symphony returned HTTP ${response.status}${errorDetail(body)}`);
       }
-      return { kind: "http", status: response.status, body };
-    } catch (error) {
-      return { kind: "network", detail: isAbortLikeError(error) ? "Request timed out." : errorMessage(error) };
+      return body as T;
     } finally {
       clearTimeout(timeout);
-      signal?.removeEventListener("abort", abortFromCaller);
+      options.signal?.removeEventListener("abort", abortFromCaller);
     }
   }
+}
+
+function parseJsonResponse(text: string): unknown {
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Failed to parse Symphony response: ${errorMessage(error)}`);
+  }
+}
+
+function errorDetail(body: unknown): string {
+  if (typeof body !== "object" || body === null || !("error" in body)) return ".";
+  const error = (body as { error?: unknown }).error;
+  if (typeof error === "string" && error.trim()) return `: ${error}`;
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return `: ${message}`;
+  }
+  return ".";
 }

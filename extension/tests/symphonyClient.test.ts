@@ -24,110 +24,6 @@ describe("SymphonyClient", () => {
     expect(JSON.stringify(fetchMock.mock.calls[0])).not.toContain(MUTATION_TOKEN_HEADER);
   });
 
-  it("fetches dashboard sections from public read endpoints without token headers", async () => {
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.endsWith("/api/v1/state")) {
-        return new Response(
-          JSON.stringify({
-            generatedAt: "2026-01-01T00:00:00.000Z",
-            operatorView: {
-              running: [{ issueIdentifier: "TEST-1", role: "worker", liveness: { status: "running" } }],
-              paused: [],
-              orphaned: [],
-              retrying: [],
-              mutationsRequireToken: true,
-            },
-          }),
-          { status: 200 },
-        );
-      }
-      if (url.endsWith("/api/v1/board?refresh=1")) {
-        return new Response(JSON.stringify({ columns: [{ id: "todo", title: "Todo", count: 1 }], counts: { total: 1 } }), {
-          status: 200,
-        });
-      }
-      if (url.endsWith("/api/v1/activity?offset=0&limit=20")) {
-        return new Response(JSON.stringify({ activity: [], counts: { totalItems: 0 } }), { status: 200 });
-      }
-      if (url.endsWith("/api/v1/workspaces")) {
-        return new Response(JSON.stringify({ workspaces: [] }), { status: 200 });
-      }
-      return new Response("not found", { status: 404 });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const state = await new SymphonyClient().fetchDashboard("http://127.0.0.1:7331/", "secret", undefined, { refreshBoard: true });
-
-    expect(state.connection.kind).toBe("connected");
-    expect(state.sections?.operatorQueues).toMatchObject({ status: "ready", data: { running: [{ issueIdentifier: "TEST-1" }] } });
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "http://127.0.0.1:7331/api/v1/state",
-      "http://127.0.0.1:7331/api/v1/board?refresh=1",
-      "http://127.0.0.1:7331/api/v1/activity?offset=0&limit=20",
-      "http://127.0.0.1:7331/api/v1/workspaces",
-    ]);
-    expect(JSON.stringify(fetchMock.mock.calls)).not.toContain(MUTATION_TOKEN_HEADER);
-  });
-
-  it("keeps the dashboard connected when the board tracker is unavailable", async () => {
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.endsWith("/api/v1/state")) {
-        return new Response(JSON.stringify({ generatedAt: "2026-01-01T00:00:00.000Z", operatorView: {} }), { status: 200 });
-      }
-      if (url.endsWith("/api/v1/board")) {
-        return new Response(JSON.stringify({ error: { code: "tracker_unavailable", message: "Issue board requires a configured tracker client" } }), {
-          status: 503,
-        });
-      }
-      if (url.endsWith("/api/v1/workspaces")) {
-        return new Response(JSON.stringify({ workspaces: [] }), { status: 200 });
-      }
-      return new Response(JSON.stringify({ activity: [], counts: { totalItems: 0 } }), { status: 200 });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const state = await new SymphonyClient().fetchDashboard("http://127.0.0.1:7331", "");
-
-    expect(state.connection.kind).toBe("connected");
-    expect(state.sections?.board).toMatchObject({ status: "unavailable" });
-  });
-
-  it("keeps the dashboard connected when activity fails", async () => {
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.endsWith("/api/v1/state")) {
-        return new Response(JSON.stringify({ generatedAt: "2026-01-01T00:00:00.000Z", operatorView: { running: [] } }), { status: 200 });
-      }
-      if (url.endsWith("/api/v1/board")) {
-        return new Response(JSON.stringify({ columns: [], counts: { total: 0 } }), { status: 200 });
-      }
-      if (url.endsWith("/api/v1/activity?offset=0&limit=20")) {
-        return new Response(JSON.stringify({ error: { message: "activity unavailable" } }), { status: 500 });
-      }
-      if (url.endsWith("/api/v1/workspaces")) {
-        return new Response(JSON.stringify({ workspaces: [] }), { status: 200 });
-      }
-      return new Response("not found", { status: 404 });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const state = await new SymphonyClient().fetchDashboard("http://127.0.0.1:7331", "");
-
-    expect(state.connection.kind).toBe("connected");
-    expect(state.sections?.activity).toMatchObject({ status: "error" });
-    expect(state.sections?.operatorQueues).toMatchObject({ status: "ready" });
-  });
-
-  it("skips dashboard section fetches when the state probe fails", async () => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: "down" }), { status: 503 }));
-    vi.stubGlobal("fetch", fetchMock);
-
-    const state = await new SymphonyClient().fetchDashboard("http://127.0.0.1:7331", "");
-
-    expect(state.connection).toMatchObject({ kind: "error", reason: "http_status" });
-    expect(state.sections).toBeNull();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
   it("builds mutation headers only when a token is configured", () => {
     const client = new SymphonyClient();
 
@@ -135,19 +31,48 @@ describe("SymphonyClient", () => {
     expect(client.buildMutationHeaders(" token ")).toEqual({ [MUTATION_TOKEN_HEADER]: "token" });
   });
 
-  it("opens workspaces through the public mutation endpoint with token only on the POST", async () => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ opened: true }), { status: 202 }));
+  it("reads board, activity, run, and transcript endpoints without mutation headers", async () => {
+    const fetchMock = vi.fn(async (_input: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new SymphonyClient();
+
+    await client.fetchBoard("http://127.0.0.1:7331/", { refresh: true });
+    await client.fetchBoardIssue("http://127.0.0.1:7331/", "ENG-8", { refresh: true });
+    await client.fetchActivity("http://127.0.0.1:7331/", { issue: "ENG-8", offset: 50, limit: 25 });
+    await client.fetchRun("http://127.0.0.1:7331/", "run-1");
+    await client.fetchTranscript("http://127.0.0.1:7331/", "run-1", { offset: 100, limit: 50 });
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "http://127.0.0.1:7331/api/v1/board?refresh=1",
+      "http://127.0.0.1:7331/api/v1/board/issues/ENG-8?refresh=1",
+      "http://127.0.0.1:7331/api/v1/activity?issue=ENG-8&offset=50&limit=25",
+      "http://127.0.0.1:7331/api/v1/runs/run-1",
+      "http://127.0.0.1:7331/api/v1/runs/run-1/transcript?offset=100&limit=50",
+    ]);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(JSON.stringify(init)).not.toContain(MUTATION_TOKEN_HEADER);
+    }
+  });
+
+  it("sends the mutation token only for open workspace", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ opened: true }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await new SymphonyClient().openWorkspace("http://127.0.0.1:7331/", " secret ", "ENG-6");
+    await new SymphonyClient().openWorkspace("http://127.0.0.1:7331/", "ENG-8", " token ");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:7331/api/v1/issues/ENG-6/open-workspace",
+      "http://127.0.0.1:7331/api/v1/issues/ENG-8/open-workspace",
       expect.objectContaining({
         method: "POST",
-        headers: { Accept: "application/json", [MUTATION_TOKEN_HEADER]: "secret" },
+        headers: expect.objectContaining({ [MUTATION_TOKEN_HEADER]: "token" }),
       }),
     );
+  });
+
+  it("surfaces status API error details", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: { message: "tracker missing" } }), { status: 503 })));
+
+    await expect(new SymphonyClient().fetchBoard("http://127.0.0.1:7331")).rejects.toThrow("tracker missing");
   });
 
   it("classifies timeout aborts as offline", async () => {

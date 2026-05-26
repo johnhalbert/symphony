@@ -1,396 +1,180 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type * as vscodeTypes from "vscode";
-import type { DashboardViewState } from "../src/dashboardTypes";
-import type { SymphonyClient } from "../src/symphonyClient";
-import { SymphonyPanelProvider } from "../src/webviewProvider";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { BoardIssueDetailResponse } from "../src/statusApiTypes";
+import type { ExtensionMessage } from "../src/webviewMessages";
 
-type MessageHandler = (message: unknown) => void;
+const settings = vi.hoisted(() => ({ baseUrl: "http://127.0.0.1:7331", token: "" }));
 
-const settingsState = vi.hoisted(() => ({
-  baseUrl: "http://127.0.0.1:7331",
-  token: "token",
+vi.mock("vscode", () => ({
+  commands: { executeCommand: vi.fn() },
+  Uri: { joinPath: vi.fn() },
+  window: {
+    createWebviewPanel: vi.fn(),
+  },
+  workspace: {
+    getConfiguration: () => ({
+      get: (key: string) => (key === "baseUrl" ? settings.baseUrl : settings.token),
+    }),
+  },
 }));
 
-const vscodeMock = vi.hoisted(() => {
-  return {
-    commands: { executeCommand: vi.fn(async () => undefined) },
-    window: {
-      createWebviewPanel: vi.fn(),
-      showInformationMessage: vi.fn(),
-      showWarningMessage: vi.fn(),
-    },
-    workspace: {
-      getConfiguration: vi.fn(() => ({
-        get: vi.fn((key: string) => (key === "baseUrl" ? "http://127.0.0.1:7331" : "token")),
-      })),
-    },
-    Uri: {
-      joinPath: vi.fn((_base: unknown, ...parts: string[]) => ({ toString: () => parts.join("/") })),
-    },
-    ViewColumn: { Beside: 2 },
-  };
-});
-
-vi.mock("vscode", () => vscodeMock);
-
-vi.mock("../src/settings", () => ({
-  readSymphonySettings: () => ({ ...settingsState }),
+vi.mock("../src/settings.js", () => ({
+  normalizeBaseUrl: (value: string) => new URL(value.trim().replace(/\/+$/, "")).toString().replace(/\/+$/, ""),
+  readSymphonySettings: () => ({ baseUrl: settings.baseUrl, token: settings.token }),
 }));
 
-describe("SymphonyPanelProvider", () => {
+describe("SymphonyPanelProvider message handling", () => {
   beforeEach(() => {
-    vi.useRealTimers();
-    settingsState.baseUrl = "http://127.0.0.1:7331";
-    settingsState.token = "token";
+    settings.baseUrl = "http://127.0.0.1:7331";
+    settings.token = "";
     vi.clearAllMocks();
   });
 
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.restoreAllMocks();
+  it("posts issue detail with an inline activity error when activity fails", async () => {
+    const client = fakeClient();
+    client.fetchBoardIssue.mockResolvedValue(issueDetail("ENG-8"));
+    client.fetchActivity.mockRejectedValue(new Error("activity down"));
+    const { provider, messages } = await testProvider(client);
+
+    await provider.loadIssue("ENG-8");
+
+    const state = messages.find((message) => message.type === "issueDetailState");
+    expect(state).toMatchObject({
+      type: "issueDetailState",
+      issueKey: "ENG-8",
+      offset: 0,
+      detail: issueDetail("ENG-8"),
+      activity: null,
+      activityError: "activity down",
+    });
+    expect(state).not.toHaveProperty("error");
   });
 
-  it("suppresses stale rapid refresh results", async () => {
-    let resolveFirst!: (state: DashboardViewState) => void;
-    const client = {
-      fetchDashboard: vi
-        .fn()
-        .mockImplementationOnce(() => new Promise<DashboardViewState>((resolve) => {
-          resolveFirst = resolve;
-        }))
-        .mockResolvedValueOnce(stateFor("new")),
-      openWorkspace: vi.fn(),
-    } satisfies Pick<SymphonyClient, "fetchDashboard" | "openWorkspace">;
-    const provider = new SymphonyPanelProvider(extensionUri(), client as unknown as SymphonyClient);
-    const view = webviewView(false);
-    provider.resolveWebviewView(view);
+  it("posts transcriptError without a run error when run metadata succeeds", async () => {
+    const client = fakeClient();
+    client.fetchRun.mockResolvedValue({ runId: "run-1" });
+    client.fetchTranscript.mockRejectedValue(new Error("transcript down"));
+    const { provider, messages } = await testProvider(client);
 
-    const first = provider.refreshDashboard("retry");
-    const second = provider.refreshDashboard("retry");
-    await second;
-    resolveFirst(stateFor("old"));
-    await first;
+    await provider.loadRun("run-1");
 
-    expect(view.webview.postMessage).toHaveBeenCalledTimes(1);
-    expect(view.webview.postMessage).toHaveBeenCalledWith({ type: "dashboardState", state: stateFor("new") });
+    const state = messages.find((message) => message.type === "runState");
+    expect(state).toMatchObject({
+      type: "runState",
+      runId: "run-1",
+      offset: 0,
+      run: { runId: "run-1" },
+      transcript: null,
+      transcriptError: "transcript down",
+    });
+    expect(state).not.toHaveProperty("error");
   });
 
-  it("starts fallback panel polling and stops it on dispose", async () => {
-    vi.useFakeTimers();
-    const client = {
-      fetchDashboard: vi.fn(async () => stateFor("panel")),
-      openWorkspace: vi.fn(),
-    } satisfies Pick<SymphonyClient, "fetchDashboard" | "openWorkspace">;
-    const panel = webviewPanel(true);
-    vscodeMock.window.createWebviewPanel.mockReturnValue(panel);
-    const provider = new SymphonyPanelProvider(extensionUri(), client as unknown as SymphonyClient);
+  it("tags transcript append failures without clearing run metadata", async () => {
+    const client = fakeClient();
+    client.fetchRun.mockResolvedValue({ runId: "run-1" });
+    client.fetchTranscript.mockResolvedValueOnce({ runId: "run-1", offset: 0, limit: 100, nextOffset: 100, events: [] });
+    const { provider, messages } = await testProvider(client);
+    await provider.loadRun("run-1");
+    messages.length = 0;
+    client.fetchTranscript.mockRejectedValueOnce(new Error("page down"));
 
-    await provider.openPanel();
+    await provider.loadTranscript("run-1", 100);
 
-    expect(vi.getTimerCount()).toBe(1);
-    panel.disposeCallback?.();
-    expect(vi.getTimerCount()).toBe(0);
+    expect(messages).toEqual([
+      expect.objectContaining({
+        type: "runState",
+        runId: "run-1",
+        offset: 100,
+        run: null,
+        transcript: null,
+        transcriptError: "page down",
+        appendTranscript: true,
+      }),
+    ]);
+    expect(messages[0]).not.toHaveProperty("error");
   });
 
-  it("handles open-workspace messages through the client and refreshes once", async () => {
-    const client = {
-      fetchDashboard: vi.fn(async () => stateFor("refreshed", { workspaceIssueKey: "ENG-6" })),
-      openWorkspace: vi.fn(async () => undefined),
-    } satisfies Pick<SymphonyClient, "fetchDashboard" | "openWorkspace">;
-    const provider = new SymphonyPanelProvider(extensionUri(), client as unknown as SymphonyClient);
-    const view = webviewView(false);
-    provider.resolveWebviewView(view);
-    await provider.refreshDashboard("visible");
-    client.fetchDashboard.mockClear();
+  it("refetches and tags global activity head on later dashboard refreshes", async () => {
+    const client = fakeClient();
+    client.fetchBoard.mockResolvedValue({ generatedAt: "now", tracker: {}, columns: [], issues: [], counts: {} });
+    client.fetchActivity.mockResolvedValue({ generatedAt: "now", offset: 0, limit: 50, nextOffset: 50, activity: [], counts: {}, source: {}, filter: { issue: null } });
+    const { provider, messages } = await testProvider(client);
 
-    view.webview.messageHandler?.({ type: "openWorkspace", issueKey: "ENG-6" });
-    await vi.waitFor(() => expect(client.openWorkspace).toHaveBeenCalledWith("http://127.0.0.1:7331", "token", "ENG-6"));
-    await vi.waitFor(() => expect(client.fetchDashboard).toHaveBeenCalledTimes(1));
+    await provider.loadDashboard({ refresh: false });
+    messages.length = 0;
+    await provider.loadDashboard({ refresh: true });
 
-    expect(vscodeMock.window.showInformationMessage).toHaveBeenCalledWith("Opened Symphony workspace for ENG-6.");
-  });
-
-  it("rejects open-workspace messages before dashboard state is loaded", async () => {
-    const client = {
-      fetchDashboard: vi.fn(async () => stateFor("unused")),
-      openWorkspace: vi.fn(async () => undefined),
-    } satisfies Pick<SymphonyClient, "fetchDashboard" | "openWorkspace">;
-    const provider = new SymphonyPanelProvider(extensionUri(), client as unknown as SymphonyClient);
-    const view = webviewView(false);
-    provider.resolveWebviewView(view);
-
-    view.webview.messageHandler?.({ type: "openWorkspace", issueKey: "ENG-6" });
-
-    await vi.waitFor(() =>
-      expect(vscodeMock.window.showWarningMessage).toHaveBeenCalledWith("Unable to open Symphony workspace: Dashboard state unavailable."),
+    expect(client.fetchActivity).toHaveBeenCalledTimes(2);
+    expect(client.fetchActivity).toHaveBeenLastCalledWith(settings.baseUrl, expect.objectContaining({ offset: 0, limit: 50 }));
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: "dashboardState",
+        activity: expect.objectContaining({ offset: 0 }),
+        reconcileActivityHead: true,
+      }),
     );
-    expect(client.openWorkspace).not.toHaveBeenCalled();
   });
 
-  it("rejects open-workspace messages when the dashboard is not connected", async () => {
-    const client = {
-      fetchDashboard: vi.fn(async (): Promise<DashboardViewState> => ({
-        connection: { kind: "offline", baseUrl: "http://127.0.0.1:7331", reason: "network", detail: "offline" },
-        sections: null,
-      })),
-      openWorkspace: vi.fn(async () => undefined),
-    } satisfies Pick<SymphonyClient, "fetchDashboard" | "openWorkspace">;
-    const provider = new SymphonyPanelProvider(extensionUri(), client as unknown as SymphonyClient);
-    const view = webviewView(false);
-    provider.resolveWebviewView(view);
-    await provider.refreshDashboard("visible");
+  it("refreshes selected issue activity head with the resolved activity key", async () => {
+    const client = fakeClient();
+    client.fetchBoard.mockResolvedValue({ generatedAt: "now", tracker: {}, columns: [], issues: [], counts: {} });
+    client.fetchBoardIssue.mockResolvedValue(issueDetail("ENG-8", "issue-id"));
+    client.fetchActivity.mockResolvedValue({ generatedAt: "now", offset: 0, limit: 50, nextOffset: null, activity: [], counts: {}, source: {}, filter: { issue: null } });
+    const { provider, messages } = await testProvider(client);
 
-    view.webview.messageHandler?.({ type: "openWorkspace", issueKey: "ENG-6" });
+    await provider.loadIssue("issue-id");
+    messages.length = 0;
+    await provider.loadDashboard({ refresh: true });
 
-    await vi.waitFor(() =>
-      expect(vscodeMock.window.showWarningMessage).toHaveBeenCalledWith("Unable to open Symphony workspace: Dashboard state unavailable."),
+    expect(client.fetchActivity).toHaveBeenCalledWith(settings.baseUrl, expect.objectContaining({ issue: "ENG-8", offset: 0, limit: 50 }));
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: "issueDetailState",
+        issueKey: "issue-id",
+        activity: expect.objectContaining({ offset: 0 }),
+        reconcileActivityHead: true,
+      }),
     );
-    expect(client.openWorkspace).not.toHaveBeenCalled();
-  });
-
-  it("rejects unknown policy, required-token, and missing-workspace messages", async () => {
-    const client = {
-      fetchDashboard: vi.fn(async () => stateFor("unknown-policy", { mutationsRequireToken: null, workspaceIssueKey: "ENG-6" })),
-      openWorkspace: vi.fn(async () => undefined),
-    } satisfies Pick<SymphonyClient, "fetchDashboard" | "openWorkspace">;
-    const provider = new SymphonyPanelProvider(extensionUri(), client as unknown as SymphonyClient);
-    const view = webviewView(false);
-    provider.resolveWebviewView(view);
-    await provider.refreshDashboard("visible");
-
-    view.webview.messageHandler?.({ type: "openWorkspace", issueKey: "ENG-6" });
-    await vi.waitFor(() =>
-      expect(vscodeMock.window.showWarningMessage).toHaveBeenCalledWith("Unable to open Symphony workspace: Mutation policy unavailable."),
-    );
-    expect(client.openWorkspace).not.toHaveBeenCalled();
-
-    vi.clearAllMocks();
-    client.fetchDashboard.mockResolvedValueOnce(stateFor("missing-token", { mutationsRequireToken: true, tokenConfigured: true, workspaceIssueKey: "ENG-6" }));
-    settingsState.token = "";
-    await provider.refreshDashboard("visible");
-    view.webview.messageHandler?.({ type: "openWorkspace", issueKey: "ENG-6" });
-    await vi.waitFor(() =>
-      expect(vscodeMock.window.showWarningMessage).toHaveBeenCalledWith("Unable to open Symphony workspace: Configure symphony.token to enable."),
-    );
-    expect(client.openWorkspace).not.toHaveBeenCalled();
-
-    vi.clearAllMocks();
-    settingsState.token = "token";
-    client.fetchDashboard.mockResolvedValueOnce(stateFor("missing-workspace", { workspaceIssueKey: null }));
-    await provider.refreshDashboard("visible");
-    view.webview.messageHandler?.({ type: "openWorkspace", issueKey: "CRAFTED-KEY" });
-    await vi.waitFor(() =>
-      expect(vscodeMock.window.showWarningMessage).toHaveBeenCalledWith("Unable to open Symphony workspace: No workspace context."),
-    );
-    expect(client.openWorkspace).not.toHaveBeenCalled();
-  });
-
-  it("allows open-workspace without a token when policy does not require one", async () => {
-    settingsState.token = "";
-    const client = {
-      fetchDashboard: vi.fn(async () => stateFor("allowed", { mutationsRequireToken: false, tokenConfigured: false, workspaceIssueKey: "ENG-6" })),
-      openWorkspace: vi.fn(async () => undefined),
-    } satisfies Pick<SymphonyClient, "fetchDashboard" | "openWorkspace">;
-    const provider = new SymphonyPanelProvider(extensionUri(), client as unknown as SymphonyClient);
-    const view = webviewView(false);
-    provider.resolveWebviewView(view);
-    await provider.refreshDashboard("visible");
-    client.fetchDashboard.mockClear();
-
-    view.webview.messageHandler?.({ type: "openWorkspace", issueKey: "ENG-6" });
-
-    await vi.waitFor(() => expect(client.openWorkspace).toHaveBeenCalledWith("http://127.0.0.1:7331", "", "ENG-6"));
-    expect(vscodeMock.window.showWarningMessage).not.toHaveBeenCalled();
-  });
-
-  it("allows workspace context from board and operator rows", async () => {
-    const client = {
-      fetchDashboard: vi.fn(async () => stateFor("board", { workspaceIssueKey: "BOARD-1", workspaceSource: "board" })),
-      openWorkspace: vi.fn(async () => undefined),
-    } satisfies Pick<SymphonyClient, "fetchDashboard" | "openWorkspace">;
-    const provider = new SymphonyPanelProvider(extensionUri(), client as unknown as SymphonyClient);
-    const view = webviewView(false);
-    provider.resolveWebviewView(view);
-    await provider.refreshDashboard("visible");
-
-    view.webview.messageHandler?.({ type: "openWorkspace", issueKey: "BOARD-1" });
-    await vi.waitFor(() => expect(client.openWorkspace).toHaveBeenCalledWith("http://127.0.0.1:7331", "token", "BOARD-1"));
-    await vi.waitFor(() => expect(client.fetchDashboard).toHaveBeenCalledTimes(2));
-
-    client.openWorkspace.mockClear();
-    client.fetchDashboard.mockClear();
-    client.fetchDashboard.mockResolvedValueOnce(stateFor("operator", { workspaceIssueKey: "RUN-1", workspaceSource: "operator" }));
-    await provider.refreshDashboard("visible");
-    view.webview.messageHandler?.({ type: "openWorkspace", issueKey: "RUN-1" });
-    await vi.waitFor(() => expect(client.openWorkspace).toHaveBeenCalledWith("http://127.0.0.1:7331", "token", "RUN-1"));
   });
 });
 
-function extensionUri(): vscodeTypes.Uri {
-  return { toString: () => "extension:" } as vscodeTypes.Uri;
-}
-
-function webviewView(visible: boolean): vscodeTypes.WebviewView & { webview: TestWebview } {
-  const webview = testWebview();
+function fakeClient() {
   return {
-    visible,
-    webview,
-    onDidChangeVisibility: vi.fn(),
-  } as unknown as vscodeTypes.WebviewView & { webview: TestWebview };
-}
-
-function webviewPanel(visible: boolean): vscodeTypes.WebviewPanel & { disposeCallback?: () => void } {
-  const panel: {
-    visible: boolean;
-    webview: TestWebview;
-    onDidDispose: ReturnType<typeof vi.fn>;
-    onDidChangeViewState: ReturnType<typeof vi.fn>;
-    reveal: ReturnType<typeof vi.fn>;
-    dispose: ReturnType<typeof vi.fn>;
-    disposeCallback?: () => void;
-  } = {
-    visible,
-    webview: testWebview(),
-    onDidDispose: vi.fn((callback: () => void) => {
-      panel.disposeCallback = callback;
-      return { dispose: vi.fn() };
-    }),
-    onDidChangeViewState: vi.fn(),
-    reveal: vi.fn(),
-    dispose: vi.fn(),
+    fetchBoard: vi.fn(),
+    fetchBoardIssue: vi.fn(),
+    fetchActivity: vi.fn(),
+    fetchRun: vi.fn(),
+    fetchTranscript: vi.fn(),
+    openWorkspace: vi.fn(),
+    probeState: vi.fn(),
   };
-  return panel as unknown as vscodeTypes.WebviewPanel & { disposeCallback?: () => void };
 }
 
-type TestWebview = vscodeTypes.Webview & {
-  html: string;
-  messageHandler?: MessageHandler;
-  postMessage: ReturnType<typeof vi.fn>;
-};
-
-function testWebview(): TestWebview {
-  const webview = {
-    html: "",
-    cspSource: "vscode-resource:",
-    options: {},
-    asWebviewUri: vi.fn((uri: vscodeTypes.Uri) => uri),
-    onDidReceiveMessage: vi.fn((handler: MessageHandler) => {
-      webview.messageHandler = handler;
-      return { dispose: vi.fn() };
-    }),
-    postMessage: vi.fn(async () => true),
-  } as unknown as TestWebview;
-  return webview;
-}
-
-function stateFor(
-  label: string,
-  options: {
-    mutationsRequireToken?: boolean | null;
-    tokenConfigured?: boolean;
-    workspaceIssueKey?: string | null;
-    workspaceSource?: "active" | "operator" | "board" | "workspaces";
-  } = {},
-): DashboardViewState {
-  const workspaceIssueKey = options.workspaceIssueKey;
-  const issueKey = workspaceIssueKey ?? "";
-  const workspaceSource = options.workspaceSource ?? "workspaces";
-  const workspace = workspaceIssueKey ? workspaceContext(workspaceIssueKey) : null;
-  return {
-    connection: {
-      kind: "connected",
-      baseUrl: "http://127.0.0.1:7331",
-      generatedAt: label,
-      summary: {
-        runningCount: 0,
-        retryingCount: 0,
-        tokenConfigured: options.tokenConfigured ?? true,
-        mutationsRequireToken: options.mutationsRequireToken === undefined ? false : options.mutationsRequireToken,
-      },
+async function testProvider(client: ReturnType<typeof fakeClient>) {
+  const { SymphonyPanelProvider } = await import("../src/webviewProvider.js");
+  const provider = new SymphonyPanelProvider({} as never, client as never);
+  const messages: ExtensionMessage[] = [];
+  Object.defineProperty(provider, "postWebviewMessage", {
+    value: async (message: ExtensionMessage) => {
+      messages.push(message);
     },
-    sections: {
-      activeSessions: {
-        status: "ready",
-        data: {
-          sessions:
-            workspace && workspaceSource === "active"
-              ? [
-                  {
-                    issueIdentifier: issueKey,
-                    issueKey,
-                    role: "worker",
-                    statusLabel: "running",
-                    runId: "run-1",
-                    detail: null,
-                    workspace,
-                  },
-                ]
-              : [],
-        },
-      },
-      operatorQueues: {
-        status: "ready",
-        data: {
-          running:
-            workspace && workspaceSource === "operator"
-              ? [
-                  {
-                    issueIdentifier: issueKey,
-                    issueKey,
-                    role: "worker",
-                    statusLabel: "running",
-                    detail: null,
-                    workspace,
-                  },
-                ]
-              : [],
-          paused: [],
-          orphaned: [],
-          retrying: [],
-        },
-      },
-      board: {
-        status: "ready",
-        data: {
-          generatedAt: label,
-          columns: [],
-          counts: null,
-          issues:
-            workspace && workspaceSource === "board"
-              ? [{ issueIdentifier: issueKey, issueKey, title: null, state: null, workspace }]
-              : [],
-        },
-      },
-      workspaces: {
-        status: "ready",
-        data: {
-          rows:
-            workspace && workspaceSource === "workspaces"
-              ? [
-                  {
-                    workspaceKey: workspace.workspaceKey ?? issueKey,
-                    issueIdentifier: issueKey,
-                    issueKey,
-                    path: workspace.path ?? `C:\\workspaces\\${issueKey}`,
-                    sourceKind: workspace.sourceKind,
-                    branchName: workspace.branchName,
-                  },
-                ]
-              : [],
-        },
-      },
-      activity: { status: "ready", data: { items: [], totalItems: 0 } },
+  });
+  return {
+    provider: provider as unknown as {
+      loadDashboard(options: { refresh: boolean }): Promise<void>;
+      loadIssue(issueKey: string): Promise<void>;
+      loadRun(runId: string): Promise<void>;
+      loadTranscript(runId: string, offset: number): Promise<void>;
     },
+    messages,
   };
 }
 
-function workspaceContext(issueKey: string) {
+function issueDetail(issue: string, id = issue): BoardIssueDetailResponse {
   return {
-    workspaceKey: issueKey,
-    issueId: issueKey,
-    issueIdentifier: issueKey,
-    path: `C:\\workspaces\\${issueKey}`,
-    sourceKind: "dogfood",
-    branchName: "eng-6",
-  };
+    issue,
+    issueDetails: {
+      issue: { identifier: issue, id },
+    },
+  } as BoardIssueDetailResponse;
 }

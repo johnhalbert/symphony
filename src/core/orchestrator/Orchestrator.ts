@@ -44,6 +44,7 @@ import {
   type TranscriptEvent,
   type UpdateRunInput,
 } from "../persistence/RunTranscriptStore.js";
+import { sanitizeAgentEventForPublicOutput } from "../transcript/TranscriptProjection.js";
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
   buildWorkerHandoffPacket,
@@ -1240,7 +1241,8 @@ export class Orchestrator {
     events: AsyncIterable<AgentEvent>,
     context: { workspace: Workspace; prompt: string; attempt: number | null; turnNumber: number },
   ): Promise<void> {
-    for await (const event of events) {
+    for await (const rawEvent of events) {
+      const event = sanitizeAgentEventForPublicOutput(rawEvent);
       const eventAt = new Date(event.at ?? Date.now());
       if (event.type === "run_status") {
         entry.sdkRunStatus = event.sdkStatus;
@@ -1724,6 +1726,10 @@ export class Orchestrator {
     runPhase: AgentRunPhase = "implementation",
   ): void {
     this.clearRetry(issueId);
+    if (this.stopped) {
+      this.claimed.delete(issueId);
+      return;
+    }
     const dueAtMs = Date.now() + delayMs;
     const timer = setTimeout(() => {
       void this.onRetryTimer(issueId);

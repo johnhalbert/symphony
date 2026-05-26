@@ -14,15 +14,15 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("symphony.openSettings", () =>
       vscode.commands.executeCommand("workbench.action.openSettings", "symphony.baseUrl"),
     ),
-    vscode.commands.registerCommand("symphony.refresh", () => provider.refreshDashboard("command")),
+    vscode.commands.registerCommand("symphony.refresh", () => provider.reprobe()),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("symphony.baseUrl") || event.affectsConfiguration("symphony.token")) {
-        void provider.refreshDashboard("config");
+        void provider.reprobe();
       }
     }),
   );
 
-  void provider.refreshDashboard("activate");
+  void provider.reprobe();
 }
 
 export function deactivate(): void {
