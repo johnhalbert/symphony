@@ -320,6 +320,7 @@ describe("TransitionPolicy review-loop planners", () => {
       {
         issue: issue({ state: "Ready to Merge" }),
         gateId: "merge-gate:issue-1:pr-42:head-sha-1",
+        blockerFingerprint: "head-sha-1:lint:missing|test:failure",
         fromState: "Ready to Merge",
         pullRequest: {
           number: 42,
@@ -340,10 +341,10 @@ describe("TransitionPolicy review-loop planners", () => {
 
     expect(operations).toHaveLength(2);
     expect(operations[0]).toMatchObject({
-      idempotencyKey: "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:r1",
+      idempotencyKey: "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_lint_missing_test_failure:r1",
       kind: "comment",
       payload: {
-        dedupeKey: "merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:r1",
+        dedupeKey: "merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_lint_missing_test_failure:r1",
       },
     });
     expect(commentBody(operations, 0)).toContain("## Symphony Merge Gate");
@@ -355,7 +356,7 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(commentBody(operations, 0)).toContain("lint: missing");
     expect(commentBody(operations, 0)).toContain("typecheck: pending (https://ci.test/typecheck)");
     expect(operations[1]).toMatchObject({
-      idempotencyKey: "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:r1:In Progress",
+      idempotencyKey: "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_lint_missing_test_failure:r1:In Progress",
       kind: "transition",
       payload: {
         fromStates: ["Ready to Merge"],
@@ -370,6 +371,7 @@ describe("TransitionPolicy review-loop planners", () => {
       {
         issue: issue({ state: "Ready to Merge" }),
         gateId: "merge-gate:issue-1:pr-42:head-sha-1",
+        blockerFingerprint: "head-sha-1:test:failure",
         fromState: "Ready to Merge",
         pullRequest: {
           number: 42,
@@ -391,7 +393,7 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(commentBody(operations, 0)).toContain("Status: blocked, human action required");
     expect(commentBody(operations, 0)).toContain("Transitioning to blocked state: Blocked");
     expect(operations[1]).toMatchObject({
-      idempotencyKey: "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:r3:Blocked",
+      idempotencyKey: "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:head-sha-1_test_failure:r3:Blocked",
       kind: "transition",
       payload: {
         fromStates: ["Ready to Merge"],

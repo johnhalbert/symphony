@@ -801,10 +801,73 @@ describe("MergePolicyService", () => {
       reviewer: "symphony-merge-gate",
       findings: ["Required check failed: test: failure / failure (https://ci.test/test)"],
       writebackOperationKeys: [
-        "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:r1",
-        "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:r1:In Progress",
+        "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_test_failure:r1",
+        "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_test_failure:r1:In Progress",
       ],
     });
+  });
+
+  it("treats stale required checks as actionable merge-gate failures", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient({
+        checkResults: [{ name: "test", status: "failure", conclusion: "stale", url: "https://ci.test/test" }],
+      }),
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("repair_dispatched");
+    expect(writer.transitions).toHaveLength(1);
+    expect(lifecycle?.mergeGate?.checks).toMatchObject([{ name: "test", rawStatus: "failure", outcome: "failing", conclusion: "stale" }]);
+  });
+
+  it("accepts neutral and skipped required checks as passing for gated merge", async () => {
+    const config = mergeConfig({ requiredChecks: ["test", "typecheck"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({
+      checkResults: [
+        { name: "test", status: "success", conclusion: "neutral", url: "https://ci.test/test" },
+        { name: "typecheck", status: "success", conclusion: "skipped", url: "https://ci.test/typecheck" },
+      ],
+    });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result.status).toBe("merged");
+    expect(client.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-1" });
   });
 
   it("redispatches a same-head merge gate failure after review pass with a fresh repair round", async () => {
@@ -866,8 +929,8 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.mergeGate?.repairReportId).toBeNull();
     expect(gateVerdicts).toHaveLength(1);
     expect(gateVerdicts[0]?.writebackOperationKeys).toEqual([
-      "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:r2",
-      "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:r2:In Progress",
+      "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_test_failure:r2",
+      "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_test_failure:r2:In Progress",
     ]);
     expect(client.mergeInput).toBeNull();
   });
@@ -927,8 +990,8 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
     expect(lifecycle?.blockedReason).toContain("3/3");
     expect(lifecycle?.reviewVerdicts.find((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")?.writebackOperationKeys).toEqual([
-      "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:r3",
-      "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:r3:Blocked",
+      "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:head-sha-1_test_failure:r3",
+      "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:head-sha-1_test_failure:r3:Blocked",
     ]);
   });
 
@@ -1270,6 +1333,67 @@ describe("MergePolicyService", () => {
       checks: [{ name: "test", outcome: "passing" }, { name: "typecheck", outcome: "missing_actionable" }],
     });
     expect(lifecycle?.reviewVerdicts.filter((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
+  });
+
+  it("dispatches distinct merge-gate writebacks when the same-head blocker fingerprint changes", async () => {
+    const config = mergeConfig({ requiredChecks: ["test", "typecheck"] });
+    config.mergePolicy.sourceStates.push("In Progress");
+    config.mergePolicy.missingCheckStabilizationMs = 0;
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const firstService = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(store, new MemoryWriter(currentIssue), new StructuredLogger(() => undefined), 60_000),
+      client: new FakeMergeClient({
+        checkResults: [
+          { name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" },
+          { name: "typecheck", status: "success", conclusion: "success", url: "https://ci.test/typecheck" },
+        ],
+      }),
+    });
+    await firstService.reconcileIssue(currentIssue);
+
+    const writer = new MemoryWriter(currentIssue);
+    const secondService = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 60_000),
+      client: new FakeMergeClient({
+        checkResults: [{ name: "test", status: "success", conclusion: "success", url: "https://ci.test/test" }],
+      }),
+    });
+
+    const result = await secondService.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+    const gateVerdict = lifecycle?.reviewVerdicts.find((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1");
+
+    expect(result.status).toBe("repair_dispatched");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["In Progress"],
+        toState: "In Progress",
+        reason: "Symphony merge gate required CI repair",
+      },
+    ]);
+    expect(writer.comments[0]?.dedupeKey).toContain("head-sha-1_typecheck_missing");
+    expect(lifecycle?.reviewRound).toBe(1);
+    expect(lifecycle?.mergeGate?.blockerFingerprint).toBe("head-sha-1:typecheck:missing");
+    expect(gateVerdict).toMatchObject({
+      idempotencyKey: "merge-gate:issue-1:pr-42:head-sha-1:repair:head-sha-1:typecheck:missing",
+      writebackOperationKeys: [
+        "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_typecheck_missing:r1",
+        "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_typecheck_missing:r1:In Progress",
+      ],
+    });
   });
 
   it("blocks from the merge source state when the merge gate repair ceiling is reached", async () => {

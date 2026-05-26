@@ -1132,6 +1132,10 @@ export class Orchestrator {
         return;
       }
 
+      if (this.shouldDiscoverPullRequestBeforeFirstWorkerPrompt(entry.lifecycle)) {
+        await this.discoverPullRequestForEntry(entry, workspace);
+      }
+
       for (let turnNumber = 1; turnNumber <= this.config.agent.maxTurns; turnNumber += 1) {
         if (entry.abortController.signal.aborted) throw new SymphonyError("agent_error", "Run was cancelled");
         if (turnNumber > 1 && this.options.harness.supportsContinuation === false) {
@@ -2117,6 +2121,11 @@ export class Orchestrator {
     await appendLaneMemoTelemetry(this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
   }
 
+  private shouldDiscoverPullRequestBeforeFirstWorkerPrompt(lifecycle: IssueLifecycleRecord | null | undefined): boolean {
+    const gate = lifecycle?.mergeGate ?? null;
+    return gate?.status === "repair_dispatched" || gate?.status === "blocked";
+  }
+
   private async discoverPullRequestForEntry(entry: RunningEntry, workspace: Workspace): Promise<void> {
     const branchName = workspace.gitBranchName ?? entry.issue.branchName;
     if (!branchName) return;
@@ -2397,8 +2406,8 @@ export class Orchestrator {
   }
 
   private async loadWorkerMergeGatePromptResult(entry: RunningEntry): Promise<WorkerMergeGatePromptResult | null> {
-    const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
-    if (lifecycle === undefined || lifecycle === null) return null;
+    const lifecycle = await this.loadWorkerCurrentPromptLifecycle(entry);
+    if (lifecycle === null) return null;
     return formatWorkerMergeGatePromptResult(lifecycle);
   }
 

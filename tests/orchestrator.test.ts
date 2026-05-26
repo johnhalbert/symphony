@@ -4257,7 +4257,7 @@ describe("Orchestrator", () => {
       summaryPointers: {
         prUrl: "https://github.com/acme/symphony/pull/42",
         prNumber: 42,
-        prHeadSha: "head-sha-2",
+        prHeadSha: "head-sha-1",
         prBranch: "symphony/TEST-1",
       },
       completionReports: [report],
@@ -4320,6 +4320,13 @@ describe("Orchestrator", () => {
       },
     });
     const harness = new FakeHarness();
+    const pullRequestClient = new FakePullRequestDiscoveryClient({
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "head-sha-2",
+      lastPushedAt: "2026-01-01T00:02:00Z",
+    });
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
@@ -4329,12 +4336,14 @@ describe("Orchestrator", () => {
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
       lifecycleStore,
+      pullRequestClient,
     });
 
     await orchestrator.refreshNow();
     await new Promise((resolve) => setTimeout(resolve, 100));
     await orchestrator.stop();
 
+    expect(pullRequestClient.branches[0]).toBe("symphony/TEST-1");
     expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Head Advanced");
     expect(harness.runs[0]?.prompt).toContain("Current PR head SHA: head-sha-2");
     expect(harness.runs[0]?.prompt).toContain("normal review approval");

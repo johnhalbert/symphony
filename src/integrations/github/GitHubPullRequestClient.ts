@@ -947,9 +947,13 @@ function normalizeCheckRun(node: GitHubCheckRunNode): PullRequestCheckResult | n
   const normalizedStatus =
     status !== "completed"
       ? "pending"
-      : conclusion === "success"
+      : conclusion === "success" || conclusion === "neutral" || conclusion === "skipped"
       ? "success"
-      : conclusion === "failure" || conclusion === "cancelled" || conclusion === "timed_out" || conclusion === "action_required"
+      : conclusion === "failure" ||
+        conclusion === "cancelled" ||
+        conclusion === "timed_out" ||
+        conclusion === "action_required" ||
+        conclusion === "stale"
       ? "failure"
       : "unknown";
   return {

@@ -58,6 +58,7 @@ export interface MergeGateCheckEvidence {
 export interface MergeGateWritebackContext {
   issue: Issue;
   gateId: string;
+  blockerFingerprint: string | null;
   fromState: string;
   pullRequest: {
     url: string | null;
@@ -595,7 +596,7 @@ export function planMergeGateRepairWritebacks(
   config: ServiceConfig,
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
-  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:repair:r${context.reviewRound}`;
+  const eventKey = mergeGateWritebackEventKey(context, "repair");
   return [
     mergeGateCommentOperation(
       context,
@@ -623,7 +624,7 @@ export function planMergeGateBlockedWritebacks(
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
   const blockedState = config.reviewLoop.blockedStates[0] ?? null;
-  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:blocked:r${context.reviewRound}`;
+  const eventKey = mergeGateWritebackEventKey(context, "blocked");
   const operations: NewWritebackOperation[] = [
     mergeGateCommentOperation(
       context,
@@ -648,6 +649,11 @@ export function planMergeGateBlockedWritebacks(
     });
   }
   return operations;
+}
+
+function mergeGateWritebackEventKey(context: MergeGateWritebackContext, kind: "repair" | "blocked"): string {
+  const fingerprintSegment = safeKeySegment(context.blockerFingerprint ?? "no-blocker-fingerprint");
+  return `merge-gate:${safeKeySegment(context.gateId)}:${kind}:${fingerprintSegment}:r${context.reviewRound}`;
 }
 
 export function planMergeGateHeadSupersessionWritebacks(

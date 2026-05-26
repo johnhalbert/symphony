@@ -650,6 +650,26 @@ describe("GitHubPullRequestClient", () => {
     ]);
   });
 
+  it.each([
+    ["neutral", "success"],
+    ["skipped", "success"],
+    ["stale", "failure"],
+  ] as const)("maps completed %s check runs to %s", async (conclusion, status) => {
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/status")) {
+        return jsonResponse({ statuses: [] });
+      }
+      return jsonResponse({
+        check_runs: [{ name: "test", status: "completed", conclusion, html_url: `https://ci.test/${conclusion}` }],
+      });
+    });
+
+    await expect(client.getRequiredCheckResults({ headSha: "head-sha-1", requiredChecks: ["test"] })).resolves.toEqual([
+      { name: "test", status, conclusion, url: `https://ci.test/${conclusion}` },
+    ]);
+  });
+
   it("finds required check runs across paginated GitHub responses", async () => {
     const calls: Array<{ pathname: string; search: string; accept: string | null }> = [];
     const client = new GitHubPullRequestClient(config(), async (input, init) => {

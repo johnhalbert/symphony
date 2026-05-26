@@ -293,10 +293,11 @@ export class MergePolicyService {
 
     await this.requireMergeGateWritebacksSucceeded(issue, operations, blocked ? this.options.config.reviewLoop.blockedStates[0] ?? null : this.options.config.writeback.dispatchState);
 
+    const blockerKind = blocked ? "blocked" : "repair";
     const operationKeys = operations.map((operation) => operation.idempotencyKey);
     const storedVerdict: IssueReviewVerdictRecord = {
       id: gate.id,
-      idempotencyKey: gate.id,
+      idempotencyKey: mergeGateVerdictIdempotencyKey(gate, blockerKind),
       runId: report.runId,
       issueId: issue.id,
       issueIdentifier: issue.identifier,
@@ -343,6 +344,7 @@ export class MergePolicyService {
     return {
       issue,
       gateId: gate.id,
+      blockerFingerprint: gate.blockerFingerprint,
       fromState: sourceState,
       pullRequest: gate.pullRequest,
       requiredChecks: gate.requiredChecks,
@@ -687,6 +689,10 @@ function blockerFingerprint(headSha: string, blockers: MergeGateCheckEvidence[])
     .map((check) => `${check.name}:${check.status}`)
     .sort()
     .join("|")}`;
+}
+
+function mergeGateVerdictIdempotencyKey(gate: MergeGateStatus, kind: "repair" | "blocked"): string {
+  return `${gate.id}:${kind}:${gate.blockerFingerprint ?? "no-blocker-fingerprint"}`;
 }
 
 function isSameMergeGateBlocker(lifecycle: IssueLifecycleRecord, gate: MergeGateStatus): boolean {
