@@ -34,6 +34,7 @@ import {
   type MergeGateCheckEvidence,
 } from "../writeback/TransitionPolicy.js";
 import type { WritebackOperation, WritebackProcessor } from "../writeback/WritebackOutbox.js";
+import { shouldSilentlyRetireMergeGate, silentlyRetireMergeGate } from "./MergeGateLifecycle.js";
 
 const MERGE_GATE_REVIEWER = "symphony-merge-gate";
 
@@ -146,8 +147,13 @@ export class MergePolicyService {
       return this.handleHeadSupersession(latestIssue, lifecycle, report, pullRequest, headSha, livePullRequest, sourceState);
     }
 
-    const gateId = mergeGateId(latestIssue.id, pullRequest, headSha);
     let activeLifecycle = lifecycle;
+    if (shouldSilentlyRetireMergeGate(activeLifecycle.mergeGate, headSha, pullRequest.number)) {
+      activeLifecycle = await this.options.lifecycleStore.updateIssue(latestIssue, {
+        mergeGate: silentlyRetireMergeGate(activeLifecycle.mergeGate, headSha),
+      });
+    }
+    const gateId = mergeGateId(latestIssue.id, pullRequest, headSha);
     const approvalVerdict = latestApprovalPassVerdict(activeLifecycle);
     const existingGateVerdict = findMergeGateVerdict(activeLifecycle, gateId);
     const decision = await this.evaluateChecks(github, headSha, pullRequest, gateId, activeLifecycle);
@@ -212,7 +218,11 @@ export class MergePolicyService {
 
     const merge = buildMergeMetadata(latestIssue, pullRequest, headSha, mergeResult, serviceMerge, checkStatus, doneTransition.idempotencyKey);
 
-    const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge });
+    const mergeGate =
+      activeLifecycle.mergeGate && shouldSilentlyRetireMergeGate(activeLifecycle.mergeGate, headSha, pullRequest.number)
+        ? silentlyRetireMergeGate(activeLifecycle.mergeGate, headSha)
+        : activeLifecycle.mergeGate ?? null;
+    const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge, mergeGate });
     const storedMerge = updated.merge ?? merge;
     await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
     return { status, merge: storedMerge };
@@ -724,8 +734,8 @@ function mergeGateStateFromStatus(
     reviewRound,
     gateRunId: previous?.gateRunId ?? gateRunId,
     gateReportId: previous?.gateReportId ?? gateReportId,
-    repairRunId: previous?.repairRunId ?? null,
-    repairReportId: previous?.repairReportId ?? null,
+    repairRunId: status === "repair_dispatched" ? null : previous?.repairRunId ?? null,
+    repairReportId: status === "repair_dispatched" ? null : previous?.repairReportId ?? null,
     blockerFingerprint: gate.blockerFingerprint,
     writebackOperationKeys: gate.writebackOperationKeys,
     supersededByHeadSha: status === "superseded" ? previous?.supersededByHeadSha ?? null : null,

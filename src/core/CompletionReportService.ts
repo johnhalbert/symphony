@@ -25,6 +25,7 @@ import {
   planCompletionReportPublicationApprovalTerminalWritebacks,
   planPullRequestHandoffWritebacks,
 } from "./writeback/TransitionPolicy.js";
+import { shouldSilentlyRetireMergeGate, silentlyRetireMergeGate } from "./merge/MergeGateLifecycle.js";
 import type {
   FileWritebackOutboxStore,
   NewWritebackOperation,
@@ -559,7 +560,7 @@ export class CompletionReportService {
     }
     await this.recordPullRequestMetadata(input.context, input.publication);
 
-    const updatedLifecycle = await this.options.lifecycleStore.updateIssue(input.context.issue, {
+    let currentLifecycle = await this.options.lifecycleStore.updateIssue(input.context.issue, {
       phase: "review",
       blockedReason: null,
       incompleteTurnCount: 0,
@@ -567,21 +568,29 @@ export class CompletionReportService {
       completionReports: upsertCompletionReport(lifecycle.completionReports, storedReport),
       summaryPointers: summaryPointersFor(input.context, pullRequest, input.publication, lifecycle),
     });
-    const repairBoundLifecycle =
-      lifecycle.mergeGate?.status === "repair_dispatched" &&
-      lifecycle.mergeGate.repairReportId === null &&
-      storedReport.pullRequest?.headSha === lifecycle.mergeGate.headSha &&
-      storedReport.pullRequest?.number === lifecycle.mergeGate.pullRequest.number
-        ? await this.options.lifecycleStore.updateIssue(input.context.issue, {
-            mergeGate: {
-              ...lifecycle.mergeGate,
-              repairRunId: lifecycle.mergeGate.repairRunId ?? storedReport.runId,
-              repairReportId: storedReport.id,
-              updatedAt: new Date().toISOString(),
-            },
-          })
-        : updatedLifecycle;
-    await appendLaneMemoTelemetry(this.options.runStore, input.context.activeRunId, repairBoundLifecycle, "completion_report");
+    const reportHeadSha = storedReport.pullRequest?.headSha ?? null;
+    const reportNumber = storedReport.pullRequest?.number ?? null;
+    if (reportHeadSha !== null && reportNumber !== null && shouldSilentlyRetireMergeGate(currentLifecycle.mergeGate, reportHeadSha, reportNumber)) {
+      currentLifecycle = await this.options.lifecycleStore.updateIssue(input.context.issue, {
+        mergeGate: silentlyRetireMergeGate(currentLifecycle.mergeGate, reportHeadSha),
+      });
+    }
+    if (
+      currentLifecycle.mergeGate?.status === "repair_dispatched" &&
+      (currentLifecycle.mergeGate.repairReportId === null || currentLifecycle.mergeGate.repairReportId !== storedReport.id) &&
+      reportHeadSha === currentLifecycle.mergeGate.headSha &&
+      reportNumber === currentLifecycle.mergeGate.pullRequest.number
+    ) {
+      currentLifecycle = await this.options.lifecycleStore.updateIssue(input.context.issue, {
+        mergeGate: {
+          ...currentLifecycle.mergeGate,
+          repairRunId: storedReport.runId,
+          repairReportId: storedReport.id,
+          updatedAt: new Date().toISOString(),
+        },
+      });
+    }
+    await appendLaneMemoTelemetry(this.options.runStore, input.context.activeRunId, currentLifecycle, "completion_report");
 
     return { accepted: true, replayed: false, report: storedReport, writebackOperations: enqueued };
   }

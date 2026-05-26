@@ -649,6 +649,109 @@ describe("GitHubPullRequestClient", () => {
       { name: "lint", status: "missing", conclusion: null, url: null },
     ]);
   });
+
+  it("finds required check runs across paginated GitHub responses", async () => {
+    const calls: Array<{ pathname: string; search: string; accept: string | null }> = [];
+    const client = new GitHubPullRequestClient(config(), async (input, init) => {
+      const url = new URL(String(input));
+      const headers = init?.headers as Record<string, string> | undefined;
+      calls.push({ pathname: url.pathname, search: url.search, accept: headers?.accept ?? headers?.Accept ?? null });
+      if (url.pathname.endsWith("/status")) {
+        return jsonResponse({ statuses: [] });
+      }
+      if (url.searchParams.get("page") === "2") {
+        return jsonResponse({
+          check_runs: [
+            {
+              id: 101,
+              name: "typecheck",
+              status: "completed",
+              conclusion: "success",
+              html_url: "https://ci.test/typecheck",
+              completed_at: "2026-01-01T00:02:00Z",
+            },
+          ],
+        });
+      }
+      return jsonResponse(
+        {
+          check_runs: Array.from({ length: 100 }, (_item, index) => ({
+            id: index + 1,
+            name: `filler-${index}`,
+            status: "completed",
+            conclusion: "success",
+          })),
+        },
+        200,
+        { link: '<https://api.github.test/repos/octo-org/symphony/commits/head-sha-1/check-runs?page=2>; rel="next"' },
+      );
+    });
+
+    await expect(client.getRequiredCheckResults({ headSha: "head-sha-1", requiredChecks: ["typecheck"] })).resolves.toEqual([
+      { name: "typecheck", status: "success", conclusion: "success", url: "https://ci.test/typecheck" },
+    ]);
+    const checkRunCalls = calls.filter((call) => call.pathname.endsWith("/check-runs"));
+    expect(checkRunCalls).toHaveLength(2);
+    expect(checkRunCalls.map((call) => call.accept)).toEqual(["application/vnd.github+json", "application/vnd.github+json"]);
+  });
+
+  it("uses the latest completed check run when duplicate names are paginated", async () => {
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/status")) {
+        return jsonResponse({ statuses: [] });
+      }
+      return jsonResponse({
+        check_runs: [
+          {
+            id: 1,
+            name: "test",
+            status: "completed",
+            conclusion: "failure",
+            html_url: "https://ci.test/test-old",
+            completed_at: "2026-01-01T00:01:00Z",
+          },
+          {
+            id: 2,
+            name: "test",
+            status: "completed",
+            conclusion: "success",
+            html_url: "https://ci.test/test-new",
+            completed_at: "2026-01-01T00:02:00Z",
+          },
+        ],
+      });
+    });
+
+    await expect(client.getRequiredCheckResults({ headSha: "head-sha-1", requiredChecks: ["test"] })).resolves.toEqual([
+      { name: "test", status: "success", conclusion: "success", url: "https://ci.test/test-new" },
+    ]);
+  });
+
+  it("keeps commit status precedence over same-name check runs", async () => {
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/status")) {
+        return jsonResponse({ statuses: [{ context: "test", state: "success", target_url: "https://ci.test/status" }] });
+      }
+      return jsonResponse({
+        check_runs: [
+          {
+            id: 1,
+            name: "test",
+            status: "completed",
+            conclusion: "failure",
+            html_url: "https://ci.test/check-run",
+            completed_at: "2026-01-01T00:02:00Z",
+          },
+        ],
+      });
+    });
+
+    await expect(client.getRequiredCheckResults({ headSha: "head-sha-1", requiredChecks: ["test"] })).resolves.toEqual([
+      { name: "test", status: "success", conclusion: "success", url: "https://ci.test/status" },
+    ]);
+  });
 });
 
 function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {

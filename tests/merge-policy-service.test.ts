@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { MergePolicyService, type MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
-import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileIssueLifecycleStore, type IssueMergeGateState } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { TrackerTransitionInput, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
@@ -116,6 +116,79 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.mergeGate?.status).toBe("superseded");
     expect(lifecycle?.mergeGate?.supersededByHeadSha).toBe("new-head-sha");
     expect(lifecycle?.summaryPointers.ciStatus).toBe("head_superseded");
+  });
+
+  it("silently retires an old-head merge gate when the latest report already matches the live head", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await runStore.recordPullRequestEvent({
+      runId: "worker-run-1",
+      action: "updated",
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "head-sha-2",
+      prBranch: "symphony/TEST-1",
+    });
+    const seeded = await lifecycleStore.get(currentIssue.id);
+    const report = {
+      ...seeded!.completionReports[0]!,
+      id: "completion-report:issue-1:report-2",
+      idempotencyKey: "report-2",
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-2",
+        branch: "symphony/TEST-1",
+      },
+    };
+    await lifecycleStore.updateIssue(currentIssue, {
+      reviewRound: 1,
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "head-sha-2",
+        prBranch: "symphony/TEST-1",
+      },
+      reviewFeedback: [
+        {
+          ...seeded!.reviewFeedback[0]!,
+          pullRequest: report.pullRequest,
+        },
+      ],
+      mergeGate: mergeGateState({ status: "repair_dispatched", headSha: "head-sha-1", reviewRound: 1 }),
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const client = new FakeMergeClient({ headSha: "head-sha-2" });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, new StructuredLogger(() => undefined), 60_000),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("merged");
+    expect(client.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-2" });
+    expect(writer.transitions).toEqual([
+      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+    ]);
+    expect(writer.comments).toEqual([]);
+    expect(lifecycle?.reviewRound).toBe(1);
+    expect(lifecycle?.lastReviewVerdictId).toBe("review-verdict:issue-1:verdict-pass-1");
+    expect(lifecycle?.mergeGate).toMatchObject({
+      status: "superseded",
+      headSha: "head-sha-1",
+      supersededByHeadSha: "head-sha-2",
+    });
   });
 
   it("requires live writeback mode before gated merge", async () => {
@@ -509,6 +582,8 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.phase).toBe("implementation");
     expect(lifecycle?.lastReviewVerdictId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
+    expect(lifecycle?.mergeGate?.repairRunId).toBeNull();
+    expect(lifecycle?.mergeGate?.repairReportId).toBeNull();
     expect(gateVerdicts).toHaveLength(1);
     expect(gateVerdicts[0]?.writebackOperationKeys).toEqual([
       "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:r2",
@@ -1193,4 +1268,41 @@ class MemoryWriter implements TrackerWriter {
     this.comments.push(input);
     return { status: "applied" as const };
   }
+}
+
+function mergeGateState(overrides: Partial<IssueMergeGateState> = {}): IssueMergeGateState {
+  const headSha = overrides.headSha ?? "head-sha-1";
+  return {
+    id: `merge-gate:issue-1:pr-42:${headSha}`,
+    status: "repair_dispatched",
+    headSha,
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha,
+      branch: "symphony/TEST-1",
+    },
+    requiredChecks: ["test"],
+    checks: [
+      {
+        name: "test",
+        outcome: "failing",
+        rawStatus: "failure",
+        conclusion: "failure",
+        url: "https://ci.test/test",
+        firstObservedAt: null,
+        actionableSince: null,
+      },
+    ],
+    reviewRound: 1,
+    gateRunId: "worker-run-1",
+    gateReportId: "completion-report:issue-1:report-1",
+    repairRunId: "repair-run-1",
+    repairReportId: "completion-report:issue-1:repair-1",
+    blockerFingerprint: `${headSha}:test:failure`,
+    writebackOperationKeys: [],
+    supersededByHeadSha: null,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
 }

@@ -208,10 +208,13 @@ interface GitHubCommitStatusNode {
 }
 
 interface GitHubCheckRunNode {
+  id?: unknown;
   name?: unknown;
   status?: unknown;
   conclusion?: unknown;
   html_url?: unknown;
+  started_at?: unknown;
+  completed_at?: unknown;
 }
 
 interface GraphQlPageInfoNode {
@@ -349,39 +352,26 @@ export class GitHubPullRequestClient {
     this.assertConfiguredForMerge();
     const headSha = requireNonEmpty(input.headSha, "A pull request head SHA is required for check validation");
     const requiredChecks = input.requiredChecks.map((check) => check.trim()).filter((check) => check.length > 0);
-    const [statusResponse, checkRunsResponse] = await Promise.all([
+    const [statusResponse, checkRuns] = await Promise.all([
       this.fetchImpl(this.repoUrl(`commits/${encodeURIComponent(headSha)}/status`), {
         method: "GET",
         headers: requestHeaders(this.config.token ?? ""),
       }),
-      this.fetchImpl(this.repoUrl(`commits/${encodeURIComponent(headSha)}/check-runs`), {
-        method: "GET",
-        headers: {
-          ...requestHeaders(this.config.token ?? ""),
-          accept: "application/vnd.github+json",
-        },
-      }),
+      this.fetchAllCheckRunsForCommit(headSha),
     ]);
     if (!statusResponse.ok) {
       throw new SymphonyError("tracker_error", `GitHub commit status inspection returned HTTP ${statusResponse.status}`);
     }
-    if (!checkRunsResponse.ok) {
-      throw new SymphonyError("tracker_error", `GitHub check run inspection returned HTTP ${checkRunsResponse.status}`);
-    }
     const statusBody = (await statusResponse.json()) as { statuses?: unknown };
-    const checkRunsBody = (await checkRunsResponse.json()) as { check_runs?: unknown };
     const statuses = Array.isArray(statusBody.statuses) ? statusBody.statuses : [];
-    const checkRuns = Array.isArray(checkRunsBody.check_runs) ? checkRunsBody.check_runs : [];
+    const checkRunByName = indexCheckRunsByName(checkRuns);
     return requiredChecks.map((required) => {
       const status = statuses
         .filter(isRecord)
         .map((item) => normalizeCommitStatus(item as GitHubCommitStatusNode))
         .find((item) => item?.name === required);
       if (status) return status;
-      const checkRun = checkRuns
-        .filter(isRecord)
-        .map((item) => normalizeCheckRun(item as GitHubCheckRunNode))
-        .find((item) => item?.name === required);
+      const checkRun = checkRunByName.get(required);
       return checkRun ?? { name: required, status: "missing", conclusion: null, url: null };
     });
   }
@@ -730,6 +720,31 @@ export class GitHubPullRequestClient {
     return items;
   }
 
+  private async fetchAllCheckRunsForCommit(headSha: string): Promise<GitHubCheckRunNode[]> {
+    const firstUrl = this.repoUrl(`commits/${encodeURIComponent(headSha)}/check-runs`);
+    firstUrl.searchParams.set("per_page", "100");
+    const checkRuns: GitHubCheckRunNode[] = [];
+    let nextUrl: URL | null = firstUrl;
+    while (nextUrl) {
+      const response = await this.fetchImpl(nextUrl, {
+        method: "GET",
+        headers: {
+          ...requestHeaders(this.config.token ?? ""),
+          accept: "application/vnd.github+json",
+        },
+      });
+      if (!response.ok) {
+        throw new SymphonyError("tracker_error", `GitHub check run inspection returned HTTP ${response.status}`);
+      }
+      const body = (await response.json()) as { check_runs?: unknown };
+      if (Array.isArray(body.check_runs)) {
+        checkRuns.push(...body.check_runs.filter(isRecord).map((item) => item as GitHubCheckRunNode));
+      }
+      nextUrl = nextLinkUrl(response.headers.get("link"));
+    }
+    return checkRuns;
+  }
+
   private async fetchReviewThreadMetadata(pullRequestNumber: number): Promise<PullRequestReviewThreadMetadata[]> {
     const threads: PullRequestReviewThreadMetadata[] = [];
     let after: string | null = null;
@@ -838,6 +853,52 @@ function normalizeCommitStatus(node: GitHubCommitStatusNode): PullRequestCheckRe
     conclusion: state,
     url: asNullableString(node.target_url),
   };
+}
+
+function indexCheckRunsByName(nodes: GitHubCheckRunNode[]): Map<string, PullRequestCheckResult> {
+  const grouped = new Map<string, GitHubCheckRunNode[]>();
+  for (const node of nodes) {
+    const name = asString(node.name);
+    if (!name) continue;
+    grouped.set(name, [...(grouped.get(name) ?? []), node]);
+  }
+  const indexed = new Map<string, PullRequestCheckResult>();
+  for (const [name, runs] of grouped.entries()) {
+    const selected = selectAuthoritativeCheckRun(runs);
+    const normalized = selected ? normalizeCheckRun(selected) : null;
+    if (normalized) indexed.set(name, normalized);
+  }
+  return indexed;
+}
+
+function selectAuthoritativeCheckRun(nodes: GitHubCheckRunNode[]): GitHubCheckRunNode | null {
+  const completed = nodes.filter((node) => asNullableString(node.status) === "completed");
+  const candidates = completed.length > 0 ? completed : nodes;
+  return [...candidates].sort(compareCheckRunsByRecency)[0] ?? null;
+}
+
+function compareCheckRunsByRecency(a: GitHubCheckRunNode, b: GitHubCheckRunNode): number {
+  return checkRunSortValue(b) - checkRunSortValue(a);
+}
+
+function checkRunSortValue(node: GitHubCheckRunNode): number {
+  return checkRunTimestamp(node.completed_at) ?? checkRunTimestamp(node.started_at) ?? checkRunId(node.id) ?? 0;
+}
+
+function checkRunTimestamp(value: unknown): number | null {
+  const raw = asNullableString(value);
+  if (raw === null) return null;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function checkRunId(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
 }
 
 function normalizeCheckRun(node: GitHubCheckRunNode): PullRequestCheckResult | null {
