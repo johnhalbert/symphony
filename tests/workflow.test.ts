@@ -87,6 +87,7 @@ Work on {{ issue.identifier }}.`,
     expect(config.mergePolicy).toEqual({
       mode: "disabled",
       sourceStates: [],
+      conflictsState: null,
       doneState: "Done",
       mergeMethod: "merge",
       requiredChecks: [],
@@ -443,6 +444,7 @@ Work on {{ issue.identifier }}.`,
     expect(config.mergePolicy).toEqual({
       mode: "gated",
       sourceStates: ["Review Passed"],
+      conflictsState: null,
       doneState: "Done",
       mergeMethod: "squash",
       requiredChecks: ["test"],
@@ -591,6 +593,53 @@ Work on {{ issue.identifier }}.`,
     );
 
     expect(config.mergePolicy.requiredChecks).toEqual([]);
+  });
+
+  it("validates merge conflict states as active implementation states", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: {
+          kind: "linear",
+          api_key: "$LINEAR_API_KEY",
+          project_slug: "TEST",
+          active_states: ["Todo", "In Progress", "Approved with Conflicts"],
+        },
+        review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge" },
+        merge_policy: {
+          mode: "gated",
+          source_states: ["Ready to Merge"],
+          conflicts_state: "Approved with Conflicts",
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.mergePolicy.conflictsState).toBe("Approved with Conflicts");
+    expect(config.issueBoard.columns.progress).toContain("Approved with Conflicts");
+  });
+
+  it("rejects merge conflict states outside the implementation bucket", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: {
+            kind: "linear",
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "TEST",
+            active_states: ["Todo", "In Progress"],
+          },
+          review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge" },
+          merge_policy: {
+            mode: "gated",
+            source_states: ["Ready to Merge"],
+            conflicts_state: "Ready to Merge",
+          },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("merge_policy.conflicts_state must be listed in tracker.active_states");
   });
 
   it("rejects handoff states that overlap active or terminal states", () => {

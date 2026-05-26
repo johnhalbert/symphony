@@ -47,6 +47,7 @@ const rawConfigSchema = z
         enabled: z.boolean().optional(),
         mode: z.enum(["disabled", "manual", "gated"]).optional(),
         source_states: stringArray.optional(),
+        conflicts_state: z.string().optional(),
         done_state: z.string().optional(),
         merge_method: z.enum(["merge", "squash", "rebase"]).optional(),
         required_checks: stringArray.optional(),
@@ -351,6 +352,7 @@ export interface ReviewLoopConfig {
 export interface MergePolicyConfig {
   mode: "disabled" | "manual" | "gated";
   sourceStates: string[];
+  conflictsState: string | null;
   doneState: string;
   mergeMethod: "merge" | "squash" | "rebase";
   requiredChecks: string[];
@@ -558,6 +560,15 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     blockedStates,
     reviewPassState,
   });
+  validateMergePolicyStateBuckets({
+    activeStates,
+    handoffStates,
+    terminalStates,
+    reviewStates,
+    blockedStates,
+    reviewPassState,
+    mergePolicy,
+  });
   validatePullRequestHandoffPolicy({
     publishPullRequests,
     handoffStates,
@@ -738,6 +749,7 @@ function normalizeMergePolicy(raw: RawWorkflowConfig, reviewPassState: string | 
   return {
     mode,
     sourceStates: rawPolicy?.source_states ?? (reviewPassState === null ? [] : [reviewPassState]),
+    conflictsState: normalizeOptionalConfigString(rawPolicy?.conflicts_state),
     doneState: rawPolicy?.done_state ?? "Done",
     mergeMethod: rawPolicy?.merge_method ?? "merge",
     requiredChecks,
@@ -951,6 +963,46 @@ function validateStateBuckets(input: {
           `${leftName} must not overlap ${rightName}: ${overlap.join(", ")}`,
         );
       }
+    }
+  }
+}
+
+function validateMergePolicyStateBuckets(input: {
+  activeStates: string[];
+  handoffStates: string[];
+  terminalStates: string[];
+  reviewStates: string[];
+  blockedStates: string[];
+  reviewPassState: string | null;
+  mergePolicy: MergePolicyConfig;
+}): void {
+  const { mergePolicy } = input;
+  const conflictsState = mergePolicy.conflictsState;
+  if (mergePolicy.mode === "disabled" || conflictsState === null) return;
+
+  if (!input.activeStates.some((state) => statesEqual(state, conflictsState))) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `merge_policy.conflicts_state must be listed in tracker.active_states: ${conflictsState}`,
+    );
+  }
+
+  const conflictOverlaps: Array<[string, string[]]> = [
+    ["merge_policy.source_states", mergePolicy.sourceStates],
+    ["merge_policy.done_state", [mergePolicy.doneState]],
+    ["tracker.handoff_states", input.handoffStates],
+    ["tracker.terminal_states", input.terminalStates],
+    ["review_loop.blocked_states", input.blockedStates],
+    ["review_loop.review_states", input.reviewStates],
+    ["review_loop.review_pass_state", input.reviewPassState === null ? [] : [input.reviewPassState]],
+  ];
+  for (const [name, states] of conflictOverlaps) {
+    const overlap = overlappingStates([conflictsState], states);
+    if (overlap.length > 0) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `merge_policy.conflicts_state must not overlap ${name}: ${overlap.join(", ")}`,
+      );
     }
   }
 }

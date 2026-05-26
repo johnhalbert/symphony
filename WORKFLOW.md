@@ -7,6 +7,7 @@ tracker:
   active_states:
     - Todo
     - In Progress
+    - Approved with Conflicts
   handoff_states: []
   terminal_states:
     - Done
@@ -39,6 +40,7 @@ merge_policy:
   mode: gated
   source_states:
     - Ready to Merge
+  conflicts_state: Approved with Conflicts
   done_state: Done
   merge_method: merge
   required_checks:

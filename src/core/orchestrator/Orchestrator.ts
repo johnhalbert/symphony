@@ -2077,12 +2077,20 @@ export class Orchestrator {
         logger: this.options.logger,
       });
       const result = await service.reconcileIssue(issue);
-      if (result.status !== "skipped") {
+      if (result.status === "merged" || result.status === "already_merged") {
         this.options.logger.info("merge policy reconciled issue", {
           issue_id: issue.id,
           issue_identifier: issue.identifier,
           status: result.status,
           merge_id: result.merge.id,
+        });
+      } else if (result.status === "blocked_conflicts") {
+        this.options.logger.info("merge policy blocked on conflicts", {
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          status: result.status,
+          head_sha: result.headSha,
+          mergeable_state: result.mergeableState,
         });
       }
     } catch (error) {

@@ -591,7 +591,13 @@ export class CompletionReportService {
     if (lifecyclePhase !== "implementation") {
       throw new SymphonyError("invalid_request", `Completion report cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
-    if (!sameState(context.issue.state, this.options.config.writeback.dispatchState)) {
+    const allowedStates = [
+      this.options.config.writeback.dispatchState,
+      ...(this.options.config.mergePolicy.mode === "gated" && this.options.config.mergePolicy.conflictsState !== null
+        ? [this.options.config.mergePolicy.conflictsState]
+        : []),
+    ];
+    if (!sameStateIn(context.issue.state, allowedStates)) {
       throw new SymphonyError("invalid_request", "Completion report requires the issue to be in the active implementation state");
     }
   }
@@ -1212,4 +1218,8 @@ function formatPullRequestBody(report: CompletionReportInput, context: Completio
 
 function sameState(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function sameStateIn(state: string, states: string[]): boolean {
+  return states.some((candidate) => sameState(state, candidate));
 }

@@ -370,6 +370,35 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("accepts conflict-fix completion reports from the configured merge conflicts state", async () => {
+    const { service, lifecycleStore, outbox } = fixture({
+      configure(config) {
+        config.mergePolicy.mode = "gated";
+        config.mergePolicy.conflictsState = "Approved with Conflicts";
+        config.tracker.activeStates = ["Todo", "In Progress", "Approved with Conflicts"];
+      },
+    });
+
+    const result = await service.submitCompletionReport(
+      report(),
+      context({ issue: issue({ state: "Approved with Conflicts", branchName: "symphony/TEST-1" }) }),
+    );
+
+    expect(result.replayed).toBe(false);
+    expect(result.writebackOperations).toHaveLength(2);
+    const transition = (await outbox.list()).find((operation) => operation.kind === "transition");
+    expect(transition).toMatchObject({
+      payload: {
+        fromStates: ["In Progress", "Approved with Conflicts"],
+        toState: "In Review",
+      },
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+    });
+  });
+
   it("rejects missing required report fields", async () => {
     const { service } = fixture();
     const { summary: _summary, ...missingSummary } = report();

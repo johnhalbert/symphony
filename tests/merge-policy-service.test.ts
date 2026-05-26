@@ -100,6 +100,79 @@ describe("MergePolicyService", () => {
     expect(client.mergeInput).toBeNull();
   });
 
+  it("transitions approved PRs with merge conflicts to the conflict-fix state without merging", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({ mergeable: false, mergeableState: "dirty" });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result.status).toBe("blocked_conflicts");
+    expect(client.mergeInput).toBeNull();
+    expect(currentIssue.state).toBe("Approved with Conflicts");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge"],
+        toState: "Approved with Conflicts",
+        reason: "Symphony gated merge blocked: Pull request has merge conflicts with the base branch",
+      },
+    ]);
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      merge: null,
+    });
+  });
+
+  it("defers merge while GitHub mergeability is unknown", async () => {
+    const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({ mergeable: false, mergeableState: "unknown" });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result).toMatchObject({ status: "skipped" });
+    expect(client.mergeInput).toBeNull();
+    expect(currentIssue.state).toBe("Ready to Merge");
+  });
+
   it("requires live writeback mode before gated merge", async () => {
     const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test.", writebackMode: "dry_run" });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
@@ -516,18 +589,25 @@ function mergeConfig(input: {
   requiredChecks?: string[];
   noCiEvidence?: string;
   writebackMode?: "live" | "dry_run";
+  conflictsState?: string;
   credentialProfiles?: Record<string, unknown>;
   env?: NodeJS.ProcessEnv;
 }) {
   return parseServiceConfig(
     {
-      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_API_KEY",
+        project_slug: "TEST",
+        ...(input.conflictsState === undefined ? {} : { active_states: ["Todo", "In Progress", input.conflictsState] }),
+      },
       workspace: { root },
       writeback: { enabled: true, mode: input.writebackMode ?? "live" },
       review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge" },
       merge_policy: {
         mode: "gated",
         source_states: ["Ready to Merge"],
+        ...(input.conflictsState === undefined ? {} : { conflicts_state: input.conflictsState }),
         done_state: "Done",
         merge_method: "squash",
         required_checks: input.requiredChecks ?? [],
@@ -673,6 +753,8 @@ class FakeMergeClient implements MergePolicyGitHubClient {
       headSha?: string;
       state?: string;
       merged?: boolean;
+      mergeable?: boolean | null;
+      mergeableState?: string | null;
       mergeCommitSha?: string | null;
       mergedAt?: string | null;
       mergedBy?: string | null;
@@ -690,6 +772,8 @@ class FakeMergeClient implements MergePolicyGitHubClient {
       lastPushedAt: "2026-01-01T00:00:00Z",
       state: this.input.state ?? "open",
       merged: this.input.merged ?? false,
+      mergeable: this.input.mergeable === undefined ? true : this.input.mergeable,
+      mergeableState: this.input.mergeableState === undefined ? "clean" : this.input.mergeableState,
       mergeCommitSha: this.input.mergeCommitSha ?? "merge-sha-1",
       mergedAt: this.input.mergedAt ?? "2026-01-01T00:00:02.000Z",
       mergedBy: this.input.mergedBy ?? "symphony-bot",

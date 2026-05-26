@@ -26,6 +26,8 @@ export interface PullRequestDetails extends PullRequestMetadata {
   mergeCommitSha: string | null;
   mergedAt: string | null;
   mergedBy: string | null;
+  mergeable: boolean | null;
+  mergeableState: string | null;
 }
 
 export interface PullRequestCheckResult {
@@ -140,6 +142,8 @@ interface GitHubPullRequestNode {
   number?: unknown;
   state?: unknown;
   merged?: unknown;
+  mergeable?: unknown;
+  mergeable_state?: unknown;
   merge_commit_sha?: unknown;
   merged_at?: unknown;
   draft?: unknown;
@@ -824,6 +828,8 @@ function normalizePullRequestDetails(node: GitHubPullRequestNode): PullRequestDe
     mergeCommitSha: asNullableString(node.merge_commit_sha),
     mergedAt: asNullableString(node.merged_at),
     mergedBy: asNullableString(node.merged_by?.login),
+    mergeable: typeof node.mergeable === "boolean" ? node.mergeable : null,
+    mergeableState: asNullableString(node.mergeable_state),
   };
 }
 

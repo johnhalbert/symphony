@@ -24,7 +24,7 @@ import type {
 import type { RunRecord, RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { Issue } from "../types.js";
-import { planMergeCompletedWritebacks } from "../writeback/TransitionPolicy.js";
+import { planMergeCompletedWritebacks, planMergeConflictsWritebacks } from "../writeback/TransitionPolicy.js";
 import type { WritebackOperation, WritebackProcessor } from "../writeback/WritebackOutbox.js";
 
 export interface MergePolicyGitHubClient {
@@ -37,7 +37,8 @@ export interface MergePolicyGitHubClient {
 export type MergePolicyResult =
   | { status: "skipped"; reason: string }
   | { status: "merged"; merge: IssueMergeMetadata }
-  | { status: "already_merged"; merge: IssueMergeMetadata };
+  | { status: "already_merged"; merge: IssueMergeMetadata }
+  | { status: "blocked_conflicts"; headSha: string; mergeableState: string | null };
 
 export interface MergePolicyServiceOptions {
   config: ServiceConfig;
@@ -99,29 +100,45 @@ export class MergePolicyService {
     const livePullRequest = await github.getPullRequest({ pullRequestNumber: requireNumber(pullRequest.number) });
     validateLivePullRequestMetadata(livePullRequest, pullRequest, headSha);
 
-    const checkStatus = await this.validateChecks(github, headSha);
     const mergeId = `merge:${latestIssue.id}:${headSha}`;
-    const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
     let status: "merged" | "already_merged" = "merged";
     let mergeResult: PullRequestMergeResult;
     if (isOpenPullRequest(livePullRequest)) {
+      const mergeability = classifyMergeability(livePullRequest);
+      if (mergeability.kind === "unknown") {
+        return { status: "skipped", reason: "pull request mergeability is still being computed" };
+      }
+      if (mergeability.kind === "conflicts") {
+        await this.ensureConflictsTransition(latestIssue, pullRequest, headSha, sourceState, mergeability.reason, livePullRequest.mergeableState);
+        return { status: "blocked_conflicts", headSha, mergeableState: livePullRequest.mergeableState };
+      }
+      if (mergeability.kind === "blocked") {
+        throw new SymphonyError("invalid_request", mergeability.reason);
+      }
+      const checkStatus = await this.validateChecks(github, headSha);
+      const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
       mergeResult = await github.mergePullRequest({
         pullRequestNumber: requireNumber(pullRequest.number),
         expectedHeadSha: headSha,
         method: config.mergePolicy.mergeMethod,
       });
+      const merge = buildMergeMetadata(latestIssue, pullRequest, headSha, mergeResult, serviceMerge, checkStatus, doneTransition.idempotencyKey);
+      const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge });
+      const storedMerge = updated.merge ?? merge;
+      await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
+      return { status, merge: storedMerge };
     } else {
+      const checkStatus = await this.validateChecks(github, headSha);
+      const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
       const serviceLogin = await github.getAuthenticatedLogin();
       mergeResult = recoverAlreadyMergedPullRequest(livePullRequest, serviceLogin);
       status = "already_merged";
+      const merge = buildMergeMetadata(latestIssue, pullRequest, headSha, mergeResult, serviceMerge, checkStatus, doneTransition.idempotencyKey);
+      const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge });
+      const storedMerge = updated.merge ?? merge;
+      await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
+      return { status, merge: storedMerge };
     }
-
-    const merge = buildMergeMetadata(latestIssue, pullRequest, headSha, mergeResult, serviceMerge, checkStatus, doneTransition.idempotencyKey);
-
-    const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge });
-    const storedMerge = updated.merge ?? merge;
-    await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
-    return { status, merge: storedMerge };
   }
 
   private async ensureDoneTransition(issue: Issue, merge: IssueMergeMetadata, sourceState: string): Promise<void> {
@@ -165,6 +182,51 @@ export class MergePolicyService {
 
   private mergeSourceState(issue: Issue): string | null {
     return this.options.config.mergePolicy.sourceStates.find((state) => statesEqual(state, issue.state)) ?? null;
+  }
+
+  private async ensureConflictsTransition(
+    issue: Issue,
+    pullRequest: CompletionReportPullRequestRef,
+    headSha: string,
+    sourceState: string,
+    reason: string,
+    mergeableState: string | null,
+  ): Promise<void> {
+    const conflictsState = this.options.config.mergePolicy.conflictsState;
+    if (conflictsState === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${reason}; configure merge_policy.conflicts_state to route approved-but-conflicting pull requests to a fix state`,
+      );
+    }
+    const writeback = this.options.writeback;
+    if (!writeback) throw new SymphonyError("invalid_request", "Gated merge conflicts transition requires service-owned writeback");
+    const operations = planMergeConflictsWritebacks(
+      {
+        issue,
+        mergeId: `merge:${issue.id}:${headSha}`,
+        fromState: sourceState,
+        conflictsState,
+        pullRequest,
+        mergeableState,
+        reason,
+      },
+      this.options.config,
+    );
+    for (const operation of operations) {
+      const result = await writeback.enqueueAndProcess(operation, { retrySkipped: true });
+      if (operation.kind === "transition" && result.status !== "succeeded") {
+        throw new SymphonyError(
+          "invalid_request",
+          `Gated merge conflicts writeback did not succeed: ${result.status}${result.lastError ? ` (${result.lastError})` : ""}`,
+        );
+      }
+    }
+    const latest = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? null;
+    if (!latest || !statesEqual(latest.state, conflictsState)) {
+      throw new SymphonyError("invalid_request", "Gated merge conflicts writeback could not be verified");
+    }
+    await this.options.lifecycleStore.updateIssue(latest, { phase: "implementation", blockedReason: null });
   }
 
   private validateLifecycle(
@@ -275,6 +337,19 @@ function validateLivePullRequestMetadata(
 
 function isOpenPullRequest(livePullRequest: PullRequestDetails): boolean {
   return livePullRequest.state === null || livePullRequest.state.toLowerCase() === "open";
+}
+
+function classifyMergeability(
+  livePullRequest: PullRequestDetails,
+): { kind: "mergeable" } | { kind: "conflicts"; reason: string } | { kind: "unknown" } | { kind: "blocked"; reason: string } {
+  const mergeableState = livePullRequest.mergeableState?.toLowerCase() ?? null;
+  if (livePullRequest.mergeable === null || mergeableState === "unknown") return { kind: "unknown" };
+  if (livePullRequest.mergeable === true) return { kind: "mergeable" };
+  if (mergeableState === "dirty") {
+    return { kind: "conflicts", reason: "Pull request has merge conflicts with the base branch" };
+  }
+  const stateDescription = mergeableState === null ? "unknown" : mergeableState;
+  return { kind: "blocked", reason: `Pull request is not currently mergeable: ${stateDescription}` };
 }
 
 function recoverAlreadyMergedPullRequest(
