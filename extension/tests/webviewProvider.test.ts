@@ -94,7 +94,7 @@ describe("SymphonyPanelProvider message handling", () => {
     expect(messages[0]).not.toHaveProperty("error");
   });
 
-  it("keeps global history durable by skipping activity on later dashboard refreshes", async () => {
+  it("refetches and tags global activity head on later dashboard refreshes", async () => {
     const client = fakeClient();
     client.fetchBoard.mockResolvedValue({ generatedAt: "now", tracker: {}, columns: [], issues: [], counts: {} });
     client.fetchActivity.mockResolvedValue({ generatedAt: "now", offset: 0, limit: 50, nextOffset: 50, activity: [], counts: {}, source: {}, filter: { issue: null } });
@@ -104,11 +104,35 @@ describe("SymphonyPanelProvider message handling", () => {
     messages.length = 0;
     await provider.loadDashboard({ refresh: true });
 
-    expect(client.fetchActivity).toHaveBeenCalledTimes(1);
+    expect(client.fetchActivity).toHaveBeenCalledTimes(2);
+    expect(client.fetchActivity).toHaveBeenLastCalledWith(settings.baseUrl, expect.objectContaining({ offset: 0, limit: 50 }));
     expect(messages).toContainEqual(
       expect.objectContaining({
         type: "dashboardState",
-        activity: null,
+        activity: expect.objectContaining({ offset: 0 }),
+        reconcileActivityHead: true,
+      }),
+    );
+  });
+
+  it("refreshes selected issue activity head with the resolved activity key", async () => {
+    const client = fakeClient();
+    client.fetchBoard.mockResolvedValue({ generatedAt: "now", tracker: {}, columns: [], issues: [], counts: {} });
+    client.fetchBoardIssue.mockResolvedValue(issueDetail("ENG-8", "issue-id"));
+    client.fetchActivity.mockResolvedValue({ generatedAt: "now", offset: 0, limit: 50, nextOffset: null, activity: [], counts: {}, source: {}, filter: { issue: null } });
+    const { provider, messages } = await testProvider(client);
+
+    await provider.loadIssue("issue-id");
+    messages.length = 0;
+    await provider.loadDashboard({ refresh: true });
+
+    expect(client.fetchActivity).toHaveBeenCalledWith(settings.baseUrl, expect.objectContaining({ issue: "ENG-8", offset: 0, limit: 50 }));
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: "issueDetailState",
+        issueKey: "issue-id",
+        activity: expect.objectContaining({ offset: 0 }),
+        reconcileActivityHead: true,
       }),
     );
   });
@@ -146,11 +170,11 @@ async function testProvider(client: ReturnType<typeof fakeClient>) {
   };
 }
 
-function issueDetail(issue: string): BoardIssueDetailResponse {
+function issueDetail(issue: string, id = issue): BoardIssueDetailResponse {
   return {
     issue,
     issueDetails: {
-      issue: { identifier: issue, id: issue },
+      issue: { identifier: issue, id },
     },
   } as BoardIssueDetailResponse;
 }

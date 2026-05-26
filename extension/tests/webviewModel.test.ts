@@ -60,6 +60,47 @@ describe("webview model reducer", () => {
     expect(model.activityError).toBe("previous failure");
   });
 
+  it("reconciles refreshed global activity head while preserving loaded tail", () => {
+    const model = createInitialDashboardState();
+    model.dashboardGeneration = 1;
+    model.globalActivity = [...Array.from({ length: 50 }, (_, index) => activityItem(`old-${index}`)), activityItem("tail-50")];
+    model.globalActivityNextOffset = 100;
+
+    applyExtensionMessage(model, {
+      type: "dashboardState",
+      dashboardGeneration: 1,
+      board: null,
+      activity: activityPage(0, 50, ["new-0", "old-1"]),
+      offset: 0,
+      reconcileActivityHead: true,
+    });
+
+    expect(model.globalActivity.map((item) => item.id)).toEqual(["new-0", "old-1", "tail-50"]);
+    expect(model.globalActivityNextOffset).toBe(100);
+    expect(model.activityError).toBeNull();
+  });
+
+  it("reconciles issue activity head with the same tail-preserving rules", () => {
+    const model = createInitialDashboardState();
+    model.selectedIssueKey = "ENG-8";
+    model.issueEpoch = 1;
+    model.issueActivity = [...Array.from({ length: 50 }, (_, index) => activityItem(`issue-old-${index}`)), activityItem("issue-tail")];
+    model.issueActivityNextOffset = 100;
+
+    applyExtensionMessage(model, {
+      type: "issueDetailState",
+      issueKey: "ENG-8",
+      issueEpoch: 1,
+      offset: 0,
+      detail: null,
+      activity: activityPage(0, 50, ["issue-new"]),
+      reconcileActivityHead: true,
+    });
+
+    expect(model.issueActivity.map((item) => item.id)).toEqual(["issue-new", "issue-tail"]);
+    expect(model.issueActivityNextOffset).toBe(100);
+  });
+
   it("rejects global history appends with stale offsets", () => {
     const model = createInitialDashboardState();
     model.dashboardGeneration = 1;

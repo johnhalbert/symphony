@@ -122,8 +122,14 @@ export function applyExtensionMessage(model: DashboardState, message: ExtensionM
         model.boardError = null;
       }
       if (message.activity) {
-        model.globalActivity = message.appendActivity ? [...model.globalActivity, ...message.activity.activity] : message.activity.activity;
-        model.globalActivityNextOffset = message.activity.nextOffset;
+        if (message.reconcileActivityHead) {
+          const reconciled = reconcileActivityHead(model.globalActivity, model.globalActivityNextOffset, message.activity);
+          model.globalActivity = reconciled.activity;
+          model.globalActivityNextOffset = reconciled.nextOffset;
+        } else {
+          model.globalActivity = message.appendActivity ? [...model.globalActivity, ...message.activity.activity] : message.activity.activity;
+          model.globalActivityNextOffset = message.activity.nextOffset;
+        }
         model.activityError = null;
       }
       model.boardError = message.boardError ?? model.boardError;
@@ -139,8 +145,14 @@ export function applyExtensionMessage(model: DashboardState, message: ExtensionM
         model.issueError = null;
       }
       if (message.activity) {
-        model.issueActivity = message.appendActivity ? [...model.issueActivity, ...message.activity.activity] : message.activity.activity;
-        model.issueActivityNextOffset = message.activity.nextOffset;
+        if (message.reconcileActivityHead) {
+          const reconciled = reconcileActivityHead(model.issueActivity, model.issueActivityNextOffset, message.activity);
+          model.issueActivity = reconciled.activity;
+          model.issueActivityNextOffset = reconciled.nextOffset;
+        } else {
+          model.issueActivity = message.appendActivity ? [...model.issueActivity, ...message.activity.activity] : message.activity.activity;
+          model.issueActivityNextOffset = message.activity.nextOffset;
+        }
         model.issueActivityError = null;
       }
       model.issueError = message.error ?? model.issueError;
@@ -167,4 +179,17 @@ export function applyExtensionMessage(model: DashboardState, message: ExtensionM
       model.operationMessage = { level: message.level, message: message.message };
       return;
   }
+}
+
+function reconcileActivityHead(
+  existing: ActivityItem[],
+  existingNextOffset: number | null,
+  page: { activity: ActivityItem[]; limit: number; nextOffset: number | null },
+): { activity: ActivityItem[]; nextOffset: number | null } {
+  const headIds = new Set(page.activity.map((item) => item.id));
+  const tail = existing.slice(page.limit).filter((item) => !headIds.has(item.id));
+  return {
+    activity: [...page.activity, ...tail],
+    nextOffset: tail.length > 0 ? existingNextOffset : page.nextOffset,
+  };
 }

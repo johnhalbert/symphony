@@ -1128,6 +1128,9 @@ async function buildBoardIssueDetail(input: {
   };
 }
 
+const ACTIVITY_TRANSCRIPT_TAIL_PER_RUN = 500;
+const TERMINAL_ACTIVITY_TRANSCRIPT_TAIL = 256;
+
 async function buildActivityFeed(input: {
   generatedAt: string;
   runStore: RunTranscriptStore | undefined;
@@ -1141,6 +1144,8 @@ async function buildActivityFeed(input: {
   const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : allRuns;
   const activity: ActivityItem[] = [];
   let transcriptEventsConsidered = 0;
+  let transcriptEventsTotal = 0;
+  let transcriptEventsTruncated = false;
   let syntheticRunEvents = 0;
   let writebackOperationsConsidered = 0;
 
@@ -1152,8 +1157,15 @@ async function buildActivityFeed(input: {
       syntheticRunEvents += 1;
     }
 
-    const events = input.runStore ? await readAllTranscriptEvents(input.runStore, run.runId) : [];
+    const totalEvents = input.runStore ? await input.runStore.ensureTranscriptEventCount(run.runId) : 0;
+    transcriptEventsTotal += totalEvents;
+    const transcriptOffset = Math.max(0, totalEvents - ACTIVITY_TRANSCRIPT_TAIL_PER_RUN);
+    const events =
+      input.runStore && totalEvents > 0
+        ? (await input.runStore.readTranscript(run.runId, { offset: transcriptOffset, limit: ACTIVITY_TRANSCRIPT_TAIL_PER_RUN })).events
+        : [];
     transcriptEventsConsidered += events.length;
+    transcriptEventsTruncated ||= totalEvents > events.length;
     activity.push(...events.map((event) => activityItemForTranscriptEvent(run, event)));
   }
 
@@ -1177,6 +1189,9 @@ async function buildActivityFeed(input: {
       totalItems: activity.length,
       distinctRunsConsidered: runs.length,
       transcriptEventsConsidered,
+      transcriptEventsTotal,
+      transcriptEventsIncluded: transcriptEventsConsidered,
+      transcriptEventsTruncated,
       syntheticRunEvents,
       writebackOperationsConsidered,
     },
@@ -1184,6 +1199,7 @@ async function buildActivityFeed(input: {
       kind: "durable_activity" as const,
       runStoreAvailable: Boolean(input.runStore),
       writebackOutboxAvailable: Boolean(input.writebackOutbox),
+      transcriptTailPerRun: ACTIVITY_TRANSCRIPT_TAIL_PER_RUN,
     },
     filter: {
       issue: input.query.issue,
@@ -2243,7 +2259,10 @@ async function terminalActivity(run: RunRecord | null, lifecycle: IssueLifecycle
     };
   }
   if (run && runStore) {
-    return deriveTerminalActivityFromTranscript(await readAllTranscriptEvents(runStore, run.runId), run.updatedAt ?? lifecycle?.updatedAt ?? null);
+    const totalEvents = await runStore.ensureTranscriptEventCount(run.runId);
+    const offset = Math.max(0, totalEvents - TERMINAL_ACTIVITY_TRANSCRIPT_TAIL);
+    const page = await runStore.readTranscript(run.runId, { offset, limit: TERMINAL_ACTIVITY_TRANSCRIPT_TAIL });
+    return deriveTerminalActivityFromTranscript(page.events, run.updatedAt ?? lifecycle?.updatedAt ?? null);
   }
   return {
     lastHarnessActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
@@ -2252,18 +2271,6 @@ async function terminalActivity(run: RunRecord | null, lifecycle: IssueLifecycle
     lastToolActivityAt: null,
     unavailable: ["transcript_store_unavailable"],
   };
-}
-
-async function readAllTranscriptEvents(runStore: RunTranscriptStore, runId: string): Promise<TranscriptEvent[]> {
-  const events: TranscriptEvent[] = [];
-  let offset = 0;
-  do {
-    const page = await runStore.readTranscript(runId, { offset, limit: 1_000 });
-    events.push(...page.events);
-    if (page.nextOffset === null) break;
-    offset = page.nextOffset;
-  } while (true);
-  return events;
 }
 
 function deriveTerminalActivityFromTranscript(events: TranscriptEvent[], fallbackHarnessActivityAt: string | null) {

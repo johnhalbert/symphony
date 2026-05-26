@@ -529,7 +529,15 @@ describe("Cursor event mapping", () => {
           yield { type: "user", message: { content: "SECRET_PROMPT" } };
           yield { type: "thinking", text: "SECRET_THINKING" };
           yield { type: "task", text: "SECRET_TASK" };
-          yield { type: "tool_call", name: "shell", status: "completed", arguments: "SECRET_ARGS" };
+          yield {
+            type: "tool_call",
+            name: "shell",
+            status: "completed",
+            arguments: "SECRET_ARGS",
+            result: "SECRET_RESULT",
+            output: "SECRET_OUTPUT",
+            error: "SECRET_ERROR",
+          };
         },
         wait: async () => ({ status: "finished" as const, result: undefined }),
         cancel: vi.fn(async () => undefined),
@@ -554,9 +562,30 @@ describe("Cursor event mapping", () => {
     expect(persisted).not.toContain("SECRET_THINKING");
     expect(persisted).not.toContain("SECRET_TASK");
     expect(persisted).not.toContain("SECRET_ARGS");
-    expect(runStore.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "thinking", message: "Cursor thinking event" }));
-    expect(runStore.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "task", message: "Cursor task event" }));
-    expect(runStore.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "tool_call", message: "tool shell completed" }));
+    expect(persisted).not.toContain("SECRET_RESULT");
+    expect(persisted).not.toContain("SECRET_OUTPUT");
+    expect(persisted).not.toContain("SECRET_ERROR");
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ eventType: "thinking", message: "Cursor thinking event", payload: expect.objectContaining({ kind: "thinking", summary: "[redacted]" }) }),
+    );
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ eventType: "task", message: "Cursor task event", payload: expect.objectContaining({ kind: "task", summary: "[redacted]" }) }),
+    );
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "tool_call",
+        message: "tool shell completed",
+        payload: expect.objectContaining({
+          kind: "tool_call",
+          name: "shell",
+          status: "completed",
+          argumentsPreview: "[redacted]",
+          resultPreview: "[redacted]",
+          outputPreview: "[redacted]",
+          errorPreview: "[redacted]",
+        }),
+      }),
+    );
     expect(events).toContainEqual({ type: "progress", message: "Cursor thinking event", activitySource: "stream" });
     expect(events).toContainEqual({ type: "progress", message: "Cursor task event", activitySource: "stream" });
   });

@@ -24,6 +24,7 @@ export type ExtensionMessage =
       boardError?: string | undefined;
       activityError?: string | undefined;
       appendActivity?: boolean | undefined;
+      reconcileActivityHead?: boolean | undefined;
       offset?: number | undefined;
     }
   | {
@@ -36,6 +37,7 @@ export type ExtensionMessage =
       error?: string | undefined;
       activityError?: string | undefined;
       appendActivity?: boolean | undefined;
+      reconcileActivityHead?: boolean | undefined;
     }
   | {
       type: "runState";

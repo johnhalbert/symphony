@@ -20,6 +20,7 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
   private activityScopeKey: string | null = null;
   private globalActivityLoaded = false;
   private activeIssueKey: string | null = null;
+  private activeIssueActivityKey: string | null = null;
   private issueEpoch = 0;
   private activeRunId: string | null = null;
   private runEpoch = 0;
@@ -146,11 +147,11 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
     const settings = readSymphonySettings();
     const scopeKey = await this.syncActivityScope(settings.baseUrl);
     const dashboardGeneration = ++this.dashboardGeneration;
-    const includeActivity = !this.globalActivityLoaded;
+    const reconcileActivityHead = this.globalActivityLoaded;
     await this.postWebviewMessage({ type: "dashboardLoading", dashboardGeneration });
     const [board, activity] = await Promise.allSettled([
       this.client.fetchBoard(settings.baseUrl, { refresh: options.refresh, signal: options.signal }),
-      includeActivity ? this.client.fetchActivity(settings.baseUrl, { offset: 0, limit: 50, signal: options.signal }) : Promise.resolve(null),
+      this.client.fetchActivity(settings.baseUrl, { offset: 0, limit: 50, signal: options.signal }),
     ]);
     if (dashboardGeneration !== this.dashboardGeneration || scopeKey !== this.activityScopeKey) return;
     const activityValue = activity.status === "fulfilled" ? activity.value : null;
@@ -163,7 +164,11 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
       boardError: board.status === "rejected" ? errorMessage(board.reason) : undefined,
       activityError: activity.status === "rejected" ? errorMessage(activity.reason) : undefined,
       offset: 0,
+      reconcileActivityHead,
     });
+    if (this.activeIssueKey) {
+      await this.refreshIssueActivityHead(this.activeIssueKey, options.signal);
+    }
   }
 
   private async loadGlobalActivity(offset: number): Promise<void> {
@@ -193,11 +198,13 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
     const settings = readSymphonySettings();
     const scopeKey = await this.syncActivityScope(settings.baseUrl);
     this.activeIssueKey = issueKey;
+    this.activeIssueActivityKey = null;
     const issueEpoch = ++this.issueEpoch;
     try {
       const detail = await this.client.fetchBoardIssue(settings.baseUrl, issueKey);
       if (!this.shouldPostIssue(issueKey, issueEpoch, scopeKey)) return;
       const activityIssue = detail.issueDetails.issue.identifier ?? detail.issueDetails.issue.id ?? issueKey;
+      this.activeIssueActivityKey = activityIssue;
       try {
         const activity = await this.client.fetchActivity(settings.baseUrl, { issue: activityIssue, offset: 0, limit: 50 });
         if (!this.shouldPostIssue(issueKey, issueEpoch, scopeKey)) return;
@@ -224,8 +231,9 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
     const settings = readSymphonySettings();
     const scopeKey = await this.syncActivityScope(settings.baseUrl);
     const issueEpoch = this.issueEpoch;
+    const activityIssue = this.activeIssueKey === issueKey ? (this.activeIssueActivityKey ?? issueKey) : issueKey;
     try {
-      const activity = await this.client.fetchActivity(settings.baseUrl, { issue: issueKey, offset, limit: 50 });
+      const activity = await this.client.fetchActivity(settings.baseUrl, { issue: activityIssue, offset, limit: 50 });
       if (!this.shouldPostIssue(issueKey, issueEpoch, scopeKey)) return;
       await this.postWebviewMessage({ type: "issueDetailState", issueKey, issueEpoch, offset, detail: null, activity, appendActivity: true });
     } catch (error) {
@@ -279,6 +287,38 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
     }
   }
 
+  private async refreshIssueActivityHead(issueKey: string, signal?: AbortSignal | undefined): Promise<void> {
+    const settings = readSymphonySettings();
+    const scopeKey = await this.syncActivityScope(settings.baseUrl);
+    const issueEpoch = this.issueEpoch;
+    const activityIssue = this.activeIssueActivityKey ?? issueKey;
+    try {
+      const activity = await this.client.fetchActivity(settings.baseUrl, { issue: activityIssue, offset: 0, limit: 50, signal });
+      if (!this.shouldPostIssue(issueKey, issueEpoch, scopeKey)) return;
+      await this.postWebviewMessage({
+        type: "issueDetailState",
+        issueKey,
+        issueEpoch,
+        offset: 0,
+        detail: null,
+        activity,
+        reconcileActivityHead: true,
+      });
+    } catch (error) {
+      if (!this.shouldPostIssue(issueKey, issueEpoch, scopeKey)) return;
+      await this.postWebviewMessage({
+        type: "issueDetailState",
+        issueKey,
+        issueEpoch,
+        offset: 0,
+        detail: null,
+        activity: null,
+        activityError: errorMessage(error),
+        reconcileActivityHead: true,
+      });
+    }
+  }
+
   private async openWorkspace(issueKey: string): Promise<void> {
     const settings = readSymphonySettings();
     try {
@@ -300,6 +340,7 @@ export class SymphonyPanelProvider implements vscode.WebviewViewProvider, vscode
       this.activityScopeKey = scopeKey;
       this.globalActivityLoaded = false;
       this.activeIssueKey = null;
+      this.activeIssueActivityKey = null;
       this.activeRunId = null;
       await this.postWebviewMessage({ type: "activityScopeReset", scopeKey });
     }

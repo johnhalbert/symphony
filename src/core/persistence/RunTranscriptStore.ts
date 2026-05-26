@@ -1,5 +1,7 @@
+import { createReadStream } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
@@ -99,6 +101,7 @@ export interface RunRecord {
   completedAt: string | null;
   error: string | null;
   tokens: TokenCounts;
+  transcriptEventCount?: number;
   prUrl?: string | null;
   prNumber?: number | null;
   prHeadSha?: string | null;
@@ -275,6 +278,7 @@ export class FileRunTranscriptStore {
       completedAt: existing?.completedAt ?? null,
       error: existing?.error ?? null,
       tokens: existing?.tokens ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      transcriptEventCount: existing?.transcriptEventCount ?? 0,
     };
     await this.writeRun(record);
     return record;
@@ -327,15 +331,20 @@ export class FileRunTranscriptStore {
   }
 
   async appendEvent(input: Omit<TranscriptEvent, "sequence"> & { sequence?: number }): Promise<TranscriptEvent> {
-    await fs.mkdir(this.runDir(input.runId), { recursive: true });
-    const sequence = input.sequence ?? (await this.nextSequence(input.runId));
-    const event: TranscriptEvent = {
-      ...input,
-      sequence,
-      payload: sanitizeJson(input.payload),
-    };
-    await fs.appendFile(this.eventsPath(input.runId), `${JSON.stringify(event)}\n`, "utf8");
-    return event;
+    return this.withRunUpdateLock(input.runId, async () => {
+      await fs.mkdir(this.runDir(input.runId), { recursive: true });
+      const count = await this.ensureTranscriptEventCountUnlocked(input.runId);
+      const sequence = input.sequence ?? count + 1;
+      const event: TranscriptEvent = {
+        ...input,
+        sequence,
+        payload: sanitizeJson(input.payload),
+      };
+      await fs.appendFile(this.eventsPath(input.runId), `${JSON.stringify(event)}\n`, "utf8");
+      const record = await this.getRun(input.runId);
+      if (record) await this.writeRun({ ...record, transcriptEventCount: count + 1, updatedAt: new Date().toISOString() });
+      return event;
+    });
   }
 
   async getRun(runId: string): Promise<RunRecord | null> {
@@ -367,12 +376,14 @@ export class FileRunTranscriptStore {
   async readTranscript(runId: string, options: { offset?: number; limit?: number } = {}): Promise<TranscriptPage> {
     const offset = Math.max(options.offset ?? 0, 0);
     const limit = Math.min(Math.max(options.limit ?? 100, 1), 1_000);
-    const lines = await readLinesIfExists(this.eventsPath(runId));
-    const events = lines
-      .slice(offset, offset + limit)
-      .map((line) => JSON.parse(line) as TranscriptEvent);
-    const nextOffset = offset + events.length < lines.length ? offset + events.length : null;
+    const total = await this.ensureTranscriptEventCount(runId);
+    const events = await readJsonlPage<TranscriptEvent>(this.eventsPath(runId), offset, limit);
+    const nextOffset = offset + events.length < total ? offset + events.length : null;
     return { runId, offset, limit, nextOffset, events };
+  }
+
+  async ensureTranscriptEventCount(runId: string): Promise<number> {
+    return this.withRunUpdateLock(runId, () => this.ensureTranscriptEventCountUnlocked(runId));
   }
 
   async listRuns(): Promise<RunRecord[]> {
@@ -404,9 +415,12 @@ export class FileRunTranscriptStore {
     }
   }
 
-  private async nextSequence(runId: string): Promise<number> {
-    const lines = await readLinesIfExists(this.eventsPath(runId));
-    return lines.length + 1;
+  private async ensureTranscriptEventCountUnlocked(runId: string): Promise<number> {
+    const record = await this.getRun(runId);
+    if (typeof record?.transcriptEventCount === "number") return record.transcriptEventCount;
+    const count = await countJsonlLines(this.eventsPath(runId));
+    if (record) await this.writeRun({ ...record, transcriptEventCount: count });
+    return count;
   }
 
   private workspacesDir(): string {
@@ -579,14 +593,44 @@ async function readJsonIfExists<T>(filePath: string): Promise<T | null> {
   return null;
 }
 
-async function readLinesIfExists(filePath: string): Promise<string[]> {
+async function readJsonlPage<T>(filePath: string, offset: number, limit: number): Promise<T[]> {
+  const events: T[] = [];
+  let lineIndex = 0;
   try {
-    const body = await fs.readFile(filePath, "utf8");
-    return body.split(/\r?\n/).filter((line) => line.length > 0);
+    const stream = createReadStream(filePath, { encoding: "utf8" });
+    const lines = createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (line.length === 0) continue;
+      if (lineIndex >= offset && events.length < limit) {
+        events.push(JSON.parse(line) as T);
+      }
+      lineIndex += 1;
+      if (events.length >= limit) {
+        lines.close();
+        stream.destroy();
+        break;
+      }
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
+  return events;
+}
+
+async function countJsonlLines(filePath: string): Promise<number> {
+  let count = 0;
+  try {
+    const stream = createReadStream(filePath, { encoding: "utf8" });
+    const lines = createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (line.length > 0) count += 1;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  return count;
 }
 
 function sanitizeJson(value: unknown): unknown {

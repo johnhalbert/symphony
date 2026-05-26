@@ -614,16 +614,19 @@ describe("StatusServer durable API", () => {
           totalItems: number;
           distinctRunsConsidered: number;
           transcriptEventsConsidered: number;
+          transcriptEventsTotal: number;
+          transcriptEventsIncluded: number;
+          transcriptEventsTruncated: boolean;
           syntheticRunEvents: number;
           writebackOperationsConsidered: number;
         };
-        source: { runStoreAvailable: boolean; writebackOutboxAvailable: boolean };
+        source: { runStoreAvailable: boolean; writebackOutboxAvailable: boolean; transcriptTailPerRun: number };
       };
       const secondPageResponse = await fetch(`${baseUrl}/api/v1/activity?offset=1&limit=1`);
       const secondPage = (await secondPageResponse.json()) as typeof firstPage;
       const issueResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-A&limit=100`);
       const issueBody = (await issueResponse.json()) as typeof firstPage;
-      const writebackResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-B&offset=1001&limit=10`);
+      const writebackResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-B&offset=500&limit=10`);
       const writebackText = await writebackResponse.text();
       const writebackBody = JSON.parse(writebackText) as typeof firstPage;
       const clampedResponse = await fetch(`${baseUrl}/api/v1/activity?limit=999`);
@@ -644,14 +647,18 @@ describe("StatusServer durable API", () => {
       });
       expect(firstPage.nextOffset).toBe(1);
       expect(firstPage.counts).toMatchObject({
-        totalItems: 1_005,
+        totalItems: 504,
         distinctRunsConsidered: 2,
-        transcriptEventsConsidered: 1_002,
+        transcriptEventsConsidered: 501,
+        transcriptEventsTotal: 1_002,
+        transcriptEventsIncluded: 501,
+        transcriptEventsTruncated: true,
         syntheticRunEvents: 2,
         writebackOperationsConsidered: 1,
       });
       expect(firstPage.source.runStoreAvailable).toBe(true);
       expect(firstPage.source.writebackOutboxAvailable).toBe(true);
+      expect(firstPage.source.transcriptTailPerRun).toBe(500);
       expect(firstPageText).not.toContain("PROMPT_SECRET");
       expect(firstPageText).not.toContain("PAYLOAD_SECRET");
       expect(secondPage.activity[0]?.issue.identifier).toBe("TEST-A");
@@ -806,10 +813,13 @@ describe("StatusServer durable API", () => {
           totalItems: number;
           distinctRunsConsidered: number;
           transcriptEventsConsidered: number;
+          transcriptEventsTotal: number;
+          transcriptEventsIncluded: number;
+          transcriptEventsTruncated: boolean;
           syntheticRunEvents: number;
           writebackOperationsConsidered: number;
         };
-        source: { kind: string; runStoreAvailable: boolean; writebackOutboxAvailable: boolean };
+        source: { kind: string; runStoreAvailable: boolean; writebackOutboxAvailable: boolean; transcriptTailPerRun: number };
       };
 
       expect(response.status).toBe(200);
@@ -819,10 +829,13 @@ describe("StatusServer durable API", () => {
         totalItems: 0,
         distinctRunsConsidered: 0,
         transcriptEventsConsidered: 0,
+        transcriptEventsTotal: 0,
+        transcriptEventsIncluded: 0,
+        transcriptEventsTruncated: false,
         syntheticRunEvents: 0,
         writebackOperationsConsidered: 0,
       });
-      expect(body.source).toEqual({ kind: "durable_activity", runStoreAvailable: false, writebackOutboxAvailable: false });
+      expect(body.source).toEqual({ kind: "durable_activity", runStoreAvailable: false, writebackOutboxAvailable: false, transcriptTailPerRun: 500 });
     } finally {
       await server.stop();
     }

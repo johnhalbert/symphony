@@ -532,28 +532,90 @@ function cursorTranscriptEvent(message: unknown): { eventType: string; message?:
     case "user":
       return null;
     case "thinking":
-      return { eventType: "thinking", message: "Cursor thinking event" };
+      return {
+        eventType: "thinking",
+        message: "Cursor thinking event",
+        payload: summaryPayload("thinking", message.text ?? message.message ?? message.content, 240),
+      };
     case "tool_call":
       return {
         eventType: "tool_call",
         message: `tool ${typeof message.name === "string" ? message.name : "unknown"} ${typeof message.status === "string" ? message.status : "unknown"}`,
+        payload: toolCallPayload(message),
       };
     case "assistant":
-      return { eventType: "assistant", message: "Cursor assistant message" };
+      return {
+        eventType: "assistant",
+        message: "Cursor assistant message",
+        payload: textPayload("assistant", message.text ?? message.message ?? message.content, 500),
+      };
     case "task":
-      return { eventType: "task", message: "Cursor task event" };
+      return {
+        eventType: "task",
+        message: "Cursor task event",
+        payload: summaryPayload("task", message.text ?? message.message ?? message.content, 240),
+      };
     case "status":
-      return { eventType: "status", message: typeof message.status === "string" ? `Cursor status ${message.status}` : "Cursor status event" };
+      return {
+        eventType: "status",
+        message: typeof message.status === "string" ? `Cursor status ${message.status}` : "Cursor status event",
+        payload: {
+          kind: "status",
+          status: sanitizedPreviewValue(message.status, 160).preview ?? "unknown",
+          messagePreview: sanitizedPreviewValue(message.message ?? message.text, 500).preview,
+          truncated: sanitizedPreviewValue(message.message ?? message.text, 500).truncated,
+        },
+      };
     case "system":
       return {
         eventType: "system",
         message: `Cursor system event: ${typeof message.subtype === "string" ? message.subtype : "system"}`,
+        payload: {
+          kind: "system",
+          subtype: sanitizedPreviewValue(message.subtype, 160).preview ?? "system",
+          messagePreview: sanitizedPreviewValue(message.message ?? message.text, 500).preview,
+          truncated: sanitizedPreviewValue(message.message ?? message.text, 500).truncated,
+        },
       };
     case "request":
       return { eventType: "request", message: "Cursor requested external input" };
     default:
       return { eventType: message.type };
   }
+}
+
+function summaryPayload(kind: "thinking" | "task", value: unknown, maxLength: number): unknown {
+  const preview = sanitizedPreviewValue(value, maxLength);
+  return { kind, summary: preview.preview ?? "", truncated: preview.truncated, redacted: true };
+}
+
+function textPayload(kind: "assistant", value: unknown, maxLength: number): unknown {
+  const preview = sanitizedPreviewValue(value, maxLength);
+  return { kind, textPreview: preview.preview ?? "", truncated: preview.truncated };
+}
+
+function toolCallPayload(message: { [key: string]: unknown }): unknown {
+  const payload: Record<string, unknown> = {
+    kind: "tool_call",
+    name: sanitizedPreviewValue(message.name, 160).preview ?? "unknown",
+    status: sanitizedPreviewValue(message.status, 160).preview ?? "unknown",
+    callId: sanitizedPreviewValue(message.callId ?? message.call_id ?? message.id, 160).preview,
+    argumentsPreview: sanitizedPreviewValue(message.arguments ?? message.args ?? message.input, 500).preview,
+    redacted: true,
+    truncated: false,
+  };
+  for (const [field, outputField] of [
+    ["result", "resultPreview"],
+    ["output", "outputPreview"],
+    ["error", "errorPreview"],
+  ] as const) {
+    const preview = sanitizedPreviewValue(message[field], 500);
+    if (preview.preview !== null) payload[outputField] = preview.preview;
+    payload.truncated = Boolean(payload.truncated) || preview.truncated;
+  }
+  const argumentPreview = sanitizedPreviewValue(message.arguments ?? message.args ?? message.input, 500);
+  payload.truncated = Boolean(payload.truncated) || argumentPreview.truncated;
+  return payload;
 }
 
 function cursorLastToolContext(message: unknown): CursorLastToolContext | null {
@@ -574,6 +636,23 @@ function previewValue(value: unknown, maxLength: number): string | null {
   const text = typeof value === "string" ? value : safeJsonPreview(value);
   const oneLine = text.replace(/\s+/g, " ").trim();
   return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`;
+}
+
+function sanitizedPreviewValue(value: unknown, maxLength: number): { preview: string | null; truncated: boolean } {
+  if (value === undefined || value === null) return { preview: null, truncated: false };
+  const text = typeof value === "string" ? value : safeJsonPreview(value);
+  const redacted = redactTranscriptText(text).replace(/\s+/g, " ").trim();
+  return {
+    preview: redacted.length <= maxLength ? redacted : `${redacted.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`,
+    truncated: redacted.length > maxLength,
+  };
+}
+
+function redactTranscriptText(value: string): string {
+  return value
+    .replace(/SECRET_[A-Z0-9_]+/g, "[redacted]")
+    .replace(/\b(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*[^\s"',}]+/gi, "$1=[redacted]")
+    .replace(/\bBearer\s+[^\s"',}]+/gi, "Bearer [redacted]");
 }
 
 function safeJsonPreview(value: unknown): string {

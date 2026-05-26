@@ -74,6 +74,7 @@ describe("FileRunTranscriptStore", () => {
 
     expect(run).toMatchObject({
       status: "succeeded",
+      transcriptEventCount: 5,
       gitBranchName: "symphony/TEST-1",
       repoPath: "/repo",
       baseRef: "origin/main",
@@ -100,6 +101,41 @@ describe("FileRunTranscriptStore", () => {
       "pr_updated",
       "ci_status_changed",
     ]);
+    expect(page.nextOffset).toBeNull();
+  });
+
+  it("assigns contiguous sequences when appends race", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await store.startRun({
+      runId: "run-race",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+
+    await Promise.all(
+      Array.from({ length: 20 }, (_, index) =>
+        store.appendEvent({
+          runId: "run-race",
+          at: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+          source: "harness",
+          eventType: "progress",
+          message: `event ${index}`,
+        }),
+      ),
+    );
+
+    const run = await store.getRun("run-race");
+    const page = await store.readTranscript("run-race", { offset: 0, limit: 25 });
+    expect(run?.transcriptEventCount).toBe(20);
+    expect(page.events.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(
+      Array.from({ length: 20 }, (_, index) => index + 1),
+    );
     expect(page.nextOffset).toBeNull();
   });
 

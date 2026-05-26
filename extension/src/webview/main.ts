@@ -346,12 +346,45 @@ function renderTranscript(): string {
 }
 
 function renderTranscriptEvent(event: TranscriptEvent): string {
-  const payload = event.payload === undefined ? missingPayloadNote(event.eventType) : `<pre>${escapeHtml(previewJson(event.payload))}</pre>`;
+  const payload = renderTranscriptPayload(event);
   return `<article class="transcript-event">
     <header><span class="badge">${escapeHtml(event.source)}</span><strong>${escapeHtml(event.eventType)}</strong><span class="meta mono">#${event.sequence} · ${escapeHtml(event.at)}</span></header>
     ${event.message ? `<p>${escapeHtml(event.message)}</p>` : ""}
     ${payload}
   </article>`;
+}
+
+function renderTranscriptPayload(event: TranscriptEvent): string {
+  if (event.payload === undefined) return missingPayloadNote(event.eventType);
+  if (!isSummaryPayload(event.payload)) return `<pre>${escapeHtml(previewJson(event.payload))}</pre>`;
+  const rows = summaryRows(event.payload);
+  return `<dl class="summary transcript-summary">${rows.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value))}</dd>`).join("")}</dl>`;
+}
+
+function isSummaryPayload(value: unknown): value is JsonObject & { kind: string } {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && typeof (value as { kind?: unknown }).kind === "string";
+}
+
+function summaryRows(payload: JsonObject & { kind: string }): Array<[string, string]> {
+  const rows: Array<[string, string | null]> = [["Kind", payload.kind]];
+  for (const [label, key] of [
+    ["Tool", "name"],
+    ["Status", "status"],
+    ["Call ID", "callId"],
+    ["Summary", "summary"],
+    ["Text", "textPreview"],
+    ["Message", "messagePreview"],
+    ["Arguments", "argumentsPreview"],
+    ["Result", "resultPreview"],
+    ["Output", "outputPreview"],
+    ["Error", "errorPreview"],
+  ] as const) {
+    const value = payload[key];
+    if (typeof value === "string" && value.length > 0) rows.push([label, value]);
+  }
+  if (payload.truncated === true) rows.push(["Truncated", "yes"]);
+  if (payload.redacted === true) rows.push(["Redacted", "yes"]);
+  return rows.filter((row): row is [string, string] => row[1] !== null);
 }
 
 function renderActivityList(activity: ActivityItem[]): string {
