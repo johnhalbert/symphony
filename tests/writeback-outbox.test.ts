@@ -99,6 +99,30 @@ describe("FileWritebackOutboxStore", () => {
     expect(persisted?.status).toMatch(/retrying|dead_letter/);
   });
 
+  it("claims the same due record only once across concurrent processors", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter({ commentDelayMs: 20 });
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const operation = {
+      idempotencyKey: "comment:issue-1:publication-approval-rejected",
+      kind: "comment" as const,
+      issueId: "issue-1",
+      payload: {
+        body: "Status: rejected",
+        dedupeKey: "publication-approval-rejected",
+      },
+    };
+    await store.enqueueOnce(operation);
+
+    await Promise.all([
+      processor.processDue({ idempotencyKeys: [operation.idempotencyKey] }),
+      processor.processDue({ idempotencyKeys: [operation.idempotencyKey] }),
+    ]);
+
+    expect(writer.comments).toHaveLength(1);
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
+  });
+
   it("marks verified writeback results as succeeded", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter({ transitionStatus: "verified" });
@@ -737,7 +761,7 @@ class FakeWriter implements TrackerWriter {
   readonly issueCreates: TrackerIssueCreateInput[] = [];
   readonly issueRelations: TrackerIssueRelationInput[] = [];
 
-  constructor(private readonly options: { transitionStatus?: TrackerWriteResult["status"] } = {}) {}
+  constructor(private readonly options: { transitionStatus?: TrackerWriteResult["status"]; commentDelayMs?: number } = {}) {}
 
   async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
     this.transitions.push(input);
@@ -746,6 +770,7 @@ class FakeWriter implements TrackerWriter {
   }
 
   async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+    if (this.options.commentDelayMs) await new Promise((resolve) => setTimeout(resolve, this.options.commentDelayMs));
     this.comments.push(input);
     return { status: "applied" };
   }

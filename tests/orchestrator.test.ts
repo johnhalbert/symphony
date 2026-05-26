@@ -653,6 +653,7 @@ describe("Orchestrator", () => {
     await waitFor(() => harness.runs.length === 1);
     await waitFor(() => first.snapshot().counts.running === 0);
     await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
+    await settleOrchestratorExit();
     await first.stop();
 
     const second = new Orchestrator({
@@ -674,6 +675,7 @@ describe("Orchestrator", () => {
     await waitFor(() => harness.runs.length === 2, "planning retry after durable backoff");
     await waitFor(() => second.snapshot().counts.running === 0);
     await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 2);
+    await settleOrchestratorExit();
     await second.stop();
 
     const lifecycle = await lifecycleStore.get(candidate.id);

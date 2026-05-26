@@ -144,6 +144,9 @@ type LifecycleGuardResult =
   | { status: "retry"; message: string };
 
 export class FileWritebackOutboxStore {
+  private readonly claimLocks = new Set<string>();
+  private readonly writeLocks = new Map<string, Promise<void>>();
+
   constructor(private readonly stateDir: string) {}
 
   async enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation> {
@@ -174,12 +177,25 @@ export class FileWritebackOutboxStore {
       .filter((record) => Date.parse(record.nextAttemptAt) <= now.getTime())
       .filter((record) => allowed === null || allowed.has(record.idempotencyKey))
       .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+    const claimed: WritebackOperation[] = [];
     for (const record of due) {
-      record.status = "in_flight";
-      record.updatedAt = new Date().toISOString();
-      await this.write(record);
+      if (this.claimLocks.has(record.idempotencyKey)) continue;
+      this.claimLocks.add(record.idempotencyKey);
+      try {
+        const current = await this.get(record.idempotencyKey);
+        if (!current) continue;
+        if (!["pending", "retrying"].includes(current.status)) continue;
+        if (Date.parse(current.nextAttemptAt) > now.getTime()) continue;
+        if (allowed !== null && !allowed.has(current.idempotencyKey)) continue;
+        current.status = "in_flight";
+        current.updatedAt = new Date().toISOString();
+        await this.write(current);
+        claimed.push(current);
+      } finally {
+        this.claimLocks.delete(record.idempotencyKey);
+      }
     }
-    return due;
+    return claimed;
   }
 
   async markSucceeded(record: WritebackOperation, result?: TrackerWriteResult): Promise<WritebackOperation> {
@@ -244,6 +260,23 @@ export class FileWritebackOutboxStore {
   }
 
   private async write(record: WritebackOperation): Promise<void> {
+    const previous = this.writeLocks.get(record.idempotencyKey) ?? Promise.resolve();
+    let current!: Promise<void>;
+    current = (async () => {
+      await previous.catch(() => undefined);
+      try {
+        await this.writeUnlocked(record);
+      } finally {
+        if (this.writeLocks.get(record.idempotencyKey) === current) {
+          this.writeLocks.delete(record.idempotencyKey);
+        }
+      }
+    })();
+    this.writeLocks.set(record.idempotencyKey, current);
+    await current;
+  }
+
+  private async writeUnlocked(record: WritebackOperation): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
     const target = this.recordPath(record.idempotencyKey);
     const temp = `${target}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
