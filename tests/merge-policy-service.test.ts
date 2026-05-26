@@ -303,7 +303,7 @@ describe("MergePolicyService", () => {
     expect(currentIssue.state).toBe("Ready to Merge");
   });
 
-  it("requires every configured required check to be returned successful by the merge client", async () => {
+  it("waits when a configured required check is missing", async () => {
     const config = mergeConfig({ requiredChecks: ["test", "typecheck"] });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
@@ -326,12 +326,15 @@ describe("MergePolicyService", () => {
       client,
     });
 
-    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/typecheck/);
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result.status).toBe("checks_pending");
+    expect(result.status === "checks_pending" ? result.gate.missingChecks.map((check) => check.name) : []).toEqual(["typecheck"]);
     expect(client.mergeInput).toBeNull();
     expect(currentIssue.state).toBe("Ready to Merge");
   });
 
-  it("rejects a returned required check with a non-success status", async () => {
+  it("dispatches a worker repair when a required check fails", async () => {
     const config = mergeConfig({ requiredChecks: ["test"] });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
@@ -355,10 +358,120 @@ describe("MergePolicyService", () => {
       client,
     });
 
-    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/Required checks are not passing: test/);
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("repair_dispatched");
     expect(client.mergeInput).toBeNull();
-    expect(writer.transitions).toEqual([]);
-    expect(currentIssue.state).toBe("Ready to Merge");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge"],
+        toState: "In Progress",
+        reason: "Symphony merge gate required CI repair",
+      },
+    ]);
+    expect(writer.comments[0]?.body).toContain("Status: repair required");
+    expect(writer.comments[0]?.body).toContain("test: failure / failure (https://ci.test/test)");
+    expect(currentIssue.state).toBe("In Progress");
+    expect(lifecycle).toMatchObject({
+      phase: "implementation",
+      reviewRound: 1,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+      lastReviewVerdictId: "merge-gate:issue-1:pr-42:head-sha-1",
+    });
+    expect(lifecycle?.reviewVerdicts.at(-1)).toMatchObject({
+      id: "merge-gate:issue-1:pr-42:head-sha-1",
+      verdict: "fail",
+      reviewer: "symphony-merge-gate",
+      findings: ["Required check failed: test: failure / failure (https://ci.test/test)"],
+    });
+  });
+
+  it("blocks from the merge source state when the merge gate repair ceiling is reached", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue, { reviewRound: 2 });
+    const client = new FakeMergeClient({
+      checkResults: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("blocked");
+    expect(client.mergeInput).toBeNull();
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge"],
+        toState: "Blocked",
+        reason: "Symphony merge gate repair ceiling reached",
+      },
+    ]);
+    expect(currentIssue.state).toBe("Blocked");
+    expect(lifecycle?.phase).toBe("blocked");
+    expect(lifecycle?.reviewRound).toBe(3);
+    expect(lifecycle?.blockedReason).toContain("merge gate required checks failed");
+  });
+
+  it("retries a skipped merge gate repair writeback without merging or burning another round", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({
+      checkResults: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+    });
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const firstService = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(store, new MemoryWriter(currentIssue, "skipped"), new StructuredLogger(() => undefined), 60_000),
+      client,
+    });
+
+    await expect(firstService.reconcileIssue(currentIssue)).rejects.toThrow(/Merge gate writeback did not succeed/);
+    expect((await lifecycleStore.get(currentIssue.id))?.reviewRound).toBe(0);
+    expect(client.mergeInput).toBeNull();
+
+    const writer = new MemoryWriter(currentIssue);
+    const secondService = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 60_000),
+      client,
+    });
+
+    const result = await secondService.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("repair_dispatched");
+    expect(client.mergeInput).toBeNull();
+    expect(currentIssue.state).toBe("In Progress");
+    expect(lifecycle?.reviewRound).toBe(1);
   });
 
   it("rejects a successful Done writeback when the tracker still reports a non-Done state", async () => {
@@ -524,7 +637,7 @@ function mergeConfig(input: {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
       workspace: { root },
       writeback: { enabled: true, mode: input.writebackMode ?? "live" },
-      review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge" },
+      review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge", blocked_states: ["Blocked"] },
       merge_policy: {
         mode: "gated",
         source_states: ["Ready to Merge"],
@@ -548,7 +661,7 @@ async function seedLifecycle(
   lifecycleStore: FileIssueLifecycleStore,
   runStore: FileRunTranscriptStore,
   currentIssue: Issue,
-  options: { includeApproval?: boolean } = {},
+  options: { includeApproval?: boolean; reviewRound?: number } = {},
 ): Promise<void> {
   await runStore.startRun({
     runId: "worker-run-1",
@@ -574,6 +687,7 @@ async function seedLifecycle(
   });
   await lifecycleStore.ensureIssue(currentIssue, {
     phase: "passed",
+    reviewRound: options.reviewRound ?? 0,
     lastCompletionReportId: "completion-report:issue-1:report-1",
     lastReviewVerdictId: "review-verdict:issue-1:verdict-pass-1",
     summaryPointers: {
@@ -722,6 +836,7 @@ class FakeMergeClient implements MergePolicyGitHubClient {
 
 class MemoryWriter implements TrackerWriter {
   readonly transitions: TrackerTransitionInput[] = [];
+  readonly comments: Array<{ issueId: string; body: string; dedupeKey: string }> = [];
 
   constructor(
     private readonly currentIssue?: Issue,
@@ -736,7 +851,8 @@ class MemoryWriter implements TrackerWriter {
       : { status: this.transitionStatus };
   }
 
-  async createIssueComment() {
+  async createIssueComment(input: { issueId: string; body: string; dedupeKey: string }) {
+    this.comments.push(input);
     return { status: "applied" as const };
   }
 }

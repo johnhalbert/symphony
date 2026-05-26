@@ -2078,11 +2078,22 @@ export class Orchestrator {
       });
       const result = await service.reconcileIssue(issue);
       if (result.status !== "skipped") {
+        const mergeDetails =
+          result.status === "merged" || result.status === "already_merged"
+            ? { merge_id: result.merge.id }
+            : {
+                merge_gate_id: result.gate.id,
+                pr_number: result.gate.pullRequest.number,
+                head_sha: result.gate.headSha,
+                failed_checks: result.gate.failedChecks.map((check) => check.name),
+                pending_checks: result.gate.pendingChecks.map((check) => check.name),
+                missing_checks: result.gate.missingChecks.map((check) => check.name),
+              };
         this.options.logger.info("merge policy reconciled issue", {
           issue_id: issue.id,
           issue_identifier: issue.identifier,
           status: result.status,
-          merge_id: result.merge.id,
+          ...mergeDetails,
         });
       }
     } catch (error) {

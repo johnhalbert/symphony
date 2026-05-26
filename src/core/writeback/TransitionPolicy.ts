@@ -48,6 +48,31 @@ export interface MergeCompletedWritebackContext {
   doneState: string;
 }
 
+export interface MergeGateCheckEvidence {
+  name: string;
+  status: string;
+  conclusion: string | null;
+  url: string | null;
+}
+
+export interface MergeGateWritebackContext {
+  issue: Issue;
+  gateId: string;
+  fromState: string;
+  pullRequest: {
+    url: string | null;
+    number: number | null;
+    headSha?: string | null;
+    branch?: string | null;
+  };
+  requiredChecks: string[];
+  failedChecks: MergeGateCheckEvidence[];
+  pendingChecks: MergeGateCheckEvidence[];
+  missingChecks: MergeGateCheckEvidence[];
+  reviewRound: number;
+  maxReviewRounds: number;
+}
+
 export interface CompletionReportWritebackDetails {
   reportId: string;
   idempotencyKey: string;
@@ -549,6 +574,66 @@ export function planMergeCompletedWritebacks(
   ];
 }
 
+export function planMergeGateRepairWritebacks(
+  context: MergeGateWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:repair`;
+  return [
+    mergeGateCommentOperation(
+      context,
+      eventKey,
+      "repair required",
+      `Next state: ${config.writeback.dispatchState} (worker repair queue)`,
+      "Fix the failing required checks, push the repair to the lifecycle-bound PR branch, validate it, and submit a new completion report.",
+    ),
+    {
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      payload: {
+        fromStates: [context.fromState],
+        toState: config.writeback.dispatchState,
+        reason: "Symphony merge gate required CI repair",
+      },
+    },
+  ];
+}
+
+export function planMergeGateBlockedWritebacks(
+  context: MergeGateWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:blocked`;
+  const operations: NewWritebackOperation[] = [
+    mergeGateCommentOperation(
+      context,
+      eventKey,
+      "blocked, human action required",
+      blockedState === null
+        ? "No blocked state is configured, so Symphony recorded a lifecycle-level block without changing the tracker state."
+        : `Transitioning to blocked state: ${blockedState}`,
+      "Inspect the failing required checks and decide whether to repair, adjust CI configuration, or manually override the merge gate.",
+    ),
+  ];
+  if (blockedState !== null) {
+    operations.push({
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      payload: {
+        fromStates: [context.fromState],
+        toState: blockedState,
+        reason: "Symphony merge gate repair ceiling reached",
+      },
+    });
+  }
+  return operations;
+}
+
 export function planRunFailedComment(context: RunWritebackContext, config: ServiceConfig, error: string | null): NewWritebackOperation | null {
   if (!config.writeback.enabled) return null;
   return {
@@ -709,6 +794,60 @@ function formatPullRequestHandoffChecks(ci: NonNullable<PullRequestHandoffWriteb
     `- Required checks: ${ci.requiredChecks.join(", ")}`,
     `- Passing checks: ${ci.passedChecks.length === 0 ? "none" : ci.passedChecks.join(", ")}`,
   ];
+}
+
+function mergeGateCommentOperation(
+  context: MergeGateWritebackContext,
+  eventKey: string,
+  status: string,
+  nextState: string,
+  requiredAction: string,
+): NewWritebackOperation {
+  return {
+    idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+    kind: "comment",
+    issueId: context.issue.id,
+    payload: {
+      dedupeKey: eventKey,
+      body: [
+        "## Symphony Merge Gate",
+        "",
+        `Status: ${status}`,
+        nextState,
+        "",
+        `PR: ${formatPullRequest(context.pullRequest)}`,
+        `PR head SHA: ${context.pullRequest.headSha ?? "n/a"}`,
+        `Branch: ${context.pullRequest.branch ?? "n/a"}`,
+        "",
+        "Required checks:",
+        ...listOrFallback(context.requiredChecks, "No required checks configured."),
+        "",
+        "Failing checks:",
+        ...formatMergeGateChecks(context.failedChecks, "No failing checks recorded."),
+        "",
+        "Pending checks:",
+        ...formatMergeGateChecks(context.pendingChecks, "No pending checks recorded."),
+        "",
+        "Missing checks:",
+        ...formatMergeGateChecks(context.missingChecks, "No missing checks recorded."),
+        "",
+        "Counts:",
+        `- Merge gate repair round: ${formatCount(context.reviewRound, context.maxReviewRounds)}`,
+        "",
+        "Required action:",
+        requiredAction,
+      ].join("\n"),
+    },
+  };
+}
+
+function formatMergeGateChecks(checks: MergeGateCheckEvidence[], fallback: string): string[] {
+  if (checks.length === 0) return [`- ${fallback}`];
+  return checks.map((check) => {
+    const conclusion = check.conclusion === null ? "" : ` / ${check.conclusion}`;
+    const url = check.url === null ? "" : ` (${check.url})`;
+    return `- ${check.name}: ${check.status}${conclusion}${url}`;
+  });
 }
 
 function formatReviewEvidenceForLinearComment(evidence: PullRequestReviewEvidenceItem[]): string[] {

@@ -24,8 +24,15 @@ import type {
 import type { RunRecord, RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { Issue } from "../types.js";
-import { planMergeCompletedWritebacks } from "../writeback/TransitionPolicy.js";
+import {
+  planMergeCompletedWritebacks,
+  planMergeGateBlockedWritebacks,
+  planMergeGateRepairWritebacks,
+  type MergeGateCheckEvidence,
+} from "../writeback/TransitionPolicy.js";
 import type { WritebackOperation, WritebackProcessor } from "../writeback/WritebackOutbox.js";
+
+const MERGE_GATE_REVIEWER = "symphony-merge-gate";
 
 export interface MergePolicyGitHubClient {
   getPullRequest(input: { pullRequestNumber: number }): Promise<PullRequestDetails>;
@@ -37,7 +44,27 @@ export interface MergePolicyGitHubClient {
 export type MergePolicyResult =
   | { status: "skipped"; reason: string }
   | { status: "merged"; merge: IssueMergeMetadata }
-  | { status: "already_merged"; merge: IssueMergeMetadata };
+  | { status: "already_merged"; merge: IssueMergeMetadata }
+  | { status: "checks_pending"; gate: MergeGateStatus }
+  | { status: "repair_dispatched"; gate: MergeGateStatus }
+  | { status: "blocked"; gate: MergeGateStatus };
+
+export interface MergeGateStatus {
+  id: string;
+  pullRequest: CompletionReportPullRequestRef;
+  headSha: string;
+  requiredChecks: string[];
+  passedChecks: string[];
+  failedChecks: MergeGateCheckEvidence[];
+  pendingChecks: MergeGateCheckEvidence[];
+  missingChecks: MergeGateCheckEvidence[];
+  writebackOperationKeys: string[];
+}
+
+type MergeGateDecision =
+  | { kind: "passed"; checkStatus: IssueMergeMetadata["checkStatus"] }
+  | { kind: "pending"; gate: MergeGateStatus }
+  | { kind: "failure"; gate: MergeGateStatus };
 
 export interface MergePolicyServiceOptions {
   config: ServiceConfig;
@@ -88,9 +115,6 @@ export class MergePolicyService {
     if (sourceState === null) return { status: "skipped", reason: `issue is not in a merge source state: ${latestIssue.state}` };
 
     const report = latestCompletionReport(lifecycle);
-    const verdict = latestReviewVerdict(lifecycle);
-    const workerRun = report && this.options.runStore ? await this.options.runStore.getRun(report.runId) : null;
-    this.validateLifecycle(lifecycle, report, verdict, workerRun, latestIssue);
     if (!report) throw new SymphonyError("invalid_request", "Gated merge requires a latest completion report");
 
     const pullRequest = requirePullRequest(report);
@@ -99,7 +123,30 @@ export class MergePolicyService {
     const livePullRequest = await github.getPullRequest({ pullRequestNumber: requireNumber(pullRequest.number) });
     validateLivePullRequestMetadata(livePullRequest, pullRequest, headSha);
 
-    const checkStatus = await this.validateChecks(github, headSha);
+    const gateId = mergeGateId(latestIssue.id, pullRequest, headSha);
+    let activeLifecycle = lifecycle;
+    const approvalVerdict = latestApprovalPassVerdict(activeLifecycle);
+    const existingGateVerdict = findMergeGateVerdict(activeLifecycle, gateId);
+    const decision = await this.evaluateChecks(github, headSha, pullRequest, gateId);
+    if (existingGateVerdict && decision.kind === "passed" && approvalVerdict) {
+      activeLifecycle = await this.options.lifecycleStore.updateIssue(latestIssue, {
+        phase: "passed",
+        blockedReason: null,
+        lastReviewVerdictId: approvalVerdict.id,
+      });
+    } else if (existingGateVerdict && decision.kind === "failure") {
+      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, existingGateVerdict);
+    }
+    if (decision.kind === "pending") return { status: "checks_pending", gate: decision.gate };
+
+    const verdict = latestApprovalPassVerdict(activeLifecycle);
+    const workerRun = report && this.options.runStore ? await this.options.runStore.getRun(report.runId) : null;
+    this.validateLifecycle(activeLifecycle, report, verdict, workerRun, latestIssue);
+    if (decision.kind === "failure") {
+      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, null);
+    }
+
+    const checkStatus = decision.checkStatus;
     const mergeId = `merge:${latestIssue.id}:${headSha}`;
     const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
     let status: "merged" | "already_merged" = "merged";
@@ -163,6 +210,104 @@ export class MergePolicyService {
     return operation;
   }
 
+  private async handleMergeGateFailure(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    report: IssueCompletionReportRecord,
+    gate: MergeGateStatus,
+    sourceState: string,
+    existingVerdict: IssueReviewVerdictRecord | null,
+  ): Promise<MergePolicyResult> {
+    const reviewRound = existingVerdict ? lifecycle.reviewRound : lifecycle.reviewRound + 1;
+    const blocked = reviewRound >= this.options.config.reviewLoop.maxReviewRounds;
+    const operations = blocked
+      ? planMergeGateBlockedWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config)
+      : planMergeGateRepairWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config);
+    if (operations.length === 0) {
+      throw new SymphonyError("invalid_request", "Merge gate failure could not plan service-owned writeback");
+    }
+
+    await this.requireMergeGateWritebacksSucceeded(issue, operations, blocked ? this.options.config.reviewLoop.blockedStates[0] ?? null : this.options.config.writeback.dispatchState);
+
+    const storedVerdict: IssueReviewVerdictRecord =
+      existingVerdict ??
+      {
+        id: gate.id,
+        idempotencyKey: gate.id,
+        runId: report.runId,
+        issueId: issue.id,
+        issueIdentifier: issue.identifier,
+        verdict: "fail",
+        acceptanceResults: [
+          {
+            text: "All configured required checks are passing before gated merge",
+            satisfied: false,
+            evidence: gate.failedChecks.map((check) => `${check.name}: ${check.status}`).join(", "),
+          },
+        ],
+        findings: mergeGateFindings(gate),
+        evidence: mergeGateEvidence(gate),
+        reviewer: MERGE_GATE_REVIEWER,
+        submittedAt: new Date().toISOString(),
+        writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+      };
+
+    if (!existingVerdict) {
+      await this.options.lifecycleStore.updateIssue(issue, {
+        phase: blocked ? "blocked" : "implementation",
+        reviewRound,
+        incompleteTurnCount: 0,
+        blockedReason: blocked
+          ? `merge gate required checks failed and max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`
+          : null,
+        lastReviewVerdictId: storedVerdict.id,
+        reviewVerdicts: [...lifecycle.reviewVerdicts, storedVerdict],
+        summaryPointers: { ciStatus: "failure" },
+      });
+    }
+
+    const resultGate = { ...gate, writebackOperationKeys: operations.map((operation) => operation.idempotencyKey) };
+    return blocked ? { status: "blocked", gate: resultGate } : { status: "repair_dispatched", gate: resultGate };
+  }
+
+  private mergeGateWritebackContext(issue: Issue, gate: MergeGateStatus, sourceState: string, reviewRound: number) {
+    return {
+      issue,
+      gateId: gate.id,
+      fromState: sourceState,
+      pullRequest: gate.pullRequest,
+      requiredChecks: gate.requiredChecks,
+      failedChecks: gate.failedChecks,
+      pendingChecks: gate.pendingChecks,
+      missingChecks: gate.missingChecks,
+      reviewRound,
+      maxReviewRounds: this.options.config.reviewLoop.maxReviewRounds,
+    };
+  }
+
+  private async requireMergeGateWritebacksSucceeded(
+    issue: Issue,
+    operations: Parameters<WritebackProcessor["enqueueAndProcess"]>[0][],
+    expectedState: string | null,
+  ): Promise<void> {
+    const writeback = this.options.writeback;
+    if (!writeback) throw new SymphonyError("invalid_request", "Gated merge policy requires service-owned writeback");
+    for (const operation of operations) {
+      const result: WritebackOperation = await writeback.enqueueAndProcess(operation, { retrySkipped: true });
+      if (result.status !== "succeeded") {
+        throw new SymphonyError(
+          "invalid_request",
+          `Merge gate writeback did not succeed: ${result.status}${result.lastError ? ` (${result.lastError})` : ""}`,
+        );
+      }
+    }
+    if (expectedState === null) return;
+    const latest = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? null;
+    if (!latest || !statesEqual(latest.state, expectedState)) {
+      throw new SymphonyError("invalid_request", "Merge gate writeback could not be verified");
+    }
+  }
+
   private mergeSourceState(issue: Issue): string | null {
     return this.options.config.mergePolicy.sourceStates.find((state) => statesEqual(state, issue.state)) ?? null;
   }
@@ -188,25 +333,58 @@ export class MergePolicyService {
     validateApprovalFeedback(lifecycle, verdict, requirePullRequest(report));
   }
 
-  private async validateChecks(
+  private async evaluateChecks(
     github: MergePolicyGitHubClient,
     headSha: string,
-  ): Promise<IssueMergeMetadata["checkStatus"]> {
+    pullRequest: CompletionReportPullRequestRef,
+    gateId: string,
+  ): Promise<MergeGateDecision> {
     const { requiredChecks, noCiAllowed, noCiEvidence } = this.options.config.mergePolicy;
     if (requiredChecks.length === 0) {
       if (!noCiAllowed || noCiEvidence === null) {
         throw new SymphonyError("invalid_request", "Gated merge requires configured checks or explicit no-CI evidence");
       }
-      return { requiredChecks: [], passedChecks: [], noCiEvidence };
+      return { kind: "passed", checkStatus: { requiredChecks: [], passedChecks: [], noCiEvidence } };
     }
     const checks = await github.getRequiredCheckResults({ headSha, requiredChecks });
-    const failed = requiredChecks.filter(
-      (requiredCheck) => !checks.some((check) => check.name === requiredCheck && check.status === "success"),
-    );
-    if (failed.length > 0) {
-      throw new SymphonyError("invalid_request", `Required checks are not passing: ${failed.join(", ")}`);
+    const ordered = requiredChecks.map((requiredCheck) => checkEvidence(requiredCheck, checks));
+    const failedChecks = ordered.filter((check) => check.status === "failure");
+    const pendingChecks = ordered.filter((check) => check.status === "pending");
+    const missingChecks = ordered.filter((check) => check.status === "missing");
+    const passedChecks = ordered.filter((check) => check.status === "success").map((check) => check.name);
+    if (failedChecks.length > 0) {
+      return {
+        kind: "failure",
+        gate: {
+          id: gateId,
+          pullRequest,
+          headSha,
+          requiredChecks,
+          passedChecks,
+          failedChecks,
+          pendingChecks,
+          missingChecks,
+          writebackOperationKeys: [],
+        },
+      };
     }
-    return { requiredChecks, passedChecks: requiredChecks, noCiEvidence: null };
+    if (pendingChecks.length > 0 || missingChecks.length > 0) {
+      return {
+        kind: "pending",
+        gate: {
+          id: gateId,
+          pullRequest,
+          headSha,
+          requiredChecks,
+          passedChecks,
+          failedChecks,
+          pendingChecks,
+          missingChecks,
+          writebackOperationKeys: [],
+        },
+      };
+    }
+    return { kind: "passed", checkStatus: { requiredChecks, passedChecks: requiredChecks, noCiEvidence: null } };
   }
 }
 
@@ -218,12 +396,20 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletio
   return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
 }
 
-function latestReviewVerdict(lifecycle: IssueLifecycleRecord): IssueReviewVerdictRecord | null {
-  if (lifecycle.lastReviewVerdictId) {
-    const exact = lifecycle.reviewVerdicts.find((verdict) => verdict.id === lifecycle.lastReviewVerdictId);
-    if (exact) return exact;
+function latestApprovalPassVerdict(lifecycle: IssueLifecycleRecord): IssueReviewVerdictRecord | null {
+  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
+    if (verdict.verdict !== "pass" || isMergeGateVerdict(verdict)) continue;
+    if (verdict.issueId === lifecycle.issueId && verdict.issueIdentifier === lifecycle.issueIdentifier) return verdict;
   }
-  return lifecycle.reviewVerdicts[lifecycle.reviewVerdicts.length - 1] ?? null;
+  return null;
+}
+
+function findMergeGateVerdict(lifecycle: IssueLifecycleRecord, gateId: string): IssueReviewVerdictRecord | null {
+  return lifecycle.reviewVerdicts.find((verdict) => verdict.id === gateId && isMergeGateVerdict(verdict)) ?? null;
+}
+
+function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
+  return verdict.reviewer === MERGE_GATE_REVIEWER || verdict.id.startsWith("merge-gate:");
 }
 
 function validateRunMetadata(
@@ -248,7 +434,17 @@ function validateApprovalFeedback(
   verdict: IssueReviewVerdictRecord,
   pullRequest: CompletionReportPullRequestRef,
 ): void {
-  const approval = lifecycle.reviewFeedback.find(
+  if (!hasApprovalFeedback(lifecycle, verdict, pullRequest)) {
+    throw new SymphonyError("invalid_request", "Gated merge requires service-recorded APPROVE PR review feedback");
+  }
+}
+
+function hasApprovalFeedback(
+  lifecycle: IssueLifecycleRecord,
+  verdict: IssueReviewVerdictRecord,
+  pullRequest: CompletionReportPullRequestRef,
+): boolean {
+  return lifecycle.reviewFeedback.some(
     (feedback) =>
       feedback.runId === verdict.runId &&
       feedback.kind === "review" &&
@@ -257,9 +453,6 @@ function validateApprovalFeedback(
       feedback.pullRequest.url === pullRequest.url &&
       feedback.pullRequest.headSha === pullRequest.headSha,
   );
-  if (!approval) {
-    throw new SymphonyError("invalid_request", "Gated merge requires service-recorded APPROVE PR review feedback");
-  }
 }
 
 function validateLivePullRequestMetadata(
@@ -322,6 +515,41 @@ function buildMergeMetadata(
     mergeOperationKey: `github-merge:${issue.id}:${requireNumber(pullRequest.number)}:${headSha}`,
     doneTransitionOperationKey,
   };
+}
+
+function mergeGateId(issueId: string, pullRequest: CompletionReportPullRequestRef, headSha: string): string {
+  return `merge-gate:${issueId}:pr-${requireNumber(pullRequest.number)}:${headSha}`;
+}
+
+function checkEvidence(requiredCheck: string, checks: PullRequestCheckResult[]): MergeGateCheckEvidence {
+  const exact = checks.find((check) => check.name === requiredCheck);
+  if (!exact) return { name: requiredCheck, status: "missing", conclusion: null, url: null };
+  return {
+    name: requiredCheck,
+    status: exact.status,
+    conclusion: exact.conclusion,
+    url: exact.url,
+  };
+}
+
+function mergeGateFindings(gate: MergeGateStatus): string[] {
+  return gate.failedChecks.map((check) => `Required check failed: ${formatCheckEvidence(check)}`);
+}
+
+function mergeGateEvidence(gate: MergeGateStatus): string[] {
+  return [
+    `PR: ${gate.pullRequest.number === null ? gate.pullRequest.url ?? "n/a" : `#${gate.pullRequest.number}`} (${gate.pullRequest.url ?? "n/a"})`,
+    `PR head SHA: ${gate.headSha}`,
+    ...gate.failedChecks.map((check) => `Failing check: ${formatCheckEvidence(check)}`),
+    ...gate.pendingChecks.map((check) => `Pending check: ${formatCheckEvidence(check)}`),
+    ...gate.missingChecks.map((check) => `Missing check: ${formatCheckEvidence(check)}`),
+  ];
+}
+
+function formatCheckEvidence(check: MergeGateCheckEvidence): string {
+  const conclusion = check.conclusion === null ? "" : ` / ${check.conclusion}`;
+  const url = check.url === null ? "" : ` (${check.url})`;
+  return `${check.name}: ${check.status}${conclusion}${url}`;
 }
 
 function requirePullRequest(report: IssueCompletionReportRecord): CompletionReportPullRequestRef {

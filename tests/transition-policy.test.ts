@@ -5,6 +5,8 @@ import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbo
 import {
   planBlockedEscalationWritebacks,
   planCompletionReportAcceptedWritebacks,
+  planMergeGateBlockedWritebacks,
+  planMergeGateRepairWritebacks,
   planPullRequestHandoffWritebacks,
   planReviewFailWritebacks,
   planReviewPassWritebacks,
@@ -310,6 +312,87 @@ describe("TransitionPolicy review-loop planners", () => {
         config,
       ),
     ).toEqual([]);
+  });
+
+  it("plans merge gate repair writebacks from the merge source state with check evidence", () => {
+    const config = reviewLoopConfig();
+    const operations = planMergeGateRepairWritebacks(
+      {
+        issue: issue({ state: "Ready to Merge" }),
+        gateId: "merge-gate:issue-1:pr-42:head-sha-1",
+        fromState: "Ready to Merge",
+        pullRequest: {
+          number: 42,
+          url: "https://github.com/acme/symphony/pull/42",
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
+        requiredChecks: ["test", "typecheck"],
+        failedChecks: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+        pendingChecks: [{ name: "typecheck", status: "pending", conclusion: null, url: "https://ci.test/typecheck" }],
+        missingChecks: [],
+        reviewRound: 1,
+        maxReviewRounds: 3,
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair",
+      kind: "comment",
+      payload: {
+        dedupeKey: "merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair",
+      },
+    });
+    expect(commentBody(operations, 0)).toContain("## Symphony Merge Gate");
+    expect(commentBody(operations, 0)).toContain("Status: repair required");
+    expect(commentBody(operations, 0)).toContain("PR: #42 https://github.com/acme/symphony/pull/42");
+    expect(commentBody(operations, 0)).toContain("PR head SHA: head-sha-1");
+    expect(commentBody(operations, 0)).toContain("test: failure / failure (https://ci.test/test)");
+    expect(commentBody(operations, 0)).toContain("typecheck: pending (https://ci.test/typecheck)");
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        fromStates: ["Ready to Merge"],
+        toState: "In Progress",
+      },
+    });
+  });
+
+  it("plans merge gate blocked writebacks from the merge source state", () => {
+    const config = reviewLoopConfig();
+    const operations = planMergeGateBlockedWritebacks(
+      {
+        issue: issue({ state: "Ready to Merge" }),
+        gateId: "merge-gate:issue-1:pr-42:head-sha-1",
+        fromState: "Ready to Merge",
+        pullRequest: {
+          number: 42,
+          url: "https://github.com/acme/symphony/pull/42",
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
+        requiredChecks: ["test"],
+        failedChecks: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+        pendingChecks: [],
+        missingChecks: [],
+        reviewRound: 3,
+        maxReviewRounds: 3,
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(commentBody(operations, 0)).toContain("Status: blocked, human action required");
+    expect(commentBody(operations, 0)).toContain("Transitioning to blocked state: Blocked");
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        fromStates: ["Ready to Merge"],
+        toState: "Blocked",
+      },
+    });
   });
 });
 
