@@ -231,6 +231,9 @@ describe("Orchestrator", () => {
 
     expect(harness.runs[0]?.ctx.runPhase).toBe("merge_conflict_resolution");
     expect(harness.runs[0]?.prompt).toContain("submit_merge_conflict_resolution");
+    expect(harness.runs[0]?.prompt).toContain('resolutionStatus="blocked"');
+    expect(harness.runs[0]?.prompt).toContain("previousHeadSha");
+    expect(harness.runs[0]?.prompt).toContain("baseHeadSha");
     expect(harness.runs[0]?.prompt).not.toContain("submit_issue_breakdown_plan");
     await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "merge_conflict_resolution" })).resolves.toMatchObject({
       runPhase: "merge_conflict_resolution",
@@ -243,6 +246,68 @@ describe("Orchestrator", () => {
       },
     });
   }, 10_000);
+
+  it("preserves blocked lifecycle metadata for exhausted conflict loops still in the conflict state", async () => {
+    const config = testConfig(root);
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Approved with Conflicts";
+    config.mergePolicy.maxConflictFixTurns = 3;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.tracker.activeStates = ["Todo", "In Progress", "Approved with Conflicts"];
+    const candidate = issue({ state: "Approved with Conflicts" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+      mergeConflict: {
+        ...mergeConflictRecord(),
+        status: "blocked",
+        resolutionStatus: "blocked",
+        fixTurnCount: 3,
+        blockedAt: "2026-01-01T00:00:01.000Z",
+        blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+      },
+    });
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+      mergeConflict: {
+        status: "blocked",
+        resolutionStatus: "blocked",
+        fixTurnCount: 3,
+        blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+      },
+    });
+  });
 
   it("reroutes implementation dispatch to planning when writeback reveals stale issue content", async () => {
     const config = testConfig(root);
@@ -5012,6 +5077,8 @@ function mergeConflictRecord() {
     approvedHeadSha: "head-sha-1",
     currentHeadSha: "head-sha-1",
     resolvedHeadSha: null,
+    baseBranch: "main",
+    baseHeadSha: "base-sha-1",
     sourceState: "Ready to Merge",
     conflictsState: "Approved with Conflicts",
     reason: "Pull request has merge conflicts with the base branch",

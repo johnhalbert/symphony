@@ -18,7 +18,7 @@ import type {
 const mergeConflictResolutionSchema = z.object({
   runId: z.string().trim().min(1),
   issueId: z.string().trim().min(1),
-  resolutionStatus: z.enum(["resolved", "still_conflicted"]),
+  resolutionStatus: z.enum(["resolved", "still_conflicted", "blocked"]),
   summary: z.string().trim().min(1),
   validationEvidence: z.array(z.string().trim().min(1)).min(1),
   changedFiles: z.array(z.string().trim().min(1)),
@@ -28,6 +28,11 @@ const mergeConflictResolutionSchema = z.object({
     headSha: z.string().trim().min(1),
     branch: z.string().trim().min(1).nullable(),
   }),
+  previousHeadSha: z.string().trim().min(1),
+  newHeadSha: z.string().trim().min(1),
+  baseBranch: z.string().trim().min(1),
+  baseHeadSha: z.string().trim().min(1),
+  blockedReason: z.string().trim().min(1).nullable().optional(),
   risks: z.array(z.string().trim().min(1)),
   idempotencyKey: z.string().trim().min(1),
 });
@@ -84,6 +89,9 @@ export class MergeConflictResolutionService {
     const mergeConflict = lifecycle?.mergeConflict ?? null;
     const existing = lifecycle?.mergeConflictResolutionReports.find((item) => item.idempotencyKey === report.idempotencyKey);
     if (existing && mergeConflict) {
+      assertPullRequestMatchesConflict(report.pullRequest, mergeConflict);
+      assertReportMatchesConflict(report, mergeConflict);
+      assertReplayMatchesReport(report, existing);
       return { accepted: true, replayed: true, report: existing, mergeConflict, writebackOperations: [] };
     }
     if (!lifecycle || !mergeConflict || mergeConflict.status === "blocked") {
@@ -91,27 +99,35 @@ export class MergeConflictResolutionService {
     }
 
     assertPullRequestMatchesConflict(report.pullRequest, mergeConflict);
+    assertReportMatchesConflict(report, mergeConflict);
     const storedReport = buildMergeConflictResolutionReport({ report, issue: context.issue });
     const now = new Date().toISOString();
     const countedRunIds = new Set(mergeConflict.attemptRunIds);
-    const shouldCountAttempt = report.resolutionStatus === "still_conflicted" && !countedRunIds.has(report.runId);
+    const shouldCountAttempt = report.resolutionStatus !== "resolved" && !countedRunIds.has(report.runId);
     if (shouldCountAttempt) countedRunIds.add(report.runId);
     const fixTurnCount = mergeConflict.fixTurnCount + (shouldCountAttempt ? 1 : 0);
-    const blocked = report.resolutionStatus === "still_conflicted" && fixTurnCount >= mergeConflict.maxFixTurns;
+    const blocked =
+      report.resolutionStatus === "blocked" ||
+      (report.resolutionStatus === "still_conflicted" && fixTurnCount >= mergeConflict.maxFixTurns);
+    const blockedReason = blocked
+      ? report.blockedReason ?? conflictBlockedReason(fixTurnCount, mergeConflict.maxFixTurns)
+      : null;
     const nextConflict: IssueMergeConflictMetadata = {
       ...mergeConflict,
       status: blocked ? "blocked" : report.resolutionStatus === "resolved" ? "resolved" : "open",
       resolutionStatus: blocked ? "blocked" : report.resolutionStatus,
       pullRequest: { ...report.pullRequest },
-      currentHeadSha: report.pullRequest.headSha,
-      resolvedHeadSha: report.resolutionStatus === "resolved" ? report.pullRequest.headSha : mergeConflict.resolvedHeadSha,
+      currentHeadSha: report.newHeadSha,
+      resolvedHeadSha: report.resolutionStatus === "resolved" ? report.newHeadSha : mergeConflict.resolvedHeadSha,
+      baseBranch: report.baseBranch,
+      baseHeadSha: report.baseHeadSha,
       updatedAt: now,
       fixTurnCount,
       lastConflictFixRunId: report.runId,
       lastConflictResolutionReportId: storedReport.id,
       attemptRunIds: [...countedRunIds],
       blockedAt: blocked ? now : mergeConflict.blockedAt,
-      blockedReason: blocked ? conflictBlockedReason(fixTurnCount, mergeConflict.maxFixTurns) : null,
+      blockedReason,
     };
 
     const writebackOperations = blocked ? await this.enqueueBlockedWritebacks(context, nextConflict) : [];
@@ -223,6 +239,11 @@ function buildMergeConflictResolutionReport(input: {
     validationEvidence: input.report.validationEvidence,
     changedFiles: input.report.changedFiles,
     pullRequest: input.report.pullRequest,
+    previousHeadSha: input.report.previousHeadSha,
+    newHeadSha: input.report.newHeadSha,
+    baseBranch: input.report.baseBranch,
+    baseHeadSha: input.report.baseHeadSha,
+    blockedReason: input.report.resolutionStatus === "blocked" ? input.report.blockedReason ?? null : null,
     risks: input.report.risks,
     submittedAt: new Date().toISOString(),
   };
@@ -242,6 +263,55 @@ function assertPullRequestMatchesConflict(
   requireMatches("conflict resolution PR number", pullRequest.number, mergeConflict.pullRequest.number);
   requireMatches("conflict resolution PR URL", pullRequest.url, mergeConflict.pullRequest.url);
   requireMatches("conflict resolution PR branch", pullRequest.branch, mergeConflict.pullRequest.branch);
+}
+
+function assertReportMatchesConflict(
+  report: MergeConflictResolutionInput,
+  mergeConflict: IssueMergeConflictMetadata,
+): void {
+  requireMatches("conflict resolution previous head SHA", report.previousHeadSha, mergeConflict.currentHeadSha);
+  requireMatches("conflict resolution new head SHA", report.newHeadSha, report.pullRequest.headSha);
+  if (mergeConflict.baseBranch !== null) requireMatches("conflict resolution base branch", report.baseBranch, mergeConflict.baseBranch);
+  if (mergeConflict.baseHeadSha !== null) {
+    requireMatches("conflict resolution base head SHA", report.baseHeadSha, mergeConflict.baseHeadSha);
+  }
+}
+
+function assertReplayMatchesReport(
+  report: MergeConflictResolutionInput,
+  existing: IssueMergeConflictResolutionReportRecord,
+): void {
+  const expected = {
+    runId: existing.runId,
+    resolutionStatus: existing.resolutionStatus,
+    summary: existing.summary,
+    validationEvidence: existing.validationEvidence,
+    changedFiles: existing.changedFiles,
+    pullRequest: existing.pullRequest,
+    previousHeadSha: existing.previousHeadSha,
+    newHeadSha: existing.newHeadSha,
+    baseBranch: existing.baseBranch,
+    baseHeadSha: existing.baseHeadSha,
+    blockedReason: existing.blockedReason,
+    risks: existing.risks,
+  };
+  const actual = {
+    runId: report.runId,
+    resolutionStatus: report.resolutionStatus,
+    summary: report.summary,
+    validationEvidence: report.validationEvidence,
+    changedFiles: report.changedFiles,
+    pullRequest: report.pullRequest,
+    previousHeadSha: report.previousHeadSha,
+    newHeadSha: report.newHeadSha,
+    baseBranch: report.baseBranch,
+    baseHeadSha: report.baseHeadSha,
+    blockedReason: report.resolutionStatus === "blocked" ? report.blockedReason ?? null : null,
+    risks: report.risks,
+  };
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new SymphonyError("invalid_request", "Merge conflict resolution idempotency key was reused with different report metadata");
+  }
 }
 
 function requireMatches(label: string, actual: string | number | null | undefined, expected: string | number | null | undefined): void {

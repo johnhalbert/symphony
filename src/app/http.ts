@@ -1783,7 +1783,7 @@ function renderRunningRow(
   const cancellation = cancellationSummary(row);
   const cancelFailed = cancelFailedSummary(liveCancelFailed(row));
   const activitySources = activitySummary(row);
-  const blockedReason = row.lifecycle?.blockedReason ?? null;
+  const blockedReason = lifecycleBlockedReason(row.lifecycle);
   return `<li class="run-row operator-${operator.status}">
     <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.runKind)} · ${escapeHtml(row.state)}</span></div>
     <div class="meta">run <code>${escapeHtml(runId)}</code> · agent <code>${escapeHtml(agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
@@ -2167,7 +2167,7 @@ async function terminalOperatorLiveness(
     lastActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
     lastTranscriptEventAt: null,
     lastTranscriptEvent: null,
-    lastMessage: lifecycle?.blockedReason ?? run?.error ?? null,
+    lastMessage: lifecycleBlockedReason(lifecycle) ?? run?.error ?? null,
     secondsSinceLastActivity: null,
     stallTimeoutMs: null,
     cancellation: null,
@@ -2316,7 +2316,7 @@ function blockedIssueView(lifecycle: IssueLifecycleRecord | null | undefined) {
   const blockedLifecycle = lifecycle;
   return {
     status: "blocked_human_required" as const,
-    reason: blockedLifecycle.blockedReason,
+    reason: lifecycleBlockedReason(blockedLifecycle),
     issueId: blockedLifecycle.issueId,
     issueIdentifier: blockedLifecycle.issueIdentifier,
     continuationSummaryRecommended: true,
@@ -2440,7 +2440,7 @@ function terminalTimeline(
             at: lifecycle.updatedAt,
             kind: "lifecycle_blocked",
             label: "Human-required block recorded",
-            detail: lifecycle.blockedReason,
+            detail: lifecycleBlockedReason(lifecycle),
             synthetic: true,
             source: "lifecycle_store",
           },
@@ -2464,7 +2464,19 @@ function findLiveRun(snapshot: RuntimeSnapshot, runId: string): RunningRow | nul
 }
 
 function isLifecycleBlocked(lifecycle: IssueLifecycleRecord | null | undefined): boolean {
-  return lifecycle !== null && lifecycle !== undefined && (lifecycle.phase === "blocked" || lifecycle.blockedReason !== null);
+  return (
+    lifecycle !== null &&
+    lifecycle !== undefined &&
+    (lifecycle.phase === "blocked" ||
+      lifecycle.blockedReason !== null ||
+      lifecycle.mergeConflict?.status === "blocked" ||
+      lifecycle.mergeConflict?.resolutionStatus === "blocked")
+  );
+}
+
+function lifecycleBlockedReason(lifecycle: IssueLifecycleRecord | null | undefined): string | null {
+  if (lifecycle === null || lifecycle === undefined) return null;
+  return lifecycle.blockedReason ?? lifecycle.mergeConflict?.blockedReason ?? null;
 }
 
 function liveIssueResponse(live: RunningRow, operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>) {
@@ -2597,7 +2609,7 @@ function buildIssueBlockerSummary(
     openCount: open.length,
     open,
     blocked: lifecycleBlocked || stateBlocked || dispatchBlocked,
-    humanBlockedReason: lifecycleBlocked ? (lifecycle?.blockedReason ?? null) : null,
+    humanBlockedReason: lifecycleBlocked ? lifecycleBlockedReason(lifecycle) : null,
   };
 }
 
@@ -2713,7 +2725,7 @@ function operatorAffordances(input: {
   return {
     humanRequired: {
       active: blocked,
-      reason: input.lifecycle?.blockedReason ?? null,
+      reason: lifecycleBlockedReason(input.lifecycle),
       continuationSummaryRecommended: blocked,
     },
     continuationSummary: {
@@ -2872,7 +2884,7 @@ function reviewLoopStatus(input: {
     lastCompletionReport: latestCompletionReport(lifecycle),
     lastReviewVerdict: latestReviewVerdict(lifecycle),
     mergeConflict: lifecycle?.mergeConflict ?? null,
-    blockedReason: lifecycle?.blockedReason ?? null,
+    blockedReason: lifecycleBlockedReason(lifecycle),
   };
 }
 

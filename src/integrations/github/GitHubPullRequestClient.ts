@@ -28,6 +28,8 @@ export interface PullRequestDetails extends PullRequestMetadata {
   mergedBy: string | null;
   mergeable: boolean | null;
   mergeableState: string | null;
+  baseBranch: string;
+  baseHeadSha: string;
 }
 
 export interface PullRequestCheckResult {
@@ -160,6 +162,10 @@ interface GitHubPullRequestNode {
     repo?: {
       pushed_at?: unknown;
     } | null;
+  } | null;
+  base?: {
+    ref?: unknown;
+    sha?: unknown;
   } | null;
 }
 
@@ -844,7 +850,9 @@ function normalizePullRequest(node: GitHubPullRequestNode): PullRequestMetadata 
 
 function normalizePullRequestDetails(node: GitHubPullRequestNode): PullRequestDetails | null {
   const metadata = normalizePullRequest(node);
-  if (!metadata) return null;
+  const baseBranch = asString(node.base?.ref);
+  const baseHeadSha = asString(node.base?.sha);
+  if (!metadata || !baseBranch || !baseHeadSha) return null;
   return {
     ...metadata,
     state: asNullableString(node.state),
@@ -854,6 +862,8 @@ function normalizePullRequestDetails(node: GitHubPullRequestNode): PullRequestDe
     mergedBy: asNullableString(node.merged_by?.login),
     mergeable: typeof node.mergeable === "boolean" ? node.mergeable : null,
     mergeableState: asNullableString(node.mergeable_state),
+    baseBranch,
+    baseHeadSha,
   };
 }
 

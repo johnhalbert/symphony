@@ -117,14 +117,19 @@ function mergeConflictResolutionInputSchema(): Record<string, unknown> {
       "validationEvidence",
       "changedFiles",
       "pullRequest",
+      "previousHeadSha",
+      "newHeadSha",
+      "baseBranch",
+      "baseHeadSha",
       "risks",
       "idempotencyKey",
     ],
     properties: {
       resolutionStatus: {
         type: "string",
-        enum: ["resolved", "still_conflicted"],
-        description: "Whether the conflict-fix worker resolved the merge conflicts or they remain conflicted.",
+        enum: ["resolved", "still_conflicted", "blocked"],
+        description:
+          "Whether the conflict-fix worker resolved the merge conflicts, they remain conflicted, or human intervention is now required.",
       },
       summary: { type: "string", minLength: 1 },
       validationEvidence: {
@@ -146,6 +151,30 @@ function mergeConflictResolutionInputSchema(): Record<string, unknown> {
           headSha: { type: "string", minLength: 1 },
           branch: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
         },
+      },
+      previousHeadSha: {
+        type: "string",
+        minLength: 1,
+        description: "PR head SHA from the mergeConflict.currentHeadSha field before this conflict-fix attempt.",
+      },
+      newHeadSha: {
+        type: "string",
+        minLength: 1,
+        description: "PR head SHA after this conflict-fix attempt; must match pullRequest.headSha.",
+      },
+      baseBranch: {
+        type: "string",
+        minLength: 1,
+        description: "GitHub PR base branch recorded in mergeConflict.baseBranch.",
+      },
+      baseHeadSha: {
+        type: "string",
+        minLength: 1,
+        description: "GitHub PR base commit SHA recorded in mergeConflict.baseHeadSha.",
+      },
+      blockedReason: {
+        anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+        description: "Required context when resolutionStatus is blocked.",
       },
       risks: {
         type: "array",

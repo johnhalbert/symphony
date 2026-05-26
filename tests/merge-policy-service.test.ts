@@ -147,6 +147,8 @@ describe("MergePolicyService", () => {
         resolutionStatus: "pending",
         approvedHeadSha: "head-sha-1",
         currentHeadSha: "head-sha-1",
+        baseBranch: "main",
+        baseHeadSha: "base-sha-1",
         fixTurnCount: 0,
         maxFixTurns: 3,
         conflictsState: "Approved with Conflicts",
@@ -223,6 +225,81 @@ describe("MergePolicyService", () => {
       headSha: "head-sha-2",
       pullRequest: { headSha: "head-sha-2" },
     });
+  });
+
+  it("preserves the original approved head across a false resolved conflict and later real resolution", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Approved with Conflicts", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "passed",
+      mergeConflict: mergeConflictRecord({ resolutionStatus: "resolved", resolvedHeadSha: "head-sha-2" }),
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const dirtyClient = new FakeMergeClient({ headSha: "head-sha-2", mergeable: false, mergeableState: "dirty" });
+    const dirtyService = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: dirtyClient,
+    });
+
+    await expect(dirtyService.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "blocked_conflicts" });
+    const reopened = (await lifecycleStore.get(currentIssue.id))?.mergeConflict;
+    expect(reopened).toMatchObject({
+      status: "open",
+      resolutionStatus: "pending",
+      approvedHeadSha: "head-sha-1",
+      currentHeadSha: "head-sha-2",
+      resolvedHeadSha: null,
+      baseBranch: "main",
+      baseHeadSha: "base-sha-1",
+    });
+
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "passed",
+      summaryPointers: {
+        prHeadSha: "head-sha-3",
+      },
+      mergeConflict: {
+        ...reopened!,
+        status: "resolved",
+        resolutionStatus: "resolved",
+        pullRequest: { ...reopened!.pullRequest, headSha: "head-sha-3" },
+        currentHeadSha: "head-sha-3",
+        resolvedHeadSha: "head-sha-3",
+        updatedAt: "2026-01-01T00:00:04.000Z",
+      },
+    });
+    const cleanClient = new FakeMergeClient({ headSha: "head-sha-3" });
+    const cleanService = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: cleanClient,
+    });
+
+    await expect(cleanService.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "merged" });
+    expect(cleanClient.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-3" });
   });
 
   it("rejects conflict approval carry-forward when the resolved head is not a descendant", async () => {
@@ -830,6 +907,8 @@ function mergeConflictRecord(input: { resolutionStatus?: "pending" | "resolved";
     approvedHeadSha: "head-sha-1",
     currentHeadSha: input.resolvedHeadSha ?? "head-sha-1",
     resolvedHeadSha: input.resolvedHeadSha ?? null,
+    baseBranch: "main",
+    baseHeadSha: "base-sha-1",
     sourceState: "Ready to Merge",
     conflictsState: "Approved with Conflicts",
     reason: "Pull request has merge conflicts with the base branch",
@@ -895,6 +974,8 @@ class FakeMergeClient implements MergePolicyGitHubClient {
       mergeCommitSha: this.input.mergeCommitSha ?? "merge-sha-1",
       mergedAt: this.input.mergedAt ?? "2026-01-01T00:00:02.000Z",
       mergedBy: this.input.mergedBy ?? "symphony-bot",
+      baseBranch: "main",
+      baseHeadSha: "base-sha-1",
     };
   }
 

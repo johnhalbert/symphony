@@ -210,11 +210,16 @@ export interface IssueMergeConflictResolutionReportRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
-  resolutionStatus: "resolved" | "still_conflicted";
+  resolutionStatus: "resolved" | "still_conflicted" | "blocked";
   summary: string;
   validationEvidence: string[];
   changedFiles: string[];
   pullRequest: CompletionReportPullRequestRef;
+  previousHeadSha: string | null;
+  newHeadSha: string | null;
+  baseBranch: string | null;
+  baseHeadSha: string | null;
+  blockedReason: string | null;
   risks: string[];
   submittedAt: string;
 }
@@ -227,6 +232,8 @@ export interface IssueMergeConflictMetadata {
   approvedHeadSha: string;
   currentHeadSha: string;
   resolvedHeadSha: string | null;
+  baseBranch: string | null;
+  baseHeadSha: string | null;
   sourceState: string;
   conflictsState: string;
   reason: string;
@@ -1152,6 +1159,8 @@ function normalizeMergeConflictMetadata(value: unknown, filePath: string): Issue
     approvedHeadSha: requiredString(value.approvedHeadSha, filePath, "mergeConflict.approvedHeadSha"),
     currentHeadSha: requiredString(value.currentHeadSha, filePath, "mergeConflict.currentHeadSha"),
     resolvedHeadSha: optionalNullableString(value.resolvedHeadSha, filePath, "mergeConflict.resolvedHeadSha"),
+    baseBranch: optionalNullableString(value.baseBranch, filePath, "mergeConflict.baseBranch"),
+    baseHeadSha: optionalNullableString(value.baseHeadSha, filePath, "mergeConflict.baseHeadSha"),
     sourceState: requiredString(value.sourceState, filePath, "mergeConflict.sourceState"),
     conflictsState: requiredString(value.conflictsState, filePath, "mergeConflict.conflictsState"),
     reason: requiredString(value.reason, filePath, "mergeConflict.reason"),
@@ -1187,7 +1196,7 @@ function normalizeMergeConflictResolutionReport(
 ): IssueMergeConflictResolutionReportRecord {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `mergeConflictResolutionReports[${index}] is invalid`);
   const resolutionStatus = value.resolutionStatus;
-  if (resolutionStatus !== "resolved" && resolutionStatus !== "still_conflicted") {
+  if (resolutionStatus !== "resolved" && resolutionStatus !== "still_conflicted" && resolutionStatus !== "blocked") {
     throw corruptLifecycle(filePath, `mergeConflictResolutionReports[${index}].resolutionStatus is invalid`);
   }
   return {
@@ -1204,6 +1213,26 @@ function normalizeMergeConflictResolutionReport(
       value.pullRequest,
       filePath,
       `mergeConflictResolutionReports[${index}].pullRequest`,
+    ),
+    previousHeadSha: optionalNullableString(
+      value.previousHeadSha,
+      filePath,
+      `mergeConflictResolutionReports[${index}].previousHeadSha`,
+    ),
+    newHeadSha:
+      value.newHeadSha === undefined
+        ? normalizeMergePullRequest(
+            value.pullRequest,
+            filePath,
+            `mergeConflictResolutionReports[${index}].pullRequest`,
+          ).headSha
+        : optionalNullableString(value.newHeadSha, filePath, `mergeConflictResolutionReports[${index}].newHeadSha`),
+    baseBranch: optionalNullableString(value.baseBranch, filePath, `mergeConflictResolutionReports[${index}].baseBranch`),
+    baseHeadSha: optionalNullableString(value.baseHeadSha, filePath, `mergeConflictResolutionReports[${index}].baseHeadSha`),
+    blockedReason: optionalNullableString(
+      value.blockedReason,
+      filePath,
+      `mergeConflictResolutionReports[${index}].blockedReason`,
     ),
     risks: requiredStringArray(value.risks, filePath, `mergeConflictResolutionReports[${index}].risks`),
     submittedAt: requiredString(value.submittedAt, filePath, `mergeConflictResolutionReports[${index}].submittedAt`),

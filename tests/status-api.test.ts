@@ -130,6 +130,8 @@ describe("StatusServer durable API", () => {
           approvedHeadSha: "head-sha-0",
           currentHeadSha: "head-sha-1",
           resolvedHeadSha: null,
+          baseBranch: "main",
+          baseHeadSha: "base-sha-1",
           sourceState: "Ready to Merge",
           conflictsState: "Approved with Conflicts",
           reason: "Pull request has merge conflicts with the base branch",
@@ -1898,9 +1900,39 @@ describe("StatusServer durable API", () => {
     await lifecycleStore.ensureIssue(
       { id: "issue-4", identifier: "TEST-4" },
       {
-        phase: "blocked",
-        blockedReason: "human required",
+        phase: "merge_conflict_resolution",
+        blockedReason: null,
         summaryPointers: {},
+        mergeConflict: {
+          id: "merge-conflict:issue-4:head-sha-1",
+          status: "blocked",
+          resolutionStatus: "blocked",
+          pullRequest: {
+            url: "https://github.com/acme/repo/pull/7",
+            number: 7,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-4",
+          },
+          approvedHeadSha: "approved-head-sha",
+          currentHeadSha: "head-sha-1",
+          resolvedHeadSha: null,
+          baseBranch: "main",
+          baseHeadSha: "base-sha-1",
+          sourceState: "Ready to Merge",
+          conflictsState: "Approved with Conflicts",
+          reason: "Pull request has merge conflicts with the base branch",
+          mergeableState: "dirty",
+          detectedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:01:00.000Z",
+          fixTurnCount: 3,
+          maxFixTurns: 3,
+          lastConflictFixRunId: "run-blocked",
+          lastConflictResolutionReportId: "merge-conflict-resolution:issue-4:blocked-1",
+          attemptRunIds: ["run-blocked"],
+          writebackOperationKeys: [],
+          blockedAt: "2026-01-01T00:01:00.000Z",
+          blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+        },
       },
     );
     const server = new StatusServer({
@@ -1941,12 +1973,15 @@ describe("StatusServer durable API", () => {
       expect(issueResponse.status).toBe(200);
       expect(issueBody.operatorLiveness).toMatchObject({ status: "blocked_human_required" });
       expect(issueBody.capabilities).toMatchObject({
-        humanRequired: { active: true, reason: "human required" },
+        humanRequired: { active: true, reason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)" },
         continuationSummary: { available: true, path: "/api/v1/issues/TEST-4/continuation-summary" },
       });
       expect(runsResponse.status).toBe(200);
       expect(runDetailResponse.status).toBe(200);
-      expect(runsBody.issueBlocked).toMatchObject({ status: "blocked_human_required", reason: "human required" });
+      expect(runsBody.issueBlocked).toMatchObject({
+        status: "blocked_human_required",
+        reason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+      });
       expect(runsBody.enrichment).toMatchObject({ timelineIncluded: true, level: "operator_liveness_with_timeline" });
       expect(runsBody.runs.find((run) => run.runId === "run-old")?.operatorLiveness).toBeNull();
       const blockedRun = runsBody.runs.find((run) => run.runId === "run-blocked");

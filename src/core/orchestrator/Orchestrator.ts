@@ -833,6 +833,24 @@ export class Orchestrator {
     if (!lifecycle) return true;
 
     const phase = phaseForIssueState(issue.state, this.config);
+    const conflict = lifecycle.mergeConflict;
+    if (
+      conflict &&
+      this.config.mergePolicy.conflictsState !== null &&
+      isStateIn(issue.state, [this.config.mergePolicy.conflictsState]) &&
+      (conflict.status === "blocked" || conflict.resolutionStatus === "blocked")
+    ) {
+      const blockedReason =
+        conflict.blockedReason ?? mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns);
+      if (lifecycle.phase !== "blocked" || lifecycle.blockedReason !== blockedReason) {
+        await store.updateIssue(issue, {
+          phase: "blocked",
+          blockedReason,
+          mergeConflict: { ...conflict, status: "blocked", resolutionStatus: "blocked", blockedReason },
+        });
+      }
+      return false;
+    }
     const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
     if (blockedByLifecycle) {
       if (isPendingPublicationApprovalReason(lifecycle.blockedReason)) {
@@ -863,7 +881,6 @@ export class Orchestrator {
       if (planningBackoffRemainingMs(lifecycle, this.config) > 0) return false;
     }
     if (role === "worker" && runPhase === "merge_conflict_resolution") {
-      const conflict = lifecycle.mergeConflict;
       if (!conflict || conflict.status !== "open") return false;
       if (conflict.fixTurnCount >= conflict.maxFixTurns) {
         await this.blockMergeConflictAttempts(issue, lifecycle.summaryPointers.lastRunId ?? issue.id, conflict);
@@ -2417,10 +2434,13 @@ export class Orchestrator {
       `- Pull request: ${formatPullRequest(conflict?.pullRequest.number ?? null, conflict?.pullRequest.url ?? null)}`,
       `- Approved head SHA: ${conflict?.approvedHeadSha ?? "n/a"}`,
       `- Current conflict head SHA: ${conflict?.currentHeadSha ?? "n/a"}`,
+      `- Base branch: ${conflict?.baseBranch ?? "n/a"}`,
+      `- Base head SHA: ${conflict?.baseHeadSha ?? "n/a"}`,
       `- Attempts: ${conflict?.fixTurnCount ?? 0} / ${conflict?.maxFixTurns ?? this.config.mergePolicy.maxConflictFixTurns}`,
       `- Reason: ${conflict?.reason ?? "n/a"}`,
       `- GitHub mergeable_state: ${conflict?.mergeableState ?? "unknown"}`,
-      "- Required handoff: call submit_merge_conflict_resolution with resolutionStatus=\"resolved\" or \"still_conflicted\" before ending the run.",
+      "- Required handoff: call submit_merge_conflict_resolution before ending the run.",
+      "- Report resolutionStatus=\"resolved\", resolutionStatus=\"still_conflicted\", or resolutionStatus=\"blocked\"; include previousHeadSha, newHeadSha, baseBranch, and baseHeadSha.",
       "",
       "Workspace:",
       `- Path: ${workspace?.path ?? entry.workspacePath ?? "n/a"}`,
@@ -2577,8 +2597,9 @@ export class Orchestrator {
       `- Branch: ${workspace?.gitBranchName ?? entry.issue.branchName ?? "n/a"}`,
       `- Repository path: ${workspace?.repoPath ?? "n/a"}`,
       `- Base ref: ${workspace?.baseRef ?? "n/a"}`,
-      "- Before ending the run, call the submit_merge_conflict_resolution MCP tool with resolutionStatus, summary, validationEvidence, changedFiles, pullRequest, risks, and idempotencyKey.",
-      "- Use resolutionStatus=\"resolved\" only when the PR head contains the conflict fix; use resolutionStatus=\"still_conflicted\" when conflicts remain.",
+      "- Before ending the run, call the submit_merge_conflict_resolution MCP tool with resolutionStatus, summary, validationEvidence, changedFiles, pullRequest, previousHeadSha, newHeadSha, baseBranch, baseHeadSha, risks, and idempotencyKey.",
+      "- Use resolutionStatus=\"resolved\" only when the PR head contains the conflict fix; use resolutionStatus=\"still_conflicted\" when conflicts remain; use resolutionStatus=\"blocked\" when human intervention is required now.",
+      "- previousHeadSha must match the current conflict head from the prompt, and newHeadSha must match pullRequest.headSha after your attempt.",
       "- The MCP server is scoped to this issue and current conflict-fix run; Symphony injects runId and issueId for you.",
     ].join("\n");
   }

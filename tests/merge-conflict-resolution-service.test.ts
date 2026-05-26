@@ -28,6 +28,12 @@ describe("MergeConflictResolutionService", () => {
 
     expect(result.replayed).toBe(false);
     expect(result.report.resolutionStatus).toBe("resolved");
+    expect(result.report).toMatchObject({
+      previousHeadSha: "head-sha-1",
+      newHeadSha: "head-sha-2",
+      baseBranch: "main",
+      baseHeadSha: "base-sha-1",
+    });
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       phase: "passed",
       blockedReason: null,
@@ -38,7 +44,11 @@ describe("MergeConflictResolutionService", () => {
       mergeConflict: {
         status: "resolved",
         resolutionStatus: "resolved",
+        approvedHeadSha: "head-sha-1",
+        currentHeadSha: "head-sha-2",
         resolvedHeadSha: "head-sha-2",
+        baseBranch: "main",
+        baseHeadSha: "base-sha-1",
         lastConflictFixRunId: "conflict-run-1",
       },
       mergeConflictResolutionReports: [
@@ -77,6 +87,69 @@ describe("MergeConflictResolutionService", () => {
     const operations = await outbox.list();
     expect(operations.some((operation) => operation.kind === "comment")).toBe(true);
     expect(operations.some((operation) => operation.kind === "transition")).toBe(true);
+  });
+
+  it("records explicit blocked reports with durable head and base metadata", async () => {
+    const { service, lifecycleStore } = await fixture();
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({
+        idempotencyKey: "blocked-1",
+        resolutionStatus: "blocked",
+        blockedReason: "conflict requires manual database migration review",
+      }),
+      context(),
+    );
+    const replay = await service.submit_merge_conflict_resolution(
+      resolutionReport({
+        idempotencyKey: "blocked-1",
+        resolutionStatus: "blocked",
+        blockedReason: "conflict requires manual database migration review",
+      }),
+      context(),
+    );
+
+    expect(result.replayed).toBe(false);
+    expect(replay.replayed).toBe(true);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "conflict requires manual database migration review",
+      mergeConflict: {
+        status: "blocked",
+        resolutionStatus: "blocked",
+        approvedHeadSha: "head-sha-1",
+        currentHeadSha: "head-sha-1",
+        baseBranch: "main",
+        baseHeadSha: "base-sha-1",
+        blockedReason: "conflict requires manual database migration review",
+      },
+      mergeConflictResolutionReports: [
+        expect.objectContaining({
+          resolutionStatus: "blocked",
+          previousHeadSha: "head-sha-1",
+          newHeadSha: "head-sha-1",
+          baseBranch: "main",
+          baseHeadSha: "base-sha-1",
+          blockedReason: "conflict requires manual database migration review",
+        }),
+      ],
+    });
+  });
+
+  it("rejects idempotency replays with different head or base metadata", async () => {
+    const { service } = await fixture();
+
+    await service.submit_merge_conflict_resolution(
+      resolutionReport({ idempotencyKey: "still-1", resolutionStatus: "still_conflicted" }),
+      context(),
+    );
+
+    await expect(
+      service.submit_merge_conflict_resolution(
+        resolutionReport({ idempotencyKey: "still-1", resolutionStatus: "still_conflicted", baseHeadSha: "base-sha-2" }),
+        context(),
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
   });
 
   it("rejects ordinary or mismatched issue state for conflict-resolution reports", async () => {
@@ -127,9 +200,14 @@ function context(overrides: Partial<Parameters<MergeConflictResolutionService["s
 
 function resolutionReport(input: {
   idempotencyKey?: string;
-  resolutionStatus: "resolved" | "still_conflicted";
+  resolutionStatus: "resolved" | "still_conflicted" | "blocked";
   headSha?: string;
+  previousHeadSha?: string;
+  baseBranch?: string;
+  baseHeadSha?: string;
+  blockedReason?: string;
 }) {
+  const headSha = input.headSha ?? "head-sha-1";
   return {
     runId: "conflict-run-1",
     issueId: "issue-1",
@@ -140,9 +218,14 @@ function resolutionReport(input: {
     pullRequest: {
       url: "https://github.com/acme/symphony/pull/42",
       number: 42,
-      headSha: input.headSha ?? "head-sha-1",
+      headSha,
       branch: "symphony/TEST-1",
     },
+    previousHeadSha: input.previousHeadSha ?? "head-sha-1",
+    newHeadSha: headSha,
+    baseBranch: input.baseBranch ?? "main",
+    baseHeadSha: input.baseHeadSha ?? "base-sha-1",
+    ...(input.blockedReason === undefined ? {} : { blockedReason: input.blockedReason }),
     risks: [],
     idempotencyKey: input.idempotencyKey ?? "resolve-1",
   };
@@ -162,6 +245,8 @@ function mergeConflictRecord(input: { fixTurnCount: number }) {
     approvedHeadSha: "head-sha-1",
     currentHeadSha: "head-sha-1",
     resolvedHeadSha: null,
+    baseBranch: "main",
+    baseHeadSha: "base-sha-1",
     sourceState: "Ready to Merge",
     conflictsState: "Approved with Conflicts",
     reason: "Pull request has merge conflicts with the base branch",

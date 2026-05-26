@@ -592,6 +592,10 @@ describe("GitHubPullRequestClient", () => {
           sha: "head-sha-1",
           repo: { pushed_at: "2026-01-01T00:00:00Z" },
         },
+        base: {
+          ref: "main",
+          sha: "base-sha-1",
+        },
       }),
     );
 
@@ -607,6 +611,8 @@ describe("GitHubPullRequestClient", () => {
       mergedBy: "symphony-bot",
       headBranch: "symphony/TEST-1",
       headSha: "head-sha-1",
+      baseBranch: "main",
+      baseHeadSha: "base-sha-1",
     });
   });
 

@@ -125,6 +125,7 @@ export class MergePolicyService {
           sourceState,
           mergeability.reason,
           livePullRequest.mergeableState,
+          livePullRequest,
         );
         return { status: "blocked_conflicts", headSha, mergeableState: livePullRequest.mergeableState };
       }
@@ -218,6 +219,7 @@ export class MergePolicyService {
     sourceState: string,
     reason: string,
     mergeableState: string | null,
+    livePullRequest: PullRequestDetails,
   ): Promise<void> {
     const conflictsState = this.options.config.mergePolicy.conflictsState;
     if (conflictsState === null) {
@@ -266,6 +268,8 @@ export class MergePolicyService {
         conflictsState,
         reason,
         mergeableState,
+        baseBranch: livePullRequest.baseBranch,
+        baseHeadSha: livePullRequest.baseHeadSha,
         writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
       }),
       summaryPointers: {
@@ -349,7 +353,11 @@ function validateRunMetadata(
   requireMatches("worker run PR branch", run.prBranch, pullRequest.branch);
   requireMatches("lifecycle PR number", lifecycle.summaryPointers.prNumber, pullRequest.number);
   requireMatches("lifecycle PR URL", lifecycle.summaryPointers.prUrl, pullRequest.url);
-  requireMatches("lifecycle PR head SHA", lifecycle.summaryPointers.prHeadSha, pullRequest.headSha);
+  requireMatchesAny("lifecycle PR head SHA", lifecycle.summaryPointers.prHeadSha, [
+    pullRequest.headSha,
+    lifecycle.mergeConflict?.currentHeadSha,
+    lifecycle.mergeConflict?.resolvedHeadSha,
+  ]);
   requireMatches("lifecycle PR branch", lifecycle.summaryPointers.prBranch, pullRequest.branch);
 }
 
@@ -431,30 +439,41 @@ function buildMergeConflictMetadata(input: {
   conflictsState: string;
   reason: string;
   mergeableState: string | null;
+  baseBranch: string;
+  baseHeadSha: string;
   writebackOperationKeys: string[];
 }): IssueMergeConflictMetadata {
   const existing = input.lifecycle.mergeConflict;
   const now = new Date().toISOString();
-  const id = existing?.id ?? `merge-conflict:${input.issue.id}:${input.headSha}`;
+  const sameConflictLineage =
+    existing !== null &&
+    existing !== undefined &&
+    existing.pullRequest.number === input.pullRequest.number &&
+    existing.pullRequest.url === input.pullRequest.url &&
+    existing.pullRequest.branch === input.pullRequest.branch &&
+    existing.conflictsState === input.conflictsState;
+  const id = sameConflictLineage ? existing.id : `merge-conflict:${input.issue.id}:${input.headSha}`;
   return {
     id,
     status: "open",
     resolutionStatus: "pending",
     pullRequest: { ...input.pullRequest, headSha: input.headSha },
-    approvedHeadSha: input.headSha,
+    approvedHeadSha: sameConflictLineage ? existing.approvedHeadSha : input.headSha,
     currentHeadSha: input.headSha,
     resolvedHeadSha: null,
+    baseBranch: input.baseBranch,
+    baseHeadSha: input.baseHeadSha,
     sourceState: input.sourceState,
     conflictsState: input.conflictsState,
     reason: input.reason,
     mergeableState: input.mergeableState,
-    detectedAt: existing?.detectedAt ?? now,
+    detectedAt: sameConflictLineage ? existing.detectedAt : now,
     updatedAt: now,
-    fixTurnCount: existing?.fixTurnCount ?? 0,
+    fixTurnCount: sameConflictLineage ? existing.fixTurnCount : 0,
     maxFixTurns: input.config.mergePolicy.maxConflictFixTurns,
-    lastConflictFixRunId: existing?.lastConflictFixRunId ?? null,
-    lastConflictResolutionReportId: existing?.lastConflictResolutionReportId ?? null,
-    attemptRunIds: existing?.attemptRunIds ?? [],
+    lastConflictFixRunId: sameConflictLineage ? existing.lastConflictFixRunId : null,
+    lastConflictResolutionReportId: sameConflictLineage ? existing.lastConflictResolutionReportId : null,
+    attemptRunIds: sameConflictLineage ? existing.attemptRunIds : [],
     writebackOperationKeys: input.writebackOperationKeys,
     blockedAt: null,
     blockedReason: null,
@@ -547,6 +566,15 @@ function requirePullRequest(report: IssueCompletionReportRecord): CompletionRepo
 
 function requireMatches(label: string, actual: string | number | null | undefined, expected: string | number | null | undefined): void {
   if (actual === expected) return;
+  throw new SymphonyError("invalid_request", `${label} does not match gated merge metadata`);
+}
+
+function requireMatchesAny(
+  label: string,
+  actual: string | number | null | undefined,
+  expected: Array<string | number | null | undefined>,
+): void {
+  if (expected.some((item) => actual === item)) return;
   throw new SymphonyError("invalid_request", `${label} does not match gated merge metadata`);
 }
 
