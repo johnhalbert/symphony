@@ -1,5 +1,6 @@
 import type { InteractionUpdate, SDKMessage } from "@cursor/sdk";
 import type { AgentEvent } from "../../src/core/harness/AgentHarness.js";
+import { sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
 
 export function mapCursorMessage(message: SDKMessage): AgentEvent[] {
   switch (message.type) {
@@ -8,7 +9,7 @@ export function mapCursorMessage(message: SDKMessage): AgentEvent[] {
     case "assistant":
       return message.message.content
         .filter((block) => block.type === "text")
-        .map((block) => ({ type: "progress", message: block.text, activitySource: "stream" }));
+        .map((block) => ({ type: "progress", message: sanitizedMessage(block.text), activitySource: "stream" }));
     case "thinking":
       return [{ type: "progress", message: "Cursor thinking event", activitySource: "stream" }];
     case "task":
@@ -27,12 +28,12 @@ export function mapCursorMessage(message: SDKMessage): AgentEvent[] {
           {
             type: "run_diagnostic",
             code: `cursor_stream_status_${message.status.toLowerCase()}`,
-            message: message.message ?? `Cursor stream status ${message.status}`,
+            message: sanitizedMessage(message.message ?? `Cursor stream status ${message.status}`),
             payload: { status: message.status },
           },
         ];
       }
-      return message.message ? [{ type: "progress", message: message.message, activitySource: "stream" }] : [];
+      return message.message ? [{ type: "progress", message: sanitizedMessage(message.message), activitySource: "stream" }] : [];
     case "request":
       return [{ type: "failed", error: "Cursor requested external input" }];
     case "user":
@@ -54,7 +55,11 @@ export function mapCursorDelta(update: InteractionUpdate): AgentEvent[] {
     ];
   }
   if (update.type === "text-delta" && update.text) {
-    return [{ type: "progress", message: update.text, activitySource: "delta" }];
+    return [{ type: "progress", message: sanitizedMessage(update.text), activitySource: "delta" }];
   }
   return [];
+}
+
+function sanitizedMessage(value: string): string {
+  return sanitizedPreviewValue(value).preview ?? "";
 }
