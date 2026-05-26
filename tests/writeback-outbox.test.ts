@@ -341,6 +341,8 @@ function lifecycleWithReports(overrides: { lastCompletionReportId: string; compl
       updatedAt: null,
     },
     merge: null,
+    mergeConflict: null,
+    mergeConflictResolutionReports: [],
     handoff: {
       version: 1,
       memo: {

@@ -591,7 +591,7 @@ export function planMergeConflictsWritebacks(
           `GitHub mergeable_state: ${context.mergeableState ?? "unknown"}`,
           "",
           `Transitioning to conflict-fix state: ${context.conflictsState}`,
-          "A worker must resolve the conflict and submit a fresh completion report before merge can continue.",
+          "A scoped conflict-fix worker must resolve the conflict and call submit_merge_conflict_resolution before merge can continue.",
         ].join("\n"),
       },
     },
@@ -657,22 +657,11 @@ function uniqueStates(states: string[]): string[] {
 }
 
 function completionReportAcceptedFromStates(config: ServiceConfig): string[] {
-  return uniqueStates([
-    config.writeback.dispatchState,
-    ...config.reviewLoop.blockedStates,
-    ...(config.mergePolicy.mode === "gated" && config.mergePolicy.conflictsState !== null
-      ? [config.mergePolicy.conflictsState]
-      : []),
-  ]);
+  return uniqueStates([config.writeback.dispatchState, ...config.reviewLoop.blockedStates]);
 }
 
 function pullRequestHandoffFromStates(config: ServiceConfig): string[] {
-  return uniqueStates([
-    config.writeback.dispatchState,
-    ...(config.mergePolicy.mode === "gated" && config.mergePolicy.conflictsState !== null
-      ? [config.mergePolicy.conflictsState]
-      : []),
-  ]);
+  return uniqueStates([config.writeback.dispatchState]);
 }
 
 function formatCompletionReportForComment(report: string | CompletionReportWritebackDetails | null): string[] {

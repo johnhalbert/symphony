@@ -632,6 +632,18 @@ describe("GitHubPullRequestClient", () => {
     });
   });
 
+  it("checks commit ancestry for approval carry-forward", async () => {
+    const calls: string[] = [];
+    const client = new GitHubPullRequestClient(config(), async (input) => {
+      const url = new URL(String(input));
+      calls.push(url.pathname);
+      return jsonResponse({ status: "ahead" });
+    });
+
+    await expect(client.isAncestor({ ancestorSha: "approved-sha", descendantSha: "resolved-sha" })).resolves.toBe(true);
+    expect(calls).toEqual(["/repos/octo-org/symphony/compare/approved-sha...resolved-sha"]);
+  });
+
   it("checks required commit statuses and check runs by name", async () => {
     const client = new GitHubPullRequestClient(config(), async (input) => {
       const url = new URL(String(input));

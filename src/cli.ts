@@ -15,6 +15,7 @@ import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
 import { runIssueBreakdownPlanMcpServer } from "./core/harness/IssueBreakdownPlanMcpServer.js";
+import { runMergeConflictResolutionMcpServer } from "./core/harness/MergeConflictResolutionMcpServer.js";
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
 import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcpServer.js";
@@ -59,6 +60,18 @@ program
   .requiredOption("--context-file <path>", "path to the active worker context file")
   .action(async (options: { workflow: string; contextFile: string }) => {
     await runCompletionReportMcpServer({
+      workflowPath: path.resolve(process.cwd(), options.workflow),
+      contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
+  });
+
+program
+  .command("merge-conflict-resolution-mcp")
+  .description("Run the internal Symphony merge-conflict-resolution MCP server")
+  .requiredOption("--workflow <path>", "path to WORKFLOW.md")
+  .requiredOption("--context-file <path>", "path to the active conflict-fix worker context file")
+  .action(async (options: { workflow: string; contextFile: string }) => {
+    await runMergeConflictResolutionMcpServer({
       workflowPath: path.resolve(process.cwd(), options.workflow),
       contextFile: path.resolve(process.cwd(), options.contextFile),
     });

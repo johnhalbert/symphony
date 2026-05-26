@@ -370,7 +370,7 @@ describe("CompletionReportService", () => {
     });
   });
 
-  it("accepts conflict-fix completion reports from the configured merge conflicts state", async () => {
+  it("rejects ordinary completion reports from the configured merge conflicts state", async () => {
     const { service, lifecycleStore, outbox } = fixture({
       configure(config) {
         config.mergePolicy.mode = "gated";
@@ -379,24 +379,17 @@ describe("CompletionReportService", () => {
       },
     });
 
-    const result = await service.submitCompletionReport(
-      report(),
-      context({ issue: issue({ state: "Approved with Conflicts", branchName: "symphony/TEST-1" }) }),
-    );
+    await lifecycleStore.ensureIssue(issue({ state: "Approved with Conflicts" }), {
+      phase: "merge_conflict_resolution",
+    });
 
-    expect(result.replayed).toBe(false);
-    expect(result.writebackOperations).toHaveLength(2);
-    const transition = (await outbox.list()).find((operation) => operation.kind === "transition");
-    expect(transition).toMatchObject({
-      payload: {
-        fromStates: ["In Progress", "Approved with Conflicts"],
-        toState: "In Review",
-      },
-    });
-    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "review",
-      lastCompletionReportId: "completion-report:issue-1:idem-1",
-    });
+    await expect(
+      service.submitCompletionReport(
+        report(),
+        context({ issue: issue({ state: "Approved with Conflicts", branchName: "symphony/TEST-1" }) }),
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(await outbox.list()).toHaveLength(0);
   });
 
   it("rejects missing required report fields", async () => {

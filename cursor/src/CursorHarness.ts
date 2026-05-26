@@ -2,8 +2,10 @@ import { Agent, type Run, type SDKAgent, type SDKMessage, type SettingSource } f
 import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 import type { AgentEvent, AgentHarness, AgentRunContext, AgentRunSdkStatus } from "../../src/core/harness/AgentHarness.js";
+import type { AgentRunPhase } from "../../src/core/types.js";
 import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
 import { writeIssueBreakdownPlanMcpContext } from "../../src/core/harness/IssueBreakdownPlanMcpServer.js";
+import { writeMergeConflictResolutionMcpContext } from "../../src/core/harness/MergeConflictResolutionMcpServer.js";
 import { writeReviewFeedbackMcpContext } from "../../src/core/harness/ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
 import { writeTranscriptRecallMcpContext } from "../../src/core/harness/TranscriptRecallMcpServer.js";
@@ -238,6 +240,19 @@ export class CursorHarness implements AgentHarness {
           workspacePath: ctx.workspace.path,
           workspace: ctx.workspace,
           phase: "implementation",
+        });
+      }
+      if (ctx.role === "worker" && cursorRunPhase(ctx) === "merge_conflict_resolution") {
+        await writeMergeConflictResolutionMcpContext(mergeConflictResolutionContextFilePath(ctx), {
+          issue: ctx.issue,
+          activeRunId: run.id,
+          role: "worker",
+          token: null,
+          expectedToken: null,
+          sessionId: `${agent.agentId}:${run.id}`,
+          workspacePath: ctx.workspace.path,
+          workspace: ctx.workspace,
+          phase: "merge_conflict_resolution",
         });
       }
       if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
@@ -645,6 +660,14 @@ export function cursorRoleMcpServers(
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "merge_conflict_resolution") {
+    return {
+      symphony_conflicts: applyCwd(
+        mergeConflictResolutionMcpServerConfig(ctx, mergeConflictResolutionContextFilePath(ctx), options),
+      ),
+      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
+    };
+  }
   if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
     return {
       symphony_planning: applyCwd(issueBreakdownPlanMcpServerConfig(ctx, issueBreakdownPlanContextFilePath(ctx), options)),
@@ -678,6 +701,20 @@ export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise
       workspacePath: ctx.workspace.path,
       workspace: ctx.workspace,
       phase: "implementation",
+    });
+    return;
+  }
+  if (ctx.role === "worker" && cursorRunPhase(ctx) === "merge_conflict_resolution") {
+    await writeMergeConflictResolutionMcpContext(mergeConflictResolutionContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: null,
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "merge_conflict_resolution",
     });
     return;
   }
@@ -749,6 +786,20 @@ export function completionReportMcpServerConfig(
   });
 }
 
+export function mergeConflictResolutionMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "merge-conflict-resolution-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
+}
+
 export function issueBreakdownPlanMcpServerConfig(
   ctx: AgentRunContext,
   contextFile: string,
@@ -813,6 +864,14 @@ export function completionReportContextFilePath(ctx: AgentRunContext): string {
   );
 }
 
+export function mergeConflictResolutionContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "merge-conflict-resolution-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
 export function issueBreakdownPlanContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
@@ -849,7 +908,7 @@ function agentKey(ctx: AgentRunContext): string {
   return ctx.role === "reviewer" ? `${ctx.workspace.path}:reviewer` : `${ctx.workspace.path}:worker:${cursorRunPhase(ctx)}`;
 }
 
-function cursorRunPhase(ctx: AgentRunContext): "issue_breakdown" | "implementation" | "review" {
+function cursorRunPhase(ctx: AgentRunContext): AgentRunPhase {
   return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
 }
 

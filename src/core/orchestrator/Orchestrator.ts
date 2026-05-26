@@ -53,6 +53,7 @@ import {
   type IssueLifecycleRecord,
   type IssueLifecycleSummaryReference,
   type IssueLifecycleStore,
+  type IssueMergeConflictMetadata,
   type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import { MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
@@ -150,6 +151,7 @@ export interface RunningEntry {
   cleanupWorkspaceOnExit: boolean;
   suppressRetryOnExit: boolean;
   completionReportAccepted: boolean;
+  mergeConflictResolutionAccepted: boolean;
   issueBreakdownPlanAccepted: boolean;
   pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
@@ -173,9 +175,7 @@ interface ReviewerDispatchEvidence {
   runDigest: string[];
 }
 
-type WorkerDispatchDecision =
-  | { action: "dispatch"; runPhase: AgentRunPhase }
-  | { action: "skip"; reason: "planning_required_no_lifecycle_store" };
+type WorkerDispatchDecision = { action: "dispatch"; runPhase: AgentRunPhase } | { action: "skip"; reason: string };
 
 export interface RetryEntry {
   issueId: string;
@@ -862,6 +862,14 @@ export class Orchestrator {
       }
       if (planningBackoffRemainingMs(lifecycle, this.config) > 0) return false;
     }
+    if (role === "worker" && runPhase === "merge_conflict_resolution") {
+      const conflict = lifecycle.mergeConflict;
+      if (!conflict || conflict.status !== "open") return false;
+      if (conflict.fixTurnCount >= conflict.maxFixTurns) {
+        await this.blockMergeConflictAttempts(issue, lifecycle.summaryPointers.lastRunId ?? issue.id, conflict);
+        return false;
+      }
+    }
     if (
       role === "worker" &&
       runPhase === "implementation" &&
@@ -981,6 +989,7 @@ export class Orchestrator {
   }
 
   private async resolveWorkerDispatchDecision(issue: Issue): Promise<WorkerDispatchDecision> {
+    if (this.isMergeConflictState(issue.state)) return { action: "dispatch", runPhase: "merge_conflict_resolution" };
     if (!this.config.issueBreakdown.enabled) return { action: "dispatch", runPhase: "implementation" };
     if (!this.passesIssueBreakdownRouting(issue)) return { action: "dispatch", runPhase: "implementation" };
     if (!this.options.lifecycleStore) return { action: "skip", reason: "planning_required_no_lifecycle_store" };
@@ -995,6 +1004,14 @@ export class Orchestrator {
     if (this.config.issueBreakdown.planningLabels.length === 0) return false;
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
     return this.config.issueBreakdown.planningLabels.some((label) => labels.has(label));
+  }
+
+  private isMergeConflictState(state: string): boolean {
+    return (
+      this.config.mergePolicy.mode === "gated" &&
+      this.config.mergePolicy.conflictsState !== null &&
+      statesEqual(state, this.config.mergePolicy.conflictsState)
+    );
   }
 
   private dispatchIssue(
@@ -1037,6 +1054,7 @@ export class Orchestrator {
       cleanupWorkspaceOnExit: false,
       suppressRetryOnExit: false,
       completionReportAccepted: false,
+      mergeConflictResolutionAccepted: false,
       issueBreakdownPlanAccepted: false,
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
@@ -1147,7 +1165,7 @@ export class Orchestrator {
           attempt,
           turnNumber,
         });
-        if (entry.completionReportAccepted) break;
+        if (entry.completionReportAccepted || entry.mergeConflictResolutionAccepted) break;
         if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) break;
 
         const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
@@ -1341,7 +1359,18 @@ export class Orchestrator {
         });
         if (!terminal.updated) return;
         await this.discoverPullRequestForEntry(entry, context.workspace);
-        if (entry.role === "worker" && !(await this.reconcileCompletionReportHandoff(entry)) && !entry.pullRequestHandoffAccepted) {
+        if (
+          entry.role === "worker" &&
+          entry.runPhase === "merge_conflict_resolution" &&
+          !(await this.reconcileMergeConflictResolutionHandoff(entry))
+        ) {
+          await this.recordIncompleteTurn(entry);
+        } else if (
+          entry.role === "worker" &&
+          entry.runPhase !== "merge_conflict_resolution" &&
+          !(await this.reconcileCompletionReportHandoff(entry)) &&
+          !entry.pullRequestHandoffAccepted
+        ) {
           await this.recordIncompleteTurn(entry);
         }
         if (entry.role === "reviewer") {
@@ -1356,7 +1385,11 @@ export class Orchestrator {
         ) {
           return;
         }
-        if (entry.role === "worker" && entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
+        if (
+          entry.role === "worker" &&
+          ((entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) ||
+            (entry.runPhase === "merge_conflict_resolution" && (await this.reconcileMergeConflictResolutionHandoff(entry))))
+        ) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
@@ -1384,7 +1417,11 @@ export class Orchestrator {
         ) {
           return;
         }
-        if (entry.role === "worker" && entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
+        if (
+          entry.role === "worker" &&
+          ((entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) ||
+            (entry.runPhase === "merge_conflict_resolution" && (await this.reconcileMergeConflictResolutionHandoff(entry))))
+        ) {
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
             status: "succeeded",
             completedAt: new Date().toISOString(),
@@ -1461,7 +1498,12 @@ export class Orchestrator {
       return;
     }
 
-    if (entry.role === "worker" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) {
+    if (
+      entry.role === "worker" &&
+      (((entry.runPhase === "merge_conflict_resolution" && (await this.reconcileMergeConflictResolutionHandoff(entry))) ||
+        (entry.runPhase !== "merge_conflict_resolution" &&
+          ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted))))
+    ) {
       if (entry.runId) {
         const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
           status: "succeeded",
@@ -1569,6 +1611,13 @@ export class Orchestrator {
       );
       this.claimed.delete(issueId);
     } else {
+      if (entry.runPhase === "merge_conflict_resolution") {
+        await this.recordMergeConflictAttempt(entry, error ?? "conflict-fix run failed before reporting resolution");
+        if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) {
+          this.claimed.delete(issueId);
+          return;
+        }
+      }
       if (entry.runId) {
         const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
           status: "failed",
@@ -1884,6 +1933,10 @@ export class Orchestrator {
     if (!store) return;
     if (await this.hasPendingPublicationApprovalHandoff(entry)) return;
     const refreshed = await this.refreshEntryIssue(entry, "incomplete turn refresh");
+    if (entry.runPhase === "merge_conflict_resolution") {
+      await this.recordMergeConflictAttempt(entry, "conflict-fix run ended without submit_merge_conflict_resolution");
+      return;
+    }
     if (!refreshed || !this.isImplementationActive(entry.issue)) {
       await this.updateLifecycle(entry, { phase: phaseForIssueState(entry.issue.state, this.config) });
       return;
@@ -1900,6 +1953,88 @@ export class Orchestrator {
         `max incomplete turns reached (${incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
       );
     }
+  }
+
+  private async recordMergeConflictAttempt(entry: RunningEntry, reason: string): Promise<void> {
+    const store = this.options.lifecycleStore;
+    if (!store) return;
+    const runId = entry.activeRunId ?? entry.runId ?? entry.issue.id;
+    const lifecycle = (await store.get(entry.issue.id)) ?? entry.lifecycle;
+    const conflict = lifecycle?.mergeConflict ?? null;
+    if (!lifecycle || !conflict || conflict.status !== "open") return;
+    if (conflict.attemptRunIds.includes(runId)) {
+      entry.lifecycle = lifecycle;
+      return;
+    }
+    const fixTurnCount = conflict.fixTurnCount + 1;
+    const attemptRunIds = [...conflict.attemptRunIds, runId];
+    const nextConflict: IssueMergeConflictMetadata = {
+      ...conflict,
+      resolutionStatus: fixTurnCount >= conflict.maxFixTurns ? "blocked" : "still_conflicted",
+      status: fixTurnCount >= conflict.maxFixTurns ? "blocked" : "open",
+      updatedAt: new Date().toISOString(),
+      fixTurnCount,
+      lastConflictFixRunId: runId,
+      attemptRunIds,
+      blockedAt: fixTurnCount >= conflict.maxFixTurns ? new Date().toISOString() : conflict.blockedAt,
+      blockedReason: fixTurnCount >= conflict.maxFixTurns ? mergeConflictBlockedReason(fixTurnCount, conflict.maxFixTurns) : null,
+    };
+    entry.lifecycle = await store.updateIssue(entry.issue, {
+      phase: nextConflict.status === "blocked" ? "blocked" : "merge_conflict_resolution",
+      blockedReason: nextConflict.blockedReason,
+      mergeConflict: nextConflict,
+    });
+    if (nextConflict.status === "blocked") {
+      await this.applyMergeConflictBlockedWritebacks(entry.issue, runId, nextConflict, reason);
+      this.clearRetry(entry.issue.id);
+    }
+  }
+
+  private async blockMergeConflictAttempts(
+    issue: Issue,
+    runId: string,
+    conflict: IssueMergeConflictMetadata,
+  ): Promise<void> {
+    const blockedConflict: IssueMergeConflictMetadata = {
+      ...conflict,
+      status: "blocked",
+      resolutionStatus: "blocked",
+      blockedAt: conflict.blockedAt ?? new Date().toISOString(),
+      blockedReason: conflict.blockedReason ?? mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns),
+    };
+    await this.options.lifecycleStore?.updateIssue(issue, {
+      phase: "blocked",
+      blockedReason: blockedConflict.blockedReason,
+      mergeConflict: blockedConflict,
+    });
+    await this.applyMergeConflictBlockedWritebacks(issue, runId, blockedConflict, "conflict-fix attempt limit reached");
+  }
+
+  private async applyMergeConflictBlockedWritebacks(
+    issue: Issue,
+    runId: string,
+    conflict: IssueMergeConflictMetadata,
+    reason: string,
+  ): Promise<void> {
+    await this.applyWritebacks(
+      planBlockedEscalationWritebacks(
+        {
+          issue,
+          runId,
+          reason: conflict.blockedReason ?? reason,
+          requiredAction: [
+            "Merge conflicts remain unresolved after the configured conflict-fix attempts.",
+            `Pull request: ${formatPullRequest(conflict.pullRequest.number, conflict.pullRequest.url)}`,
+            `Approved head SHA: ${conflict.approvedHeadSha}`,
+            `Latest conflict head SHA: ${conflict.currentHeadSha}`,
+            `Conflict-fix attempts: ${conflict.fixTurnCount}/${conflict.maxFixTurns}`,
+            "Resolve the conflicts manually or reset approval before returning the issue to Symphony.",
+          ].join("\n"),
+        },
+        this.config,
+      ),
+      "merge conflict blocked escalation",
+    );
   }
 
   private async refreshEntryIssue(entry: RunningEntry, reason: string): Promise<boolean> {
@@ -2008,6 +2143,33 @@ export class Orchestrator {
     return true;
   }
 
+  private async reconcileMergeConflictResolutionHandoff(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return entry.mergeConflictResolutionAccepted;
+
+    const lifecycle = await store.get(entry.issue.id);
+    const report = lifecycle?.mergeConflictResolutionReports.find((item) => item.runId === runId) ?? null;
+    if (!lifecycle || !report) return entry.mergeConflictResolutionAccepted;
+
+    entry.lifecycle = lifecycle;
+    entry.mergeConflictResolutionAccepted = true;
+
+    if (this.options.writeback) {
+      await this.options.writeback.processDue();
+    } else if (this.config.writeback.enabled) {
+      this.options.logger.warn("merge conflict resolution accepted but writeback processor is not configured", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        run_id: runId,
+        report_id: report.id,
+      });
+    }
+
+    if (report.resolutionStatus === "resolved") await this.tryReconcileMergePolicy(entry.issue);
+    return true;
+  }
+
   private async reconcileIssueBreakdownPlanHandoff(entry: RunningEntry): Promise<boolean> {
     const store = this.options.lifecycleStore;
     const runId = entry.activeRunId ?? entry.runId;
@@ -2052,7 +2214,11 @@ export class Orchestrator {
     if (this.config.mergePolicy.mode !== "gated" || this.config.mergePolicy.sourceStates.length === 0) return;
     let candidates: Issue[];
     try {
-      candidates = await this.options.tracker.fetchIssuesByStates(this.config.mergePolicy.sourceStates);
+      const states = [
+        ...this.config.mergePolicy.sourceStates,
+        ...(this.config.mergePolicy.conflictsState === null ? [] : [this.config.mergePolicy.conflictsState]),
+      ];
+      candidates = await this.options.tracker.fetchIssuesByStates(uniqueStateNames(states));
     } catch (error) {
       this.options.logger.warn("merge policy issue fetch failed", { error: errorMessage(error) });
       return;
@@ -2215,6 +2381,7 @@ export class Orchestrator {
   }
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
+    if (entry.runPhase === "merge_conflict_resolution") return this.renderMergeConflictResolutionPrompt(entry);
     const basePrompt = await this.promptRenderer.render(this.promptTemplate, {
       issue: entry.issue,
       attempt,
@@ -2234,6 +2401,33 @@ export class Orchestrator {
   private async renderIssueBreakdownPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
     const basePrompt = await this.promptRenderer.render(this.config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
     return [basePrompt, this.cursorIssueBreakdownMcpPrompt(entry)].join("\n");
+  }
+
+  private async renderMergeConflictResolutionPrompt(entry: RunningEntry): Promise<string> {
+    const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+    const conflict = lifecycle?.mergeConflict ?? null;
+    const workspace = entry.workspace;
+    return [
+      `Resolve merge conflicts for ${entry.issue.identifier}: ${entry.issue.title}`,
+      "",
+      "You are a scoped Symphony conflict-fix worker. Only resolve the merge conflict on the existing lifecycle-bound pull request.",
+      "Do not perform unrelated implementation work, request review, move Linear state, or call submit_completion_report.",
+      "",
+      "Conflict metadata:",
+      `- Pull request: ${formatPullRequest(conflict?.pullRequest.number ?? null, conflict?.pullRequest.url ?? null)}`,
+      `- Approved head SHA: ${conflict?.approvedHeadSha ?? "n/a"}`,
+      `- Current conflict head SHA: ${conflict?.currentHeadSha ?? "n/a"}`,
+      `- Attempts: ${conflict?.fixTurnCount ?? 0} / ${conflict?.maxFixTurns ?? this.config.mergePolicy.maxConflictFixTurns}`,
+      `- Reason: ${conflict?.reason ?? "n/a"}`,
+      `- GitHub mergeable_state: ${conflict?.mergeableState ?? "unknown"}`,
+      "- Required handoff: call submit_merge_conflict_resolution with resolutionStatus=\"resolved\" or \"still_conflicted\" before ending the run.",
+      "",
+      "Workspace:",
+      `- Path: ${workspace?.path ?? entry.workspacePath ?? "n/a"}`,
+      `- Branch: ${workspace?.gitBranchName ?? entry.issue.branchName ?? "n/a"}`,
+      `- Base ref: ${workspace?.baseRef ?? "n/a"}`,
+      this.cursorMergeConflictResolutionMcpPrompt(entry),
+    ].join("\n");
   }
 
   private cursorIssueBreakdownMcpPrompt(entry: RunningEntry): string {
@@ -2366,6 +2560,26 @@ export class Orchestrator {
       "- Before ending the run, call the submit_completion_report MCP tool with summary, validationEvidence, acceptanceChecklist, changedFiles, branchName, pullRequest, risks, and idempotencyKey.",
       "- The MCP server is scoped to this issue and the current Cursor run; Symphony injects runId and issueId for you.",
       "- Do not comment on Linear, transition Linear state, or request broad Linear write credentials. Symphony handles writeback after the tool accepts the report.",
+    ].join("\n");
+  }
+
+  private cursorMergeConflictResolutionMcpPrompt(entry: RunningEntry): string | null {
+    if (this.options.harness.id !== "cursor") return null;
+    if (entry.runPhase !== "merge_conflict_resolution") return null;
+    const workspace = entry.workspace;
+    return [
+      "",
+      "Symphony MCP merge-conflict-resolution handoff:",
+      `- Active issue: ${entry.issue.identifier} (${entry.issue.id})`,
+      "- Active role: worker",
+      "- Active phase: merge_conflict_resolution",
+      `- Workspace path: ${workspace?.path ?? entry.workspacePath ?? "n/a"}`,
+      `- Branch: ${workspace?.gitBranchName ?? entry.issue.branchName ?? "n/a"}`,
+      `- Repository path: ${workspace?.repoPath ?? "n/a"}`,
+      `- Base ref: ${workspace?.baseRef ?? "n/a"}`,
+      "- Before ending the run, call the submit_merge_conflict_resolution MCP tool with resolutionStatus, summary, validationEvidence, changedFiles, pullRequest, risks, and idempotencyKey.",
+      "- Use resolutionStatus=\"resolved\" only when the PR head contains the conflict fix; use resolutionStatus=\"still_conflicted\" when conflicts remain.",
+      "- The MCP server is scoped to this issue and current conflict-fix run; Symphony injects runId and issueId for you.",
     ].join("\n");
   }
 
@@ -2592,6 +2806,22 @@ function isStateIn(state: string, states: string[]): boolean {
   return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
 }
 
+function statesEqual(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+function uniqueStateNames(states: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const state of states) {
+    const key = state.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(state);
+  }
+  return unique;
+}
+
 function isTerminalSdkRunStatus(status: AgentRunSdkStatus): boolean {
   return status === "finished" || status === "error" || status === "cancelled";
 }
@@ -2683,6 +2913,10 @@ function effectiveCursorModeForEntry(entry: RunningEntry, config: ServiceConfig)
 
 function maxPlanningFailuresReason(count: number, max: number): string {
   return `max planning failures reached (${count}/${max})`;
+}
+
+function mergeConflictBlockedReason(count: number, max: number): string {
+  return `merge conflicts remain unresolved (${count}/${max} conflict-fix attempts)`;
 }
 
 function maxPlanningDispatchRetriesReason(count: number, max: number): string {

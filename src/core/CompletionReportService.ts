@@ -591,12 +591,7 @@ export class CompletionReportService {
     if (lifecyclePhase !== "implementation") {
       throw new SymphonyError("invalid_request", `Completion report cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
-    const allowedStates = [
-      this.options.config.writeback.dispatchState,
-      ...(this.options.config.mergePolicy.mode === "gated" && this.options.config.mergePolicy.conflictsState !== null
-        ? [this.options.config.mergePolicy.conflictsState]
-        : []),
-    ];
+    const allowedStates = [this.options.config.writeback.dispatchState];
     if (!sameStateIn(context.issue.state, allowedStates)) {
       throw new SymphonyError("invalid_request", "Completion report requires the issue to be in the active implementation state");
     }

@@ -55,6 +55,11 @@ export interface PullRequestMergeResult {
   mergedBy: string | null;
 }
 
+export interface CommitAncestryInput {
+  ancestorSha: string;
+  descendantSha: string;
+}
+
 export interface PullRequestPublicationInput {
   workspacePath: string;
   branchName: string;
@@ -419,6 +424,25 @@ export class GitHubPullRequestClient {
       mergedAt: new Date().toISOString(),
       mergedBy: await this.getAuthenticatedLogin(),
     };
+  }
+
+  async isAncestor(input: CommitAncestryInput): Promise<boolean> {
+    this.assertConfiguredForMerge();
+    const ancestorSha = requireNonEmpty(input.ancestorSha, "An ancestor commit SHA is required for approval carry-forward");
+    const descendantSha = requireNonEmpty(input.descendantSha, "A descendant commit SHA is required for approval carry-forward");
+    const response = await this.fetchImpl(
+      this.repoUrl(`compare/${encodeURIComponent(ancestorSha)}...${encodeURIComponent(descendantSha)}`),
+      {
+        method: "GET",
+        headers: requestHeaders(this.config.token ?? ""),
+      },
+    );
+    if (!response.ok) {
+      throw new SymphonyError("tracker_error", `GitHub commit comparison returned HTTP ${response.status}`);
+    }
+    const body = (await response.json()) as Record<string, unknown>;
+    const status = asNullableString(body.status);
+    return status === "identical" || status === "ahead";
   }
 
   async submitPullRequestReviewFeedback(

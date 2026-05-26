@@ -117,6 +117,34 @@ describe("StatusServer durable API", () => {
           mergeOperationKey: "github-merge:issue-1:7:head-sha-1",
           doneTransitionOperationKey: "transition:issue-1:merge:issue-1:head-sha-1:Done",
         },
+        mergeConflict: {
+          id: "merge-conflict:issue-1:head-sha-1",
+          status: "open",
+          resolutionStatus: "still_conflicted",
+          pullRequest: {
+            url: "https://github.com/acme/repo/pull/7",
+            number: 7,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-1",
+          },
+          approvedHeadSha: "head-sha-0",
+          currentHeadSha: "head-sha-1",
+          resolvedHeadSha: null,
+          sourceState: "Ready to Merge",
+          conflictsState: "Approved with Conflicts",
+          reason: "Pull request has merge conflicts with the base branch",
+          mergeableState: "dirty",
+          detectedAt: "2026-01-01T00:00:05.000Z",
+          updatedAt: "2026-01-01T00:00:05.500Z",
+          fixTurnCount: 1,
+          maxFixTurns: 3,
+          lastConflictFixRunId: "conflict-run-1",
+          lastConflictResolutionReportId: "merge-conflict-resolution:issue-1:still-1",
+          attemptRunIds: ["conflict-run-1"],
+          writebackOperationKeys: [],
+          blockedAt: null,
+          blockedReason: null,
+        },
         completionReports: [
           {
             id: "completion-report:issue-1:report-1",
@@ -287,6 +315,7 @@ describe("StatusServer durable API", () => {
           blockedReason: string | null;
           lastCompletionReport: { id: string; summary: string } | null;
           lastReviewVerdict: { id: string; verdict: string; findings: string[] } | null;
+          mergeConflict: { resolutionStatus: string; fixTurnCount: number } | null;
         };
         metadata: {
           prUrl: string | null;
@@ -297,6 +326,7 @@ describe("StatusServer durable API", () => {
           repoPath: string | null;
           baseRef: string | null;
           merge: { mergeCommitSha: string } | null;
+          mergeConflict: { resolutionStatus: string; fixTurnCount: number; lastConflictFixRunId: string | null } | null;
         };
         capabilities: { openWorkspace: boolean };
         diagnostics: {
@@ -357,6 +387,10 @@ describe("StatusServer durable API", () => {
           verdict: "fail",
           findings: ["Add reviewer pass evidence."],
         },
+        mergeConflict: {
+          resolutionStatus: "still_conflicted",
+          fixTurnCount: 1,
+        },
       });
       expect(issueBody.metadata).toMatchObject({
         prUrl: "https://github.com/acme/repo/pull/7",
@@ -367,6 +401,11 @@ describe("StatusServer durable API", () => {
         repoPath: "/repo",
         baseRef: "origin/main",
         merge: { mergeCommitSha: "merge-sha-1" },
+        mergeConflict: {
+          resolutionStatus: "still_conflicted",
+          fixTurnCount: 1,
+          lastConflictFixRunId: "conflict-run-1",
+        },
       });
       expect(issueBody.capabilities.openWorkspace).toBe(false);
       expect(issueBody.diagnostics.mcpToolExposure).toMatchObject({

@@ -2851,6 +2851,7 @@ function statusMetadata(input: {
     repoPath: input.live?.metadata?.repoPath ?? pointers?.repoPath ?? input.latestRun?.repoPath ?? input.workspace?.repoPath ?? null,
     baseRef: input.live?.metadata?.baseRef ?? pointers?.baseRef ?? input.latestRun?.baseRef ?? input.workspace?.baseRef ?? null,
     merge: input.lifecycle?.merge ?? null,
+    mergeConflict: input.lifecycle?.mergeConflict ?? null,
   };
 }
 
@@ -2870,6 +2871,7 @@ function reviewLoopStatus(input: {
     incompleteTurnCount: lifecycle?.incompleteTurnCount ?? null,
     lastCompletionReport: latestCompletionReport(lifecycle),
     lastReviewVerdict: latestReviewVerdict(lifecycle),
+    mergeConflict: lifecycle?.mergeConflict ?? null,
     blockedReason: lifecycle?.blockedReason ?? null,
   };
 }

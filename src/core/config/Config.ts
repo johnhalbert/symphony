@@ -48,6 +48,7 @@ const rawConfigSchema = z
         mode: z.enum(["disabled", "manual", "gated"]).optional(),
         source_states: stringArray.optional(),
         conflicts_state: z.string().optional(),
+        max_conflict_fix_turns: z.number().int().positive().optional(),
         done_state: z.string().optional(),
         merge_method: z.enum(["merge", "squash", "rebase"]).optional(),
         required_checks: stringArray.optional(),
@@ -353,6 +354,7 @@ export interface MergePolicyConfig {
   mode: "disabled" | "manual" | "gated";
   sourceStates: string[];
   conflictsState: string | null;
+  maxConflictFixTurns: number;
   doneState: string;
   mergeMethod: "merge" | "squash" | "rebase";
   requiredChecks: string[];
@@ -750,6 +752,7 @@ function normalizeMergePolicy(raw: RawWorkflowConfig, reviewPassState: string | 
     mode,
     sourceStates: rawPolicy?.source_states ?? (reviewPassState === null ? [] : [reviewPassState]),
     conflictsState: normalizeOptionalConfigString(rawPolicy?.conflicts_state),
+    maxConflictFixTurns: rawPolicy?.max_conflict_fix_turns ?? 3,
     doneState: rawPolicy?.done_state ?? "Done",
     mergeMethod: rawPolicy?.merge_method ?? "merge",
     requiredChecks,
