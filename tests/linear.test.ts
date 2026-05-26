@@ -536,6 +536,179 @@ describe("LinearTrackerClient", () => {
 
     expect(result.status).toBe("verified");
   });
+
+  it("creates child issues from planning output with parent linkage and marker", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      requests.push(request);
+      if (request.query.includes("SymphonyIssueCreateContext")) {
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "issue-1",
+              identifier: "T-1",
+              team: { id: "team-1", labels: { nodes: [{ id: "label-1", name: "Planning" }] } },
+              project: { id: "project-1" },
+              children: { nodes: [] },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          issueCreate: {
+            success: true,
+            issue: { id: "child-1", identifier: "T-2", url: "https://linear.test/T-2" },
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.createIssueFromPlan({
+      parentIssueId: "issue-1",
+      title: "Child issue",
+      description: "Build the child.",
+      acceptanceCriteria: ["Done"],
+      requestedLabels: ["planning"],
+      dependencies: [],
+      dedupeKey: "plan-1:0",
+      payloadHash: "hash-1",
+    });
+
+    expect(result.status).toBe("applied");
+    expect(result.evidence?.issue).toMatchObject({ id: "child-1", identifier: "T-2" });
+    expect(requests[1]?.variables.input).toMatchObject({
+      teamId: "team-1",
+      projectId: "project-1",
+      parentId: "issue-1",
+      labelIds: ["label-1"],
+    });
+    expect(JSON.stringify(requests[1]?.variables.input)).toContain("symphony-issue-breakdown");
+  });
+
+  it("blocks child issue creation when requested labels are unresolved", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      requests.push(request);
+      return jsonResponse({
+        data: {
+          issue: {
+            id: "issue-1",
+            identifier: "T-1",
+            team: { id: "team-1", labels: { nodes: [] } },
+            project: { id: "project-1" },
+            children: { nodes: [] },
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.createIssueFromPlan({
+      parentIssueId: "issue-1",
+      title: "Child issue",
+      description: "Build the child.",
+      acceptanceCriteria: ["Done"],
+      requestedLabels: ["planning"],
+      dependencies: [],
+      dedupeKey: "plan-1:0",
+      payloadHash: "hash-1",
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.evidence?.unresolvedLabelNames).toEqual(["planning"]);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("creates Linear blocker relations idempotently", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      requests.push(request);
+      if (request.query.includes("SymphonyIssueRelationContext")) {
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "child-1",
+              relations: { nodes: [] },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          issueRelationCreate: {
+            success: true,
+            issueRelation: { id: "relation-1", type: "blocks" },
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.createIssueRelation({
+      sourceIssueId: "child-1",
+      targetIssueId: "child-2",
+      type: "blocks",
+      dedupeKey: "relation-key",
+      dependency: "Child one",
+    });
+
+    expect(result.status).toBe("applied");
+    expect(requests[1]?.variables.input).toMatchObject({
+      issueId: "child-1",
+      relatedIssueId: "child-2",
+      type: "blocks",
+    });
+  });
+
+  it("verifies existing marker-matched child issues", async () => {
+    const config = testConfig("/tmp/symphony");
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        data: {
+          issue: {
+            id: "issue-1",
+            identifier: "T-1",
+            team: { id: "team-1", labels: { nodes: [] } },
+            project: null,
+            children: {
+              nodes: [
+                {
+                  id: "child-1",
+                  identifier: "T-2",
+                  title: "Child issue",
+                  description: "<!-- symphony-issue-breakdown:plan-1:0:hash-1 -->",
+                  url: "https://linear.test/T-2",
+                  parent: { id: "issue-1" },
+                },
+              ],
+            },
+          },
+        },
+      });
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const result = await client.createIssueFromPlan({
+      parentIssueId: "issue-1",
+      title: "Child issue",
+      description: "Build the child.",
+      acceptanceCriteria: ["Done"],
+      requestedLabels: [],
+      dependencies: [],
+      dedupeKey: "plan-1:0",
+      payloadHash: "hash-1",
+    });
+
+    expect(result.status).toBe("verified");
+    expect(result.evidence?.issueCreateStatus).toBe("verified");
+  });
 });
 
 function jsonResponse(body: unknown): Response {

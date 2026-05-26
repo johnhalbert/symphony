@@ -129,6 +129,7 @@ program
         host: options.host ?? loaded.serviceConfig.server.host,
       },
     };
+    const configRef = { value: config };
 
     const tracker = createRuntimeTrackerClient(config);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
@@ -137,7 +138,7 @@ program
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
     const operatorApproval = new OperatorApprovalService({ config, store: operatorApprovalStore, runStore });
-    const writeback = createRuntimeWritebackProcessor(config, logger);
+    const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger);
     const workspaceManager = new WorkspaceManager({
       workspace: config.workspace,
       hooks: config.hooks,
@@ -160,6 +161,7 @@ program
 
     loader.watch((event) => {
       if (event.loaded) {
+        configRef.value = event.loaded.serviceConfig;
         orchestrator.updateConfig(event.loaded.serviceConfig, event.loaded.definition.promptTemplate);
         logger.info("workflow reloaded", { workflow_path: event.loaded.definition.workflowPath });
       } else if (event.error) {

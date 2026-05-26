@@ -35,7 +35,13 @@ import {
   type TranscriptEvent,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
-import type { FileWritebackOutboxStore, WritebackOperation } from "../core/writeback/WritebackOutbox.js";
+import {
+  ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+  ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
+  issueBreakdownPlanIdForOperation,
+  type FileWritebackOutboxStore,
+  type WritebackOperation,
+} from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import type {
@@ -246,9 +252,6 @@ export class StatusServer {
           if (decision === "reject") {
             await this.recordRejectedApprovalRunTerminal(result.request);
           }
-          if (decision === "reject" && !result.replayed && this.options.operatorApproval?.rejectPolicy === "cancel") {
-            await this.options.orchestrator.cancelIssue(result.request.issueId);
-          }
           if (decision === "approve" && result.request.status === "approved") {
             const resumed = await this.options.orchestrator.resumeApprovedPublication(result.request);
             if (resumed !== true) {
@@ -259,7 +262,14 @@ export class StatusServer {
             }
           }
           if (decision === "reject" && !result.replayed) {
-            await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
+            try {
+              await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
+            } catch {
+              // The approval decision is already durable; worker exit recovery will retry terminal writeback.
+            }
+            if (this.options.operatorApproval?.rejectPolicy === "cancel") {
+              await this.options.orchestrator.cancelIssue(result.request.issueId);
+            }
           }
           sendJson(response, 200, {
             request: approvalResponse(result.request, this.options.operatorApproval?.isRequired() ?? false),
@@ -365,6 +375,20 @@ export class StatusServer {
           runPhase: "issue_breakdown",
           runKind: "planning",
           reason: result.reason,
+        });
+        return;
+      }
+
+      const issueBreakdownApplyMatch = /^\/api\/v1\/issues\/([^/]+)\/planning-run\/apply$/.exec(url.pathname);
+      if (request.method === "POST" && issueBreakdownApplyMatch) {
+        this.requireIssueBreakdownApplyToken(request);
+        const issueId = decodeURIComponent(issueBreakdownApplyMatch[1] ?? "");
+        const options = parseIssueBreakdownApplyRequest(await readJsonBody(request));
+        const result = await this.options.orchestrator.applyIssueBreakdownPlan(issueId, options);
+        sendJson(response, result.status === "pending" ? 202 : 200, {
+          issue: issueId,
+          mode: options.dryRun ? "preview" : "apply",
+          ...result,
         });
         return;
       }
@@ -586,6 +610,17 @@ export class StatusServer {
     }
   }
 
+  private requireIssueBreakdownApplyToken(request: IncomingMessage): void {
+    const expected = this.options.openWorkspaceToken?.trim() ?? "";
+    if (!expected) {
+      throw new SymphonyError("invalid_request", "Issue breakdown apply requires a configured X-Symphony-Token");
+    }
+    const provided = request.headers["x-symphony-token"];
+    if (typeof provided !== "string" || provided.trim().length === 0 || provided !== expected) {
+      throw new SymphonyError("invalid_request", "Missing or invalid issue breakdown apply token");
+    }
+  }
+
   private async fetchIssueBoard(forceRefresh: boolean): Promise<IssueBoardResponse> {
     const issueBoardColumns = this.options.issueBoardColumns ?? defaultIssueBoardColumns(this.options.trackerStateLists);
     const trackerProjection = await this.fetchIssueBoardTrackerProjection(issueBoardColumns, forceRefresh);
@@ -703,6 +738,23 @@ function parseApprovalDecision(body: unknown): "approve" | "reject" {
     throw new SymphonyError("invalid_request", "Approval decision must be approve or reject");
   }
   return decision;
+}
+
+function parseIssueBreakdownApplyRequest(body: unknown): { dryRun: boolean } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new SymphonyError("invalid_request", "Issue breakdown apply body must be an object");
+  }
+  const input = body as { dryRun?: unknown; mode?: unknown };
+  if (input.mode !== undefined) {
+    if (input.mode === "preview") return { dryRun: true };
+    if (input.mode === "apply") return { dryRun: false };
+    throw new SymphonyError("invalid_request", "Issue breakdown apply mode must be preview or apply");
+  }
+  if (input.dryRun === undefined) return { dryRun: true };
+  if (typeof input.dryRun !== "boolean") {
+    throw new SymphonyError("invalid_request", "Issue breakdown apply dryRun must be a boolean");
+  }
+  return { dryRun: input.dryRun };
 }
 
 function approvalResponse(record: OperatorApprovalRecord, enabled: boolean): Record<string, unknown> {
@@ -898,6 +950,7 @@ interface ActivityItem {
   writeback: {
     operationKind: WritebackOperation["kind"];
     status: WritebackOperation["status"];
+    skipReason: WritebackSkipReason | null;
     attempt: number;
     createdAt: string;
     updatedAt: string;
@@ -911,6 +964,11 @@ interface ActivityItem {
     transcript: string | null;
   };
 }
+
+type WritebackSkipReason = {
+  code: "issue_breakdown_plan_not_current" | "issue_breakdown_plan_stale";
+  message: string;
+};
 
 interface IssueBoardCard {
   key: string;
@@ -1264,6 +1322,7 @@ function activityItemForWritebackOperation(
     writeback: {
       operationKind: operation.kind,
       status: operation.status,
+      skipReason: writebackSkipReason(operation),
       attempt: operation.attempt,
       createdAt: operation.createdAt,
       updatedAt: operation.updatedAt,
@@ -1290,6 +1349,25 @@ function activityItemForWritebackOperation(
       transcript: null,
     },
   };
+}
+
+function writebackSkipReason(operation: WritebackOperation): WritebackSkipReason | null {
+  if (operation.status !== "skipped") return null;
+  if (issueBreakdownPlanIdForOperation(operation) === null) return null;
+  const persistedReason = operation.resultMessage ?? operation.lastError;
+  if (persistedReason === ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON) {
+    return {
+      code: "issue_breakdown_plan_not_current",
+      message: "Issue breakdown writeback is not bound to the current plan.",
+    };
+  }
+  if (persistedReason === ISSUE_BREAKDOWN_PLAN_STALE_REASON) {
+    return {
+      code: "issue_breakdown_plan_stale",
+      message: "Issue breakdown plan is no longer fresh.",
+    };
+  }
+  return null;
 }
 
 function activityIssue(run: RunRecord): ActivityItem["issue"] {
