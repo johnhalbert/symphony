@@ -37,7 +37,7 @@ import {
 } from "../core/persistence/RunTranscriptStore.js";
 import type { FileWritebackOutboxStore, WritebackOperation } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
-import { sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
+import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -308,7 +308,7 @@ export class StatusServer {
         const lifecycle = await this.options.lifecycleStore?.get(issueId);
         const enrichedRuns = await Promise.all(
           runs.map(async (run) => ({
-            ...run,
+            ...publicRunRecord(run),
             operatorLiveness: await runOperatorLiveness(run, snapshot, lifecycle, runs, this.options.runStore),
             livenessSummary: runLivenessSummary(run, snapshot, lifecycle, runs),
           })),
@@ -393,7 +393,7 @@ export class StatusServer {
           : null;
         const operatorLiveness = await issueOperatorLiveness({
           live,
-          latestRun,
+          latestRun: publicRunRecordOrNull(latestRun),
           lifecycle,
           paused,
           resolvedAgentId,
@@ -421,7 +421,7 @@ export class StatusServer {
           }),
           live: live ? liveIssueResponse(live, operatorLiveness) : null,
           workspace,
-          latestRun,
+          latestRun: publicRunRecordOrNull(latestRun),
           lifecycle,
           reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
           metadata: statusMetadata({ live, workspace, latestRun, lifecycle }),
@@ -479,7 +479,7 @@ export class StatusServer {
         const lifecycle =
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
-          ...run,
+          ...publicRunRecord(run),
           pendingApproval: (await this.options.operatorApproval?.findPendingForRun(runId)) ?? null,
           telemetry: await runTelemetrySummary(run.runId, this.options.runStore),
           operatorLiveness: await runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns, this.options.runStore),
@@ -1060,7 +1060,7 @@ async function buildBoardIssueDetail(input: {
   const runs = await runsByKeys(input.runStore, keys);
   const enrichedRuns = await Promise.all(
     runs.map(async (run) => ({
-      ...run,
+      ...publicRunRecord(run),
       operatorLiveness: await runOperatorLiveness(run, input.snapshot, lifecycle, runs, input.runStore),
       livenessSummary: runLivenessSummary(run, input.snapshot, lifecycle, runs),
     })),
@@ -1104,7 +1104,7 @@ async function buildBoardIssueDetail(input: {
     issueDetails,
     live: live ? liveIssueResponse(live, operatorLiveness) : null,
     workspace,
-    latestRun,
+    latestRun: publicRunRecordOrNull(latestRun),
     runs: enrichedRuns,
     lifecycle,
     reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
@@ -2111,6 +2111,24 @@ function publicRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
   return sanitizePublicJson(snapshot) as RuntimeSnapshot;
 }
 
+function publicRunRecord(run: RunRecord): RunRecord {
+  const record: RunRecord = {
+    ...run,
+    error: publicDiagnosticText(run.error),
+  };
+  if (run.cancelFailedReason !== undefined) record.cancelFailedReason = publicDiagnosticText(run.cancelFailedReason);
+  if (run.harnessStopFailedReason !== undefined) record.harnessStopFailedReason = publicDiagnosticText(run.harnessStopFailedReason);
+  return record;
+}
+
+function publicRunRecordOrNull(run: RunRecord | null | undefined): RunRecord | null {
+  return run ? publicRunRecord(run) : null;
+}
+
+function publicDiagnosticText(value: string | null | undefined): string | null {
+  return sanitizedPreviewValue(value).preview;
+}
+
 function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -2189,7 +2207,7 @@ async function terminalOperatorLiveness(
     lastActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
     lastTranscriptEventAt: null,
     lastTranscriptEvent: null,
-    lastMessage: lifecycle?.blockedReason ?? run?.error ?? null,
+    lastMessage: lifecycle?.blockedReason ?? publicDiagnosticText(run?.error),
     secondsSinceLastActivity: null,
     stallTimeoutMs: null,
     cancellation: null,
@@ -2231,7 +2249,7 @@ function terminalCancelFailed(run: RunRecord | null) {
       active: true,
       phase: "resolved_failed",
       at: run.cancelFailedAt ?? null,
-      reason: run.cancelFailedReason ?? null,
+      reason: publicDiagnosticText(run.cancelFailedReason),
       source: run.cancelFailedSource ?? null,
     };
   }
@@ -2429,7 +2447,7 @@ function terminalTimeline(
             at: run.completedAt,
             kind: "run_terminal",
             label: `Run ${run.status}`,
-            detail: run.error,
+            detail: publicDiagnosticText(run.error),
             synthetic: true,
             source: "run_record",
           },
@@ -2441,7 +2459,7 @@ function terminalTimeline(
             at: run.cancelFailedAt ?? run.completedAt ?? run.updatedAt,
             kind: "cancel_failed",
             label: "Cancel failed",
-            detail: run.cancelFailedReason ?? null,
+            detail: publicDiagnosticText(run.cancelFailedReason),
             synthetic: true,
             source: "run_record",
           },
@@ -2658,7 +2676,7 @@ function buildIssueLatestRunSummary(run: RunRecord | null | undefined): IssueLat
     runKind: runPhase === null ? null : runKindForPhase(runPhase),
     status: run?.status ?? null,
     terminalReason: deriveRunTerminalReason(run ?? null),
-    error: run?.error ?? null,
+    error: publicDiagnosticText(run?.error),
     completedAt: run?.completedAt ?? null,
   };
 }

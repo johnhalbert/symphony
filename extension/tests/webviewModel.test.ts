@@ -187,6 +187,79 @@ describe("webview model reducer", () => {
     expect(model.transcriptError).toBe("transcript failed");
   });
 
+  it("preserves structured transcript payloads and run metadata for rendering", () => {
+    const model = createInitialDashboardState();
+    model.selectedRunId = "run-structured";
+    model.runEpoch = 1;
+    const run = {
+      runId: "run-structured",
+      error: "failed SECRET_MODEL_ERROR token=model-error",
+      metadataNote: "keep-model-metadata",
+    };
+    const transcript = {
+      runId: "run-structured",
+      offset: 0,
+      limit: 100,
+      nextOffset: null,
+      events: [
+        {
+          runId: "run-structured",
+          sequence: 1,
+          at: "now",
+          source: "harness",
+          eventType: "tool_call",
+          payload: {
+            kind: "tool_call",
+            name: "shell",
+            status: "failed",
+            callId: "call-1",
+            outputPreview: "safe output",
+            errorPreview: "SECRET_TOOL_ERROR token=tool-error",
+          },
+        },
+        {
+          runId: "run-structured",
+          sequence: 2,
+          at: "later",
+          source: "cursor",
+          eventType: "progress",
+          payload: {
+            activitySource: "stream",
+            inputTokens: 7,
+            tokenConfigured: true,
+            secret: "SECRET_JSON_PAYLOAD",
+          },
+        },
+      ],
+    };
+
+    applyExtensionMessage(model, {
+      type: "runState",
+      runId: "run-structured",
+      runEpoch: 1,
+      offset: 0,
+      run,
+      transcript,
+    });
+
+    expect(model.runDetail).toBe(run);
+    expect(model.transcript).toEqual(transcript.events);
+    expect(model.transcript[0]?.payload).toMatchObject({
+      kind: "tool_call",
+      name: "shell",
+      status: "failed",
+      callId: "call-1",
+      outputPreview: "safe output",
+      errorPreview: "SECRET_TOOL_ERROR token=tool-error",
+    });
+    expect(model.transcript[1]?.payload).toMatchObject({
+      activitySource: "stream",
+      inputTokens: 7,
+      tokenConfigured: true,
+      secret: "SECRET_JSON_PAYLOAD",
+    });
+  });
+
   it("clears connection-scoped history and selections on activity scope reset", () => {
     const model = createInitialDashboardState();
     model.globalActivity = [activityItem("a")];

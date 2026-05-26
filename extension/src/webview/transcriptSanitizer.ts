@@ -1,4 +1,5 @@
 const REDACTED = "[redacted]";
+const MAX_SANITIZE_DEPTH = 8;
 const TOKEN_PREFIX_PATTERN = /\b(?:ghp_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,})\b/g;
 const SENSITIVE_NORMALIZED_KEYS = new Set([
   "apikey",
@@ -27,6 +28,20 @@ export function sanitizeTranscriptPreview(value: string): string {
       (match: string, prefix: string, quotedLabel: string | undefined, bareLabel: string | undefined) =>
         isSensitiveKey(quotedLabel ?? bareLabel ?? "") ? `${prefix}"${REDACTED}"` : match,
     );
+}
+
+export function sanitizeTranscriptPayload(value: unknown, depth = 0): unknown {
+  if (value === undefined || value === null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") return sanitizeTranscriptPreview(value);
+  if (typeof value !== "object") return sanitizeTranscriptPreview(String(value));
+  if (depth >= MAX_SANITIZE_DEPTH) return sanitizeTranscriptPreview(JSON.stringify(value));
+  if (Array.isArray(value)) return value.map((item) => sanitizeTranscriptPayload(item, depth + 1));
+
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    output[key] = isSensitiveKey(key) ? REDACTED : sanitizeTranscriptPayload(item, depth + 1);
+  }
+  return output;
 }
 
 function normalizeSensitiveLabel(value: string): string {

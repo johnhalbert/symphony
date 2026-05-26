@@ -790,6 +790,177 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("serves redacted run errors across public status surfaces without mutating persisted runs", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.upsertWorkspace({
+      workspaceKey: "TEST-RUN-ERROR",
+      issueId: "issue-run-error",
+      issueIdentifier: "TEST-RUN-ERROR",
+      path: path.join(config.workspace.root, "TEST-RUN-ERROR"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/TEST-RUN-ERROR",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-error-secret",
+      sessionId: "session-error-secret",
+      agentId: "agent-error-secret",
+      role: "worker",
+      issueId: "issue-run-error",
+      issueIdentifier: "TEST-RUN-ERROR",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-RUN-ERROR",
+      workspacePath: path.join(config.workspace.root, "TEST-RUN-ERROR"),
+      gitBranchName: "symphony/TEST-RUN-ERROR",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+    });
+    const rawError =
+      "failed SECRET_RUN_ERROR token=run-token access_token=run-access Bearer run-bearer ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7";
+    const rawCancelFailure = "cancel SECRET_CANCEL_FAILURE token=cancel-token client_secret: cancel-client";
+    await runStore.updateRun("run-error-secret", {
+      status: "cancelled",
+      completedAt: "2026-01-01T00:05:00.000Z",
+      error: rawError,
+      metadata: {
+        cancelFailed: true,
+        cancelFailedAt: "2026-01-01T00:05:01.000Z",
+        cancelFailedReason: rawCancelFailure,
+        cancelFailedSource: "cancel_ignored",
+      },
+    });
+    const tracker = new FakeTracker([
+      issue({
+        id: "issue-run-error",
+        identifier: "TEST-RUN-ERROR",
+        title: "Run error redaction",
+        state: "In Progress",
+      }),
+    ]);
+    const metaPath = path.join(config.workspace.stateDir, "runs", "run-error-secret", "meta.json");
+    const beforeRead = await readFile(metaPath, "utf8");
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([], { paused: ["TEST-RUN-ERROR"] }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      tracker,
+      trackerStateLists: testTrackerStateLists(),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const responses = await Promise.all([
+        fetch(`${baseUrl}/api/v1/runs/run-error-secret`),
+        fetch(`${baseUrl}/api/v1/issues/TEST-RUN-ERROR`),
+        fetch(`${baseUrl}/api/v1/issues/TEST-RUN-ERROR/runs`),
+        fetch(`${baseUrl}/api/v1/board`),
+        fetch(`${baseUrl}/api/v1/issue-board`),
+        fetch(`${baseUrl}/api/v1/board/issues/issue-run-error`),
+        fetch(`${baseUrl}/api/v1/state`),
+      ]);
+      const [runBody, issueBody, issueRunsBody, boardBody, issueBoardBody, boardDetailBody, stateBody] = await Promise.all(
+        responses.map(async (response) => {
+          expect(response.status).toBe(200);
+          return response.json() as Promise<Record<string, unknown>>;
+        }),
+      );
+      const responseText = JSON.stringify({ runBody, issueBody, issueRunsBody, boardBody, issueBoardBody, boardDetailBody, stateBody });
+
+      for (const raw of [
+        "SECRET_RUN_ERROR",
+        "run-token",
+        "run-access",
+        "run-bearer",
+        "ghp_ABCDEFGH1",
+        "sk-ABCDEFGH1",
+        "SECRET_CANCEL_FAILURE",
+        "cancel-token",
+        "cancel-client",
+      ]) {
+        expect(responseText).not.toContain(raw);
+      }
+      expect(responseText).toContain("failed");
+      expect(responseText).toContain("cancel");
+      expect(responseText).toContain("inputTokens");
+      expect(responseText).toContain("[redacted]");
+
+      const runRecord = runBody as {
+        error: string | null;
+        cancelFailedReason: string | null;
+        operatorLiveness: {
+          lastMessage: string | null;
+          cancelFailed: { reason: string | null };
+          timeline: Array<{ kind: string; detail: string | null }>;
+        };
+      };
+      expect(runRecord.error).toContain("[redacted]");
+      expect(runRecord.cancelFailedReason).toContain("[redacted]");
+      expect(runRecord.operatorLiveness.lastMessage).toContain("[redacted]");
+      expect(runRecord.operatorLiveness.cancelFailed.reason).toContain("[redacted]");
+      expect(runRecord.operatorLiveness.timeline.find((item) => item.kind === "run_terminal")?.detail).toContain("[redacted]");
+      expect(runRecord.operatorLiveness.timeline.find((item) => item.kind === "cancel_failed")?.detail).toContain("[redacted]");
+
+      const issue = issueBody as {
+        latestRun: { error: string | null };
+        issueDetails: IssueDetailsEnvelope;
+        operatorLiveness: typeof runRecord.operatorLiveness;
+      };
+      expect(issue.latestRun.error).toBe(runRecord.error);
+      expect(issue.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(issue.operatorLiveness.lastMessage).toBe(runRecord.operatorLiveness.lastMessage);
+
+      const issueRuns = issueRunsBody as {
+        issueDetails: IssueDetailsEnvelope;
+        runs: Array<{ runId: string; error: string | null; operatorLiveness: typeof runRecord.operatorLiveness }>;
+      };
+      const issueRun = issueRuns.runs.find((run) => run.runId === "run-error-secret");
+      expect(issueRuns.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(issueRun?.error).toBe(runRecord.error);
+      expect(issueRun?.operatorLiveness.lastMessage).toBe(runRecord.operatorLiveness.lastMessage);
+
+      const board = boardBody as { issues: Array<{ issueIdentifier: string | null; issueDetails: IssueDetailsEnvelope }> };
+      const issueBoard = issueBoardBody as { issues: Array<{ issueIdentifier: string | null; issueDetails: IssueDetailsEnvelope }> };
+      expect(board.issues.find((item) => item.issueIdentifier === "TEST-RUN-ERROR")?.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(issueBoard.issues.find((item) => item.issueIdentifier === "TEST-RUN-ERROR")?.issueDetails.latestRun.error).toBe(runRecord.error);
+
+      const boardDetail = boardDetailBody as {
+        latestRun: { error: string | null };
+        issueDetails: IssueDetailsEnvelope;
+        boardCard: { issueDetails: IssueDetailsEnvelope } | null;
+        runs: Array<{ runId: string; error: string | null; operatorLiveness: typeof runRecord.operatorLiveness }>;
+        operatorLiveness: typeof runRecord.operatorLiveness;
+      };
+      expect(boardDetail.latestRun.error).toBe(runRecord.error);
+      expect(boardDetail.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(boardDetail.boardCard?.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(boardDetail.runs.find((run) => run.runId === "run-error-secret")?.error).toBe(runRecord.error);
+      expect(boardDetail.operatorLiveness.lastMessage).toBe(runRecord.operatorLiveness.lastMessage);
+
+      const state = stateBody as { operatorView: { paused: Array<{ issueDetails: IssueDetailsEnvelope }> } };
+      expect(state.operatorView.paused.find((item) => item.issueDetails.issue.identifier === "TEST-RUN-ERROR")?.issueDetails.latestRun.error).toBe(
+        runRecord.error,
+      );
+      expect(await readFile(metaPath, "utf8")).toBe(beforeRead);
+      expect(beforeRead).toContain(rawError);
+      expect(beforeRead).toContain(rawCancelFailure);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves redacted cursor-derived transcript rows without backfilling counts during GET", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);

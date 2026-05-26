@@ -12,7 +12,7 @@ import type {
 import type { ConnectionState } from "../connectionState";
 import { applyExtensionMessage, createInitialDashboardState, type DashboardState } from "../webviewModel";
 import type { ExtensionMessage } from "../webviewMessages";
-import { sanitizeTranscriptPreview } from "./transcriptSanitizer";
+import { sanitizeTranscriptPayload, sanitizeTranscriptPreview } from "./transcriptSanitizer";
 
 declare global {
   interface Window {
@@ -357,7 +357,7 @@ function renderTranscriptEvent(event: TranscriptEvent): string {
 
 function renderTranscriptPayload(event: TranscriptEvent): string {
   if (event.payload === undefined) return missingPayloadNote(event.eventType);
-  if (!isSummaryPayload(event.payload)) return `<pre>${escapeHtml(sanitizeTranscriptPreview(previewJson(event.payload)))}</pre>`;
+  if (!isSummaryPayload(event.payload)) return `<pre>${escapeHtml(previewJson(sanitizeTranscriptPayload(event.payload)))}</pre>`;
   const rows = summaryRows(event.payload);
   return `<dl class="summary transcript-summary">${rows.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(sanitizeTranscriptPreview(String(value)))}</dd>`).join("")}</dl>`;
 }
@@ -412,9 +412,19 @@ function renderSection(title: string, body: string): string {
 function rows(values: Array<[string, unknown]>): string {
   const rendered = values
     .filter(([, value]) => value !== null && value !== undefined && value !== "")
-    .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value))}</dd>`)
+    .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(renderRowValue(label, value))}</dd>`)
     .join("");
   return rendered ? `<dl>${rendered}</dl>` : `<p class="meta">No data available.</p>`;
+}
+
+function renderRowValue(label: string, value: unknown): string {
+  const text = String(value);
+  return shouldSanitizeRowValue(label) ? sanitizeTranscriptPreview(text) : text;
+}
+
+function shouldSanitizeRowValue(label: string): boolean {
+  const normalized = label.trim().toLowerCase();
+  return normalized === "error" || normalized === "last message" || normalized === "detail" || normalized.endsWith("failed reason");
 }
 
 function objectRows(record: JsonObject, keys: string[]): string {
