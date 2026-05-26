@@ -2,8 +2,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { ServiceConfig } from "../src/core/config/Config.js";
+import {
+  issueBreakdownConfigFingerprint,
+  issueContentFingerprint,
+} from "../src/core/IssueBreakdownPlanService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import type { IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
+import type { IssueBreakdownCreatedIssueRef, IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
@@ -11,7 +16,14 @@ import type {
   TrackerWriteResult,
   TrackerWriter,
 } from "../src/core/tracker/TrackerWriter.js";
-import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
+import type { Issue } from "../src/core/types.js";
+import type { IssueBreakdownFreshnessGuard } from "../src/core/writeback/WritebackOutbox.js";
+import {
+  FileWritebackOutboxStore,
+  ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+  WritebackProcessor,
+} from "../src/core/writeback/WritebackOutbox.js";
+import { issue, testConfig } from "./helpers.js";
 
 describe("FileWritebackOutboxStore", () => {
   let root: string;
@@ -262,9 +274,21 @@ describe("FileWritebackOutboxStore", () => {
   it("processes issue creation writebacks and persists child issue evidence", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
     const operationKey = "issue-create:issue-1:plan-1:0:hash";
-    const lifecycleStore = { get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey] }) };
-    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000, lifecycleStore);
+    const lifecycleStore = {
+      get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey], issue: parentIssue, config }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(parentIssue, config),
+    );
 
     const result = await processor.enqueueAndProcess({
       idempotencyKey: operationKey,
@@ -297,7 +321,9 @@ describe("FileWritebackOutboxStore", () => {
   it("skips issue breakdown writebacks that are not bound to the current plan", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
-    const lifecycleStore = { get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [] }) };
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const lifecycleStore = { get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [], issue: parentIssue, config }) };
     const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000, lifecycleStore);
 
     const result = await processor.enqueueAndProcess({
@@ -320,6 +346,105 @@ describe("FileWritebackOutboxStore", () => {
     });
 
     expect(result.status).toBe("skipped");
+    expect(writer.issueCreates).toEqual([]);
+  });
+
+  it("skips issue breakdown writebacks that are no longer fresh", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const originalIssue = issue({ identifier: "ENG-1", labels: ["planning"], title: "Original title", updatedAt: "2026-01-01T00:00:00.000Z" });
+    const driftedIssue = { ...originalIssue, title: "Changed title", updatedAt: "2026-01-02T00:00:00.000Z" };
+    const operationKey = "issue-create:issue-1:plan-1:0:hash";
+    const lifecycleStore = {
+      get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey], issue: originalIssue, config }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(driftedIssue, config),
+    );
+
+    const result = await processor.enqueueAndProcess(issueCreateOperation(operationKey));
+
+    expect(result.status).toBe("skipped");
+    expect(result.lastError).toBe(ISSUE_BREAKDOWN_PLAN_STALE_REASON);
+    expect(writer.issueCreates).toEqual([]);
+  });
+
+  it("skips issue breakdown writebacks when issue-breakdown config changes", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const acceptedConfig = testConfig(root);
+    const currentConfig = testConfig(root);
+    currentConfig.issueBreakdown.planningLabels = ["changed-planning-label"];
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const operationKey = "issue-create:issue-1:plan-1:0:hash";
+    const lifecycleStore = {
+      get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey], issue: parentIssue, config: acceptedConfig }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(parentIssue, currentConfig),
+    );
+
+    const result = await processor.enqueueAndProcess(issueCreateOperation(operationKey));
+
+    expect(result.status).toBe("skipped");
+    expect(result.lastError).toBe(ISSUE_BREAKDOWN_PLAN_STALE_REASON);
+    expect(writer.issueCreates).toEqual([]);
+  });
+
+  it("retries issue breakdown writebacks when freshness lookup is transient", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const operationKey = "issue-create:issue-1:plan-1:0:hash";
+    const lifecycleStore = {
+      get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey], issue: parentIssue, config }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      { getConfig: () => config, resolveIssue: async () => ({ status: "transient_error", message: "temporary outage" }) },
+    );
+
+    const result = await processor.enqueueAndProcess(issueCreateOperation(operationKey));
+
+    expect(result.status).toBe("retrying");
+    expect(result.lastError).toContain("temporary outage");
+    expect(writer.issueCreates).toEqual([]);
+  });
+
+  it("fails closed for issue breakdown writebacks without a freshness guard", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const operationKey = "issue-create:issue-1:plan-1:0:hash";
+    const lifecycleStore = {
+      get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey], issue: parentIssue, config }),
+    };
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000, lifecycleStore);
+
+    const result = await processor.enqueueAndProcess(issueCreateOperation(operationKey));
+
+    expect(result.status).toBe("skipped");
+    expect(result.lastError).toContain("freshness guard");
     expect(writer.issueCreates).toEqual([]);
   });
 });
@@ -452,7 +577,13 @@ function lifecycleWithReports(overrides: { lastCompletionReportId: string; compl
   };
 }
 
-function lifecycleWithIssueBreakdownPlan(overrides: { operationKeys: string[] }): IssueLifecycleRecord {
+function lifecycleWithIssueBreakdownPlan(overrides: {
+  operationKeys: string[];
+  issue: Issue;
+  config: ServiceConfig;
+  applicationStatus?: IssueLifecycleRecord["issueBreakdownPlans"][number]["applicationStatus"];
+  createdIssueRefs?: IssueBreakdownCreatedIssueRef[];
+}): IssueLifecycleRecord {
   const lifecycle = lifecycleWithReports({ lastCompletionReportId: "report-1", completionReports: [] });
   return {
     ...lifecycle,
@@ -479,17 +610,45 @@ function lifecycleWithIssueBreakdownPlan(overrides: { operationKeys: string[] })
         ],
         transcriptPointers: [],
         statusApiPointers: [],
-        issueUpdatedAt: "2026-01-01T00:00:00.000Z",
-        issueContentFingerprint: "fingerprint",
-        configFingerprint: "config",
+        issueUpdatedAt: overrides.issue.updatedAt,
+        issueContentFingerprint: issueContentFingerprint(overrides.issue),
+        configFingerprint: issueBreakdownConfigFingerprint(overrides.config),
         cursorMode: "plan",
         acceptedAt: "2026-01-01T00:00:00.000Z",
-        applicationStatus: "pending",
+        applicationStatus: overrides.applicationStatus ?? "pending",
         applicationOperationKeys: overrides.operationKeys,
-        createdIssueRefs: [],
+        createdIssueRefs: overrides.createdIssueRefs ?? [],
         appliedAt: null,
         applicationBlockedReason: null,
       },
     ],
+  };
+}
+
+function freshnessGuard(parentIssue: Issue, config: ServiceConfig): IssueBreakdownFreshnessGuard {
+  return {
+    getConfig: () => config,
+    resolveIssue: async () => ({ status: "ok", issue: parentIssue }),
+  };
+}
+
+function issueCreateOperation(idempotencyKey: string) {
+  return {
+    idempotencyKey,
+    kind: "issue_create" as const,
+    issueId: "issue-1",
+    runId: "run-plan-1",
+    payload: {
+      parentIssueId: "issue-1",
+      title: "Child issue",
+      description: "Description",
+      acceptanceCriteria: ["Done"],
+      requestedLabels: ["planning"],
+      dependencies: [],
+      dedupeKey: "issue-breakdown:plan-1:0:hash",
+      payloadHash: "hash",
+      planId: "plan-1",
+      proposedIssueIndex: 0,
+    },
   };
 }

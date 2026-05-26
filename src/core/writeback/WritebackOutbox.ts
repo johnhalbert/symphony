@@ -1,8 +1,11 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
+import type { ServiceConfig } from "../config/Config.js";
+import { latestFreshIssueBreakdownPlan } from "../IssueBreakdownPlanService.js";
 import type { IssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import type { TrackerWriteEvidence, TrackerWriteResult, TrackerWriter } from "../tracker/TrackerWriter.js";
+import type { Issue } from "../types.js";
 import { errorMessage } from "../errors.js";
 
 export type WritebackStatus = "pending" | "in_flight" | "succeeded" | "skipped" | "retrying" | "dead_letter";
@@ -111,6 +114,23 @@ export type NewWritebackOperation =
   | Omit<Extract<WritebackOperation, { kind: "comment" }>, PersistedWritebackFields>
   | Omit<Extract<WritebackOperation, { kind: "issue_create" }>, PersistedWritebackFields>
   | Omit<Extract<WritebackOperation, { kind: "issue_relation" }>, PersistedWritebackFields>;
+
+export const ISSUE_BREAKDOWN_PLAN_STALE_REASON = "issue breakdown plan is no longer fresh";
+
+export type IssueBreakdownIssueLookupResult =
+  | { status: "ok"; issue: Issue }
+  | { status: "not_found" }
+  | { status: "transient_error"; message: string };
+
+export type IssueBreakdownFreshnessGuard = {
+  getConfig: () => ServiceConfig;
+  resolveIssue: (issueId: string) => Promise<IssueBreakdownIssueLookupResult>;
+};
+
+type LifecycleGuardResult =
+  | { status: "ready" }
+  | { status: "blocked"; message: string }
+  | { status: "retry"; message: string };
 
 export class FileWritebackOutboxStore {
   constructor(private readonly stateDir: string) {}
@@ -238,6 +258,7 @@ export class WritebackProcessor {
     private readonly maxBackoffMs: number,
     private readonly lifecycleStore?: Pick<IssueLifecycleStore, "get">,
     private readonly dryRun = false,
+    private readonly issueBreakdownFreshnessGuard?: IssueBreakdownFreshnessGuard,
   ) {}
 
   async enqueueAndProcess(operation: NewWritebackOperation, options: { retrySkipped?: boolean } = {}): Promise<WritebackOperation> {
@@ -256,6 +277,11 @@ export class WritebackProcessor {
         const guard = await this.verifyLifecycleBoundOperation(record);
         if (guard.status === "blocked") {
           await this.store.markSkipped(record, guard.message);
+          continue;
+        }
+        if (guard.status === "retry") {
+          const nextAttemptAt = new Date(Date.now() + computeWritebackBackoffMs(record.attempt + 1, this.maxBackoffMs)).toISOString();
+          await this.store.markRetry(record, guard.message, nextAttemptAt);
           continue;
         }
         const result = await this.execute(record);
@@ -278,7 +304,7 @@ export class WritebackProcessor {
     }
   }
 
-  private async verifyLifecycleBoundOperation(record: WritebackOperation): Promise<{ status: "ready" } | { status: "blocked"; message: string }> {
+  private async verifyLifecycleBoundOperation(record: WritebackOperation): Promise<LifecycleGuardResult> {
     const issueBreakdownPlanId = issueBreakdownPlanIdForOperation(record);
     if (issueBreakdownPlanId) {
       if (!this.lifecycleStore) return { status: "blocked", message: "issue breakdown writeback requires lifecycle guard" };
@@ -287,11 +313,29 @@ export class WritebackProcessor {
       if (!lifecycle || !plan || lifecycle.lastIssueBreakdownPlanId !== issueBreakdownPlanId) {
         return { status: "blocked", message: "issue breakdown writeback is not bound to the current plan" };
       }
-      if (plan.applicationStatus === "stale" || !plan.applicationOperationKeys.includes(record.idempotencyKey)) {
+      if (plan.applicationStatus === "stale") {
+        return { status: "blocked", message: ISSUE_BREAKDOWN_PLAN_STALE_REASON };
+      }
+      if (!plan.applicationOperationKeys.includes(record.idempotencyKey)) {
         return { status: "blocked", message: "issue breakdown writeback is not registered on the current plan" };
       }
       if ((record.kind === "comment" || record.kind === "issue_relation") && plan.createdIssueRefs.length < plan.proposedIssues.length) {
         return { status: "blocked", message: "issue breakdown relation/comment writeback requires durable child refs" };
+      }
+      if (!this.issueBreakdownFreshnessGuard) {
+        return { status: "blocked", message: "issue breakdown writeback requires freshness guard" };
+      }
+      const config = this.issueBreakdownFreshnessGuard.getConfig();
+      const lookup = await this.issueBreakdownFreshnessGuard.resolveIssue(record.issueId);
+      if (lookup.status === "transient_error") {
+        return { status: "retry", message: `issue breakdown freshness lookup failed: ${lookup.message}` };
+      }
+      if (lookup.status === "not_found") {
+        return { status: "blocked", message: ISSUE_BREAKDOWN_PLAN_STALE_REASON };
+      }
+      const freshPlan = latestFreshIssueBreakdownPlan(lifecycle, lookup.issue, config);
+      if (freshPlan?.id !== issueBreakdownPlanId) {
+        return { status: "blocked", message: ISSUE_BREAKDOWN_PLAN_STALE_REASON };
       }
       return { status: "ready" };
     }

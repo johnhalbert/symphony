@@ -2,8 +2,9 @@ import type { Logger } from "../core/logging/StructuredLogger.js";
 import type { AgentRunRole, TrackerStateLists } from "../core/types.js";
 import type { ServiceConfig } from "../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../core/config/CredentialProfiles.js";
-import { SymphonyError } from "../core/errors.js";
+import { SymphonyError, errorMessage } from "../core/errors.js";
 import { FileIssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
+import type { IssueBreakdownIssueLookupResult } from "../core/writeback/WritebackOutbox.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../core/writeback/WritebackOutbox.js";
 import { createLinearTrackerClientForCapability } from "../integrations/linear/LinearCredentialResolver.js";
 
@@ -14,10 +15,12 @@ export function createRuntimeTrackerClient(config: ServiceConfig, fetchImpl?: Fe
 }
 
 export function createRuntimeWritebackProcessor(
-  config: ServiceConfig,
+  configOrGetter: ServiceConfig | (() => ServiceConfig),
   logger: Logger,
   fetchImpl?: FetchLike,
 ): WritebackProcessor | undefined {
+  const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
+  const config = getConfig();
   if (!config.writeback.enabled) return undefined;
   return new WritebackProcessor(
     new FileWritebackOutboxStore(config.workspace.stateDir),
@@ -26,7 +29,25 @@ export function createRuntimeWritebackProcessor(
     config.writeback.maxBackoffMs,
     new FileIssueLifecycleStore(config.workspace.stateDir),
     config.writeback.mode === "dry_run",
+    {
+      getConfig,
+      resolveIssue: (issueId) => resolveIssueForBreakdownFreshness(issueId, getConfig, fetchImpl),
+    },
   );
+}
+
+export async function resolveIssueForBreakdownFreshness(
+  issueId: string,
+  getConfig: () => ServiceConfig,
+  fetchImpl?: FetchLike,
+): Promise<IssueBreakdownIssueLookupResult> {
+  try {
+    const tracker = createRuntimeTrackerClient(getConfig(), fetchImpl);
+    const issue = (await tracker.fetchIssueStatesByIds([issueId]))[0];
+    return issue ? { status: "ok", issue } : { status: "not_found" };
+  } catch (error) {
+    return { status: "transient_error", message: errorMessage(error) };
+  }
 }
 
 export function resolveCursorRuntimeApiKey(config: ServiceConfig, role: AgentRunRole): string | null {

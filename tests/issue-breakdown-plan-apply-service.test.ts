@@ -3,7 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import { IssueBreakdownPlanApplyService } from "../src/core/IssueBreakdownPlanApplyService.js";
+import {
+  IssueBreakdownPlanApplyService,
+  planIssueBreakdownApplicationWritebacks,
+} from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService } from "../src/core/IssueBreakdownPlanService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import type {
@@ -16,6 +19,9 @@ import type {
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import type { WritebackOperation, WritebackProcessor as WritebackProcessorType } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
+import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "../src/core/writeback/WritebackOutbox.js";
+import type { Issue } from "../src/core/types.js";
+import type { ServiceConfig } from "../src/core/config/Config.js";
 import { issue, testConfig } from "./helpers.js";
 
 describe("IssueBreakdownPlanApplyService", () => {
@@ -171,7 +177,15 @@ describe("IssueBreakdownPlanApplyService", () => {
     const store = new FileWritebackOutboxStore(config.workspace.stateDir);
     const logger = new StructuredLogger(() => undefined);
     const dryRunWriter = new FakeWriter();
-    const dryRunProcessor = new WritebackProcessor(store, dryRunWriter, logger, 300_000, lifecycleStore, true);
+    const dryRunProcessor = new WritebackProcessor(
+      store,
+      dryRunWriter,
+      logger,
+      300_000,
+      lifecycleStore,
+      true,
+      freshnessGuard(candidate, config),
+    );
     const dryResult = await new IssueBreakdownPlanApplyService({
       config,
       lifecycleStore,
@@ -194,7 +208,15 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(dryRunWriter.issueCreates).toHaveLength(0);
 
     const writer = new FakeWriter();
-    const liveProcessor = new WritebackProcessor(store, writer, logger, 300_000, lifecycleStore, false);
+    const liveProcessor = new WritebackProcessor(
+      store,
+      writer,
+      logger,
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(candidate, config),
+    );
     const liveResult = await new IssueBreakdownPlanApplyService({
       config,
       lifecycleStore,
@@ -218,6 +240,72 @@ describe("IssueBreakdownPlanApplyService", () => {
       id: "child-1",
       identifier: "TEST-2",
       status: "created",
+    });
+  });
+
+  it("does not mutate lifecycle when previewing a drifted pending plan", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], title: "Original title", updatedAt: "2026-01-02T00:00:00Z" });
+    const plan = await submitSingleChildPlan(config, lifecycleStore, candidate);
+    const operation = planIssueBreakdownApplicationWritebacks(candidate, plan)[0]!;
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans: [{ ...plan, applicationStatus: "pending", applicationOperationKeys: [operation.idempotencyKey] }],
+      lastIssueBreakdownPlanId: plan.id,
+    });
+    const before = await lifecycleStore.get(candidate.id);
+    const drifted = { ...candidate, title: "Changed title", updatedAt: "2026-01-03T00:00:00Z" };
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore }).previewLatestFreshPlan(drifted);
+    const after = await lifecycleStore.get(candidate.id);
+
+    expect(result.status).toBe("no_fresh_plan");
+    expect(after?.issueBreakdownPlans[0]?.applicationStatus).toBe("pending");
+    expect(after?.issueBreakdownPlans[0]?.applicationBlockedReason).toBeNull();
+    expect(after?.issueBreakdownPlans[0]).toEqual(before?.issueBreakdownPlans[0]);
+  });
+
+  it("blocks stale pending outbox work after parent drift without tracker writes", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], title: "Original title", updatedAt: "2026-01-02T00:00:00Z" });
+    const plan = await submitSingleChildPlan(config, lifecycleStore, candidate);
+    const operation = planIssueBreakdownApplicationWritebacks(candidate, plan)[0]!;
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans: [{ ...plan, applicationStatus: "pending", applicationOperationKeys: [operation.idempotencyKey] }],
+      lastIssueBreakdownPlanId: plan.id,
+    });
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    await store.enqueueOnce(operation);
+    const drifted = { ...candidate, title: "Changed title", updatedAt: "2026-01-03T00:00:00Z" };
+
+    const applyResult = await new IssueBreakdownPlanApplyService({ config, lifecycleStore }).applyLatestFreshPlan(drifted);
+    const writer = new FakeWriter();
+    await new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(drifted, config),
+    ).processDue();
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    const records = await store.list();
+
+    expect(applyResult.status).toBe("no_fresh_plan");
+    expect(writer.issueCreates).toEqual([]);
+    expect(writer.comments).toEqual([]);
+    expect(records[0]).toMatchObject({ status: "skipped", lastError: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
+    expect(lifecycle?.issueBreakdownPlans[0]).toMatchObject({
+      applicationStatus: "stale",
+      applicationBlockedReason: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+      applicationOperationKeys: [operation.idempotencyKey],
+      createdIssueRefs: [],
     });
   });
 });
@@ -294,4 +382,33 @@ class FakeWriter implements TrackerWriter {
       },
     };
   }
+}
+
+async function submitSingleChildPlan(config: ServiceConfig, lifecycleStore: FileIssueLifecycleStore, candidate: Issue) {
+  const result = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
+    {
+      runId: "run-plan-1",
+      issueId: candidate.id,
+      summary: "Split into child issues.",
+      proposedIssues: [
+        {
+          title: "Build child",
+          description: "Implement the child issue.",
+          acceptanceCriteria: ["Done"],
+          dependencies: [],
+          labels: ["planning"],
+        },
+      ],
+      idempotencyKey: "plan-1",
+    },
+    { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
+  );
+  return result.plan;
+}
+
+function freshnessGuard(parentIssue: Issue, config: ServiceConfig) {
+  return {
+    getConfig: () => config,
+    resolveIssue: async () => ({ status: "ok" as const, issue: parentIssue }),
+  };
 }

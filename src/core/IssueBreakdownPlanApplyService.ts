@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto";
 import type { ServiceConfig } from "./config/Config.js";
-import { latestFreshIssueBreakdownPlan } from "./IssueBreakdownPlanService.js";
+import { isFreshIssueBreakdownPlan, latestFreshIssueBreakdownPlan } from "./IssueBreakdownPlanService.js";
 import type {
   IssueBreakdownCreatedIssueRef,
   IssueBreakdownPlanRecord,
+  IssueLifecycleRecord,
   IssueLifecycleStore,
 } from "./persistence/IssueLifecycleStore.js";
 import type { Issue } from "./types.js";
 import type { NewWritebackOperation, WritebackOperation, WritebackProcessor } from "./writeback/WritebackOutbox.js";
+import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "./writeback/WritebackOutbox.js";
 
 export type IssueBreakdownPlanApplyResult =
   | { status: "not_required"; reason: string }
@@ -39,7 +41,12 @@ export class IssueBreakdownPlanApplyService {
     }
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
     const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.options.config);
-    if (!plan) return { status: "no_fresh_plan", reason: "no_fresh_plan" };
+    if (!plan) {
+      if (options.dryRun !== true) {
+        await this.markStaleDriftedPlans(issue, lifecycle);
+      }
+      return { status: "no_fresh_plan", reason: "no_fresh_plan" };
+    }
     if (plan.applicationStatus === "applied") return { status: "applied", plan, operations: [] };
     const childOperations = planIssueBreakdownApplicationWritebacks(issue, plan);
     const dependencyValidation = validatePlanDependencies(plan);
@@ -164,6 +171,18 @@ export class IssueBreakdownPlanApplyService {
       lastIssueBreakdownPlanId: lifecycle?.lastIssueBreakdownPlanId ?? plan.id,
     });
     return updatedPlan;
+  }
+
+  private async markStaleDriftedPlans(issue: Issue, lifecycle: IssueLifecycleRecord | null): Promise<void> {
+    if (!lifecycle) return;
+    for (const plan of lifecycle.issueBreakdownPlans) {
+      if (plan.applicationStatus !== "pending" && plan.applicationStatus !== "blocked") continue;
+      if (isFreshIssueBreakdownPlan(plan, issue, this.options.config)) continue;
+      await this.updatePlan(issue, plan, {
+        applicationStatus: "stale",
+        applicationBlockedReason: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+      });
+    }
   }
 }
 
