@@ -172,6 +172,21 @@ export class MergePolicyService {
       });
     } else if (existingGateVerdict && decision.kind === "failure") {
       if (isSameMergeGateBlocker(activeLifecycle, decision.gate)) {
+        const refreshedMergeGate = refreshActiveMergeGateObservation(activeLifecycle, decision.gate, existingGateVerdict.writebackOperationKeys);
+        if (refreshedMergeGate) {
+          const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
+            phase: activeLifecycle.phase,
+            blockedReason: refreshedMergeGate.status === "blocked" ? activeLifecycle.blockedReason : null,
+            lastReviewVerdictId: refreshedMergeGate.id,
+            mergeGate: refreshedMergeGate,
+            summaryPointers: { ciStatus: "failure" },
+          });
+          const gate = updated.mergeGate ?? refreshedMergeGate;
+          return {
+            status: gate.status === "blocked" ? "blocked" : "repair_dispatched",
+            gate: gateStatusFromState(gate),
+          };
+        }
         return {
           status: activeLifecycle.mergeGate?.status === "blocked" ? "blocked" : "repair_dispatched",
           gate: { ...decision.gate, writebackOperationKeys: activeLifecycle.mergeGate?.writebackOperationKeys ?? existingGateVerdict.writebackOperationKeys },
@@ -180,6 +195,21 @@ export class MergePolicyService {
       return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, existingGateVerdict);
     }
     if (decision.kind === "pending") {
+      const refreshedMergeGate = refreshActiveMergeGateObservation(activeLifecycle, decision.gate, existingGateVerdict?.writebackOperationKeys ?? []);
+      if (refreshedMergeGate) {
+        const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
+          phase: activeLifecycle.phase,
+          blockedReason: refreshedMergeGate.status === "blocked" ? activeLifecycle.blockedReason : null,
+          lastReviewVerdictId: refreshedMergeGate.id,
+          mergeGate: refreshedMergeGate,
+          summaryPointers: { ciStatus: "failure" },
+        });
+        const gate = updated.mergeGate ?? refreshedMergeGate;
+        return {
+          status: gate.status === "blocked" ? "blocked" : "repair_dispatched",
+          gate: gateStatusFromState(gate),
+        };
+      }
       const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
         phase: activeLifecycle.phase,
         blockedReason: null,
@@ -704,6 +734,41 @@ function isSameMergeGateBlocker(lifecycle: IssueLifecycleRecord, gate: MergeGate
     current.blockerFingerprint === gate.blockerFingerprint &&
     lifecycle.lastReviewVerdictId === gate.id
   );
+}
+
+function refreshActiveMergeGateObservation(
+  lifecycle: IssueLifecycleRecord,
+  gate: MergeGateStatus,
+  fallbackWritebackOperationKeys: string[],
+): IssueMergeGateState | null {
+  const current = lifecycle.mergeGate ?? null;
+  if (
+    current === null ||
+    current.id !== gate.id ||
+    current.headSha !== gate.headSha ||
+    (current.status !== "repair_dispatched" && current.status !== "blocked")
+  ) {
+    return null;
+  }
+  const writebackOperationKeys =
+    current.writebackOperationKeys.length > 0 ? current.writebackOperationKeys : fallbackWritebackOperationKeys;
+  return {
+    ...current,
+    pullRequest: gate.pullRequest,
+    requiredChecks: gate.requiredChecks,
+    checks: gate.checks.map((check) => ({
+      name: check.name,
+      outcome: check.outcome,
+      rawStatus: check.rawStatus,
+      conclusion: check.conclusion,
+      url: check.url,
+      firstObservedAt: check.firstObservedAt,
+      actionableSince: check.actionableSince,
+    })),
+    blockerFingerprint: current.blockerFingerprint ?? gate.blockerFingerprint,
+    writebackOperationKeys,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function mergeGateStateFromStatus(
