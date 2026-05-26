@@ -2,6 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { StatusServer } from "../src/app/http.js";
+import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import {
   CompletionReportService,
   PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
@@ -52,11 +54,12 @@ import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import {
   FileWritebackOutboxStore,
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+  ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
   WritebackProcessor,
 } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
-import type { Issue, TokenCounts } from "../src/core/types.js";
+import type { Issue, TokenCounts, TrackerStateLists } from "../src/core/types.js";
 import { issue, testConfig } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
@@ -268,9 +271,14 @@ describe("Orchestrator", () => {
     for (const key of fixture.replayOperationKeys) {
       await expect(fixture.outboxStore.get(key)).resolves.toMatchObject({
         status: "skipped",
-        lastError: "issue breakdown writeback is not bound to the current plan",
+        lastError: ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
+        resultMessage: ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
       });
     }
+    await expectStartupReplayActivitySkipReasons(fixture, {
+      code: "issue_breakdown_plan_not_current",
+      message: "Issue breakdown writeback is not bound to the current plan.",
+    });
     expect(fixture.writer.issueCreates).toEqual([]);
     expect(fixture.writer.issueRelations).toEqual([]);
     expect(fixture.writer.comments).toEqual([]);
@@ -290,8 +298,13 @@ describe("Orchestrator", () => {
       await expect(fixture.outboxStore.get(key)).resolves.toMatchObject({
         status: "skipped",
         lastError: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+        resultMessage: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
       });
     }
+    await expectStartupReplayActivitySkipReasons(fixture, {
+      code: "issue_breakdown_plan_stale",
+      message: "Issue breakdown plan is no longer fresh.",
+    });
     expect(fixture.writer.issueCreates).toEqual([]);
     expect(fixture.writer.issueRelations).toEqual([]);
     expect(fixture.writer.comments).toEqual([]);
@@ -5160,6 +5173,7 @@ async function createIssueBreakdownStartupFixture(
   workspaceRoot: string,
   options: { scenario: StartupReplayScenario },
 ): Promise<{
+  config: ReturnType<typeof testConfig>;
   orchestrator: Orchestrator;
   outboxStore: FileWritebackOutboxStore;
   lifecycleStore: FileIssueLifecycleStore;
@@ -5225,6 +5239,7 @@ async function createIssueBreakdownStartupFixture(
   });
 
   return {
+    config,
     orchestrator,
     outboxStore,
     lifecycleStore,
@@ -5233,6 +5248,82 @@ async function createIssueBreakdownStartupFixture(
     supersededPlan: seeded.plan,
     currentPlan: seeded.currentPlan,
     replayOperationKeys: seeded.replayOperationKeys,
+  };
+}
+
+type StartupReplayActivityFixture = Awaited<ReturnType<typeof createIssueBreakdownStartupFixture>>;
+
+async function expectStartupReplayActivitySkipReasons(
+  fixture: StartupReplayActivityFixture,
+  expectedSkipReason: {
+    code: "issue_breakdown_plan_not_current" | "issue_breakdown_plan_stale";
+    message: string;
+  },
+): Promise<void> {
+  const activity = await fetchActivityForIssue(fixture);
+  const expectedKinds = ["issue_create", "issue_relation", "comment"];
+  for (const [index, key] of fixture.replayOperationKeys.entries()) {
+    const item = activity.find((candidate) => candidate.id === `writeback:${key}`);
+    expect(item).toMatchObject({
+      kind: "writeback_operation",
+      writeback: {
+        operationKind: expectedKinds[index],
+        status: "skipped",
+        skipReason: expectedSkipReason,
+      },
+    });
+    expect(item?.writeback).not.toHaveProperty("lastError");
+    expect(item?.writeback).not.toHaveProperty("resultMessage");
+  }
+}
+
+async function fetchActivityForIssue(fixture: StartupReplayActivityFixture): Promise<ActivityWritebackItem[]> {
+  const logger = new StructuredLogger(() => undefined);
+  const server = new StatusServer({
+    orchestrator: fixture.orchestrator,
+    workspaceManager: new WorkspaceManager({ workspace: fixture.config.workspace, hooks: fixture.config.hooks, logger }),
+    workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: fixture.config.workspace.root, openerCommand: null }),
+    lifecycleStore: fixture.lifecycleStore,
+    writebackOutbox: fixture.outboxStore,
+    host: "127.0.0.1",
+    port: 0,
+    openWorkspaceToken: null,
+    trackerStateLists: testTrackerStateLists(),
+    staleThresholdMs: 300_000,
+  });
+  const address = await server.start();
+  try {
+    const response = await fetch(
+      `http://${address.host}:${address.port}/api/v1/activity?issue=${encodeURIComponent(fixture.parentIssue.identifier)}&limit=100`,
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { activity: ActivityWritebackItem[] };
+    return body.activity;
+  } finally {
+    await server.stop();
+  }
+}
+
+type ActivityWritebackItem = {
+  id: string;
+  kind: string;
+  writeback: null | {
+    operationKind: string;
+    status: string;
+    skipReason: {
+      code: "issue_breakdown_plan_not_current" | "issue_breakdown_plan_stale";
+      message: string;
+    } | null;
+  };
+};
+
+function testTrackerStateLists(): TrackerStateLists {
+  return {
+    activeStates: ["Todo", "In Progress"],
+    handoffStates: ["Human Review"],
+    reviewStates: ["In Review"],
+    blockedStates: ["Blocked"],
+    terminalStates: ["Done", "Canceled"],
   };
 }
 

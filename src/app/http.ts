@@ -35,7 +35,13 @@ import {
   type TranscriptEvent,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
-import type { FileWritebackOutboxStore, WritebackOperation } from "../core/writeback/WritebackOutbox.js";
+import {
+  ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+  ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
+  issueBreakdownPlanIdForOperation,
+  type FileWritebackOutboxStore,
+  type WritebackOperation,
+} from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import type {
   IssueBlockerRef,
@@ -938,6 +944,7 @@ interface ActivityItem {
   writeback: {
     operationKind: WritebackOperation["kind"];
     status: WritebackOperation["status"];
+    skipReason: WritebackSkipReason | null;
     attempt: number;
     createdAt: string;
     updatedAt: string;
@@ -951,6 +958,11 @@ interface ActivityItem {
     transcript: string | null;
   };
 }
+
+type WritebackSkipReason = {
+  code: "issue_breakdown_plan_not_current" | "issue_breakdown_plan_stale";
+  message: string;
+};
 
 interface IssueBoardCard {
   key: string;
@@ -1288,6 +1300,7 @@ function activityItemForWritebackOperation(
     writeback: {
       operationKind: operation.kind,
       status: operation.status,
+      skipReason: writebackSkipReason(operation),
       attempt: operation.attempt,
       createdAt: operation.createdAt,
       updatedAt: operation.updatedAt,
@@ -1314,6 +1327,25 @@ function activityItemForWritebackOperation(
       transcript: null,
     },
   };
+}
+
+function writebackSkipReason(operation: WritebackOperation): WritebackSkipReason | null {
+  if (operation.status !== "skipped") return null;
+  if (issueBreakdownPlanIdForOperation(operation) === null) return null;
+  const persistedReason = operation.resultMessage ?? operation.lastError;
+  if (persistedReason === ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON) {
+    return {
+      code: "issue_breakdown_plan_not_current",
+      message: "Issue breakdown writeback is not bound to the current plan.",
+    };
+  }
+  if (persistedReason === ISSUE_BREAKDOWN_PLAN_STALE_REASON) {
+    return {
+      code: "issue_breakdown_plan_stale",
+      message: "Issue breakdown plan is no longer fresh.",
+    };
+  }
+  return null;
 }
 
 function activityIssue(run: RunRecord): ActivityItem["issue"] {

@@ -116,6 +116,7 @@ export type NewWritebackOperation =
   | Omit<Extract<WritebackOperation, { kind: "issue_relation" }>, PersistedWritebackFields>;
 
 export const ISSUE_BREAKDOWN_PLAN_STALE_REASON = "issue breakdown plan is no longer fresh";
+export const ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON = "issue breakdown writeback is not bound to the current plan";
 
 export type IssueBreakdownIssueLookupResult =
   | { status: "ok"; issue: Issue }
@@ -327,7 +328,7 @@ export class WritebackProcessor {
       const lifecycle = await this.lifecycleStore.get(record.issueId);
       const plan = lifecycle?.issueBreakdownPlans.find((candidate) => candidate.id === issueBreakdownPlanId);
       if (!lifecycle || !plan || lifecycle.lastIssueBreakdownPlanId !== issueBreakdownPlanId) {
-        return { status: "blocked", message: "issue breakdown writeback is not bound to the current plan" };
+        return { status: "blocked", message: ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON };
       }
       if (plan.applicationStatus === "stale") {
         return { status: "blocked", message: ISSUE_BREAKDOWN_PLAN_STALE_REASON };

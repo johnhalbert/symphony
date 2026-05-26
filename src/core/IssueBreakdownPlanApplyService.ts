@@ -47,10 +47,11 @@ export class IssueBreakdownPlanApplyService {
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
     const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.options.config);
     if (!plan) {
+      let markedStale = false;
       if (options.dryRun !== true) {
-        await this.markStaleDriftedPlans(issue, lifecycle);
+        markedStale = await this.markStaleDriftedPlans(issue, lifecycle);
       }
-      return { status: "no_fresh_plan", reason: "no_fresh_plan" };
+      return { status: "no_fresh_plan", reason: markedStale ? ISSUE_BREAKDOWN_PLAN_STALE_REASON : "no_fresh_plan" };
     }
     if (plan.applicationStatus === "applied") return { status: "applied", plan, operations: [] };
     const childOperations = planIssueBreakdownApplicationWritebacks(issue, plan);
@@ -178,8 +179,9 @@ export class IssueBreakdownPlanApplyService {
     return updatedPlan;
   }
 
-  private async markStaleDriftedPlans(issue: Issue, lifecycle: IssueLifecycleRecord | null): Promise<void> {
-    if (!lifecycle) return;
+  private async markStaleDriftedPlans(issue: Issue, lifecycle: IssueLifecycleRecord | null): Promise<boolean> {
+    if (!lifecycle) return false;
+    let markedStale = false;
     for (const plan of lifecycle.issueBreakdownPlans) {
       if (plan.applicationStatus !== "pending" && plan.applicationStatus !== "blocked") continue;
       if (isFreshIssueBreakdownPlan(plan, issue, this.options.config)) continue;
@@ -187,7 +189,9 @@ export class IssueBreakdownPlanApplyService {
         applicationStatus: "stale",
         applicationBlockedReason: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
       });
+      markedStale = true;
     }
+    return markedStale;
   }
 }
 

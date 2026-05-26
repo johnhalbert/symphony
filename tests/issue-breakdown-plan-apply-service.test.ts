@@ -302,7 +302,7 @@ describe("IssueBreakdownPlanApplyService", () => {
     const lifecycle = await lifecycleStore.get(candidate.id);
     const records = await store.list();
 
-    expect(applyResult.status).toBe("no_fresh_plan");
+    expect(applyResult).toMatchObject({ status: "no_fresh_plan", reason: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
     expect(writer.issueCreates).toEqual([]);
     expect(writer.comments).toEqual([]);
     expect(records[0]).toMatchObject({ status: "skipped", lastError: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
