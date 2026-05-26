@@ -133,6 +133,7 @@ export class MergePolicyService {
         phase: "passed",
         blockedReason: null,
         lastReviewVerdictId: approvalVerdict.id,
+        summaryPointers: { ciStatus: "success" },
       });
     } else if (existingGateVerdict && decision.kind === "failure") {
       return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, existingGateVerdict);
@@ -218,7 +219,12 @@ export class MergePolicyService {
     sourceState: string,
     existingVerdict: IssueReviewVerdictRecord | null,
   ): Promise<MergePolicyResult> {
-    const reviewRound = existingVerdict ? lifecycle.reviewRound : lifecycle.reviewRound + 1;
+    const approvalVerdict = latestApprovalPassVerdict(lifecycle);
+    const newRepairCycle =
+      existingVerdict === null ||
+      lifecycle.phase === "passed" ||
+      (approvalVerdict !== null && lifecycle.lastReviewVerdictId === approvalVerdict.id);
+    const reviewRound = newRepairCycle ? lifecycle.reviewRound + 1 : lifecycle.reviewRound;
     const blocked = reviewRound >= this.options.config.reviewLoop.maxReviewRounds;
     const operations = blocked
       ? planMergeGateBlockedWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config)
@@ -229,44 +235,41 @@ export class MergePolicyService {
 
     await this.requireMergeGateWritebacksSucceeded(issue, operations, blocked ? this.options.config.reviewLoop.blockedStates[0] ?? null : this.options.config.writeback.dispatchState);
 
-    const storedVerdict: IssueReviewVerdictRecord =
-      existingVerdict ??
-      {
-        id: gate.id,
-        idempotencyKey: gate.id,
-        runId: report.runId,
-        issueId: issue.id,
-        issueIdentifier: issue.identifier,
-        verdict: "fail",
-        acceptanceResults: [
-          {
-            text: "All configured required checks are passing before gated merge",
-            satisfied: false,
-            evidence: gate.failedChecks.map((check) => `${check.name}: ${check.status}`).join(", "),
-          },
-        ],
-        findings: mergeGateFindings(gate),
-        evidence: mergeGateEvidence(gate),
-        reviewer: MERGE_GATE_REVIEWER,
-        submittedAt: new Date().toISOString(),
-        writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
-      };
+    const operationKeys = operations.map((operation) => operation.idempotencyKey);
+    const storedVerdict: IssueReviewVerdictRecord = {
+      id: gate.id,
+      idempotencyKey: gate.id,
+      runId: report.runId,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      verdict: "fail",
+      acceptanceResults: [
+        {
+          text: "All configured required checks are passing before gated merge",
+          satisfied: false,
+          evidence: gate.failedChecks.map((check) => `${check.name}: ${check.status}`).join(", "),
+        },
+      ],
+      findings: mergeGateFindings(gate),
+      evidence: mergeGateEvidence(gate),
+      reviewer: MERGE_GATE_REVIEWER,
+      submittedAt: new Date().toISOString(),
+      writebackOperationKeys: operationKeys,
+    };
 
-    if (!existingVerdict) {
-      await this.options.lifecycleStore.updateIssue(issue, {
-        phase: blocked ? "blocked" : "implementation",
-        reviewRound,
-        incompleteTurnCount: 0,
-        blockedReason: blocked
-          ? `merge gate required checks failed and max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`
-          : null,
-        lastReviewVerdictId: storedVerdict.id,
-        reviewVerdicts: [...lifecycle.reviewVerdicts, storedVerdict],
-        summaryPointers: { ciStatus: "failure" },
-      });
-    }
+    await this.options.lifecycleStore.updateIssue(issue, {
+      phase: blocked ? "blocked" : "implementation",
+      reviewRound,
+      incompleteTurnCount: 0,
+      blockedReason: blocked
+        ? `merge gate required checks failed and max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`
+        : null,
+      lastReviewVerdictId: storedVerdict.id,
+      reviewVerdicts: upsertMergeGateVerdict(lifecycle.reviewVerdicts, storedVerdict),
+      summaryPointers: { ciStatus: "failure" },
+    });
 
-    const resultGate = { ...gate, writebackOperationKeys: operations.map((operation) => operation.idempotencyKey) };
+    const resultGate = { ...gate, writebackOperationKeys: operationKeys };
     return blocked ? { status: "blocked", gate: resultGate } : { status: "repair_dispatched", gate: resultGate };
   }
 
@@ -410,6 +413,15 @@ function findMergeGateVerdict(lifecycle: IssueLifecycleRecord, gateId: string): 
 
 function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
   return verdict.reviewer === MERGE_GATE_REVIEWER || verdict.id.startsWith("merge-gate:");
+}
+
+function upsertMergeGateVerdict(
+  verdicts: IssueReviewVerdictRecord[],
+  mergeGateVerdict: IssueReviewVerdictRecord,
+): IssueReviewVerdictRecord[] {
+  const result = verdicts.filter((verdict) => verdict.id !== mergeGateVerdict.id || !isMergeGateVerdict(verdict));
+  result.push(mergeGateVerdict);
+  return result;
 }
 
 function validateRunMetadata(

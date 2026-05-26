@@ -579,7 +579,7 @@ export function planMergeGateRepairWritebacks(
   config: ServiceConfig,
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
-  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:repair`;
+  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:repair:r${context.reviewRound}`;
   return [
     mergeGateCommentOperation(
       context,
@@ -607,7 +607,7 @@ export function planMergeGateBlockedWritebacks(
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
   const blockedState = config.reviewLoop.blockedStates[0] ?? null;
-  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:blocked`;
+  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:blocked:r${context.reviewRound}`;
   const operations: NewWritebackOperation[] = [
     mergeGateCommentOperation(
       context,
