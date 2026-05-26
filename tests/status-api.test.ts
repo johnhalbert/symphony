@@ -117,6 +117,47 @@ describe("StatusServer durable API", () => {
           mergeOperationKey: "github-merge:issue-1:7:head-sha-1",
           doneTransitionOperationKey: "transition:issue-1:merge:issue-1:head-sha-1:Done",
         },
+        mergeGate: {
+          id: "merge-gate:issue-1:pr-7:head-sha-1",
+          status: "repair_dispatched",
+          headSha: "head-sha-1",
+          pullRequest: {
+            url: "https://github.com/acme/repo/pull/7",
+            number: 7,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-1",
+          },
+          requiredChecks: ["test", "typecheck"],
+          checks: [
+            {
+              name: "test",
+              outcome: "failing",
+              rawStatus: "failure",
+              conclusion: "failure",
+              url: "https://ci.test/test",
+              firstObservedAt: null,
+              actionableSince: null,
+            },
+            {
+              name: "typecheck",
+              outcome: "missing_actionable",
+              rawStatus: "missing",
+              conclusion: null,
+              url: null,
+              firstObservedAt: "2026-01-01T00:00:01.000Z",
+              actionableSince: "2026-01-01T00:05:01.000Z",
+            },
+          ],
+          reviewRound: 2,
+          gateRunId: "run-1",
+          gateReportId: "completion-report:issue-1:report-1",
+          repairRunId: "repair-run-1",
+          repairReportId: "completion-report:issue-1:repair-1",
+          blockerFingerprint: "head-sha-1:test:failure|typecheck:missing",
+          writebackOperationKeys: ["comment:issue-1:merge-gate"],
+          supersededByHeadSha: null,
+          updatedAt: "2026-01-01T00:05:01.000Z",
+        },
         completionReports: [
           {
             id: "completion-report:issue-1:report-1",
@@ -278,6 +319,7 @@ describe("StatusServer durable API", () => {
       });
       const issueBody = (await issueResponse.json()) as {
         issueDetails: IssueDetailsEnvelope;
+        mergeGate: IssueDetailsEnvelope["mergeGate"];
         latestRun: { runId: string };
         reviewLoop: {
           phase: string | null;
@@ -339,8 +381,22 @@ describe("StatusServer durable API", () => {
         issue: { id: "issue-1", identifier: "TEST-1", state: null, branchName: "symphony/TEST-1" },
         tracker: { generatedAt: null, stale: null, classification: null },
         pullRequest: { url: "https://github.com/acme/repo/pull/7", number: 7 },
+        mergeGate: {
+          active: true,
+          status: "repair_dispatched",
+          headSha: "head-sha-1",
+          repairRound: 2,
+          gateReportId: "completion-report:issue-1:report-1",
+          repairReportId: "completion-report:issue-1:repair-1",
+          actionableCheckNames: ["test", "typecheck"],
+          checks: [
+            { name: "test", outcome: "failing" },
+            { name: "typecheck", outcome: "missing_actionable" },
+          ],
+        },
         latestRun: { runId: "run-1", status: "running", terminalReason: null },
       });
+      expect(issueBody.mergeGate).toMatchObject({ status: "repair_dispatched", actionableCheckNames: ["test", "typecheck"] });
       expect(issueBody.latestRun.runId).toBe("run-1");
       expect(issueBody.reviewLoop).toMatchObject({
         phase: "review",
@@ -389,6 +445,7 @@ describe("StatusServer durable API", () => {
         source: "durable",
         completeness: "partial",
         issue: { id: "issue-1", identifier: "TEST-1", state: null, branchName: "symphony/TEST-1" },
+        mergeGate: { status: "repair_dispatched" },
         latestRun: { runId: "run-1", terminalReason: null },
       });
       expect(runResponse.status).toBe(200);

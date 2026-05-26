@@ -50,6 +50,7 @@ const rawConfigSchema = z
         done_state: z.string().optional(),
         merge_method: z.enum(["merge", "squash", "rebase"]).optional(),
         required_checks: stringArray.optional(),
+        missing_check_stabilization_ms: z.number().int().nonnegative().optional(),
         no_ci: z
           .object({
             allowed: z.boolean().optional(),
@@ -354,6 +355,7 @@ export interface MergePolicyConfig {
   doneState: string;
   mergeMethod: "merge" | "squash" | "rebase";
   requiredChecks: string[];
+  missingCheckStabilizationMs: number;
   noCiAllowed: boolean;
   noCiEvidence: string | null;
 }
@@ -741,6 +743,7 @@ function normalizeMergePolicy(raw: RawWorkflowConfig, reviewPassState: string | 
     doneState: rawPolicy?.done_state ?? "Done",
     mergeMethod: rawPolicy?.merge_method ?? "merge",
     requiredChecks,
+    missingCheckStabilizationMs: rawPolicy?.missing_check_stabilization_ms ?? 60_000,
     noCiAllowed: rawPolicy?.no_ci?.allowed ?? false,
     noCiEvidence,
   };

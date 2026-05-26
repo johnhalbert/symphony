@@ -30,7 +30,7 @@ export interface PullRequestDetails extends PullRequestMetadata {
 
 export interface PullRequestCheckResult {
   name: string;
-  status: "success" | "failure" | "pending" | "missing";
+  status: "success" | "failure" | "pending" | "missing" | "unknown";
   conclusion: string | null;
   url: string | null;
 }
@@ -831,9 +831,10 @@ function normalizeCommitStatus(node: GitHubCommitStatusNode): PullRequestCheckRe
   const name = asString(node.context);
   if (!name) return null;
   const state = asNullableString(node.state);
+  const status = state === "success" ? "success" : state === "pending" ? "pending" : state === "failure" || state === "error" ? "failure" : "unknown";
   return {
     name,
-    status: state === "success" ? "success" : state === "pending" ? "pending" : "failure",
+    status,
     conclusion: state,
     url: asNullableString(node.target_url),
   };
@@ -844,9 +845,17 @@ function normalizeCheckRun(node: GitHubCheckRunNode): PullRequestCheckResult | n
   if (!name) return null;
   const status = asNullableString(node.status);
   const conclusion = asNullableString(node.conclusion);
+  const normalizedStatus =
+    status !== "completed"
+      ? "pending"
+      : conclusion === "success"
+      ? "success"
+      : conclusion === "failure" || conclusion === "cancelled" || conclusion === "timed_out" || conclusion === "action_required"
+      ? "failure"
+      : "unknown";
   return {
     name,
-    status: status === "completed" && conclusion === "success" ? "success" : status === "completed" ? "failure" : "pending",
+    status: normalizedStatus,
     conclusion,
     url: asNullableString(node.html_url),
   };

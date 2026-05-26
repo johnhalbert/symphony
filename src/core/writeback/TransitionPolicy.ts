@@ -67,10 +67,26 @@ export interface MergeGateWritebackContext {
   };
   requiredChecks: string[];
   failedChecks: MergeGateCheckEvidence[];
+  actionableMissingChecks?: MergeGateCheckEvidence[];
   pendingChecks: MergeGateCheckEvidence[];
   missingChecks: MergeGateCheckEvidence[];
+  unknownChecks?: MergeGateCheckEvidence[];
   reviewRound: number;
   maxReviewRounds: number;
+}
+
+export interface MergeGateHeadSupersessionWritebackContext {
+  issue: Issue;
+  gateId: string;
+  fromState: string;
+  pullRequest: {
+    url: string | null;
+    number: number | null;
+    headSha?: string | null;
+    branch?: string | null;
+  };
+  liveHeadSha: string;
+  reportId: string;
 }
 
 export interface CompletionReportWritebackDetails {
@@ -634,6 +650,48 @@ export function planMergeGateBlockedWritebacks(
   return operations;
 }
 
+export function planMergeGateHeadSupersessionWritebacks(
+  context: MergeGateHeadSupersessionWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:head-superseded:${safeKeySegment(context.liveHeadSha)}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Merge Gate",
+          "",
+          "Status: head superseded, implementation rebind required",
+          `Next state: ${config.writeback.dispatchState} (worker queue)`,
+          "",
+          `PR: ${formatPullRequest(context.pullRequest)}`,
+          `Previous PR head SHA: ${context.pullRequest.headSha ?? "n/a"}`,
+          `Live PR head SHA: ${context.liveHeadSha}`,
+          `Anchor report: ${context.reportId}`,
+          "",
+          "Required action:",
+          "Submit a fresh completion report for the live PR head. Normal review and approval are required before Symphony can merge.",
+        ].join("\n"),
+      },
+    },
+    {
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      payload: {
+        fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
+        toState: config.writeback.dispatchState,
+        reason: "Symphony merge gate head superseded",
+      },
+    },
+  ];
+}
+
 export function planRunFailedComment(context: RunWritebackContext, config: ServiceConfig, error: string | null): NewWritebackOperation | null {
   if (!config.writeback.enabled) return null;
   return {
@@ -825,11 +883,17 @@ function mergeGateCommentOperation(
         "Failing checks:",
         ...formatMergeGateChecks(context.failedChecks, "No failing checks recorded."),
         "",
+        "Actionable missing checks:",
+        ...formatMergeGateChecks(context.actionableMissingChecks ?? [], "No actionable missing checks recorded."),
+        "",
         "Pending checks:",
         ...formatMergeGateChecks(context.pendingChecks, "No pending checks recorded."),
         "",
         "Missing checks:",
         ...formatMergeGateChecks(context.missingChecks, "No missing checks recorded."),
+        "",
+        "Unknown checks:",
+        ...formatMergeGateChecks(context.unknownChecks ?? [], "No unknown checks recorded."),
         "",
         "Counts:",
         `- Merge gate repair round: ${formatCount(context.reviewRound, context.maxReviewRounds)}`,

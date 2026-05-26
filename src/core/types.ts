@@ -94,6 +94,46 @@ export interface IssuePullRequestSummary {
   lastPushedAt: string | null;
 }
 
+export type IssueMergeGateViewStatus = "observing" | "repair_dispatched" | "blocked" | "resolved" | "superseded";
+export type IssueMergeGateViewCheckOutcome =
+  | "passing"
+  | "pending"
+  | "missing_observed"
+  | "missing_actionable"
+  | "failing"
+  | "unknown";
+
+export interface IssueMergeGateCheckSummary {
+  name: string;
+  outcome: IssueMergeGateViewCheckOutcome;
+  rawStatus: string;
+  conclusion: string | null;
+  url: string | null;
+  firstObservedAt: string | null;
+  actionableSince: string | null;
+}
+
+export interface IssueMergeGateSummary {
+  active: boolean;
+  id: string | null;
+  status: IssueMergeGateViewStatus | null;
+  headSha: string | null;
+  pullRequest: IssuePullRequestSummary;
+  repairRound: number | null;
+  gateRunId: string | null;
+  gateReportId: string | null;
+  repairRunId: string | null;
+  repairReportId: string | null;
+  checks: IssueMergeGateCheckSummary[];
+  actionableCheckNames: string[];
+  observingCheckNames: string[];
+  blockerFingerprint: string | null;
+  supersededByHeadSha: string | null;
+  awaitingCi: boolean;
+  automationBlocked: boolean;
+  updatedAt: string | null;
+}
+
 export interface IssueLatestRunSummary {
   runId: string | null;
   runPhase: AgentRunPhase | null;
@@ -112,6 +152,7 @@ export interface IssueDetailsEnvelope {
   blockers: IssueBlockerSummary;
   workspace: IssueWorkspaceSummary;
   pullRequest: IssuePullRequestSummary;
+  mergeGate?: IssueMergeGateSummary | null;
   latestRun: IssueLatestRunSummary;
 }
 

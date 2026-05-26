@@ -62,7 +62,7 @@ import {
   PullRequestReviewEvidenceService,
   type PullRequestReviewEvidenceClient,
 } from "../review/PullRequestReviewEvidenceService.js";
-import { formatWorkerReviewVerdictPrompt } from "../ReviewVerdictService.js";
+import { formatWorkerMergeGatePrompt, formatWorkerReviewVerdictPrompt } from "../ReviewVerdictService.js";
 import {
   PlaceholderContinuationSummarizer,
   type ContinuationSummarizer,
@@ -2228,8 +2228,9 @@ export class Orchestrator {
     const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
-    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
-    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), reviewVerdict, reviewEvidence]
+    const mergeGate = await this.loadWorkerMergeGatePrompt(entry);
+    const reviewVerdict = mergeGate === null ? await this.loadWorkerReviewVerdictPrompt(entry) : null;
+    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), mergeGate, reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
   }
@@ -2258,11 +2259,13 @@ export class Orchestrator {
     const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
-    const reviewVerdict = await this.loadWorkerReviewVerdictPrompt(entry);
+    const mergeGate = await this.loadWorkerMergeGatePrompt(entry);
+    const reviewVerdict = mergeGate === null ? await this.loadWorkerReviewVerdictPrompt(entry) : null;
     return [
       continuationBrief,
       reviewHardening,
       handoff,
+      mergeGate,
       reviewVerdict,
       reviewEvidence,
       this.cursorWorkerMcpPrompt(entry),
@@ -2375,6 +2378,11 @@ export class Orchestrator {
   private async loadWorkerReviewVerdictPrompt(entry: RunningEntry): Promise<string | null> {
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
     return lifecycle === undefined || lifecycle === null ? null : formatWorkerReviewVerdictPrompt(lifecycle);
+  }
+
+  private async loadWorkerMergeGatePrompt(entry: RunningEntry): Promise<string | null> {
+    const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+    return lifecycle === undefined || lifecycle === null ? null : formatWorkerMergeGatePrompt(lifecycle);
   }
 
   private async loadIssueBreakdownPlanPrompt(entry: RunningEntry): Promise<string | null> {
@@ -2716,12 +2724,16 @@ function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[
     lifecycle.incompleteTurnCount > 0 ||
     lifecycle.summaryReferences.length > 0 ||
     lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem) ||
+    lifecycle.mergeGate !== null ||
     lifecycle.merge !== null ||
     lifecycle.phase !== "implementation"
   );
 }
 
 function nextWorkerAction(lifecycle: IssueLifecycleRecord): string {
+  if (lifecycle.mergeGate?.status === "repair_dispatched" || lifecycle.mergeGate?.status === "blocked") {
+    return "Repair the Symphony merge-gate checks on the lifecycle-bound PR, validate, and submit a new completion report.";
+  }
   if (lifecycle.handoff.lastReviewerOutput?.verdict === "fail") return "Address the latest reviewer findings, validate, and submit a new completion report.";
   if (lifecycle.incompleteTurnCount > 0) return "Continue the incomplete implementation using the memo and pointers before rediscovering context.";
   if (lifecycle.reviewEvidence.items.some(isActiveReviewEvidenceItem)) {

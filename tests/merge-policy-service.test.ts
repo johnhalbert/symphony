@@ -75,13 +75,14 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.merge?.doneTransitionOperationKey).toBe("transition:issue-1:merge:issue-1:head-sha-1:Done");
   });
 
-  it("fails closed when the live PR head SHA has changed", async () => {
+  it("supersedes a stale PR head and routes the issue back to implementation", async () => {
     const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await seedLifecycle(lifecycleStore, runStore, currentIssue);
     const client = new FakeMergeClient({ headSha: "new-head-sha" });
+    const writer = new MemoryWriter(currentIssue);
     const service = new MergePolicyService({
       config,
       tracker: tracker(currentIssue),
@@ -89,15 +90,32 @@ describe("MergePolicyService", () => {
       runStore,
       writeback: new WritebackProcessor(
         new FileWritebackOutboxStore(config.workspace.stateDir),
-        new MemoryWriter(),
+        writer,
         new StructuredLogger(() => undefined),
         60_000,
       ),
       client,
     });
 
-    await expect(service.reconcileIssue(currentIssue)).rejects.toMatchObject({ code: "invalid_request" });
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("head_superseded");
     expect(client.mergeInput).toBeNull();
+    expect(currentIssue.state).toBe("In Progress");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge", "In Progress"],
+        toState: "In Progress",
+        reason: "Symphony merge gate head superseded",
+      },
+    ]);
+    expect(lifecycle?.phase).toBe("implementation");
+    expect(lifecycle?.lastReviewVerdictId).toBeNull();
+    expect(lifecycle?.mergeGate?.status).toBe("superseded");
+    expect(lifecycle?.mergeGate?.supersededByHeadSha).toBe("new-head-sha");
+    expect(lifecycle?.summaryPointers.ciStatus).toBe("head_superseded");
   });
 
   it("requires live writeback mode before gated merge", async () => {
@@ -332,6 +350,49 @@ describe("MergePolicyService", () => {
     expect(result.status === "checks_pending" ? result.gate.missingChecks.map((check) => check.name) : []).toEqual(["typecheck"]);
     expect(client.mergeInput).toBeNull();
     expect(currentIssue.state).toBe("Ready to Merge");
+    expect((await lifecycleStore.get(currentIssue.id))?.mergeGate).toMatchObject({
+      status: "observing",
+      checks: [{ name: "test", outcome: "passing" }, { name: "typecheck", outcome: "missing_observed" }],
+    });
+  });
+
+  it("dispatches a worker repair when a missing required check stabilizes", async () => {
+    const config = mergeConfig({ requiredChecks: ["test", "typecheck"] });
+    config.mergePolicy.missingCheckStabilizationMs = 0;
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({
+      checkResults: [{ name: "test", status: "success", conclusion: "success", url: "https://ci.test/test" }],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("repair_dispatched");
+    expect(writer.comments[0]?.body).toContain("Actionable missing checks:");
+    expect(writer.comments[0]?.body).toContain("typecheck: missing");
+    expect(currentIssue.state).toBe("In Progress");
+    expect(lifecycle?.mergeGate).toMatchObject({
+      status: "repair_dispatched",
+      checks: [{ name: "test", outcome: "passing" }, { name: "typecheck", outcome: "missing_actionable" }],
+    });
+    expect(lifecycle?.reviewVerdicts.at(-1)?.findings).toEqual(["Required check missing (actionable): typecheck: missing"]);
   });
 
   it("dispatches a worker repair when a required check fails", async () => {

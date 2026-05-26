@@ -9,6 +9,7 @@ import type {
   ReviewVerdictAcceptanceResult,
 } from "./persistence/IssueLifecycleStore.js";
 import { phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
+import { isMergeGateVerdict } from "./merge/MergePolicyService.js";
 import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
@@ -192,6 +193,7 @@ export class ReviewVerdictService {
 export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord): string | null {
   const verdict = latestReviewVerdict(lifecycle);
   if (!verdict || verdict.verdict !== "fail") return null;
+  if (isMergeGateVerdict(verdict)) return null;
   const pointers = lifecycle.summaryPointers;
   const latestReport = latestCompletionReport(lifecycle);
   return [
@@ -225,6 +227,34 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
     "",
     "Evidence:",
     ...verdict.evidence.map((item) => `- ${item}`),
+  ].join("\n");
+}
+
+export function formatWorkerMergeGatePrompt(lifecycle: IssueLifecycleRecord): string | null {
+  const gate = lifecycle.mergeGate;
+  if (!gate || (gate.status !== "repair_dispatched" && gate.status !== "blocked")) return null;
+  const actionable = gate.checks.filter((check) => check.outcome === "failing" || check.outcome === "missing_actionable");
+  const observing = gate.checks.filter((check) => check.outcome === "pending" || check.outcome === "missing_observed" || check.outcome === "unknown");
+  return [
+    "",
+    "## Symphony Merge Gate Repair",
+    "",
+    `Status: ${gate.status}`,
+    `PR: ${formatPullRequest(gate.pullRequest.number, gate.pullRequest.url)}`,
+    `PR head SHA: ${gate.headSha}`,
+    `Branch: ${gate.pullRequest.branch ?? "n/a"}`,
+    `Repair round: ${gate.reviewRound}`,
+    `Gate report: ${gate.gateReportId ?? "n/a"}`,
+    `Repair report: ${gate.repairReportId ?? "n/a"}`,
+    "",
+    "Actionable required checks:",
+    ...formatMergeGatePromptChecks(actionable, "No actionable checks recorded."),
+    "",
+    "Awaiting CI / observation:",
+    ...formatMergeGatePromptChecks(observing, "No pending, missing-observed, or unknown checks recorded."),
+    "",
+    "Required action:",
+    "Fix failing checks or restore missing actionable required checks on the lifecycle-bound PR branch, then submit a completion report. Symphony will re-fetch GitHub checks before clearing this blocker.",
   ].join("\n");
 }
 
@@ -279,6 +309,15 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord) {
 function formatPullRequest(number: number | null, url: string | null): string {
   const parts = [number === null ? null : `#${number}`, url].filter((value): value is string => value !== null);
   return parts.length === 0 ? "n/a" : parts.join(" ");
+}
+
+function formatMergeGatePromptChecks(checks: NonNullable<IssueLifecycleRecord["mergeGate"]>["checks"], fallback: string): string[] {
+  if (checks.length === 0) return [`- ${fallback}`];
+  return checks.map((check) => {
+    const conclusion = check.conclusion === null ? "" : ` / ${check.conclusion}`;
+    const url = check.url === null ? "" : ` (${check.url})`;
+    return `- ${check.name}: ${check.outcome}${conclusion}${url}`;
+  });
 }
 
 function formatAcceptanceGaps(results: ReviewVerdictAcceptanceResult[]): string[] {

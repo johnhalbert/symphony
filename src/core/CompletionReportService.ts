@@ -104,7 +104,7 @@ export interface CompletionReportPullRequestPublisher {
 
 export interface CompletionReportPullRequestCheckResult {
   name: string;
-  status: "success" | "failure" | "pending" | "missing";
+  status: "success" | "failure" | "pending" | "missing" | "unknown";
   conclusion: string | null;
   url: string | null;
 }
@@ -567,7 +567,21 @@ export class CompletionReportService {
       completionReports: upsertCompletionReport(lifecycle.completionReports, storedReport),
       summaryPointers: summaryPointersFor(input.context, pullRequest, input.publication, lifecycle),
     });
-    await appendLaneMemoTelemetry(this.options.runStore, input.context.activeRunId, updatedLifecycle, "completion_report");
+    const repairBoundLifecycle =
+      lifecycle.mergeGate?.status === "repair_dispatched" &&
+      lifecycle.mergeGate.repairReportId === null &&
+      storedReport.pullRequest?.headSha === lifecycle.mergeGate.headSha &&
+      storedReport.pullRequest?.number === lifecycle.mergeGate.pullRequest.number
+        ? await this.options.lifecycleStore.updateIssue(input.context.issue, {
+            mergeGate: {
+              ...lifecycle.mergeGate,
+              repairRunId: lifecycle.mergeGate.repairRunId ?? storedReport.runId,
+              repairReportId: storedReport.id,
+              updatedAt: new Date().toISOString(),
+            },
+          })
+        : updatedLifecycle;
+    await appendLaneMemoTelemetry(this.options.runStore, input.context.activeRunId, repairBoundLifecycle, "completion_report");
 
     return { accepted: true, replayed: false, report: storedReport, writebackOperations: enqueued };
   }

@@ -18,7 +18,9 @@ import type {
   IssueCompletionReportRecord,
   IssueLifecycleRecord,
   IssueLifecycleStore,
+  IssueMergeGateCheckOutcome,
   IssueMergeMetadata,
+  IssueMergeGateState,
   IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import type { RunRecord, RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
@@ -27,6 +29,7 @@ import type { Issue } from "../types.js";
 import {
   planMergeCompletedWritebacks,
   planMergeGateBlockedWritebacks,
+  planMergeGateHeadSupersessionWritebacks,
   planMergeGateRepairWritebacks,
   type MergeGateCheckEvidence,
 } from "../writeback/TransitionPolicy.js";
@@ -47,7 +50,13 @@ export type MergePolicyResult =
   | { status: "already_merged"; merge: IssueMergeMetadata }
   | { status: "checks_pending"; gate: MergeGateStatus }
   | { status: "repair_dispatched"; gate: MergeGateStatus }
-  | { status: "blocked"; gate: MergeGateStatus };
+  | { status: "blocked"; gate: MergeGateStatus }
+  | {
+      status: "head_superseded";
+      previousHeadSha: string;
+      liveHeadSha: string;
+      gate: MergeGateStatus;
+    };
 
 export interface MergeGateStatus {
   id: string;
@@ -56,8 +65,19 @@ export interface MergeGateStatus {
   requiredChecks: string[];
   passedChecks: string[];
   failedChecks: MergeGateCheckEvidence[];
+  actionableMissingChecks: MergeGateCheckEvidence[];
   pendingChecks: MergeGateCheckEvidence[];
   missingChecks: MergeGateCheckEvidence[];
+  unknownChecks: MergeGateCheckEvidence[];
+  checks: Array<
+    MergeGateCheckEvidence & {
+      outcome: IssueMergeGateCheckOutcome;
+      rawStatus: "success" | "failure" | "pending" | "missing" | "unknown";
+      firstObservedAt: string | null;
+      actionableSince: string | null;
+    }
+  >;
+  blockerFingerprint: string | null;
   writebackOperationKeys: string[];
 }
 
@@ -121,24 +141,50 @@ export class MergePolicyService {
     const headSha = requireValue(pullRequest.headSha, "Completion report pull request head SHA is required for gated merge");
     const github = this.options.client ?? createGitHubPullRequestClientForCapability(config, "github.merge");
     const livePullRequest = await github.getPullRequest({ pullRequestNumber: requireNumber(pullRequest.number) });
-    validateLivePullRequestMetadata(livePullRequest, pullRequest, headSha);
+    validateLivePullRequestIdentity(livePullRequest, pullRequest);
+    if (livePullRequest.headSha !== headSha) {
+      return this.handleHeadSupersession(latestIssue, lifecycle, report, pullRequest, headSha, livePullRequest, sourceState);
+    }
 
     const gateId = mergeGateId(latestIssue.id, pullRequest, headSha);
     let activeLifecycle = lifecycle;
     const approvalVerdict = latestApprovalPassVerdict(activeLifecycle);
     const existingGateVerdict = findMergeGateVerdict(activeLifecycle, gateId);
-    const decision = await this.evaluateChecks(github, headSha, pullRequest, gateId);
+    const decision = await this.evaluateChecks(github, headSha, pullRequest, gateId, activeLifecycle);
     if (existingGateVerdict && decision.kind === "passed" && approvalVerdict) {
       activeLifecycle = await this.options.lifecycleStore.updateIssue(latestIssue, {
         phase: "passed",
         blockedReason: null,
         lastReviewVerdictId: approvalVerdict.id,
+        mergeGate:
+          activeLifecycle.mergeGate?.id === gateId
+            ? { ...activeLifecycle.mergeGate, status: "resolved", updatedAt: new Date().toISOString() }
+            : activeLifecycle.mergeGate ?? null,
         summaryPointers: { ciStatus: "success" },
       });
     } else if (existingGateVerdict && decision.kind === "failure") {
+      if (isSameMergeGateBlocker(activeLifecycle, decision.gate)) {
+        return {
+          status: activeLifecycle.mergeGate?.status === "blocked" ? "blocked" : "repair_dispatched",
+          gate: { ...decision.gate, writebackOperationKeys: activeLifecycle.mergeGate?.writebackOperationKeys ?? existingGateVerdict.writebackOperationKeys },
+        };
+      }
       return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, existingGateVerdict);
     }
-    if (decision.kind === "pending") return { status: "checks_pending", gate: decision.gate };
+    if (decision.kind === "pending") {
+      const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
+        phase: activeLifecycle.phase,
+        blockedReason: null,
+        lastReviewVerdictId:
+          existingGateVerdict && approvalVerdict && activeLifecycle.lastReviewVerdictId === existingGateVerdict.id
+            ? approvalVerdict.id
+            : activeLifecycle.lastReviewVerdictId,
+        mergeGate: mergeGateStateFromStatus(decision.gate, "observing", activeLifecycle, null, null),
+        summaryPointers: { ciStatus: "observing" },
+      });
+      activeLifecycle = updated;
+      return { status: "checks_pending", gate: decision.gate };
+    }
 
     const verdict = latestApprovalPassVerdict(activeLifecycle);
     const workerRun = report && this.options.runStore ? await this.options.runStore.getRun(report.runId) : null;
@@ -247,7 +293,7 @@ export class MergePolicyService {
         {
           text: "All configured required checks are passing before gated merge",
           satisfied: false,
-          evidence: gate.failedChecks.map((check) => `${check.name}: ${check.status}`).join(", "),
+          evidence: [...gate.failedChecks, ...gate.actionableMissingChecks].map((check) => `${check.name}: ${check.status}`).join(", "),
         },
       ],
       findings: mergeGateFindings(gate),
@@ -266,6 +312,14 @@ export class MergePolicyService {
         : null,
       lastReviewVerdictId: storedVerdict.id,
       reviewVerdicts: upsertMergeGateVerdict(lifecycle.reviewVerdicts, storedVerdict),
+      mergeGate: mergeGateStateFromStatus(
+        { ...gate, writebackOperationKeys: operationKeys },
+        blocked ? "blocked" : "repair_dispatched",
+        lifecycle,
+        report.runId,
+        report.id,
+        reviewRound,
+      ),
       summaryPointers: { ciStatus: "failure" },
     });
 
@@ -281,10 +335,61 @@ export class MergePolicyService {
       pullRequest: gate.pullRequest,
       requiredChecks: gate.requiredChecks,
       failedChecks: gate.failedChecks,
+      actionableMissingChecks: gate.actionableMissingChecks,
       pendingChecks: gate.pendingChecks,
       missingChecks: gate.missingChecks,
+      unknownChecks: gate.unknownChecks,
       reviewRound,
       maxReviewRounds: this.options.config.reviewLoop.maxReviewRounds,
+    };
+  }
+
+  private async handleHeadSupersession(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    report: IssueCompletionReportRecord,
+    pullRequest: CompletionReportPullRequestRef,
+    previousHeadSha: string,
+    livePullRequest: PullRequestDetails,
+    sourceState: string,
+  ): Promise<MergePolicyResult> {
+    const liveHeadSha = requireValue(livePullRequest.headSha, "Live PR head SHA is required for merge gate supersession");
+    const gateId = mergeGateId(issue.id, pullRequest, previousHeadSha);
+    const gate = lifecycle.mergeGate?.id === gateId ? lifecycle.mergeGate : null;
+    const supersededGate: IssueMergeGateState = gate
+      ? {
+          ...gate,
+          status: "superseded" as const,
+          supersededByHeadSha: liveHeadSha,
+          updatedAt: new Date().toISOString(),
+        }
+      : {
+          ...mergeGateStateFromStatus(
+            emptyGateStatus(gateId, pullRequest, previousHeadSha, this.options.config.mergePolicy.requiredChecks),
+            "superseded",
+            lifecycle,
+            report.runId,
+            report.id,
+          ),
+          supersededByHeadSha: liveHeadSha,
+        };
+    const operations = planMergeGateHeadSupersessionWritebacks(
+      { issue, gateId, fromState: sourceState, pullRequest, liveHeadSha, reportId: report.id },
+      this.options.config,
+    );
+    await this.requireMergeGateWritebacksSucceeded(issue, operations, this.options.config.writeback.dispatchState);
+    await this.options.lifecycleStore.updateIssue(issue, {
+      phase: "implementation",
+      blockedReason: null,
+      lastReviewVerdictId: null,
+      mergeGate: supersededGate,
+      summaryPointers: { ciStatus: "head_superseded" },
+    });
+    return {
+      status: "head_superseded",
+      previousHeadSha,
+      liveHeadSha,
+      gate: gateStatusFromState(supersededGate),
     };
   }
 
@@ -341,6 +446,7 @@ export class MergePolicyService {
     headSha: string,
     pullRequest: CompletionReportPullRequestRef,
     gateId: string,
+    lifecycle: IssueLifecycleRecord,
   ): Promise<MergeGateDecision> {
     const { requiredChecks, noCiAllowed, noCiEvidence } = this.options.config.mergePolicy;
     if (requiredChecks.length === 0) {
@@ -350,41 +456,40 @@ export class MergePolicyService {
       return { kind: "passed", checkStatus: { requiredChecks: [], passedChecks: [], noCiEvidence } };
     }
     const checks = await github.getRequiredCheckResults({ headSha, requiredChecks });
-    const ordered = requiredChecks.map((requiredCheck) => checkEvidence(requiredCheck, checks));
-    const failedChecks = ordered.filter((check) => check.status === "failure");
-    const pendingChecks = ordered.filter((check) => check.status === "pending");
-    const missingChecks = ordered.filter((check) => check.status === "missing");
-    const passedChecks = ordered.filter((check) => check.status === "success").map((check) => check.name);
-    if (failedChecks.length > 0) {
+    const ordered = requiredChecks.map((requiredCheck) =>
+      classifyCheck(requiredCheck, checks, lifecycle.mergeGate ?? null, gateId, this.options.config.mergePolicy.missingCheckStabilizationMs),
+    );
+    const failedChecks = ordered.filter((check) => check.outcome === "failing");
+    const actionableMissingChecks = ordered.filter((check) => check.outcome === "missing_actionable");
+    const pendingChecks = ordered.filter((check) => check.outcome === "pending");
+    const missingChecks = ordered.filter((check) => check.outcome === "missing_observed");
+    const unknownChecks = ordered.filter((check) => check.outcome === "unknown");
+    const passedChecks = ordered.filter((check) => check.outcome === "passing").map((check) => check.name);
+    const baseGate = {
+      id: gateId,
+      pullRequest,
+      headSha,
+      requiredChecks,
+      passedChecks,
+      failedChecks,
+      actionableMissingChecks,
+      pendingChecks,
+      missingChecks,
+      unknownChecks,
+      checks: ordered,
+      blockerFingerprint: blockerFingerprint(headSha, [...failedChecks, ...actionableMissingChecks]),
+      writebackOperationKeys: [],
+    };
+    if (failedChecks.length > 0 || actionableMissingChecks.length > 0) {
       return {
         kind: "failure",
-        gate: {
-          id: gateId,
-          pullRequest,
-          headSha,
-          requiredChecks,
-          passedChecks,
-          failedChecks,
-          pendingChecks,
-          missingChecks,
-          writebackOperationKeys: [],
-        },
+        gate: baseGate,
       };
     }
-    if (pendingChecks.length > 0 || missingChecks.length > 0) {
+    if (pendingChecks.length > 0 || missingChecks.length > 0 || unknownChecks.length > 0) {
       return {
         kind: "pending",
-        gate: {
-          id: gateId,
-          pullRequest,
-          headSha,
-          requiredChecks,
-          passedChecks,
-          failedChecks,
-          pendingChecks,
-          missingChecks,
-          writebackOperationKeys: [],
-        },
+        gate: baseGate,
       };
     }
     return { kind: "passed", checkStatus: { requiredChecks, passedChecks: requiredChecks, noCiEvidence: null } };
@@ -411,7 +516,7 @@ function findMergeGateVerdict(lifecycle: IssueLifecycleRecord, gateId: string): 
   return lifecycle.reviewVerdicts.find((verdict) => verdict.id === gateId && isMergeGateVerdict(verdict)) ?? null;
 }
 
-function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
+export function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
   return verdict.reviewer === MERGE_GATE_REVIEWER || verdict.id.startsWith("merge-gate:");
 }
 
@@ -467,15 +572,10 @@ function hasApprovalFeedback(
   );
 }
 
-function validateLivePullRequestMetadata(
-  livePullRequest: PullRequestDetails,
-  expected: CompletionReportPullRequestRef,
-  expectedHeadSha: string,
-): void {
+function validateLivePullRequestIdentity(livePullRequest: PullRequestDetails, expected: CompletionReportPullRequestRef): void {
   requireMatches("live PR number", livePullRequest.number, expected.number);
   requireMatches("live PR URL", livePullRequest.url, expected.url);
   requireMatches("live PR branch", livePullRequest.headBranch, expected.branch);
-  requireMatches("live PR head SHA", livePullRequest.headSha, expectedHeadSha);
 }
 
 function isOpenPullRequest(livePullRequest: PullRequestDetails): boolean {
@@ -544,8 +644,151 @@ function checkEvidence(requiredCheck: string, checks: PullRequestCheckResult[]):
   };
 }
 
+function classifyCheck(
+  requiredCheck: string,
+  checks: PullRequestCheckResult[],
+  existingGate: IssueMergeGateState | null,
+  gateId: string,
+  stabilizationMs: number,
+): MergeGateStatus["checks"][number] {
+  const raw = checkEvidence(requiredCheck, checks);
+  const existing = existingGate?.id === gateId ? existingGate.checks.find((check) => check.name === requiredCheck) ?? null : null;
+  const now = new Date().toISOString();
+  if (raw.status === "missing") {
+    const firstObservedAt = existing?.rawStatus === "missing" ? existing.firstObservedAt ?? now : now;
+    const elapsedMs = Date.parse(now) - Date.parse(firstObservedAt);
+    const stabilized = Number.isFinite(elapsedMs) && elapsedMs >= stabilizationMs;
+    return {
+      ...raw,
+      rawStatus: "missing",
+      outcome: stabilized ? "missing_actionable" : "missing_observed",
+      firstObservedAt,
+      actionableSince: stabilized ? existing?.actionableSince ?? now : null,
+    };
+  }
+  if (raw.status === "success") {
+    return { ...raw, rawStatus: "success", outcome: "passing", firstObservedAt: null, actionableSince: null };
+  }
+  if (raw.status === "pending") {
+    return { ...raw, rawStatus: "pending", outcome: "pending", firstObservedAt: null, actionableSince: null };
+  }
+  if (raw.status === "unknown") {
+    return { ...raw, rawStatus: "unknown", outcome: "unknown", firstObservedAt: null, actionableSince: null };
+  }
+  return { ...raw, rawStatus: "failure", outcome: "failing", firstObservedAt: null, actionableSince: null };
+}
+
+function blockerFingerprint(headSha: string, blockers: MergeGateCheckEvidence[]): string | null {
+  if (blockers.length === 0) return null;
+  return `${headSha}:${blockers
+    .map((check) => `${check.name}:${check.status}`)
+    .sort()
+    .join("|")}`;
+}
+
+function isSameMergeGateBlocker(lifecycle: IssueLifecycleRecord, gate: MergeGateStatus): boolean {
+  const current = lifecycle.mergeGate ?? null;
+  return (
+    current !== null &&
+    current.id === gate.id &&
+    (current.status === "repair_dispatched" || current.status === "blocked") &&
+    current.blockerFingerprint === gate.blockerFingerprint &&
+    lifecycle.lastReviewVerdictId === gate.id
+  );
+}
+
+function mergeGateStateFromStatus(
+  gate: MergeGateStatus,
+  status: IssueMergeGateState["status"],
+  lifecycle: IssueLifecycleRecord,
+  gateRunId: string | null,
+  gateReportId: string | null,
+  reviewRound = lifecycle.reviewRound,
+): IssueMergeGateState {
+  const previous = lifecycle.mergeGate?.id === gate.id ? lifecycle.mergeGate : null;
+  return {
+    id: gate.id,
+    status,
+    headSha: gate.headSha,
+    pullRequest: gate.pullRequest,
+    requiredChecks: gate.requiredChecks,
+    checks: gate.checks.map((check) => ({
+      name: check.name,
+      outcome: check.outcome,
+      rawStatus: check.rawStatus,
+      conclusion: check.conclusion,
+      url: check.url,
+      firstObservedAt: check.firstObservedAt,
+      actionableSince: check.actionableSince,
+    })),
+    reviewRound,
+    gateRunId: previous?.gateRunId ?? gateRunId,
+    gateReportId: previous?.gateReportId ?? gateReportId,
+    repairRunId: previous?.repairRunId ?? null,
+    repairReportId: previous?.repairReportId ?? null,
+    blockerFingerprint: gate.blockerFingerprint,
+    writebackOperationKeys: gate.writebackOperationKeys,
+    supersededByHeadSha: status === "superseded" ? previous?.supersededByHeadSha ?? null : null,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function gateStatusFromState(state: IssueMergeGateState): MergeGateStatus {
+  const checks = state.checks.map((check) => ({
+    name: check.name,
+    status: check.rawStatus,
+    conclusion: check.conclusion,
+    url: check.url,
+    outcome: check.outcome,
+    rawStatus: check.rawStatus,
+    firstObservedAt: check.firstObservedAt,
+    actionableSince: check.actionableSince,
+  }));
+  return {
+    id: state.id,
+    pullRequest: state.pullRequest,
+    headSha: state.headSha,
+    requiredChecks: state.requiredChecks,
+    passedChecks: checks.filter((check) => check.outcome === "passing").map((check) => check.name),
+    failedChecks: checks.filter((check) => check.outcome === "failing"),
+    actionableMissingChecks: checks.filter((check) => check.outcome === "missing_actionable"),
+    pendingChecks: checks.filter((check) => check.outcome === "pending"),
+    missingChecks: checks.filter((check) => check.outcome === "missing_observed"),
+    unknownChecks: checks.filter((check) => check.outcome === "unknown"),
+    checks,
+    blockerFingerprint: state.blockerFingerprint,
+    writebackOperationKeys: state.writebackOperationKeys,
+  };
+}
+
+function emptyGateStatus(
+  gateId: string,
+  pullRequest: CompletionReportPullRequestRef,
+  headSha: string,
+  requiredChecks: string[],
+): MergeGateStatus {
+  return {
+    id: gateId,
+    pullRequest,
+    headSha,
+    requiredChecks,
+    passedChecks: [],
+    failedChecks: [],
+    actionableMissingChecks: [],
+    pendingChecks: [],
+    missingChecks: [],
+    unknownChecks: [],
+    checks: [],
+    blockerFingerprint: null,
+    writebackOperationKeys: [],
+  };
+}
+
 function mergeGateFindings(gate: MergeGateStatus): string[] {
-  return gate.failedChecks.map((check) => `Required check failed: ${formatCheckEvidence(check)}`);
+  return [
+    ...gate.failedChecks.map((check) => `Required check failed: ${formatCheckEvidence(check)}`),
+    ...gate.actionableMissingChecks.map((check) => `Required check missing (actionable): ${formatCheckEvidence(check)}`),
+  ];
 }
 
 function mergeGateEvidence(gate: MergeGateStatus): string[] {
@@ -553,8 +796,10 @@ function mergeGateEvidence(gate: MergeGateStatus): string[] {
     `PR: ${gate.pullRequest.number === null ? gate.pullRequest.url ?? "n/a" : `#${gate.pullRequest.number}`} (${gate.pullRequest.url ?? "n/a"})`,
     `PR head SHA: ${gate.headSha}`,
     ...gate.failedChecks.map((check) => `Failing check: ${formatCheckEvidence(check)}`),
+    ...gate.actionableMissingChecks.map((check) => `Actionable missing check: ${formatCheckEvidence(check)}`),
     ...gate.pendingChecks.map((check) => `Pending check: ${formatCheckEvidence(check)}`),
     ...gate.missingChecks.map((check) => `Missing check: ${formatCheckEvidence(check)}`),
+    ...gate.unknownChecks.map((check) => `Unknown check: ${formatCheckEvidence(check)}`),
   ];
 }
 

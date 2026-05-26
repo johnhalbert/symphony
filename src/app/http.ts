@@ -41,6 +41,7 @@ import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
   IssueLatestRunSummary,
+  IssueMergeGateSummary,
   IssuePullRequestSummary,
   IssueStateClassification,
   IssueStatusView,
@@ -422,6 +423,7 @@ export class StatusServer {
           latestRun,
           lifecycle,
           reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
+          mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(statusMetadata({ live, workspace, latestRun, lifecycle }))),
           metadata: statusMetadata({ live, workspace, latestRun, lifecycle }),
           operatorLiveness,
           diagnostics: {
@@ -2494,6 +2496,7 @@ function buildIssueDetailsEnvelope(input: {
       blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists, input.lifecycle, issue.state),
       workspace: buildIssueWorkspaceSummary(input, metadata),
       pullRequest: buildIssuePullRequestSummary(metadata),
+      mergeGate: mergeGateStatus(input.lifecycle, buildIssuePullRequestSummary(metadata)),
       latestRun: buildIssueLatestRunSummary(input.summaryRun),
     };
   }
@@ -2506,6 +2509,7 @@ function buildIssueDetailsEnvelope(input: {
     blockers: buildIssueBlockerSummary(null, input.trackerStateLists, input.lifecycle, null),
     workspace: buildIssueWorkspaceSummary(input, metadata),
     pullRequest: buildIssuePullRequestSummary(metadata),
+    mergeGate: mergeGateStatus(input.lifecycle, buildIssuePullRequestSummary(metadata)),
     latestRun: buildIssueLatestRunSummary(input.summaryRun),
   };
 }
@@ -2586,6 +2590,7 @@ function buildIssueBlockerSummary(
 ) {
   const open = (blockedBy ?? []).filter((blocker) => blocker.state === null || !isStateNameIn(blocker.state, stateLists.terminalStates));
   const lifecycleBlocked = isLifecycleBlocked(lifecycle);
+  const mergeGateBlocked = lifecycle?.mergeGate?.status === "repair_dispatched" || lifecycle?.mergeGate?.status === "blocked";
   const stateBlocked = issueState !== null && isStateNameIn(issueState, stateLists.blockedStates);
   const dispatchBlocked =
     issueState !== null &&
@@ -2596,7 +2601,7 @@ function buildIssueBlockerSummary(
     totalCount: blockedBy?.length ?? 0,
     openCount: open.length,
     open,
-    blocked: lifecycleBlocked || stateBlocked || dispatchBlocked,
+    blocked: lifecycleBlocked || mergeGateBlocked || stateBlocked || dispatchBlocked,
     humanBlockedReason: lifecycleBlocked ? (lifecycle?.blockedReason ?? null) : null,
   };
 }
@@ -2634,6 +2639,48 @@ function buildIssuePullRequestSummary(metadata: ReturnType<typeof statusMetadata
     branch: metadata.prBranch ?? null,
     ciStatus: metadata.ciStatus ?? null,
     lastPushedAt: metadata.lastPushedAt ?? null,
+  };
+}
+
+function mergeGateStatus(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  fallbackPullRequest: IssuePullRequestSummary,
+): IssueMergeGateSummary | null {
+  const gate = lifecycle?.mergeGate ?? null;
+  if (!gate) return null;
+  const pullRequest: IssuePullRequestSummary = {
+    url: gate.pullRequest.url ?? fallbackPullRequest.url,
+    number: gate.pullRequest.number ?? fallbackPullRequest.number,
+    headSha: gate.headSha,
+    branch: gate.pullRequest.branch ?? fallbackPullRequest.branch,
+    ciStatus: fallbackPullRequest.ciStatus,
+    lastPushedAt: fallbackPullRequest.lastPushedAt,
+  };
+  const actionableCheckNames = gate.checks
+    .filter((check) => check.outcome === "failing" || check.outcome === "missing_actionable")
+    .map((check) => check.name);
+  const observingCheckNames = gate.checks
+    .filter((check) => check.outcome === "pending" || check.outcome === "missing_observed" || check.outcome === "unknown")
+    .map((check) => check.name);
+  return {
+    active: gate.status !== "resolved" && gate.status !== "superseded",
+    id: gate.id,
+    status: gate.status,
+    headSha: gate.headSha,
+    pullRequest,
+    repairRound: gate.reviewRound,
+    gateRunId: gate.gateRunId,
+    gateReportId: gate.gateReportId,
+    repairRunId: gate.repairRunId,
+    repairReportId: gate.repairReportId,
+    checks: gate.checks.map((check) => ({ ...check })),
+    actionableCheckNames,
+    observingCheckNames,
+    blockerFingerprint: gate.blockerFingerprint,
+    supersededByHeadSha: gate.supersededByHeadSha,
+    awaitingCi: gate.status === "observing",
+    automationBlocked: gate.status === "repair_dispatched" || gate.status === "blocked",
+    updatedAt: gate.updatedAt,
   };
 }
 
@@ -2887,9 +2934,16 @@ function latestReviewVerdict(lifecycle: IssueLifecycleRecord | null): IssueRevie
   if (!lifecycle) return null;
   if (lifecycle.lastReviewVerdictId) {
     const exact = lifecycle.reviewVerdicts.find((verdict) => verdict.id === lifecycle.lastReviewVerdictId);
-    if (exact) return exact;
+    if (exact && !isMergeGateVerdict(exact)) return exact;
   }
-  return lifecycle.reviewVerdicts[lifecycle.reviewVerdicts.length - 1] ?? null;
+  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
+    if (!isMergeGateVerdict(verdict)) return verdict;
+  }
+  return null;
+}
+
+function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
+  return verdict.reviewer === "symphony-merge-gate" || verdict.id.startsWith("merge-gate:");
 }
 
 function metadataValue<K extends "prUrl" | "prNumber" | "prHeadSha" | "prBranch" | "ciStatus" | "lastPushedAt" | "lastEvidenceCursor">(

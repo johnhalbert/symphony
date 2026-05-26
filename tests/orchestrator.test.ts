@@ -4142,6 +4142,95 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42#discussion_r1");
   });
 
+  it("injects dedicated merge-gate repair context instead of reviewer-fail framing", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "implementation",
+      reviewRound: 1,
+      lastCompletionReportId: report.id,
+      lastReviewVerdictId: "merge-gate:issue-1:pr-42:head-sha-1",
+      completionReports: [report],
+      reviewVerdicts: [
+        {
+          id: "merge-gate:issue-1:pr-42:head-sha-1",
+          idempotencyKey: "merge-gate:issue-1:pr-42:head-sha-1",
+          runId: "worker-run-1",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          verdict: "fail",
+          acceptanceResults: [{ text: "Required checks pass", satisfied: false, evidence: "test failed" }],
+          findings: ["Required check failed: test: failure"],
+          evidence: ["Failing check: test: failure"],
+          reviewer: "symphony-merge-gate",
+          submittedAt: "2026-01-01T00:00:01.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      mergeGate: {
+        id: "merge-gate:issue-1:pr-42:head-sha-1",
+        status: "repair_dispatched",
+        headSha: "head-sha-1",
+        pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+        requiredChecks: ["test"],
+        checks: [
+          {
+            name: "test",
+            outcome: "failing",
+            rawStatus: "failure",
+            conclusion: "failure",
+            url: "https://ci.test/test",
+            firstObservedAt: null,
+            actionableSince: null,
+          },
+        ],
+        reviewRound: 1,
+        gateRunId: "worker-run-1",
+        gateReportId: report.id,
+        repairRunId: null,
+        repairReportId: null,
+        blockerFingerprint: "head-sha-1:test:failure",
+        writebackOperationKeys: [],
+        supersededByHeadSha: null,
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      },
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Repair");
+    expect(harness.runs[0]?.prompt).toContain("test: failing / failure (https://ci.test/test)");
+    expect(harness.runs[0]?.prompt).not.toContain("Reviewer findings to address");
+  });
+
   it("cancels an active issue without retrying it", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
