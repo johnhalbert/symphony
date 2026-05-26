@@ -1,7 +1,6 @@
 declare function acquireVsCodeApi(): { postMessage(message: unknown): void };
 
 import type {
-  ActivityFeedResponse,
   ActivityItem,
   BoardIssueDetailResponse,
   IssueBoardCard,
@@ -9,44 +8,10 @@ import type {
   IssueBoardResponse,
   JsonObject,
   TranscriptEvent,
-  TranscriptPage,
 } from "../statusApiTypes";
-
-type ConnectionState =
-  | { kind: "connected"; baseUrl: string; generatedAt: string; summary: { runningCount: number | null; tokenConfigured: boolean; mutationsRequireToken: boolean | null } }
-  | { kind: "offline"; baseUrl: string; reason: string; detail: string }
-  | { kind: "error"; baseUrl: string; reason: string; detail: string };
-
-type ExtensionMessage =
-  | { type: "connectionState"; state: ConnectionState }
-  | { type: "dashboardLoading" }
-  | { type: "dashboardState"; board: IssueBoardResponse | null; activity: ActivityFeedResponse | null; boardError?: string; activityError?: string; appendActivity?: boolean }
-  | { type: "issueDetailState"; detail: BoardIssueDetailResponse | null; activity: ActivityFeedResponse | null; error?: string; activityError?: string; appendActivity?: boolean }
-  | { type: "runState"; run: JsonObject | null; transcript: TranscriptPage | null; error?: string; appendTranscript?: boolean }
-  | { type: "operationResult"; level: "info" | "error"; message: string };
-
-interface DashboardState {
-  connection: ConnectionState | null;
-  activeTab: "issues" | "history";
-  board: IssueBoardResponse | null;
-  boardLoading: boolean;
-  boardError: string | null;
-  globalActivity: ActivityItem[];
-  globalActivityNextOffset: number | null;
-  activityError: string | null;
-  selectedIssueKey: string | null;
-  issueDetail: BoardIssueDetailResponse | null;
-  issueActivity: ActivityItem[];
-  issueActivityNextOffset: number | null;
-  issueError: string | null;
-  issueActivityError: string | null;
-  selectedRunId: string | null;
-  runDetail: JsonObject | null;
-  transcript: TranscriptEvent[];
-  transcriptNextOffset: number | null;
-  runError: string | null;
-  operationMessage: { level: "info" | "error"; message: string } | null;
-}
+import type { ConnectionState } from "../connectionState";
+import { applyExtensionMessage, createInitialDashboardState, type DashboardState } from "../webviewModel";
+import type { ExtensionMessage } from "../webviewMessages";
 
 declare global {
   interface Window {
@@ -56,28 +21,7 @@ declare global {
 
 const vscode = acquireVsCodeApi();
 const root = document.getElementById("root");
-const model: DashboardState = {
-  connection: window.__SYMPHONY_INITIAL_STATE__ ?? null,
-  activeTab: "issues",
-  board: null,
-  boardLoading: false,
-  boardError: null,
-  globalActivity: [],
-  globalActivityNextOffset: null,
-  activityError: null,
-  selectedIssueKey: null,
-  issueDetail: null,
-  issueActivity: [],
-  issueActivityNextOffset: null,
-  issueError: null,
-  issueActivityError: null,
-  selectedRunId: null,
-  runDetail: null,
-  transcript: [],
-  transcriptNextOffset: null,
-  runError: null,
-  operationMessage: null,
-};
+const model: DashboardState = createInitialDashboardState(window.__SYMPHONY_INITIAL_STATE__ ?? null);
 
 window.addEventListener("message", (event: MessageEvent<ExtensionMessage>) => {
   applyMessage(event.data);
@@ -87,52 +31,7 @@ window.addEventListener("message", (event: MessageEvent<ExtensionMessage>) => {
 render();
 
 function applyMessage(message: ExtensionMessage): void {
-  switch (message.type) {
-    case "connectionState":
-      model.connection = message.state;
-      return;
-    case "dashboardLoading":
-      model.boardLoading = true;
-      model.boardError = null;
-      model.activityError = null;
-      return;
-    case "dashboardState":
-      model.boardLoading = false;
-      if (message.board) model.board = message.board;
-      if (message.activity) {
-        model.globalActivity = message.appendActivity ? [...model.globalActivity, ...message.activity.activity] : message.activity.activity;
-        model.globalActivityNextOffset = message.activity.nextOffset;
-      }
-      model.boardError = message.boardError ?? (message.board ? null : model.boardError);
-      model.activityError = message.activityError ?? (message.activity ? null : model.activityError);
-      return;
-    case "issueDetailState":
-      if (message.detail) {
-        model.issueDetail = message.detail;
-        model.issueError = null;
-      }
-      if (message.activity) {
-        model.issueActivity = message.appendActivity ? [...model.issueActivity, ...message.activity.activity] : message.activity.activity;
-        model.issueActivityNextOffset = message.activity.nextOffset;
-      }
-      model.issueError = message.error ?? model.issueError;
-      model.issueActivityError = message.activityError ?? (message.activity ? null : model.issueActivityError);
-      return;
-    case "runState":
-      if (message.run) {
-        model.runDetail = message.run;
-        model.runError = null;
-      }
-      if (message.transcript) {
-        model.transcript = message.appendTranscript ? [...model.transcript, ...message.transcript.events] : message.transcript.events;
-        model.transcriptNextOffset = message.transcript.nextOffset;
-      }
-      model.runError = message.error ?? model.runError;
-      return;
-    case "operationResult":
-      model.operationMessage = { level: message.level, message: message.message };
-      return;
-  }
+  applyExtensionMessage(model, message);
 }
 
 function render(): void {
@@ -207,7 +106,10 @@ function bindActions(): void {
     if (!target) return;
     const action = target.dataset.action;
     if (action === "retry") vscode.postMessage({ type: "retry" });
-    if (action === "refresh") vscode.postMessage({ type: "refresh" });
+    if (action === "refresh") {
+      model.dashboardGeneration += 1;
+      vscode.postMessage({ type: "refresh" });
+    }
     if (action === "settings") vscode.postMessage({ type: "openSettings" });
     if (action === "tab" && (target.dataset.tab === "issues" || target.dataset.tab === "history")) {
       model.activeTab = target.dataset.tab;
@@ -216,8 +118,10 @@ function bindActions(): void {
     if (action === "selectIssue" && target.dataset.issue) {
       model.activeTab = "issues";
       model.selectedIssueKey = target.dataset.issue;
+      model.issueEpoch += 1;
       model.issueDetail = null;
       model.issueActivity = [];
+      model.issueActivityNextOffset = null;
       model.issueError = null;
       model.issueActivityError = null;
       vscode.postMessage({ type: "selectIssue", issueKey: target.dataset.issue });
@@ -232,9 +136,12 @@ function bindActions(): void {
     if (action === "selectRun" && target.dataset.run) {
       model.activeTab = "history";
       model.selectedRunId = target.dataset.run;
+      model.runEpoch += 1;
       model.runDetail = null;
       model.transcript = [];
+      model.transcriptNextOffset = null;
       model.runError = null;
+      model.transcriptError = null;
       vscode.postMessage({ type: "selectRun", runId: target.dataset.run });
       render();
     }
@@ -295,8 +202,8 @@ function renderIssueDetail(state: Extract<ConnectionState, { kind: "connected" }
   if (!model.selectedIssueKey) {
     return `<aside class="detail"><div class="empty">Select an issue to inspect Linear metadata, workspace, PR/CI, latest run, and activity.</div></aside>`;
   }
-  if (model.issueError) return `<aside class="detail"><div class="notice error">${escapeHtml(model.issueError)}</div></aside>`;
   const detail = model.issueDetail;
+  if (model.issueError && !detail) return `<aside class="detail"><div class="notice error">${escapeHtml(model.issueError)}</div></aside>`;
   if (!detail) return `<aside class="detail"><div class="empty">Loading issue detail...</div></aside>`;
   const issue = detail.issueDetails.issue;
   const issueKey = issue.identifier ?? issue.id ?? detail.issue;
@@ -336,7 +243,7 @@ function renderIssueDetail(state: Extract<ConnectionState, { kind: "connected" }
       ["Error", detail.issueDetails.latestRun.error],
     ]))}
     ${renderRuns(detail.runs)}
-    ${renderIssueActivity(issueKey)}
+    ${renderIssueActivity(model.selectedIssueKey ?? issueKey)}
   </aside>`;
 }
 
@@ -416,7 +323,7 @@ function renderRunList(): string {
 
 function renderRunDetail(): string {
   if (!model.selectedRunId) return `<aside class="detail"><div class="empty">Select a run to inspect metadata and transcript history.</div></aside>`;
-  if (model.runError) return `<aside class="detail"><div class="notice error">${escapeHtml(model.runError)}</div></aside>`;
+  if (model.runError && !model.runDetail) return `<aside class="detail"><div class="notice error">${escapeHtml(model.runError)}</div></aside>`;
   return `<aside class="detail">
     <h2>${escapeHtml(model.selectedRunId)}</h2>
     ${model.runDetail ? renderSection("Run Metadata", objectRows(model.runDetail, ["issueIdentifier", "role", "runKind", "runPhase", "status", "startedAt", "updatedAt", "completedAt", "error"])) : `<div class="empty">Loading run...</div>`}
@@ -432,6 +339,7 @@ function renderRunDetail(): string {
 function renderTranscript(): string {
   return `<section class="detail-section">
     <h4>Transcript</h4>
+    ${model.transcriptError ? `<div class="notice error">${escapeHtml(model.transcriptError)}</div>` : ""}
     ${model.transcript.length === 0 ? `<div class="empty">No transcript events loaded.</div>` : `<div class="transcript">${model.transcript.map(renderTranscriptEvent).join("")}</div>`}
     ${model.transcriptNextOffset !== null && model.selectedRunId ? `<button type="button" data-action="loadMoreTranscript" data-run="${escapeAttr(model.selectedRunId)}" data-offset="${model.transcriptNextOffset}">Load more transcript</button>` : ""}
   </section>`;
