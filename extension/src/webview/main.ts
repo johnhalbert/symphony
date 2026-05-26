@@ -12,6 +12,7 @@ import type {
 import type { ConnectionState } from "../connectionState";
 import { applyExtensionMessage, createInitialDashboardState, type DashboardState } from "../webviewModel";
 import type { ExtensionMessage } from "../webviewMessages";
+import { sanitizeTranscriptPreview } from "./transcriptSanitizer";
 
 declare global {
   interface Window {
@@ -385,20 +386,6 @@ function summaryRows(payload: JsonObject & { kind: string }): Array<[string, str
   if (payload.truncated === true) rows.push(["Truncated", "yes"]);
   if (payload.redacted === true) rows.push(["Redacted", "yes"]);
   return rows.filter((row): row is [string, string] => row[1] !== null);
-}
-
-function sanitizeTranscriptPreview(value: string): string {
-  return value
-    .replace(/SECRET_[A-Z0-9_]+/g, "[redacted]")
-    .replace(/\bBearer\s+[^\s"',}]+/gi, "Bearer [redacted]")
-    .replace(
-      /(\b(?:api[_-]?key|apikey|token|secret|password|authorization)\b\s*=\s*)([^\s"',}]+)/gi,
-      "$1[redacted]",
-    )
-    .replace(
-      /((?:"(?:api[_-]?key|apikey|token|secret|password|authorization)"|(?:api[_-]?key|apikey|token|secret|password|authorization))\s*:\s*)("[^"]*"|'[^']*'|[^\s"',}]+)/gi,
-      '$1"[redacted]"',
-    );
 }
 
 function renderActivityList(activity: ActivityItem[]): string {

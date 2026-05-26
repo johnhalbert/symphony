@@ -718,8 +718,20 @@ describe("StatusServer durable API", () => {
       at: "2030-01-01T00:00:00.000Z",
       source: "harness",
       eventType: "progress",
-      message: "raw assistant SECRET_ACTIVITY token=activity-token",
-      payload: { activitySource: "stream", apiKey: "SECRET_API_KEY", detail: "Bearer SECRET_BEARER" },
+      message:
+        "raw assistant SECRET_ACTIVITY token=activity-token access_token=activity-access refreshToken: activity-refresh github_token=activity-github client_secret: activity-client private_key=activity-private ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      payload: {
+        activitySource: "stream",
+        apiKey: "SECRET_API_KEY",
+        detail: "Bearer SECRET_BEARER",
+        access_token: "payload-access",
+        refreshToken: "payload-refresh",
+        github_token: "payload-github",
+        client_secret: "payload-client",
+        private_key: "payload-private",
+        tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+        tokenConfigured: true,
+      },
     });
     const metaPath = path.join(config.workspace.stateDir, "runs", "run-legacy-secret", "meta.json");
     const metadata = JSON.parse(await readFile(metaPath, "utf8")) as { transcriptEventCount?: number };
@@ -756,6 +768,21 @@ describe("StatusServer durable API", () => {
       expect(`${transcriptText}\n${activityText}`).not.toContain("activity-token");
       expect(`${transcriptText}\n${activityText}`).not.toContain("SECRET_API_KEY");
       expect(`${transcriptText}\n${activityText}`).not.toContain("SECRET_BEARER");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-access");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-refresh");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-github");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-client");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-private");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-access");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-refresh");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-github");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-client");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-private");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("ghp_ABCDEFGH1");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("sk-ABCDEFGH1");
+      expect(`${transcriptText}\n${activityText}`).toContain("inputTokens");
+      expect(`${transcriptText}\n${activityText}`).toContain("totalTokens");
+      expect(`${transcriptText}\n${activityText}`).toContain("tokenConfigured");
       expect(`${transcriptText}\n${activityText}`).toContain("[redacted]");
       expect(await readFile(metaPath, "utf8")).toBe(beforeRead);
     } finally {

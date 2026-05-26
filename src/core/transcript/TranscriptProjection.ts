@@ -4,7 +4,20 @@ import type { TranscriptEvent } from "../persistence/RunTranscriptStore.js";
 const DEFAULT_PREVIEW_LENGTH = 500;
 const MAX_JSON_DEPTH = 8;
 const REDACTED = "[redacted]";
-const SENSITIVE_KEY_PATTERN = /^(?:api[_-]?key|apikey|token|secret|password|authorization)$/i;
+const TOKEN_PREFIX_PATTERN = /\b(?:ghp_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,})\b/g;
+const SENSITIVE_NORMALIZED_KEYS = new Set([
+  "apikey",
+  "authorization",
+  "token",
+  "secret",
+  "password",
+  "accesstoken",
+  "refreshtoken",
+  "githubtoken",
+  "clientsecret",
+  "privatekey",
+]);
+const SAFE_NORMALIZED_KEYS = new Set(["tokens", "inputtokens", "outputtokens", "totaltokens", "tokenconfigured"]);
 
 export interface RedactedPreview {
   preview: string | null;
@@ -28,13 +41,15 @@ export function redactTranscriptText(value: string): { text: string; redacted: b
   let text = value;
   text = text.replace(/SECRET_[A-Z0-9_]+/g, REDACTED);
   text = text.replace(/\bBearer\s+[^\s"',}]+/gi, `Bearer ${REDACTED}`);
+  text = text.replace(TOKEN_PREFIX_PATTERN, REDACTED);
   text = text.replace(
-    /(\b(?:api[_-]?key|apikey|token|secret|password|authorization)\b\s*=\s*)([^\s"',}]+)/gi,
-    `$1${REDACTED}`,
+    /(\b([A-Za-z][A-Za-z0-9_-]*)\b\s*=\s*)([^\s"',}]+)/g,
+    (match: string, prefix: string, label: string) => (isSensitiveKey(label) ? `${prefix}${REDACTED}` : match),
   );
   text = text.replace(
-    /((?:"(?:api[_-]?key|apikey|token|secret|password|authorization)"|(?:api[_-]?key|apikey|token|secret|password|authorization))\s*:\s*)("[^"]*"|'[^']*'|[^\s"',}]+)/gi,
-    `$1"${REDACTED}"`,
+    /((?:"([A-Za-z][A-Za-z0-9_-]*)"|([A-Za-z][A-Za-z0-9_-]*))\s*:\s*)("[^"]*"|'[^']*'|[^\s"',}]+)/g,
+    (match: string, prefix: string, quotedLabel: string | undefined, bareLabel: string | undefined) =>
+      isSensitiveKey(quotedLabel ?? bareLabel ?? "") ? `${prefix}"${REDACTED}"` : match,
   );
   return { text, redacted: text !== value };
 }
@@ -49,7 +64,7 @@ export function sanitizePublicJson(value: unknown, maxStringLength = DEFAULT_PRE
 
   const output: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
-    output[key] = SENSITIVE_KEY_PATTERN.test(key) ? REDACTED : sanitizePublicJson(item, maxStringLength, depth + 1);
+    output[key] = isSensitiveKey(key) ? REDACTED : sanitizePublicJson(item, maxStringLength, depth + 1);
   }
   return output;
 }
@@ -89,4 +104,20 @@ function safeJsonPreview(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function normalizeSensitiveLabel(value: string): string {
+  return value.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function isSensitiveKey(key: string): boolean {
+  const normalized = normalizeSensitiveLabel(key);
+  if (SAFE_NORMALIZED_KEYS.has(normalized)) return false;
+  if (SENSITIVE_NORMALIZED_KEYS.has(normalized)) return true;
+  return (
+    (normalized.endsWith("token") && !normalized.endsWith("tokens")) ||
+    normalized.endsWith("secret") ||
+    normalized.endsWith("privatekey") ||
+    normalized.endsWith("apikey")
+  );
 }

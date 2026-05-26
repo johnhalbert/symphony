@@ -157,8 +157,21 @@ describe("FileRunTranscriptStore", () => {
       at: "2026-01-01T00:00:00.000Z",
       source: "harness",
       eventType: "progress",
-      message: "assistant token=SECRET_TOKEN",
-      payload: { token: "SECRET_PAYLOAD", nested: { authorization: "Bearer SECRET_AUTH" } },
+      message:
+        "assistant token=SECRET_TOKEN access_token=legacy-access refreshToken: legacy-refresh github_token=legacy-github client_secret: legacy-client private_key=legacy-private ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      payload: {
+        token: "SECRET_PAYLOAD",
+        nested: {
+          authorization: "Bearer SECRET_AUTH",
+          access_token: "legacy-access-payload",
+          refreshToken: "legacy-refresh-payload",
+          github_token: "legacy-github-payload",
+          client_secret: "legacy-client-payload",
+          private_key: "legacy-private-payload",
+          tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+          tokenConfigured: true,
+        },
+      },
     });
     const metaPath = path.join(root, "runs", "run-legacy", "meta.json");
     const metadata = JSON.parse(await readFile(metaPath, "utf8")) as { transcriptEventCount?: number };
@@ -174,10 +187,32 @@ describe("FileRunTranscriptStore", () => {
     expect(JSON.stringify(page)).not.toContain("SECRET_TOKEN");
     expect(JSON.stringify(page)).not.toContain("SECRET_PAYLOAD");
     expect(JSON.stringify(page)).not.toContain("SECRET_AUTH");
+    expect(JSON.stringify(page)).not.toContain("legacy-access");
+    expect(JSON.stringify(page)).not.toContain("legacy-refresh");
+    expect(JSON.stringify(page)).not.toContain("legacy-github");
+    expect(JSON.stringify(page)).not.toContain("legacy-client");
+    expect(JSON.stringify(page)).not.toContain("legacy-private");
+    expect(JSON.stringify(page)).not.toContain("ghp_ABCDEFGH1");
+    expect(JSON.stringify(page)).not.toContain("sk-ABCDEFGH1");
     expect(page.events[0]).toMatchObject({
-      message: "assistant token=[redacted]",
-      payload: { token: "[redacted]", nested: { authorization: "[redacted]" } },
+      message: expect.stringContaining("token=[redacted]"),
+      payload: {
+        token: "[redacted]",
+        nested: {
+          authorization: "[redacted]",
+          access_token: "[redacted]",
+          refreshToken: "[redacted]",
+          github_token: "[redacted]",
+          client_secret: "[redacted]",
+          private_key: "[redacted]",
+          tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+          tokenConfigured: true,
+        },
+      },
     });
+    expect(page.events[0]?.message).toContain("inputTokens: 7");
+    expect(page.events[0]?.message).toContain("totalTokens: 9");
+    expect(page.events[0]?.message).toContain("tokenConfigured: true");
   });
 
   it("can scope latest issue run lookup by role", async () => {
