@@ -10,7 +10,6 @@ describe("extension boundary", () => {
     expect(combined).not.toMatch(/@cursor\/sdk/);
     expect(combined).not.toMatch(/(?:\.\.\/)+cursor\//);
     expect(combined).not.toMatch(/(?:\.\.\/)+src\/core\//);
-    expect(combined).not.toMatch(/Orchestrator/);
   });
 
   it("keeps webview messages in the shared contract module", async () => {

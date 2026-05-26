@@ -4,6 +4,7 @@ export type ConnectionKind = "connected" | "offline" | "error";
 
 export interface StateSummary {
   runningCount: number | null;
+  retryingCount: number | null;
   tokenConfigured: boolean;
   mutationsRequireToken: boolean | null;
 }
@@ -67,6 +68,7 @@ export function classifyProbeResult(result: ProbeResult, tokenConfigured: boolea
     generatedAt: result.body.generatedAt,
     summary: {
       runningCount: runningCount(result.body),
+      retryingCount: retryingCount(result.body),
       tokenConfigured,
       mutationsRequireToken: mutationsRequireToken(result.body),
     },
@@ -101,10 +103,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function runningCount(body: Record<string, unknown>): number | null {
+  return operatorMetricCount(body, "running");
+}
+
+function retryingCount(body: Record<string, unknown>): number | null {
+  return operatorMetricCount(body, "retrying");
+}
+
+function operatorMetricCount(body: Record<string, unknown>, metric: "running" | "retrying"): number | null {
+  const counts = body.counts;
+  if (isRecord(counts)) {
+    const value = counts[metric];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
   const operatorView = body.operatorView;
   if (!isRecord(operatorView)) return null;
-  const running = operatorView.running;
-  return Array.isArray(running) ? running.length : null;
+  const rows = operatorView[metric];
+  return Array.isArray(rows) ? rows.length : null;
 }
 
 function mutationsRequireToken(body: Record<string, unknown>): boolean | null {

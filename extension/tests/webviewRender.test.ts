@@ -194,6 +194,7 @@ function connectedState(): ConnectionState {
     generatedAt: "2030-01-01T00:00:00.000Z",
     summary: {
       runningCount: 1,
+      retryingCount: 0,
       tokenConfigured: true,
       mutationsRequireToken: false,
     },
