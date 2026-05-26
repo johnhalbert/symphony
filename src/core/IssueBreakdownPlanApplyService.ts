@@ -8,7 +8,12 @@ import type {
   IssueLifecycleStore,
 } from "./persistence/IssueLifecycleStore.js";
 import type { Issue } from "./types.js";
-import type { NewWritebackOperation, WritebackOperation, WritebackProcessor } from "./writeback/WritebackOutbox.js";
+import type {
+  EnqueueWritebackOptions,
+  NewWritebackOperation,
+  WritebackOperation,
+  WritebackProcessor,
+} from "./writeback/WritebackOutbox.js";
 import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "./writeback/WritebackOutbox.js";
 
 export type IssueBreakdownPlanApplyResult =
@@ -78,7 +83,7 @@ export class IssueBreakdownPlanApplyService {
 
     const processed: WritebackOperation[] = [];
     for (const operation of childOperations) {
-      const result = await this.options.writeback.enqueueAndProcess(operation, { retrySkipped: isDryRunReplay(operation, replayPlan) });
+      const result = await this.options.writeback.enqueueAndProcess(operation, issueBreakdownRetryOptions(operation, replayPlan));
       processed.push(result);
       const ref = createdIssueRefFromOperation(result);
       if (ref) {
@@ -115,7 +120,7 @@ export class IssueBreakdownPlanApplyService {
       applicationOperationKeys: mergeOperationKeys(workingPlan.applicationOperationKeys, finalOperations),
     });
     for (const operation of finalOperations) {
-      processed.push(await this.options.writeback.enqueueAndProcess(operation, { retrySkipped: isDryRunReplay(operation, replayPlan) }));
+      processed.push(await this.options.writeback.enqueueAndProcess(operation, issueBreakdownRetryOptions(operation, replayPlan)));
     }
 
     const blocked = processed.find((operation) => operation.status === "skipped" || operation.status === "dead_letter");
@@ -272,11 +277,15 @@ function createdIssueRefFromOperation(operation: WritebackOperation): IssueBreak
   };
 }
 
-function isDryRunReplay(operation: NewWritebackOperation, replayPlan: IssueBreakdownPlanRecord): boolean {
-  return (
-    replayPlan.applicationOperationKeys.includes(operation.idempotencyKey) &&
-    replayPlan.applicationBlockedReason === "Writeback dry_run"
-  );
+function issueBreakdownRetryOptions(
+  operation: NewWritebackOperation,
+  replayPlan: IssueBreakdownPlanRecord,
+): EnqueueWritebackOptions {
+  if (!replayPlan.applicationOperationKeys.includes(operation.idempotencyKey)) return {};
+  return {
+    retrySkipped: true,
+    retrySkippedMessages: [ISSUE_BREAKDOWN_PLAN_STALE_REASON, "Writeback dry_run"],
+  };
 }
 
 function mergeOperationKeys(existing: string[], operations: NewWritebackOperation[]): string[] {

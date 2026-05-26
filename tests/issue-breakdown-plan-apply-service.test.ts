@@ -6,12 +6,15 @@ import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import {
   IssueBreakdownPlanApplyService,
   planIssueBreakdownApplicationWritebacks,
+  planIssueBreakdownFinalizationWritebacks,
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService } from "../src/core/IssueBreakdownPlanService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import type { IssueBreakdownCreatedIssueRef } from "../src/core/persistence/IssueLifecycleStore.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
+  TrackerIssueRelationInput,
   TrackerTransitionInput,
   TrackerWriteResult,
   TrackerWriter,
@@ -23,6 +26,8 @@ import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "../src/core/writeback/Writeba
 import type { Issue } from "../src/core/types.js";
 import type { ServiceConfig } from "../src/core/config/Config.js";
 import { issue, testConfig } from "./helpers.js";
+
+type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 
 describe("IssueBreakdownPlanApplyService", () => {
   let root: string;
@@ -308,6 +313,118 @@ describe("IssueBreakdownPlanApplyService", () => {
       createdIssueRefs: [],
     });
   });
+
+  it("recovers stale-skipped child writebacks on a fresh live apply without duplicating succeeded children", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const plan = await submitTwoChildPlan(config, lifecycleStore, candidate);
+    const childOperations = planIssueBreakdownApplicationWritebacks(candidate, plan) as IssueCreateWriteback[];
+    const firstChild = childOperations[0]!;
+    const secondChild = childOperations[1]!;
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans: [
+        {
+          ...plan,
+          applicationStatus: "pending",
+          applicationOperationKeys: childOperations.map((operation) => operation.idempotencyKey),
+          createdIssueRefs: [createdIssueRef(firstChild)],
+        },
+      ],
+      lastIssueBreakdownPlanId: plan.id,
+    });
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    await store.markSucceeded(await store.enqueueOnce(firstChild), issueCreateResult(firstChild));
+    await store.markSkipped(await store.enqueueOnce(secondChild), ISSUE_BREAKDOWN_PLAN_STALE_REASON);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(candidate, config),
+    );
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback: processor }).applyLatestFreshPlan(
+      candidate,
+    );
+    const records = await store.list();
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(result.status).toBe("applied");
+    expect(writer.issueCreates).toHaveLength(1);
+    expect(writer.issueCreates[0]?.title).toBe("Build dependent child");
+    expect(writer.issueRelations).toHaveLength(1);
+    expect(writer.comments).toHaveLength(1);
+    expect(records.filter((record) => record.kind === "issue_create")).toHaveLength(2);
+    await expect(store.get(firstChild.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
+    await expect(store.get(secondChild.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
+    expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs).toHaveLength(2);
+  });
+
+  it("recovers stale-skipped relation and parent comment writebacks after child refs are durable", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const plan = await submitTwoChildPlan(config, lifecycleStore, candidate);
+    const childOperations = planIssueBreakdownApplicationWritebacks(candidate, plan) as IssueCreateWriteback[];
+    const planWithRefs = {
+      ...plan,
+      createdIssueRefs: childOperations.map((operation) => createdIssueRef(operation)),
+    };
+    const finalOperations = planIssueBreakdownFinalizationWritebacks(candidate, planWithRefs);
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans: [
+        {
+          ...planWithRefs,
+          applicationStatus: "pending",
+          applicationOperationKeys: [
+            ...childOperations.map((operation) => operation.idempotencyKey),
+            ...finalOperations.map((operation) => operation.idempotencyKey),
+          ],
+        },
+      ],
+      lastIssueBreakdownPlanId: plan.id,
+    });
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    for (const operation of childOperations) {
+      await store.markSucceeded(await store.enqueueOnce(operation), issueCreateResult(operation));
+    }
+    for (const operation of finalOperations) {
+      await store.markSkipped(await store.enqueueOnce(operation), ISSUE_BREAKDOWN_PLAN_STALE_REASON);
+    }
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(candidate, config),
+    );
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback: processor }).applyLatestFreshPlan(
+      candidate,
+    );
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(result.status).toBe("applied");
+    expect(writer.issueCreates).toHaveLength(0);
+    expect(writer.issueRelations).toHaveLength(1);
+    expect(writer.comments).toHaveLength(1);
+    for (const operation of finalOperations) {
+      await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
+    }
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
+  });
 });
 
 class CapturingWriteback implements Pick<WritebackProcessorType, "enqueueAndProcess"> {
@@ -356,6 +473,7 @@ class FakeWriter implements TrackerWriter {
   readonly transitions: TrackerTransitionInput[] = [];
   readonly comments: TrackerCommentInput[] = [];
   readonly issueCreates: TrackerIssueCreateInput[] = [];
+  readonly issueRelations: TrackerIssueRelationInput[] = [];
 
   async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
     this.transitions.push(input);
@@ -369,11 +487,12 @@ class FakeWriter implements TrackerWriter {
 
   async createIssueFromPlan(input: TrackerIssueCreateInput): Promise<TrackerWriteResult> {
     this.issueCreates.push(input);
+    const childNumber = (input.proposedIssueIndex ?? this.issueCreates.length - 1) + 1;
     return {
       status: "applied",
       evidence: {
         kind: "issue_create",
-        issue: { id: "child-1", identifier: "TEST-2", url: "https://linear.test/TEST-2" },
+        issue: { id: `child-${childNumber}`, identifier: `TEST-${childNumber + 1}`, url: `https://linear.test/TEST-${childNumber + 1}` },
         issueCreateStatus: "created",
         parentIssueId: input.parentIssueId,
         dedupeKey: input.dedupeKey,
@@ -381,6 +500,11 @@ class FakeWriter implements TrackerWriter {
         unresolvedLabelNames: [],
       },
     };
+  }
+
+  async createIssueRelation(input: TrackerIssueRelationInput): Promise<TrackerWriteResult> {
+    this.issueRelations.push(input);
+    return { status: "applied" };
   }
 }
 
@@ -404,6 +528,63 @@ async function submitSingleChildPlan(config: ServiceConfig, lifecycleStore: File
     { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
   );
   return result.plan;
+}
+
+async function submitTwoChildPlan(config: ServiceConfig, lifecycleStore: FileIssueLifecycleStore, candidate: Issue) {
+  const result = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
+    {
+      runId: "run-plan-1",
+      issueId: candidate.id,
+      summary: "Split into child issues.",
+      proposedIssues: [
+        {
+          title: "Build child",
+          description: "Implement the child issue.",
+          acceptanceCriteria: ["Done"],
+          dependencies: [],
+          labels: ["planning"],
+        },
+        {
+          title: "Build dependent child",
+          description: "Implement the dependent child issue.",
+          acceptanceCriteria: ["Done"],
+          dependencies: ["Build child"],
+          labels: ["planning"],
+        },
+      ],
+      idempotencyKey: "plan-1",
+    },
+    { issue: candidate, activeRunId: "run-plan-1", role: "worker", phase: "issue_breakdown" },
+  );
+  return result.plan;
+}
+
+function createdIssueRef(operation: IssueCreateWriteback): IssueBreakdownCreatedIssueRef {
+  const childNumber = operation.payload.proposedIssueIndex + 1;
+  return {
+    proposedIssueIndex: operation.payload.proposedIssueIndex,
+    operationKey: operation.idempotencyKey,
+    status: "created",
+    id: `child-${childNumber}`,
+    identifier: `TEST-${childNumber + 1}`,
+    url: `https://linear.test/TEST-${childNumber + 1}`,
+  };
+}
+
+function issueCreateResult(operation: IssueCreateWriteback): TrackerWriteResult {
+  const ref = createdIssueRef(operation);
+  return {
+    status: "applied",
+    evidence: {
+      kind: "issue_create",
+      issue: { id: ref.id, identifier: ref.identifier, url: ref.url },
+      issueCreateStatus: ref.status,
+      parentIssueId: operation.payload.parentIssueId,
+      dedupeKey: operation.payload.dedupeKey,
+      payloadHash: operation.payload.payloadHash,
+      unresolvedLabelNames: [],
+    },
+  };
 }
 
 function freshnessGuard(parentIssue: Issue, config: ServiceConfig) {

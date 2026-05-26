@@ -131,6 +131,11 @@ export type ProcessDueOptions = {
   idempotencyKeys?: readonly string[];
 };
 
+export type EnqueueWritebackOptions = {
+  retrySkipped?: boolean;
+  retrySkippedMessages?: readonly string[];
+};
+
 type LifecycleGuardResult =
   | { status: "ready" }
   | { status: "blocked"; message: string }
@@ -267,10 +272,10 @@ export class WritebackProcessor {
     private readonly issueBreakdownFreshnessGuard?: IssueBreakdownFreshnessGuard,
   ) {}
 
-  async enqueueAndProcess(operation: NewWritebackOperation, options: { retrySkipped?: boolean } = {}): Promise<WritebackOperation> {
+  async enqueueAndProcess(operation: NewWritebackOperation, options: EnqueueWritebackOptions = {}): Promise<WritebackOperation> {
     let record = await this.store.enqueueOnce(operation);
     if (record.status === "succeeded") return record;
-    if (options.retrySkipped === true && record.status === "skipped" && matchesNewWritebackOperation(record, operation)) {
+    if (canRetrySkipped(record, operation, options)) {
       record = await this.store.requeueSkipped(record);
     }
     await this.processDue();
@@ -494,7 +499,11 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
     );
   }
   if (record.kind === "comment" && operation.kind === "comment") {
-    return record.payload.body === operation.payload.body && record.payload.dedupeKey === operation.payload.dedupeKey;
+    return (
+      record.payload.body === operation.payload.body &&
+      record.payload.dedupeKey === operation.payload.dedupeKey &&
+      record.payload.issueBreakdownPlanId === operation.payload.issueBreakdownPlanId
+    );
   }
   if (record.kind === "issue_create" && operation.kind === "issue_create") {
     return JSON.stringify(record.payload) === JSON.stringify(operation.payload);
@@ -508,6 +517,18 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
 function stringArraysEqual(left: string[] | undefined, right: string[] | undefined): boolean {
   if (left === undefined || right === undefined) return left === right;
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function canRetrySkipped(
+  record: WritebackOperation,
+  operation: NewWritebackOperation,
+  options: EnqueueWritebackOptions,
+): boolean {
+  if (options.retrySkipped !== true || record.status !== "skipped" || !matchesNewWritebackOperation(record, operation)) {
+    return false;
+  }
+  if (options.retrySkippedMessages === undefined) return true;
+  return options.retrySkippedMessages.some((message) => record.lastError === message || record.resultMessage === message);
 }
 
 async function readJsonIfExists<T>(filePath: string): Promise<T | null> {

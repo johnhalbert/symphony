@@ -271,6 +271,83 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.transitions).toHaveLength(0);
   });
 
+  it("can requeue skipped operations only when an allowed reason matches", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const operation = {
+      idempotencyKey: "transition:issue-1:issue-breakdown-recovery",
+      kind: "transition" as const,
+      issueId: "issue-1",
+      payload: { fromStates: ["Todo"], toState: "In Progress" },
+    };
+    const skipped = await store.enqueueOnce(operation);
+    await store.markSkipped(skipped, ISSUE_BREAKDOWN_PLAN_STALE_REASON);
+
+    const writer = new FakeWriter();
+    const recoveryProcessor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    await expect(
+      recoveryProcessor.enqueueAndProcess(operation, {
+        retrySkipped: true,
+        retrySkippedMessages: [ISSUE_BREAKDOWN_PLAN_STALE_REASON],
+      }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+    expect(writer.transitions).toHaveLength(1);
+  });
+
+  it("does not requeue skipped operations when the allowed reason does not match", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const operation = {
+      idempotencyKey: "transition:issue-1:issue-breakdown-recovery",
+      kind: "transition" as const,
+      issueId: "issue-1",
+      payload: { fromStates: ["Todo"], toState: "In Progress" },
+    };
+    const skipped = await store.enqueueOnce(operation);
+    await store.markSkipped(skipped, "unrelated skipped reason");
+
+    const writer = new FakeWriter();
+    const recoveryProcessor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    await expect(
+      recoveryProcessor.enqueueAndProcess(operation, {
+        retrySkipped: true,
+        retrySkippedMessages: [ISSUE_BREAKDOWN_PLAN_STALE_REASON],
+      }),
+    ).resolves.toMatchObject({ status: "skipped" });
+    expect(writer.transitions).toHaveLength(0);
+  });
+
+  it("does not requeue a skipped comment when the explicit issue breakdown plan binding differs", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const operation = {
+      idempotencyKey: "comment:issue-1:issue-breakdown:plan-1:children",
+      kind: "comment" as const,
+      issueId: "issue-1",
+      runId: "run-plan-1",
+      payload: {
+        body: "Created child issues",
+        dedupeKey: "issue-breakdown-children:plan-1",
+        issueBreakdownPlanId: "plan-1",
+      },
+    };
+    const skipped = await store.enqueueOnce(operation);
+    await store.markSkipped(skipped, ISSUE_BREAKDOWN_PLAN_STALE_REASON);
+
+    const writer = new FakeWriter();
+    const recoveryProcessor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    await expect(
+      recoveryProcessor.enqueueAndProcess(
+        {
+          ...operation,
+          payload: { ...operation.payload, issueBreakdownPlanId: "plan-2" },
+        },
+        {
+          retrySkipped: true,
+          retrySkippedMessages: [ISSUE_BREAKDOWN_PLAN_STALE_REASON],
+        },
+      ),
+    ).resolves.toMatchObject({ status: "skipped" });
+    expect(writer.comments).toHaveLength(0);
+  });
+
   it("processes issue creation writebacks and persists child issue evidence", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
