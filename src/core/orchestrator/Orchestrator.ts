@@ -518,7 +518,6 @@ export class Orchestrator {
       pullRequestPublisher: publisher,
     }).resumeApprovedPublication({ approval: request, issue });
     if (!result) return false;
-    await this.options.writeback?.processDue();
     return true;
   }
 
@@ -531,9 +530,9 @@ export class Orchestrator {
       lifecycleStore: this.options.lifecycleStore,
       writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+      ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
     }).recordPublicationApprovalTerminal({ approval: request, issue });
-    if (!result) return false;
-    await this.options.writeback?.processDue();
+    if (result.length === 0) return false;
     return true;
   }
 

@@ -447,6 +447,133 @@ describe("FileWritebackOutboxStore", () => {
     expect(result.lastError).toContain("freshness guard");
     expect(writer.issueCreates).toEqual([]);
   });
+
+  it("scopes processDue to requested idempotency keys without consuming sibling issue breakdown work", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const transitionKey = "transition:issue-1:publication-approval-pending:Blocked";
+    const issueCreateKey = "issue-create:issue-1:plan-1:0:hash";
+    await store.enqueueOnce(issueCreateOperation(issueCreateKey));
+    await store.enqueueOnce({
+      idempotencyKey: transitionKey,
+      kind: "transition",
+      issueId: "issue-1",
+      payload: { fromStates: ["In Progress"], toState: "Blocked" },
+    });
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+
+    await processor.processDue({ idempotencyKeys: [transitionKey] });
+
+    await expect(store.get(transitionKey)).resolves.toMatchObject({ status: "succeeded" });
+    await expect(store.get(issueCreateKey)).resolves.toMatchObject({ status: "pending" });
+    expect(writer.transitions).toHaveLength(1);
+    expect(writer.issueCreates).toHaveLength(0);
+  });
+
+  it("skips stale legacy issue breakdown parent comments without posting them", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const originalIssue = issue({ identifier: "ENG-1", title: "Original title", updatedAt: "2026-01-01T00:00:00.000Z" });
+    const driftedIssue = { ...originalIssue, title: "Changed title", updatedAt: "2026-01-02T00:00:00.000Z" };
+    const operationKey = "comment:issue-1:issue-breakdown:plan-1:children";
+    const lifecycleStore = {
+      get: async () =>
+        lifecycleWithIssueBreakdownPlan({
+          operationKeys: [operationKey],
+          issue: originalIssue,
+          config,
+          createdIssueRefs: [createdIssueRef()],
+        }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(driftedIssue, config),
+    );
+
+    const result = await processor.enqueueAndProcess(legacyParentCommentOperation(operationKey));
+
+    expect(result.status).toBe("skipped");
+    expect(result.lastError).toBe(ISSUE_BREAKDOWN_PLAN_STALE_REASON);
+    expect(writer.comments).toHaveLength(0);
+  });
+
+  it("processes fresh legacy issue breakdown parent comments", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const operationKey = "comment:issue-1:issue-breakdown:plan-1:children";
+    const lifecycleStore = {
+      get: async () =>
+        lifecycleWithIssueBreakdownPlan({
+          operationKeys: [operationKey],
+          issue: parentIssue,
+          config,
+          createdIssueRefs: [createdIssueRef()],
+        }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(parentIssue, config),
+    );
+
+    const result = await processor.enqueueAndProcess(legacyParentCommentOperation(operationKey));
+
+    expect(result.status).toBe("succeeded");
+    expect(writer.comments).toHaveLength(1);
+  });
+
+  it("does not treat ordinary comments as issue breakdown parent comments", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+
+    const result = await processor.enqueueAndProcess({
+      idempotencyKey: "comment:issue-1:run-1:completion-report:idem-1:publication-approval-pending",
+      kind: "comment",
+      issueId: "issue-1",
+      runId: "run-1",
+      payload: {
+        body: "Publication approval pending",
+        dedupeKey: "run-1:completion-report:idem-1:publication-approval-pending",
+      },
+    });
+
+    expect(result.status).toBe("succeeded");
+    expect(writer.comments).toHaveLength(1);
+  });
+
+  it("skips ambiguous legacy issue breakdown parent comment bindings", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+
+    const result = await processor.enqueueAndProcess({
+      idempotencyKey: "comment:issue-1:issue-breakdown:plan-from-key:children",
+      kind: "comment",
+      issueId: "issue-1",
+      runId: "run-plan-1",
+      payload: {
+        body: "Created child issues",
+        dedupeKey: "issue-breakdown-children:plan-from-dedupe",
+      },
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.lastError).toContain("ambiguous");
+    expect(writer.comments).toHaveLength(0);
+  });
 });
 
 class FakeWriter implements TrackerWriter {
@@ -650,5 +777,29 @@ function issueCreateOperation(idempotencyKey: string) {
       planId: "plan-1",
       proposedIssueIndex: 0,
     },
+  };
+}
+
+function legacyParentCommentOperation(idempotencyKey: string) {
+  return {
+    idempotencyKey,
+    kind: "comment" as const,
+    issueId: "issue-1",
+    runId: "run-plan-1",
+    payload: {
+      body: "Created child issues",
+      dedupeKey: "issue-breakdown-children:plan-1",
+    },
+  };
+}
+
+function createdIssueRef(): IssueBreakdownCreatedIssueRef {
+  return {
+    proposedIssueIndex: 0,
+    operationKey: "issue-create:issue-1:plan-1:0:hash",
+    status: "created",
+    id: "child-1",
+    identifier: "TEST-2",
+    url: "https://linear.test/TEST-2",
   };
 }

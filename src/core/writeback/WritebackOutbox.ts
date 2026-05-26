@@ -127,6 +127,10 @@ export type IssueBreakdownFreshnessGuard = {
   resolveIssue: (issueId: string) => Promise<IssueBreakdownIssueLookupResult>;
 };
 
+export type ProcessDueOptions = {
+  idempotencyKeys?: readonly string[];
+};
+
 type LifecycleGuardResult =
   | { status: "ready" }
   | { status: "blocked"; message: string }
@@ -155,11 +159,13 @@ export class FileWritebackOutboxStore {
     return record;
   }
 
-  async claimDue(now = new Date()): Promise<WritebackOperation[]> {
+  async claimDue(now = new Date(), options: { idempotencyKeys?: readonly string[] } = {}): Promise<WritebackOperation[]> {
     const records = await this.list();
+    const allowed = options.idempotencyKeys === undefined ? null : new Set(options.idempotencyKeys);
     const due = records
       .filter((record) => ["pending", "retrying", "in_flight"].includes(record.status))
       .filter((record) => Date.parse(record.nextAttemptAt) <= now.getTime())
+      .filter((record) => allowed === null || allowed.has(record.idempotencyKey))
       .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
     for (const record of due) {
       record.status = "in_flight";
@@ -271,8 +277,9 @@ export class WritebackProcessor {
     return (await this.store.get(record.idempotencyKey)) ?? record;
   }
 
-  async processDue(): Promise<void> {
-    for (const record of await this.store.claimDue()) {
+  async processDue(options: ProcessDueOptions = {}): Promise<void> {
+    const claimOptions = options.idempotencyKeys === undefined ? {} : { idempotencyKeys: options.idempotencyKeys };
+    for (const record of await this.store.claimDue(new Date(), claimOptions)) {
       try {
         const guard = await this.verifyLifecycleBoundOperation(record);
         if (guard.status === "blocked") {
@@ -305,8 +312,12 @@ export class WritebackProcessor {
   }
 
   private async verifyLifecycleBoundOperation(record: WritebackOperation): Promise<LifecycleGuardResult> {
-    const issueBreakdownPlanId = issueBreakdownPlanIdForOperation(record);
-    if (issueBreakdownPlanId) {
+    const issueBreakdownBinding = issueBreakdownPlanBindingForOperation(record);
+    if (issueBreakdownBinding.status === "blocked") {
+      return { status: "blocked", message: issueBreakdownBinding.message };
+    }
+    if (issueBreakdownBinding.status === "bound") {
+      const issueBreakdownPlanId = issueBreakdownBinding.planId;
       if (!this.lifecycleStore) return { status: "blocked", message: "issue breakdown writeback requires lifecycle guard" };
       const lifecycle = await this.lifecycleStore.get(record.issueId);
       const plan = lifecycle?.issueBreakdownPlans.find((candidate) => candidate.id === issueBreakdownPlanId);
@@ -424,11 +435,42 @@ function isPullRequestHandoffOperation(record: WritebackOperation): boolean {
   return record.kind === "comment" && record.payload.dedupeKey.startsWith("pull-request-handoff:");
 }
 
-function issueBreakdownPlanIdForOperation(record: WritebackOperation): string | null {
-  if (record.kind === "issue_create") return record.payload.planId;
-  if (record.kind === "issue_relation") return record.payload.planId;
-  if (record.kind === "comment") return record.payload.issueBreakdownPlanId ?? null;
-  return null;
+export function issueBreakdownPlanIdForOperation(record: WritebackOperation): string | null {
+  const binding = issueBreakdownPlanBindingForOperation(record);
+  return binding.status === "bound" ? binding.planId : null;
+}
+
+type IssueBreakdownPlanBinding =
+  | { status: "none" }
+  | { status: "bound"; planId: string }
+  | { status: "blocked"; message: string };
+
+function issueBreakdownPlanBindingForOperation(record: WritebackOperation): IssueBreakdownPlanBinding {
+  if (record.kind === "issue_create") return { status: "bound", planId: record.payload.planId };
+  if (record.kind === "issue_relation") return { status: "bound", planId: record.payload.planId };
+  if (record.kind === "comment") return issueBreakdownPlanBindingForComment(record);
+  return { status: "none" };
+}
+
+function issueBreakdownPlanBindingForComment(record: Extract<WritebackOperation, { kind: "comment" }>): IssueBreakdownPlanBinding {
+  const explicit = record.payload.issueBreakdownPlanId?.trim();
+  if (explicit) return { status: "bound", planId: explicit };
+
+  const dedupePlanId = parseIssueBreakdownChildrenDedupeKey(record.payload.dedupeKey);
+  const idempotencyPlanId = parseIssueBreakdownChildrenIdempotencyKey(record.idempotencyKey);
+  if (dedupePlanId && idempotencyPlanId && dedupePlanId !== idempotencyPlanId) {
+    return { status: "blocked", message: "issue breakdown comment plan binding is ambiguous" };
+  }
+  const planId = dedupePlanId ?? idempotencyPlanId;
+  return planId ? { status: "bound", planId } : { status: "none" };
+}
+
+function parseIssueBreakdownChildrenDedupeKey(dedupeKey: string): string | null {
+  return dedupeKey.match(/^issue-breakdown-children:(.+)$/)?.[1] ?? null;
+}
+
+function parseIssueBreakdownChildrenIdempotencyKey(idempotencyKey: string): string | null {
+  return idempotencyKey.match(/^comment:[^:]+:issue-breakdown:([^:]+):children$/)?.[1] ?? null;
 }
 
 export function computeWritebackBackoffMs(attempt: number, maxBackoffMs: number): number {

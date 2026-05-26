@@ -3,7 +3,7 @@ import type { AgentRunRole, TrackerStateLists } from "../core/types.js";
 import type { ServiceConfig } from "../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../core/config/CredentialProfiles.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
-import { FileIssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
+import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import type { IssueBreakdownIssueLookupResult } from "../core/writeback/WritebackOutbox.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../core/writeback/WritebackOutbox.js";
 import { createLinearTrackerClientForCapability } from "../integrations/linear/LinearCredentialResolver.js";
@@ -18,16 +18,20 @@ export function createRuntimeWritebackProcessor(
   configOrGetter: ServiceConfig | (() => ServiceConfig),
   logger: Logger,
   fetchImpl?: FetchLike,
+  stores: {
+    outboxStore?: FileWritebackOutboxStore;
+    lifecycleStore?: Pick<IssueLifecycleStore, "get">;
+  } = {},
 ): WritebackProcessor | undefined {
   const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
   const config = getConfig();
   if (!config.writeback.enabled) return undefined;
   return new WritebackProcessor(
-    new FileWritebackOutboxStore(config.workspace.stateDir),
+    stores.outboxStore ?? new FileWritebackOutboxStore(config.workspace.stateDir),
     createLinearTrackerClientForCapability(config, "linear.writeback", fetchImpl),
     logger,
     config.writeback.maxBackoffMs,
-    new FileIssueLifecycleStore(config.workspace.stateDir),
+    stores.lifecycleStore ?? new FileIssueLifecycleStore(config.workspace.stateDir),
     config.writeback.mode === "dry_run",
     {
       getConfig,
