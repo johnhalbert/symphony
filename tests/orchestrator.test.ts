@@ -648,6 +648,7 @@ describe("Orchestrator", () => {
     await first.refreshNow();
     await waitFor(() => harness.runs.length === 1);
     await waitFor(() => first.snapshot().counts.running === 0);
+    await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
     await first.stop();
 
     const second = new Orchestrator({

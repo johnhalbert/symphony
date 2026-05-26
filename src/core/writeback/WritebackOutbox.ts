@@ -169,7 +169,7 @@ export class FileWritebackOutboxStore {
     const records = await this.list();
     const allowed = options.idempotencyKeys === undefined ? null : new Set(options.idempotencyKeys);
     const due = records
-      .filter((record) => ["pending", "retrying", "in_flight"].includes(record.status))
+      .filter((record) => ["pending", "retrying"].includes(record.status))
       .filter((record) => Date.parse(record.nextAttemptAt) <= now.getTime())
       .filter((record) => allowed === null || allowed.has(record.idempotencyKey))
       .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
