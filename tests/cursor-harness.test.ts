@@ -104,6 +104,30 @@ describe("Cursor event mapping", () => {
     ]);
   });
 
+  it("redacts secret-like assistant, status, and text-delta stream messages", () => {
+    const assistantEvents = mapCursorMessage({
+      type: "assistant",
+      agent_id: "agent",
+      run_id: "run",
+      message: { role: "assistant", content: [{ type: "text", text: "assistant saw SECRET_ASSISTANT token=abc123" }] },
+    });
+    const statusEvents = mapCursorMessage({
+      type: "status",
+      agent_id: "agent",
+      run_id: "run",
+      status: "ERROR",
+      message: "status leaked Authorization: Bearer SECRET_STATUS",
+    } as never);
+    const deltaEvents = mapCursorDelta({ type: "text-delta", text: "delta apiKey=SECRET_DELTA" });
+    const serialized = JSON.stringify([...assistantEvents, ...statusEvents, ...deltaEvents]);
+
+    expect(serialized).not.toContain("SECRET_ASSISTANT");
+    expect(serialized).not.toContain("abc123");
+    expect(serialized).not.toContain("SECRET_STATUS");
+    expect(serialized).not.toContain("SECRET_DELTA");
+    expect(serialized).toContain("[redacted]");
+  });
+
   it("wires the Symphony completion report MCP server into Cursor runs", () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     const ctx: AgentRunContext = {
@@ -588,6 +612,33 @@ describe("Cursor event mapping", () => {
     );
     expect(events).toContainEqual({ type: "progress", message: "Cursor thinking event", activitySource: "stream" });
     expect(events).toContainEqual({ type: "progress", message: "Cursor task event", activitySource: "stream" });
+  });
+
+  it("redacts terminal wait results before emitting public events", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-terminal-secret",
+      send: vi.fn(async () => ({
+        id: "sdk-run-terminal-secret",
+        async *stream(): AsyncIterable<unknown> {},
+        wait: async () => ({ status: "error" as const, result: "terminal failed with SECRET_TERMINAL token=raw-token" }),
+        cancel: vi.fn(async () => undefined),
+      })),
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const harness = new CursorHarness();
+    const events: unknown[] = [];
+
+    for await (const event of harness.run(agentContext(config, "worker"), "Work on TEST-1")) {
+      events.push(event);
+    }
+
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain("SECRET_TERMINAL");
+    expect(serialized).not.toContain("raw-token");
+    expect(serialized).toContain("[redacted]");
+    expect(events.at(-1)).toEqual({ type: "failed", error: "terminal failed with [redacted] token=[redacted]" });
   });
 
   it("only resumes worker agents when resume_by_issue compatibility mode is explicit", async () => {

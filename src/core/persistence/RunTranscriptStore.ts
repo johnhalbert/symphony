@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
+import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type PersistedRunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
@@ -376,10 +377,16 @@ export class FileRunTranscriptStore {
   async readTranscript(runId: string, options: { offset?: number; limit?: number } = {}): Promise<TranscriptPage> {
     const offset = Math.max(options.offset ?? 0, 0);
     const limit = Math.min(Math.max(options.limit ?? 100, 1), 1_000);
-    const total = await this.ensureTranscriptEventCount(runId);
-    const events = await readJsonlPage<TranscriptEvent>(this.eventsPath(runId), offset, limit);
+    const total = await this.readTranscriptEventCount(runId);
+    const events = (await readJsonlPage<TranscriptEvent>(this.eventsPath(runId), offset, limit)).map(projectTranscriptEventForPublicRead);
     const nextOffset = offset + events.length < total ? offset + events.length : null;
     return { runId, offset, limit, nextOffset, events };
+  }
+
+  async readTranscriptEventCount(runId: string): Promise<number> {
+    const record = await this.getRun(runId);
+    if (typeof record?.transcriptEventCount === "number") return record.transcriptEventCount;
+    return countJsonlLines(this.eventsPath(runId));
   }
 
   async ensureTranscriptEventCount(runId: string): Promise<number> {

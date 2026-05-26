@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -692,6 +692,72 @@ describe("StatusServer durable API", () => {
       expect(writebackText).not.toContain("WRITEBACK_BODY_SECRET");
       expect(writebackText).not.toContain("/local/workspace/path");
       expect(clampedBody.limit).toBe(100);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves redacted legacy transcript rows without backfilling counts during GET", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-legacy-secret",
+      sessionId: "session-legacy-secret",
+      agentId: "agent-legacy-secret",
+      role: "worker",
+      issueId: "issue-legacy-secret",
+      issueIdentifier: "TEST-LEGACY-SECRET",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-LEGACY-SECRET",
+      workspacePath: path.join(config.workspace.root, "TEST-LEGACY-SECRET"),
+    });
+    await runStore.appendEvent({
+      runId: "run-legacy-secret",
+      at: "2030-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "raw assistant SECRET_ACTIVITY token=activity-token",
+      payload: { activitySource: "stream", apiKey: "SECRET_API_KEY", detail: "Bearer SECRET_BEARER" },
+    });
+    const metaPath = path.join(config.workspace.stateDir, "runs", "run-legacy-secret", "meta.json");
+    const metadata = JSON.parse(await readFile(metaPath, "utf8")) as { transcriptEventCount?: number };
+    delete metadata.transcriptEventCount;
+    await writeFile(metaPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    const beforeRead = await readFile(metaPath, "utf8");
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/run-legacy-secret/transcript`);
+      const activityResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-LEGACY-SECRET&limit=10`);
+      const transcriptText = await transcriptResponse.text();
+      const activityText = await activityResponse.text();
+
+      expect(transcriptResponse.status).toBe(200);
+      expect(activityResponse.status).toBe(200);
+      expect(`${transcriptText}\n${activityText}`).not.toContain("SECRET_ACTIVITY");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-token");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("SECRET_API_KEY");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("SECRET_BEARER");
+      expect(`${transcriptText}\n${activityText}`).toContain("[redacted]");
+      expect(await readFile(metaPath, "utf8")).toBe(beforeRead);
     } finally {
       await server.stop();
     }

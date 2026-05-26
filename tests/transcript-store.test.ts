@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -137,6 +137,47 @@ describe("FileRunTranscriptStore", () => {
       Array.from({ length: 20 }, (_, index) => index + 1),
     );
     expect(page.nextOffset).toBeNull();
+  });
+
+  it("reads legacy missing transcript counts without mutating metadata and projects public events", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await store.startRun({
+      runId: "run-legacy",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+    await store.appendEvent({
+      runId: "run-legacy",
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "assistant token=SECRET_TOKEN",
+      payload: { token: "SECRET_PAYLOAD", nested: { authorization: "Bearer SECRET_AUTH" } },
+    });
+    const metaPath = path.join(root, "runs", "run-legacy", "meta.json");
+    const metadata = JSON.parse(await readFile(metaPath, "utf8")) as { transcriptEventCount?: number };
+    delete metadata.transcriptEventCount;
+    await writeFile(metaPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    const beforeRead = await readFile(metaPath, "utf8");
+
+    const page = await store.readTranscript("run-legacy", { offset: 0, limit: 10 });
+
+    expect(await store.readTranscriptEventCount("run-legacy")).toBe(1);
+    expect(await readFile(metaPath, "utf8")).toBe(beforeRead);
+    expect(page.nextOffset).toBeNull();
+    expect(JSON.stringify(page)).not.toContain("SECRET_TOKEN");
+    expect(JSON.stringify(page)).not.toContain("SECRET_PAYLOAD");
+    expect(JSON.stringify(page)).not.toContain("SECRET_AUTH");
+    expect(page.events[0]).toMatchObject({
+      message: "assistant token=[redacted]",
+      payload: { token: "[redacted]", nested: { authorization: "[redacted]" } },
+    });
   });
 
   it("can scope latest issue run lookup by role", async () => {

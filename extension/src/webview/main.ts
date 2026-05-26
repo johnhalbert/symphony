@@ -356,9 +356,9 @@ function renderTranscriptEvent(event: TranscriptEvent): string {
 
 function renderTranscriptPayload(event: TranscriptEvent): string {
   if (event.payload === undefined) return missingPayloadNote(event.eventType);
-  if (!isSummaryPayload(event.payload)) return `<pre>${escapeHtml(previewJson(event.payload))}</pre>`;
+  if (!isSummaryPayload(event.payload)) return `<pre>${escapeHtml(sanitizeTranscriptPreview(previewJson(event.payload)))}</pre>`;
   const rows = summaryRows(event.payload);
-  return `<dl class="summary transcript-summary">${rows.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value))}</dd>`).join("")}</dl>`;
+  return `<dl class="summary transcript-summary">${rows.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(sanitizeTranscriptPreview(String(value)))}</dd>`).join("")}</dl>`;
 }
 
 function isSummaryPayload(value: unknown): value is JsonObject & { kind: string } {
@@ -385,6 +385,20 @@ function summaryRows(payload: JsonObject & { kind: string }): Array<[string, str
   if (payload.truncated === true) rows.push(["Truncated", "yes"]);
   if (payload.redacted === true) rows.push(["Redacted", "yes"]);
   return rows.filter((row): row is [string, string] => row[1] !== null);
+}
+
+function sanitizeTranscriptPreview(value: string): string {
+  return value
+    .replace(/SECRET_[A-Z0-9_]+/g, "[redacted]")
+    .replace(/\bBearer\s+[^\s"',}]+/gi, "Bearer [redacted]")
+    .replace(
+      /(\b(?:api[_-]?key|apikey|token|secret|password|authorization)\b\s*=\s*)([^\s"',}]+)/gi,
+      "$1[redacted]",
+    )
+    .replace(
+      /((?:"(?:api[_-]?key|apikey|token|secret|password|authorization)"|(?:api[_-]?key|apikey|token|secret|password|authorization))\s*:\s*)("[^"]*"|'[^']*'|[^\s"',}]+)/gi,
+      '$1"[redacted]"',
+    );
 }
 
 function renderActivityList(activity: ActivityItem[]): string {

@@ -14,6 +14,10 @@ import {
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { resolveCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
+import {
+  sanitizeAgentEventForPublicOutput,
+  sanitizedPreviewValue,
+} from "../../src/core/transcript/TranscriptProjection.js";
 import { mapCursorDelta, mapCursorMessage } from "./CursorEventMapper.js";
 
 export interface CursorHarnessOptions {
@@ -85,6 +89,7 @@ export class CursorHarness implements AgentHarness {
     if (ctx.abortSignal.aborted) abort();
 
     const queue = new AsyncEventQueue<AgentEvent>();
+    const enqueueEvent = (event: AgentEvent) => queue.push(sanitizeAgentEventForPublicOutput(event));
     let sessionStarted = false;
     let waitStarted = false;
     let waitSettled = false;
@@ -107,7 +112,7 @@ export class CursorHarness implements AgentHarness {
         at: new Date().toISOString(),
       };
       if (sessionStarted) {
-        queue.push(event);
+        enqueueEvent(event);
       } else {
         bufferedStatusEvents.push(event);
       }
@@ -139,7 +144,7 @@ export class CursorHarness implements AgentHarness {
         };
       });
     const emitTerminalEvents = (events: AgentEvent[]) => {
-      for (const event of contextualizeTerminalEvents(events)) queue.push(event);
+      for (const event of contextualizeTerminalEvents(events)) enqueueEvent(event);
       queue.close();
     };
     const finalizeFromWait = async () => {
@@ -306,7 +311,7 @@ export class CursorHarness implements AgentHarness {
       });
 
       sessionStarted = true;
-      for (const event of bufferedStatusEvents.splice(0, bufferedStatusEvents.length)) queue.push(event);
+      for (const event of bufferedStatusEvents.splice(0, bufferedStatusEvents.length)) enqueueEvent(event);
       void finalizeFromWait();
       const streamTask = (async () => {
         try {
@@ -326,11 +331,11 @@ export class CursorHarness implements AgentHarness {
                 ...transcriptEvent,
               });
             }
-            for (const event of flush(deltaEvents)) queue.push(event);
-            for (const event of mapCursorMessage(message as SDKMessage)) queue.push(event);
+            for (const event of flush(deltaEvents)) enqueueEvent(event);
+            for (const event of mapCursorMessage(message as SDKMessage)) enqueueEvent(event);
           }
         } catch (error) {
-          queue.push({
+          enqueueEvent({
             type: "run_diagnostic",
             code: "cursor_stream_error",
             message: `Cursor stream failed: ${errorMessage(error)}`,
@@ -347,7 +352,7 @@ export class CursorHarness implements AgentHarness {
           });
         } finally {
           streamSettled = true;
-          for (const event of flush(deltaEvents)) queue.push(event);
+          for (const event of flush(deltaEvents)) enqueueEvent(event);
           if (pendingTerminalEvents) emitTerminalEvents(pendingTerminalEvents);
         }
       })();
@@ -636,23 +641,6 @@ function previewValue(value: unknown, maxLength: number): string | null {
   const text = typeof value === "string" ? value : safeJsonPreview(value);
   const oneLine = text.replace(/\s+/g, " ").trim();
   return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`;
-}
-
-function sanitizedPreviewValue(value: unknown, maxLength: number): { preview: string | null; truncated: boolean } {
-  if (value === undefined || value === null) return { preview: null, truncated: false };
-  const text = typeof value === "string" ? value : safeJsonPreview(value);
-  const redacted = redactTranscriptText(text).replace(/\s+/g, " ").trim();
-  return {
-    preview: redacted.length <= maxLength ? redacted : `${redacted.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`,
-    truncated: redacted.length > maxLength,
-  };
-}
-
-function redactTranscriptText(value: string): string {
-  return value
-    .replace(/SECRET_[A-Z0-9_]+/g, "[redacted]")
-    .replace(/\b(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*[^\s"',}]+/gi, "$1=[redacted]")
-    .replace(/\bBearer\s+[^\s"',}]+/gi, "Bearer [redacted]");
 }
 
 function safeJsonPreview(value: unknown): string {

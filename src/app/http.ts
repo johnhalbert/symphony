@@ -37,6 +37,7 @@ import {
 } from "../core/persistence/RunTranscriptStore.js";
 import type { FileWritebackOutboxStore, WritebackOperation } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
+import { sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -108,10 +109,11 @@ export class StatusServer {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       if (request.method === "GET" && url.pathname === "/") {
+        const snapshot = publicRuntimeSnapshot(this.options.orchestrator.snapshot());
         sendHtml(
           response,
           await renderDashboard(
-            this.options.orchestrator.snapshot(),
+            snapshot,
             Boolean(this.options.openWorkspaceToken),
             this.options.runStore,
             this.options.lifecycleStore,
@@ -122,7 +124,7 @@ export class StatusServer {
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/state") {
-        const snapshot = this.options.orchestrator.snapshot();
+        const snapshot = publicRuntimeSnapshot(this.options.orchestrator.snapshot());
         sendJson(response, 200, {
           ...snapshot,
           operatorView: await operatorSnapshotView(
@@ -1157,7 +1159,7 @@ async function buildActivityFeed(input: {
       syntheticRunEvents += 1;
     }
 
-    const totalEvents = input.runStore ? await input.runStore.ensureTranscriptEventCount(run.runId) : 0;
+    const totalEvents = input.runStore ? await input.runStore.readTranscriptEventCount(run.runId) : 0;
     transcriptEventsTotal += totalEvents;
     const transcriptOffset = Math.max(0, totalEvents - ACTIVITY_TRANSCRIPT_TAIL_PER_RUN);
     const events =
@@ -2105,6 +2107,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function publicRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
+  return sanitizePublicJson(snapshot) as RuntimeSnapshot;
+}
+
 function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -2259,7 +2265,7 @@ async function terminalActivity(run: RunRecord | null, lifecycle: IssueLifecycle
     };
   }
   if (run && runStore) {
-    const totalEvents = await runStore.ensureTranscriptEventCount(run.runId);
+    const totalEvents = await runStore.readTranscriptEventCount(run.runId);
     const offset = Math.max(0, totalEvents - TERMINAL_ACTIVITY_TRANSCRIPT_TAIL);
     const page = await runStore.readTranscript(run.runId, { offset, limit: TERMINAL_ACTIVITY_TRANSCRIPT_TAIL });
     return deriveTerminalActivityFromTranscript(page.events, run.updatedAt ?? lifecycle?.updatedAt ?? null);
