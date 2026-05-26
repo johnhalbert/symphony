@@ -1940,15 +1940,15 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
     workspacePath: row.workspacePath,
     lastActivityAt: row.liveness.lastActivityAt,
     lastTranscriptEventAt: row.lastEventAt,
-    lastTranscriptEvent: row.lastEvent,
-    lastMessage: row.lastMessage,
+    lastTranscriptEvent: publicDiagnosticText(row.lastEvent),
+    lastMessage: publicDiagnosticText(row.lastMessage),
     secondsSinceLastActivity: row.liveness.secondsSinceLastActivity,
     stallTimeoutMs: row.liveness.stallTimeoutMs,
     sdkRunStatus: row.liveness.sdkRunStatus ?? null,
     sdkRunStatusUpdatedAt: row.liveness.sdkRunStatusUpdatedAt ?? null,
     sdkRunStatusSource: row.liveness.sdkRunStatusSource ?? null,
     idleAlert: row.liveness.idleAlert ?? null,
-    cancellation: row.cancellation,
+    cancellation: publicLiveCancellation(row.cancellation),
     paused,
     activity: liveActivity(row),
     timeline: liveTimeline(row),
@@ -2129,6 +2129,34 @@ function publicDiagnosticText(value: string | null | undefined): string | null {
   return sanitizedPreviewValue(value).preview;
 }
 
+function publicLiveRow(row: RunningRow): RunningRow {
+  return {
+    ...row,
+    lastEvent: publicDiagnosticText(row.lastEvent),
+    lastMessage: publicDiagnosticText(row.lastMessage),
+    cancellation: publicLiveCancellation(row.cancellation),
+  };
+}
+
+function publicLiveCancellation(cancellation: RunningRow["cancellation"]): RunningRow["cancellation"] {
+  const publicCancellation: RunningRow["cancellation"] = {
+    ...cancellation,
+    reason: publicDiagnosticText(cancellation.reason),
+    harnessStopFailedReason: publicDiagnosticText(cancellation.harnessStopFailedReason),
+  };
+  if (cancellation.cancelFailed) {
+    publicCancellation.cancelFailed = publicLiveCancelFailed(cancellation.cancelFailed);
+  }
+  return publicCancellation;
+}
+
+function publicLiveCancelFailed(cancelFailed: NonNullable<RunningRow["cancellation"]["cancelFailed"]>) {
+  return {
+    ...cancelFailed,
+    reason: publicDiagnosticText(cancelFailed.reason),
+  };
+}
+
 function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -2218,14 +2246,14 @@ async function terminalOperatorLiveness(
 }
 
 function liveCancelFailed(row: RunningRow) {
-  if (row.cancellation.cancelFailed) return row.cancellation.cancelFailed;
+  if (row.cancellation.cancelFailed) return publicLiveCancelFailed(row.cancellation.cancelFailed);
   if (row.cancellation.harnessStopFailedAt) {
     return {
       tracked: true,
       active: true,
       phase: "failed",
       at: row.cancellation.harnessStopFailedAt,
-      reason: row.cancellation.harnessStopFailedReason ?? null,
+      reason: publicDiagnosticText(row.cancellation.harnessStopFailedReason),
       source: "harness_stop",
     };
   }
@@ -2380,7 +2408,7 @@ function liveTimeline(row: RunningRow) {
       at: row.liveness.lastActivityAt,
       kind: "last_activity",
       label: "Last harness activity",
-      detail: row.lastMessage ?? row.lastEvent,
+      detail: publicDiagnosticText(row.lastMessage ?? row.lastEvent),
       synthetic: true,
       source: "live_snapshot",
     },
@@ -2390,7 +2418,7 @@ function liveTimeline(row: RunningRow) {
             at: row.cancellation.requestedAt,
             kind: "cancellation_requested",
             label: "Cancellation requested",
-            detail: row.cancellation.reason,
+            detail: publicDiagnosticText(row.cancellation.reason),
             synthetic: true,
             source: "live_snapshot",
           },
@@ -2414,7 +2442,7 @@ function liveTimeline(row: RunningRow) {
             at: row.cancellation.harnessStopFailedAt,
             kind: "harness_stop_failed",
             label: "Harness stop failed",
-            detail: row.cancellation.harnessStopFailedReason ?? null,
+            detail: publicDiagnosticText(row.cancellation.harnessStopFailedReason),
             synthetic: true,
             source: "live_snapshot",
           },
@@ -2499,7 +2527,7 @@ function isLifecycleBlocked(lifecycle: IssueLifecycleRecord | null | undefined):
 }
 
 function liveIssueResponse(live: RunningRow, operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>) {
-  return { ...live, operatorLiveness };
+  return { ...publicLiveRow(live), operatorLiveness };
 }
 
 function buildIssueDetailsEnvelope(input: {

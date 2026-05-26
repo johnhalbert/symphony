@@ -961,6 +961,180 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("serves redacted live liveness diagnostics across public status surfaces without mutating live rows", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const liveRunning = liveRunningFixture(config, "TEST-LIVE-SECRET", "In Progress");
+    const rawLastEvent = "progress SECRET_LIVE_EVENT token=event-token";
+    const rawLastMessage =
+      "live SECRET_LIVE_MESSAGE token=live-token access_token=live-access Bearer live-bearer ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7";
+    const rawCancelReason = "cancel SECRET_LIVE_CANCEL token=cancel-token client_secret: cancel-client";
+    const rawHarnessStopReason = "harness SECRET_LIVE_HARNESS Bearer harness-bearer github_token=harness-github private_key: harness-private";
+    const rawNestedCancelReason = "nested SECRET_LIVE_NESTED refreshToken: nested-refresh sk-HIJKLMNO1";
+
+    liveRunning.runId = "run-live-secret";
+    liveRunning.sessionId = "session-live-secret";
+    liveRunning.lastEvent = rawLastEvent;
+    liveRunning.lastMessage = rawLastMessage;
+    liveRunning.lastEventAt = "2026-01-01T00:00:03.000Z";
+    liveRunning.liveness = {
+      status: "cancelling",
+      activeRunId: "run-live-secret",
+      lastActivityAt: "2026-01-01T00:00:03.000Z",
+      secondsSinceLastActivity: 2,
+      stallTimeoutMs: 300_000,
+    };
+    liveRunning.cancellation = {
+      requested: true,
+      requestedAt: "2026-01-01T00:00:02.000Z",
+      source: "operator",
+      reason: rawCancelReason,
+      abortSignalled: true,
+      harnessStopRequestedAt: "2026-01-01T00:00:02.000Z",
+      harnessStopFailedAt: "2026-01-01T00:00:04.000Z",
+      harnessStopFailedReason: rawHarnessStopReason,
+      cancelFailed: {
+        tracked: true,
+        active: true,
+        phase: "failed",
+        at: "2026-01-01T00:00:04.000Z",
+        reason: rawNestedCancelReason,
+        source: "harness_stop",
+      },
+      suppressRetryOnExit: true,
+    };
+    await runStore.startRun({
+      runId: liveRunning.runId,
+      sessionId: liveRunning.sessionId,
+      agentId: "agent-live-secret",
+      role: "worker",
+      issueId: liveRunning.issueId,
+      issueIdentifier: liveRunning.issueIdentifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: liveRunning.issueIdentifier,
+      workspacePath: path.join(config.workspace.root, liveRunning.issueIdentifier),
+    });
+    const tracker = new FakeTracker([
+      issue({
+        id: liveRunning.issueId,
+        identifier: liveRunning.issueIdentifier,
+        title: "Live diagnostic redaction",
+        state: "In Progress",
+      }),
+    ]);
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([liveRunning]),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      tracker,
+      trackerStateLists: testTrackerStateLists(),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const responses = await Promise.all([
+        fetch(`${baseUrl}/api/v1/runs/${liveRunning.runId}`),
+        fetch(`${baseUrl}/api/v1/issues/${liveRunning.issueIdentifier}`),
+        fetch(`${baseUrl}/api/v1/issues/${liveRunning.issueIdentifier}/runs`),
+        fetch(`${baseUrl}/api/v1/board`),
+        fetch(`${baseUrl}/api/v1/issue-board`),
+        fetch(`${baseUrl}/api/v1/board/issues/${liveRunning.issueId}`),
+      ]);
+      const [runBody, issueBody, issueRunsBody, boardBody, issueBoardBody, boardDetailBody] = await Promise.all(
+        responses.map(async (response) => {
+          expect(response.status).toBe(200);
+          return response.json() as Promise<Record<string, unknown>>;
+        }),
+      );
+      const responseText = JSON.stringify({ runBody, issueBody, issueRunsBody, boardBody, issueBoardBody, boardDetailBody });
+
+      for (const raw of [
+        "SECRET_LIVE_EVENT",
+        "event-token",
+        "SECRET_LIVE_MESSAGE",
+        "live-token",
+        "live-access",
+        "live-bearer",
+        "ghp_ABCDEFGH1",
+        "sk-ABCDEFGH1",
+        "SECRET_LIVE_CANCEL",
+        "cancel-token",
+        "cancel-client",
+        "SECRET_LIVE_HARNESS",
+        "harness-bearer",
+        "harness-github",
+        "harness-private",
+        "SECRET_LIVE_NESTED",
+        "nested-refresh",
+        "sk-HIJKLMNO1",
+      ]) {
+        expect(responseText).not.toContain(raw);
+      }
+      expect(responseText).toContain("[redacted]");
+      expect(responseText).toContain("inputTokens");
+
+      type PublicLiveLiveness = {
+        lastTranscriptEvent: string | null;
+        lastMessage: string | null;
+        cancellation: {
+          reason: string | null;
+          harnessStopFailedReason?: string | null;
+          cancelFailed?: { reason: string | null };
+        };
+        cancelFailed: { reason: string | null };
+        timeline: Array<{ kind: string; detail: string | null }>;
+      };
+      const runLiveness = (runBody as { operatorLiveness: PublicLiveLiveness }).operatorLiveness;
+      const timelineDetail = (kind: string) => runLiveness.timeline.find((item) => item.kind === kind)?.detail ?? "";
+      expect(runLiveness.lastTranscriptEvent ?? "").toContain("[redacted]");
+      expect(runLiveness.lastMessage ?? "").toContain("[redacted]");
+      expect(runLiveness.cancellation.reason ?? "").toContain("[redacted]");
+      expect(runLiveness.cancellation.harnessStopFailedReason ?? "").toContain("[redacted]");
+      expect(runLiveness.cancellation.cancelFailed?.reason ?? "").toContain("[redacted]");
+      expect(runLiveness.cancelFailed.reason ?? "").toContain("[redacted]");
+      expect(timelineDetail("last_activity")).toContain("[redacted]");
+      expect(timelineDetail("cancellation_requested")).toContain("[redacted]");
+      expect(timelineDetail("harness_stop_failed")).toContain("[redacted]");
+
+      const issueLive = (issueBody as {
+        live: { lastEvent: string | null; lastMessage: string | null; cancellation: PublicLiveLiveness["cancellation"]; operatorLiveness: PublicLiveLiveness };
+        operatorLiveness: PublicLiveLiveness;
+      }).live;
+      expect(issueLive.lastEvent).toBe(runLiveness.lastTranscriptEvent);
+      expect(issueLive.lastMessage).toBe(runLiveness.lastMessage);
+      expect(issueLive.cancellation.reason).toBe(runLiveness.cancellation.reason);
+      expect(issueLive.cancellation.harnessStopFailedReason).toBe(runLiveness.cancellation.harnessStopFailedReason);
+      expect(issueLive.cancellation.cancelFailed?.reason).toBe(runLiveness.cancellation.cancelFailed?.reason);
+      expect(issueLive.operatorLiveness.lastMessage).toBe(runLiveness.lastMessage);
+      expect((issueBody as { operatorLiveness: PublicLiveLiveness }).operatorLiveness.lastMessage).toBe(runLiveness.lastMessage);
+
+      const issueRuns = issueRunsBody as { runs: Array<{ runId: string; operatorLiveness: PublicLiveLiveness }> };
+      expect(issueRuns.runs.find((run) => run.runId === liveRunning.runId)?.operatorLiveness.lastMessage).toBe(runLiveness.lastMessage);
+      const boardDetail = boardDetailBody as { live: { lastMessage: string | null }; operatorLiveness: PublicLiveLiveness };
+      expect(boardDetail.live.lastMessage).toBe(runLiveness.lastMessage);
+      expect(boardDetail.operatorLiveness.cancelFailed.reason).toBe(runLiveness.cancelFailed.reason);
+
+      expect(liveRunning.lastEvent).toBe(rawLastEvent);
+      expect(liveRunning.lastMessage).toBe(rawLastMessage);
+      expect(liveRunning.cancellation.reason).toBe(rawCancelReason);
+      expect(liveRunning.cancellation.harnessStopFailedReason).toBe(rawHarnessStopReason);
+      expect(liveRunning.cancellation.cancelFailed?.reason).toBe(rawNestedCancelReason);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves redacted cursor-derived transcript rows without backfilling counts during GET", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
