@@ -2328,6 +2328,9 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "worker dispatch after human Todo unblock");
+    await waitFor(() => writer.transitions.length === 1, "dispatch transition writeback");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "worker dispatch exit");
+    await settleOrchestratorExit();
     await orchestrator.stop();
 
     expect(writer.transitions).toEqual([
