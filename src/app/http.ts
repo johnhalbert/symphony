@@ -252,9 +252,6 @@ export class StatusServer {
           if (decision === "reject") {
             await this.recordRejectedApprovalRunTerminal(result.request);
           }
-          if (decision === "reject" && !result.replayed && this.options.operatorApproval?.rejectPolicy === "cancel") {
-            await this.options.orchestrator.cancelIssue(result.request.issueId);
-          }
           if (decision === "approve" && result.request.status === "approved") {
             const resumed = await this.options.orchestrator.resumeApprovedPublication(result.request);
             if (resumed !== true) {
@@ -266,6 +263,9 @@ export class StatusServer {
           }
           if (decision === "reject" && !result.replayed) {
             await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
+            if (this.options.operatorApproval?.rejectPolicy === "cancel") {
+              await this.options.orchestrator.cancelIssue(result.request.issueId);
+            }
           }
           sendJson(response, 200, {
             request: approvalResponse(result.request, this.options.operatorApproval?.isRequired() ?? false),
