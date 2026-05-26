@@ -1,7 +1,9 @@
 import {
   buildIssueHandoffState,
+  type CompletionReportPullRequestRef,
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
+  type IssueCompletionReportRecord,
   type IssueMergeGateState,
   type IssueReviewVerdictRecord,
   latestCurrentApprovalPassVerdict,
@@ -44,6 +46,21 @@ export function resolveMergeGate(gate: IssueMergeGateState): IssueMergeGateState
 
 export function isActiveMergeGate(gate: IssueMergeGateState | null | undefined): gate is IssueMergeGateState {
   return gate !== null && gate !== undefined && gate.status !== "resolved" && gate.status !== "superseded";
+}
+
+export function hasRepairGateClearance(lifecycle: IssueLifecycleRecord, gate: IssueMergeGateState): boolean {
+  if (gate.status === "blocked") return false;
+  if (gate.status !== "repair_dispatched") return false;
+  const repairReport = bindRepairCompletionReport(lifecycle, gate);
+  if (!repairReport) return false;
+  return resolveRepairGateClearanceApprovalVerdict(lifecycle, gate, repairReport) !== null;
+}
+
+export function canAutoResolveMergeGateOnCheckPass(lifecycle: IssueLifecycleRecord, gateId: string): boolean {
+  const gate = lifecycle.mergeGate?.id === gateId ? lifecycle.mergeGate : null;
+  if (!isActiveMergeGate(gate)) return latestCurrentApprovalPassVerdict(lifecycle) !== null;
+  if (gate.status === "observing") return latestCurrentApprovalPassVerdict(lifecycle) !== null;
+  return hasRepairGateClearance(lifecycle, gate);
 }
 
 export function inactiveMergeGateLifecyclePatch(
@@ -134,6 +151,72 @@ function inactiveMergeGate(
     supersededByHeadSha: status === "superseded" ? supersededByHeadSha : null,
     updatedAt: new Date().toISOString(),
   };
+}
+
+function bindRepairCompletionReport(
+  lifecycle: IssueLifecycleRecord,
+  gate: IssueMergeGateState,
+): IssueCompletionReportRecord | null {
+  if (!gate.repairReportId || !gate.repairRunId) return null;
+  if (lifecycle.lastCompletionReportId !== gate.repairReportId) return null;
+
+  const repairReport = lifecycle.completionReports.find((report) => report.id === gate.repairReportId) ?? null;
+  if (!repairReport || repairReport.runId !== gate.repairRunId) return null;
+  if (repairReport.acceptedAt.trim().length === 0) return null;
+  if (repairReport.pullRequest?.number !== gate.pullRequest.number) return null;
+  if (repairReport.pullRequest?.headSha !== gate.headSha) return null;
+
+  const gateVerdict = lifecycle.reviewVerdicts.find((verdict) => verdict.id === gate.id && isMergeGateVerdict(verdict)) ?? null;
+  if (!gateVerdict) return null;
+
+  const repairAcceptedAt = Date.parse(repairReport.acceptedAt);
+  const gateFailedAt = Date.parse(gateVerdict.submittedAt);
+  if (!Number.isFinite(repairAcceptedAt) || !Number.isFinite(gateFailedAt)) return null;
+  if (gate.gateReportId && repairReport.id === gate.gateReportId) return null;
+  if (repairAcceptedAt <= gateFailedAt) return null;
+
+  return repairReport;
+}
+
+function resolveRepairGateClearanceApprovalVerdict(
+  lifecycle: IssueLifecycleRecord,
+  gate: IssueMergeGateState,
+  repairReport: IssueCompletionReportRecord,
+): IssueReviewVerdictRecord | null {
+  const approvalVerdict = latestCurrentApprovalPassVerdict(lifecycle);
+  if (!approvalVerdict) return null;
+  if (lifecycle.lastReviewVerdictId !== approvalVerdict.id) return null;
+  if (approvalVerdict.verdict !== "pass" || isMergeGateVerdict(approvalVerdict)) return null;
+  if (approvalVerdict.evidence.length === 0 || approvalVerdict.acceptanceResults.some((result) => !result.satisfied)) return null;
+
+  const gateVerdict = lifecycle.reviewVerdicts.find((verdict) => verdict.id === gate.id && isMergeGateVerdict(verdict)) ?? null;
+  if (!gateVerdict) return null;
+  const repairAcceptedAt = Date.parse(repairReport.acceptedAt);
+  const approvalSubmittedAt = Date.parse(approvalVerdict.submittedAt);
+  const gateFailedAt = Date.parse(gateVerdict.submittedAt);
+  if (!Number.isFinite(repairAcceptedAt) || !Number.isFinite(approvalSubmittedAt) || !Number.isFinite(gateFailedAt)) return null;
+  if (approvalSubmittedAt <= repairAcceptedAt || approvalSubmittedAt <= gateFailedAt) return null;
+
+  const repairPullRequest = repairReport.pullRequest;
+  if (!repairPullRequest) return null;
+  if (!hasRepairApprovalFeedback(lifecycle, approvalVerdict, repairPullRequest)) return null;
+  return approvalVerdict;
+}
+
+function hasRepairApprovalFeedback(
+  lifecycle: Pick<IssueLifecycleRecord, "reviewFeedback">,
+  verdict: IssueReviewVerdictRecord,
+  pullRequest: CompletionReportPullRequestRef,
+): boolean {
+  return lifecycle.reviewFeedback.some(
+    (feedback) =>
+      feedback.runId === verdict.runId &&
+      feedback.kind === "review" &&
+      feedback.event === "APPROVE" &&
+      feedback.pullRequest.number === pullRequest.number &&
+      feedback.pullRequest.url === pullRequest.url &&
+      feedback.pullRequest.headSha === pullRequest.headSha,
+  );
 }
 
 function scrubMergeGateVerdicts(verdicts: IssueReviewVerdictRecord[], gateId: string): IssueReviewVerdictRecord[] {

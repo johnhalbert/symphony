@@ -35,7 +35,14 @@ import {
   type MergeGateCheckEvidence,
 } from "../writeback/TransitionPolicy.js";
 import type { WritebackOperation, WritebackProcessor } from "../writeback/WritebackOutbox.js";
-import { inactiveMergeGateLifecyclePatch, shouldSilentlyRetireMergeGate, supersededMergeGateLifecyclePatch } from "./MergeGateLifecycle.js";
+import {
+  canAutoResolveMergeGateOnCheckPass,
+  hasRepairGateClearance,
+  inactiveMergeGateLifecyclePatch,
+  isActiveMergeGate,
+  shouldSilentlyRetireMergeGate,
+  supersededMergeGateLifecyclePatch,
+} from "./MergeGateLifecycle.js";
 
 const MERGE_GATE_REVIEWER = "symphony-merge-gate";
 
@@ -158,7 +165,21 @@ export class MergePolicyService {
     const approvalVerdict = latestCurrentApprovalPassVerdict(activeLifecycle);
     const existingGateVerdict = findMergeGateVerdict(activeLifecycle, gateId);
     const decision = await this.evaluateChecks(github, headSha, pullRequest, gateId, activeLifecycle);
-    if (decision.kind === "passed" && approvalVerdict && (existingGateVerdict || activeLifecycle.mergeGate?.id === gateId)) {
+    if (decision.kind === "passed") {
+      const gate = activeLifecycle.mergeGate;
+      if (gate?.id === gateId && isActiveMergeGate(gate)) {
+        if (gate.status === "blocked") return { status: "blocked", gate: gateStatusFromState(gate) };
+        if (gate.status === "repair_dispatched" && !hasRepairGateClearance(activeLifecycle, gate)) {
+          return { status: "repair_dispatched", gate: gateStatusFromState(gate) };
+        }
+      }
+    }
+    if (
+      decision.kind === "passed" &&
+      approvalVerdict &&
+      (existingGateVerdict || activeLifecycle.mergeGate?.id === gateId) &&
+      canAutoResolveMergeGateOnCheckPass(activeLifecycle, gateId)
+    ) {
       const inactiveGatePatch =
         activeLifecycle.mergeGate?.id === gateId
           ? inactiveMergeGateLifecyclePatch(activeLifecycle, activeLifecycle.mergeGate, "resolved")
@@ -224,6 +245,15 @@ export class MergePolicyService {
       return { status: "checks_pending", gate: decision.gate };
     }
 
+    if (decision.kind === "passed") {
+      const gate = activeLifecycle.mergeGate;
+      if (gate?.id === gateId && isActiveMergeGate(gate)) {
+        if (gate.status === "blocked") return { status: "blocked", gate: gateStatusFromState(gate) };
+        if (gate.status === "repair_dispatched" && !hasRepairGateClearance(activeLifecycle, gate)) {
+          return { status: "repair_dispatched", gate: gateStatusFromState(gate) };
+        }
+      }
+    }
     const verdict = latestCurrentApprovalPassVerdict(activeLifecycle);
     const workerRun = report && this.options.runStore ? await this.options.runStore.getRun(report.runId) : null;
     this.validateLifecycle(activeLifecycle, report, verdict, workerRun, latestIssue);
