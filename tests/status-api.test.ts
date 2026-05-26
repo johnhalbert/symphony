@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -541,6 +541,73 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("protects issue breakdown preview/apply with a fail-closed token", async () => {
+    const config = testConfig(path.join(root, "apply-token"));
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    let applyCalls = 0;
+    const applyOptions: Array<{ dryRun?: boolean }> = [];
+    const orchestrator = Object.assign(fakeOrchestrator(), {
+      async applyIssueBreakdownPlan(_issueId: string, options: { dryRun?: boolean }) {
+        applyCalls += 1;
+        applyOptions.push(options);
+        return { status: "preview", plan: { id: "plan-1" }, operations: [] };
+      },
+    }) as unknown as Orchestrator;
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const noConfiguredToken = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        body: JSON.stringify({ dryRun: true }),
+      });
+      expect(noConfiguredToken.status).toBe(401);
+      expect(applyCalls).toBe(0);
+      (server as unknown as { options: { openWorkspaceToken: string } }).options.openWorkspaceToken = "secret";
+      const missing = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        body: JSON.stringify({ dryRun: true }),
+      });
+      const invalid = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        headers: { "x-symphony-token": "wrong" },
+        body: JSON.stringify({ dryRun: false }),
+      });
+      const valid = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+        body: JSON.stringify({ mode: "preview" }),
+      });
+      const validApply = await fetch(`${baseUrl}/api/v1/issues/issue-1/planning-run/apply`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+        body: JSON.stringify({ dryRun: false }),
+      });
+
+      expect(missing.status).toBe(401);
+      expect(invalid.status).toBe(401);
+      expect(valid.status).toBe(200);
+      expect(validApply.status).toBe(200);
+      expect(applyCalls).toBe(2);
+      expect(applyOptions).toEqual([{ dryRun: true }, { dryRun: false }]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves a redacted globally sorted activity feed from persisted transcripts", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
@@ -655,16 +722,19 @@ describe("StatusServer durable API", () => {
           totalItems: number;
           distinctRunsConsidered: number;
           transcriptEventsConsidered: number;
+          transcriptEventsTotal: number;
+          transcriptEventsIncluded: number;
+          transcriptEventsTruncated: boolean;
           syntheticRunEvents: number;
           writebackOperationsConsidered: number;
         };
-        source: { runStoreAvailable: boolean; writebackOutboxAvailable: boolean };
+        source: { runStoreAvailable: boolean; writebackOutboxAvailable: boolean; transcriptTailPerRun: number };
       };
       const secondPageResponse = await fetch(`${baseUrl}/api/v1/activity?offset=1&limit=1`);
       const secondPage = (await secondPageResponse.json()) as typeof firstPage;
       const issueResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-A&limit=100`);
       const issueBody = (await issueResponse.json()) as typeof firstPage;
-      const writebackResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-B&offset=1001&limit=10`);
+      const writebackResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-B&offset=500&limit=10`);
       const writebackText = await writebackResponse.text();
       const writebackBody = JSON.parse(writebackText) as typeof firstPage;
       const clampedResponse = await fetch(`${baseUrl}/api/v1/activity?limit=999`);
@@ -685,14 +755,18 @@ describe("StatusServer durable API", () => {
       });
       expect(firstPage.nextOffset).toBe(1);
       expect(firstPage.counts).toMatchObject({
-        totalItems: 1_005,
+        totalItems: 504,
         distinctRunsConsidered: 2,
-        transcriptEventsConsidered: 1_002,
+        transcriptEventsConsidered: 501,
+        transcriptEventsTotal: 1_002,
+        transcriptEventsIncluded: 501,
+        transcriptEventsTruncated: true,
         syntheticRunEvents: 2,
         writebackOperationsConsidered: 1,
       });
       expect(firstPage.source.runStoreAvailable).toBe(true);
       expect(firstPage.source.writebackOutboxAvailable).toBe(true);
+      expect(firstPage.source.transcriptTailPerRun).toBe(500);
       expect(firstPageText).not.toContain("PROMPT_SECRET");
       expect(firstPageText).not.toContain("PAYLOAD_SECRET");
       expect(secondPage.activity[0]?.issue.identifier).toBe("TEST-A");
@@ -726,6 +800,603 @@ describe("StatusServer durable API", () => {
       expect(writebackText).not.toContain("WRITEBACK_BODY_SECRET");
       expect(writebackText).not.toContain("/local/workspace/path");
       expect(clampedBody.limit).toBe(100);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves redacted legacy transcript rows without backfilling counts during GET", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-legacy-secret",
+      sessionId: "session-legacy-secret",
+      agentId: "agent-legacy-secret",
+      role: "worker",
+      issueId: "issue-legacy-secret",
+      issueIdentifier: "TEST-LEGACY-SECRET",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-LEGACY-SECRET",
+      workspacePath: path.join(config.workspace.root, "TEST-LEGACY-SECRET"),
+    });
+    await runStore.appendEvent({
+      runId: "run-legacy-secret",
+      at: "2030-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message:
+        "raw assistant SECRET_ACTIVITY token=activity-token access_token=activity-access refreshToken: activity-refresh github_token=activity-github client_secret: activity-client private_key=activity-private ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      payload: {
+        activitySource: "stream",
+        apiKey: "SECRET_API_KEY",
+        detail: "Bearer SECRET_BEARER",
+        access_token: "payload-access",
+        refreshToken: "payload-refresh",
+        github_token: "payload-github",
+        client_secret: "payload-client",
+        private_key: "payload-private",
+        tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+        tokenConfigured: true,
+      },
+    });
+    const metaPath = path.join(config.workspace.stateDir, "runs", "run-legacy-secret", "meta.json");
+    const metadata = JSON.parse(await readFile(metaPath, "utf8")) as { transcriptEventCount?: number };
+    delete metadata.transcriptEventCount;
+    await writeFile(metaPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    const beforeRead = await readFile(metaPath, "utf8");
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/run-legacy-secret/transcript`);
+      const activityResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-LEGACY-SECRET&limit=10`);
+      const transcriptText = await transcriptResponse.text();
+      const activityText = await activityResponse.text();
+
+      expect(transcriptResponse.status).toBe(200);
+      expect(activityResponse.status).toBe(200);
+      expect(`${transcriptText}\n${activityText}`).not.toContain("SECRET_ACTIVITY");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-token");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("SECRET_API_KEY");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("SECRET_BEARER");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-access");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-refresh");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-github");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-client");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("activity-private");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-access");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-refresh");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-github");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-client");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("payload-private");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("ghp_ABCDEFGH1");
+      expect(`${transcriptText}\n${activityText}`).not.toContain("sk-ABCDEFGH1");
+      expect(`${transcriptText}\n${activityText}`).toContain("inputTokens");
+      expect(`${transcriptText}\n${activityText}`).toContain("totalTokens");
+      expect(`${transcriptText}\n${activityText}`).toContain("tokenConfigured");
+      expect(`${transcriptText}\n${activityText}`).toContain("[redacted]");
+      expect(await readFile(metaPath, "utf8")).toBe(beforeRead);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves redacted run errors across public status surfaces without mutating persisted runs", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.upsertWorkspace({
+      workspaceKey: "TEST-RUN-ERROR",
+      issueId: "issue-run-error",
+      issueIdentifier: "TEST-RUN-ERROR",
+      path: path.join(config.workspace.root, "TEST-RUN-ERROR"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/TEST-RUN-ERROR",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-error-secret",
+      sessionId: "session-error-secret",
+      agentId: "agent-error-secret",
+      role: "worker",
+      issueId: "issue-run-error",
+      issueIdentifier: "TEST-RUN-ERROR",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-RUN-ERROR",
+      workspacePath: path.join(config.workspace.root, "TEST-RUN-ERROR"),
+      gitBranchName: "symphony/TEST-RUN-ERROR",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+    });
+    const rawError =
+      "failed SECRET_RUN_ERROR token=run-token access_token=run-access Bearer run-bearer ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7";
+    const rawCancelFailure = "cancel SECRET_CANCEL_FAILURE token=cancel-token client_secret: cancel-client";
+    await runStore.updateRun("run-error-secret", {
+      status: "cancelled",
+      completedAt: "2026-01-01T00:05:00.000Z",
+      error: rawError,
+      metadata: {
+        cancelFailed: true,
+        cancelFailedAt: "2026-01-01T00:05:01.000Z",
+        cancelFailedReason: rawCancelFailure,
+        cancelFailedSource: "cancel_ignored",
+      },
+    });
+    const tracker = new FakeTracker([
+      issue({
+        id: "issue-run-error",
+        identifier: "TEST-RUN-ERROR",
+        title: "Run error redaction",
+        state: "In Progress",
+      }),
+    ]);
+    const metaPath = path.join(config.workspace.stateDir, "runs", "run-error-secret", "meta.json");
+    const beforeRead = await readFile(metaPath, "utf8");
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([], { paused: ["TEST-RUN-ERROR"] }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      tracker,
+      trackerStateLists: testTrackerStateLists(),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const responses = await Promise.all([
+        fetch(`${baseUrl}/api/v1/runs/run-error-secret`),
+        fetch(`${baseUrl}/api/v1/issues/TEST-RUN-ERROR`),
+        fetch(`${baseUrl}/api/v1/issues/TEST-RUN-ERROR/runs`),
+        fetch(`${baseUrl}/api/v1/board`),
+        fetch(`${baseUrl}/api/v1/issue-board`),
+        fetch(`${baseUrl}/api/v1/board/issues/issue-run-error`),
+        fetch(`${baseUrl}/api/v1/state`),
+      ]);
+      const [runBody, issueBody, issueRunsBody, boardBody, issueBoardBody, boardDetailBody, stateBody] = await Promise.all(
+        responses.map(async (response) => {
+          expect(response.status).toBe(200);
+          return response.json() as Promise<Record<string, unknown>>;
+        }),
+      );
+      const responseText = JSON.stringify({ runBody, issueBody, issueRunsBody, boardBody, issueBoardBody, boardDetailBody, stateBody });
+
+      for (const raw of [
+        "SECRET_RUN_ERROR",
+        "run-token",
+        "run-access",
+        "run-bearer",
+        "ghp_ABCDEFGH1",
+        "sk-ABCDEFGH1",
+        "SECRET_CANCEL_FAILURE",
+        "cancel-token",
+        "cancel-client",
+      ]) {
+        expect(responseText).not.toContain(raw);
+      }
+      expect(responseText).toContain("failed");
+      expect(responseText).toContain("cancel");
+      expect(responseText).toContain("inputTokens");
+      expect(responseText).toContain("[redacted]");
+
+      const runRecord = runBody as {
+        error: string | null;
+        cancelFailedReason: string | null;
+        operatorLiveness: {
+          lastMessage: string | null;
+          cancelFailed: { reason: string | null };
+          timeline: Array<{ kind: string; detail: string | null }>;
+        };
+      };
+      expect(runRecord.error).toContain("[redacted]");
+      expect(runRecord.cancelFailedReason).toContain("[redacted]");
+      expect(runRecord.operatorLiveness.lastMessage).toContain("[redacted]");
+      expect(runRecord.operatorLiveness.cancelFailed.reason).toContain("[redacted]");
+      expect(runRecord.operatorLiveness.timeline.find((item) => item.kind === "run_terminal")?.detail).toContain("[redacted]");
+      expect(runRecord.operatorLiveness.timeline.find((item) => item.kind === "cancel_failed")?.detail).toContain("[redacted]");
+
+      const issue = issueBody as {
+        latestRun: { error: string | null };
+        issueDetails: IssueDetailsEnvelope;
+        operatorLiveness: typeof runRecord.operatorLiveness;
+      };
+      expect(issue.latestRun.error).toBe(runRecord.error);
+      expect(issue.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(issue.operatorLiveness.lastMessage).toBe(runRecord.operatorLiveness.lastMessage);
+
+      const issueRuns = issueRunsBody as {
+        issueDetails: IssueDetailsEnvelope;
+        runs: Array<{ runId: string; error: string | null; operatorLiveness: typeof runRecord.operatorLiveness }>;
+      };
+      const issueRun = issueRuns.runs.find((run) => run.runId === "run-error-secret");
+      expect(issueRuns.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(issueRun?.error).toBe(runRecord.error);
+      expect(issueRun?.operatorLiveness.lastMessage).toBe(runRecord.operatorLiveness.lastMessage);
+
+      const board = boardBody as { issues: Array<{ issueIdentifier: string | null; issueDetails: IssueDetailsEnvelope }> };
+      const issueBoard = issueBoardBody as { issues: Array<{ issueIdentifier: string | null; issueDetails: IssueDetailsEnvelope }> };
+      expect(board.issues.find((item) => item.issueIdentifier === "TEST-RUN-ERROR")?.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(issueBoard.issues.find((item) => item.issueIdentifier === "TEST-RUN-ERROR")?.issueDetails.latestRun.error).toBe(runRecord.error);
+
+      const boardDetail = boardDetailBody as {
+        latestRun: { error: string | null };
+        issueDetails: IssueDetailsEnvelope;
+        boardCard: { issueDetails: IssueDetailsEnvelope } | null;
+        runs: Array<{ runId: string; error: string | null; operatorLiveness: typeof runRecord.operatorLiveness }>;
+        operatorLiveness: typeof runRecord.operatorLiveness;
+      };
+      expect(boardDetail.latestRun.error).toBe(runRecord.error);
+      expect(boardDetail.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(boardDetail.boardCard?.issueDetails.latestRun.error).toBe(runRecord.error);
+      expect(boardDetail.runs.find((run) => run.runId === "run-error-secret")?.error).toBe(runRecord.error);
+      expect(boardDetail.operatorLiveness.lastMessage).toBe(runRecord.operatorLiveness.lastMessage);
+
+      const state = stateBody as { operatorView: { paused: Array<{ issueDetails: IssueDetailsEnvelope }> } };
+      expect(state.operatorView.paused.find((item) => item.issueDetails.issue.identifier === "TEST-RUN-ERROR")?.issueDetails.latestRun.error).toBe(
+        runRecord.error,
+      );
+      expect(await readFile(metaPath, "utf8")).toBe(beforeRead);
+      expect(beforeRead).toContain(rawError);
+      expect(beforeRead).toContain(rawCancelFailure);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves redacted live liveness diagnostics across public status surfaces without mutating live rows", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const liveRunning = liveRunningFixture(config, "TEST-LIVE-SECRET", "In Progress");
+    const rawLastEvent = "progress SECRET_LIVE_EVENT token=event-token";
+    const rawLastMessage =
+      "live SECRET_LIVE_MESSAGE token=live-token access_token=live-access Bearer live-bearer ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7";
+    const rawCancelReason = "cancel SECRET_LIVE_CANCEL token=cancel-token client_secret: cancel-client";
+    const rawHarnessStopReason = "harness SECRET_LIVE_HARNESS Bearer harness-bearer github_token=harness-github private_key: harness-private";
+    const rawNestedCancelReason = "nested SECRET_LIVE_NESTED refreshToken: nested-refresh sk-HIJKLMNO1";
+
+    liveRunning.runId = "run-live-secret";
+    liveRunning.sessionId = "session-live-secret";
+    liveRunning.lastEvent = rawLastEvent;
+    liveRunning.lastMessage = rawLastMessage;
+    liveRunning.lastEventAt = "2026-01-01T00:00:03.000Z";
+    liveRunning.liveness = {
+      status: "cancelling",
+      activeRunId: "run-live-secret",
+      lastActivityAt: "2026-01-01T00:00:03.000Z",
+      secondsSinceLastActivity: 2,
+      stallTimeoutMs: 300_000,
+    };
+    liveRunning.cancellation = {
+      requested: true,
+      requestedAt: "2026-01-01T00:00:02.000Z",
+      source: "operator",
+      reason: rawCancelReason,
+      abortSignalled: true,
+      harnessStopRequestedAt: "2026-01-01T00:00:02.000Z",
+      harnessStopFailedAt: "2026-01-01T00:00:04.000Z",
+      harnessStopFailedReason: rawHarnessStopReason,
+      cancelFailed: {
+        tracked: true,
+        active: true,
+        phase: "failed",
+        at: "2026-01-01T00:00:04.000Z",
+        reason: rawNestedCancelReason,
+        source: "harness_stop",
+      },
+      suppressRetryOnExit: true,
+    };
+    await runStore.startRun({
+      runId: liveRunning.runId,
+      sessionId: liveRunning.sessionId,
+      agentId: "agent-live-secret",
+      role: "worker",
+      issueId: liveRunning.issueId,
+      issueIdentifier: liveRunning.issueIdentifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: liveRunning.issueIdentifier,
+      workspacePath: path.join(config.workspace.root, liveRunning.issueIdentifier),
+    });
+    const tracker = new FakeTracker([
+      issue({
+        id: liveRunning.issueId,
+        identifier: liveRunning.issueIdentifier,
+        title: "Live diagnostic redaction",
+        state: "In Progress",
+      }),
+    ]);
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([liveRunning]),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      tracker,
+      trackerStateLists: testTrackerStateLists(),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const responses = await Promise.all([
+        fetch(`${baseUrl}/api/v1/runs/${liveRunning.runId}`),
+        fetch(`${baseUrl}/api/v1/issues/${liveRunning.issueIdentifier}`),
+        fetch(`${baseUrl}/api/v1/issues/${liveRunning.issueIdentifier}/runs`),
+        fetch(`${baseUrl}/api/v1/board`),
+        fetch(`${baseUrl}/api/v1/issue-board`),
+        fetch(`${baseUrl}/api/v1/board/issues/${liveRunning.issueId}`),
+      ]);
+      const [runBody, issueBody, issueRunsBody, boardBody, issueBoardBody, boardDetailBody] = await Promise.all(
+        responses.map(async (response) => {
+          expect(response.status).toBe(200);
+          return response.json() as Promise<Record<string, unknown>>;
+        }),
+      );
+      const responseText = JSON.stringify({ runBody, issueBody, issueRunsBody, boardBody, issueBoardBody, boardDetailBody });
+
+      for (const raw of [
+        "SECRET_LIVE_EVENT",
+        "event-token",
+        "SECRET_LIVE_MESSAGE",
+        "live-token",
+        "live-access",
+        "live-bearer",
+        "ghp_ABCDEFGH1",
+        "sk-ABCDEFGH1",
+        "SECRET_LIVE_CANCEL",
+        "cancel-token",
+        "cancel-client",
+        "SECRET_LIVE_HARNESS",
+        "harness-bearer",
+        "harness-github",
+        "harness-private",
+        "SECRET_LIVE_NESTED",
+        "nested-refresh",
+        "sk-HIJKLMNO1",
+      ]) {
+        expect(responseText).not.toContain(raw);
+      }
+      expect(responseText).toContain("[redacted]");
+      expect(responseText).toContain("inputTokens");
+
+      type PublicLiveLiveness = {
+        lastTranscriptEvent: string | null;
+        lastMessage: string | null;
+        cancellation: {
+          reason: string | null;
+          harnessStopFailedReason?: string | null;
+          cancelFailed?: { reason: string | null };
+        };
+        cancelFailed: { reason: string | null };
+        timeline: Array<{ kind: string; detail: string | null }>;
+      };
+      const runLiveness = (runBody as { operatorLiveness: PublicLiveLiveness }).operatorLiveness;
+      const timelineDetail = (kind: string) => runLiveness.timeline.find((item) => item.kind === kind)?.detail ?? "";
+      expect(runLiveness.lastTranscriptEvent ?? "").toContain("[redacted]");
+      expect(runLiveness.lastMessage ?? "").toContain("[redacted]");
+      expect(runLiveness.cancellation.reason ?? "").toContain("[redacted]");
+      expect(runLiveness.cancellation.harnessStopFailedReason ?? "").toContain("[redacted]");
+      expect(runLiveness.cancellation.cancelFailed?.reason ?? "").toContain("[redacted]");
+      expect(runLiveness.cancelFailed.reason ?? "").toContain("[redacted]");
+      expect(timelineDetail("last_activity")).toContain("[redacted]");
+      expect(timelineDetail("cancellation_requested")).toContain("[redacted]");
+      expect(timelineDetail("harness_stop_failed")).toContain("[redacted]");
+
+      const issueLive = (issueBody as {
+        live: { lastEvent: string | null; lastMessage: string | null; cancellation: PublicLiveLiveness["cancellation"]; operatorLiveness: PublicLiveLiveness };
+        operatorLiveness: PublicLiveLiveness;
+      }).live;
+      expect(issueLive.lastEvent).toBe(runLiveness.lastTranscriptEvent);
+      expect(issueLive.lastMessage).toBe(runLiveness.lastMessage);
+      expect(issueLive.cancellation.reason).toBe(runLiveness.cancellation.reason);
+      expect(issueLive.cancellation.harnessStopFailedReason).toBe(runLiveness.cancellation.harnessStopFailedReason);
+      expect(issueLive.cancellation.cancelFailed?.reason).toBe(runLiveness.cancellation.cancelFailed?.reason);
+      expect(issueLive.operatorLiveness.lastMessage).toBe(runLiveness.lastMessage);
+      expect((issueBody as { operatorLiveness: PublicLiveLiveness }).operatorLiveness.lastMessage).toBe(runLiveness.lastMessage);
+
+      const issueRuns = issueRunsBody as { runs: Array<{ runId: string; operatorLiveness: PublicLiveLiveness }> };
+      expect(issueRuns.runs.find((run) => run.runId === liveRunning.runId)?.operatorLiveness.lastMessage).toBe(runLiveness.lastMessage);
+      const boardDetail = boardDetailBody as { live: { lastMessage: string | null }; operatorLiveness: PublicLiveLiveness };
+      expect(boardDetail.live.lastMessage).toBe(runLiveness.lastMessage);
+      expect(boardDetail.operatorLiveness.cancelFailed.reason).toBe(runLiveness.cancelFailed.reason);
+
+      expect(liveRunning.lastEvent).toBe(rawLastEvent);
+      expect(liveRunning.lastMessage).toBe(rawLastMessage);
+      expect(liveRunning.cancellation.reason).toBe(rawCancelReason);
+      expect(liveRunning.cancellation.harnessStopFailedReason).toBe(rawHarnessStopReason);
+      expect(liveRunning.cancellation.cancelFailed?.reason).toBe(rawNestedCancelReason);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves redacted cursor-derived transcript rows without backfilling counts during GET", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-cursor-secret",
+      sessionId: "session-cursor-secret",
+      agentId: "agent-cursor-secret",
+      role: "worker",
+      issueId: "issue-cursor-secret",
+      issueIdentifier: "TEST-CURSOR-SECRET",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-CURSOR-SECRET",
+      workspacePath: path.join(config.workspace.root, "TEST-CURSOR-SECRET"),
+    });
+    await runStore.appendEvent({
+      runId: "run-cursor-secret",
+      at: "2030-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message:
+        "assistant stream SECRET_STREAM token=stream-token access_token=stream-access github_token=stream-github client_secret: stream-client private_key=stream-private ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      payload: {
+        type: "progress",
+        activitySource: "stream",
+        message:
+          "assistant stream payload SECRET_STREAM_PAYLOAD token=stream-payload-token client_secret: stream-payload-client inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      },
+    });
+    await runStore.appendEvent({
+      runId: "run-cursor-secret",
+      at: "2030-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message:
+        "text delta SECRET_DELTA token=delta-token apiKey=delta-api private_key=delta-private sk-HIJKLMNO1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      payload: {
+        type: "progress",
+        activitySource: "delta",
+        message:
+          "text delta payload SECRET_DELTA_PAYLOAD refreshToken: delta-refresh github_token=delta-github inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      },
+    });
+    await runStore.appendEvent({
+      runId: "run-cursor-secret",
+      at: "2030-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "run_diagnostic",
+      message:
+        "status diagnostic SECRET_DIAGNOSTIC token=diagnostic-token client_secret: diagnostic-client private_key=diagnostic-private inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      payload: {
+        type: "run_diagnostic",
+        code: "cursor_stream_status_error",
+        status: "ERROR",
+        message:
+          "diagnostic payload SECRET_DIAGNOSTIC_PAYLOAD access_token=diagnostic-access github_token=diagnostic-github inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+      },
+    });
+    await runStore.appendEvent({
+      runId: "run-cursor-secret",
+      at: "2030-01-01T00:00:03.000Z",
+      source: "cursor",
+      eventType: "status",
+      message: "Cursor status ERROR",
+      payload: {
+        kind: "status",
+        status: "ERROR",
+        messagePreview:
+          "cursor status SECRET_CURSOR_STATUS token=status-token access_token=status-access github_token=status-github client_secret: status-client private_key=status-private ghp_QRSTUVWX1 sk-QRSTUVWX1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+        truncated: false,
+      },
+    });
+    const metaPath = path.join(config.workspace.stateDir, "runs", "run-cursor-secret", "meta.json");
+    const metadata = JSON.parse(await readFile(metaPath, "utf8")) as { transcriptEventCount?: number };
+    delete metadata.transcriptEventCount;
+    await writeFile(metaPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    const beforeRead = await readFile(metaPath, "utf8");
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/run-cursor-secret/transcript`);
+      const activityResponse = await fetch(`${baseUrl}/api/v1/activity?issue=TEST-CURSOR-SECRET&limit=10`);
+      const transcriptText = await transcriptResponse.text();
+      const activityText = await activityResponse.text();
+      const combinedText = `${transcriptText}\n${activityText}`;
+
+      expect(transcriptResponse.status).toBe(200);
+      expect(activityResponse.status).toBe(200);
+      for (const rawValue of [
+        "SECRET_STREAM",
+        "stream-token",
+        "stream-access",
+        "stream-github",
+        "stream-client",
+        "stream-private",
+        "ghp_ABCDEFGH1",
+        "sk-ABCDEFGH1",
+        "SECRET_STREAM_PAYLOAD",
+        "stream-payload-token",
+        "stream-payload-client",
+        "SECRET_DELTA",
+        "delta-token",
+        "delta-api",
+        "delta-private",
+        "sk-HIJKLMNO1",
+        "SECRET_DELTA_PAYLOAD",
+        "delta-refresh",
+        "delta-github",
+        "SECRET_DIAGNOSTIC",
+        "diagnostic-token",
+        "diagnostic-client",
+        "diagnostic-private",
+        "SECRET_DIAGNOSTIC_PAYLOAD",
+        "diagnostic-access",
+        "diagnostic-github",
+        "SECRET_CURSOR_STATUS",
+        "status-token",
+        "status-access",
+        "status-github",
+        "status-client",
+        "status-private",
+        "ghp_QRSTUVWX1",
+        "sk-QRSTUVWX1",
+      ]) {
+        expect(combinedText).not.toContain(rawValue);
+      }
+      expect(combinedText).toContain("activitySource");
+      expect(combinedText).toContain("stream");
+      expect(combinedText).toContain("delta");
+      expect(combinedText).toContain("cursor_stream_status_error");
+      expect(combinedText).toContain("\"eventType\": \"status\"");
+      expect(combinedText).toContain("\"kind\": \"status\"");
+      expect(combinedText).toContain("inputTokens");
+      expect(combinedText).toContain("totalTokens");
+      expect(combinedText).toContain("tokenConfigured");
+      expect(combinedText).toContain("[redacted]");
+      expect(await readFile(metaPath, "utf8")).toBe(beforeRead);
     } finally {
       await server.stop();
     }
@@ -847,10 +1518,13 @@ describe("StatusServer durable API", () => {
           totalItems: number;
           distinctRunsConsidered: number;
           transcriptEventsConsidered: number;
+          transcriptEventsTotal: number;
+          transcriptEventsIncluded: number;
+          transcriptEventsTruncated: boolean;
           syntheticRunEvents: number;
           writebackOperationsConsidered: number;
         };
-        source: { kind: string; runStoreAvailable: boolean; writebackOutboxAvailable: boolean };
+        source: { kind: string; runStoreAvailable: boolean; writebackOutboxAvailable: boolean; transcriptTailPerRun: number };
       };
 
       expect(response.status).toBe(200);
@@ -860,10 +1534,13 @@ describe("StatusServer durable API", () => {
         totalItems: 0,
         distinctRunsConsidered: 0,
         transcriptEventsConsidered: 0,
+        transcriptEventsTotal: 0,
+        transcriptEventsIncluded: 0,
+        transcriptEventsTruncated: false,
         syntheticRunEvents: 0,
         writebackOperationsConsidered: 0,
       });
-      expect(body.source).toEqual({ kind: "durable_activity", runStoreAvailable: false, writebackOutboxAvailable: false });
+      expect(body.source).toEqual({ kind: "durable_activity", runStoreAvailable: false, writebackOutboxAvailable: false, transcriptTailPerRun: 500 });
     } finally {
       await server.stop();
     }

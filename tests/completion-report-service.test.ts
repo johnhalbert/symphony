@@ -8,6 +8,7 @@ import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleS
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
+import type { OperatorApprovalRecord } from "../src/core/approval/OperatorApprovalService.js";
 import type {
   CompletionReportPullRequestCheckResult,
   CompletionReportPullRequestPublication,
@@ -340,6 +341,74 @@ describe("CompletionReportService", () => {
     expect((await lifecycleStore.get("issue-1"))?.completionReports).toHaveLength(1);
   });
 
+  it("scopes publication approval setup drains to the report writeback keys", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.requiredForPublication = true;
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const runStore = new FileRunTranscriptStore(root);
+    const outbox = new FileWritebackOutboxStore(root);
+    await startRun(runStore);
+    const siblingKey = "issue-create:issue-1:plan-1:0:hash";
+    await outbox.enqueueOnce({
+      idempotencyKey: siblingKey,
+      kind: "issue_create",
+      issueId: "issue-1",
+      runId: "run-plan-1",
+      payload: {
+        parentIssueId: "issue-1",
+        planId: "plan-1",
+        proposedIssueIndex: 0,
+        title: "Child issue",
+        description: "Description",
+        acceptanceCriteria: ["Done"],
+        requestedLabels: ["planning"],
+        dependencies: [],
+        dedupeKey: "issue-breakdown:plan-1:0:hash",
+        payloadHash: "hash",
+      },
+    });
+    const processedKeyBatches: string[][] = [];
+    const writebackProcessor = {
+      async processDue(options: { idempotencyKeys?: readonly string[] } = {}) {
+        const keys = [...(options.idempotencyKeys ?? [])];
+        processedKeyBatches.push(keys);
+        for (const key of keys) {
+          const record = await outbox.get(key);
+          if (record) await outbox.markSucceeded(record);
+        }
+      },
+    };
+    const service = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: outbox,
+      writebackProcessor,
+      runStore,
+      operatorApproval: {
+        async requestPublicationApproval(input) {
+          return approvalRecord(input.issueId, input.issueIdentifier, input.runId, input.evidenceCursor, input.action);
+        },
+        async waitForPublicationApprovalRequest(record) {
+          return record;
+        },
+      },
+    });
+
+    await service.submitCompletionReport(report(), contextWithWorkspace());
+
+    expect(processedKeyBatches).toHaveLength(1);
+    expect(processedKeyBatches[0]).not.toContain(siblingKey);
+    expect(processedKeyBatches[0]?.every((key) => key.includes("completion-report:idem-1"))).toBe(true);
+    await expect(outbox.get(siblingKey)).resolves.toMatchObject({ status: "pending" });
+  });
+
   it("rejects reports for a different active run", async () => {
     const { service } = fixture();
 
@@ -543,4 +612,29 @@ class FakePublisher implements CompletionReportPullRequestPublisher {
     this.checkInputs.push(input);
     return this.checks;
   }
+}
+
+function approvalRecord(
+  issueId: string,
+  issueIdentifier: string,
+  runId: string,
+  evidenceCursor: string,
+  action: OperatorApprovalRecord["action"],
+): OperatorApprovalRecord {
+  return {
+    requestId: `approval:${runId}:${evidenceCursor}`,
+    status: "pending",
+    issueId,
+    issueIdentifier,
+    runId,
+    evidenceCursor,
+    dedupeKey: `${runId}:${evidenceCursor}`,
+    action,
+    requestedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: null,
+    resolvedAt: null,
+    resolvedBy: null,
+    decision: null,
+    staleReason: null,
+  };
 }

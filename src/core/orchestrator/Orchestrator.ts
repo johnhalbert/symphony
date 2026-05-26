@@ -28,6 +28,7 @@ import {
   latestFreshIssueBreakdownPlan,
   renderIssueBreakdownPlanSummary,
 } from "../IssueBreakdownPlanService.js";
+import { IssueBreakdownPlanApplyService } from "../IssueBreakdownPlanApplyService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
   DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE,
@@ -44,6 +45,7 @@ import {
   type TranscriptEvent,
   type UpdateRunInput,
 } from "../persistence/RunTranscriptStore.js";
+import { sanitizeAgentEventForPublicOutput } from "../transcript/TranscriptProjection.js";
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
   buildWorkerHandoffPacket,
@@ -175,7 +177,9 @@ interface ReviewerDispatchEvidence {
   runDigest: string[];
 }
 
-type WorkerDispatchDecision = { action: "dispatch"; runPhase: AgentRunPhase } | { action: "skip"; reason: string };
+type WorkerDispatchDecision =
+  | { action: "dispatch"; runPhase: AgentRunPhase }
+  | { action: "skip"; reason: string };
 
 export interface RetryEntry {
   issueId: string;
@@ -486,6 +490,24 @@ export class Orchestrator {
     return { queued: true, issue, reason: "explicit_request" };
   }
 
+  async applyIssueBreakdownPlan(issueIdOrIdentifier: string, options: { dryRun?: boolean } = {}) {
+    if (!this.config.issueBreakdown.enabled || !this.config.issueBreakdown.applyToLinear.enabled) {
+      throw new SymphonyError("invalid_request", "Issue breakdown Linear application is disabled");
+    }
+    if (!this.options.lifecycleStore) {
+      throw new SymphonyError("invalid_request", "Issue breakdown Linear application requires a lifecycle store");
+    }
+    const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
+    const issue = refreshed[0];
+    if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    const service = new IssueBreakdownPlanApplyService({
+      config: this.config,
+      lifecycleStore: this.options.lifecycleStore,
+      writeback: this.options.writeback,
+    });
+    return options.dryRun === true ? service.previewLatestFreshPlan(issue) : service.applyLatestFreshPlan(issue);
+  }
+
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
@@ -502,7 +524,6 @@ export class Orchestrator {
       pullRequestPublisher: publisher,
     }).resumeApprovedPublication({ approval: request, issue });
     if (!result) return false;
-    await this.options.writeback?.processDue();
     return true;
   }
 
@@ -515,9 +536,9 @@ export class Orchestrator {
       lifecycleStore: this.options.lifecycleStore,
       writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+      ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
     }).recordPublicationApprovalTerminal({ approval: request, issue });
-    if (!result) return false;
-    await this.options.writeback?.processDue();
+    if (result.length === 0) return false;
     return true;
   }
 
@@ -1041,9 +1062,22 @@ export class Orchestrator {
     if (!this.passesIssueBreakdownRouting(issue)) return { action: "dispatch", runPhase: "implementation" };
     if (!this.options.lifecycleStore) return { action: "skip", reason: "planning_required_no_lifecycle_store" };
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.config);
+    if (plan === null) return { action: "dispatch", runPhase: "issue_breakdown" };
+    if (this.config.issueBreakdown.applyToLinear.enabled) {
+      return {
+        action: "skip",
+        reason:
+          plan.applicationStatus === "applied"
+            ? "issue_breakdown_applied_to_linear"
+            : plan.applicationStatus === "blocked"
+              ? "issue_breakdown_apply_blocked"
+              : "issue_breakdown_apply_required",
+      };
+    }
     return {
       action: "dispatch",
-      runPhase: latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) === null ? "issue_breakdown" : "implementation",
+      runPhase: "implementation",
     };
   }
 
@@ -1305,7 +1339,8 @@ export class Orchestrator {
     events: AsyncIterable<AgentEvent>,
     context: { workspace: Workspace; prompt: string; attempt: number | null; turnNumber: number },
   ): Promise<void> {
-    for await (const event of events) {
+    for await (const rawEvent of events) {
+      const event = sanitizeAgentEventForPublicOutput(rawEvent);
       const eventAt = new Date(event.at ?? Date.now());
       if (event.type === "run_status") {
         entry.sdkRunStatus = event.sdkStatus;
@@ -1834,6 +1869,10 @@ export class Orchestrator {
     runPhase: AgentRunPhase = "implementation",
   ): void {
     this.clearRetry(issueId);
+    if (this.stopped) {
+      this.claimed.delete(issueId);
+      return;
+    }
     const dueAtMs = Date.now() + delayMs;
     const timer = setTimeout(() => {
       void this.onRetryTimer(issueId);

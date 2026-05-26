@@ -2,6 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { StatusServer } from "../src/app/http.js";
+import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import {
   CompletionReportService,
   PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
@@ -20,12 +22,18 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import {
+  planIssueBreakdownApplicationWritebacks,
+  planIssueBreakdownFinalizationWritebacks,
+} from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService } from "../src/core/IssueBreakdownPlanService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
 import {
   FileIssueLifecycleStore,
   type IssueCompletionReportRecord,
+  type IssueBreakdownCreatedIssueRef,
+  type IssueBreakdownPlanRecord,
   type IssueLifecyclePatch,
   type IssueReviewVerdictRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
@@ -34,12 +42,29 @@ import type {
   RemotePullRequestReviewEvidence,
 } from "../src/core/review/PullRequestReviewEvidenceService.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
-import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
+import type {
+  TrackerCommentInput,
+  TrackerIssueCreateInput,
+  TrackerIssueRelationInput,
+  TrackerTransitionInput,
+  TrackerWriteResult,
+  TrackerWriter,
+} from "../src/core/tracker/TrackerWriter.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
-import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
+import {
+  FileWritebackOutboxStore,
+  ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+  ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
+  WritebackProcessor,
+} from "../src/core/writeback/WritebackOutbox.js";
+import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
-import type { Issue, TokenCounts } from "../src/core/types.js";
+import type { Issue, TokenCounts, TrackerStateLists } from "../src/core/types.js";
 import { issue, testConfig } from "./helpers.js";
+
+type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
+type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
+type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
 
 describe("Orchestrator", () => {
   let root: string;
@@ -184,24 +209,21 @@ describe("Orchestrator", () => {
     });
   }, 10_000);
 
-  it("dispatches a scoped conflict-fix worker from the merge conflicts state", async () => {
+  it("does not apply accepted issue breakdown plans during normal dispatch", async () => {
     const config = testConfig(root);
     config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
     config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
     config.issueBreakdown.planningLabels = ["planning"];
-    config.mergePolicy.mode = "gated";
-    config.mergePolicy.conflictsState = "Approved with Conflicts";
-    config.mergePolicy.maxConflictFixTurns = 3;
-    config.tracker.activeStates = ["Todo", "In Progress"];
-    const candidate = issue({ state: "Approved with Conflicts", labels: ["planning"] });
-    const requestedStates: string[][] = [];
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return [];
+        return [candidate];
       },
-      async fetchIssuesByStates(states) {
-        requestedStates.push(states);
-        return states.includes("Approved with Conflicts") ? [candidate] : [];
+      async fetchIssuesByStates() {
+        return [];
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -209,81 +231,8 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-    await lifecycleStore.ensureIssue(candidate, {
-      phase: "merge_conflict_resolution",
-      mergeConflict: mergeConflictRecord(),
-    });
-    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-    const harness = new FakeHarness();
-    const orchestrator = new Orchestrator({
-      config,
-      tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
-      harness,
-      logger,
-      promptTemplate: "Work on {{ issue.identifier }}",
-      lifecycleStore,
-      runStore,
-    });
-
-    await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1);
-    await waitFor(() => orchestrator.snapshot().counts.running === 0);
-    await orchestrator.stop();
-
-    expect(harness.runs[0]?.ctx.runPhase).toBe("merge_conflict_resolution");
-    expect(harness.runs[0]?.prompt).toContain("submit_merge_conflict_resolution");
-    expect(harness.runs[0]?.prompt).toContain('resolutionStatus="blocked"');
-    expect(harness.runs[0]?.prompt).toContain("previousHeadSha");
-    expect(harness.runs[0]?.prompt).toContain("baseHeadSha");
-    expect(harness.runs[0]?.prompt).not.toContain("submit_issue_breakdown_plan");
-    expect(requestedStates).toContainEqual(["Approved with Conflicts"]);
-    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "merge_conflict_resolution" })).resolves.toMatchObject({
-      runPhase: "merge_conflict_resolution",
-      runKind: "implementation",
-    });
-    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-      mergeConflict: {
-        fixTurnCount: 1,
-        attemptRunIds: expect.arrayContaining(["fake-issue-1-1"]),
-      },
-    });
-  }, 10_000);
-
-  it("preserves blocked lifecycle metadata for exhausted conflict loops still in the conflict state", async () => {
-    const config = testConfig(root);
-    config.mergePolicy.mode = "gated";
-    config.mergePolicy.conflictsState = "Approved with Conflicts";
-    config.mergePolicy.maxConflictFixTurns = 3;
-    config.reviewLoop.blockedStates = ["Blocked"];
-    config.tracker.activeStates = ["Todo", "In Progress"];
-    const candidate = issue({ state: "Approved with Conflicts" });
-    const tracker: TrackerClient = {
-      async fetchCandidateIssues() {
-        return [];
-      },
-      async fetchIssuesByStates(states) {
-        return states.includes("Approved with Conflicts") ? [candidate] : [];
-      },
-      async fetchIssueStatesByIds() {
-        return [candidate];
-      },
-    };
-    const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-    await lifecycleStore.ensureIssue(candidate, {
-      phase: "blocked",
-      blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
-      mergeConflict: {
-        ...mergeConflictRecord(),
-        status: "blocked",
-        resolutionStatus: "blocked",
-        fixTurnCount: 3,
-        blockedAt: "2026-01-01T00:00:01.000Z",
-        blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
-      },
-    });
-    const harness = new FakeHarness();
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const writer = new StateChangingWriter(() => undefined);
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -293,114 +242,90 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
       lifecycleStore,
       runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      writeback: new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000),
     });
 
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
     await orchestrator.refreshNow();
     await settleOrchestratorExit();
     await orchestrator.stop();
 
-    expect(harness.runs).toHaveLength(0);
-    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-      phase: "blocked",
-      blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
-      mergeConflict: {
-        status: "blocked",
-        resolutionStatus: "blocked",
-        fixTurnCount: 3,
-        blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
-      },
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(writer.issueCreates).toEqual([]);
+    expect(harness.runs.filter((run) => run.ctx.runPhase === "implementation")).toHaveLength(0);
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("not_requested");
+    expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs).toEqual([]);
+  }, 10_000);
+
+  it("startup processDue skips superseded issue breakdown children, relations, and comments", async () => {
+    const fixture = await createIssueBreakdownStartupFixture(root, { scenario: "superseded" });
+
+    await fixture.orchestrator.start();
+    await fixture.orchestrator.stop();
+    const lifecycle = await fixture.lifecycleStore.get(fixture.parentIssue.id);
+    const planA = lifecycle?.issueBreakdownPlans.find((plan) => plan.id === fixture.supersededPlan.id);
+
+    for (const key of fixture.replayOperationKeys) {
+      await expect(fixture.outboxStore.get(key)).resolves.toMatchObject({
+        status: "skipped",
+        lastError: ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
+        resultMessage: ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
+      });
+    }
+    await expectStartupReplayActivitySkipReasons(fixture, {
+      code: "issue_breakdown_plan_not_current",
+      message: "Issue breakdown writeback is not bound to the current plan.",
     });
+    expect(fixture.writer.issueCreates).toEqual([]);
+    expect(fixture.writer.issueRelations).toEqual([]);
+    expect(fixture.writer.comments).toEqual([]);
+    expect(lifecycle?.lastIssueBreakdownPlanId).toBe(fixture.currentPlan?.id);
+    expect(planA).toMatchObject({ applicationStatus: "pending", applicationBlockedReason: null });
   });
 
-  it("blocks after three conflict-fix runs that exit without MCP handoff", async () => {
-    const config = testConfig(root);
-    config.mergePolicy.mode = "gated";
-    config.mergePolicy.conflictsState = "Approved with Conflicts";
-    config.mergePolicy.maxConflictFixTurns = 3;
-    config.reviewLoop.blockedStates = ["Blocked"];
-    config.tracker.activeStates = ["Todo", "In Progress"];
-    config.writeback.enabled = true;
-    config.writeback.mode = "live";
-    const candidate = issue({ state: "Approved with Conflicts" });
-    let currentState = "Approved with Conflicts";
-    const conflictStateQueries: string[][] = [];
-    const tracker: TrackerClient = {
-      async fetchCandidateIssues() {
-        return [];
-      },
-      async fetchIssuesByStates(states) {
-        conflictStateQueries.push(states);
-        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
-      },
-      async fetchIssueStatesByIds() {
-        return [{ ...candidate, state: currentState }];
-      },
-    };
-    const logger = new StructuredLogger(() => undefined);
-    const stateDir = config.workspace.stateDir;
-    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
-    await lifecycleStore.ensureIssue(candidate, {
-      phase: "merge_conflict_resolution",
-      mergeConflict: mergeConflictRecord(),
-    });
-    const runStore = new FileRunTranscriptStore(stateDir);
-    const outboxStore = new FileWritebackOutboxStore(stateDir);
-    const writer = new StateChangingWriter((state) => {
-      currentState = state;
-    });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
-    const harness = new ConflictNoReportHarness();
-    const orchestrator = new Orchestrator({
-      config,
-      tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
-      harness,
-      logger,
-      promptTemplate: "Work on {{ issue.identifier }}",
-      lifecycleStore,
-      runStore,
-      writeback,
-    });
+  it("startup processDue skips drifted issue breakdown replay without marking the plan stale", async () => {
+    const fixture = await createIssueBreakdownStartupFixture(root, { scenario: "drifted" });
 
-    try {
-      await orchestrator.refreshNow();
-      await waitFor(() => harness.runs.length === 3 && currentState === "Blocked", "conflict loop blocked", 6_000);
-      await settleOrchestratorExit();
-      await orchestrator.refreshNow();
-      await settleOrchestratorExit();
-    } finally {
-      await orchestrator.stop();
+    await fixture.orchestrator.start();
+    await fixture.orchestrator.stop();
+    const lifecycle = await fixture.lifecycleStore.get(fixture.parentIssue.id);
+    const plan = lifecycle?.issueBreakdownPlans.find((candidatePlan) => candidatePlan.id === fixture.supersededPlan.id);
+
+    for (const key of fixture.replayOperationKeys) {
+      await expect(fixture.outboxStore.get(key)).resolves.toMatchObject({
+        status: "skipped",
+        lastError: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+        resultMessage: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+      });
     }
-
-    expect(config.tracker.activeStates).not.toContain("Approved with Conflicts");
-    expect(conflictStateQueries).toContainEqual(["Approved with Conflicts"]);
-    expect(harness.runs.map((run) => run.ctx.runPhase)).toEqual([
-      "merge_conflict_resolution",
-      "merge_conflict_resolution",
-      "merge_conflict_resolution",
-    ]);
-    expect(harness.runs).toHaveLength(3);
-    expect(writer.comments.some((comment) => comment.body.includes("Merge conflicts remain unresolved"))).toBe(true);
-    expect(writer.transitions).toEqual([
-      expect.objectContaining({
-        fromStates: expect.arrayContaining(["Approved with Conflicts"]),
-        toState: "Blocked",
-      }),
-    ]);
-    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-      phase: "blocked",
-      blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
-      mergeConflict: {
-        status: "blocked",
-        resolutionStatus: "blocked",
-        fixTurnCount: 3,
-        maxFixTurns: 3,
-        lastConflictFixRunId: "conflict-run-3",
-        attemptRunIds: ["conflict-run-1", "conflict-run-2", "conflict-run-3"],
-      },
+    await expectStartupReplayActivitySkipReasons(fixture, {
+      code: "issue_breakdown_plan_stale",
+      message: "Issue breakdown plan is no longer fresh.",
     });
-    expect(orchestrator.snapshot().counts.retrying).toBe(0);
-  }, 10_000);
+    expect(fixture.writer.issueCreates).toEqual([]);
+    expect(fixture.writer.issueRelations).toEqual([]);
+    expect(fixture.writer.comments).toEqual([]);
+    expect(plan?.applicationStatus).toBe("pending");
+    expect(plan?.applicationBlockedReason).toBeNull();
+    expect(plan?.applicationStatus).not.toBe("stale");
+  });
+
+  it("startup processDue still applies fresh current issue breakdown work", async () => {
+    const fixture = await createIssueBreakdownStartupFixture(root, { scenario: "fresh" });
+
+    await fixture.orchestrator.start();
+    await fixture.orchestrator.stop();
+
+    for (const key of fixture.replayOperationKeys) {
+      await expect(fixture.outboxStore.get(key)).resolves.toMatchObject({ status: "succeeded" });
+    }
+    expect(fixture.writer.issueCreates).toHaveLength(1);
+    expect(fixture.writer.issueRelations).toHaveLength(1);
+    expect(fixture.writer.comments).toHaveLength(1);
+  });
 
   it("reroutes implementation dispatch to planning when writeback reveals stale issue content", async () => {
     const config = testConfig(root);
@@ -469,6 +394,99 @@ describe("Orchestrator", () => {
     expect(harness.runs.some((run) => run.ctx.runPhase === "implementation")).toBe(false);
     expect(lifecycle?.planningFailureCount).toBe(0);
   }, 10_000);
+
+  it("routes worker dispatch to planning when only a superseded plan matches the issue", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      title: "Original work",
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    const changed = { ...candidate, title: "Changed work", updatedAt: "2026-01-02T00:05:00Z" };
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await submitTwoChildPlan(config, lifecycleStore, candidate, "plan-a", "run-plan-a");
+    await submitTwoChildPlan(config, lifecycleStore, changed, "plan-b", "run-plan-b");
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
+    expect(harness.runs[0]?.prompt).not.toContain("Issue breakdown plan:");
+  });
+
+  it("queues explicit issue breakdown planning when the only matching plan is superseded", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    const candidate = issue({
+      state: "Todo",
+      title: "Original work",
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    const changed = { ...candidate, title: "Changed work", updatedAt: "2026-01-02T00:05:00Z" };
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await submitTwoChildPlan(config, lifecycleStore, candidate, "plan-a", "run-plan-a");
+    await submitTwoChildPlan(config, lifecycleStore, changed, "plan-b", "run-plan-b");
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    const result = await orchestrator.requestIssueBreakdown(candidate.id);
+    await waitFor(() => harness.runs.length === 1);
+    await orchestrator.stop();
+
+    expect(result).toMatchObject({ queued: true, reason: "explicit_request" });
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+  });
 
   it("allows issue breakdown planning when implementation incomplete-turn limits are exhausted", async () => {
     const config = testConfig(root);
@@ -599,8 +617,8 @@ describe("Orchestrator", () => {
     config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
     config.issueBreakdown.planningLabels = ["planning"];
     config.issueBreakdown.maxPlanningFailures = 3;
-    config.issueBreakdown.planningRetryBaseMs = 1_000;
-    config.issueBreakdown.planningRetryMaxMs = 1_000;
+    config.issueBreakdown.planningRetryBaseMs = 10_000;
+    config.issueBreakdown.planningRetryMaxMs = 10_000;
     const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -630,6 +648,7 @@ describe("Orchestrator", () => {
     await first.refreshNow();
     await waitFor(() => harness.runs.length === 1);
     await waitFor(() => first.snapshot().counts.running === 0);
+    await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
     await first.stop();
 
     const second = new Orchestrator({
@@ -646,7 +665,7 @@ describe("Orchestrator", () => {
     await second.refreshNow();
     await settleOrchestratorExit();
     expect(harness.runs).toHaveLength(1);
-    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    await lifecycleStore.updateIssue(candidate, { lastPlanningFailureAt: "2000-01-01T00:00:00.000Z" });
     await second.refreshNow();
     await waitFor(() => harness.runs.length === 2, "planning retry after durable backoff");
     await waitFor(() => second.snapshot().counts.running === 0);
@@ -5156,39 +5175,6 @@ function pendingApprovalLifecyclePatch(
   };
 }
 
-function mergeConflictRecord() {
-  return {
-    id: "merge-conflict:issue-1:head-sha-1",
-    status: "open" as const,
-    resolutionStatus: "pending" as const,
-    pullRequest: {
-      url: "https://github.com/acme/symphony/pull/42",
-      number: 42,
-      headSha: "head-sha-1",
-      branch: "symphony/TEST-1",
-    },
-    approvedHeadSha: "head-sha-1",
-    currentHeadSha: "head-sha-1",
-    resolvedHeadSha: null,
-    baseBranch: "main",
-    baseHeadSha: "base-sha-1",
-    sourceState: "Ready to Merge",
-    conflictsState: "Approved with Conflicts",
-    reason: "Pull request has merge conflicts with the base branch",
-    mergeableState: "dirty",
-    detectedAt: "2026-01-01T00:00:00.000Z",
-    updatedAt: "2026-01-01T00:00:00.000Z",
-    fixTurnCount: 0,
-    maxFixTurns: 3,
-    lastConflictFixRunId: null,
-    lastConflictResolutionReportId: null,
-    attemptRunIds: [],
-    writebackOperationKeys: [],
-    blockedAt: null,
-    blockedReason: null,
-  };
-}
-
 function approvalRecordFor(
   status: OperatorApprovalRecord["status"],
   candidate: Issue,
@@ -5273,6 +5259,266 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+type StartupReplayScenario = "superseded" | "drifted" | "fresh";
+
+async function createIssueBreakdownStartupFixture(
+  workspaceRoot: string,
+  options: { scenario: StartupReplayScenario },
+): Promise<{
+  config: ReturnType<typeof testConfig>;
+  orchestrator: Orchestrator;
+  outboxStore: FileWritebackOutboxStore;
+  lifecycleStore: FileIssueLifecycleStore;
+  writer: StateChangingWriter;
+  parentIssue: Issue;
+  supersededPlan: IssueBreakdownPlanRecord;
+  currentPlan: IssueBreakdownPlanRecord | null;
+  replayOperationKeys: string[];
+}> {
+  const config = testConfig(workspaceRoot);
+  config.issueBreakdown.applyToLinear.enabled = true;
+  config.writeback.enabled = true;
+  config.writeback.mode = "live";
+  const logger = new StructuredLogger(() => undefined);
+  const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+  const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+  const parentIssue = issue({
+    identifier: "ENG-1",
+    labels: ["planning"],
+    title: "Original issue",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const seeded = await seedIssueBreakdownReplayWork(config, lifecycleStore, outboxStore, parentIssue, {
+    supersede: options.scenario === "superseded",
+  });
+  const resolvedIssue =
+    options.scenario === "drifted"
+      ? { ...parentIssue, title: "Changed issue", updatedAt: "2026-01-02T00:00:00.000Z" }
+      : parentIssue;
+  const tracker: TrackerClient = {
+    async fetchCandidateIssues() {
+      return [];
+    },
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssueStatesByIds() {
+      return [resolvedIssue];
+    },
+  };
+  const writer = new StateChangingWriter(() => undefined);
+  const writeback = new WritebackProcessor(
+    outboxStore,
+    writer,
+    logger,
+    config.writeback.maxBackoffMs,
+    lifecycleStore,
+    false,
+    {
+      getConfig: () => config,
+      resolveIssue: async () => ({ status: "ok", issue: resolvedIssue }),
+    },
+  );
+  const orchestrator = new Orchestrator({
+    config,
+    tracker,
+    workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+    harness: new FakeHarness(),
+    logger,
+    promptTemplate: "Work on {{ issue.identifier }}",
+    lifecycleStore,
+    writeback,
+  });
+
+  return {
+    config,
+    orchestrator,
+    outboxStore,
+    lifecycleStore,
+    writer,
+    parentIssue,
+    supersededPlan: seeded.plan,
+    currentPlan: seeded.currentPlan,
+    replayOperationKeys: seeded.replayOperationKeys,
+  };
+}
+
+type StartupReplayActivityFixture = Awaited<ReturnType<typeof createIssueBreakdownStartupFixture>>;
+
+async function expectStartupReplayActivitySkipReasons(
+  fixture: StartupReplayActivityFixture,
+  expectedSkipReason: {
+    code: "issue_breakdown_plan_not_current" | "issue_breakdown_plan_stale";
+    message: string;
+  },
+): Promise<void> {
+  const activity = await fetchActivityForIssue(fixture);
+  const expectedKinds = ["issue_create", "issue_relation", "comment"];
+  for (const [index, key] of fixture.replayOperationKeys.entries()) {
+    const item = activity.find((candidate) => candidate.id === `writeback:${key}`);
+    expect(item).toMatchObject({
+      kind: "writeback_operation",
+      writeback: {
+        operationKind: expectedKinds[index],
+        status: "skipped",
+        skipReason: expectedSkipReason,
+      },
+    });
+    expect(item?.writeback).not.toHaveProperty("lastError");
+    expect(item?.writeback).not.toHaveProperty("resultMessage");
+  }
+}
+
+async function fetchActivityForIssue(fixture: StartupReplayActivityFixture): Promise<ActivityWritebackItem[]> {
+  const logger = new StructuredLogger(() => undefined);
+  const server = new StatusServer({
+    orchestrator: fixture.orchestrator,
+    workspaceManager: new WorkspaceManager({ workspace: fixture.config.workspace, hooks: fixture.config.hooks, logger }),
+    workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: fixture.config.workspace.root, openerCommand: null }),
+    lifecycleStore: fixture.lifecycleStore,
+    writebackOutbox: fixture.outboxStore,
+    host: "127.0.0.1",
+    port: 0,
+    openWorkspaceToken: null,
+    trackerStateLists: testTrackerStateLists(),
+    staleThresholdMs: 300_000,
+  });
+  const address = await server.start();
+  try {
+    const response = await fetch(
+      `http://${address.host}:${address.port}/api/v1/activity?issue=${encodeURIComponent(fixture.parentIssue.identifier)}&limit=100`,
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { activity: ActivityWritebackItem[] };
+    return body.activity;
+  } finally {
+    await server.stop();
+  }
+}
+
+type ActivityWritebackItem = {
+  id: string;
+  kind: string;
+  writeback: null | {
+    operationKind: string;
+    status: string;
+    skipReason: {
+      code: "issue_breakdown_plan_not_current" | "issue_breakdown_plan_stale";
+      message: string;
+    } | null;
+  };
+};
+
+function testTrackerStateLists(): TrackerStateLists {
+  return {
+    activeStates: ["Todo", "In Progress"],
+    handoffStates: ["Human Review"],
+    reviewStates: ["In Review"],
+    blockedStates: ["Blocked"],
+    terminalStates: ["Done", "Canceled"],
+  };
+}
+
+async function seedIssueBreakdownReplayWork(
+  config: ReturnType<typeof testConfig>,
+  lifecycleStore: FileIssueLifecycleStore,
+  outboxStore: FileWritebackOutboxStore,
+  parentIssue: Issue,
+  options: { supersede: boolean },
+): Promise<{ plan: IssueBreakdownPlanRecord; currentPlan: IssueBreakdownPlanRecord | null; replayOperationKeys: string[] }> {
+  const plan = await submitTwoChildPlan(config, lifecycleStore, parentIssue, "plan-a", "run-plan-a");
+  const childOperations = planIssueBreakdownApplicationWritebacks(parentIssue, plan) as IssueCreateWriteback[];
+  const planWithRefs = {
+    ...plan,
+    createdIssueRefs: childOperations.map((operation) => createdIssueRefForOperation(operation)),
+  };
+  const finalOperations = planIssueBreakdownFinalizationWritebacks(parentIssue, planWithRefs);
+  const relationOperation = finalOperations.find((operation): operation is IssueRelationWriteback => operation.kind === "issue_relation");
+  const parentCommentOperation = finalOperations.find((operation): operation is CommentWriteback => operation.kind === "comment");
+  if (!relationOperation || !parentCommentOperation) throw new Error("expected relation and parent comment writebacks");
+
+  const applicationOperationKeys = [
+    ...childOperations.map((operation) => operation.idempotencyKey),
+    ...finalOperations.map((operation) => operation.idempotencyKey),
+  ];
+  const lifecycle = await lifecycleStore.get(parentIssue.id);
+  await lifecycleStore.updateIssue(parentIssue, {
+    issueBreakdownPlans: (lifecycle?.issueBreakdownPlans ?? []).map((candidatePlan) =>
+      candidatePlan.id === plan.id
+        ? {
+            ...planWithRefs,
+            applicationStatus: "pending",
+            applicationOperationKeys,
+            applicationBlockedReason: null,
+          }
+        : candidatePlan,
+    ),
+    lastIssueBreakdownPlanId: plan.id,
+  });
+
+  await outboxStore.enqueueOnce(childOperations[0]!);
+  await outboxStore.markRetry(
+    await outboxStore.enqueueOnce(relationOperation),
+    "transient relation failure",
+    "2026-01-01T00:00:00.000Z",
+  );
+  await outboxStore.enqueueOnce(parentCommentOperation);
+
+  const currentPlan = options.supersede ? await submitTwoChildPlan(config, lifecycleStore, parentIssue, "plan-b", "run-plan-b") : null;
+  return {
+    plan,
+    currentPlan,
+    replayOperationKeys: [childOperations[0]!.idempotencyKey, relationOperation.idempotencyKey, parentCommentOperation.idempotencyKey],
+  };
+}
+
+async function submitTwoChildPlan(
+  config: ReturnType<typeof testConfig>,
+  lifecycleStore: FileIssueLifecycleStore,
+  parentIssue: Issue,
+  idempotencyKey: string,
+  runId: string,
+): Promise<IssueBreakdownPlanRecord> {
+  const result = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
+    {
+      runId,
+      issueId: parentIssue.id,
+      summary: "Split into child issues.",
+      proposedIssues: [
+        {
+          title: "Build child",
+          description: "Implement the child issue.",
+          acceptanceCriteria: ["Done"],
+          dependencies: [],
+          labels: ["planning"],
+        },
+        {
+          title: "Build dependent child",
+          description: "Implement the dependent child issue.",
+          acceptanceCriteria: ["Done"],
+          dependencies: ["Build child"],
+          labels: ["planning"],
+        },
+      ],
+      idempotencyKey,
+    },
+    { issue: parentIssue, activeRunId: runId, role: "worker", phase: "issue_breakdown" },
+  );
+  return result.plan;
+}
+
+function createdIssueRefForOperation(operation: IssueCreateWriteback): IssueBreakdownCreatedIssueRef {
+  const childNumber = operation.payload.proposedIssueIndex + 1;
+  return {
+    proposedIssueIndex: operation.payload.proposedIssueIndex,
+    operationKey: operation.idempotencyKey,
+    status: "created",
+    id: `child-${childNumber}`,
+    identifier: `TEST-${childNumber + 1}`,
+    url: `https://linear.test/TEST-${childNumber + 1}`,
+  };
 }
 
 async function waitFor(predicate: () => boolean, description = "condition", timeoutMs = 2_000): Promise<void> {
@@ -5693,18 +5939,6 @@ class TokenSequenceHarness implements AgentHarness {
   }
 }
 
-class ConflictNoReportHarness implements AgentHarness {
-  readonly id = "conflict-no-report";
-  readonly runs: Array<{ ctx: AgentRunContext; prompt: string; runId: string }> = [];
-
-  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
-    const runId = `conflict-run-${this.runs.length + 1}`;
-    this.runs.push({ ctx, prompt, runId });
-    yield { type: "session_started", sessionId: `${runId}-session`, runId };
-    yield { type: "completed", message: "conflict worker exited without MCP handoff" };
-  }
-}
-
 class SdkWaitErrorHarness implements AgentHarness {
   readonly id = "sdk-wait-error";
   readonly runs: string[] = [];
@@ -6019,6 +6253,8 @@ class FakePullRequestReviewEvidenceClient implements PullRequestReviewEvidenceCl
 class StateChangingWriter implements TrackerWriter {
   readonly transitions: TrackerTransitionInput[] = [];
   readonly comments: TrackerCommentInput[] = [];
+  readonly issueCreates: TrackerIssueCreateInput[] = [];
+  readonly issueRelations: TrackerIssueRelationInput[] = [];
 
   constructor(private readonly setState: (state: string) => void) {}
 
@@ -6030,6 +6266,28 @@ class StateChangingWriter implements TrackerWriter {
 
   async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
     this.comments.push(input);
+    return { status: "applied" };
+  }
+
+  async createIssueFromPlan(input: TrackerIssueCreateInput): Promise<TrackerWriteResult> {
+    this.issueCreates.push(input);
+    const childNumber = (input.proposedIssueIndex ?? this.issueCreates.length - 1) + 1;
+    return {
+      status: "applied",
+      evidence: {
+        kind: "issue_create",
+        issue: { id: `child-${childNumber}`, identifier: `TEST-${childNumber + 1}`, url: `https://linear.test/TEST-${childNumber + 1}` },
+        issueCreateStatus: "created",
+        parentIssueId: input.parentIssueId,
+        dedupeKey: input.dedupeKey,
+        payloadHash: input.payloadHash,
+        unresolvedLabelNames: [],
+      },
+    };
+  }
+
+  async createIssueRelation(input: TrackerIssueRelationInput): Promise<TrackerWriteResult> {
+    this.issueRelations.push(input);
     return { status: "applied" };
   }
 }

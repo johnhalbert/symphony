@@ -36,8 +36,15 @@ import {
   type TranscriptEvent,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
-import type { FileWritebackOutboxStore, WritebackOperation } from "../core/writeback/WritebackOutbox.js";
+import {
+  ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+  ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
+  issueBreakdownPlanIdForOperation,
+  type FileWritebackOutboxStore,
+  type WritebackOperation,
+} from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
+import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -109,10 +116,11 @@ export class StatusServer {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       if (request.method === "GET" && url.pathname === "/") {
+        const snapshot = publicRuntimeSnapshot(this.options.orchestrator.snapshot());
         sendHtml(
           response,
           await renderDashboard(
-            this.options.orchestrator.snapshot(),
+            snapshot,
             Boolean(this.options.openWorkspaceToken),
             this.options.runStore,
             this.options.lifecycleStore,
@@ -123,7 +131,7 @@ export class StatusServer {
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/state") {
-        const snapshot = this.options.orchestrator.snapshot();
+        const snapshot = publicRuntimeSnapshot(this.options.orchestrator.snapshot());
         sendJson(response, 200, {
           ...snapshot,
           operatorView: await operatorSnapshotView(
@@ -245,9 +253,6 @@ export class StatusServer {
           if (decision === "reject") {
             await this.recordRejectedApprovalRunTerminal(result.request);
           }
-          if (decision === "reject" && !result.replayed && this.options.operatorApproval?.rejectPolicy === "cancel") {
-            await this.options.orchestrator.cancelIssue(result.request.issueId);
-          }
           if (decision === "approve" && result.request.status === "approved") {
             const resumed = await this.options.orchestrator.resumeApprovedPublication(result.request);
             if (resumed !== true) {
@@ -258,7 +263,14 @@ export class StatusServer {
             }
           }
           if (decision === "reject" && !result.replayed) {
-            await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
+            try {
+              await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
+            } catch {
+              // The approval decision is already durable; worker exit recovery will retry terminal writeback.
+            }
+            if (this.options.operatorApproval?.rejectPolicy === "cancel") {
+              await this.options.orchestrator.cancelIssue(result.request.issueId);
+            }
           }
           sendJson(response, 200, {
             request: approvalResponse(result.request, this.options.operatorApproval?.isRequired() ?? false),
@@ -307,7 +319,7 @@ export class StatusServer {
         const lifecycle = await this.options.lifecycleStore?.get(issueId);
         const enrichedRuns = await Promise.all(
           runs.map(async (run) => ({
-            ...run,
+            ...publicRunRecord(run),
             operatorLiveness: await runOperatorLiveness(run, snapshot, lifecycle, runs, this.options.runStore),
             livenessSummary: runLivenessSummary(run, snapshot, lifecycle, runs),
           })),
@@ -368,6 +380,20 @@ export class StatusServer {
         return;
       }
 
+      const issueBreakdownApplyMatch = /^\/api\/v1\/issues\/([^/]+)\/planning-run\/apply$/.exec(url.pathname);
+      if (request.method === "POST" && issueBreakdownApplyMatch) {
+        this.requireIssueBreakdownApplyToken(request);
+        const issueId = decodeURIComponent(issueBreakdownApplyMatch[1] ?? "");
+        const options = parseIssueBreakdownApplyRequest(await readJsonBody(request));
+        const result = await this.options.orchestrator.applyIssueBreakdownPlan(issueId, options);
+        sendJson(response, result.status === "pending" ? 202 : 200, {
+          issue: issueId,
+          mode: options.dryRun ? "preview" : "apply",
+          ...result,
+        });
+        return;
+      }
+
       const issueMatch = /^\/api\/v1\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && issueMatch) {
         const issueId = decodeURIComponent(issueMatch[1] ?? "");
@@ -392,7 +418,7 @@ export class StatusServer {
           : null;
         const operatorLiveness = await issueOperatorLiveness({
           live,
-          latestRun,
+          latestRun: publicRunRecordOrNull(latestRun),
           lifecycle,
           paused,
           resolvedAgentId,
@@ -420,7 +446,7 @@ export class StatusServer {
           }),
           live: live ? liveIssueResponse(live, operatorLiveness) : null,
           workspace,
-          latestRun,
+          latestRun: publicRunRecordOrNull(latestRun),
           lifecycle,
           reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
           metadata: statusMetadata({ live, workspace, latestRun, lifecycle }),
@@ -478,7 +504,7 @@ export class StatusServer {
         const lifecycle =
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
-          ...run,
+          ...publicRunRecord(run),
           pendingApproval: (await this.options.operatorApproval?.findPendingForRun(runId)) ?? null,
           telemetry: await runTelemetrySummary(run.runId, this.options.runStore),
           operatorLiveness: await runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns, this.options.runStore),
@@ -582,6 +608,17 @@ export class StatusServer {
     const provided = request.headers["x-symphony-token"];
     if (provided !== expected) {
       throw new SymphonyError("invalid_request", "Missing or invalid open-workspace token");
+    }
+  }
+
+  private requireIssueBreakdownApplyToken(request: IncomingMessage): void {
+    const expected = this.options.openWorkspaceToken?.trim() ?? "";
+    if (!expected) {
+      throw new SymphonyError("invalid_request", "Issue breakdown apply requires a configured X-Symphony-Token");
+    }
+    const provided = request.headers["x-symphony-token"];
+    if (typeof provided !== "string" || provided.trim().length === 0 || provided !== expected) {
+      throw new SymphonyError("invalid_request", "Missing or invalid issue breakdown apply token");
     }
   }
 
@@ -702,6 +739,23 @@ function parseApprovalDecision(body: unknown): "approve" | "reject" {
     throw new SymphonyError("invalid_request", "Approval decision must be approve or reject");
   }
   return decision;
+}
+
+function parseIssueBreakdownApplyRequest(body: unknown): { dryRun: boolean } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new SymphonyError("invalid_request", "Issue breakdown apply body must be an object");
+  }
+  const input = body as { dryRun?: unknown; mode?: unknown };
+  if (input.mode !== undefined) {
+    if (input.mode === "preview") return { dryRun: true };
+    if (input.mode === "apply") return { dryRun: false };
+    throw new SymphonyError("invalid_request", "Issue breakdown apply mode must be preview or apply");
+  }
+  if (input.dryRun === undefined) return { dryRun: true };
+  if (typeof input.dryRun !== "boolean") {
+    throw new SymphonyError("invalid_request", "Issue breakdown apply dryRun must be a boolean");
+  }
+  return { dryRun: input.dryRun };
 }
 
 function approvalResponse(record: OperatorApprovalRecord, enabled: boolean): Record<string, unknown> {
@@ -897,6 +951,7 @@ interface ActivityItem {
   writeback: {
     operationKind: WritebackOperation["kind"];
     status: WritebackOperation["status"];
+    skipReason: WritebackSkipReason | null;
     attempt: number;
     createdAt: string;
     updatedAt: string;
@@ -910,6 +965,11 @@ interface ActivityItem {
     transcript: string | null;
   };
 }
+
+type WritebackSkipReason = {
+  code: "issue_breakdown_plan_not_current" | "issue_breakdown_plan_stale";
+  message: string;
+};
 
 interface IssueBoardCard {
   key: string;
@@ -1059,7 +1119,7 @@ async function buildBoardIssueDetail(input: {
   const runs = await runsByKeys(input.runStore, keys);
   const enrichedRuns = await Promise.all(
     runs.map(async (run) => ({
-      ...run,
+      ...publicRunRecord(run),
       operatorLiveness: await runOperatorLiveness(run, input.snapshot, lifecycle, runs, input.runStore),
       livenessSummary: runLivenessSummary(run, input.snapshot, lifecycle, runs),
     })),
@@ -1103,7 +1163,7 @@ async function buildBoardIssueDetail(input: {
     issueDetails,
     live: live ? liveIssueResponse(live, operatorLiveness) : null,
     workspace,
-    latestRun,
+    latestRun: publicRunRecordOrNull(latestRun),
     runs: enrichedRuns,
     lifecycle,
     reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
@@ -1129,6 +1189,9 @@ async function buildBoardIssueDetail(input: {
   };
 }
 
+const ACTIVITY_TRANSCRIPT_TAIL_PER_RUN = 500;
+const TERMINAL_ACTIVITY_TRANSCRIPT_TAIL = 256;
+
 async function buildActivityFeed(input: {
   generatedAt: string;
   runStore: RunTranscriptStore | undefined;
@@ -1142,6 +1205,8 @@ async function buildActivityFeed(input: {
   const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : allRuns;
   const activity: ActivityItem[] = [];
   let transcriptEventsConsidered = 0;
+  let transcriptEventsTotal = 0;
+  let transcriptEventsTruncated = false;
   let syntheticRunEvents = 0;
   let writebackOperationsConsidered = 0;
 
@@ -1153,8 +1218,15 @@ async function buildActivityFeed(input: {
       syntheticRunEvents += 1;
     }
 
-    const events = input.runStore ? await readAllTranscriptEvents(input.runStore, run.runId) : [];
+    const totalEvents = input.runStore ? await input.runStore.readTranscriptEventCount(run.runId) : 0;
+    transcriptEventsTotal += totalEvents;
+    const transcriptOffset = Math.max(0, totalEvents - ACTIVITY_TRANSCRIPT_TAIL_PER_RUN);
+    const events =
+      input.runStore && totalEvents > 0
+        ? (await input.runStore.readTranscript(run.runId, { offset: transcriptOffset, limit: ACTIVITY_TRANSCRIPT_TAIL_PER_RUN })).events
+        : [];
     transcriptEventsConsidered += events.length;
+    transcriptEventsTruncated ||= totalEvents > events.length;
     activity.push(...events.map((event) => activityItemForTranscriptEvent(run, event)));
   }
 
@@ -1178,6 +1250,9 @@ async function buildActivityFeed(input: {
       totalItems: activity.length,
       distinctRunsConsidered: runs.length,
       transcriptEventsConsidered,
+      transcriptEventsTotal,
+      transcriptEventsIncluded: transcriptEventsConsidered,
+      transcriptEventsTruncated,
       syntheticRunEvents,
       writebackOperationsConsidered,
     },
@@ -1185,6 +1260,7 @@ async function buildActivityFeed(input: {
       kind: "durable_activity" as const,
       runStoreAvailable: Boolean(input.runStore),
       writebackOutboxAvailable: Boolean(input.writebackOutbox),
+      transcriptTailPerRun: ACTIVITY_TRANSCRIPT_TAIL_PER_RUN,
     },
     filter: {
       issue: input.query.issue,
@@ -1247,6 +1323,7 @@ function activityItemForWritebackOperation(
     writeback: {
       operationKind: operation.kind,
       status: operation.status,
+      skipReason: writebackSkipReason(operation),
       attempt: operation.attempt,
       createdAt: operation.createdAt,
       updatedAt: operation.updatedAt,
@@ -1273,6 +1350,25 @@ function activityItemForWritebackOperation(
       transcript: null,
     },
   };
+}
+
+function writebackSkipReason(operation: WritebackOperation): WritebackSkipReason | null {
+  if (operation.status !== "skipped") return null;
+  if (issueBreakdownPlanIdForOperation(operation) === null) return null;
+  const persistedReason = operation.resultMessage ?? operation.lastError;
+  if (persistedReason === ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON) {
+    return {
+      code: "issue_breakdown_plan_not_current",
+      message: "Issue breakdown writeback is not bound to the current plan.",
+    };
+  }
+  if (persistedReason === ISSUE_BREAKDOWN_PLAN_STALE_REASON) {
+    return {
+      code: "issue_breakdown_plan_stale",
+      message: "Issue breakdown plan is no longer fresh.",
+    };
+  }
+  return null;
 }
 
 function activityIssue(run: RunRecord): ActivityItem["issue"] {
@@ -1927,15 +2023,15 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
     workspacePath: row.workspacePath,
     lastActivityAt: row.liveness.lastActivityAt,
     lastTranscriptEventAt: row.lastEventAt,
-    lastTranscriptEvent: row.lastEvent,
-    lastMessage: row.lastMessage,
+    lastTranscriptEvent: publicDiagnosticText(row.lastEvent),
+    lastMessage: publicDiagnosticText(row.lastMessage),
     secondsSinceLastActivity: row.liveness.secondsSinceLastActivity,
     stallTimeoutMs: row.liveness.stallTimeoutMs,
     sdkRunStatus: row.liveness.sdkRunStatus ?? null,
     sdkRunStatusUpdatedAt: row.liveness.sdkRunStatusUpdatedAt ?? null,
     sdkRunStatusSource: row.liveness.sdkRunStatusSource ?? null,
     idleAlert: row.liveness.idleAlert ?? null,
-    cancellation: row.cancellation,
+    cancellation: publicLiveCancellation(row.cancellation),
     paused,
     activity: liveActivity(row),
     timeline: liveTimeline(row),
@@ -2094,6 +2190,56 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function publicRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
+  return sanitizePublicJson(snapshot) as RuntimeSnapshot;
+}
+
+function publicRunRecord(run: RunRecord): RunRecord {
+  const record: RunRecord = {
+    ...run,
+    error: publicDiagnosticText(run.error),
+  };
+  if (run.cancelFailedReason !== undefined) record.cancelFailedReason = publicDiagnosticText(run.cancelFailedReason);
+  if (run.harnessStopFailedReason !== undefined) record.harnessStopFailedReason = publicDiagnosticText(run.harnessStopFailedReason);
+  return record;
+}
+
+function publicRunRecordOrNull(run: RunRecord | null | undefined): RunRecord | null {
+  return run ? publicRunRecord(run) : null;
+}
+
+function publicDiagnosticText(value: string | null | undefined): string | null {
+  return sanitizedPreviewValue(value).preview;
+}
+
+function publicLiveRow(row: RunningRow): RunningRow {
+  return {
+    ...row,
+    lastEvent: publicDiagnosticText(row.lastEvent),
+    lastMessage: publicDiagnosticText(row.lastMessage),
+    cancellation: publicLiveCancellation(row.cancellation),
+  };
+}
+
+function publicLiveCancellation(cancellation: RunningRow["cancellation"]): RunningRow["cancellation"] {
+  const publicCancellation: RunningRow["cancellation"] = {
+    ...cancellation,
+    reason: publicDiagnosticText(cancellation.reason),
+    harnessStopFailedReason: publicDiagnosticText(cancellation.harnessStopFailedReason),
+  };
+  if (cancellation.cancelFailed) {
+    publicCancellation.cancelFailed = publicLiveCancelFailed(cancellation.cancelFailed);
+  }
+  return publicCancellation;
+}
+
+function publicLiveCancelFailed(cancelFailed: NonNullable<RunningRow["cancellation"]["cancelFailed"]>) {
+  return {
+    ...cancelFailed,
+    reason: publicDiagnosticText(cancelFailed.reason),
+  };
+}
+
 function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -2172,7 +2318,7 @@ async function terminalOperatorLiveness(
     lastActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
     lastTranscriptEventAt: null,
     lastTranscriptEvent: null,
-    lastMessage: lifecycleBlockedReason(lifecycle) ?? run?.error ?? null,
+    lastMessage: lifecycle?.blockedReason ?? publicDiagnosticText(run?.error),
     secondsSinceLastActivity: null,
     stallTimeoutMs: null,
     cancellation: null,
@@ -2183,14 +2329,14 @@ async function terminalOperatorLiveness(
 }
 
 function liveCancelFailed(row: RunningRow) {
-  if (row.cancellation.cancelFailed) return row.cancellation.cancelFailed;
+  if (row.cancellation.cancelFailed) return publicLiveCancelFailed(row.cancellation.cancelFailed);
   if (row.cancellation.harnessStopFailedAt) {
     return {
       tracked: true,
       active: true,
       phase: "failed",
       at: row.cancellation.harnessStopFailedAt,
-      reason: row.cancellation.harnessStopFailedReason ?? null,
+      reason: publicDiagnosticText(row.cancellation.harnessStopFailedReason),
       source: "harness_stop",
     };
   }
@@ -2214,7 +2360,7 @@ function terminalCancelFailed(run: RunRecord | null) {
       active: true,
       phase: "resolved_failed",
       at: run.cancelFailedAt ?? null,
-      reason: run.cancelFailedReason ?? null,
+      reason: publicDiagnosticText(run.cancelFailedReason),
       source: run.cancelFailedSource ?? null,
     };
   }
@@ -2248,7 +2394,10 @@ async function terminalActivity(run: RunRecord | null, lifecycle: IssueLifecycle
     };
   }
   if (run && runStore) {
-    return deriveTerminalActivityFromTranscript(await readAllTranscriptEvents(runStore, run.runId), run.updatedAt ?? lifecycle?.updatedAt ?? null);
+    const totalEvents = await runStore.readTranscriptEventCount(run.runId);
+    const offset = Math.max(0, totalEvents - TERMINAL_ACTIVITY_TRANSCRIPT_TAIL);
+    const page = await runStore.readTranscript(run.runId, { offset, limit: TERMINAL_ACTIVITY_TRANSCRIPT_TAIL });
+    return deriveTerminalActivityFromTranscript(page.events, run.updatedAt ?? lifecycle?.updatedAt ?? null);
   }
   return {
     lastHarnessActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
@@ -2257,18 +2406,6 @@ async function terminalActivity(run: RunRecord | null, lifecycle: IssueLifecycle
     lastToolActivityAt: null,
     unavailable: ["transcript_store_unavailable"],
   };
-}
-
-async function readAllTranscriptEvents(runStore: RunTranscriptStore, runId: string): Promise<TranscriptEvent[]> {
-  const events: TranscriptEvent[] = [];
-  let offset = 0;
-  do {
-    const page = await runStore.readTranscript(runId, { offset, limit: 1_000 });
-    events.push(...page.events);
-    if (page.nextOffset === null) break;
-    offset = page.nextOffset;
-  } while (true);
-  return events;
 }
 
 function deriveTerminalActivityFromTranscript(events: TranscriptEvent[], fallbackHarnessActivityAt: string | null) {
@@ -2354,7 +2491,7 @@ function liveTimeline(row: RunningRow) {
       at: row.liveness.lastActivityAt,
       kind: "last_activity",
       label: "Last harness activity",
-      detail: row.lastMessage ?? row.lastEvent,
+      detail: publicDiagnosticText(row.lastMessage ?? row.lastEvent),
       synthetic: true,
       source: "live_snapshot",
     },
@@ -2364,7 +2501,7 @@ function liveTimeline(row: RunningRow) {
             at: row.cancellation.requestedAt,
             kind: "cancellation_requested",
             label: "Cancellation requested",
-            detail: row.cancellation.reason,
+            detail: publicDiagnosticText(row.cancellation.reason),
             synthetic: true,
             source: "live_snapshot",
           },
@@ -2388,7 +2525,7 @@ function liveTimeline(row: RunningRow) {
             at: row.cancellation.harnessStopFailedAt,
             kind: "harness_stop_failed",
             label: "Harness stop failed",
-            detail: row.cancellation.harnessStopFailedReason ?? null,
+            detail: publicDiagnosticText(row.cancellation.harnessStopFailedReason),
             synthetic: true,
             source: "live_snapshot",
           },
@@ -2421,7 +2558,7 @@ function terminalTimeline(
             at: run.completedAt,
             kind: "run_terminal",
             label: `Run ${run.status}`,
-            detail: run.error,
+            detail: publicDiagnosticText(run.error),
             synthetic: true,
             source: "run_record",
           },
@@ -2433,7 +2570,7 @@ function terminalTimeline(
             at: run.cancelFailedAt ?? run.completedAt ?? run.updatedAt,
             kind: "cancel_failed",
             label: "Cancel failed",
-            detail: run.cancelFailedReason ?? null,
+            detail: publicDiagnosticText(run.cancelFailedReason),
             synthetic: true,
             source: "run_record",
           },
@@ -2532,7 +2669,7 @@ function mergeConflictDashboardSummary(conflict: IssueMergeConflictMetadata | nu
 }
 
 function liveIssueResponse(live: RunningRow, operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>) {
-  return { ...live, operatorLiveness };
+  return { ...publicLiveRow(live), operatorLiveness };
 }
 
 function buildIssueDetailsEnvelope(input: {
@@ -2709,7 +2846,7 @@ function buildIssueLatestRunSummary(run: RunRecord | null | undefined): IssueLat
     runKind: runPhase === null ? null : runKindForPhase(runPhase),
     status: run?.status ?? null,
     terminalReason: deriveRunTerminalReason(run ?? null),
-    error: run?.error ?? null,
+    error: publicDiagnosticText(run?.error),
     completedAt: run?.completedAt ?? null,
   };
 }

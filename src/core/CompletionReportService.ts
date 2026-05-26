@@ -360,7 +360,7 @@ export class CompletionReportService {
     };
     const publicationInput = this.buildPublicationInput(report, context, lifecycle);
     const publication = await this.options.pullRequestPublisher.publishPullRequest(publicationInput);
-    return this.finalizeCompletionReport({
+    const result = await this.finalizeCompletionReport({
       report,
       context,
       inputPullRequest: normalizeInputPullRequest(report.pullRequest, report.branchName),
@@ -368,15 +368,17 @@ export class CompletionReportService {
       lifecycle,
       existing,
     });
+    await this.processDueForOperations(result.writebackOperations);
+    return result;
   }
 
-  async recordPublicationApprovalTerminal(input: PublicationApprovalResumeInput): Promise<boolean> {
-    if (!isTerminalApprovalStatus(input.approval.status)) return false;
+  async recordPublicationApprovalTerminal(input: PublicationApprovalResumeInput): Promise<WritebackOperation[]> {
+    if (!isTerminalApprovalStatus(input.approval.status)) return [];
     const lifecycle = await this.options.lifecycleStore.get(input.approval.issueId);
     const existing = lifecycle?.completionReports.find(
       (item) => item.runId === input.approval.runId && item.idempotencyKey === input.approval.evidenceCursor,
     );
-    if (!lifecycle || !existing || isFinalizedCompletionReport(existing)) return false;
+    if (!lifecycle || !existing || isFinalizedCompletionReport(existing)) return [];
     const alreadyRecorded = lifecycle.blockedReason === `publication approval ${input.approval.status}`;
     const pendingReport =
       pendingPublicationHandoffForRun(lifecycle, {
@@ -388,7 +390,7 @@ export class CompletionReportService {
       pendingReport.runId !== input.approval.runId ||
       pendingReport.idempotencyKey !== input.approval.evidenceCursor
     ) {
-      return false;
+      return [];
     }
 
     const report = completionReportInputFromRecord(existing);
@@ -401,8 +403,7 @@ export class CompletionReportService {
       workspace: workspaceFromApproval(input.approval, lifecycle),
       phase: "blocked",
     };
-    await this.enqueuePublicationApprovalTerminal(input.approval, report, context, existing.pullRequest);
-    return true;
+    return this.enqueuePublicationApprovalTerminal(input.approval, report, context, existing.pullRequest);
   }
 
   async recoverPendingPublicationApproval(
@@ -487,12 +488,10 @@ export class CompletionReportService {
       if (!result) {
         return { recovered: false, reason: "approval_not_pending", report: pendingReport };
       }
-      await this.options.writebackProcessor?.processDue();
       return { recovered: true, report: pendingReport, outcome: "approved" };
     }
     if (isTerminalApprovalStatus(approvalRequest.status)) {
       await this.recordPublicationApprovalTerminal({ approval: approvalRequest, issue: input.issue });
-      await this.options.writebackProcessor?.processDue();
       return { recovered: true, report: pendingReport, outcome: "terminal" };
     }
     return { recovered: false, reason: "approval_not_pending", report: pendingReport };
@@ -781,7 +780,7 @@ export class CompletionReportService {
         "Publication approval requires a writeback processor to apply pending Linear audit before waiting",
       );
     }
-    await processor.processDue();
+    await processor.processDue({ idempotencyKeys: operations.map((operation) => operation.idempotencyKey) });
     for (const operation of operations) {
       const record = await this.options.writebackOutbox.get(operation.idempotencyKey);
       if (!record || !SETTLED_WRITEBACK_STATUSES.has(record.status)) {
@@ -840,13 +839,14 @@ export class CompletionReportService {
     report: CompletionReportInput,
     context: CompletionReportActiveContext,
     pullRequest: CompletionReportPullRequestRef | null,
-  ): Promise<void> {
-    if (!isTerminalApprovalStatus(approval.status)) return;
+  ): Promise<WritebackOperation[]> {
+    if (!isTerminalApprovalStatus(approval.status)) return [];
     await this.recordPublicationApprovalTerminalRun(approval);
     const issue = {
       ...context.issue,
       state: this.options.config.reviewLoop.blockedStates[0] ?? context.issue.state,
     };
+    const enqueued: WritebackOperation[] = [];
     for (const operation of planCompletionReportPublicationApprovalTerminalWritebacks(
       runWritebackContext({ ...context, issue }, report.runId),
       this.options.config,
@@ -854,11 +854,20 @@ export class CompletionReportService {
       approval.status,
       approval.staleReason,
     )) {
-      await this.options.writebackOutbox.enqueueOnce(operation);
+      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
     }
     await this.options.lifecycleStore.updateIssue(context.issue, {
       phase: "blocked",
       blockedReason: `publication approval ${approval.status}`,
+    });
+    await this.processDueForOperations(enqueued);
+    return enqueued;
+  }
+
+  private async processDueForOperations(operations: ReadonlyArray<Pick<WritebackOperation, "idempotencyKey">>): Promise<void> {
+    if (operations.length === 0) return;
+    await this.options.writebackProcessor?.processDue({
+      idempotencyKeys: operations.map((operation) => operation.idempotencyKey),
     });
   }
 

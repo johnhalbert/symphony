@@ -31,6 +31,50 @@ describe("SymphonyClient", () => {
     expect(client.buildMutationHeaders(" token ")).toEqual({ [MUTATION_TOKEN_HEADER]: "token" });
   });
 
+  it("reads board, activity, run, and transcript endpoints without mutation headers", async () => {
+    const fetchMock = vi.fn(async (_input: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new SymphonyClient();
+
+    await client.fetchBoard("http://127.0.0.1:7331/", { refresh: true });
+    await client.fetchBoardIssue("http://127.0.0.1:7331/", "ENG-8", { refresh: true });
+    await client.fetchActivity("http://127.0.0.1:7331/", { issue: "ENG-8", offset: 50, limit: 25 });
+    await client.fetchRun("http://127.0.0.1:7331/", "run-1");
+    await client.fetchTranscript("http://127.0.0.1:7331/", "run-1", { offset: 100, limit: 50 });
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "http://127.0.0.1:7331/api/v1/board?refresh=1",
+      "http://127.0.0.1:7331/api/v1/board/issues/ENG-8?refresh=1",
+      "http://127.0.0.1:7331/api/v1/activity?issue=ENG-8&offset=50&limit=25",
+      "http://127.0.0.1:7331/api/v1/runs/run-1",
+      "http://127.0.0.1:7331/api/v1/runs/run-1/transcript?offset=100&limit=50",
+    ]);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(JSON.stringify(init)).not.toContain(MUTATION_TOKEN_HEADER);
+    }
+  });
+
+  it("sends the mutation token only for open workspace", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ opened: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await new SymphonyClient().openWorkspace("http://127.0.0.1:7331/", "ENG-8", " token ");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:7331/api/v1/issues/ENG-8/open-workspace",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ [MUTATION_TOKEN_HEADER]: "token" }),
+      }),
+    );
+  });
+
+  it("surfaces status API error details", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: { message: "tracker missing" } }), { status: 503 })));
+
+    await expect(new SymphonyClient().fetchBoard("http://127.0.0.1:7331")).rejects.toThrow("tracker missing");
+  });
+
   it("classifies timeout aborts as offline", async () => {
     vi.useFakeTimers();
     vi.stubGlobal(

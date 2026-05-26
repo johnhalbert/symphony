@@ -56,6 +56,22 @@ export interface ProposedIssueRecord {
   labels: string[];
 }
 
+export type IssueBreakdownPlanApplicationStatus =
+  | "not_requested"
+  | "pending"
+  | "applied"
+  | "blocked"
+  | "stale";
+
+export interface IssueBreakdownCreatedIssueRef {
+  proposedIssueIndex: number;
+  operationKey: string;
+  status: "created" | "verified";
+  id: string;
+  identifier: string | null;
+  url: string | null;
+}
+
 export interface IssueBreakdownPlanRecord {
   id: string;
   idempotencyKey: string;
@@ -72,6 +88,11 @@ export interface IssueBreakdownPlanRecord {
   configFingerprint: string;
   cursorMode: string;
   acceptedAt: string;
+  applicationStatus: IssueBreakdownPlanApplicationStatus;
+  applicationOperationKeys: string[];
+  createdIssueRefs: IssueBreakdownCreatedIssueRef[];
+  appliedAt: string | null;
+  applicationBlockedReason: string | null;
 }
 
 export interface CompletionReportChecklistItem {
@@ -453,7 +474,13 @@ export class FileIssueLifecycleStore {
 
   private async write(record: IssueLifecycleRecord): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
-    await fs.writeFile(this.recordPath(record.issueId), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    const target = this.recordPath(record.issueId);
+    const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    if (process.platform === "win32") {
+      await fs.rm(target, { force: true });
+    }
+    await fs.rename(temp, target);
   }
 
   private recordsDir(): string {
@@ -826,6 +853,28 @@ function normalizeIssueBreakdownPlan(value: unknown, filePath: string, index: nu
     configFingerprint: requiredString(value.configFingerprint, filePath, `issueBreakdownPlans[${index}].configFingerprint`),
     cursorMode: requiredString(value.cursorMode, filePath, `issueBreakdownPlans[${index}].cursorMode`),
     acceptedAt: requiredString(value.acceptedAt, filePath, `issueBreakdownPlans[${index}].acceptedAt`),
+    applicationStatus: normalizeIssueBreakdownPlanApplicationStatus(
+      value.applicationStatus,
+      filePath,
+      `issueBreakdownPlans[${index}].applicationStatus`,
+    ),
+    applicationOperationKeys:
+      value.applicationOperationKeys === undefined
+        ? []
+        : requiredStringArray(value.applicationOperationKeys, filePath, `issueBreakdownPlans[${index}].applicationOperationKeys`),
+    createdIssueRefs: normalizeCreatedIssueRefs(value.createdIssueRefs, filePath, index),
+    appliedAt:
+      value.appliedAt === undefined
+        ? null
+        : nullableString(value.appliedAt, filePath, `issueBreakdownPlans[${index}].appliedAt`),
+    applicationBlockedReason:
+      value.applicationBlockedReason === undefined
+        ? null
+        : nullableString(
+            value.applicationBlockedReason,
+            filePath,
+            `issueBreakdownPlans[${index}].applicationBlockedReason`,
+          ),
   };
 }
 
@@ -853,6 +902,50 @@ function normalizeProposedIssues(value: unknown, filePath: string, planIndex: nu
         `issueBreakdownPlans[${planIndex}].proposedIssues[${index}].dependencies`,
       ),
       labels: requiredStringArray(item.labels, filePath, `issueBreakdownPlans[${planIndex}].proposedIssues[${index}].labels`),
+    };
+  });
+}
+
+function normalizeIssueBreakdownPlanApplicationStatus(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssueBreakdownPlanApplicationStatus {
+  if (value === undefined) return "not_requested";
+  if (value === "not_requested" || value === "pending" || value === "applied" || value === "blocked" || value === "stale") {
+    return value;
+  }
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizeCreatedIssueRefs(value: unknown, filePath: string, planIndex: number): IssueBreakdownCreatedIssueRef[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs is invalid`);
+  return value.map((item, index) => {
+    if (!isRecord(item)) throw corruptLifecycle(filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}] is invalid`);
+    const status = item.status;
+    if (status !== "created" && status !== "verified") {
+      throw corruptLifecycle(filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].status is invalid`);
+    }
+    return {
+      proposedIssueIndex: nonNegativeInteger(
+        item.proposedIssueIndex,
+        filePath,
+        `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].proposedIssueIndex`,
+      ),
+      operationKey: requiredString(
+        item.operationKey,
+        filePath,
+        `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].operationKey`,
+      ),
+      status,
+      id: requiredString(item.id, filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].id`),
+      identifier: nullableString(
+        item.identifier,
+        filePath,
+        `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].identifier`,
+      ),
+      url: nullableString(item.url, filePath, `issueBreakdownPlans[${planIndex}].createdIssueRefs[${index}].url`),
     };
   });
 }
