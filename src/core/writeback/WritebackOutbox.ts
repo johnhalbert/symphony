@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
@@ -245,7 +246,7 @@ export class FileWritebackOutboxStore {
   private async write(record: WritebackOperation): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
     const target = this.recordPath(record.idempotencyKey);
-    const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
+    const temp = `${target}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
     await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
     if (process.platform === "win32") {
       await fs.rm(target, { force: true });
