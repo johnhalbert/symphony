@@ -4,14 +4,25 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ServiceConfig } from "../src/core/config/Config.js";
 import {
+  planIssueBreakdownApplicationWritebacks,
+  planIssueBreakdownFinalizationWritebacks,
+} from "../src/core/IssueBreakdownPlanApplyService.js";
+import {
   issueBreakdownConfigFingerprint,
   issueContentFingerprint,
+  IssueBreakdownPlanService,
 } from "../src/core/IssueBreakdownPlanService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import type { IssueBreakdownCreatedIssueRef, IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileIssueLifecycleStore,
+  type IssueBreakdownCreatedIssueRef,
+  type IssueBreakdownPlanRecord,
+  type IssueLifecycleRecord,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
+  TrackerIssueRelationInput,
   TrackerTransitionInput,
   TrackerWriteResult,
   TrackerWriter,
@@ -23,7 +34,12 @@ import {
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   WritebackProcessor,
 } from "../src/core/writeback/WritebackOutbox.js";
+import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
+
+type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
+type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
+type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
 
 describe("FileWritebackOutboxStore", () => {
   let root: string;
@@ -395,7 +411,7 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.issueCreates).toHaveLength(1);
   });
 
-  it("skips issue breakdown writebacks that are not bound to the current plan", async () => {
+  it("skips issue breakdown writebacks that are not registered on the current plan", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
     const config = testConfig(root);
@@ -423,7 +439,46 @@ describe("FileWritebackOutboxStore", () => {
     });
 
     expect(result.status).toBe("skipped");
+    expect(result.lastError).toBe("issue breakdown writeback is not registered on the current plan");
     expect(writer.issueCreates).toEqual([]);
+  });
+
+  it("skips superseded issue breakdown replay work before tracker writes", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const seeded = await seedSupersededIssueBreakdownWork(config, lifecycleStore, store, parentIssue);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      freshnessGuard(parentIssue, config),
+    );
+
+    await processor.processDue();
+    const lifecycle = await lifecycleStore.get(parentIssue.id);
+
+    for (const key of seeded.replayOperationKeys) {
+      await expect(store.get(key)).resolves.toMatchObject({
+        status: "skipped",
+        lastError: "issue breakdown writeback is not bound to the current plan",
+      });
+    }
+    expect(writer.issueCreates).toEqual([]);
+    expect(writer.issueRelations).toEqual([]);
+    expect(writer.comments).toEqual([]);
+    expect(lifecycle?.lastIssueBreakdownPlanId).toBe(seeded.currentPlan.id);
+    expect(lifecycle?.issueBreakdownPlans.find((plan) => plan.id === seeded.supersededPlan.id)).toMatchObject({
+      applicationStatus: "pending",
+      applicationBlockedReason: null,
+    });
   });
 
   it("skips issue breakdown writebacks that are no longer fresh", async () => {
@@ -657,6 +712,7 @@ class FakeWriter implements TrackerWriter {
   readonly transitions: TrackerTransitionInput[] = [];
   readonly comments: TrackerCommentInput[] = [];
   readonly issueCreates: TrackerIssueCreateInput[] = [];
+  readonly issueRelations: TrackerIssueRelationInput[] = [];
 
   constructor(private readonly options: { transitionStatus?: TrackerWriteResult["status"] } = {}) {}
 
@@ -685,6 +741,11 @@ class FakeWriter implements TrackerWriter {
         unresolvedLabelNames: [],
       },
     };
+  }
+
+  async createIssueRelation(input: TrackerIssueRelationInput): Promise<TrackerWriteResult> {
+    this.issueRelations.push(input);
+    return { status: "applied" };
   }
 }
 
@@ -778,6 +839,105 @@ function lifecycleWithReports(overrides: { lastCompletionReportId: string; compl
     },
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+async function seedSupersededIssueBreakdownWork(
+  config: ServiceConfig,
+  lifecycleStore: FileIssueLifecycleStore,
+  store: FileWritebackOutboxStore,
+  parentIssue: Issue,
+): Promise<{
+  supersededPlan: IssueBreakdownPlanRecord;
+  currentPlan: IssueBreakdownPlanRecord;
+  replayOperationKeys: string[];
+}> {
+  const planA = await submitTwoChildPlan(config, lifecycleStore, parentIssue, "plan-a", "run-plan-a");
+  const childOperations = planIssueBreakdownApplicationWritebacks(parentIssue, planA) as IssueCreateWriteback[];
+  const planAWithRefs = {
+    ...planA,
+    createdIssueRefs: childOperations.map((operation) => createdIssueRefForOperation(operation)),
+  };
+  const finalOperations = planIssueBreakdownFinalizationWritebacks(parentIssue, planAWithRefs);
+  const relationOperation = finalOperations.find((operation): operation is IssueRelationWriteback => operation.kind === "issue_relation");
+  const parentCommentOperation = finalOperations.find((operation): operation is CommentWriteback => operation.kind === "comment");
+  if (!relationOperation || !parentCommentOperation) throw new Error("expected relation and parent comment writebacks");
+
+  const registeredOperationKeys = [
+    ...childOperations.map((operation) => operation.idempotencyKey),
+    ...finalOperations.map((operation) => operation.idempotencyKey),
+  ];
+  const lifecycle = await lifecycleStore.get(parentIssue.id);
+  await lifecycleStore.updateIssue(parentIssue, {
+    issueBreakdownPlans: (lifecycle?.issueBreakdownPlans ?? []).map((plan) =>
+      plan.id === planA.id
+        ? {
+            ...planAWithRefs,
+            applicationStatus: "pending",
+            applicationOperationKeys: registeredOperationKeys,
+            applicationBlockedReason: null,
+          }
+        : plan,
+    ),
+    lastIssueBreakdownPlanId: planA.id,
+  });
+
+  await store.enqueueOnce(childOperations[0]!);
+  await store.markRetry(await store.enqueueOnce(relationOperation), "transient relation failure", "2026-01-01T00:00:00.000Z");
+  await store.enqueueOnce(parentCommentOperation);
+
+  const planB = await submitTwoChildPlan(config, lifecycleStore, parentIssue, "plan-b", "run-plan-b");
+  return {
+    supersededPlan: planA,
+    currentPlan: planB,
+    replayOperationKeys: [childOperations[0]!.idempotencyKey, relationOperation.idempotencyKey, parentCommentOperation.idempotencyKey],
+  };
+}
+
+async function submitTwoChildPlan(
+  config: ServiceConfig,
+  lifecycleStore: FileIssueLifecycleStore,
+  parentIssue: Issue,
+  idempotencyKey: string,
+  runId: string,
+): Promise<IssueBreakdownPlanRecord> {
+  const result = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
+    {
+      runId,
+      issueId: parentIssue.id,
+      summary: "Split into child issues.",
+      proposedIssues: [
+        {
+          title: "Build child",
+          description: "Implement the child issue.",
+          acceptanceCriteria: ["Done"],
+          dependencies: [],
+          labels: ["planning"],
+        },
+        {
+          title: "Build dependent child",
+          description: "Implement the dependent child issue.",
+          acceptanceCriteria: ["Done"],
+          dependencies: ["Build child"],
+          labels: ["planning"],
+        },
+      ],
+      idempotencyKey,
+    },
+    { issue: parentIssue, activeRunId: runId, role: "worker", phase: "issue_breakdown" },
+  );
+  return result.plan;
+}
+
+function createdIssueRefForOperation(operation: IssueCreateWriteback): IssueBreakdownCreatedIssueRef {
+  const childNumber = operation.payload.proposedIssueIndex + 1;
+  return {
+    proposedIssueIndex: operation.payload.proposedIssueIndex,
+    operationKey: operation.idempotencyKey,
+    status: "created",
+    id: `child-${childNumber}`,
+    identifier: `TEST-${childNumber + 1}`,
+    url: `https://linear.test/TEST-${childNumber + 1}`,
   };
 }
 
