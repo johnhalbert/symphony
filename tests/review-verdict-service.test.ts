@@ -445,6 +445,7 @@ function mergeGate(overrides: Partial<IssueMergeGateState> = {}): IssueMergeGate
         actionableSince: null,
       },
     ],
+    mergeability: null,
     reviewRound: 1,
     gateRunId: "worker-run-1",
     gateReportId: "completion-report:issue-1:report-1",

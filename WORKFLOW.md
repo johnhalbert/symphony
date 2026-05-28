@@ -39,7 +39,6 @@ merge_policy:
   mode: gated
   source_states:
     - Ready to Merge
-  conflicts_state: Approved with Conflicts
   max_conflict_fix_turns: 3
   done_state: Done
   merge_method: merge

@@ -115,6 +115,19 @@ export interface IssueMergeGateCheckSummary {
   actionableSince: string | null;
 }
 
+export type IssueMergeGateMergeabilityViewStatus = "mergeable" | "conflicted" | "unknown" | "blocked";
+
+export interface IssueMergeGateMergeabilitySummary {
+  status: IssueMergeGateMergeabilityViewStatus;
+  pullRequest: IssuePullRequestSummary;
+  mergeable: boolean | null;
+  mergeableState: string | null;
+  reason: string | null;
+  baseBranch: string | null;
+  baseHeadSha: string | null;
+  checkedAt: string;
+}
+
 export interface IssueMergeGateSummary {
   active: boolean;
   id: string | null;
@@ -127,6 +140,7 @@ export interface IssueMergeGateSummary {
   repairRunId: string | null;
   repairReportId: string | null;
   checks: IssueMergeGateCheckSummary[];
+  mergeability: IssueMergeGateMergeabilitySummary | null;
   actionableCheckNames: string[];
   observingCheckNames: string[];
   blockerFingerprint: string | null;

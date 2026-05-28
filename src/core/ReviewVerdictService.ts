@@ -272,6 +272,15 @@ export function formatWorkerMergeGatePromptResult(lifecycle: IssueLifecycleRecor
   if (!gate || (gate.status !== "repair_dispatched" && gate.status !== "blocked")) return null;
   const actionable = gate.checks.filter((check) => check.outcome === "failing" || check.outcome === "missing_actionable");
   const observing = gate.checks.filter((check) => check.outcome === "pending" || check.outcome === "missing_observed" || check.outcome === "unknown");
+  const conflict = gate.mergeability?.status === "conflicted";
+  const requiredAction = conflict
+    ? [
+        "Fetch the latest upstream changes from origin/main, rebase the lifecycle-bound PR branch over origin/main, resolve merge conflicts, commit and push the repaired branch, validate the requested checks, and submit a normal completion report.",
+        actionable.length > 0
+          ? "Also fix the failing or missing required checks before submitting the completion report."
+          : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
+      ].join(" ")
+    : "Fix failing checks or restore missing actionable required checks on the lifecycle-bound PR branch, then submit a completion report. Symphony will re-fetch GitHub checks and PR mergeability before clearing this blocker.";
   return {
     kind: "repair",
     text: [
@@ -295,8 +304,11 @@ export function formatWorkerMergeGatePromptResult(lifecycle: IssueLifecycleRecor
       "Awaiting CI / observation:",
       ...formatMergeGatePromptChecks(observing, "No pending, missing-observed, or unknown checks recorded."),
       "",
+      "Mergeability:",
+      ...formatMergeGatePromptMergeability(gate),
+      "",
       "Required action:",
-      "Fix failing checks or restore missing actionable required checks on the lifecycle-bound PR branch, then submit a completion report. Symphony will re-fetch GitHub checks before clearing this blocker.",
+      requiredAction,
     ].join("\n"),
   };
 }
@@ -453,6 +465,20 @@ function formatMergeGatePromptChecks(checks: NonNullable<IssueLifecycleRecord["m
     const url = check.url === null ? "" : ` (${check.url})`;
     return `- ${check.name}: ${check.outcome}${conclusion}${url}${formatMissingCheckStabilization(check)}`;
   });
+}
+
+function formatMergeGatePromptMergeability(gate: IssueMergeGateState): string[] {
+  const mergeability = gate.mergeability;
+  if (mergeability === null) return ["- No mergeability blocker recorded."];
+  return [
+    `- Status: ${mergeability.status}`,
+    `- GitHub mergeable: ${mergeability.mergeable === null ? "unknown" : String(mergeability.mergeable)}`,
+    `- GitHub mergeable_state: ${mergeability.mergeableState ?? "unknown"}`,
+    `- Reason: ${mergeability.reason ?? "n/a"}`,
+    `- Base branch: ${mergeability.baseBranch ?? "n/a"}`,
+    `- Base head SHA: ${mergeability.baseHeadSha ?? "n/a"}`,
+    `- Checked at: ${mergeability.checkedAt}`,
+  ];
 }
 
 function formatMissingCheckStabilization(check: IssueMergeGateState["checks"][number]): string {

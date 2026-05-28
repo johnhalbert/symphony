@@ -18,6 +18,7 @@ import type {
   IssueLifecycleRecord,
   IssueLifecycleStore,
   IssueMergeConflictMetadata,
+  IssueMergeGateMergeabilityState,
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
 import { latestCurrentApprovalPassVerdict } from "../core/persistence/IssueLifecycleStore.js";
@@ -2932,6 +2933,7 @@ function mergeGateStatus(
     repairRunId: gate.repairRunId,
     repairReportId: gate.repairReportId,
     checks: gate.checks.map((check) => ({ ...check })),
+    mergeability: mergeGateMergeabilityStatus(gate.mergeability ?? null, fallbackPullRequest),
     actionableCheckNames,
     observingCheckNames,
     blockerFingerprint: gate.blockerFingerprint,
@@ -2939,6 +2941,30 @@ function mergeGateStatus(
     awaitingCi: gate.status === "observing",
     automationBlocked: gate.status === "repair_dispatched" || gate.status === "blocked",
     updatedAt: gate.updatedAt,
+  };
+}
+
+function mergeGateMergeabilityStatus(
+  mergeability: IssueMergeGateMergeabilityState | null,
+  fallbackPullRequest: IssuePullRequestSummary,
+): IssueMergeGateSummary["mergeability"] {
+  if (mergeability === null) return null;
+  return {
+    status: mergeability.status,
+    pullRequest: {
+      url: mergeability.pullRequest.url ?? fallbackPullRequest.url,
+      number: mergeability.pullRequest.number ?? fallbackPullRequest.number,
+      headSha: mergeability.pullRequest.headSha ?? fallbackPullRequest.headSha,
+      branch: mergeability.pullRequest.branch ?? fallbackPullRequest.branch,
+      ciStatus: fallbackPullRequest.ciStatus,
+      lastPushedAt: fallbackPullRequest.lastPushedAt,
+    },
+    mergeable: mergeability.mergeable,
+    mergeableState: mergeability.mergeableState,
+    reason: mergeability.reason,
+    baseBranch: mergeability.baseBranch,
+    baseHeadSha: mergeability.baseHeadSha,
+    checkedAt: mergeability.checkedAt,
   };
 }
 

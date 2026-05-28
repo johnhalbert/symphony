@@ -232,6 +232,7 @@ export type IssueMergeGateCheckOutcome =
   | "failing"
   | "unknown";
 export type IssueMergeGateRawCheckStatus = "success" | "failure" | "pending" | "missing" | "unknown";
+export type IssueMergeGateMergeabilityStatus = "mergeable" | "conflicted" | "unknown" | "blocked";
 
 export interface IssueMergeGateCheckState {
   name: string;
@@ -243,6 +244,17 @@ export interface IssueMergeGateCheckState {
   actionableSince: string | null;
 }
 
+export interface IssueMergeGateMergeabilityState {
+  status: IssueMergeGateMergeabilityStatus;
+  pullRequest: CompletionReportPullRequestRef;
+  mergeable: boolean | null;
+  mergeableState: string | null;
+  reason: string | null;
+  baseBranch: string | null;
+  baseHeadSha: string | null;
+  checkedAt: string;
+}
+
 export interface IssueMergeGateState {
   id: string;
   status: IssueMergeGateStatus;
@@ -250,6 +262,7 @@ export interface IssueMergeGateState {
   pullRequest: CompletionReportPullRequestRef;
   requiredChecks: string[];
   checks: IssueMergeGateCheckState[];
+  mergeability: IssueMergeGateMergeabilityState | null;
   reviewRound: number;
   gateRunId: string | null;
   gateReportId: string | null;
@@ -1399,6 +1412,7 @@ function normalizeMergeGateState(value: unknown, filePath: string): IssueMergeGa
     pullRequest: normalizeMergeGatePullRequest(value.pullRequest, filePath),
     requiredChecks: requiredStringArray(value.requiredChecks, filePath, "mergeGate.requiredChecks"),
     checks: normalizeMergeGateChecks(value.checks, filePath),
+    mergeability: normalizeMergeGateMergeability(value.mergeability, filePath),
     reviewRound: nonNegativeInteger(value.reviewRound, filePath, "mergeGate.reviewRound"),
     gateRunId: optionalNullableString(value.gateRunId, filePath, "mergeGate.gateRunId"),
     gateReportId: optionalNullableString(value.gateReportId, filePath, "mergeGate.gateReportId"),
@@ -1429,6 +1443,23 @@ function normalizeMergeGateChecks(value: unknown, filePath: string): IssueMergeG
       actionableSince: optionalNullableString(item.actionableSince, filePath, `mergeGate.checks[${index}].actionableSince`),
     };
   });
+}
+
+function normalizeMergeGateMergeability(value: unknown, filePath: string): IssueMergeGateMergeabilityState | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "mergeGate.mergeability is invalid");
+  const status = value.status;
+  if (!isMergeGateMergeabilityStatus(status)) throw corruptLifecycle(filePath, "mergeGate.mergeability.status is invalid");
+  return {
+    status,
+    pullRequest: normalizeMergeGatePullRequest(value.pullRequest, filePath),
+    mergeable: optionalNullableBoolean(value.mergeable, filePath, "mergeGate.mergeability.mergeable"),
+    mergeableState: optionalNullableString(value.mergeableState, filePath, "mergeGate.mergeability.mergeableState"),
+    reason: optionalNullableString(value.reason, filePath, "mergeGate.mergeability.reason"),
+    baseBranch: optionalNullableString(value.baseBranch, filePath, "mergeGate.mergeability.baseBranch"),
+    baseHeadSha: optionalNullableString(value.baseHeadSha, filePath, "mergeGate.mergeability.baseHeadSha"),
+    checkedAt: requiredString(value.checkedAt, filePath, "mergeGate.mergeability.checkedAt"),
+  };
 }
 
 function normalizeMergeGatePullRequest(value: unknown, filePath: string): CompletionReportPullRequestRef {
@@ -1733,6 +1764,10 @@ function isMergeGateStatus(value: unknown): value is IssueMergeGateStatus {
     value === "resolved" ||
     value === "superseded"
   );
+}
+
+function isMergeGateMergeabilityStatus(value: unknown): value is IssueMergeGateMergeabilityStatus {
+  return value === "mergeable" || value === "conflicted" || value === "unknown" || value === "blocked";
 }
 
 function isMergeGateCheckOutcome(value: unknown): value is IssueMergeGateCheckOutcome {

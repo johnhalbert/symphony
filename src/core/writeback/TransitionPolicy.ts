@@ -1,6 +1,7 @@
 import type { ServiceConfig } from "../config/Config.js";
 import type {
   IssueCompletionReportRecord,
+  IssueMergeGateMergeabilityState,
   IssueReviewVerdictRecord,
   PullRequestReviewEvidenceItem,
 } from "../persistence/IssueLifecycleStore.js";
@@ -72,6 +73,7 @@ export interface MergeGateWritebackContext {
   pendingChecks: MergeGateCheckEvidence[];
   missingChecks: MergeGateCheckEvidence[];
   unknownChecks?: MergeGateCheckEvidence[];
+  mergeability?: IssueMergeGateMergeabilityState | null;
   reviewRound: number;
   maxReviewRounds: number;
 }
@@ -615,13 +617,22 @@ export function planMergeGateRepairWritebacks(
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
   const eventKey = mergeGateWritebackEventKey(context, "repair");
+  const conflict = context.mergeability?.status === "conflicted";
+  const requiredAction = conflict
+    ? [
+        "Fetch the latest upstream changes from origin/main, rebase the lifecycle-bound PR branch over origin/main, resolve merge conflicts, commit and push the repaired branch, validate the requested checks, and submit a new completion report.",
+        hasActionableCheckBlockers(context)
+          ? "Also fix the failing or missing required checks before submitting the completion report."
+          : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
+      ].join(" ")
+    : "Fix the failing required checks, push the repair to the lifecycle-bound PR branch, validate it, and submit a new completion report.";
   return [
     mergeGateCommentOperation(
       context,
       eventKey,
       "repair required",
       `Next state: ${config.writeback.dispatchState} (worker repair queue)`,
-      "Fix the failing required checks, push the repair to the lifecycle-bound PR branch, validate it, and submit a new completion report.",
+      requiredAction,
     ),
     {
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
@@ -630,7 +641,7 @@ export function planMergeGateRepairWritebacks(
       payload: {
         fromStates: [context.fromState],
         toState: config.writeback.dispatchState,
-        reason: "Symphony merge gate required CI repair",
+        reason: conflict ? "Symphony merge gate required PR repair" : "Symphony merge gate required CI repair",
       },
     },
   ];
@@ -643,6 +654,7 @@ export function planMergeGateBlockedWritebacks(
   if (!config.writeback.enabled) return [];
   const blockedState = config.reviewLoop.blockedStates[0] ?? null;
   const eventKey = mergeGateWritebackEventKey(context, "blocked");
+  const conflict = context.mergeability?.status === "conflicted";
   const operations: NewWritebackOperation[] = [
     mergeGateCommentOperation(
       context,
@@ -651,7 +663,9 @@ export function planMergeGateBlockedWritebacks(
       blockedState === null
         ? "No blocked state is configured, so Symphony recorded a lifecycle-level block without changing the tracker state."
         : `Transitioning to blocked state: ${blockedState}`,
-      "Inspect the failing required checks and decide whether to repair, adjust CI configuration, or manually override the merge gate.",
+      conflict
+        ? "Inspect the merge conflicts and required checks, then decide whether to repair manually, reset approval, or override the merge gate."
+        : "Inspect the failing required checks and decide whether to repair, adjust CI configuration, or manually override the merge gate.",
     ),
   ];
   if (blockedState !== null) {
@@ -969,6 +983,9 @@ function mergeGateCommentOperation(
         "Unknown checks:",
         ...formatMergeGateChecks(context.unknownChecks ?? [], "No unknown checks recorded."),
         "",
+        "Mergeability:",
+        ...formatMergeGateMergeability(context.mergeability ?? null),
+        "",
         "Counts:",
         `- Merge gate repair round: ${formatCount(context.reviewRound, context.maxReviewRounds)}`,
         "",
@@ -979,6 +996,10 @@ function mergeGateCommentOperation(
   };
 }
 
+function hasActionableCheckBlockers(context: MergeGateWritebackContext): boolean {
+  return context.failedChecks.length > 0 || (context.actionableMissingChecks ?? []).length > 0;
+}
+
 function formatMergeGateChecks(checks: MergeGateCheckEvidence[], fallback: string): string[] {
   if (checks.length === 0) return [`- ${fallback}`];
   return checks.map((check) => {
@@ -986,6 +1007,19 @@ function formatMergeGateChecks(checks: MergeGateCheckEvidence[], fallback: strin
     const url = check.url === null ? "" : ` (${check.url})`;
     return `- ${check.name}: ${check.status}${conclusion}${url}`;
   });
+}
+
+function formatMergeGateMergeability(mergeability: IssueMergeGateMergeabilityState | null): string[] {
+  if (mergeability === null) return ["- No mergeability blocker recorded."];
+  return [
+    `- Status: ${mergeability.status}`,
+    `- GitHub mergeable: ${mergeability.mergeable === null ? "unknown" : String(mergeability.mergeable)}`,
+    `- GitHub mergeable_state: ${mergeability.mergeableState ?? "unknown"}`,
+    `- Reason: ${mergeability.reason ?? "n/a"}`,
+    `- Base branch: ${mergeability.baseBranch ?? "n/a"}`,
+    `- Base head SHA: ${mergeability.baseHeadSha ?? "n/a"}`,
+    `- Checked at: ${mergeability.checkedAt}`,
+  ];
 }
 
 function formatReviewEvidenceForLinearComment(evidence: PullRequestReviewEvidenceItem[]): string[] {

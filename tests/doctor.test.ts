@@ -171,7 +171,7 @@ describe("doctor review-loop checks", () => {
         status: "ok",
         message: "Hermes gateway session exposes required Symphony MCP tools for worker and reviewer profiles",
       });
-      expect(clients).toHaveLength(3);
+      expect(clients).toHaveLength(2);
       expect(clients.flatMap((client) => client.requests.map((request) => request.method))).toContain("tools.list");
       expect(clients.every((client) => client.env.authHome === config.hermes.auth.managedRoot)).toBe(true);
     } finally {
@@ -744,7 +744,6 @@ class DoctorFakeHermesGatewayClient extends EventEmitter implements HermesGatewa
             name: "mcp-symphony",
             tools: [
               "mcp_symphony_submit_completion_report",
-              "mcp_symphony_conflicts_submit_merge_conflict_resolution",
               "mcp_symphony_review_verdict_submit_review_verdict",
               "mcp_symphony_review_feedback_submit_pull_request_review_feedback",
             ],

@@ -655,7 +655,7 @@ Work on {{ issue.identifier }}.
     expect(config.mergePolicy.requiredChecks).toEqual([]);
   });
 
-  it("validates merge conflict states as merge-policy board states outside normal buckets", () => {
+  it("parses legacy merge conflict states without adding them to normal board routing", () => {
     const config = parseServiceConfig(
       {
         tracker: {
@@ -678,11 +678,11 @@ Work on {{ issue.identifier }}.
     expect(config.mergePolicy.conflictsState).toBe("Approved with Conflicts");
     expect(config.tracker.activeStates).not.toContain("Approved with Conflicts");
     expect(config.issueBoard.columns.progress).not.toContain("Approved with Conflicts");
-    expect(config.issueBoard.columns.review).toContain("Approved with Conflicts");
+    expect(config.issueBoard.columns.review).not.toContain("Approved with Conflicts");
   });
 
-  it("rejects merge conflict states that overlap normal lifecycle buckets", () => {
-    expect(() =>
+  it("accepts legacy merge conflict states that overlap normal lifecycle buckets because new routing ignores them", () => {
+    expect(
       parseServiceConfig(
         {
           tracker: {
@@ -701,8 +701,8 @@ Work on {{ issue.identifier }}.
         "/repo/WORKFLOW.md",
         { LINEAR_API_KEY: "secret" },
       ),
-    ).toThrow("merge_policy.conflicts_state must not overlap tracker.active_states");
-    expect(() =>
+    ).toMatchObject({ mergePolicy: { conflictsState: "In Progress" } });
+    expect(
       parseServiceConfig(
         {
           tracker: {
@@ -721,7 +721,7 @@ Work on {{ issue.identifier }}.
         "/repo/WORKFLOW.md",
         { LINEAR_API_KEY: "secret" },
       ),
-    ).toThrow("merge_policy.conflicts_state must not overlap merge_policy.source_states");
+    ).toMatchObject({ mergePolicy: { conflictsState: "Ready to Merge" } });
   });
 
   it("rejects handoff states that overlap active or terminal states", () => {

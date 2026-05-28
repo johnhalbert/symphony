@@ -268,7 +268,6 @@ export async function runtimeHarnessDependencyDoctorChecks(
       config.hermes.roleTemplates.worker,
       config.hermes.roleTemplates.reviewer,
       config.hermes.roleTemplates.planner,
-      config.hermes.roleTemplates.mergeConflictResolution,
     ]),
   );
   const pythonCheck = await hermesPythonImportDoctorCheck(config);

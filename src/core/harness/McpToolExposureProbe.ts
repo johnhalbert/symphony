@@ -6,10 +6,7 @@ import { Agent, type Run, type SDKAgent, type SettingSource } from "@cursor/sdk"
 import type { CursorSettingSource, ServiceConfig } from "../config/Config.js";
 import type { AgentRunContext } from "./AgentHarness.js";
 import { COMPLETION_REPORT_TOOL_NAME, writeCompletionReportMcpContext } from "./CompletionReportMcpServer.js";
-import {
-  MERGE_CONFLICT_RESOLUTION_TOOL_NAME,
-  writeMergeConflictResolutionMcpContext,
-} from "./MergeConflictResolutionMcpServer.js";
+import { writeMergeConflictResolutionMcpContext } from "./MergeConflictResolutionMcpServer.js";
 import {
   buildMcpSubprocessEnvironment,
   buildMcpSubprocessServerConfig,
@@ -200,13 +197,6 @@ export const MCP_TOOL_EXPOSURE_SPECS: readonly McpToolExposureSpec[] = [
     serverKey: "symphony",
     command: "completion-report-mcp",
     expectedTool: COMPLETION_REPORT_TOOL_NAME,
-  },
-  {
-    role: "worker",
-    runPhase: "merge_conflict_resolution",
-    serverKey: "symphony_conflicts",
-    command: "merge-conflict-resolution-mcp",
-    expectedTool: MERGE_CONFLICT_RESOLUTION_TOOL_NAME,
   },
   {
     role: "reviewer",

@@ -668,11 +668,6 @@ export class Orchestrator {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchWorkerIssue(issue, null);
       }
-      const conflictFixCandidates = await this.fetchMergeConflictWorkerCandidates();
-      for (const issue of sortIssuesForDispatch(conflictFixCandidates)) {
-        if (this.availableSlots() <= 0) break;
-        await this.tryDispatchWorkerIssue(issue, null);
-      }
       const reviewerCandidates = await this.options.tracker.fetchIssuesByStates(this.config.reviewLoop.reviewStates);
       for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
         if (this.availableSlots() <= 0) break;
@@ -834,16 +829,6 @@ export class Orchestrator {
       reason,
       cleanup_workspace: cleanupWorkspace,
     });
-  }
-
-  private async fetchMergeConflictWorkerCandidates(): Promise<Issue[]> {
-    if (this.config.mergePolicy.mode !== "gated" || this.config.mergePolicy.conflictsState === null) return [];
-    try {
-      return await this.options.tracker.fetchIssuesByStates([this.config.mergePolicy.conflictsState]);
-    } catch (error) {
-      this.options.logger.warn("merge conflict worker issue fetch failed", { error: errorMessage(error) });
-      return [];
-    }
   }
 
   private shouldDispatchWorker(
@@ -1101,12 +1086,8 @@ export class Orchestrator {
     return this.config.issueBreakdown.planningLabels.some((label) => labels.has(label));
   }
 
-  private isMergeConflictState(state: string): boolean {
-    return (
-      this.config.mergePolicy.mode === "gated" &&
-      this.config.mergePolicy.conflictsState !== null &&
-      statesEqual(state, this.config.mergePolicy.conflictsState)
-    );
+  private isMergeConflictState(_state: string): boolean {
+    return false;
   }
 
   private dispatchIssue(
