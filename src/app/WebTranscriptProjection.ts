@@ -38,19 +38,17 @@ export function projectWebTranscript(events: readonly TranscriptEvent[]): Transc
 function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
-  if (eventType.includes("tool")) return projectToolCallMessage(event, payload);
-  if (isThinkingEvent(eventType)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
-  if (isTaskEvent(eventType)) return projectTaskMessage(event, payload);
-  if (isRequestEvent(eventType)) return projectRequestMessage(event, payload);
-  if (event.source === "cursor" || event.source === "harness") {
+  const payloadKind = normalizedPayloadKind(payload);
+  if (isToolEvent(eventType, payloadKind)) return projectToolCallMessage(event, payload);
+  if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
+  if (isTaskEvent(eventType, payloadKind)) return projectTaskMessage(event, payload);
+  if (isRequestEvent(eventType, payloadKind)) return projectRequestMessage(event, payload);
+  if (isSystemEvent(eventType, payloadKind)) return projectSystemMessage(event, payload);
+  if (isStatusEvent(eventType, payloadKind)) return projectStatusMessage(event, payload, eventType);
+  if (isAssistantEvent(event, eventType, payloadKind)) {
     return { kind: "assistant", ts: event.at, text: eventText(event, payload) };
   }
-  return {
-    kind: "status",
-    state: firstCleanString(payload.state, payload.status) ?? eventType,
-    ts: event.at,
-    text: eventText(event, payload),
-  };
+  return projectStatusMessage(event, payload, eventType);
 }
 
 function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, unknown>): TranscriptMessage {
@@ -93,21 +91,75 @@ function projectRequestMessage(event: TranscriptEvent, payload: Record<string, u
   };
 }
 
-function isThinkingEvent(eventType: string): boolean {
-  return eventType.includes("thinking") || eventType.includes("reasoning") || eventType.includes("thought");
+function projectSystemMessage(event: TranscriptEvent, payload: Record<string, unknown>): TranscriptMessage {
+  return {
+    kind: "system",
+    ts: event.at,
+    model: firstCleanString(payload.model, payload.modelName) ?? "",
+    cwd: firstCleanString(payload.cwd, payload.workingDirectory) ?? "",
+    workspace: firstCleanString(payload.workspace, payload.workspaceKey, payload.workspacePath) ?? "",
+    session: firstCleanString(payload.session, payload.sessionId, payload.threadId) ?? event.runId,
+    tools: stringLabels(payload.tools),
+    note: firstCleanString(payload.note, payload.messagePreview, payload.summary, payload.subtype, event.message) ?? event.eventType,
+  };
 }
 
-function isTaskEvent(eventType: string): boolean {
-  return eventType.includes("task");
+function projectStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  return {
+    kind: "status",
+    state: firstCleanString(payload.state, payload.status, payload.subtype) ?? eventType,
+    ts: event.at,
+    text: eventText(event, payload),
+  };
 }
 
-function isRequestEvent(eventType: string): boolean {
+function isToolEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType.includes("tool") || payloadKindIncludes(payloadKind, "tool");
+}
+
+function isThinkingEvent(eventType: string, payloadKind: string | null): boolean {
+  return (
+    eventType.includes("thinking") ||
+    eventType.includes("reasoning") ||
+    eventType.includes("thought") ||
+    payloadKindIncludes(payloadKind, "thinking") ||
+    payloadKindIncludes(payloadKind, "reasoning") ||
+    payloadKindIncludes(payloadKind, "thought")
+  );
+}
+
+function isTaskEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType.includes("task") || payloadKindIncludes(payloadKind, "task");
+}
+
+function isRequestEvent(eventType: string, payloadKind: string | null): boolean {
   return (
     eventType.includes("approval") ||
     eventType.includes("human_required") ||
     eventType.includes("humanrequired") ||
-    eventType.includes("request")
+    eventType.includes("request") ||
+    payloadKindIncludes(payloadKind, "approval") ||
+    payloadKindIncludes(payloadKind, "human_required") ||
+    payloadKindIncludes(payloadKind, "humanrequired") ||
+    payloadKindIncludes(payloadKind, "request")
   );
+}
+
+function isSystemEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "system" || payloadKind === "system";
+}
+
+function isStatusEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "status" || payloadKind === "status";
+}
+
+function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind: string | null): boolean {
+  if (eventType === "assistant" || payloadKind === "assistant") return true;
+  return event.source === "harness" && (eventType === "progress" || eventType === "completed");
 }
 
 function sanitizedPayloadRecord(event: TranscriptEvent): Record<string, unknown> {
@@ -132,6 +184,25 @@ function actionLabels(value: unknown): string[] {
     if (label) labels.push(label);
   }
   return labels;
+}
+
+function stringLabels(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const labels: string[] = [];
+  for (const item of value) {
+    const label = isRecord(item) ? firstCleanString(item.label, item.name, item.id) : firstCleanString(item);
+    if (label) labels.push(label);
+  }
+  return labels;
+}
+
+function normalizedPayloadKind(payload: Record<string, unknown>): string | null {
+  const kind = firstCleanString(payload.kind, payload.type);
+  return kind ? normalizeToken(kind) : null;
+}
+
+function payloadKindIncludes(payloadKind: string | null, token: string): boolean {
+  return payloadKind?.includes(token) ?? false;
 }
 
 function firstCleanString(...values: unknown[]): string | null {

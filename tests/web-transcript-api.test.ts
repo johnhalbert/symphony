@@ -200,6 +200,68 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("serves Cursor status, system, and unknown transcript events without assistant fallback", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, {
+      runId: "cursor-nonassistant-run",
+      sessionId: "cursor-nonassistant-session",
+      issueIdentifier: "TEST-1",
+    });
+    await runStore.appendEvent({
+      runId: "cursor-nonassistant-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "cursor",
+      eventType: "status",
+      message: "Cursor status warming",
+      payload: { kind: "status", status: "warming", messagePreview: "status public preview", truncated: false },
+    });
+    await runStore.appendEvent({
+      runId: "cursor-nonassistant-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "cursor",
+      eventType: "system",
+      message: "Cursor system event: bootstrap",
+      payload: { kind: "system", subtype: "bootstrap", messagePreview: "system public preview", truncated: false },
+    });
+    await runStore.appendEvent({
+      runId: "cursor-nonassistant-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "cursor",
+      eventType: "novel_cursor_event",
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/cursor-nonassistant-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expect(body).toEqual([
+        { kind: "status", state: "warming", ts: "2026-01-01T00:00:01.000Z", text: "status public preview" },
+        {
+          kind: "system",
+          ts: "2026-01-01T00:00:02.000Z",
+          model: "",
+          cwd: "",
+          workspace: "",
+          session: "cursor-nonassistant-run",
+          tools: [],
+          note: "system public preview",
+        },
+        {
+          kind: "status",
+          state: "novel_cursor_event",
+          ts: "2026-01-01T00:00:03.000Z",
+          text: "novel_cursor_event",
+        },
+      ]);
+      expect(body.map((message) => message.kind)).not.toContain("assistant");
+    } finally {
+      await server.stop();
+    }
+  });
+
 });
 
 function createServer(config: ReturnType<typeof testConfig>, runStore: FileRunTranscriptStore | undefined): StatusServer {

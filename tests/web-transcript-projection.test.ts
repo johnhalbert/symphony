@@ -126,6 +126,45 @@ describe("projectWebTranscript", () => {
     ).toEqual([{ kind: "thinking", ts: "2026-01-01T00:00:00.000Z", text: "actual reasoning text preview" }]);
   });
 
+  it("projects Cursor status, system, and unknown events as non-assistant messages", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "status",
+        source: "cursor",
+        message: "Cursor status running",
+        payload: { kind: "status", status: "running", messagePreview: "workspace ready" },
+      }),
+      event({
+        eventType: "system",
+        source: "cursor",
+        message: "Cursor system event: startup",
+        payload: { kind: "system", subtype: "startup", messagePreview: "system public preview", truncated: false },
+      }),
+      event({ eventType: "some_new_cursor_kind", source: "cursor" }),
+    ]);
+
+    expect(messages).toEqual([
+      { kind: "status", state: "running", ts: "2026-01-01T00:00:00.000Z", text: "workspace ready" },
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.000Z",
+        model: "",
+        cwd: "",
+        workspace: "",
+        session: "run-1",
+        tools: [],
+        note: "system public preview",
+      },
+      {
+        kind: "status",
+        state: "some_new_cursor_kind",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "some_new_cursor_kind",
+      },
+    ]);
+    expect(messages.map((message) => message.kind)).not.toContain("assistant");
+  });
+
 });
 
 function event(overrides: Partial<TranscriptEvent>): TranscriptEvent {
