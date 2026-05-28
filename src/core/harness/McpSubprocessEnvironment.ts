@@ -64,7 +64,7 @@ export function buildMcpSubprocessEnvironment(input: McpSubprocessEnvironmentInp
   const env: Record<string, string> = {};
   addRuntimeBaseline(env, parentEnv);
   addRequiredParseDependencies(env, input.config);
-  addCommandCapabilitySlice(env, input.config, input.command);
+  addCommandCapabilitySlice(env, input.config, input.command, parentEnv);
   return env;
 }
 
@@ -136,16 +136,17 @@ function addCommandCapabilitySlice(
   env: Record<string, string>,
   config: ServiceConfig,
   command: McpSubprocessCommand,
+  parentEnv: NodeJS.ProcessEnv,
 ): void {
   if (command === "completion-report-mcp" && config.github.publishPullRequests) {
     addGitHubParseRefs(env, config);
     if (!(config.github.operatorApproval?.requiredForPublication ?? false)) {
-      addGitHubCapabilityEnvironment(env, config, "service", "github.publication");
+      addGitHubCapabilityEnvironment(env, config, parentEnv, "service", "github.publication");
     }
   }
   if (command === "review-feedback-mcp") {
     addGitHubParseRefs(env, config);
-    addGitHubCapabilityEnvironment(env, config, "reviewer", "github.review_feedback_write");
+    addGitHubCapabilityEnvironment(env, config, parentEnv, "reviewer", "github.review_feedback_write");
   }
 }
 
@@ -168,6 +169,7 @@ function addGitHubParseRefs(env: Record<string, string>, config: ServiceConfig):
 function addGitHubCapabilityEnvironment(
   env: Record<string, string>,
   config: ServiceConfig,
+  parentEnv: NodeJS.ProcessEnv,
   role: CredentialRole,
   capability: "github.publication" | "github.review_feedback_write",
 ): void {
@@ -187,6 +189,8 @@ function addGitHubCapabilityEnvironment(
   const rawGithubTokenRef = envReference(rawGithubToken);
   if (rawGithubTokenRef) {
     env[rawGithubTokenRef] = config.github.token ?? "";
+    if (config.github.token !== null) return;
+    addGitHubAppCapabilityEnvironment(env, config, parentEnv);
     return;
   }
 
@@ -194,7 +198,74 @@ function addGitHubCapabilityEnvironment(
     return;
   }
 
-  env.GITHUB_TOKEN = config.github.token ?? "";
+  if (config.github.token !== null) {
+    env.GITHUB_TOKEN = config.github.token;
+    return;
+  }
+
+  if (config.github.app !== null) {
+    addGitHubAppCapabilityEnvironment(env, config, parentEnv);
+    return;
+  }
+
+  env.GITHUB_TOKEN = "";
+}
+
+function addGitHubAppCapabilityEnvironment(
+  env: Record<string, string>,
+  config: ServiceConfig,
+  parentEnv: NodeJS.ProcessEnv,
+): void {
+  const app = config.github.app;
+  if (app === null) return;
+
+  const rawApp = config.raw.github?.app;
+  addGitHubAppStringEnvironment(env, rawApp?.app_id, "GITHUB_APP_ID", app.appId);
+  addGitHubAppStringEnvironment(env, rawApp?.client_id, "GITHUB_APP_CLIENT_ID", app.clientId);
+  addGitHubAppStringEnvironment(env, rawApp?.installation_id, "GITHUB_APP_INSTALLATION_ID", app.installationId);
+  addGitHubAppPrivateKeyEnvironment(env, rawApp?.private_key, app.privateKeyEnvVar, parentEnv);
+  addGitHubAppStringEnvironment(env, rawApp?.private_key_path, "GITHUB_APP_PRIVATE_KEY_PATH", app.privateKeyPath);
+}
+
+function addGitHubAppStringEnvironment(
+  env: Record<string, string>,
+  rawValue: string | undefined,
+  defaultEnvVar: string,
+  normalizedValue: string | null,
+): void {
+  const explicitRef = envReference(rawValue);
+  if (explicitRef) {
+    env[explicitRef] = normalizedValue ?? "";
+    return;
+  }
+
+  if (rawValue === undefined && normalizedValue !== null) {
+    env[defaultEnvVar] = normalizedValue;
+  }
+}
+
+function addGitHubAppPrivateKeyEnvironment(
+  env: Record<string, string>,
+  rawValue: string | undefined,
+  privateKeyEnvVar: string | null,
+  parentEnv: NodeJS.ProcessEnv,
+): void {
+  const explicitRef = envReference(rawValue);
+  if (explicitRef) {
+    env[explicitRef] = parentEnv[explicitRef] ?? "";
+    return;
+  }
+
+  if (rawValue !== undefined) return;
+
+  if (privateKeyEnvVar !== null) {
+    env[privateKeyEnvVar] = parentEnv[privateKeyEnvVar] ?? "";
+    return;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(parentEnv, "GITHUB_APP_PRIVATE_KEY")) {
+    env.GITHUB_APP_PRIVATE_KEY = parentEnv.GITHUB_APP_PRIVATE_KEY ?? "";
+  }
 }
 
 function envReference(value: string | undefined): string | null {
