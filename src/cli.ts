@@ -39,10 +39,12 @@ program
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .option("--json", "print JSON output")
   .option("--strict", "treat warnings as failures")
-  .action(async (workflow: string, options: { json?: boolean; strict?: boolean }) => {
+  .option("--live-runtime", "run opt-in live runtime harness diagnostics")
+  .action(async (workflow: string, options: { json?: boolean; strict?: boolean; liveRuntime?: boolean }) => {
     const result = await runDoctor({
       workflowPath: path.resolve(process.cwd(), workflow),
       strict: options.strict,
+      liveRuntime: options.liveRuntime,
       cliPath: currentCliPath(),
     });
     if (options.json) {

@@ -55,12 +55,34 @@ export async function resolveIssueForBreakdownFreshness(
 }
 
 export function resolveCursorRuntimeApiKey(config: ServiceConfig, role: AgentRunRole): string | null {
-  return resolveCursorRuntimeCredential(config, role)?.value ?? null;
+  return resolveRuntimeApiKey(config, role, "cursor");
 }
 
 export function resolveCursorRuntimeCredential(config: ServiceConfig, role: AgentRunRole): ResolvedCredential | null {
-  enforceCapabilityOwner(config, role, "cursor.runtime", "CURSOR_API_KEY");
-  return config.credentialProfiles.resolveForRole(role, "cursor.runtime");
+  return resolveRuntimeCredential(config, role, "cursor");
+}
+
+export function resolveRuntimeApiKey(config: ServiceConfig, role: AgentRunRole, harnessId: string): string | null {
+  return resolveRuntimeCredential(config, role, harnessId)?.value ?? null;
+}
+
+export function resolveRuntimeCredential(
+  config: ServiceConfig,
+  role: AgentRunRole,
+  harnessId: string,
+): ResolvedCredential | null {
+  if (harnessId === "cursor") {
+    enforceCapabilityOwner(config, role, "runtime.cursor", "CURSOR_API_KEY");
+    return (
+      config.credentialProfiles.resolveForRole(role, "runtime.cursor") ??
+      config.credentialProfiles.resolveForRole(role, "cursor.runtime")
+    );
+  }
+  if (harnessId === "hermes") {
+    enforceCapabilityOwner(config, role, "runtime.hermes", "runtime.hermes credential profile");
+    return config.credentialProfiles.resolveForRole(role, "runtime.hermes");
+  }
+  return null;
 }
 
 export function resolveStatusMutationToken(config: ServiceConfig): string | null {

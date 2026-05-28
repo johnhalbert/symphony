@@ -79,6 +79,16 @@ describe("FileRunTranscriptStore", () => {
       repoPath: "/repo",
       baseRef: "origin/main",
       promptCharCount: 4,
+      harnessId: "cursor",
+      runtimeModel: "gpt-5.5",
+      runtimeModelParams: [
+        { id: "context", value: "272k" },
+        { id: "reasoning", value: "extra-high" },
+      ],
+      runtimeSettingSources: [],
+      runtimeMode: "plan",
+      runtimeAllowLargeContext: false,
+      runtimeAgentLifecycle: "fresh_per_run",
       cursorModel: "gpt-5.5",
       cursorModelParams: [
         { id: "context", value: "272k" },

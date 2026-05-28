@@ -59,6 +59,9 @@ interface LinearIssueNode {
   assignee?: {
     id?: unknown;
   } | null;
+  delegate?: {
+    id?: unknown;
+  } | null;
   labels?: {
     nodes?: Array<{ name?: unknown }>;
   } | null;
@@ -148,6 +151,7 @@ const ISSUE_FIELDS = `
   updatedAt
   state { name }
   assignee { id }
+  delegate { id }
   labels { nodes { name } }
   inverseRelations { nodes { type issue { id identifier state { name } } } }
 `;
@@ -205,6 +209,7 @@ const ISSUE_STATES_QUERY = `
         updatedAt
         state { name }
         assignee { id }
+        delegate { id }
         labels { nodes { name } }
         inverseRelations { nodes { type issue { id identifier state { name } } } }
       }
@@ -709,6 +714,7 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
   const state = asString(node.state?.name);
   if (!id || !identifier || !title || !state) return null;
   const assigneeId = asNullableString(node.assignee?.id);
+  const delegateId = asNullableString(node.delegate?.id);
 
   return {
     id,
@@ -720,7 +726,8 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
     branchName: asNullableString(node.branchName),
     url: asNullableString(node.url),
     assigneeId,
-    assignedToWorker: assignedToWorker(assigneeId, assigneeFilter),
+    delegateId,
+    assignedToWorker: assignedToWorker(assigneeId, delegateId, assigneeFilter),
     labels: normalizeLabels(node.labels?.nodes),
     blockedBy: normalizeBlockers(node.inverseRelations?.nodes),
     createdAt: asNullableString(node.createdAt),
@@ -743,9 +750,13 @@ function normalizeBlockers(nodes: LinearRelationNode[] | undefined): IssueBlocke
     }));
 }
 
-function assignedToWorker(assigneeId: string | null, assigneeFilter: AssigneeFilter | null): boolean {
+function assignedToWorker(
+  assigneeId: string | null,
+  delegateId: string | null,
+  assigneeFilter: AssigneeFilter | null,
+): boolean {
   if (!assigneeFilter) return true;
-  return assigneeId !== null && assigneeFilter.matchValues.has(assigneeId);
+  return [assigneeId, delegateId].some((routeId) => routeId !== null && assigneeFilter.matchValues.has(routeId));
 }
 
 function asString(value: unknown): string | null {

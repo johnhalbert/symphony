@@ -8,6 +8,7 @@ import {
   createRuntimeTrackerClient,
   createRuntimeWritebackProcessor,
   resolveCursorRuntimeApiKey,
+  resolveRuntimeCredential,
   resolveStatusMutationToken,
 } from "../src/app/RuntimeDependencies.js";
 
@@ -111,24 +112,84 @@ describe("runtime dependency credential wiring", () => {
     expect(() => resolveStatusMutationToken(config)).toThrow(/server\.open_workspace is owned by worker/);
   });
 
-  it("resolves cursor.runtime per active role and rejects wrong-role-only assignments", () => {
+  it("resolves runtime.cursor per active role and keeps cursor.runtime as a legacy alias", () => {
     const config = runtimeConfig();
     expect(resolveCursorRuntimeApiKey(config, "worker")).toBe("worker-cursor-secret");
     expect(resolveCursorRuntimeApiKey(config, "reviewer")).toBe("reviewer-cursor-secret");
+    expect(resolveRuntimeCredential(config, "worker", "cursor")).toMatchObject({
+      capability: "runtime.cursor",
+      value: "worker-cursor-secret",
+    });
+
+    const legacyAlias = runtimeConfig({
+      credentialProfiles: {
+        profiles: {
+          legacy: { value: "$LEGACY_CURSOR_PROFILE_TOKEN", capabilities: ["cursor.runtime"] },
+        },
+        roles: {
+          worker: { "cursor.runtime": "legacy" },
+        },
+      },
+      env: { LEGACY_CURSOR_PROFILE_TOKEN: "legacy-alias-secret" },
+    });
+    expect(resolveCursorRuntimeApiKey(legacyAlias, "worker")).toBe("legacy-alias-secret");
 
     const wrongRole = runtimeConfig({
       credentialProfiles: {
         profiles: {
-          wrong: { value: "$WRONG_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
+          wrong: { value: "$WRONG_CURSOR_TOKEN", capabilities: ["runtime.cursor"] },
         },
         roles: {
-          service: { "cursor.runtime": "wrong" },
+          service: { "runtime.cursor": "wrong" },
         },
       },
       env: { WRONG_CURSOR_TOKEN: "wrong-cursor-secret" },
     });
 
-    expect(() => resolveCursorRuntimeApiKey(wrongRole, "worker")).toThrow(/cursor\.runtime is owned by worker/);
+    expect(() => resolveCursorRuntimeApiKey(wrongRole, "worker")).toThrow(/runtime\.cursor is owned by worker/);
+  });
+
+  it("resolves runtime.hermes per active role without falling back to Cursor credentials", () => {
+    const config = runtimeConfig({
+      credentialProfiles: {
+        profiles: {
+          "worker-hermes": { value: "$WORKER_HERMES_TOKEN", capabilities: ["runtime.hermes"] },
+          "reviewer-hermes": { value: "$REVIEWER_HERMES_TOKEN", capabilities: ["runtime.hermes"] },
+        },
+        roles: {
+          worker: { "runtime.hermes": "worker-hermes" },
+          reviewer: { "runtime.hermes": "reviewer-hermes" },
+        },
+      },
+      env: {
+        WORKER_HERMES_TOKEN: "worker-hermes-secret",
+        REVIEWER_HERMES_TOKEN: "reviewer-hermes-secret",
+      },
+    });
+
+    expect(resolveRuntimeCredential(config, "worker", "hermes")).toMatchObject({
+      capability: "runtime.hermes",
+      value: "worker-hermes-secret",
+    });
+    expect(resolveRuntimeCredential(config, "reviewer", "hermes")).toMatchObject({
+      capability: "runtime.hermes",
+      value: "reviewer-hermes-secret",
+    });
+    expect(resolveRuntimeCredential(runtimeConfig(), "worker", "hermes")).toBeNull();
+
+    const wrongRole = runtimeConfig({
+      credentialProfiles: {
+        profiles: {
+          wrong: { value: "$WRONG_HERMES_TOKEN", capabilities: ["runtime.hermes"] },
+        },
+        roles: {
+          service: { "runtime.hermes": "wrong" },
+        },
+      },
+      env: { WRONG_HERMES_TOKEN: "wrong-hermes-secret" },
+    });
+
+    expect(() => resolveRuntimeCredential(wrongRole, "worker", "hermes")).toThrow(/runtime\.hermes is owned by worker/);
   });
 });
 
@@ -149,18 +210,18 @@ function runtimeConfig(
           profiles: {
             "linear-tracker": { value: "$LINEAR_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
             "linear-writeback": { value: "$LINEAR_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
-            "worker-cursor": { value: "$WORKER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
-            "reviewer-cursor": { value: "$REVIEWER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
+            "worker-cursor": { value: "$WORKER_CURSOR_TOKEN", capabilities: ["runtime.cursor"] },
+            "reviewer-cursor": { value: "$REVIEWER_CURSOR_TOKEN", capabilities: ["runtime.cursor"] },
             "open-workspace": { value: "$OPEN_WORKSPACE_PROFILE_TOKEN", capabilities: ["server.open_workspace"] },
           },
           roles: {
             worker: {
               "linear.tracker": "linear-tracker",
-              "cursor.runtime": "worker-cursor",
+              "runtime.cursor": "worker-cursor",
               "server.open_workspace": "open-workspace",
             },
             reviewer: {
-              "cursor.runtime": "reviewer-cursor",
+              "runtime.cursor": "reviewer-cursor",
             },
             service: {
               "linear.writeback": "linear-writeback",

@@ -40,33 +40,41 @@ State semantics:
 - A passing review is recorded through structured reviewer verdict evidence, such as a Linear comment or PR review, before the issue leaves `In Review`.
 - Do not add a separate `Ready` or `Ready for Human` state for the current dogfood loop; use the configured `Ready to Merge` pass destination.
 
-## 3. Baseline Checks
+## 3. Hermes Runtime Setup
 
-Run:
+Initialize the upstream Hermes submodule and install the Hermes Python dependencies before dogfood:
 
 ```powershell
-npm test
-npm run typecheck
-npm run smoke:sdk-local
+git submodule update --init hermes/upstream-src
+python -m pip install -e '.\hermes\upstream-src[mcp]'
+hermes auth add openai-codex
 ```
 
-`npm run smoke:sdk-local` requires `CURSOR_API_KEY`.
+Native Windows is supported for Symphony's stdio gateway path when Node 22+ and Python 3.11+ are installed. Configure `hermes.python` in `WORKFLOW.md` if `python` does not resolve to the intended interpreter. WSL is not required for this integration path.
 
-## 4. Doctor
+Hermes owns OpenAI Codex auth. Symphony bootstraps selected provider state from the local Hermes auth store into `hermes.auth.managed_root`; it does not read Codex CLI auth directly and does not require `runtime.hermes` API-key credentials for `openai-codex`.
+
+The reference workflow configures Hermes with `provider: openai-codex` and `model: gpt-5.5`. The generated worker, reviewer, and planner profile templates set Hermes `agent.reasoning_effort: xhigh`.
+
+## 4. Preflight
 
 Run:
 
 ```powershell
 $env:LINEAR_PROJECT_SLUG = "symphony-6cf4dcc723df"
 $env:LINEAR_ASSIGNEE = "me"
-npm run doctor
+npm run typecheck
+npm test
+npm run doctor -- --strict
+npm run doctor -- --strict --live-runtime
+npm run smoke:hermes-local
 ```
 
-Set `LINEAR_API_KEY`, `CURSOR_API_KEY`, and `SYMPHONY_OPEN_WORKSPACE_TOKEN` as needed.
+Set `LINEAR_API_KEY`, scoped GitHub credential-profile variables such as `GITHUB_PUBLICATION_TOKEN` and `GITHUB_FEEDBACK_TOKEN`, and `SYMPHONY_WORKSPACE_TOKEN` in the workflow root `.env` file or process environment as needed.
 
-Doctor verifies workflow parsing, writable workspace paths, git availability, Cursor baseline model configuration, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, completion-report/review-verdict MCP tool availability, candidate isolation, and current Linear candidates.
+Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable workspace paths, git availability, runtime harness/provider checks, Hermes paths, Python importability, managed auth readiness when `openai-codex` is selected, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, subprocess MCP tool availability, candidate isolation, and current Linear candidates.
 
-Doctor also warns when `continuation_context.search_enabled` or `continuation_context.summarization_enabled` is enabled while those capabilities remain roadmap placeholders. The warning is intentional and does not imply Symphony can search, summarize, poll, or dispatch placeholder work.
+`doctor --live-runtime` is the opt-in live Hermes gateway readiness check. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory.
 
 ## 5. Promotion Policy
 
@@ -81,11 +89,11 @@ Before promotion, verify:
 - The issue does not touch protected paths unless a human is implementing it manually.
 - The issue is not a continuation search or richer summarization placeholder that should remain `Backlog` with `dogfood-blocked`.
 
-Gate issues such as orchestrator, config, workflow, Linear integration, and dogfood safety docs remain human-implemented until the smoke checkpoint passes.
+Gate issues such as orchestrator, config, workflow, Linear integration, runtime harnesses, and dogfood safety docs remain human-implemented until the smoke checkpoint passes.
 
-## 6. Review-Loop Smoke
+## 6. Hermes Smoke Issue
 
-For `ENG-5`, promote one intentionally safe issue through `Backlog -> Todo`.
+Create or choose one tiny, unprotected Linear issue with `dogfood-ready`, then promote it through `Backlog -> Todo`.
 
 Expected result:
 
@@ -93,52 +101,52 @@ Expected result:
 - A git worktree is created.
 - The run transcript is persisted.
 - The worker calls `submit_completion_report` with summary, validation evidence, acceptance checklist, changed files, branch/PR details, risks, and an idempotency key.
-- The issue reaches `Human Review` through service-owned PR handoff after the completion report and configured checks are accepted. Handoff checks are evaluated when the completion report is submitted; the worker MCP call does not poll or wait for newly queued CI checks.
-- A human operator moves the issue from `Human Review` to `In Review` when reviewer-agent review should start.
-- The reviewer records a fail verdict with concrete requested revisions.
-- Symphony transitions the issue back to `In Progress` and the next worker turn addresses the requested revisions.
-- The worker submits a new completion report before any second handoff.
-- The reviewer records a pass verdict.
+- Symphony publishes or reuses the lifecycle-bound pull request and moves the issue directly to `In Review` because `github.pr_handoff.enabled` is false.
+- The reviewer records a pass verdict for the tiny smoke.
 - Symphony applies the configured `Ready to Merge` pass destination.
+- A human reviews and merges manually.
 - The workspace remains available for review-loop evidence and operator inspection until the pass path is complete.
+
+For review-loop proof, promote one small real issue after the smoke issue. If the reviewer naturally fails it, verify the fail/revise/pass path. If not, keep single-issue dogfood until a real reviewer fail exercises the repair loop.
 
 ## 7. Manual Dogfood Checklist
 
 Before the smoke:
 
-- [ ] `npm run doctor -- --strict` has no errors and only understood warnings.
-- [ ] There are zero current `Todo` or `In Progress` candidates before intentional promotion.
-- [ ] The target issue is the only issue with `dogfood-ready` and no `dogfood-blocked` or `safety-blocked` label.
-- [ ] `Ready to Merge` exists in Linear and is not listed as an active, review, blocked, or terminal state.
-- [ ] `Blocked` exists in Linear and is not listed as an active or review state.
-- [ ] `Human Review` is understood as the PR handoff state; `In Review` is understood as the agent review queue.
+- `npm run doctor -- --strict` has no errors and only understood warnings.
+- `npm run doctor -- --strict --live-runtime` succeeds.
+- `npm run smoke:hermes-local` succeeds.
+- There are zero current `Todo` or `In Progress` candidates before intentional promotion.
+- The target issue is the only issue with `dogfood-ready` and no `dogfood-blocked` or `safety-blocked` label.
+- `Ready to Merge` exists in Linear and is not listed as an active, review, blocked, or terminal state.
+- `Blocked` exists in Linear and is not listed as an active or review state.
+- `In Review` is understood as the agent review queue; no `Human Review` handoff is active while `github.pr_handoff.enabled` is false.
 
 During the smoke:
 
-- [ ] No issue becomes a worker candidate until an operator intentionally moves it to `Todo` with the required label.
-- [ ] No issue enters `Human Review` through Symphony writeback until the lifecycle record has a last completion report and verified PR.
-- [ ] No issue enters `In Review` until a human operator promotes it from `Human Review`.
-- [ ] No reviewer dispatch occurs without a last completion report.
-- [ ] A fail verdict returns the issue to `In Progress`, increments the review round, and includes a revision-request comment.
-- [ ] A pass verdict is recorded before the configured pass destination is applied.
-- [ ] A blocked escalation comments with the reason, counters, last report, last verdict, and required human action.
+- No issue becomes a worker candidate until an operator intentionally moves it to `Todo` with the required label.
+- No issue enters `In Review` until the lifecycle record has an accepted worker completion report and any configured PR publication step has completed.
+- No reviewer dispatch occurs without a last completion report.
+- A fail verdict returns the issue to `In Progress`, increments the review round, and includes a revision-request comment.
+- A pass verdict is recorded before the configured pass destination is applied.
+- A blocked escalation comments with the reason, counters, last report, last verdict, and required human action.
 
 After the smoke:
 
-- [ ] Inspect `/api/v1/issues/<issue>` and confirm `reviewLoop.phase`, `role`, `reviewRound`, `incompleteTurnCount`, `lastCompletionReport`, `lastReviewVerdict`, and `blockedReason` match the observed loop.
-- [ ] Identify the handoff worker run from `reviewLoop.lastCompletionReport.runId`, or from the matching `role: "worker"` entry in `/api/v1/issues/<issue>/runs` when correlating multiple worker runs. Do not use `latestRun` alone for post-handoff interpretation; after reviewer dispatch, `latestRun` may be a reviewer run while `lastCompletionReport` still describes the worker handoff.
-- [ ] Inspect `/api/v1/runs/<handoffWorkerRunId>`. In the post-handoff context where `reviewLoop.lastCompletionReport` points at that worker run and `reviewLoop.phase` is `review`, `status: "succeeded"` means Symphony reconciled the accepted handoff. A succeeded worker run without a matching completion report is an incomplete turn, not a successful handoff.
-- [ ] Inspect `/api/v1/runs/<handoffWorkerRunId>/transcript` when the SDK tail looks suspicious. Raw harness `failed` or `cancelled` events may appear after an accepted report even though the handoff worker run status is `succeeded`; a throw path may leave no terminal harness event. Treat lifecycle and the report-linked worker run record as authoritative for handoff outcome.
-- [ ] Confirm no unrelated issue acquired `dogfood-ready`, entered `Todo`/`In Progress`, or received a Symphony worker run.
+- Inspect `/api/v1/issues/<issue>` and confirm `reviewLoop.phase`, `role`, `reviewRound`, `incompleteTurnCount`, `lastCompletionReport`, `lastReviewVerdict`, and `blockedReason` match the observed loop.
+- Identify the handoff worker run from `reviewLoop.lastCompletionReport.runId`, or from the matching `role: "worker"` entry in `/api/v1/issues/<issue>/runs` when correlating multiple worker runs. Do not use `latestRun` alone for post-handoff interpretation; after reviewer dispatch, `latestRun` may be a reviewer run while `lastCompletionReport` still describes the worker handoff.
+- Inspect `/api/v1/runs/<handoffWorkerRunId>`. In the post-handoff context where `reviewLoop.lastCompletionReport` points at that worker run and `reviewLoop.phase` is `review`, `status: "succeeded"` means Symphony reconciled the accepted handoff. A succeeded worker run without a matching completion report is an incomplete turn, not a successful handoff.
+- Inspect `/api/v1/runs/<handoffWorkerRunId>/transcript` when the SDK tail looks suspicious. Raw harness `failed` or `cancelled` events may appear after an accepted report even though the handoff worker run status is `succeeded`; a throw path may leave no terminal harness event. Treat lifecycle and the report-linked worker run record as authoritative for handoff outcome.
+- Confirm no unrelated issue acquired `dogfood-ready`, entered `Todo`/`In Progress`, or received a Symphony worker run.
 
 ## 8. Recovery
 
 Use the status API with `X-Symphony-Token` when a token is configured:
 
 ```powershell
-Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_OPEN_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/pause"
-Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_OPEN_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/cancel"
-Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_OPEN_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/resume"
+Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/pause"
+Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/cancel"
+Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/resume"
 ```
 
 If the process must stop, use Ctrl+C and inspect worktrees before cleanup.

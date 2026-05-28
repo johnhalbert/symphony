@@ -9,12 +9,24 @@ import { createGitHubPullRequestClientForCapability } from "./integrations/githu
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { errorMessage } from "./core/errors.js";
 import type { ServiceConfig } from "./core/config/Config.js";
-import { resolveCursorRuntimeApiKey } from "./app/RuntimeDependencies.js";
+import { resolveCursorRuntimeApiKey, resolveRuntimeApiKey } from "./app/RuntimeDependencies.js";
 import { COMPLETION_REPORT_TOOL_NAME } from "./core/harness/CompletionReportMcpServer.js";
-import { runSubprocessMcpToolExposureProbe } from "./core/harness/McpToolExposureProbe.js";
+import {
+  runHermesGatewayMcpToolExposureProbe,
+  runSubprocessMcpToolExposureProbe,
+} from "./core/harness/McpToolExposureProbe.js";
 import { REVIEW_FEEDBACK_TOOL_NAME } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { REVIEW_VERDICT_TOOL_NAME } from "./core/harness/ReviewVerdictMcpServer.js";
 import { CONTINUATION_CONTEXT_ROADMAP } from "./core/summarization/ContinuationContextRoadmap.js";
+import type { HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
+import {
+  HermesAuthManager,
+  hermesManagedAuthMissingMessage,
+  hermesOwnedAuthProvidersForRuntime,
+  isHermesOwnedAuthProvider,
+  normalizeHermesAuthProvider,
+  redactHermesAuthMessage,
+} from "../hermes/src/HermesAuthManager.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -34,6 +46,7 @@ export interface DoctorResult {
 export interface DoctorOptions {
   workflowPath: string;
   strict?: boolean | undefined;
+  liveRuntime?: boolean | undefined;
   cliPath?: string | undefined;
 }
 
@@ -42,6 +55,13 @@ export interface ReviewLoopDoctorCheckOptions {
   cliPath?: string | undefined;
   mcpToolLister?: McpToolLister;
   linearStateLister?: LinearStateLister;
+}
+
+export interface RuntimeHarnessDependencyDoctorCheckOptions {
+  strict?: boolean | undefined;
+  liveRuntime?: boolean | undefined;
+  cliPath?: string | undefined;
+  hermesGatewayFactory?: ((env: HermesGatewayEnvironment) => HermesGatewayClient) | undefined;
 }
 
 export type McpToolServerCommand = "completion-report-mcp" | "review-verdict-mcp" | "review-feedback-mcp";
@@ -64,7 +84,14 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
     checks.push({ id: "workflow.parse", status: "ok", message: `Loaded ${workflowPath}` });
-    checks.push(...cursorPolicyDoctorChecks(config));
+    checks.push(...runtimeHarnessDoctorChecks(config));
+    checks.push(
+      ...(await runtimeHarnessDependencyDoctorChecks(config, {
+        strict: options.strict ?? false,
+        liveRuntime: options.liveRuntime ?? false,
+        cliPath: options.cliPath,
+      })),
+    );
     checks.push({
       id: "agent.concurrency",
       status: config.agent.maxConcurrentAgents === 1 ? "ok" : "warn",
@@ -87,7 +114,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
     checks.push(await githubPublicationDoctorCheck(config));
     checks.push(await githubReviewFeedbackDoctorCheck(config));
 
-    checks.push(cursorRuntimeDoctorCheck(config));
+    checks.push(runtimeCredentialDoctorCheck(config));
 
     const tracker = createLinearTrackerClientForCapability(config, "linear.tracker");
     try {
@@ -181,6 +208,265 @@ export function cursorPolicyDoctorChecks(config: ServiceConfig): DoctorCheck[] {
           : `Managed Cursor runs request ${config.cursor.mode} conversation mode`,
     },
   ];
+}
+
+export function runtimeHarnessDoctorChecks(config: ServiceConfig): DoctorCheck[] {
+  const checks: DoctorCheck[] = [
+    {
+      id: "runtime.harness",
+      status: "ok",
+      message: `Runtime harness is ${config.agent.harness}`,
+    },
+  ];
+  if (config.agent.harness === "cursor") return [...checks, ...cursorPolicyDoctorChecks(config)];
+  if (config.agent.harness === "hermes") return [...checks, ...hermesRuntimeDoctorChecks(config)];
+  return [
+    ...checks,
+    {
+      id: "runtime.provider_checks",
+      status: "warn",
+      message: `No provider-specific doctor checks are registered for runtime harness ${config.agent.harness}`,
+    },
+  ];
+}
+
+export function hermesRuntimeDoctorChecks(config: ServiceConfig): DoctorCheck[] {
+  const provider = config.hermes.provider ?? "profile/default";
+  const model = config.hermes.model ?? "";
+  return [
+    {
+      id: "hermes.runtime",
+      status: model.length > 0 ? "ok" : "error",
+      message:
+        model.length > 0
+          ? `Hermes provider is ${provider}; model is ${model}`
+          : "hermes.model is required when agent.harness is hermes so the upstream gateway cannot fall back to an unrelated default model",
+    },
+    {
+      id: "hermes.profiles",
+      status: "ok",
+      message:
+        `state_dir: ${config.hermes.stateDir}; templates: worker=${config.hermes.roleTemplates.worker}, ` +
+        `reviewer=${config.hermes.roleTemplates.reviewer}, planner=${config.hermes.roleTemplates.planner}; ` +
+        `worker lifecycle is ${config.hermes.workerSessionLifecycle}; profile retention is ${config.hermes.keepProfiles}`,
+    },
+  ];
+}
+
+export async function runtimeHarnessDependencyDoctorChecks(
+  config: ServiceConfig,
+  options: RuntimeHarnessDependencyDoctorCheckOptions = {},
+): Promise<DoctorCheck[]> {
+  if (config.agent.harness !== "hermes") return [];
+  const checks: DoctorCheck[] = [];
+  checks.push(await hermesPathDoctorCheck("hermes.upstream_root", config.hermes.upstreamRoot, [
+    path.join("tui_gateway", "entry.py"),
+    path.join("ui-tui", "src", "gatewayClient.ts"),
+  ]));
+  checks.push(
+    await hermesPathDoctorCheck("hermes.templates", config.hermes.templatesDir, [
+      config.hermes.roleTemplates.worker,
+      config.hermes.roleTemplates.reviewer,
+      config.hermes.roleTemplates.planner,
+      config.hermes.roleTemplates.mergeConflictResolution,
+    ]),
+  );
+  const pythonCheck = await hermesPythonImportDoctorCheck(config);
+  checks.push(pythonCheck);
+  checks.push(...(await hermesAuthDoctorChecks(config, options)));
+  if (options.liveRuntime) {
+    checks.push(
+      pythonCheck.status === "error"
+        ? {
+            id: "hermes.live_runtime",
+            status: "error",
+            message: "Hermes live runtime check requires hermes.python to import the gateway and Python MCP SDK",
+          }
+        : await hermesLiveRuntimeDoctorCheck(config, options),
+    );
+  }
+  return checks;
+}
+
+export async function hermesLiveRuntimeDoctorCheck(
+  config: ServiceConfig,
+  options: Pick<RuntimeHarnessDependencyDoctorCheckOptions, "cliPath" | "hermesGatewayFactory"> = {},
+): Promise<DoctorCheck> {
+  if (!config.hermes.model) {
+    return {
+      id: "hermes.live_runtime",
+      status: "error",
+      message: "Hermes live runtime check requires hermes.model before starting the gateway",
+    };
+  }
+  if (!options.cliPath) {
+    return {
+      id: "hermes.live_runtime",
+      status: "error",
+      message: "Hermes live runtime check requires an explicit cliPath",
+    };
+  }
+  try {
+    const stage = await runHermesGatewayMcpToolExposureProbe(config, {
+      cliPath: options.cliPath,
+      roles: ["worker", "reviewer"],
+      enabled: true,
+      ...(options.hermesGatewayFactory === undefined ? {} : { gatewayFactory: options.hermesGatewayFactory }),
+    });
+    if (stage.status === "success") {
+      return {
+        id: "hermes.live_runtime",
+        status: "ok",
+        message: "Hermes gateway session exposes required Symphony MCP tools for worker and reviewer profiles",
+      };
+    }
+    return {
+      id: "hermes.live_runtime",
+      status: "error",
+      message: `Hermes gateway live runtime check failed (${stage.failureCode ?? stage.status}): ${redactHermesAuthMessage(stage.message)}`,
+    };
+  } catch (error) {
+    return {
+      id: "hermes.live_runtime",
+      status: "error",
+      message: `Hermes gateway live runtime check failed: ${redactHermesAuthMessage(errorMessage(error))}`,
+    };
+  }
+}
+
+async function hermesPathDoctorCheck(id: string, root: string, entries: string[]): Promise<DoctorCheck> {
+  const missing: string[] = [];
+  for (const entry of [...new Set(entries)]) {
+    try {
+      await fs.access(path.join(root, entry));
+    } catch {
+      missing.push(entry);
+    }
+  }
+  if (missing.length === 0) return { id, status: "ok", message: `${root} contains ${entries.length} required path(s)` };
+  return { id, status: "error", message: `${root} is missing required path(s): ${missing.join(", ")}` };
+}
+
+async function hermesPythonImportDoctorCheck(config: ServiceConfig): Promise<DoctorCheck> {
+  const python = config.hermes.python ?? (process.platform === "win32" ? "python" : "python3");
+  const script = [
+    "import importlib",
+    "import pathlib",
+    "import sys",
+    "root = pathlib.Path(sys.argv[1]).resolve()",
+    "sys.path.insert(0, str(root))",
+    "importlib.import_module('tui_gateway.entry')",
+    "importlib.import_module('mcp')",
+    "print('ok')",
+  ].join("; ");
+  try {
+    await execFileAsync(python, ["-c", script, config.hermes.upstreamRoot], {
+      cwd: config.hermes.upstreamRoot,
+      env: {
+        ...process.env,
+        HERMES_HOME: config.hermes.stateDir,
+        HERMES_PYTHON_SRC_ROOT: config.hermes.upstreamRoot,
+      },
+      timeout: config.hermes.startupTimeoutMs,
+    });
+    return { id: "hermes.python", status: "ok", message: `${python} can import tui_gateway.entry and mcp` };
+  } catch (error) {
+    return {
+      id: "hermes.python",
+      status: "error",
+      message:
+        `${python} could not import Hermes gateway dependencies (${hermesPythonDependencyError(error)}). ` +
+        `Install them with python -m pip install -e "${config.hermes.upstreamRoot}[mcp]"`,
+    };
+  }
+}
+
+function hermesPythonDependencyError(error: unknown): string {
+  const message = errorMessage(error);
+  if (/No module named ['"]mcp['"]/.test(message)) return "Python package mcp is not installed";
+  if (/No module named ['"]tui_gateway/.test(message)) return "tui_gateway.entry is not importable";
+  return message
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0)
+    ?.slice(0, 240) ?? "unknown import error";
+}
+
+export async function hermesAuthDoctorChecks(
+  config: ServiceConfig,
+  options: RuntimeHarnessDependencyDoctorCheckOptions = {},
+): Promise<DoctorCheck[]> {
+  if (!isHermesOwnedAuthProvider(config.hermes.provider)) return [];
+  const provider = normalizeHermesAuthProvider(config.hermes.provider ?? "");
+  const requiredProviders = hermesOwnedAuthProvidersForRuntime(config.hermes.provider, config.hermes.auth.providers);
+  if (requiredProviders.length === 0) {
+    return [
+      {
+        id: "hermes.auth",
+        status: "error",
+        message: `Hermes provider ${provider} requires hermes.auth.providers to include openai-codex`,
+      },
+    ];
+  }
+
+  const manager = new HermesAuthManager({
+    managedRoot: config.hermes.auth.managedRoot,
+    bootstrapFrom: config.hermes.auth.bootstrapFrom,
+    providers: config.hermes.auth.providers,
+    upstreamRoot: config.hermes.upstreamRoot,
+    python: config.hermes.python,
+    timeoutMs: config.hermes.startupTimeoutMs,
+  });
+
+  try {
+    const preparation = await manager.prepare(requiredProviders);
+    const checks: DoctorCheck[] = [
+      {
+        id: "hermes.auth_root",
+        status: "ok",
+        message: `Hermes managed auth root is ready at ${preparation.managedRoot}; bootstrap source is ${preparation.bootstrapFrom}`,
+      },
+    ];
+
+    if (preparation.missingProviders.length > 0) {
+      return [
+        ...checks,
+        ...preparation.missingProviders.map((missingProvider) => ({
+          id: `hermes.auth.${missingProvider}`,
+          status: "error" as const,
+          message: hermesManagedAuthMissingMessage(missingProvider, preparation.managedRoot, preparation.bootstrapFrom),
+        })),
+      ];
+    }
+
+    for (const authProvider of requiredProviders) {
+      const source = preparation.copiedProviders.includes(authProvider) ? "bootstrapped" : "managed store";
+      checks.push({
+        id: `hermes.auth.${authProvider}`,
+        status: "ok",
+        message: `Hermes managed auth for ${authProvider} is available from ${source}`,
+      });
+    }
+
+    if (requiredProviders.includes("openai-codex")) {
+      const validation = await manager.validateOpenAiCodex({ refreshIfExpiring: options.strict === true });
+      checks.push({
+        id: "hermes.auth.openai-codex.resolve",
+        status: "ok",
+        message: `Hermes Python resolved openai-codex auth via ${validation.source ?? "unknown source"}`,
+      });
+    }
+
+    return checks;
+  } catch (error) {
+    return [
+      {
+        id: "hermes.auth",
+        status: "error",
+        message: redactHermesAuthMessage(errorMessage(error)),
+      },
+    ];
+  }
 }
 
 function hasBaselineCursorModel(
@@ -333,7 +619,7 @@ async function mcpToolAvailabilityCheck(
       return {
         id: "review_loop.mcp_tools",
         status: "error",
-        message: "Configured Cursor CLI could not list review-loop MCP tools: missing explicit cliPath",
+        message: "Configured MCP subprocess runner could not list review-loop MCP tools: missing explicit cliPath",
       };
     }
     const stage = await runSubprocessMcpToolExposureProbe(config, { cliPath: options.cliPath });
@@ -341,13 +627,13 @@ async function mcpToolAvailabilityCheck(
       return {
         id: "review_loop.mcp_tools",
         status: "error",
-        message: `Configured Cursor CLI MCP exposure failed (${stage.failureCode ?? "unknown"}): ${stage.message}`,
+        message: `Configured MCP subprocess exposure failed (${stage.failureCode ?? "unknown"}): ${stage.message}`,
       };
     }
     return {
       id: "review_loop.mcp_tools",
       status: "ok",
-      message: `Configured Cursor CLI exposes MCP tools: ${stage.results.map((result) => result.expectedTool).join(", ")}`,
+      message: `Configured MCP subprocess runner exposes tools: ${stage.results.map((result) => result.expectedTool).join(", ")}`,
     };
   }
   const lister = options.mcpToolLister;
@@ -366,19 +652,19 @@ async function mcpToolAvailabilityCheck(
       return {
         id: "review_loop.mcp_tools",
         status: "error",
-        message: `Configured Cursor CLI did not list required MCP tools: ${missing.join(", ")}`,
+        message: `Configured MCP subprocess runner did not list required tools: ${missing.join(", ")}`,
       };
     }
     return {
       id: "review_loop.mcp_tools",
       status: "ok",
-      message: `Configured Cursor CLI lists MCP tools: ${expected.map((item) => item.tool).join(", ")}`,
+      message: `Configured MCP subprocess runner lists tools: ${expected.map((item) => item.tool).join(", ")}`,
     };
   } catch (error) {
     return {
       id: "review_loop.mcp_tools",
       status: "error",
-      message: `Configured Cursor CLI could not list review-loop MCP tools: ${errorMessage(error)}`,
+      message: `Configured MCP subprocess runner could not list review-loop MCP tools: ${errorMessage(error)}`,
     };
   }
 }
@@ -485,19 +771,54 @@ function githubAccessMessage(
   return authDescription ? `${base} using ${authDescription}` : base;
 }
 
+export function runtimeCredentialDoctorCheck(config: ServiceConfig): DoctorCheck {
+  if (config.agent.harness === "cursor") return cursorRuntimeDoctorCheck(config);
+  if (config.agent.harness === "hermes") return hermesRuntimeCredentialDoctorCheck(config);
+  return {
+    id: "env.runtime",
+    status: "warn",
+    message: `No runtime credential doctor check is registered for ${config.agent.harness}`,
+  };
+}
+
 function cursorRuntimeDoctorCheck(config: ServiceConfig): DoctorCheck {
   try {
     const missing = (["worker", "reviewer"] as const).filter((role) => !resolveCursorRuntimeApiKey(config, role));
     if (missing.length === 0) {
-      return { id: "env.cursor", status: "ok", message: "cursor.runtime credentials are available for worker and reviewer" };
+      return { id: "env.cursor", status: "ok", message: "runtime.cursor credentials are available for worker and reviewer" };
     }
     return {
       id: "env.cursor",
       status: "warn",
-      message: `cursor.runtime credentials are missing for ${missing.join(", ")}; SDK smoke cannot run`,
+      message: `runtime.cursor credentials are missing for ${missing.join(", ")}; Cursor SDK smoke cannot run`,
     };
   } catch (error) {
-    return { id: "env.cursor", status: "error", message: `cursor.runtime: ${errorMessage(error)}` };
+    return { id: "env.cursor", status: "error", message: `runtime.cursor: ${errorMessage(error)}` };
+  }
+}
+
+function hermesRuntimeCredentialDoctorCheck(config: ServiceConfig): DoctorCheck {
+  if (isHermesOwnedAuthProvider(config.hermes.provider)) {
+    return {
+      id: "env.hermes",
+      status: "ok",
+      message: `Hermes provider ${normalizeHermesAuthProvider(config.hermes.provider ?? "")} uses managed Hermes auth at ${config.hermes.auth.managedRoot}`,
+    };
+  }
+  try {
+    const missing = (["worker", "reviewer"] as const).filter((role) => !resolveRuntimeApiKey(config, role, "hermes"));
+    if (missing.length === 0) {
+      return { id: "env.hermes", status: "ok", message: "runtime.hermes credentials are available for worker and reviewer" };
+    }
+    return {
+      id: "env.hermes",
+      status: "warn",
+      message:
+        `runtime.hermes credentials are missing for ${missing.join(", ")}; ` +
+        `${config.hermes.runtimeCredentialEnv} will not be injected for those roles`,
+    };
+  } catch (error) {
+    return { id: "env.hermes", status: "error", message: `runtime.hermes: ${errorMessage(error)}` };
   }
 }
 

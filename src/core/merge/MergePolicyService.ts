@@ -123,9 +123,13 @@ export class MergePolicyService {
     if (!serviceLinear) {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service linear.writeback credentials");
     }
-    const serviceMerge = resolveGitHubClientConfig(config, "github.merge").credential;
-    if (!serviceMerge) {
-      throw new SymphonyError("invalid_request", "Gated merge policy requires service github.merge credentials");
+    const serviceMergeConfig = resolveGitHubClientConfig(config, "github.merge");
+    const serviceMerge = serviceMergeConfig.credential;
+    if (!serviceMerge && serviceMergeConfig.github.app === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Gated merge policy requires service github.merge credentials or GitHub App installation auth",
+      );
     }
 
     const latestIssue = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? issue;
@@ -962,7 +966,7 @@ function buildMergeMetadata(
   pullRequest: CompletionReportPullRequestRef,
   headSha: string,
   mergeResult: PullRequestMergeResult,
-  serviceMerge: ResolvedCredential,
+  serviceMerge: ResolvedCredential | null,
   checkStatus: IssueMergeMetadata["checkStatus"],
   doneTransitionOperationKey: string,
 ): IssueMergeMetadata {
@@ -974,7 +978,7 @@ function buildMergeMetadata(
     mergedAt: mergeResult.mergedAt,
     mergedBy: {
       login: mergeResult.mergedBy,
-      profile: serviceMerge.profileName,
+      profile: serviceMerge?.profileName ?? null,
       capability: "github.merge",
     },
     checkStatus,

@@ -88,7 +88,7 @@ describe("GitHub credential resolver", () => {
     expect(resolveGitHubClientConfig(config, "github.merge").github.token).toBe("merge-token");
   });
 
-  it("defaults publication and review-feedback to App auth over legacy GitHub tokens", () => {
+  it("defaults service publication, service merge, and review-feedback to App auth over legacy GitHub tokens", () => {
     const config = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -106,7 +106,7 @@ describe("GitHub credential resolver", () => {
       },
     );
 
-    for (const capability of ["github.publication", "github.review_feedback_write"] as const) {
+    for (const capability of ["github.publication", "github.review_feedback_write", "github.merge"] as const) {
       const resolved = resolveGitHubClientConfig(config, capability);
       expect(resolved.github.token).toBeNull();
       expect(resolved.github.app).not.toBeNull();

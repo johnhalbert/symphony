@@ -1,3 +1,5 @@
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import {
@@ -47,6 +49,37 @@ describe("MCP subprocess environment", () => {
       "--context-file",
       "/tmp/context.json",
     ]);
+    expect(
+      buildMcpCliSpawnArgs({
+        cliPath: "/repo/src/cli.ts",
+        command: "completion-report-mcp",
+        workflowPath: "/repo/WORKFLOW.md",
+        contextFile: "/tmp/context.json",
+      }),
+    ).toEqual([
+      "--import",
+      "tsx",
+      "/repo/src/cli.ts",
+      "completion-report-mcp",
+      "--workflow",
+      "/repo/WORKFLOW.md",
+      "--context-file",
+      "/tmp/context.json",
+    ]);
+  });
+
+  it("resolves the default tsx import relative to the CLI entrypoint", () => {
+    const cliPath = path.join(process.cwd(), "src", "cli.ts");
+    const loaderUrl = pathToFileURL(path.join(process.cwd(), "node_modules", "tsx", "dist", "loader.mjs")).href;
+
+    expect(
+      buildMcpCliSpawnArgs({
+        cliPath,
+        command: "completion-report-mcp",
+        workflowPath: path.join(process.cwd(), "WORKFLOW.md"),
+        contextFile: path.join(process.cwd(), ".tmp", "context.json"),
+      }).slice(0, 2),
+    ).toEqual(["--import", loaderUrl]);
   });
 
   it("builds MCP server configs with an explicit cliPath and env key slice", () => {

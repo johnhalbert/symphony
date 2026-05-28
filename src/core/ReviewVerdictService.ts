@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
 import type {
+  CompletionReportPullRequestRef,
   IssueLifecyclePhase,
   IssueLifecycleRecord,
   IssueMergeGateState,
@@ -21,6 +22,11 @@ import {
   planReviewPassWritebacks,
 } from "./writeback/TransitionPolicy.js";
 import type { FileWritebackOutboxStore, WritebackOperation } from "./writeback/WritebackOutbox.js";
+
+const PASS_REQUIRES_APPROVE_MESSAGE =
+  'Pass review verdict requires prior submit_pull_request_review_feedback with kind="review" and event="APPROVE" for the active reviewer run and lifecycle-bound PR.';
+const FAIL_AFTER_APPROVE_MESSAGE =
+  "Fail review verdict cannot follow APPROVE review feedback in the same reviewer run; submit a pass verdict or start a fresh review run.";
 
 const reviewVerdictSchema = z.object({
   runId: z.string().trim().min(1),
@@ -93,6 +99,7 @@ export class ReviewVerdictService {
     this.validateVerdictPayload(verdict);
 
     const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, { phase: lifecyclePhase });
+    this.validateReviewFeedbackAlignment(verdict, lifecycle);
     const writebackDetails = {
       idempotencyKey: verdict.idempotencyKey,
       acceptanceResults: normalizeAcceptanceResults(verdict.acceptanceResults),
@@ -192,6 +199,20 @@ export class ReviewVerdictService {
   private validateVerdictPayload(verdict: ReviewVerdictInput): void {
     if (verdict.verdict === "fail" && verdict.findings.length === 0) {
       throw new SymphonyError("invalid_request", "Fail review verdicts require at least one finding");
+    }
+  }
+
+  private validateReviewFeedbackAlignment(verdict: ReviewVerdictInput, lifecycle: IssueLifecycleRecord): void {
+    if (verdict.verdict === "fail") {
+      if (hasSameRunApprovalFeedback(lifecycle, verdict.runId)) {
+        throw new SymphonyError("invalid_request", FAIL_AFTER_APPROVE_MESSAGE);
+      }
+      return;
+    }
+
+    const pullRequest = currentPullRequestForReview(lifecycle);
+    if (!pullRequest || !hasSameRunApprovalFeedbackForPullRequest(lifecycle, verdict.runId, pullRequest)) {
+      throw new SymphonyError("invalid_request", PASS_REQUIRES_APPROVE_MESSAGE);
     }
   }
 }
@@ -326,6 +347,51 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord) {
     if (exact) return exact;
   }
   return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
+}
+
+function currentPullRequestForReview(lifecycle: IssueLifecycleRecord): CompletionReportPullRequestRef | null {
+  const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+  if (reportPullRequest?.number !== null && reportPullRequest?.number !== undefined) return reportPullRequest;
+  if (lifecycle.summaryPointers.prNumber === null) return null;
+  return {
+    url: lifecycle.summaryPointers.prUrl,
+    number: lifecycle.summaryPointers.prNumber,
+    headSha: lifecycle.summaryPointers.prHeadSha,
+    branch: lifecycle.summaryPointers.prBranch ?? lifecycle.summaryPointers.gitBranchName,
+  };
+}
+
+function hasSameRunApprovalFeedback(lifecycle: IssueLifecycleRecord, runId: string): boolean {
+  return lifecycle.reviewFeedback.some(
+    (feedback) => feedback.runId === runId && feedback.kind === "review" && feedback.event === "APPROVE",
+  );
+}
+
+function hasSameRunApprovalFeedbackForPullRequest(
+  lifecycle: IssueLifecycleRecord,
+  runId: string,
+  pullRequest: CompletionReportPullRequestRef,
+): boolean {
+  return lifecycle.reviewFeedback.some(
+    (feedback) =>
+      feedback.runId === runId &&
+      feedback.kind === "review" &&
+      feedback.event === "APPROVE" &&
+      samePullRequest(feedback.pullRequest, pullRequest),
+  );
+}
+
+function samePullRequest(
+  feedbackPullRequest: CompletionReportPullRequestRef,
+  currentPullRequest: CompletionReportPullRequestRef,
+): boolean {
+  return (
+    feedbackPullRequest.number === currentPullRequest.number &&
+    feedbackPullRequest.url === currentPullRequest.url &&
+    feedbackPullRequest.headSha !== null &&
+    currentPullRequest.headSha !== null &&
+    feedbackPullRequest.headSha === currentPullRequest.headSha
+  );
 }
 
 function isCurrentHeadSupersededGate(

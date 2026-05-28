@@ -35,6 +35,7 @@ import {
   type IssueBreakdownCreatedIssueRef,
   type IssueBreakdownPlanRecord,
   type IssueLifecyclePatch,
+  type IssueReviewFeedbackRecord,
   type IssueReviewVerdictRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
 import type {
@@ -806,7 +807,7 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
-  it("adds scoped Symphony MCP completion instructions to Cursor worker prompts", async () => {
+  it("adds scoped Symphony MCP completion instructions to runtime worker prompts", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });
     const tracker: TrackerClient = {
@@ -842,6 +843,44 @@ describe("Orchestrator", () => {
     expect(harness.prompts[0]).toContain("call the submit_completion_report MCP tool");
     expect(harness.prompts[0]).toContain("Symphony injects runId and issueId");
     expect(harness.prompts[0]).toContain("Do not comment on Linear");
+  });
+
+  it("fails before worker dispatch when the runtime harness lacks MCP handoff support", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logEntries: unknown[] = [];
+    const logger = new StructuredLogger((entry) => logEntries.push(entry));
+    const harness = new NonMcpHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => orchestrator.snapshot().retrying.length === 1);
+    const snapshot = orchestrator.snapshot();
+    await orchestrator.stop();
+
+    expect(harness.prompts).toEqual([]);
+    expect(JSON.stringify(logEntries) + JSON.stringify(snapshot.retrying)).toContain(
+      "Runtime harness no-mcp does not support Symphony MCP handoff required for implementation",
+    );
   });
 
   it("revalidates issue state before dispatch", async () => {
@@ -3438,6 +3477,10 @@ describe("Orchestrator", () => {
     expect(prompt).toContain("submit_pull_request_review_feedback");
     expect(prompt).toContain("submit_review_verdict.evidence");
     expect(prompt.indexOf("submit_pull_request_review_feedback")).toBeLessThan(prompt.indexOf("submit_review_verdict"));
+    expect(prompt).toContain('event "APPROVE"');
+    expect(prompt).toContain('event "REQUEST_CHANGES"');
+    expect(prompt).toContain("These supplemental comments do not satisfy pass approval");
+    expect(prompt).not.toContain('event "REQUEST_CHANGES", "COMMENT", or "APPROVE"');
     expect(prompt).toContain("PR number, repository, token, or commit identity");
     expect(prompt).toContain("Before any fail verdict, perform a bounded sibling-risk sweep");
     expect(prompt).toContain("Include every known blocking gap");
@@ -5310,6 +5353,42 @@ function completionReportRecord(candidate = issue()): IssueCompletionReportRecor
   };
 }
 
+async function appendApprovalFeedback(
+  lifecycleStore: FileIssueLifecycleStore,
+  candidate: Issue,
+  runId: string,
+): Promise<void> {
+  const lifecycle = (await lifecycleStore.get(candidate.id)) ?? (await lifecycleStore.get(candidate.identifier));
+  if (!lifecycle) throw new Error(`Missing lifecycle for ${candidate.identifier}`);
+  await lifecycleStore.updateIssue(candidate, {
+    reviewFeedback: [...lifecycle.reviewFeedback, approvalFeedbackRecord(candidate, runId)],
+  });
+}
+
+function approvalFeedbackRecord(candidate: Issue, runId: string): IssueReviewFeedbackRecord {
+  return {
+    id: `review-feedback:${candidate.id}:${runId}:approve-1`,
+    idempotencyKey: "approve-1",
+    requestHash: "request-hash",
+    runId,
+    issueId: candidate.id,
+    issueIdentifier: candidate.identifier,
+    kind: "review",
+    event: "APPROVE",
+    body: "Looks good.",
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      branch: candidate.branchName,
+    },
+    reviewer: "reviewer-agent",
+    reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-approve",
+    commentUrls: [],
+    submittedAt: "2026-01-01T00:00:02Z",
+  };
+}
+
 function reviewVerdictRecord(candidate = issue()): IssueReviewVerdictRecord {
   return {
     id: `review-verdict:${candidate.id}:verdict-1`,
@@ -6042,6 +6121,18 @@ class CursorPromptHarness implements AgentHarness {
   }
 }
 
+class NonMcpHarness implements AgentHarness {
+  readonly id = "no-mcp";
+  readonly capabilities = { continuation: true, mcpHandoff: false };
+  readonly prompts: string[] = [];
+
+  async *run(_ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.prompts.push(prompt);
+    yield { type: "session_started", sessionId: "no-mcp-session", runId: "no-mcp-run" };
+    yield { type: "completed" };
+  }
+}
+
 class IssueBreakdownAcceptingHarness implements AgentHarness {
   readonly id = "issue-breakdown-accepting";
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
@@ -6302,7 +6393,12 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
         ],
         changedFiles: ["tests/orchestrator.test.ts"],
         branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
-        pullRequest: null,
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "abc123",
+          branch: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
+        },
         risks: [],
         idempotencyKey: `smoke-report-${runNumber}`,
       },
@@ -6319,6 +6415,9 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
   }
 
   private async submitReviewVerdict(ctx: AgentRunContext, runId: string, runNumber: number): Promise<void> {
+    if (runNumber > 1) {
+      await appendApprovalFeedback(this.lifecycleStore, ctx.issue, runId);
+    }
     await new ReviewVerdictService({
       config: ctx.config,
       lifecycleStore: this.lifecycleStore,
@@ -6381,6 +6480,9 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
     const runId = "review-run-1";
     this.runs.push({ role: ctx.role, runId });
     yield { type: "session_started", sessionId: "review-session-1", runId };
+    if (this.verdict === "pass") {
+      await appendApprovalFeedback(this.lifecycleStore, ctx.issue, runId);
+    }
     await new ReviewVerdictService({
       config: ctx.config,
       lifecycleStore: this.lifecycleStore,

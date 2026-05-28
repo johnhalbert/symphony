@@ -23,20 +23,29 @@ import { StructuredLogger } from "../logging/StructuredLogger.js";
 import { resolveCursorRuntimeApiKey } from "../../app/RuntimeDependencies.js";
 import {
   completionReportContextFilePath,
-  cursorAgentCreateOptions,
-  cursorAgentSendOptions,
   mergeConflictResolutionContextFilePath,
-  cursorRoleMcpServers,
   reviewFeedbackContextFilePath,
   reviewVerdictContextFilePath,
+  symphonyRoleMcpServers,
+} from "./HandoffMcp.js";
+import {
+  cursorAgentCreateOptions,
+  cursorAgentSendOptions,
 } from "../../../cursor/src/CursorHarness.js";
+import { ScopedGatewayClient, type HermesGatewayClient, type HermesGatewayEnvironment } from "../../../hermes/src/GatewayFacade.js";
+import { hermesOwnedAuthProvidersForRuntime } from "../../../hermes/src/HermesAuthManager.js";
+import { writeHermesMcpConfig } from "../../../hermes/src/HermesMcpConfig.js";
+import { HermesProfileManager, safeProfileKey } from "../../../hermes/src/HermesProfileManager.js";
 
-export type McpToolExposureStage = "subprocess" | "sdk";
+export type McpToolExposureStage = "subprocess" | "sdk" | "hermes_gateway";
 export type McpToolExposureStatus = "success" | "failure" | "skipped";
 export type SdkRoleStatus = "success" | "failure" | "partial" | "skipped";
 export type McpToolExposureFailureCode =
   | "subprocess_spawn_list_failure"
   | "subprocess_missing_empty_name_mismatch"
+  | "runtime_missing_empty_name_mismatch"
+  | "hermes_gateway_startup_failure"
+  | "hermes_gateway_tools_list_failure"
   | "sdk_credentials_missing"
   | "sdk_startup_send_failure"
   | "sdk_stream_unsupported"
@@ -119,6 +128,16 @@ export interface McpToolExposureProbeOptions {
   sdkCwd?: string;
   mcpCwd?: string;
   settingSources?: CursorSettingSource[];
+}
+
+export interface HermesGatewayMcpToolExposureProbeOptions {
+  cliPath: string;
+  roles?: AgentRunRole[];
+  enabled: boolean;
+  cwd?: string;
+  mcpCwd?: string;
+  gatewayFactory?: (env: HermesGatewayEnvironment) => HermesGatewayClient;
+  profileManager?: HermesProfileManager;
 }
 
 export interface SdkSystemToolExtraction {
@@ -223,18 +242,33 @@ export async function runMcpToolExposureProbe(options: McpToolExposureProbeOptio
     cliPath: probeConfig.cliPath,
     roles,
   });
-  const sdk = await runSdkMcpToolExposureProbe(options.config, {
-    cliPath: probeConfig.cliPath,
-    roles,
-    enabled: probeConfig.liveSmokeEnabled,
-    timeoutMs: probeConfig.sdkTimeoutMs,
-    waitTimeoutMs: probeConfig.waitTimeoutMs,
-    postCancelWaitMs: probeConfig.postCancelWaitMs,
-    cwd: probeConfig.agentCwd,
-    mcpCwd: probeConfig.mcpCwd,
-    settingSources: probeConfig.settingSources,
-  });
-  return reportFromStages(options.config, probeConfig, [subprocess, sdk]);
+  const sdk =
+    options.config.agent.harness === "cursor"
+      ? await runSdkMcpToolExposureProbe(options.config, {
+          cliPath: probeConfig.cliPath,
+          roles,
+          enabled: probeConfig.liveSmokeEnabled,
+          timeoutMs: probeConfig.sdkTimeoutMs,
+          waitTimeoutMs: probeConfig.waitTimeoutMs,
+          postCancelWaitMs: probeConfig.postCancelWaitMs,
+          cwd: probeConfig.agentCwd,
+          mcpCwd: probeConfig.mcpCwd,
+          settingSources: probeConfig.settingSources,
+        })
+      : skippedSdkMcpToolExposureProbe(options.config, specsForRoles(roles), roleRunContextFromProbeConfig(probeConfig));
+  const stages = [subprocess, sdk];
+  if (options.config.agent.harness === "hermes") {
+    stages.push(
+      await runHermesGatewayMcpToolExposureProbe(options.config, {
+        cliPath: probeConfig.cliPath,
+        roles,
+        enabled: probeConfig.liveSmokeEnabled,
+        cwd: probeConfig.agentCwd,
+        mcpCwd: probeConfig.mcpCwd,
+      }),
+    );
+  }
+  return reportFromStages(options.config, probeConfig, stages);
 }
 
 export async function runSubprocessMcpToolExposureProbe(
@@ -276,6 +310,187 @@ export async function runSubprocessMcpToolExposureProbe(
     }
   }
   return summarizeStage("subprocess", results);
+}
+
+export async function runHermesGatewayMcpToolExposureProbe(
+  config: ServiceConfig,
+  options: HermesGatewayMcpToolExposureProbeOptions,
+): Promise<McpToolExposureStageResult> {
+  const specs = specsForRoles(options.roles ?? ["worker", "reviewer"]);
+  if (!options.enabled) {
+    const message = "Live Hermes gateway MCP exposure smoke skipped because SYMPHONY_MCP_EXPOSURE_SMOKE is not 1";
+    return {
+      stage: "hermes_gateway",
+      status: "skipped",
+      failureCode: null,
+      message,
+      results: specs.map((spec) => skippedServerResult(spec, message)),
+    };
+  }
+  if (config.agent.harness !== "hermes") {
+    const message = `Live Hermes gateway MCP exposure probe skipped because runtime harness ${config.agent.harness} is not hermes`;
+    return {
+      stage: "hermes_gateway",
+      status: "skipped",
+      failureCode: null,
+      message,
+      results: specs.map((spec) => skippedServerResult(spec, message)),
+    };
+  }
+
+  const results: McpToolExposureServerResult[] = [];
+  const profileManager =
+    options.profileManager ??
+    new HermesProfileManager({
+      templatesDir: config.hermes.templatesDir,
+      stateDir: config.hermes.stateDir,
+    });
+  const cwd = options.cwd ?? config.workflowDir;
+  const mcpCwd = options.mcpCwd ?? cwd;
+  await fs.mkdir(cwd, { recursive: true });
+
+  for (const target of uniqueSdkTargets(specs)) {
+    const roleSpecs = specsForSdkTarget(specs, target.role, target.runPhase);
+    const ctx = probeAgentRunContext(config, target.role, cwd, target.runPhase);
+    const profile = await profileManager.materialize({
+      workspaceKey: ctx.workspace.workspaceKey,
+      role: target.role,
+      phase: target.runPhase,
+      template: hermesTemplateForProbeTarget(config, target.role, target.runPhase),
+      profileKey: safeProfileKey(`mcp-${target.role}-${shortPhaseName(target.runPhase)}-${randomUUID().slice(0, 8)}`),
+      mode: "fresh",
+    });
+    let client: HermesGatewayClient | null = null;
+    let sessionId: string | null = null;
+    const envKeyNamesByServer = new Map<McpToolExposureSpec["serverKey"], string[]>();
+    try {
+      await writeRoleContexts(ctx);
+      const servers = symphonyRoleMcpServers(ctx, { cliPath: options.cliPath, mcpCwd });
+      const hermesServers = await writeHermesMcpConfig({ profileDir: profile.profileDir, servers });
+      for (const spec of roleSpecs) {
+        envKeyNamesByServer.set(spec.serverKey, sortedKeys(hermesServers[spec.serverKey]?.env ?? {}));
+      }
+      const authProviders = hermesOwnedAuthProvidersForRuntime(config.hermes.provider, config.hermes.auth.providers);
+      const env: HermesGatewayEnvironment = {
+        upstreamRoot: config.hermes.upstreamRoot,
+        hermesHome: profile.profileDir,
+        authHome: authProviders.length > 0 ? config.hermes.auth.managedRoot : null,
+        cwd,
+        python: config.hermes.python,
+        model: config.hermes.model,
+        provider: config.hermes.provider,
+        startupTimeoutMs: config.hermes.startupTimeoutMs,
+        requestTimeoutMs: config.hermes.requestTimeoutMs,
+        extraEnv: {},
+      };
+      client = options.gatewayFactory?.(env) ?? new ScopedGatewayClient(env);
+      client.drain();
+      const session = await hermesGatewayRequest<{ session_id?: unknown }>(
+        client,
+        "session.create",
+        { cols: 120 },
+        config.hermes.startupTimeoutMs,
+      );
+      sessionId = typeof session.session_id === "string" ? session.session_id : null;
+      if (!sessionId) {
+        throw new Error("Hermes gateway did not return a session_id");
+      }
+      const tools = await hermesGatewayRequest(
+        client,
+        "tools.list",
+        { session_id: sessionId },
+        config.hermes.requestTimeoutMs,
+      );
+      const rawToolNames = extractHermesToolNames(tools);
+      const classified = roleSpecs.map((spec) =>
+        classifyToolListResult("hermes_gateway", spec, rawToolNames, envKeyNamesByServer.get(spec.serverKey)),
+      );
+      const logTail = classified.some((result) => result.status === "failure") ? redactSensitiveText(client.getLogTail(20)) : "";
+      for (const result of classified) {
+        results.push(
+          result.status === "failure" && logTail
+            ? { ...result, message: `${result.message}; gateway log tail: ${logTail}` }
+            : result,
+        );
+      }
+    } catch (error) {
+      const failureCode = sessionId === null ? "hermes_gateway_startup_failure" : "hermes_gateway_tools_list_failure";
+      const logTail = client?.getLogTail(20);
+      const message = redactSensitiveText(
+        `Hermes gateway MCP exposure failed for ${target.role}/${target.runPhase}: ${errorMessage(error)}${
+          logTail ? `; gateway log tail: ${logTail}` : ""
+        }`,
+      );
+      for (const spec of roleSpecs) {
+        results.push(failureServerResult(spec, failureCode, message, envKeyNamesByServer.get(spec.serverKey)));
+      }
+    } finally {
+      if (client && sessionId) {
+        await client.request("session.close", { session_id: sessionId }).catch(() => undefined);
+      }
+      client?.kill("hermes.mcp_exposure_probe");
+      await removePathInsideRoot(config.hermes.stateDir, profile.profileDir).catch(() => undefined);
+    }
+  }
+
+  return summarizeStage("hermes_gateway", results);
+}
+
+function skippedSdkMcpToolExposureProbe(
+  config: ServiceConfig,
+  specs: readonly McpToolExposureSpec[],
+  roleRunContext: {
+    agentCwd: string;
+    mcpCwd: string;
+    settingSources: CursorSettingSource[];
+    cursorMode: string | null;
+    sdkTimeoutMs: number;
+    waitTimeoutMs: number;
+    postCancelWaitMs: number;
+  },
+): McpToolExposureStageResult {
+  const message = `Live Cursor SDK MCP exposure probe skipped because runtime harness ${config.agent.harness} is not cursor`;
+  const sdkRoleRuns = uniqueSdkTargets(specs).map((target) =>
+    syntheticSdkRoleRun({
+      role: target.role,
+      runPhase: target.runPhase,
+      roleStatus: "skipped",
+      primaryFailureCode: null,
+      message,
+      ...roleRunContext,
+    }),
+  );
+  return {
+    stage: "sdk",
+    status: "skipped",
+    failureCode: null,
+    message,
+    results: specs.map((spec) => {
+      const roleRunIndex = sdkRoleRuns.findIndex((roleRun) => roleRunMatchesSpec(roleRun, spec));
+      return skippedServerResult(spec, message, roleRunIndex);
+    }),
+    sdkRoleRuns,
+  };
+}
+
+function roleRunContextFromProbeConfig(probeConfig: McpToolExposureProbeConfig): {
+  agentCwd: string;
+  mcpCwd: string;
+  settingSources: CursorSettingSource[];
+  cursorMode: string | null;
+  sdkTimeoutMs: number;
+  waitTimeoutMs: number;
+  postCancelWaitMs: number;
+} {
+  return {
+    agentCwd: probeConfig.agentCwd,
+    mcpCwd: probeConfig.mcpCwd,
+    settingSources: probeConfig.settingSources,
+    cursorMode: probeConfig.cursorMode,
+    sdkTimeoutMs: probeConfig.sdkTimeoutMs,
+    waitTimeoutMs: probeConfig.waitTimeoutMs,
+    postCancelWaitMs: probeConfig.postCancelWaitMs,
+  };
 }
 
 export async function runSdkMcpToolExposureProbe(
@@ -338,18 +553,18 @@ export async function runSdkMcpToolExposureProbe(
       }
     }
   } catch (error) {
-    return missingCredentialsStage(specs, roleRunContext, `cursor.runtime: ${errorMessage(error)}`);
+    return missingCredentialsStage(specs, roleRunContext, `runtime.cursor: ${errorMessage(error)}`);
   }
   if (missingRoles.length > 0) {
     return missingCredentialsStage(
       specs,
       roleRunContext,
-      `cursor.runtime credentials are missing for ${missingRoles.join(", ")}`,
+      `runtime.cursor credentials are missing for ${missingRoles.join(", ")}`,
     );
   }
 
   if (roleApiKeys.size === 0) {
-    return missingCredentialsStage(specs, roleRunContext, "cursor.runtime credentials are missing");
+    return missingCredentialsStage(specs, roleRunContext, "runtime.cursor credentials are missing");
   }
 
   const results: McpToolExposureServerResult[] = [];
@@ -357,7 +572,7 @@ export async function runSdkMcpToolExposureProbe(
   for (const target of uniqueSdkTargets(specs)) {
     const apiKey = roleApiKeys.get(target.role);
     if (!apiKey) {
-      throw new Error(`cursor.runtime credential unexpectedly missing for ${target.role}`);
+      throw new Error(`runtime.cursor credential unexpectedly missing for ${target.role}`);
     }
     const roleRunIndex = sdkRoleRuns.length;
     const roleProbe = await runSdkRoleProbe(config, {
@@ -438,6 +653,54 @@ export function normalizeMcpToolName(rawName: string, specs: readonly McpToolExp
   return null;
 }
 
+export function extractHermesToolNames(payload: unknown): string[] {
+  const names: string[] = [];
+  const root = isRecord(payload) && isRecord(payload.result) ? payload.result : payload;
+  const toolsets = isRecord(root) && Array.isArray(root.toolsets) ? root.toolsets : [];
+  const pushName = (value: unknown): void => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (trimmed.length > 0) names.push(trimmed);
+  };
+
+  for (const toolset of toolsets) {
+    if (!isRecord(toolset)) continue;
+    if (toolset.enabled === false) continue;
+    const toolsetName = typeof toolset.name === "string" ? toolset.name.trim() : "";
+    const tools = Array.isArray(toolset.tools) ? toolset.tools : [];
+    for (const tool of tools) {
+      if (typeof tool === "string") {
+        pushName(tool);
+        if (toolsetName) pushName(`${toolsetName}.${tool}`);
+        continue;
+      }
+      if (!isRecord(tool)) continue;
+      const schema = isRecord(tool.schema) ? tool.schema : null;
+      const rawName =
+        typeof tool.name === "string"
+          ? tool.name
+          : typeof tool.id === "string"
+            ? tool.id
+            : typeof schema?.name === "string"
+              ? schema.name
+              : "";
+      pushName(rawName);
+      if (toolsetName && rawName) pushName(`${toolsetName}.${rawName}`);
+    }
+  }
+
+  const flatTools = isRecord(root) && Array.isArray(root.tools) ? root.tools : [];
+  for (const tool of flatTools) {
+    if (typeof tool === "string") {
+      pushName(tool);
+      continue;
+    }
+    if (isRecord(tool)) pushName(tool.name);
+  }
+
+  return unique(names);
+}
+
 export function redactSensitiveText(input: string, extraSecrets: string[] = []): string {
   let redacted = input;
   const secrets = [...extraSecrets, ...sensitiveEnvValues()].filter((value) => value.length >= 8);
@@ -452,7 +715,7 @@ export function redactSensitiveText(input: string, extraSecrets: string[] = []):
 }
 
 export function classifyToolListResult(
-  stage: Extract<McpToolExposureStage, "subprocess">,
+  stage: Extract<McpToolExposureStage, "subprocess" | "hermes_gateway">,
   spec: McpToolExposureSpec,
   rawToolNames: string[],
   envKeyNames: string[] = [],
@@ -469,7 +732,7 @@ export function classifyToolListResult(
       command: spec.command,
       expectedTool: spec.expectedTool,
       status: "failure",
-      failureCode: "subprocess_missing_empty_name_mismatch",
+      failureCode: missingToolFailureCode(stage),
       message: `${stageLabel(stage)} exposed no MCP tools for ${spec.serverKey}`,
       rawToolNames,
       normalizedToolNames,
@@ -483,8 +746,8 @@ export function classifyToolListResult(
       command: spec.command,
       expectedTool: spec.expectedTool,
       status: "failure",
-      failureCode: "subprocess_missing_empty_name_mismatch",
-      message: `${stageLabel(stage)} did not expose ${spec.expectedTool} for ${spec.serverKey}; raw tools: ${rawToolNames.join(", ")}`,
+      failureCode: missingToolFailureCode(stage),
+      message: `${stageLabel(stage)} did not expose ${spec.expectedTool} for ${spec.serverKey}; raw tools: ${formatListForMessage(rawToolNames)}`,
       rawToolNames,
       normalizedToolNames,
       envKeyNames: sortedKeysFromList(envKeyNames),
@@ -610,7 +873,7 @@ async function runSdkRoleProbe(
     await fs.mkdir(path.dirname(traceFile), { recursive: true });
     await fs.rm(traceFile, { force: true });
     process.env.SYMPHONY_MCP_TRACE_FILE = traceFile;
-    const roleMcpServers = cursorRoleMcpServers(ctx, { cliPath: options.cliPath, mcpCwd: options.mcpCwd });
+    const roleMcpServers = symphonyRoleMcpServers(ctx, { cliPath: options.cliPath, mcpCwd: options.mcpCwd });
     const createOptions = cursorAgentCreateOptions(ctx, options.apiKey, { mcpServers: roleMcpServers });
     createOptions.local = {
       ...createOptions.local,
@@ -908,6 +1171,7 @@ function probeAgentRunContext(config: ServiceConfig, role: AgentRunRole, cwd: st
     branchName: null,
     url: null,
     assigneeId: null,
+    delegateId: null,
     assignedToWorker: role === "worker",
     labels: [],
     blockedBy: [],
@@ -935,6 +1199,39 @@ function probeAgentRunContext(config: ServiceConfig, role: AgentRunRole, cwd: st
     abortSignal: new AbortController().signal,
     logger: new StructuredLogger(() => undefined),
   };
+}
+
+function hermesTemplateForProbeTarget(config: ServiceConfig, role: AgentRunRole, runPhase: AgentRunPhase): string {
+  if (role === "reviewer") return config.hermes.roleTemplates.reviewer;
+  if (runPhase === "issue_breakdown") return config.hermes.roleTemplates.planner;
+  if (runPhase === "merge_conflict_resolution") return config.hermes.roleTemplates.mergeConflictResolution;
+  return config.hermes.roleTemplates.worker;
+}
+
+function shortPhaseName(runPhase: AgentRunPhase): string {
+  if (runPhase === "merge_conflict_resolution") return "conflict";
+  if (runPhase === "issue_breakdown") return "plan";
+  return runPhase;
+}
+
+async function hermesGatewayRequest<T>(
+  client: HermesGatewayClient,
+  method: string,
+  params: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<T> {
+  const outcome = await settleWithTimeout(client.request<T>(method, params), timeoutMs);
+  if (outcome.status === "fulfilled") return outcome.value;
+  if (outcome.status === "timeout") throw new Error(`Hermes gateway request ${method} timed out after ${timeoutMs}ms`);
+  throw outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
+}
+
+async function removePathInsideRoot(rootPath: string, targetPath: string): Promise<void> {
+  const root = path.resolve(rootPath);
+  const target = path.resolve(targetPath);
+  const relative = path.relative(root, target);
+  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return;
+  await fs.rm(target, { recursive: true, force: true });
 }
 
 function summarizeStage(
@@ -1381,6 +1678,9 @@ function sdkFailureMessage(
       return `Cursor SDK attempted unexpected tool call: ${observation.unexpectedToolCall ?? "unknown"}`;
     case "subprocess_spawn_list_failure":
     case "subprocess_missing_empty_name_mismatch":
+    case "runtime_missing_empty_name_mismatch":
+    case "hermes_gateway_startup_failure":
+    case "hermes_gateway_tools_list_failure":
       return `Unexpected SDK failure code ${failureCode}`;
   }
 }
@@ -1519,7 +1819,11 @@ function runId(run: Run | null): string | null {
 }
 
 function formatListForMessage(values: string[]): string {
-  return values.length === 0 ? "none" : values.join(", ");
+  if (values.length === 0) return "none";
+  const maxItems = 40;
+  const shown = values.slice(0, maxItems).join(", ");
+  const remaining = values.length - maxItems;
+  return remaining > 0 ? `${shown}, ... (${remaining} more)` : shown;
 }
 
 function sdkToolCallName(message: unknown): string | null {
@@ -1533,7 +1837,15 @@ function sdkToolCallName(message: unknown): string | null {
 }
 
 function stageLabel(stage: McpToolExposureStage): string {
-  return stage === "subprocess" ? "MCP subprocess tools/list" : "Cursor SDK MCP discovery";
+  if (stage === "subprocess") return "MCP subprocess tools/list";
+  if (stage === "hermes_gateway") return "Hermes gateway MCP discovery";
+  return "Cursor SDK MCP discovery";
+}
+
+function missingToolFailureCode(
+  stage: Extract<McpToolExposureStage, "subprocess" | "hermes_gateway">,
+): Extract<McpToolExposureFailureCode, "subprocess_missing_empty_name_mismatch" | "runtime_missing_empty_name_mismatch"> {
+  return stage === "subprocess" ? "subprocess_missing_empty_name_mismatch" : "runtime_missing_empty_name_mismatch";
 }
 
 function sortedKeys(value: Record<string, unknown>): string[] {

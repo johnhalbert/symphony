@@ -1,0 +1,84 @@
+import type { ReactNode } from "react";
+import { Icon } from "../components/common";
+import type { AppTab } from "../types/symphony";
+import { appTabs } from "./navigation";
+
+const tabIcon: Record<AppTab, () => ReactNode> = {
+  dashboard: Icon.dashboard,
+  issues: Icon.layout,
+  history: Icon.history,
+  sidebar: Icon.message,
+  states: Icon.agent,
+};
+
+export function AppChrome({
+  activeTab,
+  onTabChange,
+  children,
+  rightSlot,
+  runningCount = 4,
+}: {
+  activeTab: AppTab;
+  onTabChange: (tab: AppTab) => void;
+  children: ReactNode;
+  rightSlot?: ReactNode;
+  runningCount?: number;
+}) {
+  return (
+    <div className="app">
+      <div className="titlebar">
+        <div className="titlebar__brand">
+          <span className="dot" />
+          Symphony
+          <span className="meta">main</span>
+        </div>
+        <div className="tabs" role="tablist" aria-label="Symphony views">
+          {appTabs.map((tab) => (
+            <button
+              className="tab"
+              data-active={activeTab === tab.id}
+              key={tab.id}
+              onClick={() => onTabChange(tab.id)}
+              role="tab"
+              aria-label={tab.label}
+              aria-selected={activeTab === tab.id}
+              title={tab.label}
+              type="button"
+            >
+              {tabIcon[tab.id]()}
+              <span>{tab.label}</span>
+              {tab.badge ? <span className="badge">{tab.badge}</span> : null}
+            </button>
+          ))}
+        </div>
+        <div className="titlebar__right">
+          {rightSlot}
+          <button className="icon-btn" type="button" title="Search">
+            {Icon.search()}
+          </button>
+          <button className="icon-btn" type="button" title="More">
+            {Icon.more()}
+          </button>
+        </div>
+      </div>
+      {children}
+      <div className="statusbar">
+        <span className="statusbar__seg">
+          <span className="pulse" />
+          {runningCount} agents running
+        </span>
+        <span className="statusbar__sep">·</span>
+        <span className="statusbar__seg mono">openai/symphony@main</span>
+        <span className="statusbar__sep">·</span>
+        <span className="statusbar__seg mono">poll 22s · next in 8s</span>
+        <div className="statusbar__right">
+          <span className="statusbar__seg mono">linear · connected</span>
+          <span className="statusbar__sep">·</span>
+          <span className="statusbar__seg mono">api source · mock</span>
+          <span className="statusbar__sep">·</span>
+          <span className="statusbar__seg mono">0 errors · 24h</span>
+        </div>
+      </div>
+    </div>
+  );
+}

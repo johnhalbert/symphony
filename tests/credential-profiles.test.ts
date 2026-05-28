@@ -37,7 +37,7 @@ describe("credential profile config", () => {
             },
             "cursor-runtime": {
               value: "$CURSOR_PROFILE_TOKEN",
-              capabilities: ["cursor.runtime"],
+              capabilities: ["runtime.cursor"],
             },
             "workspace-open": {
               value: "$WORKSPACE_OPEN_TOKEN",
@@ -48,7 +48,7 @@ describe("credential profile config", () => {
             worker: {
               "github.discovery": "github-read",
               "linear.writeback": "linear-write",
-              "cursor.runtime": "cursor-runtime",
+              "runtime.cursor": "cursor-runtime",
               "server.open_workspace": "workspace-open",
             },
             reviewer: {
@@ -56,7 +56,7 @@ describe("credential profile config", () => {
               "github.review_feedback_write": "github-feedback",
               "linear.tracker": "linear-read",
               "linear.writeback": "linear-write",
-              "cursor.runtime": "cursor-runtime",
+              "runtime.cursor": "cursor-runtime",
             },
             service: {
               "github.publication": "github-publish",
@@ -106,12 +106,22 @@ describe("credential profile config", () => {
       source: "profile",
       profileName: "workspace-open",
     });
+    expect(config.credentialProfiles.resolveForRole("worker", "runtime.cursor")).toMatchObject({
+      value: "cursor-profile-secret",
+      source: "profile",
+      profileName: "cursor-runtime",
+    });
+    expect(config.credentialProfiles.resolveForRole("worker", "cursor.runtime")).toMatchObject({
+      value: "cursor-profile-secret",
+      source: "profile",
+      profileName: "cursor-runtime",
+    });
     expect(config.credentialProfiles.capabilitiesForRole("reviewer")).toEqual([
       "github.review_evidence_read",
       "github.review_feedback_write",
       "linear.tracker",
       "linear.writeback",
-      "cursor.runtime",
+      "runtime.cursor",
     ]);
     expect(config.credentialProfiles.capabilitiesForRole("service")).toEqual([
       "github.publication",
@@ -203,6 +213,7 @@ describe("credential profile config", () => {
     expect(config.credentialProfiles.resolveForRole("worker", "linear.writeback")?.value).toBe(
       "legacy-linear-secret",
     );
+    expect(config.credentialProfiles.resolveForRole("worker", "runtime.cursor")?.value).toBe("legacy-cursor-secret");
     expect(config.credentialProfiles.resolveForRole("worker", "cursor.runtime")?.value).toBe("legacy-cursor-secret");
     expect(config.credentialProfiles.resolveForRole("worker", "server.open_workspace")?.value).toBe(
       "legacy-open-secret",

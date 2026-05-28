@@ -2,7 +2,7 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
-import type { CursorWorkspaceOpener } from "../../cursor/src/CursorWorkspaceOpener.js";
+import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
   runKindForPhase,
@@ -65,7 +65,7 @@ import type {
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
   workspaceManager: WorkspaceManager;
-  workspaceOpener: CursorWorkspaceOpener;
+  workspaceOpener: WorkspaceOpener;
   runStore?: RunTranscriptStore;
   lifecycleStore?: IssueLifecycleStore;
   mcpExposureDiagnosticsStore?: FileMcpExposureDiagnosticsStore;
@@ -2039,7 +2039,7 @@ async function orphanedOperatorViews(snapshot: RuntimeSnapshot, runStore?: RunTr
   return runs.map((run) => ({
     issueId: run.issueId,
     issueIdentifier: run.issueIdentifier,
-    role: run.role,
+    role: run.role ?? "unknown",
     runId: run.runId,
     agentId: run.agentId,
     sessionId: run.sessionId,
@@ -2796,6 +2796,7 @@ function durableIssueStatusView(input: {
       input.lifecycle?.summaryPointers.branchName ?? input.latestRun?.gitBranchName ?? input.workspace?.gitBranchName ?? null,
     url: null,
     assigneeId: null,
+    delegateId: null,
     labels: [],
     blockedBy: [],
     createdAt: null,
@@ -3241,8 +3242,8 @@ async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (char) => {
+function escapeHtml(value: unknown): string {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => {
     switch (char) {
       case "&":
         return "&amp;";

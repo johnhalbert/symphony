@@ -18,6 +18,7 @@ export interface Issue {
   branchName: string | null;
   url: string | null;
   assigneeId: string | null;
+  delegateId: string | null;
   assignedToWorker: boolean;
   labels: string[];
   blockedBy: IssueBlockerRef[];
@@ -35,6 +36,7 @@ export interface IssueStatusView {
   branchName: string | null;
   url: string | null;
   assigneeId: string | null;
+  delegateId: string | null;
   labels: string[];
   blockedBy: IssueBlockerRef[];
   createdAt: string | null;
@@ -167,6 +169,7 @@ export function toIssueStatusView(issue: Issue): IssueStatusView {
     branchName: issue.branchName,
     url: issue.url,
     assigneeId: issue.assigneeId,
+    delegateId: issue.delegateId,
     labels: [...issue.labels],
     blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
     createdAt: issue.createdAt,

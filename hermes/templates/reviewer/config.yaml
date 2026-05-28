@@ -1,0 +1,16 @@
+toolsets:
+  - hermes-cli
+agent:
+  max_turns: 90
+  reasoning_effort: xhigh
+  tool_use_enforcement: auto
+  disabled_toolsets:
+    - tts
+    - delegation
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  provider: ""
+display:
+  show_reasoning: true
+  tool_progress: all

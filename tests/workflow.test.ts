@@ -1,8 +1,12 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import YAML from "yaml";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
-import { parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
+import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
 import { issue } from "./helpers.js";
 
 describe("workflow loading and prompt rendering", () => {
@@ -110,6 +114,49 @@ Work on {{ issue.identifier }}.`,
       canceled: ["Cancelled", "Canceled", "Duplicate"],
     });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
+  });
+
+  it("loads workflow-local .env values for runtime config resolution", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-env-"));
+    try {
+      const workflowPath = path.join(root, "WORKFLOW.md");
+      await writeFile(
+        path.join(root, ".env"),
+        [
+          "WORKFLOW_TEST_LINEAR_API_KEY=linear-secret",
+          "WORKFLOW_TEST_LINEAR_PROJECT=TEST",
+          "WORKFLOW_TEST_GITHUB=github-secret",
+          "WORKFLOW_TEST_WORKSPACE=workspace-secret",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await writeFile(
+        workflowPath,
+        `---
+tracker:
+  kind: linear
+  api_key: $WORKFLOW_TEST_LINEAR_API_KEY
+  project_slug: $WORKFLOW_TEST_LINEAR_PROJECT
+github:
+  token: $WORKFLOW_TEST_GITHUB
+server:
+  open_workspace_token: $WORKFLOW_TEST_WORKSPACE
+---
+Work on {{ issue.identifier }}.
+`,
+        "utf8",
+      );
+
+      const loaded = await new WorkflowLoader(workflowPath).load();
+
+      expect(loaded.serviceConfig.tracker.apiKey).toBe("linear-secret");
+      expect(loaded.serviceConfig.tracker.projectSlug).toBe("TEST");
+      expect(loaded.serviceConfig.github.token).toBe("github-secret");
+      expect(loaded.serviceConfig.server.openWorkspaceToken).toBe("workspace-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("parses bounded SDK error retry configuration", () => {
@@ -922,33 +969,108 @@ Work on {{ issue.identifier }}.`,
     });
   });
 
-  it("ignores obsolete Hermes blocks and rejects Hermes harness selection", () => {
+  it("parses Hermes runtime config while preserving Cursor as the default harness", () => {
     const config = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
         hermes: {
-          command: "hermes",
-          home: "$HERMES_HOME",
-          env: { HERMES_PROVIDER: "openai" },
+          state_dir: "$HERMES_HOME",
+          model: "$HERMES_MODEL",
+          provider: "openai",
+          role_templates: { reviewer: "fresh-reviewer" },
         },
       },
       "/repo/WORKFLOW.md",
-      { LINEAR_API_KEY: "secret", HERMES_HOME: "/tmp/hermes-home" },
+      { LINEAR_API_KEY: "secret", HERMES_HOME: "/tmp/hermes-home", HERMES_MODEL: "hermes-test-model" },
     );
 
     expect(config.agent.harness).toBe("cursor");
-    expect("hermes" in config).toBe(false);
+    expect(config.hermes.stateDir.replace(/\\/g, "/")).toMatch(/\/tmp\/hermes-home$/);
+    expect(config.hermes).toMatchObject({
+      model: "hermes-test-model",
+      provider: "openai",
+      workerSessionLifecycle: "reuse_by_issue",
+      keepProfiles: "failed",
+      runtimeCredentialEnv: "HERMES_API_KEY",
+      auth: {
+        mode: "managed_root",
+        providers: ["openai-codex"],
+      },
+      roleTemplates: {
+        worker: "worker",
+        reviewer: "fresh-reviewer",
+        planner: "planner",
+        mergeConflictResolution: "worker",
+      },
+    });
+    expect(config.hermes.auth.managedRoot.replace(/\\/g, "/")).toMatch(/\/tmp\/hermes-home\/auth$/);
+    expect(config.hermes.auth.bootstrapFrom.replace(/\\/g, "/")).toMatch(/\/tmp\/hermes-home$/);
 
-    expect(() =>
-      parseServiceConfig(
-        {
-          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
-          agent: { harness: "hermes", max_turns: 1 },
+    const hermesConfig = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { harness: "hermes", max_turns: 1 },
+        hermes: {
+          auth: {
+            managed_root: "$SYMPHONY_HERMES_AUTH",
+            bootstrap_from: "local-hermes-auth",
+            providers: ["openai-codex"],
+          },
         },
-        "/repo/WORKFLOW.md",
-        { LINEAR_API_KEY: "secret" },
-      ),
-    ).toThrow(SymphonyError);
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret", SYMPHONY_HERMES_AUTH: "/tmp/symphony-hermes-auth" },
+    );
+    expect(hermesConfig.agent.harness).toBe("hermes");
+    expect(hermesConfig.hermes.auth.managedRoot.replace(/\\/g, "/")).toMatch(/\/tmp\/symphony-hermes-auth$/);
+    expect(hermesConfig.hermes.auth.bootstrapFrom.replace(/\\/g, "/")).toMatch(/\/repo\/local-hermes-auth$/);
+  });
+
+  it("parses the canonical workflow with current Hermes dogfood defaults", async () => {
+    const workflowPath = path.resolve("WORKFLOW.md");
+    const parsed = parseWorkflowFile(await readFile(workflowPath, "utf8"), workflowPath);
+    const config = parseServiceConfig(parsed.config, workflowPath, {
+      LINEAR_API_KEY: "linear-secret",
+      LINEAR_PROJECT_SLUG: "TEST",
+      LINEAR_ASSIGNEE: "me",
+      GITHUB_PUBLICATION_TOKEN: "publication-secret",
+      GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+      GITHUB_APP_ID: "12345",
+      GITHUB_APP_CLIENT_ID: "Iv1.client-id",
+      GITHUB_APP_INSTALLATION_ID: "67890",
+      GITHUB_APP_PRIVATE_KEY_PATH: "/tmp/github-app-private-key.pem",
+      SYMPHONY_WORKSPACE_TOKEN: "workspace-secret",
+    });
+
+    expect(config.agent.harness).toBe("hermes");
+    expect(config.agent.maxConcurrentAgents).toBe(5);
+    expect(config.agent.maxTurns).toBe(1);
+    expect(config.mergePolicy.mode).toBe("gated");
+    expect(config.continuationContext.searchEnabled).toBe(false);
+    expect(config.github.prHandoff.enabled).toBe(false);
+    expect(config.github.token).toBeNull();
+    expect(config.github.app).toMatchObject({
+      appId: "12345",
+      clientId: "Iv1.client-id",
+      installationId: "67890",
+    });
+    expect(config.github.app?.privateKeyPath?.replace(/\\/g, "/")).toMatch(/\/tmp\/github-app-private-key\.pem$/);
+    expect(config.server.openWorkspaceToken).toBe("workspace-secret");
+    expect(config.hermes.provider).toBe("openai-codex");
+    expect(config.hermes.model).toBe("gpt-5.5");
+    expect(config.hermes.auth).toMatchObject({
+      mode: "managed_root",
+      providers: ["openai-codex"],
+    });
+    expect(config.hermes.workerSessionLifecycle).toBe("reuse_by_issue");
+    expect(config.hermes.keepProfiles).toBe("failed");
+    expect(config.agent.protectedPaths).toContain("hermes/src/**");
+    for (const template of ["worker", "reviewer", "planner"]) {
+      const templateConfig = YAML.parse(
+        await readFile(path.resolve("hermes", "templates", template, "config.yaml"), "utf8"),
+      ) as { agent?: { reasoning_effort?: unknown } };
+      expect(templateConfig.agent?.reasoning_effort).toBe("xhigh");
+    }
   });
 
   it("fails strict prompt rendering on unknown variables", async () => {

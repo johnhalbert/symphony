@@ -49,7 +49,7 @@ merge_policy:
     allowed: false
 
 continuation_context:
-  search_enabled: true
+  search_enabled: false
   summarization_enabled: false
 
 polling:
@@ -66,8 +66,8 @@ workspace:
     cleanup: refuse_dirty
 
 agent:
-  harness: cursor
-  max_concurrent_agents: 2
+  harness: hermes
+  max_concurrent_agents: 5
   max_turns: 1
   max_retry_backoff_ms: 300000
   require_labels:
@@ -84,6 +84,7 @@ agent:
     - src/core/workflow/**
     - src/integrations/linear/**
     - cursor/src/**
+    - hermes/src/**
 
 cursor:
   model: gpt-5.5
@@ -94,10 +95,22 @@ cursor:
   worker_agent_lifecycle: fresh_per_run
   setting_sources: []
 
+hermes:
+  upstream_root: ./hermes/upstream-src
+  templates_dir: ./hermes/templates
+  provider: openai-codex
+  model: gpt-5.5
+  auth:
+    mode: managed_root
+    providers:
+      - openai-codex
+  worker_session_lifecycle: reuse_by_issue
+  keep_profiles: failed
+
 server:
   host: 127.0.0.1
   port: 7331
-  open_workspace_token: $SYMPHONY_OPEN_WORKSPACE_TOKEN
+  open_workspace_token: $SYMPHONY_WORKSPACE_TOKEN
 
 writeback:
   enabled: true
@@ -108,7 +121,11 @@ writeback:
 github:
   owner: johnhalbert
   repo: symphony
-  token: $GITHUB_TOKEN
+  app:
+    app_id: $GITHUB_APP_ID
+    client_id: $GITHUB_APP_CLIENT_ID
+    installation_id: $GITHUB_APP_INSTALLATION_ID
+    private_key_path: $GITHUB_APP_PRIVATE_KEY_PATH
   head_owner: johnhalbert
   publish_pull_requests: true
   pr_handoff:
@@ -117,27 +134,11 @@ github:
     required_for_publication: false
     reject_policy: cancel
     poll_interval_ms: 2000
-
-credential_profiles:
-  profiles:
-    publication:
-      value: $GITHUB_PUBLICATION_TOKEN
-      capabilities:
-        - github.publication
-    feedback:
-      value: $GITHUB_FEEDBACK_TOKEN
-      capabilities:
-        - github.review_feedback_write
-  roles:
-    service:
-      github.publication: publication
-    reviewer:
-      github.review_feedback_write: feedback
 ---
 
 # Symphony Dogfood Worker
 
-You are a Cursor worker operating under Symphony for the `{{ issue.identifier }}` Linear issue.
+You are a runtime-harness worker operating under Symphony for the `{{ issue.identifier }}` Linear issue.
 
 ## Control Plane
 
@@ -147,13 +148,13 @@ Use Linear only as read context unless the prompt explicitly asks for a non-life
 
 ## State Contract
 
-`Todo` and `In Progress` are the worker implementation queue. `In Review` is the reviewer-agent queue and stops worker dispatch/retry behavior after Symphony accepts the worker completion report. Temporary incident mode: the PR-driven `Human Review` handoff is disabled because the Engineering Linear workflow currently has no `Human Review` state. While this mode is active, Symphony publishes or reuses the lifecycle-bound pull request and transitions accepted completion reports directly to `In Review`; the separate PR handoff check gate is not active. `Blocked` is the human-required escalation state for exhausted review loops, repeated incomplete worker turns, or other conditions that require operator intervention.
+`Todo` and `In Progress` are the worker implementation queue. `In Review` is the reviewer-agent queue and stops worker dispatch/retry behavior after Symphony accepts the worker completion report. The PR-driven `Human Review` handoff is disabled for the initial Hermes dogfood loop. Symphony publishes or reuses the lifecycle-bound pull request and transitions accepted completion reports directly to `In Review`; the separate PR handoff check gate is not active. `Blocked` is the human-required escalation state for exhausted review loops, repeated incomplete worker turns, or other conditions that require operator intervention.
 
 A passing review is recorded with structured reviewer verdict evidence, such as a Linear comment or PR review, and Symphony transitions the issue from `In Review` to `Ready to Merge`. Review failures continue through the review loop, and escalation failures transition to `Blocked`.
 
 Reviewer-approved GitHub merge remains manual unless `merge_policy.mode: gated` is explicitly enabled. In gated mode, Symphony must confirm the issue reached `Ready to Merge`, validate the lifecycle-bound PR, approval evidence, current head SHA, and configured CI/no-CI policy, then perform service-owned merge and transition the issue to `Done`.
 
-Transcript search is available through the bounded, read-only `search_transcript_context` MCP tool when `continuation_context.search_enabled` is true. Richer summarization remains a roadmap placeholder; keep `continuation_context.summarization_enabled` disabled until a concrete implementation exists.
+Transcript search remains disabled until the transcript recall implementation is ready for dogfood. Richer summarization remains a roadmap placeholder; keep `continuation_context.summarization_enabled` disabled until a concrete implementation exists.
 
 ## Required Workflow
 
@@ -179,4 +180,4 @@ In the completion report, summarize the scenario matrix you covered, the validat
 
 ## Protected Areas
 
-Issues that touch orchestration, workflow parsing, Linear integration, Cursor harness, dogfood workflow, or dogfood safety docs require explicit operator oversight and must carry the expected dogfood routing labels before dispatch.
+Issues that touch orchestration, workflow parsing, Linear integration, runtime harnesses, dogfood workflow, or dogfood safety docs require explicit operator oversight and must carry the expected dogfood routing labels before dispatch.

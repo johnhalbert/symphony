@@ -6,7 +6,11 @@ import {
   submitReviewVerdictFromMcp,
   writeReviewVerdictMcpContext,
 } from "../src/core/harness/ReviewVerdictMcpServer.js";
-import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileIssueLifecycleStore,
+  type IssueCompletionReportRecord,
+  type IssueReviewFeedbackRecord,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { issue } from "./helpers.js";
 
@@ -95,8 +99,12 @@ describe("review verdict MCP handoff", () => {
     const contextFile = path.join(root, "review-context.json");
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     await writeFile(workflowPath, workflow(stateDir), "utf8");
+    const report = completionReportRecord();
     await lifecycleStore.ensureIssue(issue({ state: "In Review", branchName: "symphony/TEST-1" }), {
       phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      reviewFeedback: [approvalFeedback({ runId: "review-run-2" })],
       summaryPointers: { lastRunId: "review-run-2" },
     });
     await writeReviewVerdictMcpContext(contextFile, {
@@ -177,4 +185,53 @@ Work on {{ issue.identifier }}.
 
 function slash(value: string): string {
   return value.replace(/\\/g, "/");
+}
+
+function completionReportRecord(): IssueCompletionReportRecord {
+  return {
+    id: "completion-report-1",
+    idempotencyKey: "report-1",
+    runId: "worker-run-1",
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    summary: "Implemented the requested change.",
+    validationEvidence: ["npm test"],
+    acceptanceChecklist: [{ text: "Reviewer verdict submissions are wired through MCP.", satisfied: true, evidence: "Tests passed." }],
+    changedFiles: ["src/index.ts"],
+    branchName: "symphony/TEST-1",
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      branch: "symphony/TEST-1",
+    },
+    risks: [],
+    acceptedAt: "2026-01-01T00:00:00Z",
+    writebackOperationKeys: [],
+  };
+}
+
+function approvalFeedback(overrides: Partial<IssueReviewFeedbackRecord> = {}): IssueReviewFeedbackRecord {
+  return {
+    id: "review-feedback:issue-1:review-run-2:approve-1",
+    idempotencyKey: "approve-1",
+    requestHash: "request-hash",
+    runId: "review-run-2",
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    kind: "review",
+    event: "APPROVE",
+    body: "Looks good.",
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      branch: "symphony/TEST-1",
+    },
+    reviewer: "reviewer-agent:review-run-2",
+    reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-2",
+    commentUrls: [],
+    submittedAt: "2026-01-01T00:00:02.000Z",
+    ...overrides,
+  };
 }

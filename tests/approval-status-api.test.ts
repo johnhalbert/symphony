@@ -639,7 +639,12 @@ describe("approval status API", () => {
 
       await orchestrator.refreshNow();
       expect(orchestrator.snapshot().counts.running).toBe(1);
-      const runningRun = await runStore.getRun("live-report-run");
+      const runningRun = await waitForRunMatch(
+        runStore,
+        "live-report-run",
+        (run) => run.pendingApprovalRequestId === pending.requestId,
+        "pending approval metadata",
+      );
       expect(runningRun).toMatchObject({ status: "running", pendingApprovalRequestId: pending.requestId });
       expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
       await waitFor(async () => {

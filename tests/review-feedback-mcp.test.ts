@@ -29,7 +29,9 @@ describe("review feedback MCP handoff", () => {
     const output = await listToolsViaServer();
 
     expect(output).toContain(REVIEW_FEEDBACK_TOOL_NAME);
+    expect(output).toContain("APPROVE");
     expect(output).toContain("REQUEST_CHANGES");
+    expect(output).not.toContain('"COMMENT"');
     expect(output).toContain("idempotencyKey");
   });
 
@@ -65,7 +67,7 @@ describe("review feedback MCP handoff", () => {
     const result = await submitReviewFeedbackFromMcp(
       {
         kind: "review",
-        event: "COMMENT",
+        event: "APPROVE",
         body: "Reviewer feedback from MCP.",
         comments: [{ path: "src/index.ts", body: "Inline note.", line: 5, side: "RIGHT" }],
         idempotencyKey: "feedback-1",

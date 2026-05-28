@@ -169,6 +169,41 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    hermes: z
+      .object({
+        upstream_root: z.string().optional(),
+        python: z.string().optional(),
+        templates_dir: z.string().optional(),
+        state_dir: z.string().optional(),
+        auth: z
+          .object({
+            mode: z.enum(["managed_root"]).optional(),
+            managed_root: z.string().optional(),
+            bootstrap_from: z.string().optional(),
+            providers: z.array(z.string()).min(1).optional(),
+          })
+          .passthrough()
+          .optional(),
+        runtime_credential_env: z.string().optional(),
+        model: z.string().optional(),
+        provider: z.string().optional(),
+        worker_session_lifecycle: z.enum(["fresh_per_run", "reuse_by_issue"]).optional(),
+        keep_profiles: z.enum(["always", "failed", "never"]).optional(),
+        startup_timeout_ms: z.number().int().positive().optional(),
+        request_timeout_ms: z.number().int().positive().optional(),
+        shutdown_grace_ms: z.number().int().nonnegative().optional(),
+        role_templates: z
+          .object({
+            worker: z.string().optional(),
+            reviewer: z.string().optional(),
+            planner: z.string().optional(),
+            merge_conflict_resolution: z.string().optional(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
     server: z
       .object({
         port: z.number().int().min(0).optional(),
@@ -287,7 +322,7 @@ export interface AgentConfig {
   protectedPaths: string[];
 }
 
-export type AgentHarnessKind = "cursor";
+export type AgentHarnessKind = string;
 
 export type CursorSettingSource =
   | "project"
@@ -313,6 +348,42 @@ export type CursorWorkerAgentLifecycle = "fresh_per_run" | "resume_by_issue";
 export interface CursorModelParameter {
   id: string;
   value: string;
+}
+
+export type HermesWorkerSessionLifecycle = "fresh_per_run" | "reuse_by_issue";
+export type HermesProfileRetention = "always" | "failed" | "never";
+
+export interface HermesRoleTemplatesConfig {
+  worker: string;
+  reviewer: string;
+  planner: string;
+  mergeConflictResolution: string;
+}
+
+export type HermesAuthMode = "managed_root";
+
+export interface HermesAuthConfig {
+  mode: HermesAuthMode;
+  managedRoot: string;
+  bootstrapFrom: string;
+  providers: string[];
+}
+
+export interface HermesConfig {
+  upstreamRoot: string;
+  python: string | null;
+  templatesDir: string;
+  stateDir: string;
+  auth: HermesAuthConfig;
+  runtimeCredentialEnv: string;
+  model: string | null;
+  provider: string | null;
+  workerSessionLifecycle: HermesWorkerSessionLifecycle;
+  keepProfiles: HermesProfileRetention;
+  startupTimeoutMs: number;
+  requestTimeoutMs: number;
+  shutdownGraceMs: number;
+  roleTemplates: HermesRoleTemplatesConfig;
 }
 
 export interface ServerConfig {
@@ -429,6 +500,7 @@ export interface ServiceConfig {
   hooks: HookConfig;
   agent: AgentConfig;
   cursor: CursorConfig;
+  hermes: HermesConfig;
   server: ServerConfig;
   writeback: WritebackConfig;
   github: GitHubConfig;
@@ -451,7 +523,6 @@ const VALID_CURSOR_SETTING_SOURCES = new Set<CursorSettingSource>([
   "plugins",
   "all",
 ]);
-const VALID_AGENT_HARNESSES = new Set<AgentHarnessKind>(["cursor"]);
 const DEFAULT_CURSOR_MODEL = "gpt-5.5";
 const DEFAULT_CURSOR_MODEL_PARAMS: CursorModelParameter[] = [
   { id: "context", value: "272k" },
@@ -570,6 +641,33 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const cursorModelParams = normalizeCursorModelParams(raw.cursor?.model_params);
   const cursorAllowLargeContext = raw.cursor?.allow_large_context ?? false;
   validateCursorModelPolicy(cursorModel, cursorModelParams, cursorAllowLargeContext);
+  const hermesUpstreamRoot =
+    raw.hermes?.upstream_root === undefined
+      ? path.resolve(workflowDir, "hermes/upstream-src")
+      : resolvePathValue(raw.hermes.upstream_root, workflowDir, env);
+  const hermesTemplatesDir =
+    raw.hermes?.templates_dir === undefined
+      ? path.resolve(workflowDir, "hermes/templates")
+      : resolvePathValue(raw.hermes.templates_dir, workflowDir, env);
+  const hermesStateDir =
+    raw.hermes?.state_dir === undefined
+      ? path.join(workspaceStateDir, "hermes")
+      : resolvePathValue(raw.hermes.state_dir, workflowDir, env);
+  const hermesAuthManagedRoot =
+    raw.hermes?.auth?.managed_root === undefined
+      ? path.join(hermesStateDir, "auth")
+      : resolvePathValue(raw.hermes.auth.managed_root, workflowDir, env);
+  const hermesAuthBootstrapFrom =
+    raw.hermes?.auth?.bootstrap_from === undefined
+      ? defaultHermesAuthBootstrapSource(env)
+      : resolvePathValue(raw.hermes.auth.bootstrap_from, workflowDir, env);
+  const hermesRuntimeCredentialEnv = normalizeEnvironmentVariableName(
+    raw.hermes?.runtime_credential_env ?? "HERMES_API_KEY",
+    "hermes.runtime_credential_env",
+  );
+  const hermesPython = normalizeOptionalConfigString(resolveConfigString(raw.hermes?.python, env));
+  const hermesModel = normalizeOptionalConfigString(resolveConfigString(raw.hermes?.model, env));
+  const hermesProvider = normalizeOptionalConfigString(resolveConfigString(raw.hermes?.provider, env));
   const cursorRuntimeApiKey = normalizeOptionalConfigString(resolveConfigString("$CURSOR_API_KEY", env));
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const credentialProfiles = createCredentialProfileRegistry({
@@ -673,6 +771,32 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       openerCommand: raw.cursor?.opener_command ?? null,
       allowLargeContext: cursorAllowLargeContext,
       workerAgentLifecycle: raw.cursor?.worker_agent_lifecycle ?? "fresh_per_run",
+    },
+    hermes: {
+      upstreamRoot: hermesUpstreamRoot,
+      python: hermesPython,
+      templatesDir: hermesTemplatesDir,
+      stateDir: hermesStateDir,
+      auth: {
+        mode: raw.hermes?.auth?.mode ?? "managed_root",
+        managedRoot: hermesAuthManagedRoot,
+        bootstrapFrom: hermesAuthBootstrapFrom,
+        providers: normalizeHermesAuthProviders(raw.hermes?.auth?.providers),
+      },
+      runtimeCredentialEnv: hermesRuntimeCredentialEnv,
+      model: hermesModel,
+      provider: hermesProvider,
+      workerSessionLifecycle: raw.hermes?.worker_session_lifecycle ?? "reuse_by_issue",
+      keepProfiles: raw.hermes?.keep_profiles ?? "failed",
+      startupTimeoutMs: raw.hermes?.startup_timeout_ms ?? 15_000,
+      requestTimeoutMs: raw.hermes?.request_timeout_ms ?? 120_000,
+      shutdownGraceMs: raw.hermes?.shutdown_grace_ms ?? 2_000,
+      roleTemplates: {
+        worker: raw.hermes?.role_templates?.worker ?? "worker",
+        reviewer: raw.hermes?.role_templates?.reviewer ?? "reviewer",
+        planner: raw.hermes?.role_templates?.planner ?? "planner",
+        mergeConflictResolution: raw.hermes?.role_templates?.merge_conflict_resolution ?? "worker",
+      },
     },
     server: {
       port: raw.server?.port ?? null,
@@ -836,6 +960,19 @@ function normalizePromptExtensions(input: string[] | undefined): string[] {
 function normalizeOptionalConfigString(value: string | undefined): string | null {
   const trimmed = value?.trim() ?? "";
   return trimmed.length === 0 ? null : trimmed;
+}
+
+function normalizeHermesAuthProviders(providers: string[] | undefined): string[] {
+  const normalized = (providers ?? ["openai-codex"]).map((provider) => provider.trim()).filter((provider) => provider.length > 0);
+  const unique = [...new Set(normalized)];
+  if (unique.length > 0) return unique;
+  throw new SymphonyError("config_validation_error", "hermes.auth.providers must include at least one nonempty provider id");
+}
+
+function defaultHermesAuthBootstrapSource(env: NodeJS.ProcessEnv): string {
+  const configured = normalizeOptionalConfigString(resolveConfigString("$HERMES_HOME", env));
+  if (configured) return path.resolve(configured);
+  return path.join(os.homedir(), ".hermes");
 }
 
 function normalizeMergePolicy(raw: RawWorkflowConfig, reviewPassState: string | null): MergePolicyConfig {
@@ -1151,9 +1288,15 @@ function validateCursorModelPolicy(
 }
 
 function normalizeAgentHarness(value: string | undefined): AgentHarnessKind {
-  const harness = value ?? "cursor";
-  if (VALID_AGENT_HARNESSES.has(harness as AgentHarnessKind)) return harness as AgentHarnessKind;
-  throw new SymphonyError("config_validation_error", `Unsupported agent harness: ${harness}`);
+  const harness = (value ?? "cursor").trim();
+  if (harness.length > 0) return harness;
+  throw new SymphonyError("config_validation_error", "agent.harness must be a nonempty runtime harness id");
+}
+
+function normalizeEnvironmentVariableName(value: string, configPath: string): string {
+  const name = value.trim();
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return name;
+  throw new SymphonyError("config_validation_error", `${configPath} must be a valid environment variable name`);
 }
 
 function resolveRepositoryValue(value: string, baseDir: string, env: NodeJS.ProcessEnv): string {

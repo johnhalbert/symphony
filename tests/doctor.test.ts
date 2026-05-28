@@ -1,3 +1,7 @@
+import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import {
@@ -5,9 +9,15 @@ import {
   cursorPolicyDoctorChecks,
   githubPublicationDoctorCheck,
   githubReviewFeedbackDoctorCheck,
+  hermesAuthDoctorChecks,
+  hermesLiveRuntimeDoctorCheck,
+  hermesRuntimeDoctorChecks,
   reviewLoopDoctorChecks,
+  runtimeCredentialDoctorCheck,
+  runtimeHarnessDoctorChecks,
 } from "../src/doctor.js";
 import { testConfig } from "./helpers.js";
+import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 
 describe("doctor review-loop checks", () => {
   afterEach(() => {
@@ -65,6 +75,191 @@ describe("doctor review-loop checks", () => {
     });
   });
 
+  it("runs Hermes runtime checks without assuming Cursor policy", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { harness: "hermes" },
+        hermes: {
+          state_dir: "/tmp/hermes-state",
+          model: "hermes-test-model",
+          provider: "openai",
+          role_templates: { reviewer: "fresh-reviewer" },
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(runtimeHarnessDoctorChecks(config)).toEqual([
+      { id: "runtime.harness", status: "ok", message: "Runtime harness is hermes" },
+      {
+        id: "hermes.runtime",
+        status: "ok",
+        message: "Hermes provider is openai; model is hermes-test-model",
+      },
+      {
+        id: "hermes.profiles",
+        status: "ok",
+        message:
+          `state_dir: ${config.hermes.stateDir}; templates: worker=worker, reviewer=fresh-reviewer, planner=planner; worker lifecycle is reuse_by_issue; profile retention is failed`,
+      },
+    ]);
+    expect(hermesRuntimeDoctorChecks(config)[0]).toMatchObject({ id: "hermes.runtime", status: "ok" });
+  });
+
+  it("errors when Hermes dogfood would run without an explicit model", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { harness: "hermes" },
+        hermes: {
+          provider: "openai-codex",
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(hermesRuntimeDoctorChecks(config)).toContainEqual({
+      id: "hermes.runtime",
+      status: "error",
+      message:
+        "hermes.model is required when agent.harness is hermes so the upstream gateway cannot fall back to an unrelated default model",
+    });
+    await expect(hermesLiveRuntimeDoctorCheck(config, { cliPath: "/tmp/symphony-doctor/src/cli.ts" })).resolves.toEqual({
+      id: "hermes.live_runtime",
+      status: "error",
+      message: "Hermes live runtime check requires hermes.model before starting the gateway",
+    });
+  });
+
+  it("runs the opt-in Hermes live runtime doctor check with a gateway session and tools.list", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-live-"));
+    try {
+      await writeHermesTemplates(root);
+      const clients: DoctorFakeHermesGatewayClient[] = [];
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
+          agent: { harness: "hermes" },
+          hermes: {
+            upstream_root: path.join(root, "upstream"),
+            templates_dir: path.join(root, "templates"),
+            state_dir: path.join(root, "state", "hermes"),
+            provider: "openai-codex",
+            model: "gpt-5-test",
+            auth: { managed_root: path.join(root, "auth") },
+          },
+        },
+        path.join(root, "WORKFLOW.md"),
+        { LINEAR_API_KEY: "secret" },
+      );
+
+      await expect(
+        hermesLiveRuntimeDoctorCheck(config, {
+          cliPath: path.join(root, "cli.ts"),
+          hermesGatewayFactory: (env) => {
+            const client = new DoctorFakeHermesGatewayClient(env);
+            clients.push(client);
+            return client;
+          },
+        }),
+      ).resolves.toEqual({
+        id: "hermes.live_runtime",
+        status: "ok",
+        message: "Hermes gateway session exposes required Symphony MCP tools for worker and reviewer profiles",
+      });
+      expect(clients).toHaveLength(3);
+      expect(clients.flatMap((client) => client.requests.map((request) => request.method))).toContain("tools.list");
+      expect(clients.every((client) => client.env.authHome === config.hermes.auth.managedRoot)).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("checks Hermes-owned auth for openai-codex without requiring runtime.hermes credentials", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-auth-"));
+    try {
+      const bootstrapFrom = path.join(root, "local-hermes");
+      await mkdir(bootstrapFrom, { recursive: true });
+      await writeFile(
+        path.join(bootstrapFrom, "auth.json"),
+        JSON.stringify({
+          version: 1,
+          active_provider: "openai-codex",
+          providers: {
+            "openai-codex": {
+              tokens: { access_token: "access-token", refresh_token: "refresh-token" },
+              last_refresh: "2026-05-27T00:00:00Z",
+              auth_mode: "chatgpt",
+            },
+          },
+        }),
+        "utf8",
+      );
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          agent: { harness: "hermes" },
+          hermes: {
+            upstream_root: path.resolve("hermes/upstream-src"),
+            state_dir: path.join(root, "state", "hermes"),
+            provider: "openai-codex",
+            auth: { bootstrap_from: bootstrapFrom },
+          },
+        },
+        path.join(root, "WORKFLOW.md"),
+        { LINEAR_API_KEY: "secret" },
+      );
+
+      await expect(hermesAuthDoctorChecks(config)).resolves.toEqual([
+        {
+          id: "hermes.auth_root",
+          status: "ok",
+          message: `Hermes managed auth root is ready at ${config.hermes.auth.managedRoot}; bootstrap source is ${bootstrapFrom}`,
+        },
+        {
+          id: "hermes.auth.openai-codex",
+          status: "ok",
+          message: "Hermes managed auth for openai-codex is available from bootstrapped",
+        },
+        {
+          id: "hermes.auth.openai-codex.resolve",
+          status: "ok",
+          message: "Hermes Python resolved openai-codex auth via hermes-auth-store",
+        },
+      ]);
+      expect(runtimeCredentialDoctorCheck(config)).toEqual({
+        id: "env.hermes",
+        status: "ok",
+        message: `Hermes provider openai-codex uses managed Hermes auth at ${config.hermes.auth.managedRoot}`,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps API-key Hermes providers on the legacy runtime.hermes credential check", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { harness: "hermes" },
+        hermes: {
+          provider: "openai-api",
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(runtimeCredentialDoctorCheck(config)).toMatchObject({
+      id: "env.hermes",
+      status: "warn",
+    });
+  });
+
   it("validates review state, blocked state, MCP tools, and candidate isolation", async () => {
     const config = testConfig("/tmp/symphony-doctor");
     config.tracker.activeStates = ["Todo", "In Progress"];
@@ -100,7 +295,7 @@ describe("doctor review-loop checks", () => {
         id: "review_loop.mcp_tools",
         status: "ok",
         message:
-          "Configured Cursor CLI lists MCP tools: submit_completion_report, submit_review_verdict, submit_pull_request_review_feedback",
+          "Configured MCP subprocess runner lists tools: submit_completion_report, submit_review_verdict, submit_pull_request_review_feedback",
       },
       {
         id: "review_loop.candidate_isolation",
@@ -203,7 +398,7 @@ describe("doctor review-loop checks", () => {
     expect(checks).toContainEqual({
       id: "review_loop.mcp_tools",
       status: "error",
-      message: "Configured Cursor CLI did not list required MCP tools: review-verdict-mcp:submit_review_verdict",
+      message: "Configured MCP subprocess runner did not list required tools: review-verdict-mcp:submit_review_verdict",
     });
   });
 
@@ -221,7 +416,7 @@ describe("doctor review-loop checks", () => {
     expect(checks).toContainEqual({
       id: "review_loop.mcp_tools",
       status: "error",
-      message: "Configured Cursor CLI could not list review-loop MCP tools: missing explicit cliPath",
+      message: "Configured MCP subprocess runner could not list review-loop MCP tools: missing explicit cliPath",
     });
   });
 
@@ -514,4 +709,66 @@ function linearTeam(
     teamName: overrides.teamName ?? "Engineering",
     states,
   };
+}
+
+class DoctorFakeHermesGatewayClient extends EventEmitter implements HermesGatewayClient {
+  readonly requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+
+  constructor(readonly env: HermesGatewayEnvironment) {
+    super();
+  }
+
+  on(event: "event", listener: (event: GatewayEvent) => void): this;
+  on(event: "exit", listener: (code: number | null) => void): this;
+  on(event: "event" | "exit", listener: ((event: GatewayEvent) => void) | ((code: number | null) => void)): this {
+    return super.on(event, listener);
+  }
+
+  off(event: "event", listener: (event: GatewayEvent) => void): this;
+  off(event: "exit", listener: (code: number | null) => void): this;
+  off(event: "event" | "exit", listener: ((event: GatewayEvent) => void) | ((code: number | null) => void)): this {
+    return super.off(event, listener);
+  }
+
+  drain(): void {
+    return;
+  }
+
+  async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+    this.requests.push({ method, params });
+    if (method === "session.create") return { session_id: "doctor-session" } as T;
+    if (method === "tools.list") {
+      return {
+        toolsets: [
+          {
+            name: "mcp-symphony",
+            tools: [
+              "mcp_symphony_submit_completion_report",
+              "mcp_symphony_conflicts_submit_merge_conflict_resolution",
+              "mcp_symphony_review_verdict_submit_review_verdict",
+              "mcp_symphony_review_feedback_submit_pull_request_review_feedback",
+            ],
+          },
+        ],
+      } as T;
+    }
+    return { ok: true } as T;
+  }
+
+  kill(): void {
+    return;
+  }
+
+  getLogTail(): string {
+    return "";
+  }
+}
+
+async function writeHermesTemplates(root: string): Promise<void> {
+  for (const template of ["worker", "reviewer", "planner"]) {
+    const templateDir = path.join(root, "templates", template);
+    await mkdir(templateDir, { recursive: true });
+    await writeFile(path.join(templateDir, "SOUL.md"), `${template} soul\n`, "utf8");
+    await writeFile(path.join(templateDir, "config.yaml"), "memory_enabled: false\n", "utf8");
+  }
 }

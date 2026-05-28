@@ -1,3 +1,7 @@
+import path from "node:path";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+
 import type { ServiceConfig } from "../config/Config.js";
 import type { CredentialRole } from "../config/CredentialProfiles.js";
 
@@ -69,7 +73,7 @@ export function buildMcpSubprocessEnvironment(input: McpSubprocessEnvironmentInp
 }
 
 export function buildMcpCliSpawnArgs(input: McpCliSpawnArgsInput): string[] {
-  const execArgv = shouldIncludeNodeExecArgv(input.cliPath) ? (input.execArgv ?? process.execArgv) : [];
+  const execArgv = shouldIncludeNodeExecArgv(input.cliPath) ? (input.execArgv ?? defaultNodeExecArgv(input.cliPath)) : [];
   return [
     ...execArgv,
     input.cliPath,
@@ -93,6 +97,20 @@ export function buildMcpSubprocessServerConfig(input: McpSubprocessServerConfigI
 
 export function shouldIncludeNodeExecArgv(cliPath: string): boolean {
   return /\.(?:c|m)?tsx?$/i.test(cliPath);
+}
+
+function defaultNodeExecArgv(cliPath: string): string[] {
+  return ["--import", resolveTsxImportSpecifier(cliPath)];
+}
+
+function resolveTsxImportSpecifier(cliPath: string): string {
+  try {
+    const requireFromCli = createRequire(pathToFileURL(path.resolve(cliPath)));
+    const resolved = requireFromCli.resolve("tsx");
+    return pathToFileURL(resolved).href;
+  } catch {
+    return "tsx";
+  }
 }
 
 function addRuntimeBaseline(env: Record<string, string>, parentEnv: NodeJS.ProcessEnv): void {

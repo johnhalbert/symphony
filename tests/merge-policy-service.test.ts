@@ -2694,6 +2694,40 @@ describe("MergePolicyService", () => {
       profile: "merge",
     });
   });
+
+  it("allows GitHub App installation auth for service-owned merge", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        app: { app_id: "12345", installation_id: "67890", private_key: "fake-private-key" },
+      },
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient(),
+    });
+
+    await service.reconcileIssue(currentIssue);
+    expect((await lifecycleStore.get(currentIssue.id))?.merge?.mergedBy).toMatchObject({
+      capability: "github.merge",
+      profile: null,
+    });
+  });
 });
 
 function mergeConfig(input: {
@@ -2702,6 +2736,7 @@ function mergeConfig(input: {
   writebackMode?: "live" | "dry_run";
   conflictsState?: string;
   credentialProfiles?: Record<string, unknown>;
+  github?: Record<string, unknown>;
   env?: NodeJS.ProcessEnv;
 }) {
   return parseServiceConfig(
@@ -2727,7 +2762,7 @@ function mergeConfig(input: {
             ? { allowed: false }
             : { allowed: true, evidence: input.noCiEvidence },
       },
-      github: { owner: "acme", repo: "symphony" },
+      github: input.github ?? { owner: "acme", repo: "symphony" },
       ...(input.credentialProfiles === undefined ? {} : { credential_profiles: input.credentialProfiles }),
     },
     path.join(root, "WORKFLOW.md"),

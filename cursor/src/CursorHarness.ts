@@ -3,16 +3,12 @@ import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
 import type { AgentEvent, AgentHarness, AgentRunContext, AgentRunSdkStatus } from "../../src/core/harness/AgentHarness.js";
 import type { AgentRunPhase } from "../../src/core/types.js";
-import { writeCompletionReportMcpContext } from "../../src/core/harness/CompletionReportMcpServer.js";
-import { writeIssueBreakdownPlanMcpContext } from "../../src/core/harness/IssueBreakdownPlanMcpServer.js";
-import { writeMergeConflictResolutionMcpContext } from "../../src/core/harness/MergeConflictResolutionMcpServer.js";
-import { writeReviewFeedbackMcpContext } from "../../src/core/harness/ReviewFeedbackMcpServer.js";
-import { writeReviewVerdictMcpContext } from "../../src/core/harness/ReviewVerdictMcpServer.js";
-import { writeTranscriptRecallMcpContext } from "../../src/core/harness/TranscriptRecallMcpServer.js";
 import {
-  buildMcpSubprocessServerConfig,
-  type McpSubprocessServerConfig,
-} from "../../src/core/harness/McpSubprocessEnvironment.js";
+  symphonyRoleMcpServers,
+  writeActiveHandoffMcpContexts,
+  writeInitialHandoffMcpContexts,
+} from "../../src/core/harness/HandoffMcp.js";
+import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { resolveCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
@@ -21,6 +17,23 @@ import {
   sanitizedPreviewValue,
 } from "../../src/core/transcript/TranscriptProjection.js";
 import { mapCursorDelta, mapCursorMessage } from "./CursorEventMapper.js";
+
+export {
+  completionReportContextFilePath,
+  completionReportMcpServerConfig,
+  issueBreakdownPlanContextFilePath,
+  issueBreakdownPlanMcpServerConfig,
+  mergeConflictResolutionContextFilePath,
+  mergeConflictResolutionMcpServerConfig,
+  reviewFeedbackContextFilePath,
+  reviewFeedbackMcpServerConfig,
+  reviewVerdictContextFilePath,
+  reviewVerdictMcpServerConfig,
+  symphonyRoleMcpServers as cursorRoleMcpServers,
+  transcriptRecallContextFilePath,
+  transcriptRecallMcpServerConfig,
+  writeInitialHandoffMcpContexts as writeInitialRoleMcpContexts,
+} from "../../src/core/harness/HandoffMcp.js";
 
 export interface CursorHarnessOptions {
   runStore?: RunTranscriptStore;
@@ -36,13 +49,20 @@ interface CursorAgentLease {
 
 export class CursorHarness implements AgentHarness {
   readonly id = "cursor";
+  readonly capabilities = {
+    continuation: true,
+    mcpHandoff: true,
+    runStatus: true,
+    liveDiagnostics: true,
+  };
+  readonly supportsContinuation = true;
   private readonly agents = new Map<string, SDKAgent>();
   private readonly activeRuns = new Map<string, Run>();
 
   constructor(private readonly options: CursorHarnessOptions = {}) {}
 
   async prepare(ctx: AgentRunContext): Promise<void> {
-    await writeInitialRoleMcpContexts(ctx);
+    await writeInitialHandoffMcpContexts(ctx);
     if (shouldReuseAgent(ctx)) await this.getOrCreateAgent(ctx);
   }
 
@@ -59,7 +79,7 @@ export class CursorHarness implements AgentHarness {
     const deltaEvents: AgentEvent[] = [];
     const cliPath = currentSymphonyCliPath();
     const runOptions = cursorAgentSendOptions(ctx, {
-      mcpServers: cursorRoleMcpServers(ctx, { cliPath }),
+      mcpServers: symphonyRoleMcpServers(ctx, { cliPath }),
       onDelta: ({ update }) => {
         deltaEvents.push(...mapCursorDelta(update));
       },
@@ -234,70 +254,7 @@ export class CursorHarness implements AgentHarness {
     if (initialStatus) enqueueStatus(initialStatus, "initial");
 
     try {
-      if (ctx.role === "worker" && cursorRunPhase(ctx) === "implementation") {
-        await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
-          issue: ctx.issue,
-          activeRunId: run.id,
-          role: "worker",
-          token: null,
-          expectedToken: null,
-          sessionId: `${agent.agentId}:${run.id}`,
-          workspacePath: ctx.workspace.path,
-          workspace: ctx.workspace,
-          phase: "implementation",
-        });
-      }
-      if (ctx.role === "worker" && cursorRunPhase(ctx) === "merge_conflict_resolution") {
-        await writeMergeConflictResolutionMcpContext(mergeConflictResolutionContextFilePath(ctx), {
-          issue: ctx.issue,
-          activeRunId: run.id,
-          role: "worker",
-          token: null,
-          expectedToken: null,
-          sessionId: `${agent.agentId}:${run.id}`,
-          workspacePath: ctx.workspace.path,
-          workspace: ctx.workspace,
-          phase: "merge_conflict_resolution",
-        });
-      }
-      if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
-        await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
-          issue: ctx.issue,
-          activeRunId: run.id,
-          role: "worker",
-          workspacePath: ctx.workspace.path,
-          workspace: ctx.workspace,
-          phase: "issue_breakdown",
-        });
-      }
-      if (ctx.config.continuationContext.searchEnabled) {
-        await writeTranscriptRecallMcpContext(transcriptRecallContextFilePath(ctx), {
-          issue: ctx.issue,
-          activeRunId: run.id,
-          role: ctx.role,
-          phase: cursorRunPhase(ctx),
-        });
-      }
-      if (ctx.role === "reviewer") {
-        await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
-          issue: ctx.issue,
-          activeRunId: run.id,
-          role: "reviewer",
-          token: null,
-          expectedToken: null,
-          reviewer: `${agent.agentId}:${run.id}`,
-          phase: "review",
-        });
-        await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
-          issue: ctx.issue,
-          activeRunId: run.id,
-          role: "reviewer",
-          token: null,
-          expectedToken: null,
-          reviewer: `${agent.agentId}:${run.id}`,
-          phase: "review",
-        });
-      }
+      await writeActiveHandoffMcpContexts(ctx, { activeRunId: run.id, sessionId: `${agent.agentId}:${run.id}` });
       yield {
         type: "session_started",
         sessionId: `${agent.agentId}:${run.id}`,
@@ -315,6 +272,7 @@ export class CursorHarness implements AgentHarness {
         eventType: "cursor_agent_lifecycle",
         message: `Cursor agent ${lease.outcome}; resumeUsed=${lease.resumeUsed}`,
         payload: {
+          harnessId: this.id,
           agentId: agent.agentId,
           lifecycleMode: ctx.config.cursor.workerAgentLifecycle,
           reusable,
@@ -344,6 +302,7 @@ export class CursorHarness implements AgentHarness {
                 at: new Date().toISOString(),
                 source: "cursor",
                 ...transcriptEvent,
+                payload: runtimeTranscriptPayload(transcriptEvent.payload, this.id),
               });
             }
             for (const event of flush(deltaEvents)) enqueueEvent(event);
@@ -396,6 +355,7 @@ export class CursorHarness implements AgentHarness {
           eventType: "cursor_agent_disposed",
           message: dispose.ok ? "Cursor agent disposed" : `Cursor agent dispose failed: ${dispose.error}`,
           payload: {
+            harnessId: this.id,
             agentId: agent.agentId,
             ok: dispose.ok,
             reason: "run_finished",
@@ -432,8 +392,8 @@ export class CursorHarness implements AgentHarness {
 
   private async createAgent(ctx: AgentRunContext, options: { allowResume: boolean }): Promise<CursorAgentLease> {
     const cliPath = currentSymphonyCliPath();
-    await writeInitialRoleMcpContexts(ctx);
-    const mcpServers = cursorRoleMcpServers(ctx, { cliPath });
+    await writeInitialHandoffMcpContexts(ctx);
+    const mcpServers = symphonyRoleMcpServers(ctx, { cliPath });
     const createOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
       mcpServers,
     });
@@ -638,6 +598,13 @@ function toolCallPayload(message: { [key: string]: unknown }): unknown {
   return payload;
 }
 
+function runtimeTranscriptPayload(payload: unknown, harnessId: string): unknown {
+  if (typeof payload === "object" && payload !== null && !Array.isArray(payload)) {
+    return { harnessId, ...payload };
+  }
+  return payload === undefined ? { harnessId } : { harnessId, payload };
+}
+
 function cursorLastToolContext(message: unknown): CursorLastToolContext | null {
   if (!isCursorMessageRecord(message) || message.type !== "tool_call") return null;
   return {
@@ -711,122 +678,8 @@ export function cursorAgentSendOptions(
 }
 
 function cursorConversationModeOption(ctx: AgentRunContext): { mode?: "agent" | "plan" } {
-  const mode = ctx.cursorModeOverride ?? ctx.config.cursor.mode;
+  const mode = ctx.runModeOverride ?? ctx.config.cursor.mode;
   return mode === null ? {} : { mode };
-}
-
-export function cursorRoleMcpServers(
-  ctx: AgentRunContext,
-  options: { cliPath: string; mcpCwd?: string },
-): Record<string, McpSubprocessServerConfig> {
-  const applyCwd = (server: McpSubprocessServerConfig): McpSubprocessServerConfig =>
-    options.mcpCwd === undefined ? server : { ...server, cwd: options.mcpCwd };
-  if (ctx.role === "worker" && cursorRunPhase(ctx) === "implementation") {
-    return {
-      symphony: applyCwd(completionReportMcpServerConfig(ctx, completionReportContextFilePath(ctx), options)),
-      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
-    };
-  }
-  if (ctx.role === "worker" && cursorRunPhase(ctx) === "merge_conflict_resolution") {
-    return {
-      symphony_conflicts: applyCwd(
-        mergeConflictResolutionMcpServerConfig(ctx, mergeConflictResolutionContextFilePath(ctx), options),
-      ),
-      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
-    };
-  }
-  if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
-    return {
-      symphony_planning: applyCwd(issueBreakdownPlanMcpServerConfig(ctx, issueBreakdownPlanContextFilePath(ctx), options)),
-      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
-    };
-  }
-  return {
-    symphony_review_verdict: applyCwd(reviewVerdictMcpServerConfig(ctx, reviewVerdictContextFilePath(ctx), options)),
-    symphony_review_feedback: applyCwd(reviewFeedbackMcpServerConfig(ctx, reviewFeedbackContextFilePath(ctx), options)),
-    ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
-  };
-}
-
-export async function writeInitialRoleMcpContexts(ctx: AgentRunContext): Promise<void> {
-  if (ctx.config.continuationContext.searchEnabled) {
-    await writeTranscriptRecallMcpContext(transcriptRecallContextFilePath(ctx), {
-      issue: ctx.issue,
-      activeRunId: null,
-      role: ctx.role,
-      phase: cursorRunPhase(ctx),
-    });
-  }
-  if (ctx.role === "worker" && cursorRunPhase(ctx) === "implementation") {
-    await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
-      issue: ctx.issue,
-      activeRunId: null,
-      role: "worker",
-      token: null,
-      expectedToken: null,
-      sessionId: null,
-      workspacePath: ctx.workspace.path,
-      workspace: ctx.workspace,
-      phase: "implementation",
-    });
-    return;
-  }
-  if (ctx.role === "worker" && cursorRunPhase(ctx) === "merge_conflict_resolution") {
-    await writeMergeConflictResolutionMcpContext(mergeConflictResolutionContextFilePath(ctx), {
-      issue: ctx.issue,
-      activeRunId: null,
-      role: "worker",
-      token: null,
-      expectedToken: null,
-      sessionId: null,
-      workspacePath: ctx.workspace.path,
-      workspace: ctx.workspace,
-      phase: "merge_conflict_resolution",
-    });
-    return;
-  }
-  if (ctx.role === "worker" && cursorRunPhase(ctx) === "issue_breakdown") {
-    await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
-      issue: ctx.issue,
-      activeRunId: null,
-      role: "worker",
-      workspacePath: ctx.workspace.path,
-      workspace: ctx.workspace,
-      phase: "issue_breakdown",
-    });
-    return;
-  }
-  if (ctx.role !== "reviewer") return;
-  await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
-    issue: ctx.issue,
-    activeRunId: null,
-    role: "reviewer",
-    token: null,
-    expectedToken: null,
-    reviewer: null,
-    phase: "review",
-  });
-  await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
-    issue: ctx.issue,
-    activeRunId: null,
-    role: "reviewer",
-    token: null,
-    expectedToken: null,
-    reviewer: null,
-    phase: "review",
-  });
-}
-
-function transcriptRecallMcpServerEntry(
-  ctx: AgentRunContext,
-  options: { cliPath: string },
-  applyCwd: (server: McpSubprocessServerConfig) => McpSubprocessServerConfig,
-): Record<string, McpSubprocessServerConfig> {
-  return ctx.config.continuationContext.searchEnabled
-    ? {
-        symphony_recall: applyCwd(transcriptRecallMcpServerConfig(ctx, transcriptRecallContextFilePath(ctx), options)),
-      }
-    : {};
 }
 
 export function cursorAgentName(ctx: AgentRunContext): string {
@@ -839,148 +692,12 @@ export function cursorModelSelection(ctx: AgentRunContext): ModelSelection {
     : { id: ctx.config.cursor.model, params: ctx.config.cursor.modelParams };
 }
 
-export function completionReportMcpServerConfig(
-  ctx: AgentRunContext,
-  contextFile: string,
-  options: { cliPath: string },
-): McpSubprocessServerConfig {
-  return buildMcpSubprocessServerConfig({
-    config: ctx.config,
-    command: "completion-report-mcp",
-    cliPath: options.cliPath,
-    workflowPath: ctx.config.workflowPath,
-    contextFile,
-  });
-}
-
-export function mergeConflictResolutionMcpServerConfig(
-  ctx: AgentRunContext,
-  contextFile: string,
-  options: { cliPath: string },
-): McpSubprocessServerConfig {
-  return buildMcpSubprocessServerConfig({
-    config: ctx.config,
-    command: "merge-conflict-resolution-mcp",
-    cliPath: options.cliPath,
-    workflowPath: ctx.config.workflowPath,
-    contextFile,
-  });
-}
-
-export function issueBreakdownPlanMcpServerConfig(
-  ctx: AgentRunContext,
-  contextFile: string,
-  options: { cliPath: string },
-): McpSubprocessServerConfig {
-  return buildMcpSubprocessServerConfig({
-    config: ctx.config,
-    command: "issue-breakdown-plan-mcp",
-    cliPath: options.cliPath,
-    workflowPath: ctx.config.workflowPath,
-    contextFile,
-  });
-}
-
-export function reviewVerdictMcpServerConfig(
-  ctx: AgentRunContext,
-  contextFile: string,
-  options: { cliPath: string },
-): McpSubprocessServerConfig {
-  return buildMcpSubprocessServerConfig({
-    config: ctx.config,
-    command: "review-verdict-mcp",
-    cliPath: options.cliPath,
-    workflowPath: ctx.config.workflowPath,
-    contextFile,
-  });
-}
-
-export function reviewFeedbackMcpServerConfig(
-  ctx: AgentRunContext,
-  contextFile: string,
-  options: { cliPath: string },
-): McpSubprocessServerConfig {
-  return buildMcpSubprocessServerConfig({
-    config: ctx.config,
-    command: "review-feedback-mcp",
-    cliPath: options.cliPath,
-    workflowPath: ctx.config.workflowPath,
-    contextFile,
-  });
-}
-
-export function transcriptRecallMcpServerConfig(
-  ctx: AgentRunContext,
-  contextFile: string,
-  options: { cliPath: string },
-): McpSubprocessServerConfig {
-  return buildMcpSubprocessServerConfig({
-    config: ctx.config,
-    command: "transcript-recall-mcp",
-    cliPath: options.cliPath,
-    workflowPath: ctx.config.workflowPath,
-    contextFile,
-  });
-}
-
-export function completionReportContextFilePath(ctx: AgentRunContext): string {
-  return path.join(
-    ctx.config.workspace.stateDir,
-    "completion-report-mcp",
-    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
-  );
-}
-
-export function mergeConflictResolutionContextFilePath(ctx: AgentRunContext): string {
-  return path.join(
-    ctx.config.workspace.stateDir,
-    "merge-conflict-resolution-mcp",
-    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
-  );
-}
-
-export function issueBreakdownPlanContextFilePath(ctx: AgentRunContext): string {
-  return path.join(
-    ctx.config.workspace.stateDir,
-    "issue-breakdown-plan-mcp",
-    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
-  );
-}
-
-export function reviewVerdictContextFilePath(ctx: AgentRunContext): string {
-  return path.join(
-    ctx.config.workspace.stateDir,
-    "review-verdict-mcp",
-    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
-  );
-}
-
-export function reviewFeedbackContextFilePath(ctx: AgentRunContext): string {
-  return path.join(
-    ctx.config.workspace.stateDir,
-    "review-feedback-mcp",
-    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
-  );
-}
-
-export function transcriptRecallContextFilePath(ctx: AgentRunContext): string {
-  return path.join(
-    ctx.config.workspace.stateDir,
-    "transcript-recall-mcp",
-    `${safeFileName(ctx.issue.id)}-${ctx.role}-${ctx.turnNumber}.json`,
-  );
-}
-
 function agentKey(ctx: AgentRunContext): string {
   return ctx.role === "reviewer" ? `${ctx.workspace.path}:reviewer` : `${ctx.workspace.path}:worker:${cursorRunPhase(ctx)}`;
 }
 
 function cursorRunPhase(ctx: AgentRunContext): AgentRunPhase {
   return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
-}
-
-function safeFileName(value: string): string {
-  return value.replace(/[^A-Za-z0-9._-]/g, "_") || "context";
 }
 
 function currentSymphonyCliPath(): string {

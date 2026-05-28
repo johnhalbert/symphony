@@ -24,10 +24,11 @@ describe("LinearTrackerClient", () => {
     expect(normalized?.labels).toEqual(["bug"]);
     expect(normalized?.blockedBy[0]?.identifier).toBe("T-0");
     expect(normalized?.assigneeId).toBe("user-1");
+    expect(normalized?.delegateId).toBeNull();
     expect(normalized?.assignedToWorker).toBe(true);
   });
 
-  it("filters assignment when an assignee route is configured", () => {
+  it("routes to worker when an assignee route matches the assignee", () => {
     const assigned = normalizeIssue(
       {
         id: "id",
@@ -38,18 +39,44 @@ describe("LinearTrackerClient", () => {
       },
       { matchValues: new Set(["user-1"]) },
     );
-    const unassigned = normalizeIssue(
+
+    expect(assigned?.assigneeId).toBe("user-1");
+    expect(assigned?.delegateId).toBeNull();
+    expect(assigned?.assignedToWorker).toBe(true);
+  });
+
+  it("routes to worker when an assignee route matches the delegate", () => {
+    const delegated = normalizeIssue(
       {
         id: "id-2",
         identifier: "T-2",
         title: "Title",
         state: { name: "Todo" },
-        assignee: { id: "user-2" },
+        delegate: { id: "user-1" },
       },
       { matchValues: new Set(["user-1"]) },
     );
 
-    expect(assigned?.assignedToWorker).toBe(true);
+    expect(delegated?.assigneeId).toBeNull();
+    expect(delegated?.delegateId).toBe("user-1");
+    expect(delegated?.assignedToWorker).toBe(true);
+  });
+
+  it("does not route to worker when neither assignee nor delegate match the route", () => {
+    const unassigned = normalizeIssue(
+      {
+        id: "id-3",
+        identifier: "T-3",
+        title: "Title",
+        state: { name: "Todo" },
+        assignee: { id: "user-2" },
+        delegate: { id: "user-3" },
+      },
+      { matchValues: new Set(["user-1"]) },
+    );
+
+    expect(unassigned?.assigneeId).toBe("user-2");
+    expect(unassigned?.delegateId).toBe("user-3");
     expect(unassigned?.assignedToWorker).toBe(false);
   });
 

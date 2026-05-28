@@ -20,12 +20,13 @@ The Cursor extension under `extension/` has its own lockfile and install step. `
 
 ## Optional Real Smoke
 
-The real Cursor and Linear smoke tests are opt-in. Run the workflow manually with the `real_smoke` input enabled after configuring these repository secrets:
+The hosted Linear smoke test is opt-in. Run the workflow manually with the `real_smoke` input enabled after configuring these repository secrets:
 
-- `CURSOR_API_KEY`
 - `LINEAR_API_KEY`
 - `LINEAR_PROJECT_SLUG`
 
 The manual job sets `SYMPHONY_REAL_SMOKE=1` and runs only `tests/real-smoke.test.ts`. Normal pull request and push CI set `SYMPHONY_REAL_SMOKE=0`, so live smoke tests remain skipped.
 
-`npm run smoke:sdk-local` remains a local operator check because it requires Cursor local runtime setup. It is not run by the hosted CI workflow.
+`npm run smoke:hermes-local` remains a local operator check because it requires local Hermes installation, Hermes-owned OpenAI Codex auth, Python dependencies, and the reference Hermes `gpt-5.5` model to be available to the authenticated provider. It is not run by the hosted CI workflow.
+
+`npm run smoke:sdk-local` remains available for Cursor-provider checks, but Cursor is no longer the default dogfood runtime.

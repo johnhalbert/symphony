@@ -20,7 +20,7 @@ import type {
 import { phaseForIssueState } from "../persistence/IssueLifecycleStore.js";
 import type { Issue } from "../types.js";
 
-const reviewEventSchema = z.enum(["APPROVE", "REQUEST_CHANGES", "COMMENT"]);
+const reviewEventSchema = z.enum(["APPROVE", "REQUEST_CHANGES"]);
 const reviewSideSchema = z.enum(["LEFT", "RIGHT"]);
 const inlineReviewCommentSchema = z
   .object({
@@ -251,7 +251,7 @@ export function reviewFeedbackInputSchema(): Record<string, unknown> {
         required: ["kind", "event", "body", "idempotencyKey"],
         properties: {
           kind: { const: "review" },
-          event: { enum: ["APPROVE", "REQUEST_CHANGES", "COMMENT"] },
+          event: { enum: ["APPROVE", "REQUEST_CHANGES"] },
           body: { type: "string", minLength: 1 },
           comments: {
             type: "array",

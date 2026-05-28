@@ -1,6 +1,15 @@
-import type { CursorConversationMode, ServiceConfig } from "../config/Config.js";
+import type { ServiceConfig } from "../config/Config.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { AgentRunPhase, AgentRunRole, Issue, TokenCounts, Workspace } from "../types.js";
+
+export type AgentRunMode = "agent" | "plan";
+
+export interface AgentHarnessCapabilities {
+  readonly mcpHandoff?: boolean;
+  readonly continuation?: boolean;
+  readonly runStatus?: boolean;
+  readonly liveDiagnostics?: boolean;
+}
 
 export interface AgentRunContext {
   issue: Issue;
@@ -10,7 +19,7 @@ export interface AgentRunContext {
   workspace: Workspace;
   config: ServiceConfig;
   turnNumber: number;
-  cursorModeOverride?: CursorConversationMode | null;
+  runModeOverride?: AgentRunMode | null;
   abortSignal: AbortSignal;
   logger: Logger;
 }
@@ -73,6 +82,11 @@ export type AgentEvent =
 
 export interface AgentHarness {
   readonly id: string;
+  readonly capabilities?: AgentHarnessCapabilities;
+  /**
+   * @deprecated Use capabilities.continuation. Kept as a compatibility alias
+   * while existing tests and harnesses migrate to neutral capabilities.
+   */
   readonly supportsContinuation?: boolean;
   prepare?(ctx: AgentRunContext): Promise<void>;
   run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent>;

@@ -98,6 +98,21 @@ describe("PullRequestReviewFeedbackService", () => {
     expect(client.calls[2]).toMatchObject({ input: { pullRequestNumber: 42, body: "High-level note." } });
   });
 
+  it("rejects COMMENT whole-PR review events for new feedback submissions", async () => {
+    const { service, lifecycleStore, client } = fixture();
+    await seedLifecycle(lifecycleStore);
+
+    await expect(
+      service.submitPullRequestReviewFeedback(
+        { kind: "review", event: "COMMENT", body: "Neutral whole-PR note.", idempotencyKey: "comment-1" },
+        context(),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    expect(client.calls).toHaveLength(0);
+  });
+
   it("replays matching idempotency keys without duplicate GitHub writes and rejects conflicting payloads", async () => {
     const { service, lifecycleStore, client } = fixture();
     await seedLifecycle(lifecycleStore);

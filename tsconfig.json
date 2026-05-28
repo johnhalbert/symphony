@@ -16,6 +16,6 @@
     "declaration": true,
     "sourceMap": true
   },
-  "include": ["src/**/*.ts", "cursor/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"],
+  "include": ["src/**/*.ts", "cursor/**/*.ts", "hermes/src/**/*.ts", "hermes/src/**/*.d.ts", "tests/**/*.ts", "scripts/**/*.ts"],
   "exclude": ["dist", "node_modules"]
 }

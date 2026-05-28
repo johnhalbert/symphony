@@ -6,9 +6,9 @@ This note captures the intended shape for a later non-lifecycle consensus runner
 
 Consensus lanes are proposal/review lanes, not Linear lifecycle workers or reviewers. They must not receive the completion-report, review-verdict, review-feedback, merge, or Linear lifecycle writeback tools.
 
-The orchestrator should create fresh dedicated Cursor runs for each lane and critic. Lane prompts should include the shared brief, the role persona, bounded durable context, and explicit response contracts. Critic prompts should receive only the paired lane output and minimum evidence needed to review that lane.
+The orchestrator should create fresh dedicated runtime-harness runs for each lane and critic. Lane prompts should include the shared brief, the role persona, bounded durable context, and explicit response contracts. Critic prompts should receive only the paired lane output and minimum evidence needed to review that lane.
 
-Consensus orchestration must be invoked explicitly, for example by a future planning command or dashboard action. It must not run from worker dispatch, review dispatch, issue state polling, or the always-applied Cursor rule path.
+Consensus orchestration must be invoked explicitly, for example by a future planning command or dashboard action. It must not run from worker dispatch, review dispatch, issue state polling, or the always-applied runtime rule path.
 
 ## Artifact Contracts
 
@@ -26,7 +26,7 @@ Every artifact should carry `version`, `laneId`, `runId`, `createdAt`, and bound
 
 ## Run Boundaries
 
-Each execution boundary is a fresh bounded Cursor run:
+Each execution boundary is a fresh bounded runtime-harness run:
 
 - Initial solution lanes: three fresh runs, one per persona, all receiving the same `SharedBrief`.
 - Critic runs: three fresh runs, one per lane output, with no access to other lane outputs.

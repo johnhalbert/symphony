@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -8,17 +9,20 @@ import {
   classifySdkRoleObservation,
   classifyToolListResult,
   deriveSdkPerSpecResult,
+  extractHermesToolNames,
   extractSdkSystemToolNames,
   MCP_TOOL_EXPOSURE_SPECS,
   normalizeMcpToolName,
   observeSdkRoleRun,
   redactSensitiveText,
+  runHermesGatewayMcpToolExposureProbe,
   runSdkMcpToolExposureProbe,
   type SdkRoleRunResult,
   type SdkToolDiagnostics,
 } from "../src/core/harness/McpToolExposureProbe.js";
 import { parseServiceConfig, type CursorSettingSource } from "../src/core/config/Config.js";
 import { testConfig } from "./helpers.js";
+import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 
 describe("MCP tool exposure probe helpers", () => {
   it("normalizes only bare and known server-prefixed Symphony MCP tool names", () => {
@@ -80,6 +84,85 @@ describe("MCP tool exposure probe helpers", () => {
       unnamedToolObjectCount: 2,
       malformedToolObjectCount: 1,
     });
+  });
+
+  it("extracts Hermes gateway tool names from toolset responses", () => {
+    expect(
+      extractHermesToolNames({
+        toolsets: [
+          {
+            name: "mcp-symphony",
+            tools: ["mcp_symphony_submit_completion_report", { name: "mcp_symphony_review_verdict_submit_review_verdict" }],
+          },
+          {
+            name: "mcp-symphony-review-feedback",
+            tools: [{ schema: { name: "mcp_symphony_review_feedback_submit_pull_request_review_feedback" } }],
+          },
+        ],
+      }),
+    ).toEqual([
+      "mcp_symphony_submit_completion_report",
+      "mcp-symphony.mcp_symphony_submit_completion_report",
+      "mcp_symphony_review_verdict_submit_review_verdict",
+      "mcp-symphony.mcp_symphony_review_verdict_submit_review_verdict",
+      "mcp_symphony_review_feedback_submit_pull_request_review_feedback",
+      "mcp-symphony-review-feedback.mcp_symphony_review_feedback_submit_pull_request_review_feedback",
+    ]);
+  });
+
+  it("verifies expected Symphony tools through a live Hermes gateway facade", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-hermes-mcp-probe-"));
+    try {
+      await writeHermesTemplates(root);
+      const clients: FakeHermesGatewayClient[] = [];
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
+          agent: { harness: "hermes" },
+          hermes: {
+            upstream_root: path.join(root, "upstream"),
+            templates_dir: path.join(root, "templates"),
+            state_dir: path.join(root, "state", "hermes"),
+            provider: "openai-codex",
+            model: "gpt-5-test",
+            auth: { managed_root: path.join(root, "auth") },
+          },
+        },
+        path.join(root, "WORKFLOW.md"),
+        { LINEAR_API_KEY: "linear-secret" },
+      );
+
+      await expect(
+        runHermesGatewayMcpToolExposureProbe(config, {
+          cliPath: path.join(root, "cli.ts"),
+          roles: ["worker", "reviewer"],
+          enabled: true,
+          cwd: path.join(root, "workspace"),
+          gatewayFactory: (env) => {
+            const client = new FakeHermesGatewayClient(env);
+            clients.push(client);
+            return client;
+          },
+        }),
+      ).resolves.toMatchObject({
+        stage: "hermes_gateway",
+        status: "success",
+        failureCode: null,
+        results: [
+          { status: "success", expectedTool: "submit_completion_report" },
+          { status: "success", expectedTool: "submit_merge_conflict_resolution" },
+          { status: "success", expectedTool: "submit_review_verdict" },
+          { status: "success", expectedTool: "submit_pull_request_review_feedback" },
+        ],
+      });
+      expect(clients).toHaveLength(3);
+      expect(clients.map((client) => client.env.model)).toEqual(["gpt-5-test", "gpt-5-test", "gpt-5-test"]);
+      expect(clients.every((client) => client.env.provider === "openai-codex")).toBe(true);
+      expect(clients.flatMap((client) => client.requests.map((request) => request.method))).toContain("tools.list");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("aggregates SDK tools across multiple system messages before classifying reviewer success", async () => {
@@ -444,7 +527,7 @@ describe("MCP tool exposure probe helpers", () => {
     }
   });
 
-  it("uses role-resolved cursor.runtime profiles for live SDK probe startup", async () => {
+  it("uses role-resolved runtime.cursor profiles for live SDK probe startup", async () => {
     vi.resetModules();
     const apiKeys: Array<string | undefined> = [];
     const dispose = vi.fn(async () => undefined);
@@ -474,12 +557,12 @@ describe("MCP tool exposure probe helpers", () => {
           workspace: { root: path.join(root, "workspaces") },
           credential_profiles: {
             profiles: {
-              workerCursor: { value: "$WORKER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
-              reviewerCursor: { value: "$REVIEWER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
+              workerCursor: { value: "$WORKER_CURSOR_TOKEN", capabilities: ["runtime.cursor"] },
+              reviewerCursor: { value: "$REVIEWER_CURSOR_TOKEN", capabilities: ["runtime.cursor"] },
             },
             roles: {
-              worker: { "cursor.runtime": "workerCursor" },
-              reviewer: { "cursor.runtime": "reviewerCursor" },
+              worker: { "runtime.cursor": "workerCursor" },
+              reviewer: { "runtime.cursor": "reviewerCursor" },
             },
           },
         },
@@ -529,6 +612,69 @@ function sdkObserveOptions(_role: "worker" | "reviewer", overrides: Partial<SdkT
     waitTimeoutMs: overrides.waitTimeoutMs ?? 100,
     postCancelWaitMs: overrides.postCancelWaitMs ?? 100,
   };
+}
+
+class FakeHermesGatewayClient extends EventEmitter implements HermesGatewayClient {
+  readonly requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+  readonly killed: string[] = [];
+
+  constructor(readonly env: HermesGatewayEnvironment) {
+    super();
+  }
+
+  on(event: "event", listener: (event: GatewayEvent) => void): this;
+  on(event: "exit", listener: (code: number | null) => void): this;
+  on(event: "event" | "exit", listener: ((event: GatewayEvent) => void) | ((code: number | null) => void)): this {
+    return super.on(event, listener);
+  }
+
+  off(event: "event", listener: (event: GatewayEvent) => void): this;
+  off(event: "exit", listener: (code: number | null) => void): this;
+  off(event: "event" | "exit", listener: ((event: GatewayEvent) => void) | ((code: number | null) => void)): this {
+    return super.off(event, listener);
+  }
+
+  drain(): void {
+    return;
+  }
+
+  async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+    this.requests.push({ method, params });
+    if (method === "session.create") return { session_id: `session-${this.requests.length}` } as T;
+    if (method === "tools.list") {
+      return {
+        toolsets: [
+          {
+            name: "mcp-symphony",
+            tools: [
+              "mcp_symphony_submit_completion_report",
+              "mcp_symphony_conflicts_submit_merge_conflict_resolution",
+              "mcp_symphony_review_verdict_submit_review_verdict",
+              "mcp_symphony_review_feedback_submit_pull_request_review_feedback",
+            ],
+          },
+        ],
+      } as T;
+    }
+    return { ok: true } as T;
+  }
+
+  kill(reason?: string): void {
+    this.killed.push(reason ?? "");
+  }
+
+  getLogTail(): string {
+    return "";
+  }
+}
+
+async function writeHermesTemplates(root: string): Promise<void> {
+  for (const template of ["worker", "reviewer", "planner"]) {
+    const templateDir = path.join(root, "templates", template);
+    await mkdir(templateDir, { recursive: true });
+    await writeFile(path.join(templateDir, "SOUL.md"), `${template} soul\n`, "utf8");
+    await writeFile(path.join(templateDir, "config.yaml"), "memory_enabled: false\n", "utf8");
+  }
 }
 
 function sdkObservation(overrides: Partial<SdkToolDiagnostics> = {}): SdkToolDiagnostics {

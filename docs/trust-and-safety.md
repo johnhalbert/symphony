@@ -6,7 +6,7 @@ This document describes the safety posture for running Symphony against its own 
 
 Symphony owns orchestration lifecycle decisions: issue dispatch, run records, workspace records, transcript persistence, Linear lifecycle writeback, and handoff status.
 
-Cursor workers own implementation work inside their assigned worktree. Workers must not directly mutate Linear lifecycle state, change assignees, mark work `Done`, or merge PRs when service-owned writeback is enabled.
+Runtime-harness workers own implementation work inside their assigned worktree. Workers must not directly mutate Linear lifecycle state, change assignees, mark work `Done`, or merge PRs when service-owned writeback is enabled.
 
 Humans can always override Linear state or stop Symphony. Symphony should observe external state changes and back off rather than fight them.
 
@@ -19,7 +19,7 @@ Symphony may write:
 - Dispatch transition, such as `Todo` to `In Progress`, when policy allows.
 - Run-start and run-end comments.
 - Failure and cancellation comments.
-- Verified PR handoff transition, such as `In Progress` to `Human Review`, after an accepted completion report and configured handoff checks.
+- Review-queue handoff transition, such as `In Progress` to `In Review`, after an accepted completion report and PR publication/reuse when the PR handoff gate is disabled.
 - Escalation transition to `Blocked` when review loops, incomplete turns, or other operator-required failures exceed policy limits.
 
 Symphony must not write:
@@ -48,20 +48,20 @@ Protected areas require human implementation until guardrails and the smoke chec
 - `src/core/workflow/**`
 - `src/integrations/linear/**`
 - `cursor/src/**`
+- `hermes/src/**`
 
-Gate issues that touch those areas should be implemented manually through Cursor chat, not through Symphony workers.
+Gate issues that touch those areas should be implemented manually by an operator, not through Symphony workers.
 
 ## State Model
 
 Dogfood uses these state groups:
 
 - Worker implementation queue: `Todo`, `In Progress`
-- PR-driven human review handoff: `Human Review`
 - Reviewer-agent queue: `In Review`
 - Human-required escalation: `Blocked`
 - Terminal: `Done`, `Closed`, `Cancelled`, `Canceled`, `Duplicate`
 
-`Human Review` is not active and not terminal. Reaching `Human Review` stops worker dispatch and leaves the lifecycle-bound pull request for human review. Handoff checks are evaluated at completion-report submission time; a PR can exist without a Linear handoff when those checks are still pending or failing. A human operator moves the issue to `In Review` when reviewer-agent review should start.
+The current dogfood workflow has `github.pr_handoff.enabled: false`, so `Human Review` is not part of the active loop. After an accepted worker completion report, Symphony publishes or reuses the lifecycle-bound pull request and moves the issue directly to `In Review`.
 
 `In Review` is not active and not terminal. Reaching `In Review` queues the work for independent reviewer-agent review and requires a stored worker completion report.
 
@@ -71,7 +71,7 @@ Review failures continue through the review loop. Policy exhaustion, repeated in
 
 ## GitHub PR Review Feedback
 
-Reviewer agents do not receive raw GitHub write credentials directly in their prompts or lifecycle context files. When a reviewer needs to leave PR feedback, Cursor mounts a separate Symphony-owned `review-feedback-mcp` server alongside the GitHub-free `review-verdict-mcp` server. The reviewer first calls `submit_pull_request_review_feedback`; Symphony resolves the lifecycle-bound PR and head SHA service-side, writes feedback through a scoped GitHub client, and returns durable PR review/comment URLs. The reviewer then passes those returned URLs to `submit_review_verdict.evidence`.
+Reviewer agents do not receive raw GitHub write credentials directly in their prompts or lifecycle context files. When a reviewer needs to leave PR feedback, the runtime harness mounts a separate Symphony-owned `review-feedback-mcp` server alongside the GitHub-free `review-verdict-mcp` server. The reviewer first calls `submit_pull_request_review_feedback`; Symphony resolves the lifecycle-bound PR and head SHA service-side, writes feedback through a scoped GitHub client, and returns durable PR review/comment URLs. The reviewer then passes those returned URLs to `submit_review_verdict.evidence`.
 
 The feedback context file contains only local reviewer handoff identity: issue, active run id, reviewer role, reviewer identity, review phase, and optional local handoff token fields. It must not contain PR number, PR URL, head SHA, GitHub token, repository owner/name, or other GitHub credential material.
 
@@ -85,9 +85,9 @@ Symphony refuses dirty worktree cleanup unless explicitly configured otherwise. 
 
 ## Operator Controls
 
-The status API exposes token-protected workspace opening, pause, resume, and cancel controls. Configure `server.open_workspace_token` with `SYMPHONY_OPEN_WORKSPACE_TOKEN` for local operator actions.
+The status API exposes token-protected workspace opening, pause, resume, and cancel controls. The reference workflow points `server.open_workspace_token` at `SYMPHONY_WORKSPACE_TOKEN` for local operator actions.
 
-During early dogfood, run a single Symphony process and keep `max_concurrent_agents: 1`.
+During early Hermes dogfood, run a single Symphony process and keep `max_concurrent_agents: 1`.
 
 ## Credential Profiles
 
@@ -119,17 +119,19 @@ credential_profiles:
       github.review_feedback_write: github-feedback
 ```
 
-The closed capability inventory is `github.discovery`, `github.publication`, `github.review_evidence_read`, `github.review_feedback_write`, `linear.tracker`, `linear.writeback`, `cursor.runtime`, and `server.open_workspace`. `github.review_feedback_write` is consumed only by the reviewer feedback MCP server.
+The closed capability inventory is `github.discovery`, `github.publication`, `github.review_evidence_read`, `github.review_feedback_write`, `linear.tracker`, `linear.writeback`, `runtime.cursor`, `runtime.hermes`, legacy alias `cursor.runtime`, and `server.open_workspace`. `github.review_feedback_write` is consumed only by the reviewer feedback MCP server.
 
-When `credential_profiles` is absent, current behavior is unchanged. GitHub capabilities fall back to `github.token` or `GITHUB_TOKEN`; both Linear capabilities fall back to `tracker.api_key` or `LINEAR_API_KEY`; `cursor.runtime` falls back to env-only `CURSOR_API_KEY`; and `server.open_workspace` falls back only to `server.open_workspace_token`. Workflow config may still point `server.open_workspace_token` at `SYMPHONY_OPEN_WORKSPACE_TOKEN`.
+When `credential_profiles` is absent, current behavior is unchanged. GitHub capabilities fall back to `github.token` or `GITHUB_TOKEN`; both Linear capabilities fall back to `tracker.api_key` or `LINEAR_API_KEY`; `runtime.cursor` and legacy `cursor.runtime` fall back to env-only `CURSOR_API_KEY`; `runtime.hermes` has no legacy fallback and must be assigned explicitly when the Hermes harness needs a runtime API key; and `server.open_workspace` falls back only to `server.open_workspace_token`. The reference workflow points `server.open_workspace_token` at `SYMPHONY_WORKSPACE_TOKEN`. Hermes `openai-codex` uses Hermes-owned OAuth instead of `runtime.hermes`: Symphony bootstraps selected provider state into `hermes.auth.managed_root` and passes it to generated profiles with `HERMES_AUTH_HOME`.
 
-Default role capability sets are intentionally narrow: workers use GitHub discovery/publication, Linear tracker/writeback, Cursor runtime, and workspace-open credentials; reviewers use GitHub review-evidence read, GitHub review-feedback write, Linear tracker/writeback, and Cursor runtime. MCP context `token` and `expectedToken` fields in completion-report, review-feedback, and review-verdict handoff files are local handoff authentication, not GitHub, Linear, Cursor, or server credentials, and must not be modeled as credential profiles.
+Default role capability sets are intentionally narrow: workers use GitHub discovery/publication, Linear tracker/writeback, runtime harness, and workspace-open credentials; reviewers use GitHub review-evidence read, GitHub review-feedback write, Linear tracker/writeback, and runtime harness credentials. MCP context `token` and `expectedToken` fields in completion-report, review-feedback, and review-verdict handoff files are local handoff authentication, not GitHub, Linear, runtime, or server credentials, and must not be modeled as credential profiles.
 
-## Cursor Runtime
+## Runtime Harness
 
-The current baseline model is `gpt-5.5` with thinking effort `xhigh`. This applies to direct Cursor work now and Symphony-managed workers later.
+Hermes is the dogfood runtime harness in the reference workflow. Cursor remains supported as `agent.harness: cursor` with the current Cursor baseline model `gpt-5.5` and thinking effort `xhigh`. Hermes uses generated per-role Hermes homes under the workflow state directory. For OpenAI Codex OAuth, those generated homes remain isolated while sharing the Symphony-managed Hermes auth root.
 
-Workers run through Cursor SDK local runtime in the assigned worktree. Project and user settings are loaded by default.
+Workers run through the selected runtime harness in the assigned worktree. The Cursor provider uses the Cursor SDK local runtime. The Hermes provider uses the upstream TUI stdio gateway through a Symphony facade and mounts Symphony MCP handoff tools into each generated profile.
+
+Hermes dogfood requires a nonempty `hermes.model`, so the upstream gateway cannot fall back to an unrelated default model. The reference workflow uses `gpt-5.5`, while the generated worker, reviewer, and planner templates set Hermes `agent.reasoning_effort: xhigh`. Native Windows is supported for Symphony's stdio gateway path with Node 22+ and Python 3.11+; configure `hermes.python` when the desired Python executable is not the default `python`.
 
 ## Non-Goals
 

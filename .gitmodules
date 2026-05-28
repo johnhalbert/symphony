@@ -1,0 +1,3 @@
+[submodule "hermes/upstream-src"]
+	path = hermes/upstream-src
+	url = https://github.com/NousResearch/hermes-agent.git

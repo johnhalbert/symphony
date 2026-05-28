@@ -288,7 +288,7 @@ describe("Cursor event mapping", () => {
     const ctx: AgentRunContext = {
       ...agentContext(config, "worker"),
       runPhase: "issue_breakdown",
-      cursorModeOverride: "plan",
+      runModeOverride: "plan",
     };
 
     const mcpServers = cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" });
@@ -318,19 +318,19 @@ describe("Cursor event mapping", () => {
     expect(server.env).not.toHaveProperty("CURSOR_API_KEY");
   });
 
-  it("uses profile-backed cursor.runtime credentials by default for worker and reviewer runs", () => {
+  it("uses profile-backed runtime.cursor credentials by default for worker and reviewer runs", () => {
     const config = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
         workspace: { root: "/tmp/symphony-cursor-harness" },
         credential_profiles: {
           profiles: {
-            workerCursor: { value: "$WORKER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
-            reviewerCursor: { value: "$REVIEWER_CURSOR_TOKEN", capabilities: ["cursor.runtime"] },
+            workerCursor: { value: "$WORKER_CURSOR_TOKEN", capabilities: ["runtime.cursor"] },
+            reviewerCursor: { value: "$REVIEWER_CURSOR_TOKEN", capabilities: ["runtime.cursor"] },
           },
           roles: {
-            worker: { "cursor.runtime": "workerCursor" },
-            reviewer: { "cursor.runtime": "reviewerCursor" },
+            worker: { "runtime.cursor": "workerCursor" },
+            reviewer: { "runtime.cursor": "reviewerCursor" },
           },
         },
       },

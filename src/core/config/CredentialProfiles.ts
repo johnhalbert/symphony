@@ -10,6 +10,8 @@ export const CREDENTIAL_CAPABILITIES = [
   "github.merge",
   "linear.tracker",
   "linear.writeback",
+  "runtime.cursor",
+  "runtime.hermes",
   "cursor.runtime",
   "server.open_workspace",
 ] as const;
@@ -71,7 +73,7 @@ export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<CredentialRol
     "github.discovery",
     "linear.tracker",
     "linear.writeback",
-    "cursor.runtime",
+    "runtime.cursor",
     "server.open_workspace",
   ],
   reviewer: [
@@ -79,7 +81,7 @@ export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<CredentialRol
     "github.review_feedback_write",
     "linear.tracker",
     "linear.writeback",
-    "cursor.runtime",
+    "runtime.cursor",
   ],
   service: ["github.publication", "github.merge", "linear.writeback"],
 };
@@ -107,8 +109,9 @@ export class CredentialProfileRegistry {
   }
 
   resolveForRole(role: CredentialRole, capability: CredentialCapability): ResolvedCredential | null {
-    const profileName = this.#roleAssignments.get(role)?.get(capability);
-    if (profileName !== undefined) {
+    const assignment = this.#assignmentFor(role, capability);
+    if (assignment !== null) {
+      const { profileName } = assignment;
       const profile = this.#profiles.get(profileName);
       if (profile === undefined) {
         throw new SymphonyError("config_validation_error", `Credential profile "${profileName}" is not defined`);
@@ -129,7 +132,7 @@ export class CredentialProfileRegistry {
   }
 
   hasAssignment(role: CredentialRole, capability: CredentialCapability): boolean {
-    return this.#roleAssignments.get(role)?.has(capability) ?? false;
+    return this.#assignmentFor(role, capability) !== null;
   }
 
   assignmentRolesFor(capability: CredentialCapability): CredentialRole[] {
@@ -141,7 +144,7 @@ export class CredentialProfileRegistry {
     return [
       ...new Set<CredentialCapability>([
         ...defaults,
-        ...Array.from(this.#roleAssignments.get(role)?.keys() ?? []),
+        ...Array.from(this.#roleAssignments.get(role)?.keys() ?? []).map(canonicalCredentialCapability),
       ]),
     ];
   }
@@ -168,9 +171,23 @@ export class CredentialProfileRegistry {
   #legacyFallback(capability: CredentialCapability): string | null {
     if (capability.startsWith("github.")) return this.#fallbacks.githubToken;
     if (capability.startsWith("linear.")) return this.#fallbacks.linearApiKey;
-    if (capability === "cursor.runtime") return this.#fallbacks.cursorRuntimeApiKey;
+    if (capability === "runtime.cursor" || capability === "cursor.runtime") return this.#fallbacks.cursorRuntimeApiKey;
     if (capability === "server.open_workspace") return this.#fallbacks.openWorkspaceToken;
     return null;
+  }
+
+  #assignmentFor(
+    role: CredentialRole,
+    capability: CredentialCapability,
+  ): { capability: CredentialCapability; profileName: string } | null {
+    const roleAssignments = this.#roleAssignments.get(role);
+    if (!roleAssignments) return null;
+    const profileName = roleAssignments.get(capability);
+    if (profileName !== undefined) return { capability, profileName };
+    const alias = credentialCapabilityAlias(capability);
+    if (alias === null) return null;
+    const aliasProfileName = roleAssignments.get(alias);
+    return aliasProfileName === undefined ? null : { capability: alias, profileName: aliasProfileName };
   }
 }
 
@@ -224,7 +241,7 @@ function parseRoleAssignments(
           `credential_profiles.roles.${role}.${capability} references unknown profile "${profileName}"`,
         );
       }
-      if (!profile.capabilities.includes(capability)) {
+      if (!profileSupportsCapability(profile, capability)) {
         throw new SymphonyError(
           "config_validation_error",
           `credential_profiles.roles.${role}.${capability} references profile "${profileName}" without that capability`,
@@ -240,6 +257,22 @@ function parseRoleAssignments(
 function parseCapabilityName(value: string, path: string): CredentialCapability {
   if (VALID_CAPABILITIES.has(value as CredentialCapability)) return value as CredentialCapability;
   throw new SymphonyError("config_validation_error", `${path} contains unsupported credential capability "${value}"`);
+}
+
+function profileSupportsCapability(profile: CredentialProfileDefinition, capability: CredentialCapability): boolean {
+  if (profile.capabilities.includes(capability)) return true;
+  const alias = credentialCapabilityAlias(capability);
+  return alias !== null && profile.capabilities.includes(alias);
+}
+
+function credentialCapabilityAlias(capability: CredentialCapability): CredentialCapability | null {
+  if (capability === "runtime.cursor") return "cursor.runtime";
+  if (capability === "cursor.runtime") return "runtime.cursor";
+  return null;
+}
+
+function canonicalCredentialCapability(capability: CredentialCapability): CredentialCapability {
+  return capability === "cursor.runtime" ? "runtime.cursor" : capability;
 }
 
 function parseEnvReference(value: string, path: string): string {

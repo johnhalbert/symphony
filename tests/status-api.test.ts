@@ -1887,6 +1887,10 @@ describe("StatusServer durable API", () => {
         sdkRunStatusSource: "initial",
       },
     });
+    const runMetaPath = path.join(config.workspace.stateDir, "runs", "run-orphaned", "meta.json");
+    const legacyRun = JSON.parse(await readFile(runMetaPath, "utf8")) as { role?: string };
+    delete legacyRun.role;
+    await writeFile(runMetaPath, `${JSON.stringify(legacyRun, null, 2)}\n`, "utf8");
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
       workspaceManager: new WorkspaceManager({
@@ -1947,6 +1951,7 @@ describe("StatusServer durable API", () => {
       });
       expect(html).toContain("Not Live Runs");
       expect(html).toContain("TEST-ORPHANED");
+      expect(html).toContain("unknown");
       expect(html).toContain("controls: none");
       await expect(runStore.getRun("run-orphaned")).resolves.toMatchObject({ status: "running" });
     } finally {
@@ -2226,6 +2231,7 @@ describe("StatusServer durable API", () => {
         title: "Todo with dependency",
         description: "Todo detail description",
         state: "Todo",
+        delegateId: "delegate-1",
         blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
       }),
       issue({
@@ -2385,7 +2391,7 @@ describe("StatusServer durable API", () => {
         },
         issueDetails: {
           source: "tracker",
-          issue: { description: "Todo detail description", identifier: "TEST-TODO" },
+          issue: { description: "Todo detail description", identifier: "TEST-TODO", delegateId: "delegate-1" },
         },
         runs: [],
         pullRequest: { url: null, ciStatus: null },
@@ -3404,6 +3410,7 @@ function issueDetailsFixture(overrides: Partial<IssueStatusView> & Pick<IssueSta
     branchName: null,
     url: null,
     assigneeId: null,
+    delegateId: null,
     labels: [],
     blockedBy: [],
     createdAt: null,
@@ -3423,6 +3430,7 @@ function durableIssueDetails(overrides: Partial<IssueDetailsEnvelope["issue"]> =
     branchName: "symphony/TEST-1",
     url: null,
     assigneeId: null,
+    delegateId: null,
     labels: [],
     blockedBy: [],
     createdAt: null,

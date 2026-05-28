@@ -24,6 +24,8 @@ export interface PersistedCursorModelParam {
   value: string;
 }
 
+export type PersistedRuntimeModelParam = PersistedCursorModelParam;
+
 export interface WorkspaceRecord {
   workspaceKey: string;
   issueId: string | null;
@@ -85,6 +87,13 @@ export interface RunRecord {
   turnNumber: number;
   prompt: string;
   promptCharCount?: number;
+  harnessId?: string;
+  runtimeModel?: string | null;
+  runtimeModelParams?: PersistedRuntimeModelParam[];
+  runtimeSettingSources?: string[];
+  runtimeMode?: string | null;
+  runtimeAllowLargeContext?: boolean;
+  runtimeAgentLifecycle?: string;
   cursorModel?: string | null;
   cursorModelParams?: PersistedCursorModelParam[];
   cursorSettingSources?: string[];
@@ -138,7 +147,7 @@ export interface TranscriptEvent {
   runId: string;
   sequence: number;
   at: string;
-  source: "harness" | "cursor" | "orchestrator";
+  source: "harness" | "runtime" | "cursor" | "orchestrator";
   eventType: string;
   message?: string;
   payload?: unknown;
@@ -164,6 +173,13 @@ export interface StartRunInput {
   attempt: number | null;
   turnNumber: number;
   prompt: string;
+  harnessId?: string;
+  runtimeModel?: string | null;
+  runtimeModelParams?: PersistedRuntimeModelParam[];
+  runtimeSettingSources?: string[];
+  runtimeMode?: string | null;
+  runtimeAllowLargeContext?: boolean;
+  runtimeAgentLifecycle?: string;
   cursorModel?: string | null;
   cursorModelParams?: PersistedCursorModelParam[];
   cursorSettingSources?: string[];
@@ -262,6 +278,13 @@ export class FileRunTranscriptStore {
       turnNumber: input.turnNumber,
       prompt: promptPreview(input.prompt),
       promptCharCount: input.prompt.length,
+      ...(input.harnessId === undefined ? {} : { harnessId: input.harnessId }),
+      ...(input.runtimeModel === undefined ? {} : { runtimeModel: input.runtimeModel }),
+      ...(input.runtimeModelParams === undefined ? {} : { runtimeModelParams: input.runtimeModelParams }),
+      ...(input.runtimeSettingSources === undefined ? {} : { runtimeSettingSources: input.runtimeSettingSources }),
+      ...(input.runtimeMode === undefined ? {} : { runtimeMode: input.runtimeMode }),
+      ...(input.runtimeAllowLargeContext === undefined ? {} : { runtimeAllowLargeContext: input.runtimeAllowLargeContext }),
+      ...(input.runtimeAgentLifecycle === undefined ? {} : { runtimeAgentLifecycle: input.runtimeAgentLifecycle }),
       ...(input.cursorModel === undefined ? {} : { cursorModel: input.cursorModel }),
       ...(input.cursorModelParams === undefined ? {} : { cursorModelParams: input.cursorModelParams }),
       ...(input.cursorSettingSources === undefined ? {} : { cursorSettingSources: input.cursorSettingSources }),
@@ -498,10 +521,33 @@ function promptPreview(prompt: string): string {
 
 function normalizeRunRecord(record: RunRecord): RunRecord {
   const runPhase = record.runPhase ?? defaultRunPhase(record.role);
+  const harnessId =
+    record.harnessId ??
+    (record.cursorModel !== undefined ||
+    record.cursorModelParams !== undefined ||
+    record.cursorMode !== undefined ||
+    record.cursorSettingSources !== undefined
+      ? "cursor"
+      : undefined);
   return {
     ...record,
     runPhase,
     runKind: record.runKind ?? runKindForPhase(runPhase),
+    ...(harnessId === undefined ? {} : { harnessId }),
+    ...(record.runtimeModel !== undefined ? {} : { runtimeModel: record.cursorModel ?? null }),
+    ...(record.runtimeModelParams !== undefined ? {} : { runtimeModelParams: record.cursorModelParams ?? [] }),
+    ...(record.runtimeSettingSources !== undefined ? {} : { runtimeSettingSources: record.cursorSettingSources ?? [] }),
+    ...(record.runtimeMode !== undefined ? {} : { runtimeMode: record.cursorMode ?? null }),
+    ...(record.runtimeAllowLargeContext !== undefined
+      ? {}
+      : record.cursorAllowLargeContext === undefined
+        ? {}
+        : { runtimeAllowLargeContext: record.cursorAllowLargeContext }),
+    ...(record.runtimeAgentLifecycle !== undefined
+      ? {}
+      : record.cursorWorkerAgentLifecycle === undefined
+        ? {}
+        : { runtimeAgentLifecycle: record.cursorWorkerAgentLifecycle }),
   };
 }
 

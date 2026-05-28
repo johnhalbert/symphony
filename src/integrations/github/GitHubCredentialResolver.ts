@@ -80,5 +80,9 @@ function shouldUseGitHubAppByDefault(
   credential: ResolvedCredential | null,
 ): boolean {
   if (github.app === null || credential?.source !== "legacy") return false;
-  return capability === "github.publication" || capability === "github.review_feedback_write";
+  return (
+    capability === "github.publication" ||
+    capability === "github.review_feedback_write" ||
+    capability === "github.merge"
+  );
 }

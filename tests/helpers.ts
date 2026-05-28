@@ -38,6 +38,7 @@ export function issue(overrides: Partial<Issue> = {}): Issue {
     branchName: null,
     url: null,
     assigneeId: null,
+    delegateId: null,
     assignedToWorker: true,
     labels: [],
     blockedBy: [],

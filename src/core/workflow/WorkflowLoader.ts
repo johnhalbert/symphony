@@ -33,7 +33,7 @@ export class WorkflowLoader {
   async load(): Promise<LoadedWorkflow> {
     const contents = await readWorkflowFile(this.workflowPath);
     const definition = parseWorkflowFile(contents, this.workflowPath);
-    const serviceConfig = parseServiceConfig(definition.config, this.workflowPath);
+    const serviceConfig = parseServiceConfig(definition.config, this.workflowPath, await loadWorkflowEnvironment(this.workflowPath));
     const loaded = { definition, serviceConfig };
     this.lastGood = loaded;
     return loaded;
@@ -75,6 +75,36 @@ export async function readWorkflowFile(workflowPath: string): Promise<string> {
   } catch (error) {
     throw new SymphonyError("missing_workflow_file", `Unable to read workflow file: ${workflowPath}`, error);
   }
+}
+
+export async function loadWorkflowEnvironment(
+  workflowPath: string,
+  parentEnv: NodeJS.ProcessEnv = process.env,
+): Promise<NodeJS.ProcessEnv> {
+  const envPath = path.join(path.dirname(path.resolve(workflowPath)), ".env");
+  let fileEnv: Record<string, string>;
+  try {
+    fileEnv = parseDotEnvFile(await fs.readFile(envPath, "utf8"));
+  } catch (error) {
+    if (isMissingFileError(error)) fileEnv = {};
+    else throw new SymphonyError("config_validation_error", `Unable to read env file: ${envPath}`, error);
+  }
+  return { ...fileEnv, ...parentEnv };
+}
+
+export function parseDotEnvFile(contents: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const rawLine of contents.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line.startsWith("#")) continue;
+    const unprefixed = line.startsWith("export ") ? line.slice("export ".length).trimStart() : line;
+    const separator = unprefixed.indexOf("=");
+    if (separator < 0) continue;
+    const key = unprefixed.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    env[key] = parseDotEnvValue(unprefixed.slice(separator + 1).trim());
+  }
+  return env;
 }
 
 export function parseWorkflowFile(contents: string, workflowPath: string): WorkflowDefinition {
@@ -123,4 +153,17 @@ export function parseWorkflowFile(contents: string, workflowPath: string): Workf
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseDotEnvValue(value: string): string {
+  if (value.length < 2) return value;
+  const quote = value[0];
+  if ((quote !== `"` && quote !== "'") || value[value.length - 1] !== quote) return value;
+  const unquoted = value.slice(1, -1);
+  if (quote === "'") return unquoted;
+  return unquoted.replace(/\\n/g, "\n").replace(/\\r/g, "\r").replace(/\\t/g, "\t").replace(/\\"/g, `"`).replace(/\\\\/g, "\\");
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "ENOENT";
 }

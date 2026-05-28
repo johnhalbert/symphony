@@ -2,6 +2,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { AgentActivitySource, AgentEvent, AgentHarness, AgentRunSdkStatus } from "../harness/AgentHarness.js";
+import {
+  harnessSupportsContinuation,
+  harnessSupportsMcpHandoff,
+  renderCompletionMcpHandoffPrompt,
+  renderIssueBreakdownMcpHandoffPrompt,
+  renderMergeConflictResolutionMcpHandoffPrompt,
+} from "../harness/HandoffMcp.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import {
@@ -42,6 +49,7 @@ import {
   type RunMetadata,
   type RunRecord,
   type RunTranscriptStore,
+  type StartRunInput,
   type TranscriptEvent,
   type UpdateRunInput,
 } from "../persistence/RunTranscriptStore.js";
@@ -312,7 +320,7 @@ You are a reviewer agent for {{ issue.identifier }}.
 
 Inspect only. Do not modify files, create commits, push branches, comment on Linear, transition Linear state, or otherwise change workspace or lifecycle state directly.
 
-Use the linked GitHub pull request as the primary detailed review surface. Call the submit_pull_request_review_feedback MCP tool before any verdict submission to leave concrete feedback directly on the lifecycle-bound PR by submitting a GitHub PR review and/or posting PR review comments. Requested changes must point to the relevant files, lines, or threads on GitHub; a pass verdict should also leave a concise approving or summary review/comment on the PR.
+Use the linked GitHub pull request as the primary detailed review surface. Call the submit_pull_request_review_feedback MCP tool before any verdict submission to leave concrete feedback directly on the lifecycle-bound PR by submitting a GitHub PR review and/or posting PR review comments. A pass verdict requires a prior whole-PR review with kind "review" and event "APPROVE" in this reviewer run. Requested changes should use kind "review" with event "REQUEST_CHANGES" when PR feedback is submitted, and must point to the relevant files, lines, or threads on GitHub.
 
 After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" for requested changes and "pass" only when all acceptance criteria are satisfied. The MCP servers supply the active run, issue, and lifecycle-bound PR context; include runId, issueId, PR number, repository, token, or commit identity only if a tool explicitly asks for it.
 
@@ -329,8 +337,9 @@ Tool payload guidance:
 - idempotencyKey: a stable unique key for this reviewer verdict.
 
 Feedback tool payload guidance:
-- Use kind "review" with event "REQUEST_CHANGES", "COMMENT", or "APPROVE" for whole-PR review feedback; include inline comments when helpful.
-- Use kind "review_comment" for a single inline comment or reply, and "issue_comment" only for high-level PR comments.
+- For a pass verdict, first use kind "review" with event "APPROVE" for whole-PR approval feedback; include inline comments when helpful.
+- For a fail verdict, use kind "review" with event "REQUEST_CHANGES" when submitting whole-PR review feedback; include inline comments when helpful.
+- Use kind "review_comment" for a single inline comment or reply, and "issue_comment" only for supplemental high-level PR comments. These supplemental comments do not satisfy pass approval.
 - Use a stable idempotencyKey; reuse returned URLs as verdict evidence on retry.
 
 Report a verdict in this format:
@@ -777,7 +786,7 @@ export class Orchestrator {
       } else if (entry.role === "worker" && isStateIn(latest.state, this.config.tracker.handoffStates)) {
         await this.terminateRunningIssue(issueId, false, "handoff state");
       } else if (entry.role === "worker" && !latest.assignedToWorker) {
-        await this.terminateRunningIssue(issueId, false, "assignee route changed");
+        await this.terminateRunningIssue(issueId, false, "worker route changed");
       } else if (entry.role === "worker" && !this.isWorkerStateActiveForRunPhase(latest, entry.runPhase)) {
         await this.terminateRunningIssue(issueId, false, "non-active state");
       } else if (entry.role === "reviewer" && isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
@@ -1237,7 +1246,7 @@ export class Orchestrator {
 
       for (let turnNumber = 1; turnNumber <= this.config.agent.maxTurns; turnNumber += 1) {
         if (entry.abortController.signal.aborted) throw new SymphonyError("agent_error", "Run was cancelled");
-        if (turnNumber > 1 && this.options.harness.supportsContinuation === false) {
+        if (turnNumber > 1 && !harnessSupportsContinuation(this.options.harness)) {
           throw new SymphonyError(
             "agent_error",
             `Harness ${this.options.harness.id} does not support continuation turns`,
@@ -1314,6 +1323,7 @@ export class Orchestrator {
       await this.options.workspaceManager.beforeRun(workspace.path);
       await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, null, 1));
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
+      this.requireMcpHandoff("review");
 
       entry.turnCount = 1;
       const prompt = this.formatRenderedReviewerPrompt(
@@ -1374,6 +1384,7 @@ export class Orchestrator {
         entry.runId = event.runId ?? event.sessionId;
         entry.activeRunId = entry.runId;
         entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+        const runtimeMetadata = runtimeMetadataForEntry(this.options.harness.id, entry, this.config);
         await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
         await this.options.runStore?.startRun({
           runId: entry.runId,
@@ -1387,10 +1398,12 @@ export class Orchestrator {
           attempt: context.attempt,
           turnNumber: context.turnNumber,
           prompt: context.prompt,
+          harnessId: this.options.harness.id,
+          ...runtimeMetadata,
           cursorModel: this.config.cursor.model,
           cursorModelParams: this.config.cursor.modelParams,
           cursorSettingSources: this.config.cursor.settingSources,
-          cursorMode: effectiveCursorModeForEntry(entry, this.config),
+          cursorMode: effectiveRuntimeModeForEntry(entry, this.config),
           cursorAllowLargeContext: this.config.cursor.allowLargeContext,
           cursorWorkerAgentLifecycle: this.config.cursor.workerAgentLifecycle,
           workspaceKey: context.workspace.workspaceKey,
@@ -1994,7 +2007,7 @@ export class Orchestrator {
       workspace,
       config: this.config,
       turnNumber,
-      ...(entry.runPhase === "issue_breakdown" ? { cursorModeOverride: this.config.issueBreakdown.cursorMode } : {}),
+      ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: this.config.issueBreakdown.cursorMode } : {}),
       abortSignal: entry.abortController.signal,
       logger: this.options.logger,
     };
@@ -2533,14 +2546,14 @@ export class Orchestrator {
     const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
     const mergeGate = mergeGateResult?.text ?? null;
     const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
-    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.cursorWorkerMcpPrompt(entry), mergeGate, reviewVerdict, reviewEvidence]
+    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.workerMcpPrompt(entry), mergeGate, reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
   }
 
   private async renderIssueBreakdownPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
     const basePrompt = await this.promptRenderer.render(this.config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
-    return [basePrompt, this.cursorIssueBreakdownMcpPrompt(entry)].join("\n");
+    return [basePrompt, this.issueBreakdownMcpPrompt(entry)].join("\n");
   }
 
   private async renderMergeConflictResolutionPrompt(entry: RunningEntry): Promise<string> {
@@ -2569,22 +2582,13 @@ export class Orchestrator {
       `- Path: ${workspace?.path ?? entry.workspacePath ?? "n/a"}`,
       `- Branch: ${workspace?.gitBranchName ?? entry.issue.branchName ?? "n/a"}`,
       `- Base ref: ${workspace?.baseRef ?? "n/a"}`,
-      this.cursorMergeConflictResolutionMcpPrompt(entry),
+      this.mergeConflictResolutionMcpPrompt(entry),
     ].join("\n");
   }
 
-  private cursorIssueBreakdownMcpPrompt(entry: RunningEntry): string {
-    return [
-      "",
-      "Symphony MCP issue-breakdown handoff:",
-      `- Active issue: ${entry.issue.identifier} (${entry.issue.id})`,
-      "- Active role: worker",
-      "- Active phase: issue_breakdown",
-      "- Before ending the run, call the submit_issue_breakdown_plan MCP tool with summary, proposedIssues, and idempotencyKey.",
-      "- Each proposed issue must include title, description, acceptanceCriteria, dependencies, and labels.",
-      "- Do not call submit_completion_report, comment on Linear, transition Linear state, or create child issues.",
-      "- Symphony persists the plan locally and injects it into the later implementation prompt after validation.",
-    ].join("\n");
+  private issueBreakdownMcpPrompt(entry: RunningEntry): string {
+    this.requireMcpHandoff("issue_breakdown");
+    return renderIssueBreakdownMcpHandoffPrompt({ issue: entry.issue });
   }
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
@@ -2602,7 +2606,7 @@ export class Orchestrator {
       mergeGate,
       reviewVerdict,
       reviewEvidence,
-      this.cursorWorkerMcpPrompt(entry),
+      this.workerMcpPrompt(entry),
     ]
       .filter((item): item is string => item !== null)
       .join("\n");
@@ -2690,44 +2694,39 @@ export class Orchestrator {
     return { eventCount, runs: history };
   }
 
-  private cursorWorkerMcpPrompt(entry: RunningEntry): string | null {
-    if (this.options.harness.id !== "cursor") return null;
+  private workerMcpPrompt(entry: RunningEntry): string | null {
     if (entry.runPhase !== "implementation") return null;
+    this.requireMcpHandoff("implementation");
     const workspace = entry.workspace;
-    return [
-      "",
-      "Symphony MCP completion handoff:",
-      `- Active issue: ${entry.issue.identifier} (${entry.issue.id})`,
-      `- Active role: ${entry.role}`,
-      `- Workspace path: ${workspace?.path ?? entry.workspacePath ?? "n/a"}`,
-      `- Branch: ${workspace?.gitBranchName ?? entry.issue.branchName ?? "n/a"}`,
-      `- Repository path: ${workspace?.repoPath ?? "n/a"}`,
-      `- Base ref: ${workspace?.baseRef ?? "n/a"}`,
-      "- Before ending the run, call the submit_completion_report MCP tool with summary, validationEvidence, acceptanceChecklist, changedFiles, branchName, pullRequest, risks, and idempotencyKey.",
-      "- The MCP server is scoped to this issue and the current Cursor run; Symphony injects runId and issueId for you.",
-      "- Do not comment on Linear, transition Linear state, or request broad Linear write credentials. Symphony handles writeback after the tool accepts the report.",
-    ].join("\n");
+    return renderCompletionMcpHandoffPrompt({
+      issue: entry.issue,
+      role: entry.role,
+      workspacePath: workspace?.path ?? entry.workspacePath,
+      branchName: workspace?.gitBranchName ?? entry.issue.branchName ?? null,
+      repoPath: workspace?.repoPath ?? null,
+      baseRef: workspace?.baseRef ?? null,
+    });
   }
 
-  private cursorMergeConflictResolutionMcpPrompt(entry: RunningEntry): string | null {
-    if (this.options.harness.id !== "cursor") return null;
+  private mergeConflictResolutionMcpPrompt(entry: RunningEntry): string | null {
     if (entry.runPhase !== "merge_conflict_resolution") return null;
+    this.requireMcpHandoff("merge_conflict_resolution");
     const workspace = entry.workspace;
-    return [
-      "",
-      "Symphony MCP merge-conflict-resolution handoff:",
-      `- Active issue: ${entry.issue.identifier} (${entry.issue.id})`,
-      "- Active role: worker",
-      "- Active phase: merge_conflict_resolution",
-      `- Workspace path: ${workspace?.path ?? entry.workspacePath ?? "n/a"}`,
-      `- Branch: ${workspace?.gitBranchName ?? entry.issue.branchName ?? "n/a"}`,
-      `- Repository path: ${workspace?.repoPath ?? "n/a"}`,
-      `- Base ref: ${workspace?.baseRef ?? "n/a"}`,
-      "- Before ending the run, call the submit_merge_conflict_resolution MCP tool with resolutionStatus, summary, validationEvidence, changedFiles, pullRequest, previousHeadSha, newHeadSha, baseBranch, baseHeadSha, risks, and idempotencyKey.",
-      "- Use resolutionStatus=\"resolved\" only when the PR head contains the conflict fix; use resolutionStatus=\"still_conflicted\" when conflicts remain; use resolutionStatus=\"blocked\" when human intervention is required now.",
-      "- previousHeadSha must match the current conflict head from the prompt, and newHeadSha must match pullRequest.headSha after your attempt.",
-      "- The MCP server is scoped to this issue and current conflict-fix run; Symphony injects runId and issueId for you.",
-    ].join("\n");
+    return renderMergeConflictResolutionMcpHandoffPrompt({
+      issue: entry.issue,
+      workspacePath: workspace?.path ?? entry.workspacePath,
+      branchName: workspace?.gitBranchName ?? entry.issue.branchName ?? null,
+      repoPath: workspace?.repoPath ?? null,
+      baseRef: workspace?.baseRef ?? null,
+    });
+  }
+
+  private requireMcpHandoff(runPhase: AgentRunPhase): void {
+    if (harnessSupportsMcpHandoff(this.options.harness)) return;
+    throw new SymphonyError(
+      "config_validation_error",
+      `Runtime harness ${this.options.harness.id} does not support Symphony MCP handoff required for ${runPhase}`,
+    );
   }
 
   private async loadWorkerReviewVerdictPrompt(entry: RunningEntry): Promise<string | null> {
@@ -2756,7 +2755,7 @@ export class Orchestrator {
       "",
       "Issue breakdown plan:",
       `- Source: ${plan.id}; accepted at ${plan.acceptedAt}`,
-      `- Cursor mode: ${plan.cursorMode ?? this.config.issueBreakdown.cursorMode}`,
+      `- Runtime mode: ${plan.cursorMode ?? this.config.issueBreakdown.cursorMode}`,
       `- Transcript pointers: ${formatList(plan.transcriptPointers)}`,
       `- Status pointers: ${formatList(plan.statusApiPointers)}`,
       "",
@@ -3068,8 +3067,60 @@ function latestContinuationSummaryReference(
   );
 }
 
-function effectiveCursorModeForEntry(entry: RunningEntry, config: ServiceConfig): "agent" | "plan" | null {
+function effectiveRuntimeModeForEntry(entry: RunningEntry, config: ServiceConfig): "agent" | "plan" | null {
   return entry.runPhase === "issue_breakdown" ? config.issueBreakdown.cursorMode : config.cursor.mode;
+}
+
+function runtimeMetadataForEntry(
+  harnessId: string,
+  entry: RunningEntry,
+  config: ServiceConfig,
+): Partial<
+  Pick<
+    StartRunInput,
+    | "runtimeModel"
+    | "runtimeModelParams"
+    | "runtimeSettingSources"
+    | "runtimeMode"
+    | "runtimeAllowLargeContext"
+    | "runtimeAgentLifecycle"
+  >
+> {
+  if (harnessId === "cursor") {
+    return {
+      runtimeModel: config.cursor.model,
+      runtimeModelParams: config.cursor.modelParams,
+      runtimeSettingSources: config.cursor.settingSources,
+      runtimeMode: effectiveRuntimeModeForEntry(entry, config),
+      runtimeAllowLargeContext: config.cursor.allowLargeContext,
+      runtimeAgentLifecycle: config.cursor.workerAgentLifecycle,
+    };
+  }
+  if (harnessId === "hermes") {
+    return {
+      runtimeModel: config.hermes.model,
+      runtimeModelParams: [],
+      runtimeSettingSources: [
+        `template:${hermesTemplateForEntry(entry, config)}`,
+        ...(config.hermes.provider === null ? [] : [`provider:${config.hermes.provider}`]),
+      ],
+      runtimeMode: effectiveRuntimeModeForEntry(entry, config),
+      runtimeAgentLifecycle: config.hermes.workerSessionLifecycle,
+    };
+  }
+  return {
+    runtimeModel: null,
+    runtimeModelParams: [],
+    runtimeSettingSources: [],
+    runtimeMode: effectiveRuntimeModeForEntry(entry, config),
+  };
+}
+
+function hermesTemplateForEntry(entry: RunningEntry, config: ServiceConfig): string {
+  if (entry.role === "reviewer") return config.hermes.roleTemplates.reviewer;
+  if (entry.runPhase === "issue_breakdown") return config.hermes.roleTemplates.planner;
+  if (entry.runPhase === "merge_conflict_resolution") return config.hermes.roleTemplates.mergeConflictResolution;
+  return config.hermes.roleTemplates.worker;
 }
 
 function maxPlanningFailuresReason(count: number, max: number): string {
@@ -3342,6 +3393,7 @@ function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {
     branchName: request.action.branchName,
     url: null,
     assigneeId: null,
+    delegateId: null,
     assignedToWorker: false,
     labels: [],
     blockedBy: [],
@@ -3370,6 +3422,7 @@ function issueFromPendingPublicationLifecycle(lifecycle: IssueLifecycleRecord, s
     branchName: report?.branchName ?? lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName,
     url: null,
     assigneeId: null,
+    delegateId: null,
     assignedToWorker: false,
     labels: [],
     blockedBy: [],

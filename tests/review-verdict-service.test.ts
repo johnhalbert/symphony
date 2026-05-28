@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SymphonyError } from "../src/core/errors.js";
-import { FileIssueLifecycleStore, type IssueLifecycleRecord, type IssueMergeGateState } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileIssueLifecycleStore,
+  type IssueLifecycleRecord,
+  type IssueMergeGateState,
+  type IssueReviewFeedbackRecord,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import {
   formatWorkerMergeGatePromptResult,
   ReviewVerdictService,
@@ -87,11 +92,47 @@ describe("ReviewVerdictService", () => {
     });
   });
 
+  it("rejects a pass verdict when the active reviewer run has not approved the lifecycle-bound PR", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      reviewRound: 1,
+    });
+
+    await expect(service.submitReviewVerdict(passVerdict(), context())).rejects.toMatchObject({
+      code: "invalid_request",
+      message:
+        'Pass review verdict requires prior submit_pull_request_review_feedback with kind="review" and event="APPROVE" for the active reviewer run and lifecycle-bound PR.',
+    });
+  });
+
+  it("rejects a pass verdict when feedback is non-approval or from a different run", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      reviewRound: 1,
+      reviewFeedback: [
+        requestChangesFeedback(),
+        issueCommentFeedback(),
+        reviewCommentFeedback(),
+        approvalFeedback({ runId: "other-review-run" }),
+      ],
+    });
+
+    await expect(service.submitReviewVerdict(passVerdict(), context())).rejects.toMatchObject({
+      code: "invalid_request",
+      message:
+        'Pass review verdict requires prior submit_pull_request_review_feedback with kind="review" and event="APPROVE" for the active reviewer run and lifecycle-bound PR.',
+    });
+  });
+
   it("accepts a pass verdict, records verified completion, and applies configured pass behavior", async () => {
     const { service, lifecycleStore, outbox } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
       phase: "review",
       reviewRound: 1,
+      summaryPointers: { prUrl: "https://github.com/acme/symphony/pull/42", prNumber: 42, prHeadSha: "head-sha-1" },
+      reviewFeedback: [approvalFeedback()],
     });
 
     const result = await service.submitReviewVerdict(passVerdict(), context());
@@ -111,6 +152,36 @@ describe("ReviewVerdictService", () => {
     expect((await outbox.list()).find((operation) => operation.kind === "transition")).toMatchObject({
       idempotencyKey: "transition:issue-1:review-run-1:review-verdict-pass:Ready to Merge",
       payload: { toState: "Ready to Merge" },
+    });
+  });
+
+  it("accepts a fail verdict with same-run request-changes or comment-only feedback", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      reviewFeedback: [requestChangesFeedback(), issueCommentFeedback(), reviewCommentFeedback()],
+    });
+
+    const result = await service.submitReviewVerdict(failVerdict(), context());
+
+    expect(result.replayed).toBe(false);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "implementation",
+      reviewRound: 1,
+    });
+  });
+
+  it("rejects a fail verdict after same-run approval feedback", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      reviewFeedback: [approvalFeedback()],
+    });
+
+    await expect(service.submitReviewVerdict(failVerdict(), context())).rejects.toMatchObject({
+      code: "invalid_request",
+      message:
+        "Fail review verdict cannot follow APPROVE review feedback in the same reviewer run; submit a pass verdict or start a fresh review run.",
     });
   });
 
@@ -383,6 +454,76 @@ function mergeGate(overrides: Partial<IssueMergeGateState> = {}): IssueMergeGate
     writebackOperationKeys: [],
     supersededByHeadSha: null,
     updatedAt: "2026-01-01T00:00:01.000Z",
+    ...overrides,
+  };
+}
+
+function approvalFeedback(overrides: Partial<IssueReviewFeedbackRecord> = {}): IssueReviewFeedbackRecord {
+  return reviewFeedback({
+    kind: "review",
+    event: "APPROVE",
+    body: "Looks good.",
+    reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-1",
+    commentUrls: [],
+    ...overrides,
+  });
+}
+
+function requestChangesFeedback(overrides: Partial<IssueReviewFeedbackRecord> = {}): IssueReviewFeedbackRecord {
+  return reviewFeedback({
+    id: "review-feedback:issue-1:review-run-1:request-changes-1",
+    idempotencyKey: "request-changes-1",
+    kind: "review",
+    event: "REQUEST_CHANGES",
+    body: "Please update the tests.",
+    reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-2",
+    commentUrls: [],
+    ...overrides,
+  });
+}
+
+function issueCommentFeedback(overrides: Partial<IssueReviewFeedbackRecord> = {}): IssueReviewFeedbackRecord {
+  return reviewFeedback({
+    id: "review-feedback:issue-1:review-run-1:issue-comment-1",
+    idempotencyKey: "issue-comment-1",
+    kind: "issue_comment",
+    event: null,
+    body: "High-level note.",
+    reviewUrl: null,
+    commentUrls: ["https://github.com/acme/symphony/pull/42#issuecomment-1"],
+    ...overrides,
+  });
+}
+
+function reviewCommentFeedback(overrides: Partial<IssueReviewFeedbackRecord> = {}): IssueReviewFeedbackRecord {
+  return reviewFeedback({
+    id: "review-feedback:issue-1:review-run-1:review-comment-1",
+    idempotencyKey: "review-comment-1",
+    kind: "review_comment",
+    event: null,
+    body: "Inline note.",
+    reviewUrl: null,
+    commentUrls: ["https://github.com/acme/symphony/pull/42#discussion_r1"],
+    ...overrides,
+  });
+}
+
+function reviewFeedback(overrides: Partial<IssueReviewFeedbackRecord> = {}): IssueReviewFeedbackRecord {
+  return {
+    id: "review-feedback:issue-1:review-run-1:approve-1",
+    idempotencyKey: "approve-1",
+    requestHash: "request-hash",
+    runId: "review-run-1",
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    kind: "review",
+    event: "APPROVE",
+    body: "Looks good.",
+    pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+    reviewer: "reviewer-1",
+    reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-1",
+    commentUrls: [],
+    submittedAt: "2026-01-01T00:00:02.000Z",
     ...overrides,
   };
 }
