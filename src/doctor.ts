@@ -454,7 +454,7 @@ export async function githubPublicationDoctorCheck(config: ServiceConfig): Promi
     return {
       id: "github.pr_publication",
       status: "ok",
-      message: `GitHub PR publication can access ${config.github.owner}/${config.github.repo}`,
+      message: githubAccessMessage("GitHub PR publication", config, github),
     };
   } catch (error) {
     return { id: "github.pr_publication", status: "error", message: `github.publication: ${errorMessage(error)}` };
@@ -468,11 +468,21 @@ export async function githubReviewFeedbackDoctorCheck(config: ServiceConfig): Pr
     return {
       id: "github.review_feedback_write",
       status: "ok",
-      message: `GitHub PR review feedback can access ${config.github.owner}/${config.github.repo}`,
+      message: githubAccessMessage("GitHub PR review feedback", config, github),
     };
   } catch (error) {
     return { id: "github.review_feedback_write", status: "error", message: `github.review_feedback_write: ${errorMessage(error)}` };
   }
+}
+
+function githubAccessMessage(
+  action: "GitHub PR publication" | "GitHub PR review feedback",
+  config: ServiceConfig,
+  github: ReturnType<typeof createGitHubPullRequestClientForCapability>,
+): string {
+  const base = `${action} can access ${config.github.owner}/${config.github.repo}`;
+  const authDescription = github.authenticationDescription();
+  return authDescription ? `${base} using ${authDescription}` : base;
 }
 
 function cursorRuntimeDoctorCheck(config: ServiceConfig): DoctorCheck {

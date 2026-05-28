@@ -371,6 +371,11 @@ describe("doctor review-loop checks", () => {
           owner: "acme",
           repo: "symphony",
           token: "legacy-github-token",
+          app: {
+            app_id: "12345",
+            installation_id: "67890",
+            private_key: "not-a-real-private-key-publication-profile-should-win",
+          },
           api_base_url: "https://api.github.test",
           publish_pull_requests: true,
           pr_handoff: { enabled: false },
@@ -401,7 +406,7 @@ describe("doctor review-loop checks", () => {
     await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
       id: "github.pr_publication",
       status: "ok",
-      message: "GitHub PR publication can access acme/symphony",
+      message: "GitHub PR publication can access acme/symphony using static GitHub token",
     });
     expect(authorizations).toEqual(["Bearer publication-secret"]);
   });
@@ -453,6 +458,11 @@ describe("doctor review-loop checks", () => {
           owner: "acme",
           repo: "symphony",
           token: "legacy-github-token",
+          app: {
+            app_id: "12345",
+            installation_id: "67890",
+            private_key: "not-a-real-private-key-feedback-profile-should-win",
+          },
           api_base_url: "https://api.github.test",
         },
         credential_profiles: {
@@ -481,7 +491,7 @@ describe("doctor review-loop checks", () => {
     await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
       id: "github.review_feedback_write",
       status: "ok",
-      message: "GitHub PR review feedback can access acme/symphony",
+      message: "GitHub PR review feedback can access acme/symphony using static GitHub token",
     });
     expect(authorizations).toEqual(["Bearer feedback-secret"]);
   });

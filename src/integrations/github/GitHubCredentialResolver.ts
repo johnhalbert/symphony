@@ -1,7 +1,8 @@
 import type { ServiceConfig, GitHubConfig } from "../../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../../core/config/CredentialProfiles.js";
 import { SymphonyError } from "../../core/errors.js";
-import { GitHubPullRequestClient } from "./GitHubPullRequestClient.js";
+import { GitHubAppInstallationTokenProvider } from "./GitHubAppInstallationTokenProvider.js";
+import { GitHubPullRequestClient, type GitHubAuthTokenProvider } from "./GitHubPullRequestClient.js";
 
 type FetchLike = typeof fetch;
 
@@ -42,14 +43,17 @@ export function resolveGitHubClientConfig(
   }
 
   const credential = config.credentialProfiles.resolveForRole(role, capability);
+  const selectedStaticCredential = shouldUseGitHubAppByDefault(config.github, capability, credential)
+    ? null
+    : credential;
   return {
     capability,
     role,
     github: {
       ...config.github,
-      token: credential?.value ?? null,
+      token: selectedStaticCredential?.value ?? null,
     },
-    credential,
+    credential: selectedStaticCredential,
   };
 }
 
@@ -58,5 +62,23 @@ export function createGitHubPullRequestClientForCapability(
   capability: GitHubCredentialCapability,
   fetchImpl?: FetchLike,
 ): GitHubPullRequestClient {
-  return new GitHubPullRequestClient(resolveGitHubClientConfig(config, capability).github, fetchImpl);
+  const resolved = resolveGitHubClientConfig(config, capability).github;
+  return new GitHubPullRequestClient(resolved, fetchImpl, createGitHubAuthTokenProvider(resolved, fetchImpl));
+}
+
+function createGitHubAuthTokenProvider(
+  github: GitHubConfig,
+  fetchImpl?: FetchLike,
+): GitHubAuthTokenProvider | null {
+  if (github.app === null) return null;
+  return new GitHubAppInstallationTokenProvider(github.app, github.apiBaseUrl, fetchImpl);
+}
+
+function shouldUseGitHubAppByDefault(
+  github: GitHubConfig,
+  capability: GitHubCredentialCapability,
+  credential: ResolvedCredential | null,
+): boolean {
+  if (github.app === null || credential?.source !== "legacy") return false;
+  return capability === "github.publication" || capability === "github.review_feedback_write";
 }

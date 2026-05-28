@@ -88,6 +88,72 @@ describe("GitHub credential resolver", () => {
     expect(resolveGitHubClientConfig(config, "github.merge").github.token).toBe("merge-token");
   });
 
+  it("defaults publication and review-feedback to App auth over legacy GitHub tokens", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "$GITHUB_TOKEN",
+          app: { app_id: "12345", installation_id: "67890", private_key: "fake-private-key" },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_TOKEN: "legacy-github-secret",
+      },
+    );
+
+    for (const capability of ["github.publication", "github.review_feedback_write"] as const) {
+      const resolved = resolveGitHubClientConfig(config, capability);
+      expect(resolved.github.token).toBeNull();
+      expect(resolved.github.app).not.toBeNull();
+      expect(resolved.credential).toBeNull();
+    }
+  });
+
+  it("keeps explicit capability profile tokens ahead of App auth", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "$GITHUB_TOKEN",
+          app: { app_id: "12345", installation_id: "67890", private_key: "fake-private-key" },
+        },
+        credential_profiles: {
+          profiles: {
+            publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+            feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+          },
+          roles: {
+            service: { "github.publication": "publication" },
+            reviewer: { "github.review_feedback_write": "feedback" },
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_TOKEN: "legacy-github-secret",
+        GITHUB_PUBLICATION_TOKEN: "publication-token",
+        GITHUB_FEEDBACK_TOKEN: "feedback-token",
+      },
+    );
+
+    expect(resolveGitHubClientConfig(config, "github.publication")).toMatchObject({
+      github: { token: "publication-token" },
+      credential: { source: "profile", value: "publication-token" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.review_feedback_write")).toMatchObject({
+      github: { token: "feedback-token" },
+      credential: { source: "profile", value: "feedback-token" },
+    });
+  });
+
   it("reports missing publication tokens through the publication client", async () => {
     const config = parseServiceConfig(
       {

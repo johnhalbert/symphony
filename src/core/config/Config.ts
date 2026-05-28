@@ -191,6 +191,17 @@ const rawConfigSchema = z
         owner: z.string().optional(),
         repo: z.string().optional(),
         token: z.string().optional(),
+        app: z
+          .object({
+            app_id: z.string().optional(),
+            client_id: z.string().optional(),
+            installation_id: z.string().optional(),
+            private_key: z.string().optional(),
+            private_key_path: z.string().optional(),
+            token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
+          })
+          .passthrough()
+          .optional(),
         head_owner: z.string().optional(),
         api_base_url: z.string().optional(),
         publish_pull_requests: z.boolean().optional(),
@@ -321,11 +332,22 @@ export interface GitHubConfig {
   owner: string | null;
   repo: string | null;
   token: string | null;
+  app: GitHubAppConfig | null;
   headOwner: string | null;
   apiBaseUrl: string;
   publishPullRequests: boolean;
   operatorApproval?: GitHubOperatorApprovalConfig;
   prHandoff: GitHubPullRequestHandoffConfig;
+}
+
+export interface GitHubAppConfig {
+  appId: string | null;
+  clientId: string | null;
+  installationId: string | null;
+  privateKey: string | null;
+  privateKeyEnvVar: string | null;
+  privateKeyPath: string | null;
+  tokenRefreshBufferSeconds: number;
 }
 
 export interface GitHubOperatorApprovalConfig {
@@ -435,6 +457,7 @@ const DEFAULT_CURSOR_MODEL_PARAMS: CursorModelParameter[] = [
   { id: "context", value: "272k" },
   { id: "reasoning", value: "extra-high" },
 ];
+const DEFAULT_GITHUB_APP_TOKEN_REFRESH_BUFFER_SECONDS = 300;
 const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
   "Break down {{ issue.identifier }} before implementation.",
   "",
@@ -534,6 +557,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const githubToken = normalizeOptionalConfigString(
     resolveConfigString(raw.github?.token, env) ?? resolveConfigString("$GITHUB_TOKEN", env),
   );
+  const githubApp = normalizeGitHubAppConfig(raw.github?.app, workflowDir, env);
   const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
   const publishPullRequests = raw.github?.publish_pull_requests ?? false;
   const githubOperatorApproval = {
@@ -665,6 +689,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       owner: githubOwner,
       repo: githubRepo,
       token: githubToken,
+      app: githubApp,
       headOwner: githubHeadOwner,
       apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
       publishPullRequests,
@@ -727,6 +752,67 @@ export function resolvePathValue(value: string, baseDir: string, env: NodeJS.Pro
       ? path.join(os.homedir(), resolvedVariable.slice(2))
       : resolvedVariable;
   return path.resolve(baseDir, homeExpanded);
+}
+
+function normalizeGitHubAppConfig(
+  rawApp: NonNullable<RawWorkflowConfig["github"]>["app"],
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+): GitHubAppConfig | null {
+  const appId = normalizeOptionalConfigString(resolveConfigString(rawApp?.app_id ?? "$GITHUB_APP_ID", env));
+  const clientId = normalizeOptionalConfigString(resolveConfigString(rawApp?.client_id ?? "$GITHUB_APP_CLIENT_ID", env));
+  const installationId = normalizeOptionalConfigString(
+    resolveConfigString(rawApp?.installation_id ?? "$GITHUB_APP_INSTALLATION_ID", env),
+  );
+  const privateKey = normalizeGitHubAppPrivateKey(rawApp?.private_key, env);
+  const privateKeyPath = normalizeGitHubAppPrivateKeyPath(rawApp?.private_key_path, workflowDir, env);
+  const tokenRefreshBufferSeconds =
+    rawApp?.token_refresh_buffer_seconds ?? DEFAULT_GITHUB_APP_TOKEN_REFRESH_BUFFER_SECONDS;
+
+  const hasExplicitConfig = rawApp !== undefined;
+  const hasEnvironmentConfig = Boolean(
+    appId || clientId || installationId || privateKey.value || privateKey.envVar || privateKeyPath,
+  );
+  if (!hasExplicitConfig && !hasEnvironmentConfig) return null;
+
+  return {
+    appId,
+    clientId,
+    installationId,
+    privateKey: privateKey.value,
+    privateKeyEnvVar: privateKey.envVar,
+    privateKeyPath,
+    tokenRefreshBufferSeconds,
+  };
+}
+
+interface NormalizedGitHubAppPrivateKey {
+  value: string | null;
+  envVar: string | null;
+}
+
+function normalizeGitHubAppPrivateKey(value: string | undefined, env: NodeJS.ProcessEnv): NormalizedGitHubAppPrivateKey {
+  if (value !== undefined) {
+    const envReference = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value.trim());
+    if (envReference?.[1]) {
+      return { value: null, envVar: envReference[1] };
+    }
+    return { value: normalizeOptionalConfigString(value), envVar: null };
+  }
+  return normalizeOptionalConfigString(env.GITHUB_APP_PRIVATE_KEY) === null
+    ? { value: null, envVar: null }
+    : { value: null, envVar: "GITHUB_APP_PRIVATE_KEY" };
+}
+
+function normalizeGitHubAppPrivateKeyPath(
+  value: string | undefined,
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  const rawPath = value ?? "$GITHUB_APP_PRIVATE_KEY_PATH";
+  const resolvedPath = normalizeOptionalConfigString(resolveConfigString(rawPath, env));
+  if (resolvedPath === null) return null;
+  return resolvePathValue(resolvedPath, workflowDir, env);
 }
 
 function normalizeStateLimitMap(input: Record<string, number> | undefined): Map<string, number> {

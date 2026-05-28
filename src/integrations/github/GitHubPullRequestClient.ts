@@ -3,7 +3,13 @@ import type { GitHubConfig } from "../../core/config/Config.js";
 import { SymphonyError } from "../../core/errors.js";
 
 type FetchLike = typeof fetch;
-type GitHubPullRequestClientConfig = Omit<GitHubConfig, "prHandoff"> & Partial<Pick<GitHubConfig, "prHandoff">>;
+export interface GitHubAuthTokenProvider {
+  getToken(): Promise<string>;
+  describe?(): string;
+}
+
+type GitHubPullRequestClientConfig = Omit<GitHubConfig, "prHandoff" | "app"> &
+  Partial<Pick<GitHubConfig, "prHandoff" | "app">>;
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 
 export interface PullRequestBranchLookup {
@@ -278,9 +284,13 @@ interface PullRequestReviewThreadMetadata {
 }
 
 export class GitHubPullRequestClient {
+  #lastAuthToken: string | null = null;
+  #lastAuthDescription: string | null = null;
+
   constructor(
     private readonly config: GitHubPullRequestClientConfig,
     private readonly fetchImpl: FetchLike = fetch,
+    private readonly authTokenProvider: GitHubAuthTokenProvider | null = null,
   ) {}
 
   async findOpenPullRequestByBranch(input: PullRequestBranchLookup): Promise<PullRequestMetadata | null> {
@@ -304,12 +314,7 @@ export class GitHubPullRequestClient {
 
     const response = await this.fetchImpl(url, {
       method: "GET",
-      headers: {
-        accept: "application/vnd.github+json",
-        authorization: `Bearer ${this.config.token}`,
-        "user-agent": "symphony",
-        "x-github-api-version": "2022-11-28",
-      },
+      headers: await this.requestHeaders(),
     });
 
     if (!response.ok) {
@@ -355,7 +360,7 @@ export class GitHubPullRequestClient {
     assertPullRequestNumber(input.pullRequestNumber, "PR merge inspection");
     const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}`), {
       method: "GET",
-      headers: requestHeaders(this.config.token ?? ""),
+      headers: await this.requestHeaders(),
     });
     if (!response.ok) {
       throw new SymphonyError("tracker_error", `GitHub PR inspection returned HTTP ${response.status}`);
@@ -386,10 +391,7 @@ export class GitHubPullRequestClient {
     const expectedHeadSha = requireNonEmpty(input.expectedHeadSha, "A pull request head SHA is required for PR merge");
     const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}/merge`), {
       method: "PUT",
-      headers: {
-        ...requestHeaders(this.config.token ?? ""),
-        "content-type": "application/json",
-      },
+      headers: await this.requestHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({
         sha: expectedHeadSha,
         merge_method: input.method,
@@ -419,7 +421,7 @@ export class GitHubPullRequestClient {
       this.repoUrl(`compare/${encodeURIComponent(ancestorSha)}...${encodeURIComponent(descendantSha)}`),
       {
         method: "GET",
-        headers: requestHeaders(this.config.token ?? ""),
+        headers: await this.requestHeaders(),
       },
     );
     if (!response.ok) {
@@ -439,10 +441,7 @@ export class GitHubPullRequestClient {
     const body = requireNonEmpty(input.body, "A review body is required for PR review feedback");
     const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}/reviews`), {
       method: "POST",
-      headers: {
-        ...requestHeaders(this.config.token ?? ""),
-        "content-type": "application/json",
-      },
+      headers: await this.requestHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({
         commit_id: headSha,
         event: input.event,
@@ -488,10 +487,7 @@ export class GitHubPullRequestClient {
           };
     const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}/comments`), {
       method: "POST",
-      headers: {
-        ...requestHeaders(this.config.token ?? ""),
-        "content-type": "application/json",
-      },
+      headers: await this.requestHeaders({ "content-type": "application/json" }),
       body: JSON.stringify(payload),
     });
     if (!response.ok) {
@@ -510,10 +506,7 @@ export class GitHubPullRequestClient {
     assertPullRequestNumber(input.pullRequestNumber, "PR issue comment feedback");
     const response = await this.fetchImpl(this.repoUrl(`issues/${input.pullRequestNumber}/comments`), {
       method: "POST",
-      headers: {
-        ...requestHeaders(this.config.token ?? ""),
-        "content-type": "application/json",
-      },
+      headers: await this.requestHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ body: requireNonEmpty(input.body, "An issue comment body is required for PR feedback") }),
     });
     if (!response.ok) {
@@ -527,7 +520,7 @@ export class GitHubPullRequestClient {
 
   async publishPullRequest(input: PullRequestPublicationInput): Promise<PullRequestPublicationResult> {
     this.assertConfiguredForPublication();
-    const token = this.config.token ?? "";
+    const token = await this.resolveAuthToken();
     const branchName = normalizeBranchName(input.branchName);
     assertSafePublishBranch(branchName);
     const baseBranch = normalizeBaseBranch(input.baseBranch) ?? input.baseBranch.trim();
@@ -594,59 +587,96 @@ export class GitHubPullRequestClient {
       this.repoUrl(""),
       {
         method: "GET",
-        headers: requestHeaders(this.config.token ?? ""),
+        headers: await this.requestHeaders(),
       },
     );
     if (!response.ok) {
-      throw new SymphonyError("tracker_error", `GitHub repository access returned HTTP ${response.status}`);
+      const detail = await githubErrorDetail(response, this.#lastAuthToken ?? this.config.token ?? null);
+      throw new SymphonyError(
+        "tracker_error",
+        detail.length === 0
+          ? `GitHub repository access returned HTTP ${response.status}`
+          : `GitHub repository access returned HTTP ${response.status}: ${detail}`,
+      );
     }
   }
 
   private isConfigured(): boolean {
-    return Boolean(this.config.owner && this.config.repo && this.config.token);
+    return Boolean(this.config.owner && this.config.repo && this.hasAuthentication());
+  }
+
+  private hasAuthentication(): boolean {
+    return Boolean(this.config.token?.trim() || this.authTokenProvider);
+  }
+
+  private async resolveAuthToken(): Promise<string> {
+    const staticToken = this.config.token?.trim();
+    if (staticToken) {
+      this.#lastAuthToken = staticToken;
+      this.#lastAuthDescription = "static GitHub token";
+      return staticToken;
+    }
+    const appToken = (await this.authTokenProvider?.getToken())?.trim() ?? "";
+    if (appToken.length > 0) {
+      this.#lastAuthToken = appToken;
+      this.#lastAuthDescription = this.authTokenProvider?.describe?.() ?? "GitHub App installation auth";
+      return appToken;
+    }
+    throw new SymphonyError("invalid_request", "GitHub token or GitHub App installation auth is required");
+  }
+
+  private async requestHeaders(extraHeaders: Record<string, string> = {}): Promise<Record<string, string>> {
+    return { ...requestHeaders(await this.resolveAuthToken()), ...extraHeaders };
+  }
+
+  authenticationDescription(): string | null {
+    return (
+      this.#lastAuthDescription ??
+      (this.config.token?.trim() ? "static GitHub token" : this.authTokenProvider?.describe?.() ?? null)
+    );
   }
 
   private assertConfiguredForPublication(): void {
-    if (!this.config.owner || !this.config.repo || !this.config.token) {
+    if (!this.config.owner || !this.config.repo || !this.hasAuthentication()) {
       throw new SymphonyError(
         "invalid_request",
-        "GitHub owner, repo, and token are required when PR publication is enabled",
+        "GitHub owner, repo, and token or GitHub App installation auth are required when PR publication is enabled",
       );
     }
   }
 
   private assertConfiguredForReviewEvidenceRead(): void {
-    if (!this.config.owner || !this.config.repo || !this.config.token) {
+    if (!this.config.owner || !this.config.repo || !this.hasAuthentication()) {
       throw new SymphonyError(
         "invalid_request",
-        "GitHub owner, repo, and token are required for PR review evidence ingestion",
+        "GitHub owner, repo, and token or GitHub App installation auth are required for PR review evidence ingestion",
       );
     }
   }
 
   private assertConfiguredForReviewFeedbackWrite(): void {
-    if (!this.config.owner || !this.config.repo || !this.config.token) {
+    if (!this.config.owner || !this.config.repo || !this.hasAuthentication()) {
       throw new SymphonyError(
         "invalid_request",
-        "GitHub owner, repo, and token are required for PR review feedback",
+        "GitHub owner, repo, and token or GitHub App installation auth are required for PR review feedback",
       );
     }
   }
 
   private assertConfiguredForRepositoryAccess(): void {
-    if (!this.config.owner || !this.config.repo || !this.config.token) {
+    if (!this.config.owner || !this.config.repo || !this.hasAuthentication()) {
       throw new SymphonyError(
         "invalid_request",
-        "GitHub owner, repo, and token are required for repository access",
+        "GitHub owner, repo, and token or GitHub App installation auth are required for repository access",
       );
     }
   }
 
   private assertConfiguredForMerge(): void {
-    if (!this.config.owner || !this.config.repo || !this.config.token) {
+    if (!this.config.owner || !this.config.repo || !this.hasAuthentication()) {
       throw new SymphonyError(
         "invalid_request",
-        "GitHub owner, repo, and token are required for service-owned PR merge",
+        "GitHub owner, repo, and token or GitHub App installation auth are required for service-owned PR merge",
       );
     }
   }
@@ -660,7 +690,7 @@ export class GitHubPullRequestClient {
   }
 
   private async githubWriteError(response: Response, action: string): Promise<string> {
-    const detail = await githubErrorDetail(response, this.config.token);
+    const detail = await githubErrorDetail(response, this.#lastAuthToken ?? this.config.token ?? null);
     return detail.length === 0 ? `${action} returned HTTP ${response.status}` : `${action} returned HTTP ${response.status}: ${detail}`;
   }
 
@@ -677,10 +707,7 @@ export class GitHubPullRequestClient {
       ),
       {
         method: "POST",
-        headers: {
-          ...requestHeaders(this.config.token ?? ""),
-          "content-type": "application/json",
-        },
+        headers: await this.requestHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({
           title: input.title,
           body: input.body,
@@ -708,9 +735,10 @@ export class GitHubPullRequestClient {
   }
 
   async getAuthenticatedLogin(): Promise<string | null> {
+    if (!this.hasAuthentication()) return null;
     const response = await this.fetchImpl(new URL("user", normalizedApiBaseUrl(this.config.apiBaseUrl)), {
       method: "GET",
-      headers: requestHeaders(this.config.token ?? ""),
+      headers: await this.requestHeaders(),
     });
     if (!response.ok) return null;
     const body = (await response.json()) as GitHubUserNode;
@@ -728,7 +756,7 @@ export class GitHubPullRequestClient {
     while (nextUrl) {
       const response = await this.fetchImpl(nextUrl, {
         method: "GET",
-        headers: requestHeaders(this.config.token ?? ""),
+        headers: await this.requestHeaders(),
       });
       if (!response.ok) {
         throw new SymphonyError("tracker_error", `GitHub PR review evidence returned HTTP ${response.status}`);
@@ -751,10 +779,7 @@ export class GitHubPullRequestClient {
     while (nextUrl) {
       const response = await this.fetchImpl(nextUrl, {
         method: "GET",
-        headers: {
-          ...requestHeaders(this.config.token ?? ""),
-          accept: "application/vnd.github+json",
-        },
+        headers: await this.requestHeaders({ accept: "application/vnd.github+json" }),
       });
       if (!response.ok) {
         throw new SymphonyError("tracker_error", `GitHub check run inspection returned HTTP ${response.status}`);
@@ -776,7 +801,7 @@ export class GitHubPullRequestClient {
     while (nextUrl) {
       const response = await this.fetchImpl(nextUrl, {
         method: "GET",
-        headers: requestHeaders(this.config.token ?? ""),
+        headers: await this.requestHeaders(),
       });
       if (!response.ok) {
         throw new SymphonyError("tracker_error", `GitHub commit status inspection returned HTTP ${response.status}`);
@@ -797,10 +822,7 @@ export class GitHubPullRequestClient {
     while (true) {
       const response = await this.fetchImpl(graphQlApiUrl(this.config.apiBaseUrl), {
         method: "POST",
-        headers: {
-          ...requestHeaders(this.config.token ?? ""),
-          "content-type": "application/json",
-        },
+        headers: await this.requestHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({
           query: REVIEW_THREADS_QUERY,
           variables: {
@@ -1314,7 +1336,8 @@ class GitWorktreePublisher {
       { allowFailure: true },
     );
     if (result.code !== 0) {
-      throw new SymphonyError("tracker_error", `GitHub branch push failed: ${result.stderr.trim() || result.stdout.trim()}`);
+      const detail = sanitizeSecret(result.stderr.trim() || result.stdout.trim(), token);
+      throw new SymphonyError("tracker_error", "GitHub branch push failed: " + detail);
     }
   }
 
