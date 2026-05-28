@@ -185,6 +185,11 @@ function addGitHubCapabilityEnvironment(
     return;
   }
 
+  if (config.github.app !== null) {
+    addGitHubAppCapabilityEnvironment(env, config, parentEnv);
+    return;
+  }
+
   const rawGithubToken = config.raw.github?.token;
   const rawGithubTokenRef = envReference(rawGithubToken);
   if (rawGithubTokenRef) {
@@ -202,12 +207,6 @@ function addGitHubCapabilityEnvironment(
     env.GITHUB_TOKEN = config.github.token;
     return;
   }
-
-  if (config.github.app !== null) {
-    addGitHubAppCapabilityEnvironment(env, config, parentEnv);
-    return;
-  }
-
   env.GITHUB_TOKEN = "";
 }
 

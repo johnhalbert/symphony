@@ -272,54 +272,84 @@ describe("GitHub App installation token auth", () => {
     }
   });
 
-  it("doctor reports static-token auth when static token and App auth are both configured", async () => {
-    const config = parseServiceConfig(
-      {
-        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
-        github: {
-          owner: "acme",
-          repo: "symphony",
-          token: "$GITHUB_TOKEN",
-          api_base_url: "https://api.github.test",
-          publish_pull_requests: true,
-          pr_handoff: { enabled: false },
-          app: {
-            app_id: "12345",
-            client_id: "Iv1.client-id",
-            installation_id: "67890",
-            private_key: "not-a-real-private-key-static-token-should-win",
+  it.each([
+    {
+      name: "top-level github.token ref",
+      githubTokenConfig: "$GITHUB_TOKEN",
+      legacyEnv: { GITHUB_TOKEN: "static-secret" },
+      mintedToken: "ghs_top_level_app_token",
+    },
+    {
+      name: "ambient GITHUB_TOKEN fallback",
+      githubTokenConfig: undefined,
+      legacyEnv: { GITHUB_TOKEN: "ambient-static-secret" },
+      mintedToken: "ghs_ambient_app_token",
+    },
+    {
+      name: "literal github.token",
+      githubTokenConfig: "literal-static-secret",
+      legacyEnv: {},
+      mintedToken: "ghs_literal_app_token",
+    },
+  ])(
+    "doctor defaults to App auth when App auth is mixed with $name",
+    async ({ githubTokenConfig, legacyEnv, mintedToken }) => {
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          github: {
+            owner: "acme",
+            repo: "symphony",
+            ...(githubTokenConfig === undefined ? {} : { token: githubTokenConfig }),
+            api_base_url: "https://api.github.test",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+            app: {
+              app_id: "12345",
+              client_id: "Iv1.client-id",
+              installation_id: "67890",
+              private_key: generatePrivateKey(),
+            },
           },
         },
-      },
-      "/repo/WORKFLOW.md",
-      { LINEAR_API_KEY: "linear-secret", GITHUB_TOKEN: "static-secret" },
-    );
-    const calls: FetchCall[] = [];
-    vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-      const call = recordFetchCall(input, init);
-      calls.push(call);
-      if (call.url.pathname.endsWith("/access_tokens")) {
-        throw new Error("App token endpoint should not be called when static-token auth is used");
-      }
-      return jsonResponse({ id: 1, full_name: "acme/symphony" });
-    });
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "linear-secret", ...legacyEnv },
+      );
+      const calls: FetchCall[] = [];
+      vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const call = recordFetchCall(input, init);
+        calls.push(call);
+        if (call.url.pathname.endsWith("/access_tokens")) {
+          return jsonResponse({ token: mintedToken, expires_at: "2026-01-01T01:00:00.000Z" });
+        }
+        return jsonResponse({ id: 1, full_name: "acme/symphony" });
+      });
 
-    await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
-      id: "github.pr_publication",
-      status: "ok",
-      message: "GitHub PR publication can access acme/symphony using static GitHub token",
-    });
-    await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
-      id: "github.review_feedback_write",
-      status: "ok",
-      message: "GitHub PR review feedback can access acme/symphony using static GitHub token",
-    });
-    expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
-      "GET /repos/acme/symphony",
-      "GET /repos/acme/symphony",
-    ]);
-    expect(calls.map((call) => call.authorization)).toEqual(["Bearer static-secret", "Bearer static-secret"]);
-  });
+      await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
+        id: "github.pr_publication",
+        status: "ok",
+        message: "GitHub PR publication can access acme/symphony using GitHub App installation 67890",
+      });
+      await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
+        id: "github.review_feedback_write",
+        status: "ok",
+        message: "GitHub PR review feedback can access acme/symphony using GitHub App installation 67890",
+      });
+      expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+        "POST /app/installations/67890/access_tokens",
+        "GET /repos/acme/symphony",
+        "POST /app/installations/67890/access_tokens",
+        "GET /repos/acme/symphony",
+      ]);
+      expect(calls.filter((call) => call.url.pathname === "/repos/acme/symphony").map((call) => call.authorization)).toEqual([
+        `Bearer ${mintedToken}`,
+        `Bearer ${mintedToken}`,
+      ]);
+      expect(calls.map((call) => call.authorization)).not.toContain("Bearer static-secret");
+      expect(calls.map((call) => call.authorization)).not.toContain("Bearer ambient-static-secret");
+      expect(calls.map((call) => call.authorization)).not.toContain("Bearer literal-static-secret");
+    },
+  );
 
   it("doctor validates App-backed repository access and reports the installation", async () => {
     const config = appServiceConfig({ private_key: generatePrivateKey() });

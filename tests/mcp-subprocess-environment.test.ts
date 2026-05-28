@@ -325,7 +325,88 @@ describe("MCP subprocess environment", () => {
     },
   );
 
-  it("carries custom GitHub App refs for review feedback when a static token ref is empty", () => {
+  it.each([
+    {
+      name: "top-level github.token ref",
+      github: { token: "$GITHUB_TOKEN" },
+      sourceEnv: { GITHUB_TOKEN: "legacy-github-secret" },
+    },
+    {
+      name: "ambient GITHUB_TOKEN fallback",
+      github: {},
+      sourceEnv: { GITHUB_TOKEN: "ambient-github-secret" },
+    },
+  ])("carries App refs and withholds non-empty legacy tokens for $name", (scenario) => {
+    for (const command of ["completion-report-mcp", "review-feedback-mcp"] as const) {
+      const rawConfig = {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "$GITHUB_OWNER",
+          repo: "$GITHUB_REPO",
+          publish_pull_requests: true,
+          pr_handoff: { enabled: false },
+          ...scenario.github,
+        },
+      } as const;
+      const sourceEnv = {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_OWNER: "acme",
+        GITHUB_REPO: "symphony",
+        GITHUB_APP_ID: "12345",
+        GITHUB_APP_CLIENT_ID: "Iv1.client-id",
+        GITHUB_APP_INSTALLATION_ID: "67890",
+        GITHUB_APP_PRIVATE_KEY: "",
+        GITHUB_APP_PRIVATE_KEY_PATH: "/secrets/github-app-private-key.pem",
+        ...scenario.sourceEnv,
+      };
+      const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+      expect(config.github.token).toMatch(/github-secret$/);
+      expect(config.github.app).not.toBeNull();
+      const resolvedKeyPath = config.github.app?.privateKeyPath;
+
+      const env = buildMcpSubprocessEnvironment({
+        config,
+        command,
+        parentEnv: {
+          PATH: "/bin",
+          ...sourceEnv,
+          GITHUB_TOKEN: "decoy-parent-github-secret",
+          CURSOR_API_KEY: "cursor-parent-secret",
+        },
+      });
+
+      expect(env).toMatchObject({
+        GITHUB_OWNER: "acme",
+        GITHUB_REPO: "symphony",
+        GITHUB_APP_ID: "12345",
+        GITHUB_APP_CLIENT_ID: "Iv1.client-id",
+        GITHUB_APP_INSTALLATION_ID: "67890",
+        GITHUB_APP_PRIVATE_KEY: "",
+        GITHUB_APP_PRIVATE_KEY_PATH: resolvedKeyPath,
+      });
+      expect(env).not.toHaveProperty("GITHUB_TOKEN");
+      expect(env).not.toHaveProperty("CURSOR_API_KEY");
+
+      const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+      expect(childConfig.github).toMatchObject({
+        owner: "acme",
+        repo: "symphony",
+        token: null,
+        publishPullRequests: true,
+        app: {
+          appId: "12345",
+          clientId: "Iv1.client-id",
+          installationId: "67890",
+          privateKey: null,
+          privateKeyEnvVar: null,
+          privateKeyPath: resolvedKeyPath,
+          tokenRefreshBufferSeconds: 300,
+        },
+      });
+    }
+  });
+
+  it("carries custom GitHub App refs for review feedback without propagating an empty static token ref", () => {
     const rawConfig = {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
       github: {
@@ -378,16 +459,16 @@ describe("MCP subprocess environment", () => {
     expect(env).toMatchObject({
       GITHUB_OWNER: "acme",
       GITHUB_REPO: "symphony",
-      EMPTY_GITHUB_TOKEN: "",
       CUSTOM_APP_ID: "app-123",
       CUSTOM_APP_CLIENT_ID: "Iv1.custom-client",
       CUSTOM_APP_INSTALLATION_ID: "install-456",
       CUSTOM_APP_PRIVATE_KEY: "fake-custom-app-private-key-value",
       CUSTOM_APP_PRIVATE_KEY_PATH: resolvedKeyPath,
     });
+    expect(env).not.toHaveProperty("EMPTY_GITHUB_TOKEN");
     expect(env).not.toHaveProperty("GITHUB_TOKEN");
     expect(env).not.toHaveProperty("GITHUB_PUBLICATION_TOKEN");
-    expect(githubEnvKeys(env)).toEqual(["EMPTY_GITHUB_TOKEN", "GITHUB_OWNER", "GITHUB_REPO"]);
+    expect(githubEnvKeys(env)).toEqual(["GITHUB_OWNER", "GITHUB_REPO"]);
 
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     expect(childConfig.github).toMatchObject({

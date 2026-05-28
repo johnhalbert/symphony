@@ -371,6 +371,11 @@ describe("doctor review-loop checks", () => {
           owner: "acme",
           repo: "symphony",
           token: "legacy-github-token",
+          app: {
+            app_id: "12345",
+            installation_id: "67890",
+            private_key: "not-a-real-private-key-publication-profile-should-win",
+          },
           api_base_url: "https://api.github.test",
           publish_pull_requests: true,
           pr_handoff: { enabled: false },
@@ -453,6 +458,11 @@ describe("doctor review-loop checks", () => {
           owner: "acme",
           repo: "symphony",
           token: "legacy-github-token",
+          app: {
+            app_id: "12345",
+            installation_id: "67890",
+            private_key: "not-a-real-private-key-feedback-profile-should-win",
+          },
           api_base_url: "https://api.github.test",
         },
         credential_profiles: {

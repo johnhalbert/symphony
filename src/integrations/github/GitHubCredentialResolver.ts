@@ -43,14 +43,17 @@ export function resolveGitHubClientConfig(
   }
 
   const credential = config.credentialProfiles.resolveForRole(role, capability);
+  const selectedStaticCredential = shouldUseGitHubAppByDefault(config.github, capability, credential)
+    ? null
+    : credential;
   return {
     capability,
     role,
     github: {
       ...config.github,
-      token: credential?.value ?? null,
+      token: selectedStaticCredential?.value ?? null,
     },
-    credential,
+    credential: selectedStaticCredential,
   };
 }
 
@@ -69,4 +72,13 @@ function createGitHubAuthTokenProvider(
 ): GitHubAuthTokenProvider | null {
   if (github.app === null) return null;
   return new GitHubAppInstallationTokenProvider(github.app, github.apiBaseUrl, fetchImpl);
+}
+
+function shouldUseGitHubAppByDefault(
+  github: GitHubConfig,
+  capability: GitHubCredentialCapability,
+  credential: ResolvedCredential | null,
+): boolean {
+  if (github.app === null || credential?.source !== "legacy") return false;
+  return capability === "github.publication" || capability === "github.review_feedback_write";
 }
