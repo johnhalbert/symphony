@@ -28,6 +28,7 @@ export * from "./core/workflow/ReviewLoopPromptGuidance.js";
 export * from "./core/workflow/WorkflowLoader.js";
 export * from "./core/workspace/WorkspaceManager.js";
 export * from "./integrations/github/GitHubCredentialResolver.js";
+export * from "./integrations/github/GitHubAppInstallationTokenProvider.js";
 export * from "./integrations/github/GitHubPullRequestClient.js";
 export * from "./integrations/linear/LinearCredentialResolver.js";
 export * from "./integrations/linear/LinearTrackerClient.js";

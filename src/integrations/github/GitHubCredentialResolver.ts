@@ -1,7 +1,8 @@
 import type { ServiceConfig, GitHubConfig } from "../../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../../core/config/CredentialProfiles.js";
 import { SymphonyError } from "../../core/errors.js";
-import { GitHubPullRequestClient } from "./GitHubPullRequestClient.js";
+import { GitHubAppInstallationTokenProvider } from "./GitHubAppInstallationTokenProvider.js";
+import { GitHubPullRequestClient, type GitHubAuthTokenProvider } from "./GitHubPullRequestClient.js";
 
 type FetchLike = typeof fetch;
 
@@ -58,5 +59,14 @@ export function createGitHubPullRequestClientForCapability(
   capability: GitHubCredentialCapability,
   fetchImpl?: FetchLike,
 ): GitHubPullRequestClient {
-  return new GitHubPullRequestClient(resolveGitHubClientConfig(config, capability).github, fetchImpl);
+  const resolved = resolveGitHubClientConfig(config, capability).github;
+  return new GitHubPullRequestClient(resolved, fetchImpl, createGitHubAuthTokenProvider(resolved, fetchImpl));
+}
+
+function createGitHubAuthTokenProvider(
+  github: GitHubConfig,
+  fetchImpl?: FetchLike,
+): GitHubAuthTokenProvider | null {
+  if (github.app === null) return null;
+  return new GitHubAppInstallationTokenProvider(github.app, github.apiBaseUrl, fetchImpl);
 }
