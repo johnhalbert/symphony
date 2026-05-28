@@ -49,6 +49,7 @@ import {
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import { projectWebHistory } from "./WebHistoryProjection.js";
+import { projectWebTranscript } from "./WebTranscriptProjection.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -211,6 +212,21 @@ export class StatusServer {
           includeTranscriptEvents: false,
         });
         sendJson(response, 200, projectWebHistory(runs, activityFeed.activity));
+        return;
+      }
+      const webTranscriptMatch = /^\/api\/v1\/web\/sessions\/([^/]+)\/transcript$/.exec(url.pathname);
+      if (request.method === "GET" && webTranscriptMatch) {
+        const sessionIdOrRunId = decodeURIComponent(webTranscriptMatch[1] ?? "").trim();
+        if (!this.options.runStore || sessionIdOrRunId.length === 0) {
+          sendJson(response, 200, []);
+          return;
+        }
+        const run = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId);
+        if (!run) {
+          sendJson(response, 200, []);
+          return;
+        }
+        sendJson(response, 200, projectWebTranscript(await readFullWebTranscript(this.options.runStore, run.runId)));
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
@@ -2258,6 +2274,28 @@ async function runOperatorLiveness(
     return orphanedOperatorLiveness(run, false, runStore);
   }
   return null;
+}
+
+const WEB_TRANSCRIPT_PAGE_LIMIT = 1_000;
+
+async function resolveWebTranscriptRun(runStore: RunTranscriptStore, sessionIdOrRunId: string): Promise<RunRecord | null> {
+  const directRun = await runStore.getRun(sessionIdOrRunId);
+  if (directRun) return directRun;
+  const runs = (await runStore.listRuns()).sort(compareRunChronology);
+  return runs.find((run) => run.sessionId === sessionIdOrRunId) ?? null;
+}
+
+async function readFullWebTranscript(runStore: RunTranscriptStore, runId: string): Promise<TranscriptEvent[]> {
+  const events: TranscriptEvent[] = [];
+  let offset = 0;
+  do {
+    const page = await runStore.readTranscript(runId, { offset, limit: WEB_TRANSCRIPT_PAGE_LIMIT });
+    events.push(...page.events);
+    if (page.nextOffset === null) break;
+    if (page.nextOffset <= offset) break;
+    offset = page.nextOffset;
+  } while (true);
+  return events;
 }
 
 async function runTelemetrySummary(runId: string, runStore?: RunTranscriptStore): Promise<{
