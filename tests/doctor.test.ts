@@ -401,7 +401,7 @@ describe("doctor review-loop checks", () => {
     await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
       id: "github.pr_publication",
       status: "ok",
-      message: "GitHub PR publication can access acme/symphony",
+      message: "GitHub PR publication can access acme/symphony using static GitHub token",
     });
     expect(authorizations).toEqual(["Bearer publication-secret"]);
   });
@@ -481,7 +481,7 @@ describe("doctor review-loop checks", () => {
     await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
       id: "github.review_feedback_write",
       status: "ok",
-      message: "GitHub PR review feedback can access acme/symphony",
+      message: "GitHub PR review feedback can access acme/symphony using static GitHub token",
     });
     expect(authorizations).toEqual(["Bearer feedback-secret"]);
   });

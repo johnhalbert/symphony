@@ -482,7 +482,7 @@ function githubAccessMessage(
 ): string {
   const base = `${action} can access ${config.github.owner}/${config.github.repo}`;
   const authDescription = github.authenticationDescription();
-  return authDescription?.startsWith("GitHub App") ? `${base} using ${authDescription}` : base;
+  return authDescription ? `${base} using ${authDescription}` : base;
 }
 
 function cursorRuntimeDoctorCheck(config: ServiceConfig): DoctorCheck {

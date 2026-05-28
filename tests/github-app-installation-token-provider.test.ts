@@ -272,6 +272,55 @@ describe("GitHub App installation token auth", () => {
     }
   });
 
+  it("doctor reports static-token auth when static token and App auth are both configured", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "$GITHUB_TOKEN",
+          api_base_url: "https://api.github.test",
+          publish_pull_requests: true,
+          pr_handoff: { enabled: false },
+          app: {
+            app_id: "12345",
+            client_id: "Iv1.client-id",
+            installation_id: "67890",
+            private_key: "not-a-real-private-key-static-token-should-win",
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-secret", GITHUB_TOKEN: "static-secret" },
+    );
+    const calls: FetchCall[] = [];
+    vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const call = recordFetchCall(input, init);
+      calls.push(call);
+      if (call.url.pathname.endsWith("/access_tokens")) {
+        throw new Error("App token endpoint should not be called when static-token auth is used");
+      }
+      return jsonResponse({ id: 1, full_name: "acme/symphony" });
+    });
+
+    await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
+      id: "github.pr_publication",
+      status: "ok",
+      message: "GitHub PR publication can access acme/symphony using static GitHub token",
+    });
+    await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
+      id: "github.review_feedback_write",
+      status: "ok",
+      message: "GitHub PR review feedback can access acme/symphony using static GitHub token",
+    });
+    expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+      "GET /repos/acme/symphony",
+      "GET /repos/acme/symphony",
+    ]);
+    expect(calls.map((call) => call.authorization)).toEqual(["Bearer static-secret", "Bearer static-secret"]);
+  });
+
   it("doctor validates App-backed repository access and reports the installation", async () => {
     const config = appServiceConfig({ private_key: generatePrivateKey() });
     const calls: FetchCall[] = [];

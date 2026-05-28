@@ -285,6 +285,7 @@ interface PullRequestReviewThreadMetadata {
 
 export class GitHubPullRequestClient {
   #lastAuthToken: string | null = null;
+  #lastAuthDescription: string | null = null;
 
   constructor(
     private readonly config: GitHubPullRequestClientConfig,
@@ -612,11 +613,13 @@ export class GitHubPullRequestClient {
     const staticToken = this.config.token?.trim();
     if (staticToken) {
       this.#lastAuthToken = staticToken;
+      this.#lastAuthDescription = "static GitHub token";
       return staticToken;
     }
     const appToken = (await this.authTokenProvider?.getToken())?.trim() ?? "";
     if (appToken.length > 0) {
       this.#lastAuthToken = appToken;
+      this.#lastAuthDescription = this.authTokenProvider?.describe?.() ?? "GitHub App installation auth";
       return appToken;
     }
     throw new SymphonyError("invalid_request", "GitHub token or GitHub App installation auth is required");
@@ -627,7 +630,10 @@ export class GitHubPullRequestClient {
   }
 
   authenticationDescription(): string | null {
-    return this.authTokenProvider?.describe?.() ?? (this.config.token?.trim() ? "static GitHub token" : null);
+    return (
+      this.#lastAuthDescription ??
+      (this.config.token?.trim() ? "static GitHub token" : this.authTokenProvider?.describe?.() ?? null)
+    );
   }
 
   private assertConfiguredForPublication(): void {
