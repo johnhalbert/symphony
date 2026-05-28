@@ -31,6 +31,7 @@ function issueDetails(overrides: Partial<IssueDetailsEnvelope> = {}): IssueDetai
       branchName: "symphony/TEST-1",
       url: "https://linear.test/TEST-1",
       assigneeId: "agent",
+      delegateId: null,
       labels: ["orchestrator", "observability"],
       blockedBy: [],
       createdAt: "2026-01-01T00:00:00.000Z",
