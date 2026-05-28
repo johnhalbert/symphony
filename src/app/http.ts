@@ -4,7 +4,7 @@ import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
-import { projectWebIssueDetail } from "./webProjection.js";
+import { projectWebIssueDetail, projectWebOrchestratorChat } from "./webProjection.js";
 import {
   runKindForPhase,
   toIssueStatusView,
@@ -241,6 +241,10 @@ export class StatusServer {
           return;
         }
         sendJson(response, 200, projectWebTranscript(await readFullWebTranscript(this.options.runStore, run.runId)));
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") {
+        sendJson(response, 200, projectWebOrchestratorChat());
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {

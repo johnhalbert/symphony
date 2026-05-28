@@ -411,6 +411,10 @@ export function emptyChatMessages(): ChatMessage[] {
   return [];
 }
 
+export function projectWebOrchestratorChat(): ChatMessage[] {
+  return emptyChatMessages();
+}
+
 export function projectIssueModel(
   source: IssueBoardCardProjectionInput | IssueDetailsEnvelope,
   options: ProjectIssueModelOptions = {},
