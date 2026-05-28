@@ -524,6 +524,139 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("serves web history from run records without hydrating transcripts", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "web-run-1",
+      sessionId: "cursor-session-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Build web history",
+      cursorModel: "claude-sonnet-4",
+      workspaceKey: "TEST-1",
+      workspacePath: path.join(config.workspace.root, "TEST-1"),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: "web-run-1",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "transcript detail should not be eagerly hydrated",
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/history");
+      const body = (await response.json()) as {
+        sessions: Array<{
+          id: string;
+          issue: string;
+          title: string;
+          state: string;
+          model: string;
+          msgCount: number;
+          lastEvent: string;
+          toolCount: number;
+        }>;
+        transcriptBySession: Record<string, unknown[]>;
+        timeline: Array<{ sess: string; kind: string; text: string; state?: string }>;
+        defaultSessionId: string;
+      };
+
+      expect(response.status).toBe(200);
+      expect(Object.keys(body).sort()).toEqual(["defaultSessionId", "sessions", "timeline", "transcriptBySession"]);
+      expect(body.transcriptBySession).toEqual({});
+      expect(body.defaultSessionId).toBe("web-run-1");
+      expect(body.sessions).toHaveLength(1);
+      expect(Object.keys(body.sessions[0] ?? {}).sort()).toEqual([
+        "id",
+        "issue",
+        "lastEvent",
+        "model",
+        "msgCount",
+        "startedAt",
+        "state",
+        "title",
+        "toolCount",
+        "updatedAt",
+      ]);
+      expect(body.sessions[0]).toMatchObject({
+        id: "web-run-1",
+        issue: "TEST-1",
+        title: "TEST-1",
+        state: "running",
+        model: "claude-sonnet-4",
+        msgCount: 1,
+        lastEvent: "TEST-1 run started",
+        toolCount: 0,
+      });
+      expect(body.timeline).toHaveLength(1);
+      expect(body.timeline[0]).toMatchObject({
+        sess: "web-run-1",
+        kind: "status",
+        text: "TEST-1 run started",
+        state: "running",
+      });
+      expect(JSON.stringify(body.timeline)).not.toContain("transcript detail should not be eagerly hydrated");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves an empty web history when no run store is configured", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/history");
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        sessions: [],
+        transcriptBySession: {},
+        timeline: [],
+        defaultSessionId: "",
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("scrubs inactive merge-gate blockers from durable status responses", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);

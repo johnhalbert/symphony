@@ -47,6 +47,7 @@ import {
 } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
+import { projectWebHistory } from "./WebHistoryProjection.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -191,6 +192,24 @@ export class StatusServer {
             query: parseActivityQuery(url),
           }),
         );
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/web/history") {
+        if (!this.options.runStore) {
+          sendJson(response, 200, projectWebHistory([], []));
+          return;
+        }
+        const runs = await this.options.runStore.listRuns();
+        const activityFeed = await buildActivityFeed({
+          generatedAt: this.options.orchestrator.snapshot().generatedAt,
+          runStore: this.options.runStore,
+          runs,
+          lifecycleStore: this.options.lifecycleStore,
+          writebackOutbox: this.options.writebackOutbox,
+          query: { issue: null, offset: 0, limit: Number.MAX_SAFE_INTEGER },
+          includeTranscriptEvents: false,
+        });
+        sendJson(response, 200, projectWebHistory(runs, activityFeed.activity));
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
@@ -1210,11 +1229,14 @@ const TERMINAL_ACTIVITY_TRANSCRIPT_TAIL = 256;
 async function buildActivityFeed(input: {
   generatedAt: string;
   runStore: RunTranscriptStore | undefined;
+  runs?: RunRecord[];
   lifecycleStore: IssueLifecycleStore | undefined;
   writebackOutbox: Pick<FileWritebackOutboxStore, "list"> | undefined;
   query: ActivityQuery;
+  includeTranscriptEvents?: boolean;
 }) {
-  const allRuns = input.runStore ? await input.runStore.listRuns() : [];
+  const allRuns = input.runs ?? (input.runStore ? await input.runStore.listRuns() : []);
+  const includeTranscriptEvents = input.includeTranscriptEvents ?? true;
   const lifecycleRecords = (await input.lifecycleStore?.list()) ?? [];
   const issueFilter = input.query.issue;
   const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : allRuns;
@@ -1233,16 +1255,18 @@ async function buildActivityFeed(input: {
       syntheticRunEvents += 1;
     }
 
-    const totalEvents = input.runStore ? await input.runStore.readTranscriptEventCount(run.runId) : 0;
-    transcriptEventsTotal += totalEvents;
-    const transcriptOffset = Math.max(0, totalEvents - ACTIVITY_TRANSCRIPT_TAIL_PER_RUN);
-    const events =
-      input.runStore && totalEvents > 0
-        ? (await input.runStore.readTranscript(run.runId, { offset: transcriptOffset, limit: ACTIVITY_TRANSCRIPT_TAIL_PER_RUN })).events
-        : [];
-    transcriptEventsConsidered += events.length;
-    transcriptEventsTruncated ||= totalEvents > events.length;
-    activity.push(...events.map((event) => activityItemForTranscriptEvent(run, event)));
+    if (includeTranscriptEvents) {
+      const totalEvents = input.runStore ? await input.runStore.readTranscriptEventCount(run.runId) : 0;
+      transcriptEventsTotal += totalEvents;
+      const transcriptOffset = Math.max(0, totalEvents - ACTIVITY_TRANSCRIPT_TAIL_PER_RUN);
+      const events =
+        input.runStore && totalEvents > 0
+          ? (await input.runStore.readTranscript(run.runId, { offset: transcriptOffset, limit: ACTIVITY_TRANSCRIPT_TAIL_PER_RUN })).events
+          : [];
+      transcriptEventsConsidered += events.length;
+      transcriptEventsTruncated ||= totalEvents > events.length;
+      activity.push(...events.map((event) => activityItemForTranscriptEvent(run, event)));
+    }
   }
 
   const writebackOperations = (await input.writebackOutbox?.list()) ?? [];
