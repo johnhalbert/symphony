@@ -10,6 +10,7 @@ export interface IssueStatusView extends JsonObject {
   branchName: string | null;
   url: string | null;
   assigneeId: string | null;
+  delegateId: string | null;
   labels: string[];
   blockedBy: Array<{ id: string | null; identifier: string | null; state: string | null }>;
   createdAt: string | null;

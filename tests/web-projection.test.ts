@@ -422,7 +422,7 @@ describe("web projection foundation", () => {
       assigneeId: "user-b",
       delegateId: "delegate-a",
       labels: ["zeta", "alpha", "alpha", ""],
-    } as IssueDetailsEnvelope["issue"] & { delegateId: string };
+    };
     const secondIssue = {
       ...issueDetails().issue,
       id: "issue-b",

@@ -263,9 +263,7 @@ export interface IssueBoardResponseProjectionInput {
   counts?: Record<string, unknown>;
 }
 
-interface WebReferenceIssueInput extends Pick<IssueStatusView, "assigneeId" | "labels"> {
-  delegateId?: string | null;
-}
+type WebReferenceIssueInput = Pick<IssueStatusView, "assigneeId" | "delegateId" | "labels">;
 
 interface WebReferenceIssueCardInput {
   key?: string | null;
@@ -857,10 +855,9 @@ function isIssueBoardCardProjectionInput(source: IssueBoardCardProjectionInput |
   return "issueDetails" in source;
 }
 
-function isIssueBoardModel(
-  input: IssueBoardResponseProjectionInput | IssueBoardModel | WebIssueBoardModel | null | undefined,
-): input is IssueBoardModel {
-  return Boolean(input && Array.isArray((input as IssueBoardModel).columns) && Array.isArray(input.issues) && isIssueBoardCounts((input as IssueBoardModel).counts));
+function isIssueBoardModel(input: unknown): input is IssueBoardModel {
+  if (!isRecord(input)) return false;
+  return Array.isArray(input.columns) && Array.isArray(input.issues) && isIssueBoardCounts(input.counts);
 }
 
 function isWebIssueBoardModel(

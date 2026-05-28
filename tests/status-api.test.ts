@@ -2333,6 +2333,7 @@ describe("StatusServer durable API", () => {
         state: "In Review",
         url: "https://linear.app/acme/issue/TEST-1/linear-review-title",
         labels: ["dogfood-ready"],
+        delegateId: "delegate-review",
         blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
         updatedAt: "2026-01-01T00:09:00.000Z",
       }),
@@ -2500,6 +2501,7 @@ describe("StatusServer durable API", () => {
       };
       expect(referenceResponse.status).toBe(200);
       expect(referenceBody.users.unassigned).toMatchObject({ name: "Unassigned" });
+      expect(referenceBody.users["delegate-review"]).toMatchObject({ name: "delegate-review" });
       expect(referenceBody.labels["dogfood-ready"]).toMatchObject({ name: "dogfood-ready" });
 
       const boardDetailByIdResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board/issues/issue-todo`);

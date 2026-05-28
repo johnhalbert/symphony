@@ -328,6 +328,7 @@ function issueDetailWithLatestRunError(error: string): BoardIssueDetailResponse 
         branchName: null,
         url: null,
         assigneeId: null,
+        delegateId: null,
         labels: [],
         blockedBy: [],
         createdAt: null,
