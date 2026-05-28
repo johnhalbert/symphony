@@ -771,17 +771,7 @@ function normalizeGitHubAppConfig(
 
   const hasExplicitConfig = rawApp !== undefined;
   const hasEnvironmentConfig = Boolean(
-    appId ||
-      clientId ||
-      installationId ||
-      privateKey.value ||
-      privateKey.envVar ||
-      privateKeyPath ||
-      env.GITHUB_APP_ID ||
-      env.GITHUB_APP_CLIENT_ID ||
-      env.GITHUB_APP_INSTALLATION_ID ||
-      env.GITHUB_APP_PRIVATE_KEY ||
-      env.GITHUB_APP_PRIVATE_KEY_PATH,
+    appId || clientId || installationId || privateKey.value || privateKey.envVar || privateKeyPath,
   );
   if (!hasExplicitConfig && !hasEnvironmentConfig) return null;
 
@@ -809,7 +799,7 @@ function normalizeGitHubAppPrivateKey(value: string | undefined, env: NodeJS.Pro
     }
     return { value: normalizeOptionalConfigString(value), envVar: null };
   }
-  return env.GITHUB_APP_PRIVATE_KEY === undefined
+  return normalizeOptionalConfigString(env.GITHUB_APP_PRIVATE_KEY) === null
     ? { value: null, envVar: null }
     : { value: null, envVar: "GITHUB_APP_PRIVATE_KEY" };
 }

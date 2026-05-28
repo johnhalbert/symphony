@@ -1,8 +1,11 @@
 import { generateKeyPairSync } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseServiceConfig, type ServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
-import { githubPublicationDoctorCheck } from "../src/doctor.js";
+import { githubPublicationDoctorCheck, githubReviewFeedbackDoctorCheck } from "../src/doctor.js";
 import { createGitHubPullRequestClientForCapability } from "../src/integrations/github/GitHubCredentialResolver.js";
 
 describe("GitHub App installation token auth", () => {
@@ -42,6 +45,110 @@ describe("GitHub App installation token auth", () => {
     const serialized = JSON.stringify(config.github.app);
     expect(serialized).not.toContain(secretPrivateKey);
     expect(serialized).not.toContain("secret-material");
+  });
+
+  it("falls back to the private key path when the default private key env var is empty", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "symphony-github-app-key-"));
+    try {
+      const keyPath = join(tempDir, "github-app-private-key.pem");
+      await writeFile(keyPath, generatePrivateKey(), "utf8");
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          github: {
+            owner: "acme",
+            repo: "symphony",
+            api_base_url: "https://api.github.test",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+            app: { app_id: "12345", client_id: "Iv1.client-id", installation_id: "67890" },
+          },
+        },
+        join(tempDir, "WORKFLOW.md"),
+        {
+          LINEAR_API_KEY: "linear-secret",
+          GITHUB_APP_PRIVATE_KEY: "",
+          GITHUB_APP_PRIVATE_KEY_PATH: keyPath,
+        },
+      );
+      expect(config.github.app).toMatchObject({
+        privateKey: null,
+        privateKeyEnvVar: null,
+        privateKeyPath: keyPath,
+      });
+
+      const calls: FetchCall[] = [];
+      vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const call = recordFetchCall(input, init);
+        calls.push(call);
+        if (call.url.pathname.endsWith("/access_tokens")) {
+          return jsonResponse({ token: "ghs_path_backed_token", expires_at: "2026-01-01T01:00:00.000Z" });
+        }
+        return jsonResponse({ id: 1, full_name: "acme/symphony" });
+      });
+
+      await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
+        id: "github.pr_publication",
+        status: "ok",
+        message: "GitHub PR publication can access acme/symphony using GitHub App installation 67890",
+      });
+      await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
+        id: "github.review_feedback_write",
+        status: "ok",
+        message: "GitHub PR review feedback can access acme/symphony using GitHub App installation 67890",
+      });
+      expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+        "POST /app/installations/67890/access_tokens",
+        "GET /repos/acme/symphony",
+        "POST /app/installations/67890/access_tokens",
+        "GET /repos/acme/symphony",
+      ]);
+      expect(calls[1]?.authorization).toBe("Bearer ghs_path_backed_token");
+      expect(calls[3]?.authorization).toBe("Bearer ghs_path_backed_token");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("honors an explicitly selected private key env var even when a key path is available", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "symphony-github-app-key-"));
+    try {
+      const keyPath = join(tempDir, "github-app-private-key.pem");
+      await writeFile(keyPath, generatePrivateKey(), "utf8");
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          github: {
+            owner: "acme",
+            repo: "symphony",
+            api_base_url: "https://api.github.test",
+            app: {
+              app_id: "12345",
+              installation_id: "67890",
+              private_key: "$GITHUB_APP_PRIVATE_KEY",
+              private_key_path: keyPath,
+            },
+          },
+        },
+        join(tempDir, "WORKFLOW.md"),
+        {
+          LINEAR_API_KEY: "linear-secret",
+          GITHUB_APP_PRIVATE_KEY: "",
+        },
+      );
+      expect(config.github.app).toMatchObject({ privateKeyEnvVar: "GITHUB_APP_PRIVATE_KEY", privateKeyPath: keyPath });
+
+      await expect(
+        createGitHubPullRequestClientForCapability(config, "github.publication", async () => {
+          throw new Error("fetch should not be called when the explicit private key env var is empty");
+        }).checkRepositoryAccess(),
+      ).rejects.toMatchObject({
+        code: "config_validation_error",
+        message: "GitHub App private key environment variable GITHUB_APP_PRIVATE_KEY is unset or empty",
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("mints an installation token at runtime and reuses it until the refresh window", async () => {
