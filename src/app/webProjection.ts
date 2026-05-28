@@ -263,6 +263,34 @@ export interface IssueBoardResponseProjectionInput {
   counts?: Record<string, unknown>;
 }
 
+interface WebReferenceIssueInput extends Pick<IssueStatusView, "assigneeId" | "labels"> {
+  delegateId?: string | null;
+}
+
+interface WebReferenceIssueCardInput {
+  key?: string | null;
+  issueId?: string | null;
+  issueIdentifier?: string | null;
+  issueDetails: { issue: WebReferenceIssueInput };
+}
+
+interface WebReferenceBoardColumnInput {
+  id?: string;
+  title?: string;
+  states?: string[];
+  count?: number;
+  issues?: WebReferenceIssueCardInput[];
+}
+
+interface WebReferenceBoardInput {
+  generatedAt?: string | null;
+  tracker?: unknown;
+  counts?: Record<string, unknown>;
+  issues?: WebReferenceIssueCardInput[];
+  columns?: WebReferenceBoardColumnInput[];
+  lanes?: WebReferenceBoardColumnInput[];
+}
+
 export interface BoardIssueDetailProjectionInput {
   issue: string;
   boardCard: IssueBoardCardProjectionInput | null;
@@ -341,8 +369,56 @@ const ISSUE_STATUS_TITLES: Record<IssueStatus, string> = {
   cancelled: "Cancelled",
 };
 
+const REFERENCE_COLOR_PALETTE = [
+  "#2563eb",
+  "#7c3aed",
+  "#db2777",
+  "#dc2626",
+  "#ea580c",
+  "#ca8a04",
+  "#16a34a",
+  "#0891b2",
+  "#4f46e5",
+  "#64748b",
+] as const;
+
+export function deterministicColor(value: string): string {
+  const key = normalizeReferenceKey(value) ?? "unassigned";
+  let hash = 2_166_136_261;
+  for (let index = 0; index < key.length; index += 1) {
+    hash ^= key.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619) >>> 0;
+  }
+  return REFERENCE_COLOR_PALETTE[hash % REFERENCE_COLOR_PALETTE.length] ?? REFERENCE_COLOR_PALETTE[0];
+}
+
 export function emptyReferenceData(): ReferenceData {
-  return { labels: {}, users: {} };
+  return { labels: {}, users: { unassigned: referenceUser("unassigned", "Unassigned") } };
+}
+
+export function projectWebReferenceData(input: WebReferenceBoardInput | IssueBoardModel | null | undefined): ReferenceData {
+  const labels = new Map<string, ReferenceLabelModel>();
+  const users = new Map<string, ReferenceUserModel>();
+  addReferenceUser(users, "unassigned", "Unassigned");
+
+  if (isIssueBoardModel(input)) {
+    for (const issue of input.issues) {
+      for (const label of issue.labels) addReferenceLabel(labels, label);
+      addReferenceUser(users, issue.assignee);
+    }
+  } else {
+    for (const card of uniqueReferenceCards(input)) {
+      const issue = card.issueDetails.issue;
+      for (const label of issue.labels) addReferenceLabel(labels, label);
+      addReferenceUser(users, issue.assigneeId);
+      addReferenceUser(users, issue.delegateId);
+    }
+  }
+
+  return {
+    users: sortedReferenceRecord(users),
+    labels: sortedReferenceRecord(labels),
+  };
 }
 
 export function emptyIssueModel(id = ""): IssueModel {
@@ -747,6 +823,27 @@ function uniqueIssueCards(input: IssueBoardResponseProjectionInput | null | unde
   return cards;
 }
 
+function uniqueReferenceCards(input: WebReferenceBoardInput | null | undefined): WebReferenceIssueCardInput[] {
+  const seen = new Set<string>();
+  const cards: WebReferenceIssueCardInput[] = [];
+  for (const card of candidateReferenceCards(input)) {
+    const key = firstNonEmpty(card.issueIdentifier, card.issueId, card.key);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    cards.push(card);
+  }
+  return cards;
+}
+
+function candidateReferenceCards(input: WebReferenceBoardInput | null | undefined): WebReferenceIssueCardInput[] {
+  if (!input) return [];
+  const cards = [...(input.issues ?? [])];
+  for (const column of [...(input.columns ?? []), ...(input.lanes ?? [])]) {
+    cards.push(...(column.issues ?? []));
+  }
+  return cards;
+}
+
 function candidateIssueCards(input: IssueBoardResponseProjectionInput | null | undefined): IssueBoardCardProjectionInput[] {
   if (!input) return [];
   const cards = [...(input.issues ?? [])];
@@ -837,6 +934,37 @@ function cloneChatMessages(input: ChatMessage[]): ChatMessage[] {
     ...message,
     ...(message.suggestions ? { suggestions: [...message.suggestions] } : {}),
   }));
+}
+
+function addReferenceLabel(labels: Map<string, ReferenceLabelModel>, value: string | null | undefined): void {
+  const name = normalizeReferenceKey(value);
+  if (!name || labels.has(name)) return;
+  labels.set(name, { name, color: deterministicColor(name) });
+}
+
+function addReferenceUser(users: Map<string, ReferenceUserModel>, value: string | null | undefined, displayName?: string): void {
+  const key = normalizeReferenceKey(value);
+  if (!key || users.has(key)) return;
+  users.set(key, referenceUser(key, displayName ?? key));
+}
+
+function referenceUser(key: string, name: string): ReferenceUserModel {
+  return { name, color: deterministicColor(key) };
+}
+
+function sortedReferenceRecord<T>(items: Map<string, T>): Record<string, T> {
+  return Object.fromEntries([...items.entries()].sort(([left], [right]) => compareReferenceKeys(left, right)));
+}
+
+function compareReferenceKeys(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+function normalizeReferenceKey(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function agentIdFromInputs(card: IssueBoardCardProjectionInput | null, operatorLiveness: WebOperatorLivenessInput | null): string | null {

@@ -4,12 +4,14 @@ import type { RunRecord, TranscriptEvent, TranscriptPage } from "../src/core/per
 import {
   clampIssuePriority,
   deriveIssueStatus,
+  deterministicColor,
   emptyDashboardModel,
   normalizeDescription,
   projectActivityModels,
   projectDashboardModel,
   projectHistoryModel,
   projectIssueBoardModel,
+  projectWebReferenceData,
   projectIssueDetailModel,
   projectWebIssueBoard,
   projectTranscriptMessages,
@@ -410,6 +412,60 @@ describe("web projection foundation", () => {
     expect(history.transcript.map((message) => message.kind)).toEqual(["tool_call", "request"]);
     expect(projectActivityModels(activityInput)[1]).toMatchObject({ who: "agent-1", issue: "TEST-1", runId: "run-1", text: "read_file" });
     expect(projectTranscriptMessages(transcriptEvents)[0]).toMatchObject({ kind: "tool_call", text: "read_file" });
+  });
+
+  it("projects deterministic reference data from board labels, assignees, and delegates", () => {
+    const firstIssue = {
+      ...issueDetails().issue,
+      id: "issue-a",
+      identifier: "TEST-A",
+      assigneeId: "user-b",
+      delegateId: "delegate-a",
+      labels: ["zeta", "alpha", "alpha", ""],
+    } as IssueDetailsEnvelope["issue"] & { delegateId: string };
+    const secondIssue = {
+      ...issueDetails().issue,
+      id: "issue-b",
+      identifier: "TEST-B",
+      assigneeId: "user-c",
+      labels: ["beta", "zeta"],
+    };
+
+    const firstCard = card({
+      key: "issue-a",
+      issueId: "issue-a",
+      issueIdentifier: "TEST-A",
+      issueDetails: issueDetails({ issue: firstIssue }),
+    });
+    const duplicateFirstCard = card({
+      key: "issue-a",
+      issueId: "issue-a",
+      issueIdentifier: "TEST-A",
+      issueDetails: issueDetails({ issue: { ...firstIssue, labels: ["should-not-leak"] } }),
+    });
+
+    const reference = projectWebReferenceData({
+      generatedAt: "2026-01-01T00:06:00.000Z",
+      issues: [firstCard, duplicateFirstCard],
+      columns: [{ id: "todo", title: "Todo", issues: [card({ key: "issue-b", issueId: "issue-b", issueIdentifier: "TEST-B", issueDetails: issueDetails({ issue: secondIssue }) })] }],
+    });
+
+    expect(Object.keys(reference.labels)).toEqual(["alpha", "beta", "zeta"]);
+    expect(Object.keys(reference.users)).toEqual(["delegate-a", "unassigned", "user-b", "user-c"]);
+    expect(reference.labels.alpha).toEqual({ name: "alpha", color: deterministicColor("alpha") });
+    expect(reference.users["delegate-a"]).toEqual({ name: "delegate-a", color: deterministicColor("delegate-a") });
+    expect(reference.users.unassigned).toEqual({ name: "Unassigned", color: deterministicColor("unassigned") });
+    expect(reference.labels["should-not-leak"]).toBeUndefined();
+  });
+
+  it("returns default reference data for unavailable or empty board input", () => {
+    const expected = {
+      labels: {},
+      users: { unassigned: { name: "Unassigned", color: deterministicColor("unassigned") } },
+    };
+
+    expect(projectWebReferenceData(null)).toEqual(expected);
+    expect(projectWebReferenceData({ generatedAt: null, issues: [], columns: [] })).toEqual(expected);
   });
 
   it("returns empty models for unavailable projection sources", () => {

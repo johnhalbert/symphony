@@ -2493,6 +2493,15 @@ describe("StatusServer durable API", () => {
         "/api/v1/board/issues/issue-todo",
       );
 
+      const referenceResponse = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/reference-data");
+      const referenceBody = (await referenceResponse.json()) as {
+        labels: Record<string, { name: string; color: string | null }>;
+        users: Record<string, { name: string; color: string | null }>;
+      };
+      expect(referenceResponse.status).toBe(200);
+      expect(referenceBody.users.unassigned).toMatchObject({ name: "Unassigned" });
+      expect(referenceBody.labels["dogfood-ready"]).toMatchObject({ name: "dogfood-ready" });
+
       const boardDetailByIdResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board/issues/issue-todo`);
       const boardDetailByIdentifierResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board/issues/TEST-TODO`);
       const boardDetail = (await boardDetailByIdResponse.json()) as {
@@ -2556,8 +2565,13 @@ describe("StatusServer durable API", () => {
     try {
       const response = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
       const acceptedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
+      const referenceResponse = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/reference-data");
       const body = (await response.json()) as { error: { code: string; message: string } };
       const acceptedBody = (await acceptedResponse.json()) as { error: { code: string; message: string } };
+      const referenceBody = (await referenceResponse.json()) as {
+        labels: Record<string, { name: string; color: string | null }>;
+        users: Record<string, { name: string; color: string | null }>;
+      };
 
       expect(response.status).toBe(503);
       expect(body.error).toMatchObject({
@@ -2566,6 +2580,9 @@ describe("StatusServer durable API", () => {
       });
       expect(acceptedResponse.status).toBe(503);
       expect(acceptedBody.error).toMatchObject(body.error);
+      expect(referenceResponse.status).toBe(200);
+      expect(referenceBody.labels).toEqual({});
+      expect(referenceBody.users.unassigned).toMatchObject({ name: "Unassigned" });
     } finally {
       await server.stop();
     }

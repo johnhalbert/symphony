@@ -7,7 +7,8 @@ import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
   projectWebIssueBoard,
   projectWebIssueDetail,
-  projectWebOrchestratorChat
+  projectWebOrchestratorChat,
+  projectWebReferenceData,
 } from "./webProjection.js";
 import {
   runKindForPhase,
@@ -179,6 +180,22 @@ export class StatusServer {
           url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true",
         );
         sendJson(response, 200, detail);
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/v1/web/reference-data") {
+        let board: IssueBoardResponse | null = null;
+        try {
+          board = await this.fetchIssueBoard(url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true");
+        } catch (error) {
+          if (
+            !(error instanceof SymphonyError) ||
+            (error.code !== "tracker_error" && error.code !== "tracker_unavailable")
+          ) {
+            throw error;
+          }
+        }
+        sendJson(response, 200, projectWebReferenceData(board));
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/board") {
