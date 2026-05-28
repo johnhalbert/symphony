@@ -124,6 +124,82 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       await server.stop();
     }
   });
+
+  it("projects representative Cursor public preview payloads returned by readTranscript", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "cursor-run", sessionId: "cursor-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "cursor-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "cursor",
+      eventType: "assistant",
+      message: "Cursor assistant message",
+      payload: { kind: "assistant", textPreview: "actual assistant text", internalOnly: "SECRET_ASSISTANT_INTERNAL" },
+    });
+    await runStore.appendEvent({
+      runId: "cursor-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "cursor",
+      eventType: "thinking",
+      message: "Cursor thinking event",
+      payload: { kind: "thinking", summary: "actual reasoning summary", rawThought: "SECRET_REASONING_INTERNAL" },
+    });
+    await runStore.appendEvent({
+      runId: "cursor-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "cursor",
+      eventType: "tool_call",
+      message: "tool shell completed",
+      payload: {
+        kind: "tool_call",
+        name: "shell",
+        status: "completed",
+        callId: "call-1",
+        argumentsPreview: 'command="npm test" token=[redacted]',
+        resultPreview: "result preview",
+        outputPreview: "output preview",
+        errorPreview: "error preview",
+        truncated: true,
+        result: "SECRET_RAW_TOOL_RESULT",
+        privateArgs: "SECRET_RAW_TOOL_ARGS",
+      },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/cursor-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expect(body).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "actual assistant text" },
+        { kind: "thinking", ts: "2026-01-01T00:00:02.000Z", text: "actual reasoning summary" },
+        {
+          kind: "tool_call",
+          ts: "2026-01-01T00:00:03.000Z",
+          call_id: "call-1",
+          name: "shell",
+          status: "completed",
+          args: { preview: 'command="npm test" token=[redacted]' },
+          result: "result preview",
+          output: "output preview",
+          error: "error preview",
+          truncated: true,
+        },
+      ]);
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("Cursor assistant message");
+      expect(serialized).not.toContain("Cursor thinking event");
+      expect(serialized).not.toContain("SECRET_ASSISTANT_INTERNAL");
+      expect(serialized).not.toContain("SECRET_REASONING_INTERNAL");
+      expect(serialized).not.toContain("SECRET_RAW_TOOL_RESULT");
+      expect(serialized).not.toContain("SECRET_RAW_TOOL_ARGS");
+    } finally {
+      await server.stop();
+    }
+  });
+
 });
 
 function createServer(config: ReturnType<typeof testConfig>, runStore: FileRunTranscriptStore | undefined): StatusServer {

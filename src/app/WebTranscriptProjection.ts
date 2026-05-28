@@ -23,6 +23,8 @@ export type TranscriptMessage =
       status: string;
       args: Record<string, unknown>;
       result: string | null;
+      output?: string | null;
+      error?: string | null;
       truncated?: boolean;
     }
   | { kind: "status"; state: string; ts: string; text: string }
@@ -37,9 +39,8 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
   if (eventType.includes("tool")) return projectToolCallMessage(event, payload);
-  if (eventType.includes("thinking") || eventType.includes("reasoning") || eventType.includes("thought")) {
-    return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
-  }
+  if (isThinkingEvent(eventType)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
+  if (isTaskEvent(eventType)) return projectTaskMessage(event, payload);
   if (isRequestEvent(eventType)) return projectRequestMessage(event, payload);
   if (event.source === "cursor" || event.source === "harness") {
     return { kind: "assistant", ts: event.at, text: eventText(event, payload) };
@@ -53,16 +54,32 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
 }
 
 function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, unknown>): TranscriptMessage {
-  const result = typeof payload.result === "string" ? sanitizedPreviewValue(payload.result) : null;
+  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.args, payload.arguments, payload.input);
+  const resultPreview = firstPublicPreview(payload.resultPreview, payload.result);
+  const outputPreview = firstPublicPreview(payload.outputPreview, payload.output);
+  const errorPreview = firstPublicPreview(payload.errorPreview, payload.error);
   return {
     kind: "tool_call",
     ts: event.at,
-    call_id: firstCleanString(payload.call_id, payload.callId) ?? `${event.runId}:${event.sequence}`,
-    name: firstCleanString(payload.name, payload.tool) ?? event.eventType,
-    status: firstCleanString(payload.status) ?? "unknown",
-    args: isRecord(payload.args) ? payload.args : {},
-    result: result?.preview ?? null,
-    ...(payload.truncated === true || result?.truncated ? { truncated: true } : {}),
+    call_id: firstCleanString(payload.call_id, payload.callId, payload.id) ?? `${event.runId}:${event.sequence}`,
+    name: firstCleanString(payload.name, payload.tool, payload.toolName) ?? event.eventType,
+    status: firstCleanString(payload.status, payload.state) ?? "unknown",
+    args: argsPreview ? { preview: argsPreview.preview } : {},
+    result: resultPreview?.preview ?? outputPreview?.preview ?? errorPreview?.preview ?? null,
+    ...(outputPreview ? { output: outputPreview.preview } : {}),
+    ...(errorPreview ? { error: errorPreview.preview } : {}),
+    ...(payload.truncated === true || argsPreview?.truncated || resultPreview?.truncated || outputPreview?.truncated || errorPreview?.truncated
+      ? { truncated: true }
+      : {}),
+  };
+}
+
+function projectTaskMessage(event: TranscriptEvent, payload: Record<string, unknown>): TranscriptMessage {
+  return {
+    kind: "task",
+    ts: event.at,
+    title: firstCleanString(payload.title, payload.name, payload.status) ?? event.eventType,
+    desc: eventText(event, payload),
   };
 }
 
@@ -74,6 +91,14 @@ function projectRequestMessage(event: TranscriptEvent, payload: Record<string, u
     q: firstCleanString(payload.prompt, payload.question, payload.q) ?? eventText(event, payload),
     actions: actionLabels(payload.actions),
   };
+}
+
+function isThinkingEvent(eventType: string): boolean {
+  return eventType.includes("thinking") || eventType.includes("reasoning") || eventType.includes("thought");
+}
+
+function isTaskEvent(eventType: string): boolean {
+  return eventType.includes("task");
 }
 
 function isRequestEvent(eventType: string): boolean {
@@ -91,7 +116,10 @@ function sanitizedPayloadRecord(event: TranscriptEvent): Record<string, unknown>
 }
 
 function eventText(event: TranscriptEvent, payload: Record<string, unknown>): string {
-  return firstCleanString(event.message, payload.text, payload.message, payload.summary) ?? event.eventType;
+  return (
+    firstCleanString(payload.textPreview, payload.summary, payload.messagePreview, payload.text, payload.message, event.message) ??
+    event.eventType
+  );
 }
 
 function actionLabels(value: unknown): string[] {
@@ -111,6 +139,15 @@ function firstCleanString(...values: unknown[]): string | null {
     if (typeof value !== "string") continue;
     const preview = sanitizedPreviewValue(value).preview;
     if (preview && preview.length > 0) return preview;
+  }
+  return null;
+}
+
+function firstPublicPreview(...values: unknown[]): { preview: string; truncated: boolean } | null {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    const preview = sanitizedPreviewValue(value);
+    if (preview.preview && preview.preview.length > 0) return { preview: preview.preview, truncated: preview.truncated };
   }
   return null;
 }
