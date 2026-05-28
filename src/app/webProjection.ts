@@ -86,6 +86,21 @@ export interface IssueBoardModel {
   counts: IssueBoardCountsModel;
 }
 
+export interface WebIssueBoardLanesModel {
+  todo: IssueModel[];
+  progress: IssueModel[];
+  review: IssueModel[];
+}
+
+export interface WebIssueBoardModel {
+  issues: IssueModel[];
+  backlog: IssueModel[];
+  lanes: WebIssueBoardLanesModel;
+  cycleLabel: string;
+  cycleDateRange: string;
+  selectedIssueId: string;
+}
+
 export interface RunningAgentModel {
   id: string;
   issue: string;
@@ -364,6 +379,21 @@ export function emptyIssueBoardModel(generatedAt: string | null = null): IssueBo
   };
 }
 
+export function emptyWebIssueBoardModel(): WebIssueBoardModel {
+  return {
+    issues: [],
+    backlog: [],
+    lanes: {
+      todo: [],
+      progress: [],
+      review: [],
+    },
+    cycleLabel: "",
+    cycleDateRange: "",
+    selectedIssueId: "",
+  };
+}
+
 export function emptyDashboardModel(): DashboardModel {
   return {
     generatedAt: null,
@@ -477,6 +507,34 @@ export function projectWebIssueDetail(
       operatorLiveness: input.operatorLiveness ?? input.boardCard?.operatorLiveness ?? null,
       latestRun: input.latestRun ?? null,
     }),
+  };
+}
+
+export function projectWebIssueBoard(
+  input: IssueBoardResponseProjectionInput | IssueBoardModel | WebIssueBoardModel | null | undefined,
+): WebIssueBoardModel {
+  if (isWebIssueBoardModel(input)) return cloneWebIssueBoardModel(input);
+  const issues = isIssueBoardModel(input)
+    ? input.issues.map(cloneIssueModel)
+    : uniqueIssueCards(input).map((card) => projectIssueModel(card));
+  const lanes: WebIssueBoardLanesModel = {
+    todo: issues.filter((issue) => issue.status === "todo"),
+    progress: issues.filter((issue) => issue.status === "progress"),
+    review: issues.filter((issue) => issue.status === "review"),
+  };
+  const backlog = issues
+    .map((issue, index) => ({ issue, index }))
+    .filter(({ issue }) => issue.status === "backlog" || issue.status === "todo")
+    .sort((left, right) => priorityWeight(right.issue.priority) - priorityWeight(left.issue.priority) || left.index - right.index)
+    .map(({ issue }) => issue);
+  const selectedIssue = lanes.progress[0] ?? lanes.todo[0] ?? backlog[0] ?? issues[0] ?? null;
+  return {
+    issues,
+    backlog,
+    lanes,
+    cycleLabel: "",
+    cycleDateRange: "",
+    selectedIssueId: selectedIssue?.id ?? "",
   };
 }
 
@@ -698,8 +756,27 @@ function isIssueBoardCardProjectionInput(source: IssueBoardCardProjectionInput |
   return "issueDetails" in source;
 }
 
-function isIssueBoardModel(input: IssueBoardResponseProjectionInput | IssueBoardModel | null | undefined): input is IssueBoardModel {
-  return Boolean(input && Array.isArray(input.columns) && Array.isArray(input.issues) && isIssueBoardCounts((input as IssueBoardModel).counts));
+function isIssueBoardModel(
+  input: IssueBoardResponseProjectionInput | IssueBoardModel | WebIssueBoardModel | null | undefined,
+): input is IssueBoardModel {
+  return Boolean(input && Array.isArray((input as IssueBoardModel).columns) && Array.isArray(input.issues) && isIssueBoardCounts((input as IssueBoardModel).counts));
+}
+
+function isWebIssueBoardModel(
+  input: IssueBoardResponseProjectionInput | IssueBoardModel | WebIssueBoardModel | null | undefined,
+): input is WebIssueBoardModel {
+  return Boolean(
+    input &&
+      Array.isArray(input.issues) &&
+      Array.isArray((input as WebIssueBoardModel).backlog) &&
+      isRecord((input as WebIssueBoardModel).lanes) &&
+      Array.isArray((input as WebIssueBoardModel).lanes.todo) &&
+      Array.isArray((input as WebIssueBoardModel).lanes.progress) &&
+      Array.isArray((input as WebIssueBoardModel).lanes.review) &&
+      typeof (input as WebIssueBoardModel).cycleLabel === "string" &&
+      typeof (input as WebIssueBoardModel).cycleDateRange === "string" &&
+      typeof (input as WebIssueBoardModel).selectedIssueId === "string",
+  );
 }
 
 function isIssueBoardCounts(value: unknown): value is IssueBoardCountsModel {
@@ -713,6 +790,21 @@ function cloneIssueBoardModel(input: IssueBoardModel): IssueBoardModel {
     columns: input.columns.map((column) => ({ ...column, issues: column.issues.map(cloneIssueModel) })),
     issues: input.issues.map(cloneIssueModel),
     counts: { ...input.counts },
+  };
+}
+
+function cloneWebIssueBoardModel(input: WebIssueBoardModel): WebIssueBoardModel {
+  return {
+    issues: input.issues.map(cloneIssueModel),
+    backlog: input.backlog.map(cloneIssueModel),
+    lanes: {
+      todo: input.lanes.todo.map(cloneIssueModel),
+      progress: input.lanes.progress.map(cloneIssueModel),
+      review: input.lanes.review.map(cloneIssueModel),
+    },
+    cycleLabel: input.cycleLabel,
+    cycleDateRange: input.cycleDateRange,
+    selectedIssueId: input.selectedIssueId,
   };
 }
 
@@ -774,6 +866,10 @@ function issueStatusFromState(state: string | null): IssueStatus | null {
 
 function isIssueStatus(value: string): value is IssueStatus {
   return ISSUE_STATUS_ORDER.includes(value as IssueStatus);
+}
+
+function priorityWeight(priority: IssuePriority): number {
+  return priority === "urgent" ? 4 : priority;
 }
 
 function normalizeToken(value: string): string {
