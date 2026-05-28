@@ -1,5 +1,5 @@
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
-import type { RunRecord, TranscriptEvent, TranscriptPage } from "../core/persistence/RunTranscriptStore.js";
+import type { RunRecord, TranscriptEvent, TranscriptPage, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 import type {
   AgentRunKind,
   AgentRunPhase,
@@ -166,6 +166,10 @@ export interface IssueDetailModel {
   transcript: TranscriptMessage[];
 }
 
+export interface WebIssueDetailModel {
+  issue: IssueModel;
+}
+
 export interface HistoryModel {
   sessions: SessionModel[];
   selectedSessionId: string | null;
@@ -193,9 +197,9 @@ export interface WebOperatorLivenessInput {
 }
 
 export interface IssueBoardCardLiveInput {
-  role?: AgentRunRole | null;
-  runPhase?: AgentRunPhase | null;
-  runKind?: AgentRunKind | null;
+  role?: AgentRunRole | string | null;
+  runPhase?: AgentRunPhase | string | null;
+  runKind?: AgentRunKind | string | null;
   state?: string | null;
   runId?: string | null;
   agentId?: string | null;
@@ -203,16 +207,16 @@ export interface IssueBoardCardLiveInput {
 }
 
 export interface IssueBoardCardMetadataInput {
-  prUrl?: string | null;
-  prNumber?: number | null;
-  prHeadSha?: string | null;
-  prBranch?: string | null;
-  ciStatus?: string | null;
-  lastPushedAt?: string | null;
-  branchName?: string | null;
-  gitBranchName?: string | null;
-  repoPath?: string | null;
-  baseRef?: string | null;
+  prUrl?: string | null | undefined;
+  prNumber?: number | null | undefined;
+  prHeadSha?: string | null | undefined;
+  prBranch?: string | null | undefined;
+  ciStatus?: string | null | undefined;
+  lastPushedAt?: string | null | undefined;
+  branchName?: string | null | undefined;
+  gitBranchName?: string | null | undefined;
+  repoPath?: string | null | undefined;
+  baseRef?: string | null | undefined;
 }
 
 export interface IssueBoardCardProjectionInput {
@@ -249,7 +253,7 @@ export interface BoardIssueDetailProjectionInput {
   boardCard: IssueBoardCardProjectionInput | null;
   issueDetails: IssueDetailsEnvelope;
   live?: RuntimeRunningIssue | IssueBoardCardLiveInput | null;
-  workspace?: IssueWorkspaceSummary | null;
+  workspace?: IssueWorkspaceSummary | WorkspaceRecord | null;
   latestRun?: RunRecord | null;
   runs?: RunRecord[];
   pullRequest?: IssuePullRequestSummary;
@@ -459,6 +463,21 @@ export function projectIssueBoardModel(input: IssueBoardResponseProjectionInput 
   }
   recomputeIssueBoardCounts(model);
   return model;
+}
+
+export function projectWebIssueDetail(
+  input: BoardIssueDetailProjectionInput | null | undefined,
+  requestKey: string,
+): WebIssueDetailModel | null {
+  if (!input) return null;
+  return {
+    issue: projectIssueModel(input.boardCard ?? input.issueDetails, {
+      requestKey,
+      lane: input.boardCard?.lane ?? null,
+      operatorLiveness: input.operatorLiveness ?? input.boardCard?.operatorLiveness ?? null,
+      latestRun: input.latestRun ?? null,
+    }),
+  };
 }
 
 export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput | null | undefined): IssueDetailModel {
