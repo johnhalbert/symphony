@@ -305,6 +305,8 @@ export class StatusServer {
           return;
         }
         if (request.method === "POST") {
+          this.requireMutationToken(request);
+
           let body: unknown;
           try {
             body = await readJsonBody(request);

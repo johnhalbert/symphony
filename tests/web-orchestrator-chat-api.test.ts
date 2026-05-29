@@ -66,6 +66,62 @@ describe("web orchestrator chat API", () => {
     }
   });
 
+  it("requires the mutation token for POST when configured while leaving GET read-only access open", async () => {
+    const { server, calls } = createStatusServer(root, { openWorkspaceToken: "secret" });
+    const address = await server.start();
+    const url = chatUrl(address);
+    try {
+      const getResponse = await fetch(url);
+      const missingToken = await fetch(url, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ input: "please inspect ENG-94" }),
+      });
+      const wrongToken = await fetch(url, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json", "x-symphony-token": "wrong" },
+        body: JSON.stringify({ input: "please inspect ENG-94" }),
+      });
+      const invalidBodyWithToken = await fetch(url, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json", "x-symphony-token": "secret" },
+        body: "{not-json",
+      });
+      const validToken = await fetch(url, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ input: "please inspect ENG-94" }),
+      });
+
+      const missingBody = (await missingToken.json()) as { error?: { code?: string; message?: string } };
+      const wrongBody = (await wrongToken.json()) as { error?: { code?: string; message?: string } };
+      const invalidBody = (await invalidBodyWithToken.json()) as { error?: { code?: string; message?: string } };
+
+      expect(getResponse.status).toBe(200);
+      expect(await getResponse.json()).toEqual([]);
+      expect(missingToken.status).toBe(401);
+      expect(missingBody.error).toMatchObject({
+        code: "invalid_request",
+        message: "Missing or invalid open-workspace token",
+      });
+      expect(wrongToken.status).toBe(401);
+      expect(wrongBody.error).toMatchObject({
+        code: "invalid_request",
+        message: "Missing or invalid open-workspace token",
+      });
+      expect(invalidBodyWithToken.status).toBe(400);
+      expect(invalidBody.error).toMatchObject({
+        code: "invalid_request",
+        message: "Web orchestrator chat request body must be valid JSON",
+      });
+      expect(validToken.status).toBe(200);
+      expect(await validToken.json()).toEqual([]);
+      expect(calls).toEqual(zeroCallCounts());
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("rejects invalid POST bodies with deterministic 400 error payloads and no orchestration side effects", async () => {
     const { server, calls } = createStatusServer(root);
     const address = await server.start();
@@ -134,7 +190,10 @@ function chatUrl(address: { host: string; port: number }): string {
   return "http://" + address.host + ":" + String(address.port) + "/api/v1/web/orchestrator-chat";
 }
 
-function createStatusServer(root: string): { server: StatusServer; calls: OrchestratorCallCounts } {
+function createStatusServer(
+  root: string,
+  options: { openWorkspaceToken?: string | null } = {},
+): { server: StatusServer; calls: OrchestratorCallCounts } {
   const config = testConfig(path.join(root, "workspaces"));
   const { orchestrator, calls } = instrumentedOrchestrator();
   const server = new StatusServer({
@@ -147,7 +206,7 @@ function createStatusServer(root: string): { server: StatusServer; calls: Orches
     workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
     host: "127.0.0.1",
     port: 0,
-    openWorkspaceToken: null,
+    openWorkspaceToken: options.openWorkspaceToken ?? null,
     trackerStateLists: testTrackerStateLists(),
     staleThresholdMs: 300_000,
   });
