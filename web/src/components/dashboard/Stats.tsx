@@ -1,6 +1,10 @@
-import type { DashboardTotals } from "../../types/symphony";
+import type { DashboardModel, DashboardTotals } from "../../types/symphony";
 
-export function StatsRow({ totals }: { totals: DashboardTotals }) {
+export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
+  const totals = dashboard.totals;
+  const runningCount = dashboard.runningAgents.length;
+  const agentSlotCount = Math.max(dashboard.concurrencyCap, runningCount, 0);
+
   return (
     <div className="stats">
       <div className="stat">
@@ -17,22 +21,22 @@ export function StatsRow({ totals }: { totals: DashboardTotals }) {
       <div className="stat">
         <div className="stat__label">Running agents</div>
         <div className="stat__value">
-          4<span className="suffix">/ 6</span>
+          {runningCount}<span className="suffix">/ {dashboard.concurrencyCap}</span>
         </div>
         <div style={{ display: "flex", gap: 3, marginTop: 8 }}>
-          {[1, 1, 1, 1, 0, 0].map((on, index) => (
+          {Array.from({ length: agentSlotCount }).map((_, index) => (
             <span
               key={index}
               style={{
                 flex: 1,
                 height: 4,
                 borderRadius: 2,
-                background: on ? "var(--accent)" : "var(--elevated)",
+                background: index < runningCount ? "var(--accent)" : "var(--elevated)",
               }}
             />
           ))}
         </div>
-        <div className="stat__delta">avg 18m / session</div>
+        <div className="stat__delta">{dashboard.agentUsageLabel}</div>
       </div>
       <div className="stat">
         <div className="stat__label">Open issues</div>
@@ -120,12 +124,14 @@ export function BurndownPanel({ totals }: { totals: DashboardTotals }) {
   );
 }
 
-export function BurndownCommandCenter({ totals }: { totals: DashboardTotals }) {
+export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel }) {
+  const totals = dashboard.totals;
+
   return (
     <div className="panel" style={{ borderRadius: 6, background: "#0a0a0c" }}>
       <div className="panel__head" style={{ padding: "8px 14px", borderBottom: "1px solid var(--border)" }}>
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase" }}>
-          ./symphony status --cycle 14
+          ./symphony status --branch {dashboard.branch || "--"}
         </span>
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--accent)" }}>● live</span>
       </div>
@@ -140,13 +146,13 @@ export function BurndownCommandCenter({ totals }: { totals: DashboardTotals }) {
           <span style={{ color: "var(--text-3)" }}>velocity   </span> <span style={{ color: "var(--accent)" }}>3.2 PR/day</span> · 7d avg · 14d trend ↑
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>agents     </span> <span style={{ color: "var(--accent)" }}>4 running</span> / 6 cap · 0 queued · 0 retrying
+          <span style={{ color: "var(--text-3)" }}>agents     </span> <span style={{ color: "var(--accent)" }}>{dashboard.agentUsageLabel}</span> · {dashboard.runningAgents.length} running / {dashboard.concurrencyCap} cap
         </div>
         <div>
           <span style={{ color: "var(--text-3)" }}>review     </span> 3 issues in In Review agent queue · oldest 24m
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>health     </span> <span style={{ color: "var(--st-done)" }}>nominal</span> · last poll 8s ago · 0 errors in 24h
+          <span style={{ color: "var(--text-3)" }}>health     </span> <span style={{ color: "var(--st-done)" }}>nominal</span> · {dashboard.pollLabel || "poll unavailable"} · 0 errors in 24h
         </div>
       </div>
     </div>

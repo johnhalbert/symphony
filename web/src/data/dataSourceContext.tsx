@@ -2,9 +2,9 @@ import { createContext, useContext, type ReactNode } from "react";
 import type { SymphonyDataSource } from "./dataSource";
 import { createDataSource, resolveDataSourceConfig } from "./dataSourceConfig";
 
-const dataSourceConfig = resolveDataSourceConfig(import.meta.env);
+export const defaultDataSourceConfig = resolveDataSourceConfig(import.meta.env);
 
-export const defaultDataSource: SymphonyDataSource = createDataSource(dataSourceConfig);
+export const defaultDataSource: SymphonyDataSource = createDataSource(defaultDataSourceConfig);
 
 const DataSourceContext = createContext<SymphonyDataSource>(defaultDataSource);
 

@@ -6,9 +6,11 @@ import { formatInlineText } from "../messages/messageFormat";
 export function OrchestratorChat({
   messages,
   onSend,
+  subtitle,
 }: {
   messages: ChatMessage[];
   onSend: (input: string) => Promise<void>;
+  subtitle?: string;
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -31,7 +33,7 @@ export function OrchestratorChat({
         <div className="av">SY</div>
         <div style={{ display: "flex", flexDirection: "column" }}>
           <h3>Symphony orchestrator</h3>
-          <span className="sub">codex-1 · WORKFLOW.md@main · context: cycle 14</span>
+          <span className="sub">{subtitle || "Dashboard context unavailable"}</span>
         </div>
         <div style={{ flex: 1 }} />
         <button className="icon-btn" type="button">
