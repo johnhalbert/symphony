@@ -675,7 +675,8 @@ export function projectWebDashboard(input: DashboardProjectionInput = {}): Dashb
     providerGates: projectProviderGates(runtime),
     runningAgents,
     activity: projectActivityModels(input.activity ?? null),
-    chat: cloneChatMessages(input.chat ?? []),
+    // Dashboard chat is intentionally out of scope; ignore any caller-supplied chat payloads.
+    chat: emptyChatMessages(),
     totals: dashboardTotalsFromBoard(board),
   };
 }
@@ -1013,13 +1014,6 @@ function cloneReferenceData(input: ReferenceData): ReferenceData {
 
 function cloneActivityModel(input: ActivityModel): ActivityModel {
   return { ...input };
-}
-
-function cloneChatMessages(input: ChatMessage[]): ChatMessage[] {
-  return input.map((message) => ({
-    ...message,
-    ...(message.suggestions ? { suggestions: [...message.suggestions] } : {}),
-  }));
 }
 
 function addReferenceLabel(labels: Map<string, ReferenceLabelModel>, value: string | null | undefined): void {

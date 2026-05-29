@@ -542,6 +542,20 @@ describe("web projection foundation", () => {
     expect(projectDashboardModel({ activity: null, board: null, runs: [] })).toEqual(emptyDashboard);
   });
 
+  it("drops caller-provided dashboard chat input to keep chat behavior out of scope", () => {
+    const injectedChat = [{ who: "agent" as const, text: "not allowed mock chat", suggestions: ["assistant suggestion"] }];
+
+    const dashboard = projectWebDashboard({ chat: injectedChat });
+    const legacyDashboard = projectDashboardModel({ chat: injectedChat });
+
+    expect(dashboard.chat).toEqual([]);
+    expect(legacyDashboard.chat).toEqual([]);
+    expect(JSON.stringify(dashboard)).not.toContain("not allowed mock chat");
+    expect(JSON.stringify(dashboard)).not.toContain("assistant suggestion");
+    expect(JSON.stringify(legacyDashboard)).not.toContain("not allowed mock chat");
+    expect(JSON.stringify(legacyDashboard)).not.toContain("assistant suggestion");
+  });
+
   it("projects orchestrator chat as the exact empty default without mock content", () => {
     const chat = projectWebOrchestratorChat();
     const replay = projectWebOrchestratorChat();
