@@ -407,8 +407,10 @@ Acceptance criteria:
 Steps:
 
 1. Add `src/data/apiDataSource.ts`.
-2. Configure API base URL with an environment variable:
-   - `VITE_SYMPHONY_API_BASE_URL`
+2. Configure API mode and optional API base URL with environment variables:
+   - `VITE_SYMPHONY_DATA_SOURCE=api` enables same-origin API mode for the Vite `/api` proxy.
+   - `VITE_SYMPHONY_API_BASE_URL` keeps supporting absolute or relative API base URLs and also activates API mode when no data-source mode is set.
+   - `SYMPHONY_WEB_API_PROXY_TARGET` or `SYMPHONY_API_PROXY_TARGET` can override the Vite dev proxy target; otherwise `/api` proxies to the default Symphony status server at `http://127.0.0.1:7331`.
 3. Implement the same `SymphonyDataSource` interface.
 4. Keep mock data available as local/demo mode.
 5. Add adapters from API responses into view models.
