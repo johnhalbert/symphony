@@ -20,6 +20,8 @@ export function DetailColumn({ issue, onClose }: { issue: IssueModel | null; onC
     );
   }
 
+  const assigneeName = users[issue.assignee]?.name ?? issue.assignee;
+
   return (
     <div className="issues__col">
       <div className="colhead">
@@ -56,7 +58,7 @@ export function DetailColumn({ issue, onClose }: { issue: IssueModel | null; onC
               {priorityLabel(issue.priority)}
             </button>
             <button className="btn" type="button">
-              <Avatar user={issue.assignee} /> {users[issue.assignee]?.name}
+              <Avatar user={issue.assignee} /> {assigneeName}
             </button>
           </div>
         </div>
@@ -77,7 +79,7 @@ export function DetailColumn({ issue, onClose }: { issue: IssueModel | null; onC
               <span className="k">Assignee</span>
               <span className="v">
                 <Avatar user={issue.assignee} />
-                {users[issue.assignee]?.name}
+                {assigneeName}
               </span>
               <span className="k">Labels</span>
               <span className="v">
