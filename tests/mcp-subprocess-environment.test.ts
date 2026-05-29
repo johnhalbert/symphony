@@ -1,3 +1,5 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -68,18 +70,45 @@ describe("MCP subprocess environment", () => {
     ]);
   });
 
-  it("resolves the default tsx import relative to the CLI entrypoint", () => {
-    const cliPath = path.join(process.cwd(), "src", "cli.ts");
-    const loaderUrl = pathToFileURL(path.join(process.cwd(), "node_modules", "tsx", "dist", "loader.mjs")).href;
+  it("resolves the default tsx import relative to the CLI entrypoint", async () => {
+    const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-mcp-cli-"));
+    const cliPath = path.join(fixtureRoot, "src", "cli.ts");
+    const loaderPath = path.join(fixtureRoot, "node_modules", "tsx", "dist", "loader.mjs");
+    const packagePath = path.join(fixtureRoot, "node_modules", "tsx", "package.json");
 
-    expect(
-      buildMcpCliSpawnArgs({
-        cliPath,
-        command: "completion-report-mcp",
-        workflowPath: path.join(process.cwd(), "WORKFLOW.md"),
-        contextFile: path.join(process.cwd(), ".tmp", "context.json"),
-      }).slice(0, 2),
-    ).toEqual(["--import", loaderUrl]);
+    try {
+      await mkdir(path.dirname(cliPath), { recursive: true });
+      await mkdir(path.dirname(loaderPath), { recursive: true });
+      await writeFile(cliPath, "", "utf8");
+      await writeFile(loaderPath, "export {};\n", "utf8");
+      await writeFile(
+        packagePath,
+        JSON.stringify(
+          {
+            name: "tsx",
+            version: "0.0.0-test",
+            type: "module",
+            exports: { ".": "./dist/loader.mjs" },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+
+      const loaderUrl = pathToFileURL(loaderPath).href;
+
+      expect(
+        buildMcpCliSpawnArgs({
+          cliPath,
+          command: "completion-report-mcp",
+          workflowPath: path.join(fixtureRoot, "WORKFLOW.md"),
+          contextFile: path.join(fixtureRoot, ".tmp", "context.json"),
+        }).slice(0, 2),
+      ).toEqual(["--import", loaderUrl]);
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
   });
 
   it("builds MCP server configs with an explicit cliPath and env key slice", () => {
