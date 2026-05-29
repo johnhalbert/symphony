@@ -7,7 +7,7 @@ import { resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "../src/core/persistence/McpExposureDiagnosticsStore.js";
-import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileRunTranscriptStore, type RunRecord } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
@@ -735,6 +735,98 @@ describe("StatusServer durable API", () => {
         timeline: [],
         defaultSessionId: "",
       });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves sidebar sessions from the full web history projection while keeping dashboard activity previewed", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const makeRun = (index: number, issueIdentifier: string, startedAt: string, completedAt: string): RunRecord => ({
+      runId: index === 0 ? "run-history-boundary" : `run-history-newer-${index}`,
+      sessionId: index === 0 ? "session-history-boundary" : `session-history-newer-${index}`,
+      agentId: index === 0 ? "agent-history-boundary" : `agent-history-newer-${index}`,
+      role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
+      issueId: index === 0 ? "issue-history-boundary" : `issue-history-newer-${index}`,
+      issueIdentifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: `work ${issueIdentifier}`,
+      promptCharCount: `work ${issueIdentifier}`.length,
+      cursorModel: "gpt-test",
+      workspaceKey: issueIdentifier,
+      workspacePath: path.join(config.workspace.root, issueIdentifier),
+      gitBranchName: `symphony/${issueIdentifier}`,
+      repoPath: "/repo",
+      baseRef: "main",
+      status: "succeeded",
+      startedAt,
+      updatedAt: completedAt,
+      completedAt,
+      error: null,
+      tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      transcriptEventCount: 0,
+    });
+    const boundaryRun = makeRun(0, "TEST-HISTORY", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:30.000Z");
+    const newerRuns = Array.from({ length: 20 }, (_, index) => {
+      const minute = String(index + 1).padStart(2, "0");
+      return makeRun(
+        index + 1,
+        `TEST-HISTORY-NEWER-${index + 1}`,
+        `2026-01-01T00:${minute}:00.000Z`,
+        `2026-01-01T00:${minute}:30.000Z`,
+      );
+    });
+    const runs = [boundaryRun, ...newerRuns];
+    const runStore = {
+      listRuns: async () => runs,
+    } as unknown as FileRunTranscriptStore;
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const sidebarResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sidebar`);
+      const historyResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/history`);
+      const sidebarBody = (await sidebarResponse.json()) as {
+        activity: Array<{ id: string; verb: string }>;
+        sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
+      };
+      const historyBody = (await historyResponse.json()) as {
+        sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
+        transcriptBySession: Record<string, unknown[]>;
+      };
+
+      expect(sidebarResponse.status).toBe(200);
+      expect(historyResponse.status).toBe(200);
+      expect(sidebarBody.activity).toHaveLength(20);
+      expect(sidebarBody.activity.map((item) => item.id)).not.toContain("TEST-HISTORY");
+      const sidebarBoundarySession = sidebarBody.sessions.find((session) => session.id === "run-history-boundary");
+      const historyBoundarySession = historyBody.sessions.find((session) => session.id === "run-history-boundary");
+      expect(sidebarBoundarySession).toEqual(historyBoundarySession);
+      expect(sidebarBoundarySession).toMatchObject({
+        id: "run-history-boundary",
+        issue: "TEST-HISTORY",
+        state: "finished",
+        lastEvent: "TEST-HISTORY run finished",
+      });
+      expect(sidebarBody.sessions).toHaveLength(21);
+      expect(historyBody.sessions).toHaveLength(21);
+      expect(historyBody.transcriptBySession).toEqual({});
     } finally {
       await server.stop();
     }
@@ -2290,6 +2382,19 @@ describe("StatusServer durable API", () => {
       repoPath: "/repo",
       baseRef: "main",
     });
+    await runStore.recordPullRequestEvent({
+      runId: "run-test-1",
+      action: "updated",
+      at: "2026-01-01T00:01:00.000Z",
+      prUrl: "https://github.com/acme/repo/pull/67",
+      prNumber: 67,
+      lastPushedAt: "2026-01-01T00:00:30.000Z",
+    });
+    await runStore.recordCiStatusEvent({
+      runId: "run-test-1",
+      at: "2026-01-01T00:01:30.000Z",
+      ciStatus: "success",
+    });
     await lifecycleStore.ensureIssue(
       { id: "issue-blocked", identifier: "TEST-BLOCKED" },
       { phase: "blocked", blockedReason: "needs operator", summaryPointers: {} },
@@ -2301,6 +2406,8 @@ describe("StatusServer durable API", () => {
 
     const liveRunning = liveRunningFixture(config, "TEST-1", "In Progress");
     liveRunning.issueId = "issue-1";
+    liveRunning.sessionId = "session-1";
+    liveRunning.workspacePath = path.join(config.workspace.root, "TEST-1");
     liveRunning.issueDetails = issueDetailsFixture({
       id: "issue-1",
       identifier: "TEST-1",
@@ -2330,8 +2437,11 @@ describe("StatusServer durable API", () => {
         id: "issue-1",
         identifier: "TEST-1",
         title: "Linear review title",
+        description: "Review route description.\n\nSecond route paragraph.",
+        priority: 2,
         state: "In Review",
         url: "https://linear.app/acme/issue/TEST-1/linear-review-title",
+        assigneeId: "review-assignee",
         labels: ["dogfood-ready"],
         delegateId: "delegate-review",
         blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
@@ -2342,6 +2452,20 @@ describe("StatusServer durable API", () => {
         identifier: "TEST-MERGE",
         title: "Ready to merge",
         state: "Ready to Merge",
+      }),
+      issue({
+        id: "issue-review-3",
+        identifier: "TEST-REVIEW-3",
+        title: "Third review issue",
+        state: "In Review",
+        labels: ["third-review"],
+      }),
+      issue({
+        id: "issue-review-4",
+        identifier: "TEST-REVIEW-4",
+        title: "Fourth review issue",
+        state: "In Review",
+        labels: ["fourth-review"],
       }),
       issue({
         id: "issue-done",
@@ -2402,8 +2526,8 @@ describe("StatusServer durable API", () => {
       expect(response.status).toBe(200);
       expect(tracker.requestedStates).toEqual(["Backlog", "Todo", "In Progress", "Blocked", "In Review", "Ready to Merge", "Done", "Canceled"]);
       expect(tracker.fetchCount).toBe(1);
-      expect(body.tracker).toMatchObject({ issueCount: 6, cached: false });
-      expect(body.counts).toMatchObject({ total: 7, trackerBacked: 6, symphonyOnly: 1, live: 1, paused: 1, blocked: 3 });
+      expect(body.tracker).toMatchObject({ issueCount: 8, cached: false });
+      expect(body.counts).toMatchObject({ total: 9, trackerBacked: 8, symphonyOnly: 1, live: 1, paused: 1, blocked: 3 });
       expect(body.lanes.map((lane) => lane.id)).toEqual(["backlog", "todo", "progress", "review", "done", "canceled"]);
       expect(body.issues.map((item) => item.issueIdentifier)).not.toContain("TEST-ARCHIVED");
 
@@ -2485,6 +2609,8 @@ describe("StatusServer durable API", () => {
         "TEST-PROGRESS",
         "TEST-1",
         "TEST-MERGE",
+        "TEST-REVIEW-3",
+        "TEST-REVIEW-4",
         "TEST-DONE",
         "TEST-CANCELED",
         "TEST-BLOCKED",
@@ -2492,7 +2618,7 @@ describe("StatusServer durable API", () => {
       expect(webIssuesBody.backlog.map((item) => item.id)).toEqual(["TEST-TODO"]);
       expect(webIssuesBody.lanes.todo.map((item) => item.id)).toEqual(["TEST-TODO"]);
       expect(webIssuesBody.lanes.progress.map((item) => item.id)).toEqual(["TEST-PROGRESS", "TEST-BLOCKED"]);
-      expect(webIssuesBody.lanes.review.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE"]);
+      expect(webIssuesBody.lanes.review.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE", "TEST-REVIEW-3", "TEST-REVIEW-4"]);
       expect(webIssuesBody.issues.find((item) => item.id === "TEST-CANCELED")?.status).toBe("cancelled");
       expect(webIssuesBody.selectedIssueId).toBe("TEST-PROGRESS");
 
@@ -2515,20 +2641,17 @@ describe("StatusServer durable API", () => {
       expect(webReview).toMatchObject({
         id: "TEST-1",
         status: "review",
-        priority: 1,
+        priority: 2,
         labels: ["dogfood-ready"],
-        assignee: "unassigned",
+        assignee: "review-assignee",
         agent: "agent-1",
-        pr: null,
-        ci: null,
+        pr: "#67",
+        ci: "success",
         workspace: path.join(config.workspace.root, "TEST-1"),
-        session: "run-test-1",
-        desc: ["Blocked by TEST-0"],
-        activity: [
-          { t: "2026-01-01T00:00:00Z", verb: "created", val: "In Review", who: "tracker" },
-          { t: "2026-01-01T00:09:00.000Z", verb: "updated", val: "In Review", who: "agent-1" },
-        ],
+        session: "session-1",
       });
+      expect(webReview?.desc).toEqual(expect.arrayContaining(["Review route description.", "Second route paragraph.", "Blocked by TEST-0"]));
+      expect(webReview?.activity.map((item) => item.verb)).toEqual(expect.arrayContaining(["created", "updated", "pr pushed"]));
 
       const dashboardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/dashboard`);
       const dashboardBody = (await dashboardResponse.json()) as {
@@ -2570,7 +2693,7 @@ describe("StatusServer durable API", () => {
         concurrencyCap: 2,
         providerGates: [],
         chat: [],
-        totals: { backlog: 0, todo: 1, progress: 2, review: 2, done: 1, cancelled: 1, open: 5, all: 7, completeness: 14 },
+        totals: { backlog: 0, todo: 1, progress: 2, review: 4, done: 1, cancelled: 1, open: 7, all: 9, completeness: 11 },
       });
       expect(dashboardBody.runningAgents[0]).toMatchObject({
         issue: "TEST-1",
@@ -2587,9 +2710,23 @@ describe("StatusServer durable API", () => {
       const sidebarBody = (await sidebarResponse.json()) as {
         providerGates: unknown[];
         runningAgents: Array<{ issue: string; title: string; state: string; duration: string }>;
-        reviewIssues: Array<{ id: string; status: string }>;
+        reviewIssues: Array<{
+          id: string;
+          title: string;
+          status: string;
+          priority: number | string;
+          labels: string[];
+          assignee: string;
+          agent: string | null;
+          pr: string | null;
+          ci: string | null;
+          workspace: string | null;
+          session: string | null;
+          activity: Array<{ verb: string; val: string; who: string }>;
+          desc?: string[];
+        }>;
         activity: Array<{ verb: string; id: string }>;
-        sessions: Array<{ id: string; issue: string }>;
+        sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
         chat: unknown[];
         totals: Record<string, number>;
       };
@@ -2605,11 +2742,32 @@ describe("StatusServer durable API", () => {
       ]);
       expect(sidebarBody.providerGates).toEqual(dashboardBody.providerGates);
       expect(sidebarBody.runningAgents).toEqual(dashboardBody.runningAgents);
-      expect(sidebarBody.reviewIssues.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE"]);
+      expect(sidebarBody.reviewIssues.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE", "TEST-REVIEW-3"]);
+      expect(sidebarBody.reviewIssues).toHaveLength(3);
+      expect(sidebarBody.reviewIssues.find((item) => item.id === "TEST-REVIEW-4")).toBeUndefined();
+      expect(sidebarBody.reviewIssues[0]).toMatchObject({
+        id: "TEST-1",
+        title: "Linear review title",
+        status: "review",
+        priority: 2,
+        labels: ["dogfood-ready"],
+        assignee: "review-assignee",
+        agent: "agent-1",
+        pr: "#67",
+        ci: "success",
+        workspace: path.join(config.workspace.root, "TEST-1"),
+        session: "session-1",
+      });
+      expect(sidebarBody.reviewIssues[0]?.desc).toEqual(
+        expect.arrayContaining(["Review route description.", "Second route paragraph.", "Blocked by TEST-0"]),
+      );
+      expect(sidebarBody.reviewIssues[0]?.activity.map((item) => item.verb)).toEqual(expect.arrayContaining(["created", "updated", "pr pushed"]));
       expect(sidebarBody.activity).toEqual(dashboardBody.activity);
-      expect(sidebarBody.sessions.map((item) => item.id)).toEqual(["run-test-1"]);
+      expect(sidebarBody.sessions[0]).toMatchObject({ id: "run-test-1", issue: "TEST-1", state: "running", lastEvent: "TEST-1 run started" });
       expect(sidebarBody.chat).toEqual([]);
       expect(sidebarBody.totals).toEqual(dashboardBody.totals);
+      expect(JSON.stringify(sidebarBody)).not.toContain("openai/symphony");
+      expect(JSON.stringify(sidebarBody)).not.toContain("poll 22s");
       expect(JSON.stringify(sidebarBody)).not.toContain("Mock");
 
       const boardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
@@ -2625,7 +2783,7 @@ describe("StatusServer durable API", () => {
       expect(boardResponse.status).toBe(200);
       expect(boardBody.columns.map((column) => column.id)).toEqual(["backlog", "todo", "progress", "review", "done", "canceled"]);
       expect(boardBody.columns.find((column) => column.id === "todo")?.count).toBe(1);
-      expect(boardBody.counts.total).toBe(7);
+      expect(boardBody.counts.total).toBe(9);
       expect(boardBody.issues.find((item) => item.issueIdentifier === "TEST-TODO")?.capabilities.detail).toBe(
         "/api/v1/board/issues/issue-todo",
       );
