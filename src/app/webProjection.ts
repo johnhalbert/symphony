@@ -805,29 +805,42 @@ export function projectSessionModel(run: RunRecord): SessionModel {
 }
 
 export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefined, generatedAt: string | null | undefined = snapshot?.generatedAt ?? null): RunningAgentModel[] {
-  return (snapshot?.running ?? []).map((row) => ({
-    id: row.runId ?? row.issueIdentifier,
-    issue: row.issueIdentifier,
-    title: row.issueDetails.title ?? row.issueIdentifier,
-    state: row.liveness.status,
-    step: firstNonEmpty(row.lastMessage, row.lastEvent) ?? "",
-    duration: formatRunDuration(row.startedAt, generatedAt),
-    tokens: row.tokens.totalTokens > 0 ? String(row.tokens.totalTokens) : "",
-  }));
+  return (snapshot?.running ?? []).map((row) => {
+    const id = firstNonEmpty(row.runId, row.issueIdentifier, row.issueId) ?? "";
+    const issue = firstNonEmpty(row.issueIdentifier, row.issueId) ?? "";
+    const totalTokens = row.tokens?.totalTokens ?? 0;
+    return {
+      id,
+      issue,
+      title: firstNonEmpty(row.issueDetails?.title, row.issueIdentifier, row.issueId, row.runId) ?? "",
+      state: firstNonEmpty(row.liveness?.status, row.state) ?? "",
+      step: firstNonEmpty(row.lastMessage, row.lastEvent) ?? "",
+      duration: formatRunDuration(row.startedAt, generatedAt),
+      tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
+    };
+  });
 }
 
 export function projectProviderGates(snapshot: RuntimeSnapshot | null | undefined): ProviderGateModel[] {
-  return (snapshot?.providerGates ?? []).map((gate) => ({
-    id: gate.id,
-    provider: gate.scope.providerId ?? gate.scope.harnessId,
-    kind: gate.kind,
-    message: gate.message,
-    resumeAt: gate.window?.resumeAt ?? null,
-    resumePolicy: gate.resumePolicy,
-    sourceIssue: gate.source?.issueIdentifier ?? gate.source?.issueId ?? null,
-    sourceRunId: gate.source?.runId ?? null,
-    affected: [...gate.affectedRoles, ...gate.affectedRunPhases].join(", "),
-  }));
+  return (snapshot?.providerGates ?? []).map((gate) => {
+    const affected = [
+      ...(Array.isArray(gate.affectedRoles) ? gate.affectedRoles : []),
+      ...(Array.isArray(gate.affectedRunPhases) ? gate.affectedRunPhases : []),
+    ]
+      .filter((value) => typeof value === "string" && value.trim().length > 0)
+      .join(", ");
+    return {
+      id: firstNonEmpty(gate.id) ?? "",
+      provider: firstNonEmpty(gate.scope?.providerId, gate.scope?.harnessId) ?? "",
+      kind: firstNonEmpty(gate.kind) ?? "",
+      message: firstNonEmpty(gate.message) ?? "",
+      resumeAt: gate.window?.resumeAt ?? null,
+      resumePolicy: firstNonEmpty(gate.resumePolicy) ?? "",
+      sourceIssue: firstNonEmpty(gate.source?.issueIdentifier, gate.source?.issueId) ?? null,
+      sourceRunId: firstNonEmpty(gate.source?.runId) ?? null,
+      affected,
+    };
+  });
 }
 
 export function normalizeDescription(description: string | null | undefined): string[] {

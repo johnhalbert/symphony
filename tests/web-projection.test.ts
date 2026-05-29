@@ -798,6 +798,83 @@ describe("web projection foundation", () => {
     expect(projectDashboardModel({ activity: null, board: null, runs: [] })).toEqual(emptyDashboard);
   });
 
+  it("keeps dashboard mapping stable for partial runtime rows and unavailable board data", () => {
+    const dashboard = projectWebDashboard({
+      board: null,
+      runtime: {
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        running: [
+          {
+            issueId: "issue-live",
+            issueIdentifier: "",
+            runId: null,
+            state: "running",
+            lastMessage: "",
+            lastEvent: "executing tool",
+            startedAt: "2026-01-01T00:05:00.000Z",
+            tokens: {},
+          },
+        ],
+        providerGates: [
+          {
+            id: "gate-1",
+            scope: { harnessId: "hermes", providerId: "" },
+            kind: "manual_pause",
+            message: "Provider gate active",
+            window: null,
+            resumePolicy: "manual",
+            source: { issueId: "issue-source", issueIdentifier: "", runId: "" },
+            affectedRoles: [],
+            affectedRunPhases: null,
+          },
+        ],
+      } as any,
+      config: {
+        repoLabel: "acme/symphony",
+        branch: "main",
+        workflowLabel: "WORKFLOW.md",
+        pollIntervalMs: -1,
+        concurrencyCap: 1.9,
+      },
+    });
+
+    expect(dashboard).toMatchObject({
+      repoLabel: "acme/symphony",
+      branch: "main",
+      workflowLabel: "WORKFLOW.md",
+      pollLabel: "",
+      agentUsageLabel: "1/1 agents",
+      concurrencyCap: 1,
+      activity: [],
+      chat: [],
+      totals: { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 },
+    });
+    expect(dashboard.runningAgents).toEqual([
+      {
+        id: "issue-live",
+        issue: "issue-live",
+        title: "issue-live",
+        state: "running",
+        step: "executing tool",
+        duration: "",
+        tokens: "",
+      },
+    ]);
+    expect(dashboard.providerGates).toEqual([
+      {
+        id: "gate-1",
+        provider: "hermes",
+        kind: "manual_pause",
+        message: "Provider gate active",
+        resumeAt: null,
+        resumePolicy: "manual",
+        sourceIssue: "issue-source",
+        sourceRunId: null,
+        affected: "",
+      },
+    ]);
+  });
+
   it("drops caller-provided dashboard chat input to keep chat behavior out of scope", () => {
     const injectedChat = [{ who: "agent" as const, text: "not allowed mock chat", suggestions: ["assistant suggestion"] }];
 
