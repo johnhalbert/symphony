@@ -250,6 +250,56 @@ describe("projectWebTranscript", () => {
     expect(messages.map((message) => message.kind)).not.toContain("assistant");
   });
 
+  it("keeps unresolved request actions exact empty arrays and maps unknown payloads without leaking runtime fields", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "approval_request",
+        source: "orchestrator",
+        message: "Approval requested",
+        payload: {
+          reason: "workflow_policy",
+          prompt: "Operator approval requested",
+          actions: [{ unresolvedId: "approve-secret" }, {}, null, ""],
+          rawRequest: { token: "SECRET_ACTION_TOKEN" },
+        },
+      }),
+      event({
+        eventType: "brand_new_runtime_event",
+        source: "runtime",
+        message: "raw SECRET_RUNTIME_MESSAGE",
+        payload: {
+          textPreview: "Public fallback status",
+          runId: "internal-run-id",
+          toolArgs: { token: "SECRET_TOOL_ARG" },
+          result: "SECRET_RESULT_PAYLOAD",
+        },
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      {
+        kind: "request",
+        ts: "2026-01-01T00:00:00.000Z",
+        reason: "workflow_policy",
+        q: "Operator approval requested",
+        actions: [],
+      },
+      {
+        kind: "status",
+        state: "brand_new_runtime_event",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Public fallback status",
+      },
+    ]);
+    expect(messages[0]?.kind === "request" ? messages[0].actions : null).toEqual([]);
+    expect(messages[0]?.kind === "request" ? messages[0].actions : null).not.toBeUndefined();
+    const serialized = JSON.stringify(messages);
+    expect(serialized).not.toContain("SECRET_");
+    expect(serialized).not.toContain("internal-run-id");
+    expect(serialized).not.toContain("rawRequest");
+    expect(serialized).not.toContain("toolArgs");
+  });
+
 });
 
 function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {

@@ -212,6 +212,71 @@ describe("projectWebHistory", () => {
     });
   });
 
+  it("keeps durable-only run sessions honest when optional history metadata is absent", () => {
+    const model = projectWebHistory([
+      run({
+        runId: "run-durable-only",
+        sessionId: null,
+        agentId: null,
+        issueIdentifier: "TEST-DURABLE",
+        issueTitle: null,
+        runtimeModel: null,
+        cursorModel: null,
+        runtimeModelParams: [],
+        runtimeSettingSources: [],
+        cursorModelParams: [],
+        cursorSettingSources: [],
+        workspaceKey: "TEST-DURABLE",
+        workspacePath: "",
+        repoPath: null,
+        baseRef: null,
+        gitBranchName: null,
+        status: "succeeded",
+      }),
+    ]);
+
+    expect(model.defaultSessionId).toBe("run-durable-only");
+    expect(model.transcriptBySession).toEqual({});
+    expect(model.timeline).toEqual([]);
+    expect(model.sessions[0]).toMatchObject({
+      id: "run-durable-only",
+      issue: "TEST-DURABLE",
+      title: "TEST-DURABLE",
+      state: "finished",
+      model: "",
+      msgCount: 0,
+      lastEvent: "TEST-DURABLE finished",
+      toolCount: 0,
+      runSession: {
+        runId: "run-durable-only",
+        sessionId: null,
+        agentId: null,
+        status: "succeeded",
+        transcriptEventCount: 0,
+        runtime: { model: null, modelParams: [], settingSources: [], mode: null, allowLargeContext: null, agentLifecycle: null },
+        cursor: { model: null, modelParams: [], settingSources: [], mode: null, allowLargeContext: null, workerAgentLifecycle: null },
+        workspace: { key: "TEST-DURABLE", path: "", repoPath: null, baseRef: null, branch: null },
+        pullRequest: { url: null, number: null, headSha: null, branch: null, ciStatus: null, lastPushedAt: null, lastEvidenceCursor: null },
+        approval: { pendingRequestId: null, requestedAt: null },
+        cancellation: {
+          requestedAt: null,
+          source: null,
+          reason: null,
+          outcome: null,
+          harnessStopRequestedAt: null,
+          harnessStopFailedAt: null,
+          harnessStopFailedReason: null,
+          cancelFailed: false,
+          cancelFailedAt: null,
+          cancelFailedReason: null,
+          cancelFailedSource: null,
+        },
+        failure: { kind: null, diagnosticCode: null, diagnosticMessage: null, diagnosticAt: null },
+      },
+    });
+    expect(JSON.stringify(model).toLowerCase()).not.toContain("mock");
+  });
+
   it("maps activity items into a deterministic status timeline without mock entries", () => {
     const model = projectWebHistory(
       [run({ runId: "run-a", issueIdentifier: "TEST-1" }), run({ runId: "run-b", issueIdentifier: "TEST-2" })],
