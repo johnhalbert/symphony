@@ -700,10 +700,11 @@ export function projectHistoryModel(input: { runs?: RunRecord[]; transcript?: Tr
 
 export function projectSidebarModel(input: SidebarProjectionInput = {}): SidebarModel {
   const board = projectIssueBoardModel(input.board ?? null);
+  const issueBoard = projectWebIssueBoard(board);
   return {
     providerGates: projectProviderGates(input.runtime ?? null),
     runningAgents: projectRunningAgents(input.runtime ?? null),
-    reviewIssues: board.issues.filter((issue) => issue.status === "review").map(cloneIssueModel),
+    reviewIssues: issueBoard.lanes.review.slice(0, 3).map(cloneIssueModel),
     activity: projectActivityModels(input.activity ?? null),
     sessions: (input.sessions ?? []).map(cloneSessionModel),
     chat: (input.chat ?? []).map(cloneChatMessage),

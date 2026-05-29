@@ -2290,6 +2290,19 @@ describe("StatusServer durable API", () => {
       repoPath: "/repo",
       baseRef: "main",
     });
+    await runStore.recordPullRequestEvent({
+      runId: "run-test-1",
+      action: "updated",
+      at: "2026-01-01T00:01:00.000Z",
+      prUrl: "https://github.com/acme/repo/pull/67",
+      prNumber: 67,
+      lastPushedAt: "2026-01-01T00:00:30.000Z",
+    });
+    await runStore.recordCiStatusEvent({
+      runId: "run-test-1",
+      at: "2026-01-01T00:01:30.000Z",
+      ciStatus: "success",
+    });
     await lifecycleStore.ensureIssue(
       { id: "issue-blocked", identifier: "TEST-BLOCKED" },
       { phase: "blocked", blockedReason: "needs operator", summaryPointers: {} },
@@ -2301,6 +2314,8 @@ describe("StatusServer durable API", () => {
 
     const liveRunning = liveRunningFixture(config, "TEST-1", "In Progress");
     liveRunning.issueId = "issue-1";
+    liveRunning.sessionId = "session-1";
+    liveRunning.workspacePath = path.join(config.workspace.root, "TEST-1");
     liveRunning.issueDetails = issueDetailsFixture({
       id: "issue-1",
       identifier: "TEST-1",
@@ -2330,8 +2345,11 @@ describe("StatusServer durable API", () => {
         id: "issue-1",
         identifier: "TEST-1",
         title: "Linear review title",
+        description: "Review route description.\n\nSecond route paragraph.",
+        priority: 2,
         state: "In Review",
         url: "https://linear.app/acme/issue/TEST-1/linear-review-title",
+        assigneeId: "review-assignee",
         labels: ["dogfood-ready"],
         delegateId: "delegate-review",
         blockedBy: [{ id: "issue-0", identifier: "TEST-0", state: "In Progress" }],
@@ -2342,6 +2360,20 @@ describe("StatusServer durable API", () => {
         identifier: "TEST-MERGE",
         title: "Ready to merge",
         state: "Ready to Merge",
+      }),
+      issue({
+        id: "issue-review-3",
+        identifier: "TEST-REVIEW-3",
+        title: "Third review issue",
+        state: "In Review",
+        labels: ["third-review"],
+      }),
+      issue({
+        id: "issue-review-4",
+        identifier: "TEST-REVIEW-4",
+        title: "Fourth review issue",
+        state: "In Review",
+        labels: ["fourth-review"],
       }),
       issue({
         id: "issue-done",
@@ -2402,8 +2434,8 @@ describe("StatusServer durable API", () => {
       expect(response.status).toBe(200);
       expect(tracker.requestedStates).toEqual(["Backlog", "Todo", "In Progress", "Blocked", "In Review", "Ready to Merge", "Done", "Canceled"]);
       expect(tracker.fetchCount).toBe(1);
-      expect(body.tracker).toMatchObject({ issueCount: 6, cached: false });
-      expect(body.counts).toMatchObject({ total: 7, trackerBacked: 6, symphonyOnly: 1, live: 1, paused: 1, blocked: 3 });
+      expect(body.tracker).toMatchObject({ issueCount: 8, cached: false });
+      expect(body.counts).toMatchObject({ total: 9, trackerBacked: 8, symphonyOnly: 1, live: 1, paused: 1, blocked: 3 });
       expect(body.lanes.map((lane) => lane.id)).toEqual(["backlog", "todo", "progress", "review", "done", "canceled"]);
       expect(body.issues.map((item) => item.issueIdentifier)).not.toContain("TEST-ARCHIVED");
 
@@ -2472,6 +2504,8 @@ describe("StatusServer durable API", () => {
         "TEST-PROGRESS",
         "TEST-1",
         "TEST-MERGE",
+        "TEST-REVIEW-3",
+        "TEST-REVIEW-4",
         "TEST-DONE",
         "TEST-CANCELED",
         "TEST-BLOCKED",
@@ -2479,7 +2513,7 @@ describe("StatusServer durable API", () => {
       expect(webIssuesBody.backlog.map((item) => item.id)).toEqual(["TEST-TODO"]);
       expect(webIssuesBody.lanes.todo.map((item) => item.id)).toEqual(["TEST-TODO"]);
       expect(webIssuesBody.lanes.progress.map((item) => item.id)).toEqual(["TEST-PROGRESS", "TEST-BLOCKED"]);
-      expect(webIssuesBody.lanes.review.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE"]);
+      expect(webIssuesBody.lanes.review.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE", "TEST-REVIEW-3", "TEST-REVIEW-4"]);
       expect(webIssuesBody.issues.find((item) => item.id === "TEST-CANCELED")?.status).toBe("cancelled");
       expect(webIssuesBody.selectedIssueId).toBe("TEST-PROGRESS");
 
@@ -2523,7 +2557,7 @@ describe("StatusServer durable API", () => {
         concurrencyCap: 2,
         providerGates: [],
         chat: [],
-        totals: { backlog: 0, todo: 1, progress: 2, review: 2, done: 1, cancelled: 1, open: 5, all: 7, completeness: 14 },
+        totals: { backlog: 0, todo: 1, progress: 2, review: 4, done: 1, cancelled: 1, open: 7, all: 9, completeness: 11 },
       });
       expect(dashboardBody.runningAgents[0]).toMatchObject({
         issue: "TEST-1",
@@ -2540,7 +2574,20 @@ describe("StatusServer durable API", () => {
       const sidebarBody = (await sidebarResponse.json()) as {
         providerGates: unknown[];
         runningAgents: Array<{ issue: string; title: string; state: string; duration: string }>;
-        reviewIssues: Array<{ id: string; status: string }>;
+        reviewIssues: Array<{
+          id: string;
+          title: string;
+          status: string;
+          priority: number;
+          labels: string[];
+          assignee: string;
+          agent: string | null;
+          pr: string | null;
+          ci: string | null;
+          workspace: string | null;
+          session: string | null;
+          desc?: string[];
+        }>;
         activity: Array<{ verb: string; id: string }>;
         sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
         chat: unknown[];
@@ -2559,7 +2606,7 @@ describe("StatusServer durable API", () => {
       expect(sidebarBody).toMatchObject({
         providerGates: [],
         chat: [],
-        totals: { backlog: 0, todo: 1, progress: 2, review: 2, done: 1, cancelled: 1, open: 5, all: 7, completeness: 14 },
+        totals: { backlog: 0, todo: 1, progress: 2, review: 4, done: 1, cancelled: 1, open: 7, all: 9, completeness: 11 },
       });
       expect(sidebarBody.runningAgents[0]).toMatchObject({
         issue: "TEST-1",
@@ -2567,7 +2614,24 @@ describe("StatusServer durable API", () => {
         state: "active",
         duration: "10m",
       });
-      expect(sidebarBody.reviewIssues.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE"]);
+      expect(sidebarBody.reviewIssues.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE", "TEST-REVIEW-3"]);
+      expect(sidebarBody.reviewIssues).toHaveLength(3);
+      expect(sidebarBody.reviewIssues.find((item) => item.id === "TEST-REVIEW-4")).toBeUndefined();
+      expect(sidebarBody.reviewIssues[0]).toMatchObject({
+        id: "TEST-1",
+        title: "Linear review title",
+        status: "review",
+        priority: 2,
+        labels: ["dogfood-ready"],
+        assignee: "review-assignee",
+        agent: "agent-1",
+        pr: "#67",
+        ci: "success",
+        workspace: path.join(config.workspace.root, "TEST-1"),
+        session: "session-1",
+        activity: [],
+        desc: ["Review route description.", "Second route paragraph."],
+      });
       expect(sidebarBody.activity[0]).toMatchObject({ verb: "run_started", id: "TEST-1" });
       expect(sidebarBody.sessions[0]).toMatchObject({ id: "run-test-1", issue: "TEST-1", state: "running", lastEvent: "TEST-1 run started" });
       expect(JSON.stringify(sidebarBody)).not.toContain("openai/symphony");
@@ -2587,7 +2651,7 @@ describe("StatusServer durable API", () => {
       expect(boardResponse.status).toBe(200);
       expect(boardBody.columns.map((column) => column.id)).toEqual(["backlog", "todo", "progress", "review", "done", "canceled"]);
       expect(boardBody.columns.find((column) => column.id === "todo")?.count).toBe(1);
-      expect(boardBody.counts.total).toBe(7);
+      expect(boardBody.counts.total).toBe(9);
       expect(boardBody.issues.find((item) => item.issueIdentifier === "TEST-TODO")?.capabilities.detail).toBe(
         "/api/v1/board/issues/issue-todo",
       );

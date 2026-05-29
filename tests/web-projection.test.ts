@@ -546,6 +546,95 @@ describe("web projection foundation", () => {
     expect(sidebar.totals).toMatchObject({ todo: 1, review: 1, open: 2, all: 2, completeness: 0 });
   });
 
+  it("caps sidebar review issues to the first three enriched review-lane issues", () => {
+    const richReviewIssue = card({
+      key: "TEST-REVIEW-1",
+      issueId: "issue-review-1",
+      issueIdentifier: "TEST-REVIEW-1",
+      lane: "review",
+      issueDetails: issueDetails({
+        issue: {
+          ...issueDetails().issue,
+          id: "issue-review-1",
+          identifier: "TEST-REVIEW-1",
+          title: "First review issue",
+          description: "Preserve this review description.\n\nSecond review paragraph.",
+          priority: 2,
+          state: "In Review",
+          assigneeId: "assignee-review",
+          delegateId: "delegate-review",
+          labels: ["dogfood-ready", "sidebar"],
+        },
+        workspace: {
+          workspaceKey: "TEST-REVIEW-1",
+          path: "/tmp/workspaces/TEST-REVIEW-1",
+          sourceKind: "git_worktree",
+          branchName: "symphony/TEST-REVIEW-1",
+          gitBranchName: "symphony/TEST-REVIEW-1",
+          repoPath: "/repo",
+          baseRef: "main",
+        },
+        pullRequest: {
+          url: "https://github.com/acme/repo/pull/41",
+          number: 41,
+          headSha: "head-sha-41",
+          branch: "symphony/TEST-REVIEW-1",
+          ciStatus: "success",
+          lastPushedAt: "2026-01-01T00:04:00.000Z",
+        },
+      }),
+      live: {
+        role: "reviewer",
+        runPhase: "review",
+        runKind: "review",
+        state: "running",
+        runId: "run-review-1",
+        agentId: "agent-review-1",
+        sessionId: "session-review-1",
+      },
+      operatorLiveness: {
+        agentId: "agent-review-1",
+        sessionId: "session-review-1",
+        workspacePath: "/tmp/workspaces/TEST-REVIEW-1",
+        runId: "run-review-1",
+        activeRunId: "run-review-1",
+        status: "active",
+      },
+    });
+
+    const sidebar = projectSidebarModel({
+      board: {
+        issues: [
+          webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
+          richReviewIssue,
+          webCard("TEST-REVIEW-2", { lane: "review", state: "In Review", title: "Second review issue" }),
+          webCard("TEST-REVIEW-3", { lane: "review", state: "Ready to Merge", title: "Third review issue" }),
+          webCard("TEST-REVIEW-4", { lane: "review", state: "In Review", title: "Fourth review issue" }),
+        ],
+      },
+    });
+
+    expect(sidebar.reviewIssues.map((item) => item.id)).toEqual(["TEST-REVIEW-1", "TEST-REVIEW-2", "TEST-REVIEW-3"]);
+    expect(sidebar.reviewIssues).toHaveLength(3);
+    expect(sidebar.reviewIssues.find((item) => item.id === "TEST-REVIEW-4")).toBeUndefined();
+    expect(sidebar.reviewIssues[0]).toMatchObject({
+      id: "TEST-REVIEW-1",
+      title: "First review issue",
+      status: "review",
+      priority: 2,
+      labels: ["dogfood-ready", "sidebar"],
+      assignee: "assignee-review",
+      agent: "agent-review-1",
+      pr: "#41",
+      ci: "success",
+      workspace: "/tmp/workspaces/TEST-REVIEW-1",
+      session: "session-review-1",
+      activity: [],
+      desc: ["Preserve this review description.", "Second review paragraph."],
+    });
+    expect(sidebar.totals).toMatchObject({ todo: 1, review: 4, open: 5, all: 5, completeness: 0 });
+  });
+
   it("projects deterministic reference data from board labels, assignees, and delegates", () => {
     const firstIssue = {
       ...issueDetails().issue,
