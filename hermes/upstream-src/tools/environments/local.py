@@ -212,6 +212,23 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     return sanitized
 
 
+def _is_windows_wsl_bash(candidate: str) -> bool:
+    """Return True for Windows bash shims that launch WSL instead of Git Bash."""
+    if not _IS_WINDOWS or not candidate:
+        return False
+    try:
+        normalized = os.path.normcase(os.path.abspath(candidate)).replace("/", "\\")
+    except (OSError, ValueError):
+        normalized = os.path.normcase(candidate).replace("/", "\\")
+    normalized = normalized.lower()
+
+    return (
+        normalized.endswith("\\windows\\system32\\bash.exe")
+        or normalized.endswith("\\windows\\sysnative\\bash.exe")
+        or normalized.endswith("\\appdata\\local\\microsoft\\windowsapps\\bash.exe")
+    )
+
+
 def _find_bash() -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:
@@ -224,8 +241,13 @@ def _find_bash() -> str:
         )
 
     custom = os.environ.get("HERMES_GIT_BASH_PATH")
-    if custom and os.path.isfile(custom):
+    if custom and os.path.isfile(custom) and not _is_windows_wsl_bash(custom):
         return custom
+    if custom and _is_windows_wsl_bash(custom):
+        raise RuntimeError(
+            "HERMES_GIT_BASH_PATH points at WSL bash, but Hermes local "
+            "execution on native Windows requires Git for Windows bash.exe."
+        )
 
     # Prefer our own portable Git install first — this way a broken or
     # partially-uninstalled system Git can't hijack the bash lookup.  The
@@ -246,10 +268,6 @@ def _find_bash() -> str:
             if os.path.isfile(candidate):
                 return candidate
 
-    found = shutil.which("bash")
-    if found:
-        return found
-
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
@@ -258,10 +276,17 @@ def _find_bash() -> str:
         if candidate and os.path.isfile(candidate):
             return candidate
 
+    # PATH is the last resort on Windows. ``bash`` commonly resolves to the
+    # WSL shim (System32/WindowsApps), which cannot access native ``C:/...``
+    # worktree paths. Accept PATH bash only after filtering those shims out.
+    found = shutil.which("bash")
+    if found and not _is_windows_wsl_bash(found):
+        return found
+
     raise RuntimeError(
         "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
         "Install it from: https://git-scm.com/download/win\n"
-        "Or set HERMES_GIT_BASH_PATH to your bash.exe location."
+        "Or set HERMES_GIT_BASH_PATH to your Git for Windows bash.exe location."
     )
 
 
