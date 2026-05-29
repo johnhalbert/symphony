@@ -11,6 +11,7 @@ import {
   projectWebOrchestratorChat,
   projectWebOrchestratorChatPost,
   projectWebReferenceData,
+  projectWebSidebar,
   type DashboardRuntimeConfig,
 } from "./webProjection.js";
 import {
@@ -207,6 +208,14 @@ export class StatusServer {
           response,
           200,
           await this.fetchWebDashboard(url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true"),
+        );
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") {
+        sendJson(
+          response,
+          200,
+          await this.fetchWebSidebar(url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true"),
         );
         return;
       }
@@ -824,6 +833,48 @@ export class StatusServer {
       activity,
       config: this.options.dashboard ?? null,
     });
+  }
+
+  private async fetchWebSidebar(forceRefresh: boolean) {
+    const snapshot = this.options.orchestrator.snapshot();
+    let board: IssueBoardResponse | null = null;
+    try {
+      board = await this.fetchIssueBoard(forceRefresh);
+    } catch (error) {
+      if (!(error instanceof SymphonyError) || (error.code !== "tracker_error" && error.code !== "tracker_unavailable")) {
+        throw error;
+      }
+    }
+    const runs = (await this.options.runStore?.listRuns()) ?? [];
+    const dashboardActivity = await buildActivityFeed({
+      generatedAt: snapshot.generatedAt,
+      runStore: this.options.runStore,
+      runs,
+      lifecycleStore: this.options.lifecycleStore,
+      writebackOutbox: this.options.writebackOutbox,
+      query: { issue: null, offset: 0, limit: 20 },
+      includeTranscriptEvents: false,
+    });
+    const historyActivity = await buildActivityFeed({
+      generatedAt: snapshot.generatedAt,
+      runStore: this.options.runStore,
+      runs,
+      lifecycleStore: this.options.lifecycleStore,
+      writebackOutbox: this.options.writebackOutbox,
+      query: { issue: null, offset: 0, limit: Number.MAX_SAFE_INTEGER },
+      includeTranscriptEvents: false,
+    });
+    return projectWebSidebar(
+      projectWebDashboard({
+        runtime: snapshot,
+        board,
+        activity: dashboardActivity,
+        config: this.options.dashboard ?? null,
+      }),
+      projectWebIssueBoard(board),
+      projectWebHistory(runs, historyActivity.activity),
+      projectWebOrchestratorChat(),
+    );
   }
 
   private async fetchIssueBoard(forceRefresh: boolean): Promise<IssueBoardResponse> {

@@ -6,6 +6,7 @@ import {
   deriveIssueStatus,
   deterministicColor,
   emptyDashboardModel,
+  emptySidebarModel,
   normalizeDescription,
   projectActivityModels,
   projectDashboardModel,
@@ -15,6 +16,7 @@ import {
   projectIssueDetailModel,
   projectWebDashboard,
   projectWebIssueBoard,
+  projectWebSidebar,
   projectTranscriptMessages,
   projectWebOrchestratorChat,
   projectWebOrchestratorChatPost,
@@ -22,6 +24,7 @@ import {
   type IssueBoardCardProjectionInput,
   type IssueBoardResponseProjectionInput,
 } from "../src/app/webProjection.js";
+import { projectWebHistory } from "../src/app/WebHistoryProjection.js";
 
 function issueDetails(overrides: Partial<IssueDetailsEnvelope> = {}): IssueDetailsEnvelope {
   return {
@@ -465,6 +468,108 @@ describe("web projection foundation", () => {
     expect(history.transcript.map((message) => message.kind)).toEqual(["tool_call", "request"]);
     expect(projectActivityModels(activityInput)[1]).toMatchObject({ who: "agent-1", id: "TEST-1", extra: "read_file" });
     expect(projectTranscriptMessages(transcriptEvents)[0]).toMatchObject({ kind: "tool_call", text: "read_file" });
+  });
+
+  it("composes the web sidebar model directly from dashboard, issue, history, and chat projections", () => {
+    const issues = projectWebIssueBoard({
+      issues: [
+        webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
+        webCard("TEST-REVIEW", { lane: "review", state: "In Review" }),
+      ],
+    });
+    const providerGates = [
+      {
+        id: "gate-1",
+        provider: "openai-codex",
+        kind: "windowed_bucket_exhausted",
+        message: "provider paused",
+        resumeAt: "2026-01-01T05:00:00.000Z",
+        resumePolicy: "auto_at_window_close",
+        sourceIssue: "TEST-REVIEW",
+        sourceRunId: "run-sidebar",
+        affected: "worker",
+      },
+    ];
+    const runningAgents = [
+      {
+        id: "run-sidebar",
+        issue: "TEST-REVIEW",
+        title: "Review issue",
+        state: "active",
+        step: "reviewing",
+        duration: "1m",
+        tokens: "12",
+      },
+    ];
+    const activity = [{ t: "2026-01-01T00:00:00.000Z", who: "agent-1", verb: "run_started", id: "TEST-REVIEW", extra: "run-sidebar" }];
+    const totals = { backlog: 0, todo: 1, progress: 0, review: 1, done: 0, cancelled: 0, open: 2, all: 2, completeness: 0 };
+    const dashboard = {
+      projectName: "Symphony",
+      repoLabel: "acme/symphony",
+      branch: "main",
+      workflowLabel: "WORKFLOW.md",
+      pollLabel: "poll 60s",
+      agentUsageLabel: "1/2 agents",
+      concurrencyCap: 2,
+      providerGates,
+      runningAgents,
+      activity,
+      chat: [],
+      totals,
+    };
+    const history = projectWebHistory([run({ runId: "run-sidebar", issueIdentifier: "TEST-REVIEW" })], []);
+    const chat = [{ who: "user" as const, text: "show the sidebar" }];
+
+    const sidebar = projectWebSidebar(dashboard, issues, history, chat);
+
+    expect(sidebar.providerGates).toBe(providerGates);
+    expect(sidebar.runningAgents).toBe(runningAgents);
+    expect(sidebar.reviewIssues).toEqual(issues.lanes.review);
+    expect(sidebar.activity).toBe(activity);
+    expect(sidebar.sessions).toBe(history.sessions);
+    expect(sidebar.chat).toBe(chat);
+    expect(sidebar.totals).toBe(totals);
+  });
+
+  it("caps sidebar review issues at three while preserving issue projection order", () => {
+    const issues = projectWebIssueBoard({
+      issues: [
+        webCard("TEST-REVIEW-1", { lane: "review", state: "In Review" }),
+        webCard("TEST-REVIEW-2", { lane: "review", state: "Ready to Merge" }),
+        webCard("TEST-REVIEW-3", { lane: "review", state: "In Review" }),
+        webCard("TEST-REVIEW-4", { lane: "review", state: "Ready to Merge" }),
+        webCard("TEST-PROGRESS", { lane: "progress", state: "In Progress" }),
+      ],
+    });
+
+    const sidebar = projectWebSidebar(emptyDashboardModel(), issues, projectWebHistory([], []), []);
+
+    expect(issues.lanes.review.map((issue) => issue.id)).toEqual([
+      "TEST-REVIEW-1",
+      "TEST-REVIEW-2",
+      "TEST-REVIEW-3",
+      "TEST-REVIEW-4",
+    ]);
+    expect(sidebar.reviewIssues.map((issue) => issue.id)).toEqual(["TEST-REVIEW-1", "TEST-REVIEW-2", "TEST-REVIEW-3"]);
+    expect(sidebar.reviewIssues[0]).toBe(issues.lanes.review[0]);
+    expect(sidebar.reviewIssues[2]).toBe(issues.lanes.review[2]);
+  });
+
+  it("returns a complete empty sidebar model without mock sidebar-only data", () => {
+    const expected = {
+      providerGates: [],
+      runningAgents: [],
+      reviewIssues: [],
+      activity: [],
+      sessions: [],
+      chat: [],
+      totals: { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 },
+    };
+
+    expect(emptySidebarModel()).toEqual(expected);
+    expect(projectWebSidebar(emptyDashboardModel(), projectWebIssueBoard(null), projectWebHistory([], []), projectWebOrchestratorChat())).toEqual(expected);
+    expect(JSON.stringify(expected)).not.toContain("mock");
+    expect(JSON.stringify(expected)).not.toContain("assistant");
   });
 
   it("projects deterministic reference data from board labels, assignees, and delegates", () => {

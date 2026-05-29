@@ -2536,6 +2536,35 @@ describe("StatusServer durable API", () => {
       expect(JSON.stringify(dashboardBody)).not.toContain("poll 22s");
       expect(JSON.stringify(dashboardBody)).not.toContain("Mock");
 
+      const sidebarResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sidebar`);
+      const sidebarBody = (await sidebarResponse.json()) as {
+        providerGates: unknown[];
+        runningAgents: Array<{ issue: string; title: string; state: string; duration: string }>;
+        reviewIssues: Array<{ id: string; status: string }>;
+        activity: Array<{ verb: string; id: string }>;
+        sessions: Array<{ id: string; issue: string }>;
+        chat: unknown[];
+        totals: Record<string, number>;
+      };
+      expect(sidebarResponse.status).toBe(200);
+      expect(Object.keys(sidebarBody).sort()).toEqual([
+        "activity",
+        "chat",
+        "providerGates",
+        "reviewIssues",
+        "runningAgents",
+        "sessions",
+        "totals",
+      ]);
+      expect(sidebarBody.providerGates).toEqual(dashboardBody.providerGates);
+      expect(sidebarBody.runningAgents).toEqual(dashboardBody.runningAgents);
+      expect(sidebarBody.reviewIssues.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE"]);
+      expect(sidebarBody.activity).toEqual(dashboardBody.activity);
+      expect(sidebarBody.sessions.map((item) => item.id)).toEqual(["run-test-1"]);
+      expect(sidebarBody.chat).toEqual([]);
+      expect(sidebarBody.totals).toEqual(dashboardBody.totals);
+      expect(JSON.stringify(sidebarBody)).not.toContain("Mock");
+
       const boardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
       const boardBody = (await boardResponse.json()) as {
         columns: Array<{
@@ -2629,6 +2658,7 @@ describe("StatusServer durable API", () => {
       const acceptedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
       const referenceResponse = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/reference-data");
       const dashboardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/dashboard`);
+      const sidebarResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sidebar`);
       const body = (await response.json()) as { error: { code: string; message: string } };
       const acceptedBody = (await acceptedResponse.json()) as { error: { code: string; message: string } };
       const referenceBody = (await referenceResponse.json()) as {
@@ -2641,6 +2671,15 @@ describe("StatusServer durable API", () => {
         providerGates: unknown[];
         runningAgents: unknown[];
         totals: { all: number; open: number; completeness: number };
+      };
+      const sidebarBody = (await sidebarResponse.json()) as {
+        providerGates: unknown[];
+        runningAgents: unknown[];
+        reviewIssues: unknown[];
+        activity: unknown[];
+        sessions: unknown[];
+        chat: unknown[];
+        totals: { backlog: number; todo: number; progress: number; review: number; done: number; cancelled: number; open: number; all: number; completeness: number };
       };
 
       expect(response.status).toBe(503);
@@ -2660,6 +2699,16 @@ describe("StatusServer durable API", () => {
         providerGates: [],
         runningAgents: [],
         totals: { all: 0, open: 0, completeness: 0 },
+      });
+      expect(sidebarResponse.status).toBe(200);
+      expect(sidebarBody).toEqual({
+        providerGates: [],
+        runningAgents: [],
+        reviewIssues: [],
+        activity: [],
+        sessions: [],
+        chat: [],
+        totals: { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 },
       });
     } finally {
       await server.stop();

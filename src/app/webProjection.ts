@@ -1,5 +1,6 @@
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
+import type { HistoryModel as WebHistoryModel } from "./WebHistoryProjection.js";
 import type {
   AgentRunKind,
   AgentRunPhase,
@@ -208,12 +209,11 @@ export interface HistoryModel {
 export interface SidebarModel {
   providerGates: ProviderGateModel[];
   runningAgents: RunningAgentModel[];
-  reviewQueue: IssueModel[];
-  recentActivity: ActivityModel[];
-  poll: {
-    nextPollAt: string | null;
-    errorCount24h: number | null;
-  };
+  reviewIssues: IssueModel[];
+  activity: ActivityModel[];
+  sessions: WebHistoryModel["sessions"];
+  chat: ChatMessage[];
+  totals: DashboardTotals;
 }
 
 export interface WebOperatorLivenessInput {
@@ -376,8 +376,9 @@ export interface SidebarProjectionInput {
   runtime?: RuntimeSnapshot | null;
   board?: IssueBoardResponseProjectionInput | IssueBoardModel | null;
   activity?: ActivityFeedResponseProjectionInput | ActivityModel[] | null;
-  nextPollAt?: string | null;
-  errorCount24h?: number | null;
+  history?: WebHistoryModel | null;
+  chat?: ChatMessage[] | null;
+  config?: DashboardRuntimeConfig | null | undefined;
 }
 
 const ISSUE_STATUS_ORDER: IssueStatus[] = ["backlog", "todo", "progress", "review", "done", "cancelled"];
@@ -529,12 +530,11 @@ export function emptySidebarModel(): SidebarModel {
   return {
     providerGates: [],
     runningAgents: [],
-    reviewQueue: [],
-    recentActivity: [],
-    poll: {
-      nextPollAt: null,
-      errorCount24h: null,
-    },
+    reviewIssues: [],
+    activity: [],
+    sessions: [],
+    chat: [],
+    totals: emptyDashboardTotals(),
   };
 }
 
@@ -701,16 +701,33 @@ export function projectHistoryModel(input: { runs?: RunRecord[]; transcript?: Tr
 }
 
 export function projectSidebarModel(input: SidebarProjectionInput = {}): SidebarModel {
-  const board = projectIssueBoardModel(input.board ?? null);
+  return projectWebSidebar(
+    projectWebDashboard({
+      runtime: input.runtime ?? null,
+      board: input.board ?? null,
+      activity: input.activity ?? null,
+      config: input.config ?? null,
+    }),
+    projectWebIssueBoard(input.board ?? null),
+    input.history ?? { sessions: [], transcriptBySession: {}, timeline: [], defaultSessionId: "" },
+    input.chat ?? emptyChatMessages(),
+  );
+}
+
+export function projectWebSidebar(
+  dashboard: DashboardModel,
+  issues: WebIssueBoardModel,
+  history: WebHistoryModel,
+  chat: ChatMessage[],
+): SidebarModel {
   return {
-    providerGates: projectProviderGates(input.runtime ?? null),
-    runningAgents: projectRunningAgents(input.runtime ?? null),
-    reviewQueue: board.issues.filter((issue) => issue.status === "review"),
-    recentActivity: projectActivityModels(input.activity ?? null),
-    poll: {
-      nextPollAt: input.nextPollAt ?? null,
-      errorCount24h: input.errorCount24h ?? null,
-    },
+    providerGates: dashboard.providerGates,
+    runningAgents: dashboard.runningAgents,
+    reviewIssues: issues.lanes.review.slice(0, 3),
+    activity: dashboard.activity,
+    sessions: history.sessions,
+    chat,
+    totals: dashboard.totals,
   };
 }
 
