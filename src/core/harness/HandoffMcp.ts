@@ -85,6 +85,7 @@ export function renderCompletionMcpHandoffPrompt(input: RuntimeHandoffPromptInpu
     `- Base ref: ${input.baseRef ?? "n/a"}`,
     "- Before ending the run, call the submit_completion_report MCP tool with summary, validationEvidence, acceptanceChecklist, changedFiles, branchName, pullRequest, risks, and idempotencyKey.",
     "- The MCP server is scoped to this issue and the current runtime run; Symphony injects runId and issueId for you.",
+    "- For merge-gate repairs, do not run git fetch or git push yourself. Use the base refs Symphony refreshed in this workspace; Symphony verifies and publishes after this report.",
     "- Do not comment on Linear, transition Linear state, or request broad Linear write credentials. Symphony handles writeback after the tool accepts the report.",
   ].join("\n");
 }
@@ -117,6 +118,7 @@ export function renderMergeConflictResolutionMcpHandoffPrompt(input: RuntimeHand
     "- Before ending the run, call the submit_merge_conflict_resolution MCP tool with resolutionStatus, summary, validationEvidence, changedFiles, pullRequest, previousHeadSha, newHeadSha, baseBranch, baseHeadSha, risks, and idempotencyKey.",
     "- Use resolutionStatus=\"resolved\" only when the PR head contains the conflict fix; use resolutionStatus=\"still_conflicted\" when conflicts remain; use resolutionStatus=\"blocked\" when human intervention is required now.",
     "- previousHeadSha must match the current conflict head from the prompt, and newHeadSha must match pullRequest.headSha after your attempt.",
+    "- Do not run git fetch or git push yourself. Use the base refs Symphony refreshed in this workspace; Symphony verifies and publishes resolved conflict reports.",
     "- The MCP server is scoped to this issue and current conflict-fix run; Symphony injects runId and issueId for you.",
   ].join("\n");
 }

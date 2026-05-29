@@ -162,6 +162,12 @@ function addCommandCapabilitySlice(
       addGitHubCapabilityEnvironment(env, config, parentEnv, "service", "github.publication");
     }
   }
+  if (command === "merge-conflict-resolution-mcp" && config.github.publishPullRequests) {
+    addGitHubParseRefs(env, config);
+    if (!(config.github.operatorApproval?.requiredForPublication ?? false)) {
+      addGitHubCapabilityEnvironment(env, config, parentEnv, "service", "github.publication");
+    }
+  }
   if (command === "review-feedback-mcp") {
     addGitHubParseRefs(env, config);
     addGitHubCapabilityEnvironment(env, config, parentEnv, "reviewer", "github.review_feedback_write");

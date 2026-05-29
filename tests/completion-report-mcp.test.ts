@@ -471,6 +471,7 @@ async function initPublishRepo(root: string, options: { remote?: boolean } = {})
     const remote = path.join(root, "remote.git");
     await git(["init", "--bare", remote], root);
     await git(["remote", "add", "origin", remote], workspace);
+    await git(["push", "-u", "origin", "main"], workspace);
   }
   await git(["checkout", "-b", "symphony/TEST-1"], workspace);
   return workspace;

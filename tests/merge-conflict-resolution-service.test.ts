@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { CompletionReportPullRequestPublicationInput } from "../src/core/CompletionReportService.js";
 import { MergeConflictResolutionService } from "../src/core/MergeConflictResolutionService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
@@ -57,6 +58,40 @@ describe("MergeConflictResolutionService", () => {
           resolutionStatus: "resolved",
         },
       ],
+    });
+  });
+
+  it("publishes resolved conflict reports through service-owned publication", async () => {
+    const publisher = new FakePullRequestPublisher();
+    const { service, lifecycleStore } = await fixture({ publisher });
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({ resolutionStatus: "resolved", headSha: "head-sha-2" }),
+      context(),
+    );
+
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      workspacePath: "/tmp/workspace",
+      branchName: "symphony/TEST-1",
+      baseBranch: "main",
+      requireBaseAncestor: true,
+      forceWithLease: true,
+    });
+    expect(result.report.pullRequest).toMatchObject({
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "published-head-sha",
+      branch: "symphony/TEST-1",
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      summaryPointers: {
+        prHeadSha: "published-head-sha",
+      },
+      mergeConflict: {
+        currentHeadSha: "published-head-sha",
+        resolvedHeadSha: "published-head-sha",
+      },
     });
   });
 
@@ -163,9 +198,10 @@ describe("MergeConflictResolutionService", () => {
     ).rejects.toMatchObject({ code: "invalid_request" });
   });
 
-  async function fixture(input: { fixTurnCount?: number } = {}) {
+  async function fixture(input: { fixTurnCount?: number; publisher?: FakePullRequestPublisher } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;
+    config.github.publishPullRequests = input.publisher !== undefined;
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.blockedStates = ["Blocked"];
     config.mergePolicy.mode = "gated";
@@ -180,7 +216,12 @@ describe("MergeConflictResolutionService", () => {
     });
     const outbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     return {
-      service: new MergeConflictResolutionService({ config, lifecycleStore, writebackOutbox: outbox }),
+      service: new MergeConflictResolutionService({
+        config,
+        lifecycleStore,
+        writebackOutbox: outbox,
+        ...(input.publisher ? { pullRequestPublisher: input.publisher } : {}),
+      }),
       lifecycleStore,
       outbox,
     };
@@ -196,6 +237,23 @@ function context(overrides: Partial<Parameters<MergeConflictResolutionService["s
     phase: "merge_conflict_resolution" as const,
     ...overrides,
   };
+}
+
+class FakePullRequestPublisher {
+  readonly inputs: CompletionReportPullRequestPublicationInput[] = [];
+
+  async publishPullRequest(input: CompletionReportPullRequestPublicationInput) {
+    this.inputs.push(input);
+    return {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: input.branchName,
+      headSha: "published-head-sha",
+      lastPushedAt: "2026-01-01T00:00:00.000Z",
+      action: "created" as const,
+      evidenceCursor: input.evidenceCursor,
+    };
+  }
 }
 
 function resolutionReport(input: {

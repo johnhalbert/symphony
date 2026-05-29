@@ -380,7 +380,7 @@ describe("MergePolicyService", () => {
     ]);
     expect(writer.comments[0]?.body).toContain("Mergeability:");
     expect(writer.comments[0]?.body).toContain("GitHub mergeable_state: dirty");
-    expect(writer.comments[0]?.body).toContain("rebase the lifecycle-bound PR branch over origin/main");
+    expect(writer.comments[0]?.body).toContain("worker must not run git fetch or git push");
     await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
       phase: "implementation",
       blockedReason: null,

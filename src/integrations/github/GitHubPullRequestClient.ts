@@ -75,6 +75,8 @@ export interface PullRequestPublicationInput {
   title: string;
   body: string;
   evidenceCursor: string;
+  requireBaseAncestor?: boolean;
+  forceWithLease?: boolean;
 }
 
 export interface PullRequestPublicationResult extends PullRequestMetadata {
@@ -528,9 +530,10 @@ export class GitHubPullRequestClient {
       throw new SymphonyError("invalid_request", "A base branch is required for GitHub PR publication");
     }
 
-    const existing = await this.findOpenPullRequestByBranch({ branchName, baseBranch });
-    const git = new GitWorktreePublisher(input.workspacePath);
+    const git = new GitWorktreePublisher(input.workspacePath, this.config);
     await git.assertCurrentBranch(branchName);
+    await git.fetchBaseBranch(baseBranch, token);
+    const existing = await this.findOpenPullRequestByBranch({ branchName, baseBranch });
 
     const dirty = await git.hasCommittableChanges();
     const branchDiffBeforeCommit = await git.hasBranchDiff(baseBranch);
@@ -546,6 +549,9 @@ export class GitHubPullRequestClient {
     }
 
     const branchDiffAfterCommit = dirty ? await git.hasBranchDiff(baseBranch) : branchDiffBeforeCommit;
+    if (input.requireBaseAncestor === true) {
+      await git.assertBaseAncestor(baseBranch);
+    }
     if (!existing && !branchDiffAfterCommit) {
       throw new SymphonyError(
         "invalid_request",
@@ -554,7 +560,7 @@ export class GitHubPullRequestClient {
     }
 
     if (dirty || branchDiffAfterCommit) {
-      await git.pushBranch(branchName, token);
+      await git.pushBranch(branchName, token, { forceWithLease: input.forceWithLease === true });
     }
     const headSha = await git.headSha();
 
@@ -599,6 +605,16 @@ export class GitHubPullRequestClient {
           : `GitHub repository access returned HTTP ${response.status}: ${detail}`,
       );
     }
+  }
+
+  async refreshBaseBranch(input: { workspacePath: string; baseBranch: string }): Promise<void> {
+    this.assertConfiguredForPublication();
+    const token = await this.resolveAuthToken();
+    const baseBranch = normalizeBaseBranch(input.baseBranch) ?? input.baseBranch.trim();
+    if (baseBranch.length === 0) {
+      throw new SymphonyError("invalid_request", "A base branch is required for upstream refresh");
+    }
+    await new GitWorktreePublisher(input.workspacePath, this.config).fetchBaseBranch(baseBranch, token);
   }
 
   private isConfigured(): boolean {
@@ -1255,7 +1271,8 @@ async function githubErrorDetail(response: Response, token: string | null): Prom
 
 function sanitizeSecret(value: string, secret: string | null): string {
   if (!secret || secret.length === 0) return value;
-  return value.split(secret).join("[redacted]");
+  const encoded = Buffer.from(`x-access-token:${secret}`, "utf8").toString("base64");
+  return [secret, encoded].reduce((text, item) => text.split(item).join("[redacted]"), value);
 }
 
 function normalizeBranchName(value: string): string {
@@ -1283,7 +1300,10 @@ function pullRequestHeadRef(config: GitHubPullRequestClientConfig, branchName: s
 }
 
 class GitWorktreePublisher {
-  constructor(private readonly workspacePath: string) {}
+  constructor(
+    private readonly workspacePath: string,
+    private readonly config: GitHubPullRequestClientConfig,
+  ) {}
 
   async assertCurrentBranch(branchName: string): Promise<void> {
     const current = (await this.git(["branch", "--show-current"])).stdout.trim();
@@ -1294,6 +1314,25 @@ class GitWorktreePublisher {
 
   async hasCommittableChanges(): Promise<boolean> {
     return (await this.git(["status", "--porcelain"])).stdout.trim().length > 0;
+  }
+
+  async fetchBaseBranch(baseBranch: string, token: string): Promise<void> {
+    const target = await this.serviceRemoteTarget();
+    const result = await this.git(
+      [
+        "-c",
+        `http.extraheader=${gitAuthHeader(token)}`,
+        "fetch",
+        "--prune",
+        target,
+        `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`,
+      ],
+      { allowFailure: true },
+    );
+    if (result.code !== 0) {
+      const detail = sanitizeSecret(result.stderr.trim() || result.stdout.trim(), token);
+      throw new SymphonyError("tracker_error", "GitHub upstream fetch failed: " + detail);
+    }
   }
 
   async hasBranchDiff(baseBranch: string): Promise<boolean> {
@@ -1324,13 +1363,29 @@ class GitWorktreePublisher {
     ]);
   }
 
-  async pushBranch(branchName: string, token: string): Promise<void> {
+  async assertBaseAncestor(baseBranch: string): Promise<void> {
+    const baseRef = await this.resolveBaseRef(baseBranch);
+    const result = await this.git(["merge-base", "--is-ancestor", baseRef, "HEAD"], { allowFailure: true });
+    if (result.code === 0) return;
+    if (result.code === 1) {
+      throw new SymphonyError(
+        "invalid_request",
+        `Worktree branch must include the latest ${baseRef} before service-owned publication`,
+      );
+    }
+    throw new SymphonyError("invalid_request", `Unable to verify worktree ancestry against ${baseBranch}`);
+  }
+
+  async pushBranch(branchName: string, token: string, options: { forceWithLease?: boolean } = {}): Promise<void> {
+    const target = await this.serviceRemoteTarget();
+    const forceArgs = options.forceWithLease === true ? await this.forceWithLeaseArgs(branchName, token) : [];
     const result = await this.git(
       [
         "-c",
-        `http.extraheader=AUTHORIZATION: bearer ${token}`,
+        `http.extraheader=${gitAuthHeader(token)}`,
         "push",
-        "origin",
+        ...forceArgs,
+        target,
         `HEAD:refs/heads/${branchName}`,
       ],
       { allowFailure: true },
@@ -1346,7 +1401,7 @@ class GitWorktreePublisher {
   }
 
   private async resolveBaseRef(baseBranch: string): Promise<string> {
-    const candidates = [baseBranch, `origin/${baseBranch}`];
+    const candidates = [`origin/${baseBranch}`, baseBranch];
     for (const candidate of candidates) {
       const result = await this.git(["rev-parse", "--verify", `${candidate}^{commit}`], { allowFailure: true });
       if (result.code === 0) return candidate;
@@ -1354,9 +1409,71 @@ class GitWorktreePublisher {
     throw new SymphonyError("invalid_request", `Unable to resolve PR base branch: ${baseBranch}`);
   }
 
+  private async forceWithLeaseArgs(branchName: string, token: string): Promise<string[]> {
+    await this.fetchBranch(branchName, token);
+    const remoteHead = await this.git(["rev-parse", "--verify", `refs/remotes/origin/${branchName}^{commit}`], {
+      allowFailure: true,
+    });
+    if (remoteHead.code !== 0) return [];
+    return [`--force-with-lease=refs/heads/${branchName}:${remoteHead.stdout.trim()}`];
+  }
+
+  private async fetchBranch(branchName: string, token: string): Promise<void> {
+    const target = await this.serviceRemoteTarget();
+    const result = await this.git(
+      [
+        "-c",
+        `http.extraheader=${gitAuthHeader(token)}`,
+        "fetch",
+        "--prune",
+        target,
+        `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`,
+      ],
+      { allowFailure: true },
+    );
+    if (result.code === 0) return;
+    const detail = result.stderr.trim() || result.stdout.trim();
+    if (/couldn't find remote ref|could not find remote ref|couldn't find remote ref/i.test(detail)) return;
+    throw new SymphonyError("tracker_error", "GitHub branch lease fetch failed: " + sanitizeSecret(detail, token));
+  }
+
+  private async serviceRemoteTarget(): Promise<string> {
+    const remote = await this.git(["remote", "get-url", "origin"], { allowFailure: true });
+    const remoteUrl = remote.code === 0 ? remote.stdout.trim() : "";
+    if (remoteUrl.length > 0 && !isSshRemoteUrl(remoteUrl)) return "origin";
+    return repositoryHttpUrl(this.config);
+  }
+
   private git(args: string[], options: { allowFailure?: boolean } = {}): Promise<GitResult> {
     return runCommand("git", args, this.workspacePath, DEFAULT_GIT_TIMEOUT_MS, options);
   }
+}
+
+function isSshRemoteUrl(value: string): boolean {
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.startsWith("git@") || trimmed.startsWith("ssh://") || trimmed.startsWith("git+ssh://");
+}
+
+function repositoryHttpUrl(config: GitHubPullRequestClientConfig): string {
+  const owner = requireNonEmpty(config.owner ?? "", "GitHub owner is required for service-owned git transport");
+  const repo = requireNonEmpty(config.repo ?? "", "GitHub repo is required for service-owned git transport");
+  const apiBase = new URL(normalizedApiBaseUrl(config.apiBaseUrl));
+  const gitBase =
+    apiBase.hostname === "api.github.com"
+      ? new URL("https://github.com")
+      : new URL(apiBase.pathname.replace(/\/api\/v3\/?$/i, "") || "/", apiBase.origin);
+  gitBase.pathname = joinUrlPath(gitBase.pathname, `${encodeURIComponent(owner)}/${encodeURIComponent(repo)}.git`);
+  return gitBase.toString();
+}
+
+function joinUrlPath(basePath: string, suffix: string): string {
+  const base = basePath.endsWith("/") ? basePath.slice(0, -1) : basePath;
+  return `${base}/${suffix}`;
+}
+
+function gitAuthHeader(token: string): string {
+  const encoded = Buffer.from(`x-access-token:${token}`, "utf8").toString("base64");
+  return `AUTHORIZATION: basic ${encoded}`;
 }
 
 interface GitResult {

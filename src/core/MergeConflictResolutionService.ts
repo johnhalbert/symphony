@@ -9,11 +9,8 @@ import type {
 } from "./persistence/IssueLifecycleStore.js";
 import type { Issue, Workspace } from "./types.js";
 import { planBlockedEscalationWritebacks } from "./writeback/TransitionPolicy.js";
-import type {
-  FileWritebackOutboxStore,
-  WritebackOperation,
-  WritebackProcessor,
-} from "./writeback/WritebackOutbox.js";
+import type { CompletionReportPullRequestPublisher } from "./CompletionReportService.js";
+import type { FileWritebackOutboxStore, WritebackOperation, WritebackProcessor } from "./writeback/WritebackOutbox.js";
 
 const mergeConflictResolutionSchema = z.object({
   runId: z.string().trim().min(1),
@@ -57,6 +54,7 @@ export interface MergeConflictResolutionServiceOptions {
   lifecycleStore: IssueLifecycleStore;
   writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
   writebackProcessor?: Pick<WritebackProcessor, "processDue">;
+  pullRequestPublisher?: CompletionReportPullRequestPublisher;
 }
 
 export interface MergeConflictResolutionResult {
@@ -81,7 +79,7 @@ export class MergeConflictResolutionService {
     input: unknown,
     context: MergeConflictResolutionActiveContext,
   ): Promise<MergeConflictResolutionResult> {
-    const report = parseMergeConflictResolution(input);
+    let report = parseMergeConflictResolution(input);
     this.validateCaller(report, context);
     this.validateConflictState(context);
 
@@ -100,6 +98,7 @@ export class MergeConflictResolutionService {
 
     assertPullRequestMatchesConflict(report.pullRequest, mergeConflict);
     assertReportMatchesConflict(report, mergeConflict);
+    report = await this.publishResolvedConflictIfNeeded(report, context, mergeConflict);
     const storedReport = buildMergeConflictResolutionReport({ report, issue: context.issue });
     const now = new Date().toISOString();
     const countedRunIds = new Set(mergeConflict.attemptRunIds);
@@ -214,6 +213,44 @@ export class MergeConflictResolutionService {
     for (const operation of operations) enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
     return enqueued;
   }
+
+  private async publishResolvedConflictIfNeeded(
+    report: MergeConflictResolutionInput,
+    context: MergeConflictResolutionActiveContext,
+    mergeConflict: IssueMergeConflictMetadata,
+  ): Promise<MergeConflictResolutionInput> {
+    if (report.resolutionStatus !== "resolved") return report;
+    if (!this.options.config.github.publishPullRequests || !this.options.pullRequestPublisher) return report;
+
+    const workspacePath = context.workspacePath ?? context.workspace?.path ?? null;
+    if (!workspacePath) {
+      throw new SymphonyError("invalid_request", "Merge conflict resolution publication requires a workspace path");
+    }
+    const branchName = report.pullRequest.branch ?? mergeConflict.pullRequest.branch;
+    if (!branchName) {
+      throw new SymphonyError("invalid_request", "Merge conflict resolution publication requires a pull request branch");
+    }
+    const publication = await this.options.pullRequestPublisher.publishPullRequest({
+      workspacePath,
+      branchName,
+      baseBranch: report.baseBranch,
+      title: `${context.issue.identifier}: Resolve merge conflicts`,
+      body: formatMergeConflictResolutionPublicationBody(report, context),
+      evidenceCursor: report.idempotencyKey,
+      requireBaseAncestor: true,
+      forceWithLease: true,
+    });
+    return {
+      ...report,
+      pullRequest: {
+        url: publication.url,
+        number: publication.number,
+        headSha: publication.headSha,
+        branch: publication.headBranch,
+      },
+      newHeadSha: publication.headSha,
+    };
+  }
 }
 
 function parseMergeConflictResolution(input: unknown): MergeConflictResolutionInput {
@@ -327,6 +364,32 @@ function formatPullRequest(pullRequest: CompletionReportPullRequestRef): string 
   if (pullRequest.number !== null && pullRequest.url !== null) return `#${pullRequest.number} (${pullRequest.url})`;
   if (pullRequest.number !== null) return `#${pullRequest.number}`;
   return pullRequest.url ?? "unknown";
+}
+
+function formatMergeConflictResolutionPublicationBody(
+  report: MergeConflictResolutionInput,
+  context: MergeConflictResolutionActiveContext,
+): string {
+  return [
+    "Symphony published this branch update from an accepted merge-conflict resolution report.",
+    "",
+    `Issue: ${context.issue.identifier}`,
+    `Run: ${report.runId}`,
+    `Evidence cursor: ${report.idempotencyKey}`,
+    `Previous head SHA: ${report.previousHeadSha}`,
+    `Reported new head SHA: ${report.newHeadSha}`,
+    `Base branch: ${report.baseBranch}`,
+    `Base head SHA: ${report.baseHeadSha}`,
+    "",
+    "Summary:",
+    report.summary,
+    "",
+    "Validation evidence:",
+    ...report.validationEvidence.map((item) => `- ${item}`),
+    "",
+    "Changed files:",
+    ...(report.changedFiles.length === 0 ? ["- n/a"] : report.changedFiles.map((item) => `- ${item}`)),
+  ].join("\n");
 }
 
 function sameState(left: string, right: string): boolean {

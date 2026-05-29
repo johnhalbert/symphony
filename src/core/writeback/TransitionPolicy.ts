@@ -620,12 +620,13 @@ export function planMergeGateRepairWritebacks(
   const conflict = context.mergeability?.status === "conflicted";
   const requiredAction = conflict
     ? [
-        "Fetch the latest upstream changes from origin/main, rebase the lifecycle-bound PR branch over origin/main, resolve merge conflicts, commit and push the repaired branch, validate the requested checks, and submit a new completion report.",
+        "Symphony will refresh the upstream base ref before dispatching the repair worker. The worker should rebase the lifecycle-bound PR branch over that provided base ref, resolve merge conflicts locally, validate the requested checks, and submit a new completion report.",
+        "The worker must not run git fetch or git push; Symphony verifies the repaired worktree, fetches upstream again, and pushes/updates the PR through service-owned publication.",
         hasActionableCheckBlockers(context)
           ? "Also fix the failing or missing required checks before submitting the completion report."
           : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
       ].join(" ")
-    : "Fix the failing required checks, push the repair to the lifecycle-bound PR branch, validate it, and submit a new completion report.";
+    : "Fix the failing required checks, validate locally, and submit a new completion report. The worker must not push the branch; Symphony publishes the repair through service-owned publication.";
   return [
     mergeGateCommentOperation(
       context,

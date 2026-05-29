@@ -117,6 +117,7 @@ export interface OrchestratorOptions {
   lifecycleStore?: IssueLifecycleStore;
   writeback?: WritebackProcessor;
   pullRequestClient?: PullRequestDiscoveryClient;
+  workspaceBaseRefresher?: WorkspaceBaseRefresher;
   pullRequestReviewClient?: PullRequestReviewEvidenceClient;
   pullRequestMergeClient?: MergePolicyGitHubClient;
   completionReportPublisher?: CompletionReportPullRequestPublisher;
@@ -127,6 +128,10 @@ export interface OrchestratorOptions {
 
 export interface PullRequestDiscoveryClient {
   findOpenPullRequestByBranch(input: { branchName: string }): Promise<DiscoveredPullRequest | null>;
+}
+
+export interface WorkspaceBaseRefresher {
+  refreshBaseBranch(input: { workspacePath: string; baseBranch: string }): Promise<void>;
 }
 
 export interface DiscoveredPullRequest {
@@ -1165,8 +1170,9 @@ export class Orchestrator {
     return this.config.issueBreakdown.planningLabels.some((label) => labels.has(label));
   }
 
-  private isMergeConflictState(_state: string): boolean {
-    return false;
+  private isMergeConflictState(state: string): boolean {
+    const conflictsState = this.config.mergePolicy.conflictsState;
+    return conflictsState !== null && isStateIn(state, [conflictsState]);
   }
 
   private dispatchIssue(
@@ -1282,6 +1288,7 @@ export class Orchestrator {
               },
             },
       );
+      await this.refreshServiceOwnedBaseRefForRepair(entry, workspace);
       if (entry.runPhase !== "issue_breakdown") {
         await this.options.workspaceManager.beforeRun(workspace.path);
       }
@@ -2561,6 +2568,30 @@ export class Orchestrator {
     return gate?.status === "repair_dispatched" || gate?.status === "blocked";
   }
 
+  private async refreshServiceOwnedBaseRefForRepair(entry: RunningEntry, workspace: Workspace): Promise<void> {
+    const baseBranch = serviceOwnedRepairBaseBranch(entry, workspace);
+    if (baseBranch === null) return;
+    const refresher =
+      this.options.workspaceBaseRefresher ??
+      (this.config.github.publishPullRequests
+        ? createGitHubPullRequestClientForCapability(this.config, "github.publication")
+        : null);
+    if (refresher === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Merge-conflict repair requires service-owned GitHub publication credentials for upstream fetch",
+      );
+    }
+    await refresher.refreshBaseBranch({ workspacePath: workspace.path, baseBranch });
+    this.options.logger.info("service-owned upstream fetch completed for repair worker", {
+      issue_id: entry.issue.id,
+      issue_identifier: entry.issue.identifier,
+      run_phase: entry.runPhase,
+      workspace_path: workspace.path,
+      base_branch: baseBranch,
+    });
+  }
+
   private async discoverPullRequestForEntry(entry: RunningEntry, workspace: Workspace): Promise<void> {
     const branchName = workspace.gitBranchName ?? entry.issue.branchName;
     if (!branchName) return;
@@ -2721,6 +2752,7 @@ export class Orchestrator {
       `- GitHub mergeable_state: ${conflict?.mergeableState ?? "unknown"}`,
       "- Required handoff: call submit_merge_conflict_resolution before ending the run.",
       "- Report resolutionStatus=\"resolved\", resolutionStatus=\"still_conflicted\", or resolutionStatus=\"blocked\"; include previousHeadSha, newHeadSha, baseBranch, and baseHeadSha.",
+      "- Do not run git fetch or git push. Symphony refreshed the base ref before dispatch and will verify, fetch upstream again, and publish the repaired branch after the MCP report.",
       "",
       "Workspace:",
       `- Path: ${workspace?.path ?? entry.workspacePath ?? "n/a"}`,
@@ -3335,9 +3367,18 @@ function currentPromptLifecycle(lifecycle: IssueLifecycleRecord): IssueLifecycle
   );
 }
 
+function serviceOwnedRepairBaseBranch(entry: RunningEntry, workspace: Workspace): string | null {
+  if (entry.runPhase === "merge_conflict_resolution") {
+    return entry.lifecycle?.mergeConflict?.baseBranch ?? workspace.baseRef ?? null;
+  }
+  const gate = entry.lifecycle?.mergeGate ?? null;
+  if (gate?.status !== "repair_dispatched" || gate.mergeability?.status !== "conflicted") return null;
+  return gate.mergeability.baseBranch ?? workspace.baseRef ?? entry.lifecycle?.summaryPointers.baseRef ?? null;
+}
+
 function nextWorkerAction(lifecycle: IssueLifecycleRecord): string {
   if (lifecycle.mergeGate?.status === "repair_dispatched" || lifecycle.mergeGate?.status === "blocked") {
-    return "Repair the Symphony merge-gate checks on the lifecycle-bound PR, validate, and submit a new completion report.";
+    return "Repair the Symphony merge-gate checks on the lifecycle-bound PR, validate, and submit a new completion report; Symphony owns upstream fetch and push.";
   }
   if (lifecycle.handoff.lastReviewerOutput?.verdict === "fail") return "Address the latest reviewer findings, validate, and submit a new completion report.";
   if (lifecycle.incompleteTurnCount > 0) return "Continue the incomplete implementation using the memo and pointers before rediscovering context.";

@@ -438,6 +438,44 @@ describe("GitHubPullRequestClient", () => {
     }
   });
 
+  it("fetches the upstream base before enforcing service-owned rebase verification", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-fetch-base-"));
+    try {
+      const workspace = await initPublishRepo(root);
+      const upstreamClone = path.join(root, "upstream-clone");
+      await git(["clone", path.join(root, "remote.git"), upstreamClone], root);
+      await git(["checkout", "main"], upstreamClone);
+      await writeFile(path.join(upstreamClone, "upstream.txt"), "main advanced\n", "utf8");
+      await git(["add", "upstream.txt"], upstreamClone);
+      await git(["-c", "user.name=Symphony Test", "-c", "user.email=symphony@example.com", "commit", "-m", "advance main"], upstreamClone);
+      await git(["push", "origin", "main"], upstreamClone);
+
+      const client = new GitHubPullRequestClient(config(), async () =>
+        jsonResponse([
+          {
+            html_url: "https://github.com/octo-org/symphony/pull/44",
+            number: 44,
+            head: { ref: "symphony/TEST-1", sha: "remote-sha", repo: { pushed_at: "2026-01-01T00:00:00Z" } },
+          },
+        ]),
+      );
+
+      await expect(
+        client.publishPullRequest({
+          workspacePath: workspace,
+          branchName: "symphony/TEST-1",
+          baseBranch: "main",
+          title: "TEST-1: Work",
+          body: "body",
+          evidenceCursor: "idem-1",
+          requireBaseAncestor: true,
+        }),
+      ).rejects.toThrow(/latest .*main/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("commits, pushes, and creates a pull request when none exists", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-create-"));
     try {
@@ -513,10 +551,10 @@ describe("GitHubPullRequestClient", () => {
     }
   });
 
-  it("rejects PR publication when the branch push fails", async () => {
+  it("rejects PR publication when the upstream fetch fails", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-push-fail-"));
     try {
-      const workspace = await initPublishRepo(root);
+      const workspace = await initPublishRepo(root, { remote: false });
       await git(["remote", "add", "origin", path.join(root, "missing.git")], workspace);
       await writeFile(path.join(workspace, "feature.txt"), "changed\n", "utf8");
       const client = new GitHubPullRequestClient(config(), async () => jsonResponse([]));
@@ -530,7 +568,7 @@ describe("GitHubPullRequestClient", () => {
           body: "body",
           evidenceCursor: "idem-1",
         }),
-      ).rejects.toThrow(/push failed/);
+      ).rejects.toThrow(/upstream fetch failed/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -958,10 +996,11 @@ async function initPublishRepo(root: string, options: { remote?: boolean } = {})
   await writeFile(path.join(workspace, "README.md"), "hello\n", "utf8");
   await git(["add", "README.md"], workspace);
   await git(["-c", "user.name=Symphony Test", "-c", "user.email=symphony@example.com", "commit", "-m", "initial"], workspace);
-  if (options.remote) {
+  if (options.remote ?? true) {
     const remote = path.join(root, "remote.git");
     await git(["init", "--bare", remote], root);
     await git(["remote", "add", "origin", remote], workspace);
+    await git(["push", "-u", "origin", "main"], workspace);
   }
   await git(["checkout", "-b", "symphony/TEST-1"], workspace);
   return workspace;

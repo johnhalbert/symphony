@@ -4591,7 +4591,21 @@ describe("Orchestrator", () => {
             actionableSince: null,
           },
         ],
-        mergeability: null,
+        mergeability: {
+          status: "conflicted",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-1",
+          },
+          mergeable: false,
+          mergeableState: "dirty",
+          reason: "Pull request has merge conflicts with the base branch",
+          baseBranch: "main",
+          baseHeadSha: "base-sha-1",
+          checkedAt: "2026-01-01T00:00:01.000Z",
+        },
         reviewRound: 1,
         gateRunId: "worker-run-1",
         gateReportId: report.id,
@@ -4604,6 +4618,7 @@ describe("Orchestrator", () => {
       },
     });
     const harness = new FakeHarness();
+    const refreshCalls: Array<{ workspacePath: string; baseBranch: string }> = [];
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
@@ -4613,14 +4628,21 @@ describe("Orchestrator", () => {
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
       lifecycleStore,
+      workspaceBaseRefresher: {
+        async refreshBaseBranch(input) {
+          refreshCalls.push(input);
+        },
+      },
     });
 
     await orchestrator.refreshNow();
     await new Promise((resolve) => setTimeout(resolve, 100));
     await orchestrator.stop();
 
+    expect(refreshCalls).toEqual([{ workspacePath: path.join(root, "TEST-1"), baseBranch: "main" }]);
     expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Repair");
     expect(harness.runs[0]?.prompt).toContain("test: failing / failure (https://ci.test/test)");
+    expect(harness.runs[0]?.prompt).toContain("Do not run git fetch or git push");
     expect(harness.runs[0]?.prompt).not.toContain("Reviewer findings to address");
   });
 

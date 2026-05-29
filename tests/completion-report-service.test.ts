@@ -306,6 +306,47 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("requires base ancestry and force-with-lease publication for conflicted merge-gate repairs", async () => {
+    const publisher = new FakePublisher({
+      action: "reused",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "head-sha-2",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const { service, lifecycleStore, runStore } = fixture({ publisher });
+    await startRun(runStore);
+    await lifecycleStore.ensureIssue(context().issue, {
+      phase: "implementation",
+      mergeGate: mergeGate({
+        mergeability: {
+          status: "conflicted",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-1",
+          },
+          mergeable: false,
+          mergeableState: "dirty",
+          reason: "Pull request has merge conflicts with the base branch",
+          baseBranch: "main",
+          baseHeadSha: "base-sha-1",
+          checkedAt: "2026-01-01T00:00:00.000Z",
+        },
+      }),
+    });
+
+    await service.submitCompletionReport(report(), contextWithWorkspace());
+
+    expect(publisher.inputs[0]).toMatchObject({
+      requireBaseAncestor: true,
+      forceWithLease: true,
+    });
+  });
+
   it("reuses a service-discovered PR and prevents duplicate publication on replay", async () => {
     const publisher = new FakePublisher({
       action: "reused",

@@ -10,6 +10,7 @@ import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { SymphonyError } from "../errors.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
+import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
 
 export const MERGE_CONFLICT_RESOLUTION_TOOL_NAME = "submit_merge_conflict_resolution";
 
@@ -46,10 +47,14 @@ export async function submitMergeConflictResolutionFromMcp(input: unknown, optio
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
+    const approvalRequiredForPublication = config.github.operatorApproval?.requiredForPublication ?? false;
     const service = new MergeConflictResolutionService({
       config,
       lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
       writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      ...(config.github.publishPullRequests && !approvalRequiredForPublication
+        ? { pullRequestPublisher: createGitHubPullRequestClientForCapability(config, "github.publication") }
+        : {}),
     });
     const context: MergeConflictResolutionActiveContext = {
       issue: loadedContext.issue,

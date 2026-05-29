@@ -117,6 +117,8 @@ export interface CompletionReportPullRequestPublicationInput {
   title: string;
   body: string;
   evidenceCursor: string;
+  requireBaseAncestor?: boolean;
+  forceWithLease?: boolean;
 }
 
 export interface CompletionReportPullRequestPublication {
@@ -782,6 +784,9 @@ export class CompletionReportService {
       title: `${context.issue.identifier}: ${context.issue.title}`,
       body: formatPullRequestBody(report, context),
       evidenceCursor: report.idempotencyKey,
+      ...(requiresServiceOwnedRebasePublication(existingLifecycle)
+        ? { requireBaseAncestor: true, forceWithLease: true }
+        : {}),
     };
   }
 
@@ -1171,6 +1176,12 @@ function assertPendingPublicationReplayMatches(input: {
   if (input.incomingPublicationInput.baseBranch !== input.storedPublicationInput.baseBranch) {
     mismatchedFields.push("baseBranch");
   }
+  if (input.incomingPublicationInput.requireBaseAncestor !== input.storedPublicationInput.requireBaseAncestor) {
+    mismatchedFields.push("requireBaseAncestor");
+  }
+  if (input.incomingPublicationInput.forceWithLease !== input.storedPublicationInput.forceWithLease) {
+    mismatchedFields.push("forceWithLease");
+  }
   if (input.incomingPublicationInput.title !== input.storedPublicationInput.title) mismatchedFields.push("title");
   if (input.incomingPublicationInput.body !== input.storedPublicationInput.body) mismatchedFields.push("body");
   if (mismatchedFields.length > 0) {
@@ -1216,6 +1227,11 @@ function workspaceFromApproval(approval: OperatorApprovalRecord, lifecycle: NonN
     baseRef: approval.action.baseBranch,
     ...(lifecycle.summaryPointers.repoPath === null ? {} : { repoPath: lifecycle.summaryPointers.repoPath }),
   };
+}
+
+function requiresServiceOwnedRebasePublication(lifecycle: IssueLifecycleRecord | null | undefined): boolean {
+  const gate = lifecycle?.mergeGate ?? null;
+  return gate?.status === "repair_dispatched" && gate.mergeability?.status === "conflicted";
 }
 
 function approvalRecordFromDetails(details: unknown): OperatorApprovalRecord | null {

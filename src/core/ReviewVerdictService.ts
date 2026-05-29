@@ -275,12 +275,13 @@ export function formatWorkerMergeGatePromptResult(lifecycle: IssueLifecycleRecor
   const conflict = gate.mergeability?.status === "conflicted";
   const requiredAction = conflict
     ? [
-        "Fetch the latest upstream changes from origin/main, rebase the lifecycle-bound PR branch over origin/main, resolve merge conflicts, commit and push the repaired branch, validate the requested checks, and submit a normal completion report.",
+        "Symphony has already refreshed the upstream base ref for this repair run. Rebase the lifecycle-bound PR branch over the provided base ref, resolve merge conflicts locally, validate the requested checks, and submit a normal completion report.",
+        "Do not run git fetch or git push; after the report, Symphony will fetch upstream again, verify the branch includes the latest base, commit if needed, and push/update the PR through service-owned publication.",
         actionable.length > 0
           ? "Also fix the failing or missing required checks before submitting the completion report."
           : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
       ].join(" ")
-    : "Fix failing checks or restore missing actionable required checks on the lifecycle-bound PR branch, then submit a completion report. Symphony will re-fetch GitHub checks and PR mergeability before clearing this blocker.";
+    : "Fix failing checks or restore missing actionable required checks on the lifecycle-bound PR branch, then submit a completion report. Do not push the branch yourself; Symphony will publish the repair and re-fetch GitHub checks and PR mergeability before clearing this blocker.";
   return {
     kind: "repair",
     text: [
