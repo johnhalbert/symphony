@@ -20,7 +20,7 @@ import {
   isHermesOwnedAuthProvider,
   normalizeHermesAuthProvider,
 } from "./HermesAuthManager.js";
-import { writeHermesMcpConfig } from "./HermesMcpConfig.js";
+import { SYMPHONY_HERMES_AGENT_MAX_TURNS, writeHermesMcpConfig } from "./HermesMcpConfig.js";
 import { HermesProfileManager, safeProfileKey, type HermesProfile } from "./HermesProfileManager.js";
 
 export interface HermesHarnessOptions {
@@ -257,6 +257,7 @@ export class HermesHarness implements AgentHarness {
     await writeHermesMcpConfig({
       profileDir: profile.profileDir,
       servers: symphonyRoleMcpServers(ctx, { cliPath: this.cliPath(), mcpCwd: ctx.workspace.path }),
+      agentMaxTurns: SYMPHONY_HERMES_AGENT_MAX_TURNS,
     });
 
     const requiredAuthProviders = hermesOwnedAuthProvidersForRuntime(ctx.config.hermes.provider, ctx.config.hermes.auth.providers);

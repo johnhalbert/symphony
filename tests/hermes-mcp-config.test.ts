@@ -1,9 +1,9 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import YAML from "yaml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { toHermesMcpServers, writeHermesMcpConfig } from "../hermes/src/HermesMcpConfig.js";
+import { SYMPHONY_HERMES_AGENT_MAX_TURNS, toHermesMcpServers, writeHermesMcpConfig } from "../hermes/src/HermesMcpConfig.js";
 
 let root: string;
 
@@ -65,6 +65,41 @@ describe("Hermes MCP config", () => {
           timeout: 120,
           connect_timeout: 60,
         },
+      },
+    });
+  });
+
+  it("can stamp the Symphony agent turn budget into an existing profile config", async () => {
+    const profileDir = path.join(root, "profile");
+    await mkdir(profileDir, { recursive: true });
+    await writeFile(
+      path.join(profileDir, "config.yaml"),
+      YAML.stringify({
+        agent: {
+          max_turns: 90,
+          reasoning_effort: "xhigh",
+        },
+        display: {
+          show_reasoning: true,
+        },
+      }),
+      "utf8",
+    );
+
+    await writeHermesMcpConfig({
+      profileDir,
+      servers: {},
+      agentMaxTurns: SYMPHONY_HERMES_AGENT_MAX_TURNS,
+    });
+
+    const parsed = YAML.parse(await readFile(path.join(profileDir, "config.yaml"), "utf8")) as Record<string, unknown>;
+    expect(parsed).toMatchObject({
+      agent: {
+        max_turns: SYMPHONY_HERMES_AGENT_MAX_TURNS,
+        reasoning_effort: "xhigh",
+      },
+      display: {
+        show_reasoning: true,
       },
     });
   });

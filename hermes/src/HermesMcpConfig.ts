@@ -13,11 +13,14 @@ export interface HermesMcpServerConfig {
 
 export type HermesMcpServersConfig = Record<string, HermesMcpServerConfig>;
 
+export const SYMPHONY_HERMES_AGENT_MAX_TURNS = 999;
+
 export interface WriteHermesMcpConfigOptions {
   profileDir: string;
   servers: Record<string, McpSubprocessServerConfig>;
   timeoutSeconds?: number;
   connectTimeoutSeconds?: number;
+  agentMaxTurns?: number;
 }
 
 export async function writeHermesMcpConfig(options: WriteHermesMcpConfigOptions): Promise<HermesMcpServersConfig> {
@@ -29,6 +32,7 @@ export async function writeHermesMcpConfig(options: WriteHermesMcpConfigOptions)
   });
   const next = {
     ...existing,
+    ...(options.agentMaxTurns === undefined ? {} : { agent: { ...recordValue(existing.agent), max_turns: options.agentMaxTurns } }),
     mcp_servers: mcpServers,
   };
   await fs.mkdir(options.profileDir, { recursive: true });
@@ -69,4 +73,8 @@ async function readYamlObject(filePath: string): Promise<Record<string, unknown>
 
 function stringEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
