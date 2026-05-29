@@ -7,7 +7,6 @@ import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
   projectWebIssueBoard,
   projectWebIssueDetail,
-  projectWebIssueDetail,
   projectWebOrchestratorChat
 } from "./webProjection.js";
 import {
