@@ -10,13 +10,13 @@ export function IssueCard({
   selected: boolean;
   onSelect: (issueId: string) => void;
 }) {
-  const running = issue.assignee === "agent";
+  const hasAgent = Boolean(issue.agent);
   return (
     <button
       className="card"
       data-selected={selected}
       onClick={() => onSelect(issue.id)}
-      style={running ? { boxShadow: "inset 2px 0 0 var(--accent)", textAlign: "left" } : { textAlign: "left" }}
+      style={hasAgent ? { boxShadow: "inset 2px 0 0 var(--accent)", textAlign: "left" } : { textAlign: "left" }}
       type="button"
     >
       <div className="card__top">
@@ -38,7 +38,7 @@ export function IssueCard({
           ))}
         </div>
         <div className="grow" />
-        {running ? (
+        {hasAgent ? (
           <span className="card__agent">
             <span className="pulse-dot" />
             {issue.agent}
