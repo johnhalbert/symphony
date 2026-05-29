@@ -7,6 +7,11 @@ Default validation uses the repository lockfile and does not need live service c
 - Install with `npm ci`.
 - Typecheck with `npm run typecheck`.
 - Test with `npm test`.
+- Install the web app dependencies with `npm ci --prefix web`.
+- Typecheck the web app with `npm run typecheck --prefix web`.
+- Test the web app with `npm test --prefix web`.
+- Build the web app with `npm run build --prefix web`.
+- Run the web browser/Vite proxy smoke with `npm run smoke:browser --prefix web`.
 - Install extension dependencies with `npm run extension:ci`.
 - Typecheck the extension with `npm run extension:typecheck`.
 - Test the extension with `npm run extension:test`.
@@ -17,6 +22,12 @@ Local contributors should use Node `22.12` or newer on the Node 22 line, then ru
 ## Extension Package
 
 The Cursor extension under `extension/` has its own lockfile and install step. `npm run extension:ci` runs `npm ci --prefix extension`; extension tests are unit tests with mocked HTTP and do not launch Cursor.
+
+## Web Browser Smoke
+
+`npm run smoke:browser --prefix web` starts a fake local Symphony web API, starts the Vite development server in `VITE_SYMPHONY_DATA_SOURCE=api` mode, points the `/api` dev proxy at the fake API with `SYMPHONY_WEB_API_PROXY_TARGET`, and launches a headless Chromium-compatible browser. The smoke fails if the browser renders mock dashboard data, if any web API endpoint is not observed through the Vite proxy, or if the API-mode dashboard markers do not appear.
+
+The smoke needs a Chromium-compatible executable. CI runners provide Chrome; local runs can override discovery with `SYMPHONY_WEB_BROWSER_EXECUTABLE` or `CHROME_BIN`.
 
 ## Optional Real Smoke
 
