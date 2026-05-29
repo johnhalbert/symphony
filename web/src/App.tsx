@@ -82,7 +82,7 @@ function AppShell() {
           />
         }
       >
-        {activeTab === "dashboard" ? renderLoadable(dashboard, (data) => <DashboardView dashboard={data} variant={dashboardVariant} />) : null}
+        {activeTab === "dashboard" ? renderLoadable(dashboard, (data) => <DashboardView dashboard={data} variant={dashboardVariant} useModelBurnupTotals={apiMode} />) : null}
         {activeTab === "issues" ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} />) : null}
         {activeTab === "history" ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} />) : null}
         {activeTab === "sidebar" ? renderLoadable(sidebar, (data) => <SidebarViews sidebar={data} variant={sidebarVariant} />) : null}

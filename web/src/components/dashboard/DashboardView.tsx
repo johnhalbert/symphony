@@ -9,9 +9,11 @@ import { OrchestratorChat } from "./OrchestratorChat";
 export function DashboardView({
   dashboard,
   variant = "cards",
+  useModelBurnupTotals = true,
 }: {
   dashboard: DashboardModel;
   variant?: DashboardVariant;
+  useModelBurnupTotals?: boolean;
 }) {
   const dataSource = useDataSource();
   const [chat, setChat] = useState(dashboard.chat);
@@ -72,7 +74,7 @@ export function DashboardView({
 
         {variant === "grid" ? <StatsGridDense totals={totals} /> : <StatsRow dashboard={dashboard} />}
 
-        {variant === "command-center" ? <BurndownCommandCenter dashboard={dashboard} /> : <BurndownPanel totals={totals} />}
+        {variant === "command-center" ? <BurndownCommandCenter dashboard={dashboard} /> : <BurndownPanel totals={totals} useModelBurnupTotals={useModelBurnupTotals} />}
 
         <div className="section-head">
           <h2>Running agents</h2>

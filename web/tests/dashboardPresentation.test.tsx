@@ -97,10 +97,10 @@ function dataSourceForDashboard(dashboard: DashboardModel): SymphonyDataSource {
   };
 }
 
-function renderDashboard(dashboard: DashboardModel, variant: DashboardVariant = "cards") {
+function renderDashboard(dashboard: DashboardModel, variant: DashboardVariant = "cards", useModelBurnupTotals = true) {
   return renderToStaticMarkup(
     <DataSourceProvider value={dataSourceForDashboard(dashboard)}>
-      <DashboardView dashboard={dashboard} variant={variant} />
+      <DashboardView dashboard={dashboard} variant={variant} useModelBurnupTotals={useModelBurnupTotals} />
     </DataSourceProvider>,
   );
 }
@@ -117,7 +117,10 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("concurrency cap 9");
     expect(markup).toContain('<div class="stat__value">73<span class="suffix">%</span></div>');
     expect(markup).toContain('<div class="stat__value">11</div>');
-    expect(markup).toContain("API-1");
+    expect(markup).toContain("8/32 done");
+    expect(markup).toMatch(/target\s+32/);
+    expect(markup).toMatch(/completed\s+8/);
+    expect(markup).toMatch(/API-1/);
     expect(markup).toContain("Implement API dashboard");
     expect(markup).toContain("Rendering dashboard model");
     expect(markup).toContain("api-worker");
@@ -130,6 +133,8 @@ describe("dashboard API presentation", () => {
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("4/6 agents");
     expect(markup).not.toContain("Restart SYM-42");
+    expect(markup).not.toMatch(/target\s+17/);
+    expect(markup).not.toMatch(/completed\s+13/);
   });
 
   it("uses an empty API dashboard chat array as empty initial chat instead of mock suggestions", () => {
@@ -140,6 +145,16 @@ describe("dashboard API presentation", () => {
     expect(markup).not.toContain("API suggestion");
     expect(markup).not.toContain("Restart SYM-42");
     expect(markup).not.toContain("Show SYM-42 transcript");
+  });
+
+  it("uses API totals in the grid burn-up chart without mock chart labels", () => {
+    const markup = renderDashboard(apiDashboard, "grid");
+
+    expect(markup).toContain("8/32 done");
+    expect(markup).toMatch(/target\s+32/);
+    expect(markup).toMatch(/completed\s+8/);
+    expect(markup).not.toMatch(/target\s+17/);
+    expect(markup).not.toMatch(/completed\s+13/);
   });
 
   it("wires command-center agent and poll text to the API dashboard fields", () => {
@@ -155,7 +170,7 @@ describe("dashboard API presentation", () => {
 
   it("preserves mock dashboard data when rendering the mock model", () => {
     const mockDashboard = toDashboardModel(rawMockData);
-    const markup = renderDashboard(mockDashboard);
+    const markup = renderDashboard(mockDashboard, "cards", false);
 
     expect(markup).toContain("openai/symphony");
     expect(markup).toContain("main");
@@ -163,6 +178,8 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("poll 22s");
     expect(markup).toContain("4/6 agents");
     expect(markup).toContain("Restart SYM-42");
+    expect(markup).toMatch(/target\s+17/);
+    expect(markup).toMatch(/completed\s+13/);
   });
 
   it("lets app chrome consume dashboard labels in API mode instead of fixed mock copy", () => {
