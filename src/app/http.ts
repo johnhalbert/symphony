@@ -4,6 +4,7 @@ import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
+import { projectWebIssueDetail } from "./webProjection.js";
 import {
   runKindForPhase,
   toIssueStatusView,
@@ -150,6 +151,19 @@ export class StatusServer {
           ),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
+        return;
+      }
+      const webIssueMatch = /^\/api\/v1\/web\/issues\/([^/]+)$/.exec(url.pathname);
+      if (request.method === "GET" && webIssueMatch) {
+        const issueId = decodeURIComponent(webIssueMatch[1] ?? "");
+        sendJson(
+          response,
+          200,
+          await this.fetchWebIssueDetail(
+            issueId,
+            url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true",
+          ),
+        );
         return;
       }
       const boardIssueMatch = /^\/api\/v1\/board\/issues\/([^/]+)$/.exec(url.pathname);
@@ -683,6 +697,18 @@ export class StatusServer {
     const provided = request.headers["x-symphony-token"];
     if (typeof provided !== "string" || provided.trim().length === 0 || provided !== expected) {
       throw new SymphonyError("invalid_request", "Missing or invalid issue breakdown apply token");
+    }
+  }
+
+  private async fetchWebIssueDetail(issueId: string, forceRefresh: boolean) {
+    try {
+      const detail = await this.fetchBoardIssueDetail(issueId, forceRefresh);
+      return projectWebIssueDetail(detail, issueId);
+    } catch (error) {
+      if (error instanceof SymphonyError && (error.code === "not_found" || error.code === "tracker_unavailable")) {
+        return null;
+      }
+      throw error;
     }
   }
 
