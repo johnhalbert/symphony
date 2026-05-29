@@ -1,5 +1,5 @@
 import { promises as fs } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
@@ -241,7 +241,11 @@ export class FileWritebackOutboxStore {
   }
 
   async get(idempotencyKey: string): Promise<WritebackOperation | null> {
-    return readJsonIfExists<WritebackOperation>(this.recordPath(idempotencyKey));
+    const current = await readJsonIfExists<WritebackOperation>(this.recordPath(idempotencyKey));
+    if (current) return current;
+    const legacy = this.legacyRecordPath(idempotencyKey);
+    if (legacy === this.recordPath(idempotencyKey)) return null;
+    return readJsonIfExists<WritebackOperation>(legacy);
   }
 
   async list(): Promise<WritebackOperation[]> {
@@ -250,7 +254,7 @@ export class FileWritebackOutboxStore {
     const records = await Promise.all(
       entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<WritebackOperation>(path.join(this.recordsDir(), entry))),
     );
-    return records.filter((record): record is WritebackOperation => record !== null);
+    return dedupeWritebackRecords(records.filter((record): record is WritebackOperation => record !== null));
   }
 
   private async update(record: WritebackOperation, patch: Partial<WritebackOperation>): Promise<WritebackOperation> {
@@ -279,12 +283,14 @@ export class FileWritebackOutboxStore {
   private async writeUnlocked(record: WritebackOperation): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
     const target = this.recordPath(record.idempotencyKey);
-    const temp = `${target}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+    const temp = path.join(this.recordsDir(), `${path.basename(target)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
     await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
     if (process.platform === "win32") {
       await fs.rm(target, { force: true });
     }
     await fs.rename(temp, target);
+    const legacy = this.legacyRecordPath(record.idempotencyKey);
+    if (legacy !== target) await fs.rm(legacy, { force: true });
   }
 
   private recordsDir(): string {
@@ -292,6 +298,10 @@ export class FileWritebackOutboxStore {
   }
 
   private recordPath(idempotencyKey: string): string {
+    return path.join(this.recordsDir(), shortRecordFileName(idempotencyKey));
+  }
+
+  private legacyRecordPath(idempotencyKey: string): string {
     return path.join(this.recordsDir(), `${safeFileName(idempotencyKey)}.json`);
   }
 }
@@ -519,6 +529,30 @@ export function computeWritebackBackoffMs(attempt: number, maxBackoffMs: number)
 
 function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "record";
+}
+
+function shortRecordFileName(idempotencyKey: string): string {
+  const [rawKind, rawIssueId] = idempotencyKey.split(":");
+  const kind = truncateFileSegment(safeFileName(rawKind ?? "record"), 16);
+  const issueId = truncateFileSegment(safeFileName(rawIssueId ?? "unknown"), 48);
+  const digest = createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 20);
+  return `wb_${kind}_${issueId}_${digest}.json`;
+}
+
+function truncateFileSegment(value: string, maxLength: number): string {
+  const trimmed = value.slice(0, maxLength);
+  return trimmed.length > 0 ? trimmed : "record";
+}
+
+function dedupeWritebackRecords(records: WritebackOperation[]): WritebackOperation[] {
+  const byKey = new Map<string, WritebackOperation>();
+  for (const record of records) {
+    const existing = byKey.get(record.idempotencyKey);
+    if (!existing || Date.parse(record.updatedAt) >= Date.parse(existing.updatedAt)) {
+      byKey.set(record.idempotencyKey, record);
+    }
+  }
+  return Array.from(byKey.values());
 }
 
 function matchesNewWritebackOperation(record: WritebackOperation, operation: NewWritebackOperation): boolean {

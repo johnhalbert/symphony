@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -97,6 +97,76 @@ describe("FileWritebackOutboxStore", () => {
 
     const persisted = await store.get(record.idempotencyKey);
     expect(persisted?.status).toMatch(/retrying|dead_letter/);
+  });
+
+  it("stores long idempotency keys under short deterministic filenames", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const longKey = [
+      "comment",
+      "issue-long",
+      "merge-gate",
+      "merge-gate_issue-long_pr-75_31e279aac50f866d209abbd451de787b508dd681",
+      "repair",
+      "31e279aac50f866d209abbd451de787b508dd681",
+      "Typecheck_and_test_missing",
+      "mergeability_dirty_Pull_request_has_merge_conflicts_with_the_base_branch",
+      "r1",
+      "extra".repeat(80),
+    ].join(":");
+
+    await store.enqueueOnce({
+      idempotencyKey: longKey,
+      kind: "comment",
+      issueId: "issue-long",
+      payload: { body: "Merge repair required.", dedupeKey: "merge-gate-repair" },
+    });
+
+    await expect(store.get(longKey)).resolves.toMatchObject({ idempotencyKey: longKey });
+    const files = await readdir(path.join(root, "writeback"));
+    expect(files).toHaveLength(1);
+    expect(files[0]?.length).toBeLessThan(100);
+    expect(files[0]).toMatch(/^wb_comment_issue-long_[a-f0-9]{20}\.json$/);
+  });
+
+  it("reads legacy full-key filenames and migrates them on write", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const idempotencyKey = "comment:issue-legacy:merge-gate:legacy-repair";
+    const legacyFileName = `${idempotencyKey.replace(/[^A-Za-z0-9._-]/g, "_")}.json`;
+    const writebackDir = path.join(root, "writeback");
+    await mkdir(writebackDir, { recursive: true });
+    await writeFile(
+      path.join(writebackDir, legacyFileName),
+      `${JSON.stringify(
+        {
+          idempotencyKey,
+          kind: "comment",
+          issueId: "issue-legacy",
+          status: "pending",
+          attempt: 0,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          nextAttemptAt: "2026-01-01T00:00:00.000Z",
+          lastError: null,
+          resultStatus: null,
+          resultMessage: null,
+          resultEvidence: null,
+          payload: { body: "Legacy record.", dedupeKey: "legacy" },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const legacyRecord = await store.get(idempotencyKey);
+    expect(legacyRecord).toMatchObject({ idempotencyKey, status: "pending" });
+    await store.markSucceeded(legacyRecord!);
+
+    const files = await readdir(writebackDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^wb_comment_issue-legacy_[a-f0-9]{20}\.json$/);
+    expect(files).not.toContain(legacyFileName);
+    await expect(store.get(idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
   });
 
   it("claims the same due record only once across concurrent processors", async () => {
