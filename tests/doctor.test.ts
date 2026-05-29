@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
+import { HermesAuthManager } from "../hermes/src/HermesAuthManager.js";
 import {
   continuationContextDoctorChecks,
   cursorPolicyDoctorChecks,
@@ -214,7 +215,21 @@ describe("doctor review-loop checks", () => {
         { LINEAR_API_KEY: "secret" },
       );
 
-      await expect(hermesAuthDoctorChecks(config)).resolves.toEqual([
+      await expect(
+        hermesAuthDoctorChecks(config, {
+          hermesAuthManagerFactory: (options) => {
+            const realManager = new HermesAuthManager(options);
+            return {
+              prepare: (providers) => realManager.prepare(providers),
+              validateOpenAiCodex: async () => ({
+                provider: "openai-codex",
+                source: "hermes-auth-store",
+                authMode: "chatgpt",
+              }),
+            };
+          },
+        }),
+      ).resolves.toEqual([
         {
           id: "hermes.auth_root",
           status: "ok",

@@ -5,6 +5,7 @@ import path from "node:path";
 import YAML from "yaml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HermesHarness } from "../hermes/src/HermesHarness.js";
+import type { HermesAuthManager } from "../hermes/src/HermesAuthManager.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { AgentEvent, AgentRunContext } from "../src/core/harness/AgentHarness.js";
@@ -178,6 +179,7 @@ describe("HermesHarness", () => {
     process.env.HERMES_TEST_TOKEN = leakedSecret;
     const harness = new HermesHarness({
       cliPath: path.join(root, "cli.js"),
+      authManager: acceptingHermesAuthManager(),
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
           exitOnPrompt: clients.length === 0,
@@ -250,6 +252,7 @@ describe("HermesHarness", () => {
     const resumeAt = "2026-05-28T18:00:00.000Z";
     const harness = new HermesHarness({
       cliPath: path.join(root, "cli.js"),
+      authManager: acceptingHermesAuthManager(),
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
           providerLimitOnPrompt: {
@@ -450,4 +453,16 @@ function context(
     abortSignal: new AbortController().signal,
     logger: new StructuredLogger(() => undefined),
   };
+}
+
+function acceptingHermesAuthManager(): HermesAuthManager {
+  return {
+    requireProviders: async (providers = ["openai-codex"]) => ({
+      managedRoot: path.join(root, "state", "hermes", "auth"),
+      bootstrapFrom: path.join(root, "local-hermes"),
+      presentProviders: providers,
+      copiedProviders: [],
+      missingProviders: [],
+    }),
+  } as unknown as HermesAuthManager;
 }

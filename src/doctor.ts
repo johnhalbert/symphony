@@ -21,6 +21,7 @@ import { CONTINUATION_CONTEXT_ROADMAP } from "./core/summarization/ContinuationC
 import type { HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 import {
   HermesAuthManager,
+  type HermesAuthManagerOptions,
   hermesManagedAuthMissingMessage,
   hermesOwnedAuthProvidersForRuntime,
   isHermesOwnedAuthProvider,
@@ -62,6 +63,7 @@ export interface RuntimeHarnessDependencyDoctorCheckOptions {
   liveRuntime?: boolean | undefined;
   cliPath?: string | undefined;
   hermesGatewayFactory?: ((env: HermesGatewayEnvironment) => HermesGatewayClient) | undefined;
+  hermesAuthManagerFactory?: ((options: HermesAuthManagerOptions) => Pick<HermesAuthManager, "prepare" | "validateOpenAiCodex">) | undefined;
 }
 
 export type McpToolServerCommand = "completion-report-mcp" | "review-verdict-mcp" | "review-feedback-mcp";
@@ -408,14 +410,15 @@ export async function hermesAuthDoctorChecks(
     ];
   }
 
-  const manager = new HermesAuthManager({
+  const managerOptions: HermesAuthManagerOptions = {
     managedRoot: config.hermes.auth.managedRoot,
     bootstrapFrom: config.hermes.auth.bootstrapFrom,
     providers: config.hermes.auth.providers,
     upstreamRoot: config.hermes.upstreamRoot,
     python: config.hermes.python,
     timeoutMs: config.hermes.startupTimeoutMs,
-  });
+  };
+  const manager = options.hermesAuthManagerFactory?.(managerOptions) ?? new HermesAuthManager(managerOptions);
 
   try {
     const preparation = await manager.prepare(requiredProviders);
