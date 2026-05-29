@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { HistoryModel, HistoryVariant } from "../../types/symphony";
+import { useTranscript } from "../../hooks/useSymphonyData";
 import { SessionsList } from "./SessionsList";
 import { Timeline } from "./Timeline";
 import { TranscriptPane } from "./TranscriptPane";
@@ -27,7 +28,23 @@ export function ChatHistoryView({
   return (
     <div className="history">
       {variant !== "focused" ? <SessionsList sessions={history.sessions} selectedId={session.id} onSelect={setSelectedSessionId} /> : null}
-      <TranscriptPane session={session} messages={history.transcriptBySession?.[session.id] ?? []} />
+      <SelectedTranscript history={history} session={session} />
     </div>
+  );
+}
+
+function SelectedTranscript({ history, session }: { history: HistoryModel; session: HistoryModel["sessions"][number] }) {
+  const transcript = useTranscript(session.id);
+  const embeddedMessages = history.transcriptBySession?.[session.id] ?? [];
+  const messages = transcript.error ? [] : (transcript.data ?? embeddedMessages);
+
+  return (
+    <TranscriptPane
+      key={session.id}
+      session={session}
+      messages={messages}
+      loading={transcript.loading && messages.length === 0}
+      error={transcript.error}
+    />
   );
 }

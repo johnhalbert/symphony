@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDataSource } from "../data/dataSourceContext";
 import { useAsyncResource } from "./useAsyncResource";
-import type { IssueDetailModel, Loadable } from "../types/symphony";
+import type { IssueDetailModel, Loadable, TranscriptMessage } from "../types/symphony";
 
 export function useReferenceData() {
   const dataSource = useDataSource();
@@ -66,12 +66,47 @@ export function useHistory() {
   return useAsyncResource(useCallback(() => dataSource.getHistory(), [dataSource]), [dataSource]);
 }
 
-export function useTranscript(sessionId: string | null) {
+export function useTranscript(sessionId: string | null): Loadable<TranscriptMessage[]> {
   const dataSource = useDataSource();
-  return useAsyncResource(
-    useCallback(() => (sessionId ? dataSource.getTranscript(sessionId) : Promise.resolve([])), [dataSource, sessionId]),
-    [dataSource, sessionId],
-  );
+  const normalizedSessionId = sessionId || null;
+  const [state, setState] = useState<Loadable<TranscriptMessage[]> & { sessionId: string | null }>({
+    sessionId: normalizedSessionId,
+    data: normalizedSessionId ? null : [],
+    loading: Boolean(normalizedSessionId),
+    error: null,
+  });
+
+  useEffect(() => {
+    let active = true;
+    if (!normalizedSessionId) {
+      setState({ sessionId: null, data: [], loading: false, error: null });
+      return () => {
+        active = false;
+      };
+    }
+
+    setState({ sessionId: normalizedSessionId, data: null, loading: true, error: null });
+    dataSource
+      .getTranscript(normalizedSessionId)
+      .then((data) => {
+        if (active) setState({ sessionId: normalizedSessionId, data, loading: false, error: null });
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setState({ sessionId: normalizedSessionId, data: null, loading: false, error: message });
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [dataSource, normalizedSessionId]);
+
+  if (state.sessionId !== normalizedSessionId) {
+    return { data: normalizedSessionId ? null : [], loading: Boolean(normalizedSessionId), error: null };
+  }
+
+  return { data: state.data, loading: state.loading, error: state.error };
 }
 
 export function useSidebar() {
