@@ -1,9 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { DashboardView } from "../src/components/dashboard/DashboardView";
+import { SidebarViews } from "../src/components/sidebar/SidebarViews";
 import type { SymphonyDataSource } from "../src/data/dataSource";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
-import type { ChatMessage, DashboardModel } from "../src/types/symphony";
+import type { ChatMessage, DashboardModel, SidebarModel } from "../src/types/symphony";
+
+const emptyChatCopy = "No durable orchestrator chat messages are available yet.";
 
 const dashboardWithEmbeddedChat: DashboardModel = {
   projectName: "Symphony",
@@ -28,6 +31,16 @@ const dashboardWithEmbeddedChat: DashboardModel = {
     all: 0,
     completeness: 0,
   },
+};
+
+const sidebarWithEmbeddedChat: SidebarModel = {
+  providerGates: [],
+  runningAgents: [],
+  reviewIssues: [],
+  activity: [],
+  sessions: [],
+  chat: [{ who: "agent", text: "sidebar embedded chat should not render", suggestions: ["sidebar stale suggestion"] }],
+  totals: dashboardWithEmbeddedChat.totals,
 };
 
 function dataSourceForChat(chat: ChatMessage[]): SymphonyDataSource {
@@ -82,6 +95,22 @@ function renderDashboardChat(props: {
   );
 }
 
+function renderSidebarChat(props: {
+  chat: ChatMessage[];
+  loading?: boolean;
+  error?: string | null;
+}): string {
+  return renderToStaticMarkup(
+    <SidebarViews
+      sidebar={sidebarWithEmbeddedChat}
+      variant="chat"
+      orchestratorChat={props.chat}
+      orchestratorChatError={props.error ?? null}
+      orchestratorChatLoading={props.loading ?? false}
+    />,
+  );
+}
+
 describe("dashboard orchestrator chat integration", () => {
   it("renders the dedicated orchestrator chat payload instead of embedded dashboard chat", () => {
     const markup = renderDashboardChat({
@@ -94,10 +123,11 @@ describe("dashboard orchestrator chat integration", () => {
     expect(markup).not.toContain("dashboard stale suggestion");
   });
 
-  it("keeps an empty dedicated chat response empty instead of falling back to dashboard chat", () => {
+  it("keeps an empty dedicated chat response empty with explicit loaded-empty copy", () => {
     const markup = renderDashboardChat({ chat: [] });
 
     expect(markup).toContain("Symphony orchestrator");
+    expect(markup).toContain(emptyChatCopy);
     expect(markup).not.toContain("dashboard embedded chat should not render");
     expect(markup).not.toContain("dashboard stale suggestion");
   });
@@ -108,5 +138,35 @@ describe("dashboard orchestrator chat integration", () => {
     expect(markup).toContain("Loading orchestrator chat");
     expect(markup).toContain("Orchestrator chat unavailable: Symphony API returned HTTP 503");
     expect(markup).not.toContain("dashboard embedded chat should not render");
+  });
+});
+
+describe("sidebar orchestrator chat integration", () => {
+  it("renders the dedicated orchestrator chat payload instead of embedded sidebar chat", () => {
+    const markup = renderSidebarChat({
+      chat: [{ who: "agent", text: "dedicated sidebar GET chat", suggestions: ["dedicated sidebar suggestion"] }],
+    });
+
+    expect(markup).toContain("dedicated sidebar GET chat");
+    expect(markup).toContain("dedicated sidebar suggestion");
+    expect(markup).not.toContain("sidebar embedded chat should not render");
+    expect(markup).not.toContain("sidebar stale suggestion");
+  });
+
+  it("keeps an empty dedicated sidebar chat response empty with explicit loaded-empty copy", () => {
+    const markup = renderSidebarChat({ chat: [] });
+
+    expect(markup).toContain(emptyChatCopy);
+    expect(markup).not.toContain("sidebar embedded chat should not render");
+    expect(markup).not.toContain("sidebar stale suggestion");
+  });
+
+  it("surfaces sidebar loading and error states without substituting embedded chat", () => {
+    const markup = renderSidebarChat({ chat: [], loading: true, error: "Symphony API returned HTTP 503" });
+
+    expect(markup).toContain("Loading orchestrator chat");
+    expect(markup).toContain("Orchestrator chat unavailable: Symphony API returned HTTP 503");
+    expect(markup).not.toContain("sidebar embedded chat should not render");
+    expect(markup).not.toContain("sidebar stale suggestion");
   });
 });

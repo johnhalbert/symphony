@@ -18,6 +18,7 @@ export function OrchestratorChat({
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const hasNoMessages = messages.length === 0;
 
   async function submit(input = draft) {
     const trimmed = input.trim();
@@ -45,8 +46,9 @@ export function OrchestratorChat({
         </button>
       </div>
       <div className="chat__body">
-        {loading && messages.length === 0 ? <div className="view-loading">Loading orchestrator chat...</div> : null}
+        {loading && hasNoMessages ? <div className="view-loading">Loading orchestrator chat...</div> : null}
         {error ? <div className="view-error">Orchestrator chat unavailable: {error}</div> : null}
+        {!loading && !error && hasNoMessages ? <div className="view-empty">No durable orchestrator chat messages are available yet.</div> : null}
         {messages.map((message, index) => (
           <div className="chat__msg" key={`${message.who}-${index}-${message.text}`}>
             <div className={`who ${message.who === "user" ? "who--user" : ""}`}>

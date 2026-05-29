@@ -2,7 +2,7 @@ import type { ChatMessage } from "../../types/symphony";
 import { Icon } from "../common";
 import { formatInlineText } from "../messages/messageFormat";
 
-export function SidebarChat({ messages }: { messages: ChatMessage[] }) {
+export function SidebarChat({ error = null, loading = false, messages }: { error?: string | null; loading?: boolean; messages: ChatMessage[] }) {
   const recent = messages.slice(-3);
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "40px 1fr auto", background: "var(--panel)" }}>
@@ -21,33 +21,30 @@ export function SidebarChat({ messages }: { messages: ChatMessage[] }) {
       </div>
 
       <div style={{ overflow: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 14 }}>
-        {recent.length ? (
-          recent.map((message, index) => (
-            <div key={`${message.text}-${index}`} className="chat__msg">
-              <div className={`who ${message.who === "user" ? "who--user" : ""}`}>
-                <span className="av-tiny">{message.who === "user" ? "You" : "SY"}</span>
-                {message.who === "user" ? "You" : "Orchestrator"}
-              </div>
-              <div className="body">
-                <p>{formatInlineText(message.text)}</p>
-                {message.suggestions?.length ? (
-                  <div style={{ marginTop: 4 }}>
-                    {message.suggestions.map((suggestion, suggestionIndex) => (
-                      <button className="chat__suggestion" key={suggestion} style={{ marginBottom: 4 }} type="button">
-                        {suggestionIndex === 0 ? Icon.bolt() : null}
-                        {suggestion}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
+        {loading && recent.length === 0 ? <div className="view-loading">Loading orchestrator chat...</div> : null}
+        {error ? <div className="view-error">Orchestrator chat unavailable: {error}</div> : null}
+        {!loading && !error && recent.length === 0 ? <div className="view-empty">No durable orchestrator chat messages are available yet.</div> : null}
+        {recent.map((message, index) => (
+          <div key={`${message.text}-${index}`} className="chat__msg">
+            <div className={`who ${message.who === "user" ? "who--user" : ""}`}>
+              <span className="av-tiny">{message.who === "user" ? "You" : "SY"}</span>
+              {message.who === "user" ? "You" : "Orchestrator"}
             </div>
-          ))
-        ) : (
-          <div style={{ color: "var(--text-4)", fontSize: 12, lineHeight: 1.5, padding: "6px 2px" }}>
-            No orchestrator messages yet.
+            <div className="body">
+              <p>{formatInlineText(message.text)}</p>
+              {message.suggestions?.length ? (
+                <div style={{ marginTop: 4 }}>
+                  {message.suggestions.map((suggestion, suggestionIndex) => (
+                    <button className="chat__suggestion" key={suggestion} style={{ marginBottom: 4 }} type="button">
+                      {suggestionIndex === 0 ? Icon.bolt() : null}
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
           </div>
-        )}
+        ))}
       </div>
 
       <div className="chat__input">
