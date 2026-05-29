@@ -2449,7 +2449,20 @@ describe("StatusServer durable API", () => {
 
       const webIssuesResponse = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/issues");
       const webIssuesBody = (await webIssuesResponse.json()) as {
-        issues: Array<{ id: string; status: string }>;
+        issues: Array<{
+          id: string;
+          status: string;
+          priority: number | string;
+          labels: string[];
+          assignee: string;
+          agent: string | null;
+          pr: string | null;
+          ci: string | null;
+          workspace: string | null;
+          session: string | null;
+          desc?: string[];
+          activity: Array<{ t: string; verb: string; val: string; who: string }>;
+        }>;
         backlog: Array<{ id: string; status: string }>;
         lanes: { todo: Array<{ id: string }>; progress: Array<{ id: string }>; review: Array<{ id: string }> };
         cycleLabel: string;
@@ -2482,6 +2495,40 @@ describe("StatusServer durable API", () => {
       expect(webIssuesBody.lanes.review.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE"]);
       expect(webIssuesBody.issues.find((item) => item.id === "TEST-CANCELED")?.status).toBe("cancelled");
       expect(webIssuesBody.selectedIssueId).toBe("TEST-PROGRESS");
+
+      const webTodo = webIssuesBody.issues.find((item) => item.id === "TEST-TODO");
+      expect(webTodo).toMatchObject({
+        id: "TEST-TODO",
+        status: "todo",
+        priority: 1,
+        labels: [],
+        assignee: "unassigned",
+        agent: "delegate-1",
+        pr: null,
+        ci: null,
+        workspace: null,
+        session: null,
+        desc: ["Todo detail description", "Blocked by TEST-0"],
+        activity: [{ t: "2026-01-01T00:00:00Z", verb: "created", val: "Todo", who: "tracker" }],
+      });
+      const webReview = webIssuesBody.issues.find((item) => item.id === "TEST-1");
+      expect(webReview).toMatchObject({
+        id: "TEST-1",
+        status: "review",
+        priority: 1,
+        labels: ["dogfood-ready"],
+        assignee: "unassigned",
+        agent: "agent-1",
+        pr: null,
+        ci: null,
+        workspace: path.join(config.workspace.root, "TEST-1"),
+        session: "run-test-1",
+        desc: ["Blocked by TEST-0"],
+        activity: [
+          { t: "2026-01-01T00:00:00Z", verb: "created", val: "In Review", who: "tracker" },
+          { t: "2026-01-01T00:09:00.000Z", verb: "updated", val: "In Review", who: "agent-1" },
+        ],
+      });
 
       const dashboardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/dashboard`);
       const dashboardBody = (await dashboardResponse.json()) as {
