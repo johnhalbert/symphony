@@ -16,12 +16,14 @@ import type {
   TimelineEvent,
   TranscriptMessage,
   UserMap,
+  ProviderGateModel,
 } from "../types/symphony";
 
 export interface RawData {
   issues: IssueModel[];
   users: UserMap;
   labels: LabelMap;
+  providerGates?: ProviderGateModel[];
   runningAgents: RunningAgentModel[];
   activity: ActivityModel[];
   sessions: SessionModel[];
@@ -68,6 +70,7 @@ export function toDashboardModel(raw: RawData): DashboardModel {
     pollLabel: "poll 22s",
     agentUsageLabel: "4/6 agents",
     concurrencyCap: 6,
+    providerGates: raw.providerGates ?? [],
     runningAgents: raw.runningAgents,
     activity: raw.activity,
     chat: raw.dashChat,
@@ -116,6 +119,7 @@ export function toHistoryModel(raw: RawData): HistoryModel {
 
 export function toSidebarModel(raw: RawData): SidebarModel {
   return {
+    providerGates: raw.providerGates ?? [],
     runningAgents: raw.runningAgents,
     reviewIssues: raw.issues.filter((issue) => issue.status === "review").slice(0, 3),
     activity: raw.activity,

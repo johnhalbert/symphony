@@ -85,6 +85,8 @@ export function sanitizeAgentEventForPublicOutput(event: AgentEvent): AgentEvent
       return { ...event, error: sanitizedPreviewValue(event.error).preview ?? "" };
     case "rate_limits":
       return { ...event, payload: sanitizePublicJson(event.payload) };
+    case "provider_limit":
+      return { ...event, signal: sanitizePublicJson(event.signal) as typeof event.signal };
     default:
       return event;
   }

@@ -330,6 +330,20 @@ export class StatusServer {
         return;
       }
 
+      const providerGateMutationMatch = /^\/api\/v1\/provider-gates\/([^/]+)\/(clear|resume)$/.exec(url.pathname);
+      if (request.method === "POST" && providerGateMutationMatch) {
+        this.requireMutationToken(request);
+        const gateId = decodeURIComponent(providerGateMutationMatch[1] ?? "");
+        const cleared = await this.options.orchestrator.clearProviderGate(gateId);
+        if (!cleared) throw new SymphonyError("not_found", `Provider gate not found: ${gateId}`);
+        sendJson(response, 202, {
+          cleared: true,
+          resumed: providerGateMutationMatch[2] === "resume",
+          gate: cleared,
+        });
+        return;
+      }
+
       const issueRunsMatch = /^\/api\/v1\/issues\/([^/]+)\/runs$/.exec(url.pathname);
       if (request.method === "GET" && issueRunsMatch) {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
@@ -1856,6 +1870,7 @@ async function renderDashboard(
               }</li>`,
           )
           .join("")}</ul></section>`;
+  const providerGates = renderProviderGateBanner(snapshot);
   const orphanedRows = await orphanedOperatorViews(snapshot, runStore);
   const orphaned =
     orphanedRows.length === 0
@@ -1887,12 +1902,15 @@ async function renderDashboard(
       .cancellation { color: #a31919; }
       .blocked { color: #5e197c; }
       .paused-label { color: #555; }
+      .provider-gate { border: 1px solid #bf7a00; border-left: 5px solid #bf7a00; background: #fff8e6; border-radius: 6px; margin: 0 0 1rem; padding: 0.75rem; }
+      .provider-gate strong { color: #7a4a00; }
     </style>
   </head>
   <body>
     <h1>Symphony</h1>
-    <p>Running: ${snapshot.counts.running}, retrying: ${snapshot.counts.retrying}, paused: ${snapshot.counts.paused}</p>
+    <p>Running: ${snapshot.counts.running}, retrying: ${snapshot.counts.retrying}, paused: ${snapshot.counts.paused}, provider gates: ${snapshot.counts.providerGates}</p>
     <p class="meta">Mutations ${mutationsConfigured ? "require X-Symphony-Token" : "do not require a configured token"}; use the existing pause, resume, cancel, and continuation-summary API endpoints.</p>
+    ${providerGates}
     <section>
       <h2>Running Agents</h2>
       <ul class="plain-list">${running || "<li>No active runs</li>"}</ul>
@@ -1903,6 +1921,25 @@ async function renderDashboard(
     <p class="meta">Snapshot generated at ${escapeHtml(snapshot.generatedAt)}</p>
   </body>
 </html>`;
+}
+
+function renderProviderGateBanner(snapshot: RuntimeSnapshot): string {
+  if (snapshot.providerGates.length === 0) return "";
+  return `<section><h2>Provider Limits</h2>${snapshot.providerGates
+    .map((gate) => {
+      const provider = gate.scope.providerId ?? gate.scope.harnessId;
+      const sourceInfo = gate.source;
+      const resume =
+        gate.resumePolicy === "auto_at_window_close" && gate.window?.resumeAt
+          ? `resets at ${gate.window.resumeAt}`
+          : "waiting for user resume";
+      const affected = `${gate.affectedRoles.join(", ")} · ${gate.affectedRunPhases.join(", ")}`;
+      const source = sourceInfo?.issueIdentifier || sourceInfo?.runId
+        ? `triggered by ${sourceInfo.issueIdentifier ?? "unknown issue"}${sourceInfo.runId ? ` / ${sourceInfo.runId}` : ""}`
+        : "triggering run unavailable";
+      return `<div class="provider-gate"><strong>${escapeHtml(provider)}</strong> ${escapeHtml(gate.kind)} · ${escapeHtml(resume)}<div>${escapeHtml(gate.message)}</div><div class="meta">affected ${escapeHtml(affected)} · ${escapeHtml(source)} · gate <code>${escapeHtml(gate.id)}</code></div></div>`;
+    })
+    .join("")}</section>`;
 }
 
 function renderRunningRow(
@@ -2014,6 +2051,8 @@ async function operatorSnapshotView(
     generatedAt: snapshot.generatedAt,
     mutationsRequireToken: mutationsConfigured,
     operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
+    providerGates: snapshot.providerGates.map((gate) => providerGateOperatorSummary(gate, mutationsConfigured)),
+    providerGateCounts: snapshot.providerGateCounts,
     running,
     orphaned,
     paused: await pausedOperatorViews(
@@ -2054,6 +2093,29 @@ async function orphanedOperatorViews(snapshot: RuntimeSnapshot, runStore?: RunTr
     lastActivityAt: run.activitySnapshot?.lastHarnessActivityAt ?? run.updatedAt,
     controls: { pause: false, resume: false, cancel: false, mutationsRequireToken: false },
   }));
+}
+
+function providerGateOperatorSummary(gate: RuntimeSnapshot["providerGates"][number], mutationsConfigured: boolean) {
+  return {
+    id: gate.id,
+    provider: gate.scope.providerId ?? gate.scope.harnessId,
+    harnessId: gate.scope.harnessId,
+    model: gate.scope.model ?? null,
+    kind: gate.kind,
+    message: gate.message,
+    resumePolicy: gate.resumePolicy,
+    resumeAt: gate.window?.resumeAt ?? null,
+    windowLabel: gate.window?.windowLabel ?? null,
+    windowKind: gate.window?.windowKind ?? null,
+    affectedRoles: gate.affectedRoles,
+    affectedRunPhases: gate.affectedRunPhases,
+    source: gate.source,
+    controls: {
+      clear: true,
+      resume: true,
+      mutationsRequireToken: mutationsConfigured,
+    },
+  };
 }
 
 function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: IssueLifecycleRecord | null | undefined = row.lifecycle, agentId: string | null = null) {

@@ -1,5 +1,6 @@
 import type { ServiceConfig } from "../config/Config.js";
 import type { Logger } from "../logging/StructuredLogger.js";
+import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import type { AgentRunPhase, AgentRunRole, Issue, TokenCounts, Workspace } from "../types.js";
 
 export type AgentRunMode = "agent" | "plan";
@@ -49,6 +50,11 @@ export type AgentEvent =
   | {
       type: "rate_limits";
       payload: unknown;
+      at?: string;
+    }
+  | {
+      type: "provider_limit";
+      signal: ProviderLimitSignal;
       at?: string;
     }
   | {

@@ -58,6 +58,18 @@ export interface RunningAgentModel {
   tokens: string;
 }
 
+export interface ProviderGateModel {
+  id: string;
+  provider: string;
+  kind: string;
+  message: string;
+  resumeAt: string | null;
+  resumePolicy: string;
+  sourceIssue: string | null;
+  sourceRunId: string | null;
+  affected: string;
+}
+
 export interface ActivityModel {
   t: string;
   who: string;
@@ -141,6 +153,7 @@ export interface DashboardModel {
   pollLabel: string;
   agentUsageLabel: string;
   concurrencyCap: number;
+  providerGates: ProviderGateModel[];
   runningAgents: RunningAgentModel[];
   activity: ActivityModel[];
   chat: ChatMessage[];
@@ -172,6 +185,7 @@ export interface HistoryModel {
 }
 
 export interface SidebarModel {
+  providerGates: ProviderGateModel[];
   runningAgents: RunningAgentModel[];
   reviewIssues: IssueModel[];
   activity: ActivityModel[];

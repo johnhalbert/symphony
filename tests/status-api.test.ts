@@ -525,6 +525,88 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("surfaces provider-limit gates in state and dashboard and lets operators clear them", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    config.hermes.provider = "openai-codex";
+    const candidate = issue({ state: "Todo" });
+    let candidateAvailable = true;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return candidateAvailable ? [candidate] : [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const harness = new StatusProviderLimitHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    try {
+      await orchestrator.refreshNow();
+      await waitForStatusApiAsync(async () => orchestrator.snapshot().providerGates.length === 1, "provider gate");
+      await waitForStatusApiAsync(async () => orchestrator.snapshot().counts.running === 0, "provider-limit run exit");
+
+      const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
+      const dashboardResponse = await fetch(baseUrl + "/");
+      const state = (await stateResponse.json()) as {
+        providerGates: Array<{ id: string; message: string; resumePolicy: string }>;
+        providerGateCounts: { active: number; manual: number };
+        operatorView: { providerGates: Array<{ provider: string; controls: { resume: boolean } }> };
+      };
+      const dashboard = await dashboardResponse.text();
+      const gateId = state.providerGates[0]!.id;
+
+      expect(state.providerGateCounts).toMatchObject({ active: 1, manual: 1 });
+      expect(state.providerGates[0]).toMatchObject({ message: "Codex weekly allotment exhausted", resumePolicy: "manual" });
+      expect(state.operatorView.providerGates[0]).toMatchObject({ provider: "openai-codex", controls: { resume: true } });
+      expect(dashboard).toContain("Provider Limits");
+      expect(dashboard).toContain("waiting for user resume");
+      expect(dashboard).toContain("Codex weekly allotment exhausted");
+
+      const unauthorized = await fetch(`${baseUrl}/api/v1/provider-gates/${encodeURIComponent(gateId)}/resume`, { method: "POST" });
+      expect(unauthorized.status).toBe(401);
+      candidateAvailable = false;
+      const cleared = await fetch(`${baseUrl}/api/v1/provider-gates/${encodeURIComponent(gateId)}/resume`, {
+        method: "POST",
+        headers: { "X-Symphony-Token": "secret" },
+      });
+      expect(cleared.status).toBe(202);
+      await waitForStatusApiAsync(async () => orchestrator.snapshot().providerGates.length === 0, "provider gate clear");
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
+    }
+  });
+
   it("serves web history from run records without hydrating transcripts", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
@@ -3616,6 +3698,35 @@ class PlanningRunRecordingHarness implements AgentHarness {
   }
 }
 
+class StatusProviderLimitHarness implements AgentHarness {
+  readonly id = "hermes";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    yield {
+      type: "session_started",
+      sessionId: `status-provider-limit-session-${this.runs.length}`,
+      runId: `status-provider-limit-run-${this.runs.length}`,
+    };
+    if (this.runs.length > 1) {
+      yield { type: "completed", message: "recovered" };
+      return;
+    }
+    yield {
+      type: "provider_limit",
+      signal: {
+        scope: { harnessId: "hermes", providerId: "openai-codex" },
+        kind: "windowed_bucket_exhausted",
+        message: "Codex weekly allotment exhausted",
+        window: { windowLabel: "Weekly", windowKind: "codex_weekly" },
+        resumePolicy: "manual",
+      },
+    };
+  }
+}
+
 async function createPlanningRunApiFixture(root: string, candidate: Issue): Promise<{
   baseUrl: string;
   harness: PlanningRunRecordingHarness;
@@ -3687,7 +3798,10 @@ function fakeOrchestrator(
           running: running.length,
           retrying: overrides.retrying?.length ?? 0,
           paused: overrides.paused?.length ?? 0,
+          providerGates: 0,
         },
+        providerGates: [],
+        providerGateCounts: { active: 0, manual: 0, autoResume: 0 },
         running,
         retrying: overrides.retrying ?? [],
         paused: overrides.paused ?? [],

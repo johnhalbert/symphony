@@ -51,6 +51,25 @@ export function DashboardView({
           </div>
         </div>
 
+        {dashboard.providerGates.length ? (
+          <div className="provider-limit-banner">
+            {dashboard.providerGates.map((gate) => (
+              <div className="provider-limit-banner__item" key={gate.id}>
+                <div>
+                  <strong>{gate.provider}</strong>
+                  <span>{gate.kind}</span>
+                </div>
+                <p>{gate.message}</p>
+                <small>
+                  {gate.resumeAt ? `resets ${gate.resumeAt}` : "waiting for user resume"}
+                  {gate.sourceIssue ? ` · ${gate.sourceIssue}` : ""}
+                  {gate.sourceRunId ? ` · ${gate.sourceRunId}` : ""}
+                </small>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
         {variant === "grid" ? <StatsGridDense totals={totals} /> : <StatsRow totals={totals} />}
 
         {variant === "command-center" ? <BurndownCommandCenter totals={totals} /> : <BurndownPanel totals={totals} />}

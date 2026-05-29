@@ -244,6 +244,85 @@ describe("HermesHarness", () => {
     expect(remaining.map((event) => event.type)).toContain("completed");
     await harness.dispose();
   });
+
+  it("maps Hermes provider.limit events into provider_limit harness events", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const resumeAt = "2026-05-28T18:00:00.000Z";
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
+          providerLimitOnPrompt: {
+            provider_id: "openai-codex",
+            model: "gpt-5-test",
+            kind: "windowed_bucket_exhausted",
+            message: "Codex session allotment exhausted",
+            resume_at: resumeAt,
+            window_label: "Session",
+            window_kind: "codex_5h",
+          },
+        });
+        clients.push(client);
+        return client;
+      },
+    });
+    const config = configForHarness();
+    config.hermes.provider = "openai-codex";
+    config.hermes.model = "gpt-5-test";
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "worker prompt"));
+    const limit = events.find((event): event is Extract<AgentEvent, { type: "provider_limit" }> => event.type === "provider_limit");
+
+    expect(limit?.signal).toMatchObject({
+      scope: { harnessId: "hermes", providerId: "openai-codex", model: "gpt-5-test" },
+      kind: "windowed_bucket_exhausted",
+      message: "Codex session allotment exhausted",
+      window: { resumeAt, windowLabel: "Session", windowKind: "codex_5h" },
+      resumePolicy: "auto_at_window_close",
+    });
+    expect(events.map((event) => event.type)).toContain("failed");
+  });
+
+  it("maps structured Hermes JSON-RPC provider-limit errors into provider_limit harness events", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
+          promptError: Object.assign(new Error("Codex usage limit reached"), {
+            code: "usage_limit_reached",
+            data: {
+              provider_id: "openai-codex",
+              model: "gpt-5-test",
+              reset_at: "2026-05-28T19:00:00.000Z",
+              message: "Codex usage limit reached",
+            },
+          }),
+        });
+        clients.push(client);
+        return client;
+      },
+    });
+    const config = configForHarness();
+    config.hermes.provider = "openai-codex";
+    config.hermes.model = "gpt-5-test";
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "worker prompt"));
+    const limit = events.find((event): event is Extract<AgentEvent, { type: "provider_limit" }> => event.type === "provider_limit");
+
+    expect(limit?.signal).toMatchObject({
+      scope: { harnessId: "hermes", providerId: "openai-codex", model: "gpt-5-test" },
+      kind: "windowed_bucket_exhausted",
+      message: "Codex usage limit reached",
+      window: { resumeAt: "2026-05-28T19:00:00.000Z" },
+      resumePolicy: "auto_at_window_close",
+    });
+    expect(events.map((event) => event.type)).toEqual(expect.arrayContaining(["provider_limit", "run_diagnostic", "failed"]));
+  });
 });
 
 class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
@@ -253,7 +332,7 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   constructor(
     readonly env: HermesGatewayEnvironment,
     private readonly sessionId: string,
-    private readonly options: { exitOnPrompt?: boolean; logTail?: string } = {},
+    private readonly options: { exitOnPrompt?: boolean; logTail?: string; promptError?: Error; providerLimitOnPrompt?: Record<string, unknown> } = {},
   ) {
     super();
   }
@@ -278,16 +357,25 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
     this.requests.push({ method, params });
     if (method === "session.create") return { session_id: this.sessionId } as T;
     if (method === "prompt.submit") {
+      if (this.options.promptError) throw this.options.promptError;
       if (this.options.exitOnPrompt) {
         queueMicrotask(() => this.emit("exit", 0));
         return { ok: true } as T;
       }
       queueMicrotask(() => {
-        this.emit("event", {
-          type: "message.complete",
-          session_id: this.sessionId,
-          payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
-        } satisfies GatewayEvent);
+        if (this.options.providerLimitOnPrompt) {
+          this.emit("event", {
+            type: "provider.limit",
+            session_id: this.sessionId,
+            payload: this.options.providerLimitOnPrompt,
+          } as GatewayEvent);
+        } else {
+          this.emit("event", {
+            type: "message.complete",
+            session_id: this.sessionId,
+            payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
+          } satisfies GatewayEvent);
+        }
       });
       return { ok: true } as T;
     }

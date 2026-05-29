@@ -16,6 +16,22 @@ export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
       </div>
 
       <div style={{ padding: "12px 12px 4px" }}>
+        {sidebar.providerGates.length ? (
+          <div style={{ display: "grid", gap: 8, marginBottom: 8 }}>
+            {sidebar.providerGates.map((gate) => (
+              <div key={gate.id} style={{ border: "1px solid rgba(240,184,108,0.42)", borderLeft: "3px solid var(--accent)", borderRadius: 6, background: "rgba(240,184,108,0.08)", padding: "8px 10px" }}>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11.5 }}>
+                  <span style={{ color: "var(--accent)", fontWeight: 600 }}>{gate.provider}</span>
+                  <span style={{ color: "var(--text-3)", fontFamily: "var(--font-mono)", fontSize: 10 }}>{gate.kind}</span>
+                </div>
+                <div style={{ color: "var(--text-2)", fontSize: 11, lineHeight: 1.4, marginTop: 3 }}>{gate.message}</div>
+                <div style={{ color: "var(--text-4)", fontFamily: "var(--font-mono)", fontSize: 10, marginTop: 3 }}>
+                  {gate.resumeAt ? `resets ${gate.resumeAt}` : "waiting for user resume"}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
           <MiniStat label="Completeness" value={`${sidebar.totals.completeness}%`} bar={`${sidebar.totals.completeness}%`} accent />
           <MiniStat label="Running" value={`${sidebar.runningAgents.length}/6`} sub="agents" />

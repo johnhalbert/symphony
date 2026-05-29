@@ -132,6 +132,109 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.running).toBe(0);
   });
 
+  it("records provider-limit gates without normal retry and resumes after the window closes", async () => {
+    const config = testConfig(root);
+    config.hermes.provider = "openai-codex";
+    config.hermes.model = "gpt-5-test";
+    const resumeAt = new Date(Date.now() + 120).toISOString();
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new ProviderLimitThenCompleteHarness({
+      resumeAt,
+      providerId: "openai-codex",
+      model: "gpt-5-test",
+    });
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "provider-limit run dispatched");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "provider-limit run exited");
+    const gatedSnapshot = orchestrator.snapshot();
+
+    expect(gatedSnapshot.counts.retrying).toBe(0);
+    expect(gatedSnapshot.providerGates[0]).toMatchObject({
+      kind: "windowed_bucket_exhausted",
+      resumePolicy: "auto_at_window_close",
+      window: { resumeAt, windowKind: "codex_5h" },
+      source: { issueIdentifier: "TEST-1", role: "worker", runPhase: "implementation" },
+    });
+    await expect(runStore.latestRunForIssue(candidate.id)).resolves.toMatchObject({
+      status: "failed",
+      providerLimit: {
+        kind: "windowed_bucket_exhausted",
+        window: { resumeAt },
+      },
+      failureKind: "provider_limit",
+    });
+
+    await orchestrator.refreshNow();
+    expect(harness.runs).toHaveLength(1);
+    await new Promise((resolve) => setTimeout(resolve, 170));
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "dispatch after provider window closes");
+    await orchestrator.stop();
+  });
+
+  it("keeps manual provider-limit gates active until the operator clears them", async () => {
+    const config = testConfig(root);
+    config.hermes.provider = "openai-codex";
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new ProviderLimitThenCompleteHarness({ providerId: "openai-codex" });
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => orchestrator.snapshot().providerGates.length === 1, "manual provider gate");
+    const gateId = orchestrator.snapshot().providerGates[0]!.id;
+
+    await orchestrator.refreshNow();
+    expect(harness.runs).toHaveLength(1);
+    await expect(orchestrator.clearProviderGate(gateId)).resolves.toMatchObject({ id: gateId });
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "dispatch after manual gate clear");
+    await orchestrator.stop();
+  });
+
   it("runs issue breakdown planning before implementation and injects the plan", async () => {
     const config = testConfig(root);
     config.issueBreakdown.enabled = true;
@@ -6132,6 +6235,41 @@ class NonMcpHarness implements AgentHarness {
     this.prompts.push(prompt);
     yield { type: "session_started", sessionId: "no-mcp-session", runId: "no-mcp-run" };
     yield { type: "completed" };
+  }
+}
+
+class ProviderLimitThenCompleteHarness implements AgentHarness {
+  readonly id = "hermes";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(private readonly limit: { providerId: string; model?: string | null; resumeAt?: string | null }) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    yield { type: "session_started", sessionId: `provider-limit-${this.runs.length}`, runId: `provider-limit-run-${this.runs.length}` };
+    if (this.runs.length === 1) {
+      yield {
+        type: "provider_limit",
+        signal: {
+          scope: {
+            harnessId: "hermes",
+            providerId: this.limit.providerId,
+            model: this.limit.model ?? null,
+          },
+          kind: "windowed_bucket_exhausted",
+          message: "Codex usage window exhausted",
+          window: {
+            resumeAt: this.limit.resumeAt ?? null,
+            windowLabel: this.limit.resumeAt ? "Session" : null,
+            windowKind: this.limit.resumeAt ? "codex_5h" : null,
+          },
+          resumePolicy: this.limit.resumeAt ? "auto_at_window_close" : "manual",
+        },
+      };
+      return;
+    }
+    yield { type: "completed", message: "recovered" };
   }
 }
 

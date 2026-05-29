@@ -4,6 +4,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
+import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type PersistedRunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
@@ -72,6 +73,7 @@ export interface RunMetadata {
   failureDiagnosticPayload?: unknown;
   pendingApprovalRequestId?: string | null;
   pendingApprovalRequestedAt?: string | null;
+  providerLimit?: ProviderLimitSignal | null;
 }
 
 export interface RunRecord {
@@ -141,6 +143,7 @@ export interface RunRecord {
   failureDiagnosticPayload?: unknown;
   pendingApprovalRequestId?: string | null;
   pendingApprovalRequestedAt?: string | null;
+  providerLimit?: ProviderLimitSignal | null;
 }
 
 export interface TranscriptEvent {
@@ -590,6 +593,7 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.failureDiagnosticPayload === undefined ? {} : { failureDiagnosticPayload: metadata.failureDiagnosticPayload }),
     ...(metadata.pendingApprovalRequestId === undefined ? {} : { pendingApprovalRequestId: metadata.pendingApprovalRequestId }),
     ...(metadata.pendingApprovalRequestedAt === undefined ? {} : { pendingApprovalRequestedAt: metadata.pendingApprovalRequestedAt }),
+    ...(metadata.providerLimit === undefined ? {} : { providerLimit: metadata.providerLimit }),
   };
 }
 

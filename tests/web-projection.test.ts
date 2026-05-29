@@ -256,11 +256,43 @@ describe("web projection foundation", () => {
     ];
     const transcriptPage: TranscriptPage = { runId: "run-1", offset: 0, limit: 10, nextOffset: null, events: transcriptEvents };
 
-    const dashboard = projectDashboardModel({ board: { issues: [card()] }, activity: activityInput, runs: [run()] });
+    const runtime = {
+      generatedAt: "2026-01-01T00:11:00.000Z",
+      counts: { running: 0, retrying: 0, paused: 0, providerGates: 1 },
+      providerGates: [
+        {
+          id: "provider-gate:openai-codex:test",
+          scope: { harnessId: "hermes", providerId: "openai-codex", model: "gpt-5-test" },
+          kind: "windowed_bucket_exhausted",
+          window: { resumeAt: "2026-01-01T05:00:00.000Z", windowLabel: "Session", windowKind: "codex_5h" },
+          resumePolicy: "auto_at_window_close",
+          message: "Codex session allotment exhausted",
+          observedAt: "2026-01-01T00:00:00.000Z",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          affectedRoles: ["worker", "reviewer"],
+          affectedRunPhases: ["implementation", "review"],
+          source: { issueIdentifier: "TEST-1", runId: "run-1" },
+        },
+      ],
+      providerGateCounts: { active: 1, manual: 0, autoResume: 1 },
+      running: [],
+      retrying: [],
+      paused: [],
+      totals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, secondsRunning: 0 },
+      rateLimits: null,
+    } as any;
+    const dashboard = projectDashboardModel({ board: { issues: [card()] }, activity: activityInput, runs: [run()], runtime });
     const detail = projectIssueDetailModel({ issue: "TEST-1", boardCard: card(), issueDetails: issueDetails(), latestRun: run(), runs: [run()], operatorLiveness: { agentId: "agent-1", sessionId: "session-1", workspacePath: "/tmp/workspaces/TEST-1", runId: "run-1", activeRunId: "run-1", status: "active" } });
     const history = projectHistoryModel({ runs: [run()], transcript: transcriptPage, selectedRunId: "run-1" });
 
     expect(dashboard.board.counts.total).toBe(1);
+    expect(dashboard.providerGates[0]).toMatchObject({
+      provider: "openai-codex",
+      kind: "windowed_bucket_exhausted",
+      resumeAt: "2026-01-01T05:00:00.000Z",
+      sourceIssue: "TEST-1",
+    });
     expect(dashboard.activity.map((item) => item.verb)).toEqual(["run_started", "tool_call"]);
     expect(dashboard.sessions[0]).toMatchObject({ id: "session-1", issue: "TEST-1", state: "succeeded", model: "gpt-test", msgCount: 2 });
     expect(detail.issue.id).toBe("TEST-1");

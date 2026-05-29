@@ -365,6 +365,46 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
 
 .dash__actions { display: flex; gap: 6px; }
 
+.provider-limit-banner {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.provider-limit-banner__item {
+  border: 1px solid rgba(240, 184, 108, 0.42);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: rgba(240, 184, 108, 0.08);
+  padding: 10px 12px;
+}
+
+.provider-limit-banner__item > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.provider-limit-banner__item strong {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.provider-limit-banner__item span,
+.provider-limit-banner__item small {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.provider-limit-banner__item p {
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 5px 0 4px;
+}
+
 /* Stat cards */
 .stats {
   display: grid;

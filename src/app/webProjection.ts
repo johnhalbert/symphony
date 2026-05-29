@@ -96,6 +96,18 @@ export interface RunningAgentModel {
   tokens: string | null;
 }
 
+export interface ProviderGateModel {
+  id: string;
+  provider: string;
+  kind: string;
+  message: string;
+  resumeAt: string | null;
+  resumePolicy: string;
+  sourceIssue: string | null;
+  sourceRunId: string | null;
+  affected: string;
+}
+
 export interface ActivityModel {
   id: string;
   at: string;
@@ -140,6 +152,7 @@ export interface DashboardModel {
   generatedAt: string | null;
   reference: ReferenceData;
   board: IssueBoardModel;
+  providerGates: ProviderGateModel[];
   runningAgents: RunningAgentModel[];
   activity: ActivityModel[];
   sessions: SessionModel[];
@@ -160,6 +173,7 @@ export interface HistoryModel {
 }
 
 export interface SidebarModel {
+  providerGates: ProviderGateModel[];
   runningAgents: RunningAgentModel[];
   reviewQueue: IssueModel[];
   recentActivity: ActivityModel[];
@@ -351,6 +365,7 @@ export function emptyDashboardModel(): DashboardModel {
     generatedAt: null,
     reference: emptyReferenceData(),
     board: emptyIssueBoardModel(),
+    providerGates: [],
     runningAgents: [],
     activity: [],
     sessions: [],
@@ -377,6 +392,7 @@ export function emptyHistoryModel(): HistoryModel {
 
 export function emptySidebarModel(): SidebarModel {
   return {
+    providerGates: [],
     runningAgents: [],
     reviewQueue: [],
     recentActivity: [],
@@ -468,6 +484,7 @@ export function projectDashboardModel(input: DashboardProjectionInput = {}): Das
     generatedAt: input.generatedAt ?? board.generatedAt ?? null,
     reference: cloneReferenceData(input.reference ?? emptyReferenceData()),
     board,
+    providerGates: projectProviderGates(input.runtime ?? null),
     runningAgents: projectRunningAgents(input.runtime ?? null),
     activity,
     sessions: (input.runs ?? []).map(projectSessionModel),
@@ -488,6 +505,7 @@ export function projectHistoryModel(input: { runs?: RunRecord[]; transcript?: Tr
 export function projectSidebarModel(input: SidebarProjectionInput = {}): SidebarModel {
   const board = projectIssueBoardModel(input.board ?? null);
   return {
+    providerGates: projectProviderGates(input.runtime ?? null),
     runningAgents: projectRunningAgents(input.runtime ?? null),
     reviewQueue: board.issues.filter((issue) => issue.status === "review"),
     recentActivity: projectActivityModels(input.activity ?? null),
@@ -550,6 +568,20 @@ export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefine
     step: row.lastMessage ?? row.lastEvent,
     duration: null,
     tokens: row.tokens.totalTokens > 0 ? String(row.tokens.totalTokens) : null,
+  }));
+}
+
+export function projectProviderGates(snapshot: RuntimeSnapshot | null | undefined): ProviderGateModel[] {
+  return (snapshot?.providerGates ?? []).map((gate) => ({
+    id: gate.id,
+    provider: gate.scope.providerId ?? gate.scope.harnessId,
+    kind: gate.kind,
+    message: gate.message,
+    resumeAt: gate.window?.resumeAt ?? null,
+    resumePolicy: gate.resumePolicy,
+    sourceIssue: gate.source?.issueIdentifier ?? gate.source?.issueId ?? null,
+    sourceRunId: gate.source?.runId ?? null,
+    affected: [...gate.affectedRoles, ...gate.affectedRunPhases].join(", "),
   }));
 }
 

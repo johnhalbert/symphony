@@ -53,6 +53,13 @@ import {
   type TranscriptEvent,
   type UpdateRunInput,
 } from "../persistence/RunTranscriptStore.js";
+import { FileProviderGateStore, type ProviderGateStore } from "../persistence/ProviderGateStore.js";
+import {
+  normalizeProviderLimitSignal,
+  providerLimitDelayMs,
+  type ProviderLimitSignal,
+  type RuntimeProviderGate,
+} from "../provider/ProviderLimits.js";
 import { sanitizeAgentEventForPublicOutput } from "../transcript/TranscriptProjection.js";
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
@@ -115,6 +122,7 @@ export interface OrchestratorOptions {
   completionReportPublisher?: CompletionReportPullRequestPublisher;
   operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest"> &
     Partial<Pick<OperatorApprovalService, "get" | "getByDedupe">>;
+  providerGateStore?: ProviderGateStore;
 }
 
 export interface PullRequestDiscoveryClient {
@@ -181,6 +189,7 @@ export interface RunningEntry {
   lastStreamActivityAt: Date | null;
   lastDeltaOrToolActivityAt: Date | null;
   lastToolActivityAt: Date | null;
+  providerLimitSignal: ProviderLimitSignal | null;
 }
 
 interface ReviewerDispatchEvidence {
@@ -213,6 +222,13 @@ export interface RuntimeSnapshot {
     running: number;
     retrying: number;
     paused: number;
+    providerGates: number;
+  };
+  providerGates: RuntimeProviderGate[];
+  providerGateCounts: {
+    active: number;
+    manual: number;
+    autoResume: number;
   };
   running: Array<{
     issueId: string;
@@ -404,15 +420,19 @@ export class Orchestrator {
   private readonly pausedIssues = new Set<string>();
   private readonly retryAttempts = new Map<string, RetryEntry>();
   private readonly totals: TokenCounts = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  private readonly providerGateStore: ProviderGateStore;
+  private activeProviderGates: RuntimeProviderGate[] = [];
   private rateLimits: unknown = null;
 
   constructor(private readonly options: OrchestratorOptions) {
     this.config = options.config;
     this.promptTemplate = options.promptTemplate;
+    this.providerGateStore = options.providerGateStore ?? new FileProviderGateStore(options.config.workspace.stateDir);
   }
 
   async start(): Promise<void> {
     this.stopped = false;
+    await this.refreshProviderGates();
     await this.options.writeback?.processDue();
     await this.startupCleanup();
     this.scheduleTick(0);
@@ -456,6 +476,13 @@ export class Orchestrator {
     this.scheduleTick(0);
   }
 
+  async clearProviderGate(gateId: string): Promise<RuntimeProviderGate | null> {
+    const cleared = await this.providerGateStore.clear(gateId);
+    await this.refreshProviderGates();
+    this.scheduleTick(0);
+    return cleared;
+  }
+
   async cancelIssue(issueId: string): Promise<void> {
     this.clearRetry(issueId);
     this.claimed.delete(issueId);
@@ -474,6 +501,10 @@ export class Orchestrator {
   }
 
   async requestIssueBreakdown(issueIdOrIdentifier: string): Promise<{ queued: boolean; issue: Issue; reason: string }> {
+    const gate = await this.activeProviderDispatchGate();
+    if (gate) {
+      throw new SymphonyError("conflict", providerGateDispatchBlockedMessage(gate));
+    }
     if (!this.config.issueBreakdown.enabled) {
       throw new SymphonyError("invalid_request", "Issue breakdown planning is disabled");
     }
@@ -600,6 +631,13 @@ export class Orchestrator {
         running: this.running.size,
         retrying: this.retryAttempts.size,
         paused: this.pausedIssues.size,
+        providerGates: this.activeProviderGates.length,
+      },
+      providerGates: this.activeProviderGates,
+      providerGateCounts: {
+        active: this.activeProviderGates.length,
+        manual: this.activeProviderGates.filter((gate) => gate.resumePolicy === "manual").length,
+        autoResume: this.activeProviderGates.filter((gate) => gate.resumePolicy === "auto_at_window_close").length,
       },
       running: [...this.running.entries()].map(([issueId, entry]) => ({
         issueId,
@@ -662,6 +700,20 @@ export class Orchestrator {
     this.ticking = true;
     try {
       await this.reconcileRunningIssues();
+      const providerGate = await this.activeProviderDispatchGate();
+      if (providerGate) {
+        this.options.logger.warn("agent dispatch paused by provider limit", {
+          gate_id: providerGate.id,
+          harness_id: providerGate.scope.harnessId,
+          provider_id: providerGate.scope.providerId,
+          model: providerGate.scope.model,
+          kind: providerGate.kind,
+          resume_policy: providerGate.resumePolicy,
+          resume_at: providerGate.window?.resumeAt ?? null,
+          message: providerGate.message,
+        });
+        return;
+      }
       await this.recoverPendingPublicationApprovalHandoffs();
       const workerCandidates = await this.options.tracker.fetchCandidateIssues();
       for (const issue of sortIssuesForDispatch(workerCandidates)) {
@@ -680,6 +732,29 @@ export class Orchestrator {
       this.ticking = false;
       this.scheduleTick(this.config.polling.intervalMs);
     }
+  }
+
+  private async refreshProviderGates(): Promise<RuntimeProviderGate[]> {
+    try {
+      this.activeProviderGates = await this.providerGateStore.listActive(new Date());
+    } catch (error) {
+      this.options.logger.warn("provider gate refresh failed", { error: errorMessage(error) });
+    }
+    return this.activeProviderGates;
+  }
+
+  private async activeProviderDispatchGate(): Promise<RuntimeProviderGate | null> {
+    await this.refreshProviderGates();
+    return this.activeProviderGates.find((gate) => this.providerGateMatchesConfiguredRuntime(gate)) ?? null;
+  }
+
+  private providerGateMatchesConfiguredRuntime(gate: RuntimeProviderGate): boolean {
+    if (gate.scope.harnessId && gate.scope.harnessId !== this.options.harness.id) return false;
+    const configuredProvider = runtimeProviderForHarness(this.options.harness.id, this.config);
+    if (gate.scope.providerId && configuredProvider && gate.scope.providerId !== configuredProvider) return false;
+    const configuredModel = runtimeModelForHarness(this.options.harness.id, this.config);
+    if (gate.scope.model && configuredModel && gate.scope.model !== configuredModel) return false;
+    return true;
   }
 
   private async startupCleanup(): Promise<void> {
@@ -970,6 +1045,7 @@ export class Orchestrator {
 
   private async tryDispatchWorkerIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
     const initialRunPhase = this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation";
     if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase)) return false;
 
@@ -988,6 +1064,7 @@ export class Orchestrator {
     const latest = refreshed[0];
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
     const latestRunPhase = this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation";
     if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase)) return false;
 
@@ -1027,6 +1104,7 @@ export class Orchestrator {
 
   private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
     if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(issue, "reviewer"))) return false;
 
@@ -1045,6 +1123,7 @@ export class Orchestrator {
     const latest = refreshed[0];
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
     if (!this.shouldDispatchReviewer(latest, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(latest, "reviewer"))) return false;
 
@@ -1145,6 +1224,7 @@ export class Orchestrator {
       lastStreamActivityAt: null,
       lastDeltaOrToolActivityAt: null,
       lastToolActivityAt: null,
+      providerLimitSignal: null,
     };
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
@@ -1422,6 +1502,21 @@ export class Orchestrator {
       }
       if (event.type === "tokens") this.applyTokenUpdate(entry, event.tokens);
       if (event.type === "rate_limits") this.rateLimits = event.payload;
+      if (event.type === "provider_limit") {
+        const signal = await this.recordProviderLimitEvent(entry, event.signal, eventAt);
+        await this.persistHarnessEvent(entry, { ...event, signal });
+        const runId = entry.activeRunId ?? entry.runId ?? "";
+        if (runId.length > 0) {
+          await this.updateRunTerminalStateIfRunning(runId, {
+            status: "failed",
+            completedAt: new Date().toISOString(),
+            error: signal.message,
+            tokens: entry.activeRunTokens,
+            metadata: terminalRunMetadata(entry, "failed"),
+          });
+        }
+        throw new SymphonyError("agent_error", signal.message);
+      }
       await this.persistHarnessEvent(entry, event);
       if (event.type === "completed") {
         if (entry.runPhase === "issue_breakdown") {
@@ -1536,6 +1631,56 @@ export class Orchestrator {
     return { updated: true, record: await runStore.updateRun(runId, patch) };
   }
 
+  private async recordProviderLimitEvent(
+    entry: RunningEntry,
+    signal: ProviderLimitSignal,
+    observedAt: Date,
+  ): Promise<ProviderLimitSignal> {
+    const normalized = normalizeProviderLimitSignal(
+      {
+        ...signal,
+        observedAt: signal.observedAt ?? observedAt.toISOString(),
+        source: {
+          ...(signal.source ?? {}),
+          issueId: signal.source?.issueId ?? entry.issue.id,
+          issueIdentifier: signal.source?.issueIdentifier ?? entry.issue.identifier,
+          runId: signal.source?.runId ?? entry.activeRunId ?? entry.runId,
+          sessionId: signal.source?.sessionId ?? entry.sessionId,
+          role: signal.source?.role ?? entry.role,
+          runPhase: signal.source?.runPhase ?? entry.runPhase,
+        },
+      },
+      {
+        harnessId: this.options.harness.id,
+        providerId: runtimeProviderForHarness(this.options.harness.id, this.config),
+        model: runtimeModelForHarness(this.options.harness.id, this.config),
+      },
+      observedAt,
+    );
+    entry.providerLimitSignal = normalized;
+    entry.failureKind = "provider_limit";
+    entry.failureDiagnosticCode = "provider_limit";
+    entry.failureDiagnosticMessage = normalized.message;
+    entry.failureDiagnosticAt = observedAt;
+    entry.failureDiagnosticPayload = normalized;
+    entry.lastMessage = normalized.message;
+    const gate = await this.providerGateStore.upsert(normalized);
+    await this.refreshProviderGates();
+    this.options.logger.warn("provider limit gate recorded", {
+      gate_id: gate.id,
+      issue_id: entry.issue.id,
+      issue_identifier: entry.issue.identifier,
+      run_id: normalized.source?.runId ?? null,
+      kind: gate.kind,
+      harness_id: gate.scope.harnessId,
+      provider_id: gate.scope.providerId,
+      model: gate.scope.model,
+      resume_policy: gate.resumePolicy,
+      resume_at: gate.window?.resumeAt ?? null,
+    });
+    return normalized;
+  }
+
   private async terminalizeAcceptedIssueBreakdownPlan(entry: RunningEntry): Promise<boolean> {
     const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
     if (!accepted) return false;
@@ -1556,6 +1701,11 @@ export class Orchestrator {
     if (!entry) return;
     this.running.delete(issueId);
     this.endedRuntimeSeconds += (Date.now() - entry.startedAt.getTime()) / 1000;
+
+    if (entry.providerLimitSignal) {
+      this.claimed.delete(issueId);
+      return;
+    }
 
     if (entry.runPhase === "issue_breakdown") {
       const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
@@ -1888,6 +2038,19 @@ export class Orchestrator {
     if (!retry) return;
     this.retryAttempts.delete(issueId);
     try {
+      const providerGate = await this.activeProviderDispatchGate();
+      if (providerGate) {
+        const delayMs = providerLimitDelayMs(providerGate) ?? this.config.polling.intervalMs;
+        this.scheduleRetry(
+          issueId,
+          retry.identifier,
+          retry.attempt,
+          Math.max(delayMs, this.config.polling.intervalMs),
+          retry.error ?? providerGateDispatchBlockedMessage(providerGate),
+          retry.runPhase,
+        );
+        return;
+      }
       const candidates =
         retry.runPhase === "merge_conflict_resolution"
           ? await this.options.tracker.fetchIssueStatesByIds([issueId])
@@ -3052,6 +3215,25 @@ function effectiveRuntimeModeForEntry(entry: RunningEntry, config: ServiceConfig
   return entry.runPhase === "issue_breakdown" ? config.issueBreakdown.cursorMode : config.cursor.mode;
 }
 
+function runtimeProviderForHarness(harnessId: string, config: ServiceConfig): string | null {
+  if (harnessId === "hermes") return config.hermes.provider;
+  return harnessId;
+}
+
+function runtimeModelForHarness(harnessId: string, config: ServiceConfig): string | null {
+  if (harnessId === "hermes") return config.hermes.model;
+  if (harnessId === "cursor") return config.cursor.model;
+  return null;
+}
+
+function providerGateDispatchBlockedMessage(gate: RuntimeProviderGate): string {
+  const provider = gate.scope.providerId ?? gate.scope.harnessId;
+  const reset = gate.window?.resumeAt
+    ? ` Dispatch can resume at ${gate.window.resumeAt}.`
+    : " Dispatch is waiting for operator resume.";
+  return `Provider limit active for ${provider}: ${gate.message}.${reset}`;
+}
+
 function runtimeMetadataForEntry(
   harnessId: string,
   entry: RunningEntry,
@@ -3336,6 +3518,7 @@ function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | 
     failureDiagnosticMessage: terminalStatus === "failed" ? entry.failureDiagnosticMessage : null,
     failureDiagnosticAt: terminalStatus === "failed" ? entry.failureDiagnosticAt?.toISOString() ?? null : null,
     failureDiagnosticPayload: terminalStatus === "failed" ? entry.failureDiagnosticPayload : null,
+    providerLimit: entry.providerLimitSignal,
   };
 }
 

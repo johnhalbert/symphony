@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
+import type { ProviderLimitKind, ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
 import {
   symphonyRoleMcpServers,
   writeActiveHandoffMcpContexts,
@@ -104,7 +105,11 @@ export class HermesHarness implements AgentHarness {
     const onGatewayEvent = (event: GatewayEvent) => {
       if (!acceptGatewayEvent(event, lease.gatewaySessionId)) return;
       appendRuntimeEvent(event);
-      for (const mapped of mapHermesGatewayEvent(event, { cancelled: ctx.abortSignal.aborted || this.cancelledRuns.has(runId) })) {
+      for (const mapped of mapHermesGatewayEvent(event, {
+        cancelled: ctx.abortSignal.aborted || this.cancelledRuns.has(runId),
+        providerId: ctx.config.hermes.provider,
+        model: ctx.config.hermes.model,
+      })) {
         if (mapped.type === "completed") terminalStatus = "succeeded";
         if (mapped.type === "failed") terminalStatus = "failed";
         if (mapped.type === "cancelled") terminalStatus = "cancelled";
@@ -193,6 +198,13 @@ export class HermesHarness implements AgentHarness {
     } catch (error) {
       this.retireReusableLeaseAfterRequestFailure(lease, "run_error");
       terminalStatus = "failed";
+      const providerLimit = providerLimitSignalFromHermesError(error, {
+        providerId: ctx.config.hermes.provider,
+        model: ctx.config.hermes.model,
+      });
+      if (providerLimit) {
+        yield { type: "provider_limit", signal: providerLimit };
+      }
       yield hermesRunDiagnostic("hermes_run_error", `Hermes run failed: ${errorMessage(error)}`, {
         runId,
         sessionId: symphonySessionId,
@@ -477,6 +489,105 @@ function hermesRunDiagnostic(code: string, message: string, payload: Record<stri
   };
 }
 
+interface HermesLimitMappingDefaults {
+  providerId?: string | null;
+  model?: string | null;
+}
+
+function providerLimitSignalFromHermesPayload(
+  payload: unknown,
+  defaults: HermesLimitMappingDefaults = {},
+): ProviderLimitSignal | null {
+  if (!isRecord(payload)) return null;
+  const windowRecord = isRecord(payload.window) ? payload.window : {};
+  const resumeAt =
+    isoFromUnknown(payload.resume_at) ??
+    isoFromUnknown(payload.resumeAt) ??
+    isoFromUnknown(payload.reset_at) ??
+    isoFromUnknown(payload.resetAt) ??
+    isoFromUnknown(windowRecord.resume_at) ??
+    isoFromUnknown(windowRecord.resumeAt) ??
+    isoFromUnknown(windowRecord.reset_at) ??
+    isoFromUnknown(windowRecord.resetAt);
+  const retryAfterMs =
+    numberFromUnknown(payload.retry_after_ms) ??
+    numberFromUnknown(payload.retryAfterMs) ??
+    secondsToMs(payload.retry_after) ??
+    secondsToMs(payload.retryAfter) ??
+    numberFromUnknown(windowRecord.retry_after_ms) ??
+    numberFromUnknown(windowRecord.retryAfterMs);
+  const message = nonEmptyString(payload.message) ?? "Provider limit reached";
+  const providerId =
+    nonEmptyString(payload.provider_id) ??
+    nonEmptyString(payload.providerId) ??
+    nonEmptyString(payload.provider) ??
+    defaults.providerId ??
+    null;
+  const model = nonEmptyString(payload.model) ?? defaults.model ?? null;
+  return {
+    scope: {
+      harnessId: "hermes",
+      providerId,
+      model,
+      accountScopeKey: nonEmptyString(payload.account_scope_key) ?? nonEmptyString(payload.accountScopeKey) ?? null,
+    },
+    kind: normalizeProviderLimitKind(nonEmptyString(payload.kind), message),
+    window: {
+      resumeAt,
+      retryAfterMs,
+      windowLabel:
+        nonEmptyString(payload.window_label) ??
+        nonEmptyString(payload.windowLabel) ??
+        nonEmptyString(windowRecord.window_label) ??
+        nonEmptyString(windowRecord.windowLabel) ??
+        null,
+      windowKind:
+        nonEmptyString(payload.window_kind) ??
+        nonEmptyString(payload.windowKind) ??
+        nonEmptyString(windowRecord.window_kind) ??
+        nonEmptyString(windowRecord.windowKind) ??
+        null,
+    },
+    resumePolicy:
+      nonEmptyString(payload.resume_policy) === "manual" || (!resumeAt && retryAfterMs === null)
+        ? "manual"
+        : "auto_at_window_close",
+    message,
+    observedAt: isoFromUnknown(payload.observed_at) ?? isoFromUnknown(payload.observedAt) ?? new Date().toISOString(),
+    raw: payload.raw ?? payload,
+  };
+}
+
+function providerLimitSignalFromHermesError(error: unknown, defaults: HermesLimitMappingDefaults = {}): ProviderLimitSignal | null {
+  const errorRecord = errorRecordWithProperties(error);
+  const data = isRecord(errorRecord.data) ? errorRecord.data : {};
+  const directPayload =
+    providerLimitSignalFromHermesPayload(data.provider_limit, defaults) ??
+    providerLimitSignalFromHermesPayload(data.providerLimit, defaults);
+  if (directPayload) return directPayload;
+
+  const message = errorMessage(error);
+  const code = nonEmptyString(errorRecord.code) ?? nonEmptyString(data.code) ?? nonEmptyString(data.reason) ?? nonEmptyString(data.type);
+  if (!looksLikeProviderLimit(`${code ?? ""} ${message} ${JSON.stringify(data)}`)) return null;
+  return providerLimitSignalFromHermesPayload(
+    {
+      provider_id: data.provider_id ?? data.provider ?? defaults.providerId,
+      model: data.model ?? defaults.model,
+      kind: code,
+      message,
+      reset_at: data.reset_at ?? data.resets_at ?? data.retry_until,
+      retry_after_ms: data.retry_after_ms,
+      retry_after: data.retry_after,
+      raw: {
+        code: errorRecord.code,
+        data,
+        message,
+      },
+    },
+    defaults,
+  );
+}
+
 function gatewayLogTailPayload(lease: HermesLease): { lines: string[]; lineCount: number } | null {
   const tail = lease.client.getLogTail(50).trim();
   if (!tail) return null;
@@ -496,7 +607,7 @@ function redactGatewayLogLine(line: string): string {
   return redacted;
 }
 
-function mapHermesGatewayEvent(event: GatewayEvent, input: { cancelled: boolean }): AgentEvent[] {
+function mapHermesGatewayEvent(event: GatewayEvent, input: { cancelled: boolean } & HermesLimitMappingDefaults): AgentEvent[] {
   switch (event.type) {
     case "gateway.ready":
       return [{ type: "progress", message: "Hermes gateway ready" }];
@@ -537,7 +648,31 @@ function mapHermesGatewayEvent(event: GatewayEvent, input: { cancelled: boolean 
       return [{ type: "progress", activitySource: "tool", message: `Hermes tool ${event.payload.name ?? "unknown"}: ${preview(event.payload.preview, 200)}` }];
     case "tool.complete":
       return [{ type: "progress", activitySource: "tool", message: `Hermes tool ${event.payload.name ?? "unknown"} completed` }];
+    case "provider.limit": {
+      const signal = providerLimitSignalFromHermesPayload(event.payload, input);
+      if (!signal) return [];
+      return [{ type: "provider_limit", signal }, { type: "failed", error: signal.message }];
+    }
     case "error":
+      {
+        const payloadRecord: Record<string, unknown> = isRecord(event.payload) ? event.payload : {};
+        const signal =
+          providerLimitSignalFromHermesPayload(payloadRecord.provider_limit, input) ??
+          providerLimitSignalFromHermesPayload(payloadRecord.providerLimit, input) ??
+          providerLimitSignalFromHermesPayload(event.payload, input);
+        if (signal && looksLikeProviderLimit(`${signal.kind} ${signal.message}`)) {
+          return [
+            { type: "provider_limit", signal },
+            {
+              type: "run_diagnostic",
+              code: "hermes_provider_limit",
+              message: signal.message,
+              payload: event.payload,
+            },
+            { type: "failed", error: signal.message },
+          ];
+        }
+      }
       return [
         {
           type: "run_diagnostic",
@@ -548,15 +683,27 @@ function mapHermesGatewayEvent(event: GatewayEvent, input: { cancelled: boolean 
         { type: "failed", error: event.payload?.message ?? "Hermes gateway error" },
       ];
     case "message.complete": {
-      const payload = event.payload as { status?: unknown; text?: unknown; usage?: unknown } | undefined;
+      const payload = event.payload as { provider_limit?: unknown; providerLimit?: unknown; status?: unknown; text?: unknown; usage?: unknown } | undefined;
       const usage = usageTokens(payload?.usage);
+      const providerLimit =
+        providerLimitSignalFromHermesPayload(payload?.provider_limit, input) ??
+        providerLimitSignalFromHermesPayload(payload?.providerLimit, input) ??
+        (payload?.status === "error" && looksLikeProviderLimit(String(payload.text ?? ""))
+          ? providerLimitSignalFromHermesPayload({ message: payload.text, provider_id: input.providerId, model: input.model }, input)
+          : null);
       const terminal =
-        payload?.status === "error"
-          ? ({ type: "failed", error: preview(payload.text ?? "Hermes run failed", 500) } as AgentEvent)
+        providerLimit
+          ? ({ type: "failed", error: providerLimit.message } as AgentEvent)
+          : payload?.status === "error"
+            ? ({ type: "failed", error: preview(payload.text ?? "Hermes run failed", 500) } as AgentEvent)
           : payload?.status === "interrupted" || input.cancelled
             ? ({ type: "cancelled" } as AgentEvent)
             : ({ type: "completed", message: typeof payload?.text === "string" ? payload.text : undefined } as AgentEvent);
-      return usage === null ? [terminal] : [{ type: "tokens", tokens: usage }, terminal];
+      return [
+        ...(usage === null ? [] : [{ type: "tokens", tokens: usage } as AgentEvent]),
+        ...(providerLimit ? [{ type: "provider_limit", signal: providerLimit } as AgentEvent] : []),
+        terminal,
+      ];
     }
     default:
       return [];
@@ -649,6 +796,79 @@ function preview(value: unknown, maxLength: number): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorRecordWithProperties(error: unknown): Record<string, unknown> {
+  if (isRecord(error)) return error;
+  if (!(error instanceof Error)) return {};
+  const record: Record<string, unknown> = { message: error.message };
+  const withStructured = error as Error & { code?: unknown; data?: unknown; rpcError?: unknown };
+  if (withStructured.code !== undefined) record.code = withStructured.code;
+  if (withStructured.data !== undefined) record.data = withStructured.data;
+  if (withStructured.rpcError !== undefined) record.rpcError = withStructured.rpcError;
+  return record;
+}
+
+function normalizeProviderLimitKind(kind: string | null, message: string): ProviderLimitKind {
+  const text = `${kind ?? ""} ${message}`.toLowerCase();
+  if (text.includes("credit") || text.includes("billing") || text.includes("insufficient_quota")) return "credits_exhausted";
+  if (text.includes("subscription") || text.includes("entitlement") || text.includes("plan required")) return "subscription_required";
+  if (text.includes("usage_limit") || text.includes("usage limit") || text.includes("weekly") || text.includes("5 hour") || text.includes("5-hour")) {
+    return "windowed_bucket_exhausted";
+  }
+  if (text.includes("rate_limit") || text.includes("rate limit") || text.includes("429")) return "transient_rate_limit";
+  if (
+    kind === "transient_rate_limit" ||
+    kind === "windowed_bucket_exhausted" ||
+    kind === "credits_exhausted" ||
+    kind === "subscription_required" ||
+    kind === "unknown_limit"
+  ) {
+    return kind;
+  }
+  return "unknown_limit";
+}
+
+function looksLikeProviderLimit(value: string): boolean {
+  const text = value.toLowerCase();
+  return (
+    text.includes("provider.limit") ||
+    text.includes("usage_limit_reached") ||
+    text.includes("usage limit") ||
+    text.includes("rate_limit") ||
+    text.includes("rate limit") ||
+    text.includes("429") ||
+    text.includes("credit") ||
+    text.includes("billing") ||
+    text.includes("quota") ||
+    text.includes("subscription")
+  );
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function numberFromUnknown(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function secondsToMs(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return Math.round(value * 1_000);
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.round(numeric * 1_000) : null;
+}
+
+function isoFromUnknown(value: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const ms = value > 10_000_000_000 ? value : value * 1_000;
+    return new Date(ms).toISOString();
+  }
+  if (typeof value !== "string") return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
 async function removeProfileInsideState(stateDir: string, profileDir: string): Promise<void> {
