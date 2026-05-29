@@ -96,6 +96,7 @@ function AppShell() {
                 dashboard={data}
                 variant={dashboardVariant}
                 useModelBurnupTotals={apiMode}
+                orchestratorChatReadOnly={apiMode}
                 orchestratorChat={orchestratorChat.data ?? []}
                 orchestratorChatError={orchestratorChat.error}
                 orchestratorChatLoading={orchestratorChat.loading}
@@ -109,6 +110,7 @@ function AppShell() {
               <SidebarViews
                 sidebar={data}
                 variant={sidebarVariant}
+                orchestratorChatReadOnly={apiMode}
                 orchestratorChat={orchestratorChat.data ?? []}
                 orchestratorChatError={orchestratorChat.error}
                 orchestratorChatLoading={orchestratorChat.loading}

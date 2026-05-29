@@ -8,19 +8,21 @@ export function SidebarViews({
   orchestratorChat,
   orchestratorChatError = null,
   orchestratorChatLoading = false,
+  orchestratorChatReadOnly = false,
   sidebar,
   variant,
 }: {
   orchestratorChat?: ChatMessage[];
   orchestratorChatError?: string | null;
   orchestratorChatLoading?: boolean;
+  orchestratorChatReadOnly?: boolean;
   sidebar: SidebarModel;
   variant: SidebarVariant;
 }) {
   const chatMessages = orchestratorChat ?? sidebar.chat;
   const child =
     variant === "chat" ? (
-      <SidebarChat messages={chatMessages} loading={orchestratorChatLoading} error={orchestratorChatError} />
+      <SidebarChat messages={chatMessages} loading={orchestratorChatLoading} error={orchestratorChatError} readOnly={orchestratorChatReadOnly} />
     ) : variant === "history" ? (
       <SidebarHistory sessions={sidebar.sessions} />
     ) : (
