@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { SidebarModel } from "../../types/symphony";
+import type { IssueModel, PriorityLevel, SidebarModel } from "../../types/symphony";
 import { Icon, StatusIcon } from "../common";
 
 export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
@@ -8,7 +8,9 @@ export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
       <div style={{ display: "flex", alignItems: "center", padding: "0 12px", gap: 10, background: "var(--panel)", borderBottom: "1px solid var(--border)" }}>
         <span style={{ width: 8, height: 8, borderRadius: 999, background: "var(--accent)", boxShadow: "0 0 0 3px rgba(240,184,108,0.18)" }} />
         <span style={{ fontSize: 12, fontWeight: 500 }}>Symphony</span>
-        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>main · poll 22s</span>
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>
+          {sidebar.runningAgents.length} live · {sidebar.totals.open} open
+        </span>
         <div style={{ flex: 1 }} />
         <button className="icon-btn" type="button">
           {Icon.more()}
@@ -34,77 +36,111 @@ export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
         ) : null}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
           <MiniStat label="Completeness" value={`${sidebar.totals.completeness}%`} bar={`${sidebar.totals.completeness}%`} accent />
-          <MiniStat label="Running" value={`${sidebar.runningAgents.length}/6`} sub="agents" />
+          <MiniStat label="Running" value={String(sidebar.runningAgents.length)} sub="agents" />
           <MiniStat label="Open" value={String(sidebar.totals.open)} sub="issues" />
-          <MiniStat label="Velocity" value="3.2" sub="PR/day" />
+          <MiniStat label="Review" value={String(sidebar.totals.review)} sub="issues" />
         </div>
       </div>
 
       <div style={{ overflow: "auto" }}>
         <SidebarSection title="Running agents" count={sidebar.runningAgents.length}>
-          {sidebar.runningAgents.map((agent) => (
-            <div key={agent.id} style={{ display: "grid", gridTemplateColumns: "8px 1fr auto", gap: 8, padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center" }}>
-              <span style={{ width: 6, height: 6, borderRadius: 999, background: "var(--accent)", boxShadow: "0 0 0 3px rgba(240,184,108,0.15)", animation: "pulse 1.6s ease-in-out infinite" }} />
-              <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
-                <div style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11.5 }}>
-                  <span style={{ fontFamily: "var(--font-mono)", color: "var(--text-3)", fontSize: 10.5 }}>{agent.issue}</span>
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)" }}>{agent.title}</span>
+          {sidebar.runningAgents.length ? (
+            sidebar.runningAgents.map((agent) => (
+              <div key={agent.id} style={{ display: "grid", gridTemplateColumns: "8px 1fr auto", gap: 8, padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center" }}>
+                <span style={{ width: 6, height: 6, borderRadius: 999, background: "var(--accent)", boxShadow: "0 0 0 3px rgba(240,184,108,0.15)", animation: "pulse 1.6s ease-in-out infinite" }} />
+                <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11.5 }}>
+                    <span style={{ fontFamily: "var(--font-mono)", color: "var(--text-3)", fontSize: 10.5 }}>{agent.issue}</span>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)" }}>{agent.title}</span>
+                  </div>
+                  <div style={{ fontSize: 10.5, color: "var(--accent)", fontFamily: "var(--font-mono)", display: "flex", alignItems: "center", gap: 5 }}>
+                    <span className="spinner" />
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.step}</span>
+                  </div>
                 </div>
-                <div style={{ fontSize: 10.5, color: "var(--accent)", fontFamily: "var(--font-mono)", display: "flex", alignItems: "center", gap: 5 }}>
-                  <span className="spinner" />
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.step}</span>
-                </div>
+                <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>{agent.duration}</span>
               </div>
-              <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>{agent.duration}</span>
-            </div>
-          ))}
+            ))
+          ) : (
+            <SidebarEmptyState>No running agents.</SidebarEmptyState>
+          )}
         </SidebarSection>
 
         <SidebarSection title="Agent review queue" count={sidebar.reviewIssues.length}>
-          {sidebar.reviewIssues.map((issue) => (
-            <div key={issue.id} style={{ display: "grid", gridTemplateColumns: "13px 1fr auto", gap: 8, padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center" }}>
-              <StatusIcon state="review" />
-              <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
-                <div style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11.5 }}>
-                  <span style={{ fontFamily: "var(--font-mono)", color: "var(--text-3)", fontSize: 10.5 }}>{issue.id}</span>
+          {sidebar.reviewIssues.length ? (
+            sidebar.reviewIssues.map((issue) => (
+              <div key={issue.id} style={{ display: "grid", gridTemplateColumns: "13px 1fr", gap: 8, padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center" }}>
+                <StatusIcon state="review" />
+                <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11.5 }}>
+                    <span style={{ fontFamily: "var(--font-mono)", color: "var(--text-3)", fontSize: 10.5 }}>{issue.id}</span>
+                    {issue.pr ? (
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "var(--link)", fontSize: 10.5, fontFamily: "var(--font-mono)" }}>
+                        <span style={{ width: 11, height: 11 }}>{Icon.pr()}</span>
+                        {issue.pr}
+                      </span>
+                    ) : null}
+                  </div>
+                  <span style={{ fontSize: 11.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{issue.title}</span>
+                  <span style={{ fontSize: 10, color: "var(--text-4)", fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {reviewIssueMeta(issue)}
+                  </span>
                 </div>
-                <span style={{ fontSize: 11.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{issue.title}</span>
               </div>
-              {issue.pr ? (
-                <span style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "var(--link)", fontSize: 10.5, fontFamily: "var(--font-mono)" }}>
-                  <span style={{ width: 11, height: 11 }}>{Icon.pr()}</span>
-                  {issue.pr}
-                </span>
-              ) : null}
-            </div>
-          ))}
+            ))
+          ) : (
+            <SidebarEmptyState>No review issues.</SidebarEmptyState>
+          )}
         </SidebarSection>
 
         <SidebarSection title="Recent activity" count={null}>
-          {sidebar.activity.slice(0, 6).map((activity, index) => (
-            <div key={`${activity.t}-${index}`} style={{ display: "grid", gridTemplateColumns: "8px 1fr", gap: 8, padding: "7px 12px", alignItems: "flex-start", borderBottom: "1px solid var(--border-subtle)", fontSize: 11.5 }}>
-              <span style={{ width: 5, height: 5, borderRadius: 999, marginTop: 7, background: "var(--text-3)" }} />
-              <div style={{ minWidth: 0 }}>
-                <div style={{ color: "var(--text-2)", lineHeight: 1.4 }}>
-                  <span style={{ fontFamily: "var(--font-mono)", color: "var(--text)" }}>{activity.who}</span>{" "}
-                  <span style={{ color: "var(--text-3)" }}>{activity.verb}</span>{" "}
-                  <span style={{ fontFamily: "var(--font-mono)", color: "var(--text)" }}>{activity.id}</span>
+          {sidebar.activity.length ? (
+            sidebar.activity.slice(0, 6).map((activity, index) => (
+              <div key={`${activity.t}-${index}`} style={{ display: "grid", gridTemplateColumns: "8px 1fr", gap: 8, padding: "7px 12px", alignItems: "flex-start", borderBottom: "1px solid var(--border-subtle)", fontSize: 11.5 }}>
+                <span style={{ width: 5, height: 5, borderRadius: 999, marginTop: 7, background: "var(--text-3)" }} />
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ color: "var(--text-2)", lineHeight: 1.4 }}>
+                    <span style={{ fontFamily: "var(--font-mono)", color: "var(--text)" }}>{activity.who}</span>{" "}
+                    <span style={{ color: "var(--text-3)" }}>{activity.verb}</span>{" "}
+                    <span style={{ fontFamily: "var(--font-mono)", color: "var(--text)" }}>{activity.id}</span>
+                  </div>
+                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-4)", marginTop: 1 }}>{activity.t}</div>
                 </div>
-                <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-4)", marginTop: 1 }}>{activity.t}</div>
               </div>
-            </div>
-          ))}
+            ))
+          ) : (
+            <SidebarEmptyState>No recent activity.</SidebarEmptyState>
+          )}
         </SidebarSection>
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", background: "var(--panel)", borderTop: "1px solid var(--border)", fontSize: 11, color: "var(--text-3)", fontFamily: "var(--font-mono)" }}>
         <span style={{ width: 6, height: 6, borderRadius: 999, background: "var(--accent)", animation: "pulse 1.6s ease-in-out infinite" }} />
-        <span>poll in 8s</span>
+        <span>{sidebar.totals.all} total issues</span>
         <div style={{ flex: 1 }} />
-        <span>0 errors · 24h</span>
+        <span>
+          {sidebar.totals.done} done · {sidebar.totals.cancelled} cancelled
+        </span>
       </div>
     </div>
   );
+}
+
+function formatPriority(priority: PriorityLevel): string {
+  return priority === "urgent" ? "urgent" : `P${priority}`;
+}
+
+function reviewIssueMeta(issue: IssueModel): string {
+  return [
+    issue.assignee ? `@${issue.assignee}` : null,
+    `priority ${formatPriority(issue.priority)}`,
+    ...issue.labels.map((label) => `#${label}`),
+    issue.ci ? `ci ${issue.ci}` : null,
+    issue.workspace ? `ws ${issue.workspace}` : null,
+    issue.session ? `session ${issue.session}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 function MiniStat({ label, value, sub, bar, accent }: { label: string; value: string; sub?: string; bar?: string; accent?: boolean }) {
@@ -131,6 +167,14 @@ function SidebarSection({ title, count, children }: { title: string; count: numb
         {count !== null ? <span style={{ marginLeft: 6, fontFamily: "var(--font-mono)", color: "var(--text-4)" }}>{count}</span> : null}
       </div>
       <div>{children}</div>
+    </div>
+  );
+}
+
+function SidebarEmptyState({ children }: { children: ReactNode }) {
+  return (
+    <div style={{ padding: "8px 12px", color: "var(--text-4)", fontSize: 11.5, fontStyle: "italic" }}>
+      {children}
     </div>
   );
 }

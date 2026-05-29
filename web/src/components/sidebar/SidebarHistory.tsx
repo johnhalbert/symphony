@@ -27,30 +27,36 @@ export function SidebarHistory({ sessions }: { sessions: SessionModel[] }) {
         </button>
       </div>
       <div style={{ overflow: "auto" }}>
-        {sessions.map((session) => (
-          <div className="session-row" key={session.id} style={{ gridTemplateColumns: "14px 1fr", padding: "9px 12px" }}>
-            <span className="ico">
-              <StatusBadgeDot state={session.state} />
-            </span>
-            <div className="info">
-              <div className="top">
-                <span className="id">{session.issue}</span>
-                <SessionStateChip state={session.state} />
-                <div style={{ flex: 1 }} />
-                <span style={{ fontSize: 10, color: "var(--text-4)", fontFamily: "var(--font-mono)" }}>{session.updatedAt}</span>
+        {sessions.length ? (
+          sessions.map((session) => (
+            <div className="session-row" key={session.id} style={{ gridTemplateColumns: "14px 1fr", padding: "9px 12px" }}>
+              <span className="ico">
+                <StatusBadgeDot state={session.state} />
+              </span>
+              <div className="info">
+                <div className="top">
+                  <span className="id">{session.issue}</span>
+                  <SessionStateChip state={session.state} />
+                  <div style={{ flex: 1 }} />
+                  <span style={{ fontSize: 10, color: "var(--text-4)", fontFamily: "var(--font-mono)" }}>{session.updatedAt}</span>
+                </div>
+                <div className="t" style={{ fontSize: 11.5 }}>
+                  {session.title}
+                </div>
+                <div className="meta" style={{ fontSize: 10 }}>
+                  <span>
+                    {session.msgCount} msgs · {session.toolCount} tools
+                  </span>
+                </div>
+                <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-4)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>{session.lastEvent}</div>
               </div>
-              <div className="t" style={{ fontSize: 11.5 }}>
-                {session.title}
-              </div>
-              <div className="meta" style={{ fontSize: 10 }}>
-                <span>
-                  {session.msgCount} msgs · {session.toolCount} tools
-                </span>
-              </div>
-              <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-4)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>{session.lastEvent}</div>
             </div>
+          ))
+        ) : (
+          <div style={{ color: "var(--text-4)", fontSize: 12, lineHeight: 1.5, padding: "12px" }}>
+            No sidebar sessions yet.
           </div>
-        ))}
+        )}
       </div>
     </div>
   );
