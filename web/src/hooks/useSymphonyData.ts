@@ -1,6 +1,7 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useDataSource } from "../data/dataSourceContext";
 import { useAsyncResource } from "./useAsyncResource";
+import type { IssueDetailModel, Loadable } from "../types/symphony";
 
 export function useReferenceData() {
   const dataSource = useDataSource();
@@ -17,12 +18,47 @@ export function useIssueBoard() {
   return useAsyncResource(useCallback(() => dataSource.getIssueBoard(), [dataSource]), [dataSource]);
 }
 
-export function useIssueDetail(issueId: string | null) {
+export function useIssueDetail(issueId: string | null): Loadable<IssueDetailModel | null> {
   const dataSource = useDataSource();
-  return useAsyncResource(
-    useCallback(() => (issueId ? dataSource.getIssueDetail(issueId) : Promise.resolve(null)), [dataSource, issueId]),
-    [dataSource, issueId],
-  );
+  const normalizedIssueId = issueId || null;
+  const [state, setState] = useState<Loadable<IssueDetailModel | null> & { issueId: string | null }>({
+    issueId: normalizedIssueId,
+    data: null,
+    loading: Boolean(normalizedIssueId),
+    error: null,
+  });
+
+  useEffect(() => {
+    let active = true;
+    if (!normalizedIssueId) {
+      setState({ issueId: null, data: null, loading: false, error: null });
+      return () => {
+        active = false;
+      };
+    }
+
+    setState({ issueId: normalizedIssueId, data: null, loading: true, error: null });
+    dataSource
+      .getIssueDetail(normalizedIssueId)
+      .then((data) => {
+        if (active) setState({ issueId: normalizedIssueId, data, loading: false, error: null });
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setState({ issueId: normalizedIssueId, data: null, loading: false, error: message });
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [dataSource, normalizedIssueId]);
+
+  if (state.issueId !== normalizedIssueId) {
+    return { data: null, loading: Boolean(normalizedIssueId), error: null };
+  }
+
+  return { data: state.data, loading: state.loading, error: state.error };
 }
 
 export function useHistory() {

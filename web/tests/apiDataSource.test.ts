@@ -24,6 +24,27 @@ describe("API data source", () => {
     });
   });
 
+  it("fetches issue detail from the encoded issue-detail endpoint", async () => {
+    const detail = { issue: { id: "ENG/109", title: "Detail" }, activity: [], runs: [], transcript: [] };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(detail));
+
+    await expect(createApiDataSource("https://symphony.example.test///").getIssueDetail("ENG/109")).resolves.toEqual(detail);
+    expect(fetchMock).toHaveBeenCalledWith("https://symphony.example.test/api/v1/web/issues/ENG%2F109", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
+  it("passes through null issue detail responses", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(null));
+
+    await expect(createApiDataSource("").getIssueDetail("UNKNOWN-1")).resolves.toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/issues/UNKNOWN-1", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
   it("normalizes absolute base URLs and encodes path parameters", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ id: "ENG/102" }));
 
@@ -90,5 +111,17 @@ describe("API data source", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: "nope" }, { status: 502 }));
 
     await expect(createApiDataSource("").getIssueBoard()).rejects.toThrow("Symphony API returned HTTP 502");
+  });
+
+  it("surfaces issue-detail HTTP failures", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 404 }));
+
+    await expect(createApiDataSource("https://symphony.example.test").getIssueDetail("missing")).rejects.toThrow(
+      "Symphony API returned HTTP 404",
+    );
+    expect(fetchMock).toHaveBeenCalledWith("https://symphony.example.test/api/v1/web/issues/missing", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
   });
 });

@@ -2,19 +2,47 @@ import type { IssueModel } from "../../types/symphony";
 import { Avatar, Icon, Label, Priority, STATUS_LABEL, StatusIcon } from "../common";
 import { useReferenceData } from "../../data/referenceDataContext";
 
+interface DetailColumnProps {
+  issue: IssueModel | null;
+  issueId?: string | null;
+  loading?: boolean;
+  error?: string | null;
+  emptyMessage?: string;
+  onClose: () => void;
+}
+
 function priorityLabel(priority: IssueModel["priority"]): string {
   if (priority === "urgent") return "Urgent";
   return { 0: "None", 1: "Low", 2: "Medium", 3: "High" }[priority] ?? "Unknown";
 }
 
-export function DetailColumn({ issue, onClose }: { issue: IssueModel | null; onClose: () => void }) {
+export function DetailColumn({
+  issue,
+  issueId = issue?.id ?? null,
+  loading = false,
+  error = null,
+  emptyMessage = "Select an issue to inspect details.",
+  onClose,
+}: DetailColumnProps) {
   const { users } = useReferenceData();
 
-  if (!issue) {
+  if (loading || error || !issue) {
+    const hasSelection = Boolean(issueId);
     return (
       <div className="issues__col">
+        {hasSelection ? (
+          <div className="colhead">
+            <h3 style={{ fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--text-3)" }}>{issueId}</h3>
+            <div className="grow" />
+            <button className="icon-btn" title="Close" type="button" onClick={onClose}>
+              {Icon.close()}
+            </button>
+          </div>
+        ) : null}
         <div className="detail">
-          <div className="view-empty">Select an issue to inspect details.</div>
+          {loading ? <div className="view-loading">Loading issue detail…</div> : null}
+          {!loading && error ? <div className="view-error">Unable to load issue detail: {error}</div> : null}
+          {!loading && !error ? <div className="view-empty">{emptyMessage}</div> : null}
         </div>
       </div>
     );
