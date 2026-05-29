@@ -296,7 +296,7 @@ export class StatusServer {
           sendJson(response, 200, []);
           return;
         }
-        sendJson(response, 200, projectWebTranscript(await readFullWebTranscript(this.options.runStore, run.runId)));
+        sendJson(response, 200, projectWebTranscript(await readFullWebTranscript(this.options.runStore, run.runId), { run }));
         return;
       }
       if (url.pathname === "/api/v1/web/orchestrator-chat") {

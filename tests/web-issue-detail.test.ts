@@ -375,6 +375,23 @@ describe("web issue detail projection", () => {
       ],
       transcript: [
         {
+          kind: "system",
+          ts: "2026-01-01T00:01:00.000Z",
+          model: "gpt-5-test",
+          cwd: "/tmp/workspaces/TEST-1",
+          workspace: "TEST-1",
+          session: "session-1",
+          tools: [],
+          note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+        },
+        {
+          kind: "user",
+          ts: "2026-01-01T00:01:00.000Z",
+          from: "orchestrator",
+          issue: "TEST-1",
+          text: "Implement web route",
+        },
+        {
           kind: "tool_call",
           ts: "2026-01-01T00:03:00.000Z",
           call_id: "call-1",
@@ -386,8 +403,8 @@ describe("web issue detail projection", () => {
       ],
     });
     expect(Object.keys(detail ?? {})).toEqual(["issue", "activity", "runs", "transcript"]);
-    expect(detail?.transcript[0]).not.toHaveProperty("payload");
-    expect(detail?.transcript[0]).not.toHaveProperty("runId");
+    expect(detail?.transcript[2]).not.toHaveProperty("payload");
+    expect(detail?.transcript[2]).not.toHaveProperty("runId");
     expect(JSON.stringify(detail).toLowerCase()).not.toContain("mock");
   });
 
@@ -544,8 +561,21 @@ describe("GET /api/v1/web/issues/:issueId", () => {
           msgCount: 1,
         }),
       ]);
-      expect(body.transcript).toHaveLength(1);
+      expect(body.transcript).toHaveLength(3);
       expect(body.transcript[0]).toMatchObject({
+        kind: "system",
+        model: "gpt-5-test",
+        workspace: "TEST-1",
+        session: "session-1",
+        note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+      });
+      expect(body.transcript[1]).toMatchObject({
+        kind: "user",
+        from: "orchestrator",
+        issue: "TEST-1",
+        text: "work",
+      });
+      expect(body.transcript[2]).toMatchObject({
         kind: "tool_call",
         ts: "2026-01-01T00:03:00.000Z",
         call_id: "call-route-1",
@@ -556,8 +586,8 @@ describe("GET /api/v1/web/issues/:issueId", () => {
         output: expect.stringContaining("[redacted]"),
         error: expect.stringContaining("[redacted]"),
       });
-      expect(body.transcript[0]).not.toHaveProperty("payload");
-      expect(body.transcript[0]).not.toHaveProperty("runId");
+      expect(body.transcript[2]).not.toHaveProperty("payload");
+      expect(body.transcript[2]).not.toHaveProperty("runId");
       const transcriptResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sessions/session-1/transcript`);
       const sessionTranscript = await transcriptResponse.json();
       expect(transcriptResponse.status).toBe(200);

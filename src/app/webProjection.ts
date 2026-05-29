@@ -642,7 +642,7 @@ export function projectWebIssueDetail(
     }),
     activity: projectActivityModels(input.activity ?? null),
     runs: (input.runs ?? []).map(projectSessionModel),
-    transcript: projectTranscriptMessages(input.transcript ?? null),
+    transcript: projectTranscriptMessages(input.transcript ?? null, { run: input.latestRun ?? null }),
   };
 }
 
@@ -758,9 +758,12 @@ export function projectActivityModels(input: ActivityFeedResponseProjectionInput
   }));
 }
 
-export function projectTranscriptMessages(input: TranscriptPage | TranscriptEvent[] | null | undefined): TranscriptMessage[] {
+export function projectTranscriptMessages(
+  input: TranscriptPage | TranscriptEvent[] | null | undefined,
+  options: { run?: RunRecord | null; includeRunPrelude?: boolean } = {},
+): TranscriptMessage[] {
   const events = Array.isArray(input) ? input : input?.events ?? [];
-  return projectWebTranscript(events);
+  return projectWebTranscript(events, options);
 }
 
 export function projectSessionModel(run: RunRecord): SessionModel {
