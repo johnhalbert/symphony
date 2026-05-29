@@ -1,6 +1,7 @@
 import type { IssueModel } from "../../types/symphony";
 import { Avatar, Icon, Label, Priority, STATUS_LABEL, StatusIcon } from "../common";
 import { useReferenceData } from "../../data/referenceDataContext";
+import { referenceDisplayName } from "../../data/referenceData";
 
 interface DetailColumnProps {
   issue: IssueModel | null;
@@ -48,7 +49,7 @@ export function DetailColumn({
     );
   }
 
-  const assigneeName = users[issue.assignee]?.name ?? issue.assignee;
+  const assigneeName = referenceDisplayName(issue.assignee, users[issue.assignee]);
 
   return (
     <div className="issues__col">

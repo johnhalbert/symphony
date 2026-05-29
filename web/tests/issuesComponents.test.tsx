@@ -45,14 +45,20 @@ describe("issues components", () => {
     expect(resolveSelectedIssueId("ENG-104", { issues: [fallback], selectedIssueId: "ENG-105" })).toBe("ENG-105");
   });
 
-  it("falls back to the assignee id when API issue data references a user missing from reference data", () => {
-    const html = renderToStaticMarkup(
+  it("falls back to the assignee id when API reference data is missing or blank", () => {
+    const missingHtml = renderToStaticMarkup(
       <ReferenceDataProvider value={{ users: {}, labels: {} }}>
         <DetailColumn issue={makeIssue({ assignee: "missing-user" })} onClose={() => {}} />
       </ReferenceDataProvider>,
     );
+    const blankHtml = renderToStaticMarkup(
+      <ReferenceDataProvider value={{ users: { blank: { name: "", color: null } }, labels: {} }}>
+        <DetailColumn issue={makeIssue({ assignee: "blank" })} onClose={() => {}} />
+      </ReferenceDataProvider>,
+    );
 
-    expect(html).toContain("missing-user");
+    expect(missingHtml).toContain("missing-user");
+    expect(blankHtml).toContain("blank");
   });
 
   it("renders the empty detail state without dereferencing a null issue", () => {

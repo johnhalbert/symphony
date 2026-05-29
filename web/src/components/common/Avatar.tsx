@@ -1,9 +1,11 @@
 import { useReferenceData } from "../../data/referenceDataContext";
+import { referenceColor, referenceDisplayName } from "../../data/referenceData";
 
 export function Avatar({ user, size }: { user: string; size?: "md" | "lg" }) {
   const { users } = useReferenceData();
-  const entry = users[user] || { name: user, color: "#5a5a62" };
-  const initials = entry.name
+  const entry = users[user];
+  const displayName = referenceDisplayName(user, entry);
+  const initials = displayName
     .split(/\s+/)
     .map((part) => part[0])
     .filter(Boolean)
@@ -12,7 +14,7 @@ export function Avatar({ user, size }: { user: string; size?: "md" | "lg" }) {
     .toUpperCase();
   const cls = size === "md" ? "avatar avatar--md" : size === "lg" ? "avatar avatar--lg" : "avatar";
   return (
-    <span className={cls} style={{ background: entry.color, color: "#0c0c0e" }}>
+    <span className={cls} style={{ background: referenceColor(entry), color: "#0c0c0e" }}>
       {initials}
     </span>
   );
