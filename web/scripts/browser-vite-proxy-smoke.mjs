@@ -293,11 +293,19 @@ async function main() {
       exclude: forbiddenMarkers,
     });
 
-    await clickButtonByText(page, "Dedicated smoke suggestion", "dedicated orchestrator chat suggestion");
-    await waitForBrowserText(page, "orchestrator chat POST response through the Vite proxy", {
-      include: ["Dedicated smoke suggestion", "Dedicated chat POST acknowledgement from API"],
+    await waitForBrowserText(page, "dashboard orchestrator chat read-only API-mode guard", {
+      include: [
+        "Dedicated smoke suggestion",
+        "API mode shows durable chat history only",
+        "Sending commands from this web chat is not supported yet",
+        "no orchestrator action will be dispatched",
+      ],
       exclude: forbiddenMarkers,
     });
+    await assertButtonDisabledByText(page, "Dedicated smoke suggestion", "dedicated orchestrator chat suggestion");
+    await clickButtonByText(page, "Dedicated smoke suggestion", "disabled dedicated orchestrator chat suggestion");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assertNoObservedEndpoint("POST /api/v1/web/orchestrator-chat");
 
     await clickButtonByAriaLabel(page, "Issues", "Issues tab");
     await waitForBrowserText(page, "issues tab issue cards", {
@@ -340,10 +348,16 @@ async function main() {
       exclude: forbiddenMarkers,
     });
     await selectOption(page, 'select[aria-label="Sidebar variant"]', "chat", "sidebar chat variant");
-    await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload", {
-      include: ["Dedicated orchestrator chat from API endpoint", "Dedicated smoke suggestion"],
+    await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload and read-only guard", {
+      include: [
+        "Dedicated orchestrator chat from API endpoint",
+        "Dedicated smoke suggestion",
+        "read-only API mode",
+        "Sending commands from this compact chat is not supported yet",
+      ],
       exclude: forbiddenMarkers,
     });
+    await assertButtonDisabledByText(page, "Dedicated smoke suggestion", "sidebar dedicated orchestrator chat suggestion");
 
     assertObservedEndpoints([
       "GET /api/v1/web/reference-data",
@@ -354,8 +368,8 @@ async function main() {
       "GET /api/v1/web/sessions/smoke-session/transcript",
       "GET /api/v1/web/sidebar",
       "GET /api/v1/web/orchestrator-chat",
-      "POST /api/v1/web/orchestrator-chat",
     ]);
+    assertNoObservedEndpoint("POST /api/v1/web/orchestrator-chat");
 
     await page.close();
     await stopBrowserProcess(browserProcess);
@@ -727,6 +741,26 @@ async function clickButtonByText(page, text, description) {
   );
 }
 
+async function assertButtonDisabledByText(page, text, description) {
+  const result = await page.evaluate(`(() => {
+    const expected = ${JSON.stringify(text)};
+    const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
+    const button = Array.from(document.querySelectorAll("button")).find((candidate) => normalize(candidate.innerText || candidate.textContent).includes(expected));
+    if (!button) return { found: false };
+    return {
+      found: true,
+      disabled: Boolean(button.disabled),
+      ariaDisabled: button.getAttribute("aria-disabled"),
+      text: normalize(button.innerText || button.textContent).slice(0, 160),
+    };
+  })()`);
+  assert(result?.found, `Could not find ${description} in the browser`);
+  assert(
+    result.disabled || result.ariaDisabled === "true",
+    `Expected ${description} to be disabled by the API-mode guard, got ${JSON.stringify(result)}`,
+  );
+}
+
 async function clickElementFromExpression(page, elementExpression, description) {
   const rect = await page.evaluate(`(() => {
     const element = ${elementExpression};
@@ -734,6 +768,7 @@ async function clickElementFromExpression(page, elementExpression, description) 
     element.scrollIntoView({ block: "center", inline: "center" });
     const rect = element.getBoundingClientRect();
     const style = window.getComputedStyle(element);
+
     return {
       found: true,
       visible: rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none",
@@ -769,6 +804,11 @@ function assertObservedEndpoints(endpoints) {
   for (const endpoint of endpoints) {
     assert(observed.has(endpoint), `Expected fake API to receive ${endpoint} through the Vite proxy`);
   }
+}
+
+function assertNoObservedEndpoint(endpoint) {
+  const observed = new Set(requestLog.map((entry) => `${entry.method} ${entry.path}`));
+  assert(!observed.has(endpoint), `Expected API-mode read-only guard not to call ${endpoint} through the Vite proxy`);
 }
 
 function describeBrowserTextState(state) {
