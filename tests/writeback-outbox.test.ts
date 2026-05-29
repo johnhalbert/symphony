@@ -1,3 +1,4 @@
+import { promises as nodeFs } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -126,6 +127,39 @@ describe("FileWritebackOutboxStore", () => {
     expect(files).toHaveLength(1);
     expect(files[0]?.length).toBeLessThan(100);
     expect(files[0]).toMatch(/^wb_comment_issue-long_[a-f0-9]{20}\.json$/);
+  });
+
+  it("ignores oversized legacy cleanup paths after writing a short filename", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const realRm = nodeFs.rm.bind(nodeFs);
+    vi.spyOn(nodeFs, "rm").mockImplementation(async (...args: Parameters<typeof nodeFs.rm>) => {
+      const target = String(args[0]);
+      if (path.basename(target).length > 255) {
+        const error = new Error("name too long") as NodeJS.ErrnoException;
+        error.code = "ENAMETOOLONG";
+        throw error;
+      }
+      await realRm(...args);
+    });
+    const longKey = [
+      "comment",
+      "issue-long",
+      "merge-gate",
+      "merge-gate_issue-long_pr-75_31e279aac50f866d209abbd451de787b508dd681",
+      "repair",
+      "extra".repeat(80),
+    ].join(":");
+
+    await expect(
+      store.enqueueOnce({
+        idempotencyKey: longKey,
+        kind: "comment",
+        issueId: "issue-long",
+        payload: { body: "Merge repair required.", dedupeKey: "merge-gate-repair" },
+      }),
+    ).resolves.toMatchObject({ idempotencyKey: longKey });
+
+    await expect(store.get(longKey)).resolves.toMatchObject({ idempotencyKey: longKey });
   });
 
   it("reads legacy full-key filenames and migrates them on write", async () => {

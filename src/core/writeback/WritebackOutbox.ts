@@ -290,7 +290,7 @@ export class FileWritebackOutboxStore {
     }
     await fs.rename(temp, target);
     const legacy = this.legacyRecordPath(record.idempotencyKey);
-    if (legacy !== target) await fs.rm(legacy, { force: true });
+    if (legacy !== target) await rmIfExists(legacy);
   }
 
   private recordsDir(): string {
@@ -604,7 +604,21 @@ async function readJsonIfExists<T>(filePath: string): Promise<T | null> {
   try {
     return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (isAbsentPathError(error)) return null;
     throw error;
   }
+}
+
+async function rmIfExists(filePath: string): Promise<void> {
+  try {
+    await fs.rm(filePath, { force: true });
+  } catch (error) {
+    if (isAbsentPathError(error)) return;
+    throw error;
+  }
+}
+
+function isAbsentPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENAMETOOLONG";
 }
