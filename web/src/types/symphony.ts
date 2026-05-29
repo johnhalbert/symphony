@@ -175,6 +175,9 @@ export interface IssueBoardModel {
 
 export interface IssueDetailModel {
   issue: IssueModel;
+  activity: ActivityModel[];
+  runs: SessionModel[];
+  transcript: TranscriptMessage[];
 }
 
 export interface HistoryModel {

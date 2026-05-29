@@ -196,9 +196,7 @@ export interface IssueDetailModel {
   transcript: TranscriptMessage[];
 }
 
-export interface WebIssueDetailModel {
-  issue: IssueModel;
-}
+export type WebIssueDetailModel = IssueDetailModel;
 
 export interface HistoryModel {
   sessions: SessionModel[];
@@ -327,6 +325,8 @@ export interface BoardIssueDetailProjectionInput {
   workspace?: IssueWorkspaceSummary | WorkspaceRecord | null;
   latestRun?: RunRecord | null;
   runs?: RunRecord[];
+  activity?: ActivityFeedResponseProjectionInput | ActivityModel[] | null;
+  transcript?: TranscriptPage | TranscriptEvent[] | null;
   pullRequest?: IssuePullRequestSummary;
   operatorLiveness?: WebOperatorLivenessInput | null;
 }
@@ -649,6 +649,9 @@ export function projectWebIssueDetail(
       operatorLiveness: input.operatorLiveness ?? input.boardCard?.operatorLiveness ?? null,
       latestRun: input.latestRun ?? null,
     }),
+    activity: projectActivityModels(input.activity ?? null),
+    runs: (input.runs ?? []).map(projectSessionModel),
+    transcript: projectTranscriptMessages(input.transcript ?? null),
   };
 }
 
@@ -682,18 +685,7 @@ export function projectWebIssueBoard(
 
 export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput | null | undefined): IssueDetailModel {
   if (!input) return emptyIssueDetailModel();
-  const issue = projectIssueModel(input.boardCard ?? input.issueDetails, {
-    requestKey: input.issue,
-    lane: input.boardCard?.lane ?? null,
-    operatorLiveness: input.operatorLiveness ?? input.boardCard?.operatorLiveness ?? null,
-    latestRun: input.latestRun ?? null,
-  });
-  return {
-    issue,
-    activity: [],
-    runs: (input.runs ?? []).map(projectSessionModel),
-    transcript: [],
-  };
+  return projectWebIssueDetail(input, input.issue) ?? emptyIssueDetailModel(input.issue);
 }
 
 export function projectWebDashboard(input: DashboardProjectionInput = {}): DashboardModel {

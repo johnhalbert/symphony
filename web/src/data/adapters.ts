@@ -103,7 +103,15 @@ export function toIssueBoardModel(raw: RawData): IssueBoardModel {
 
 export function toIssueDetailModel(raw: RawData, issueId: string): IssueDetailModel | null {
   const issue = raw.issues.find((candidate) => candidate.id === issueId);
-  return issue ? { issue } : null;
+  if (!issue) return null;
+  const runs = raw.sessions.filter((session) => session.issue === issueId);
+  const sessionIds = new Set(runs.map((session) => session.id));
+  return {
+    issue,
+    activity: raw.activity.filter((item) => item.id === issueId),
+    runs,
+    transcript: sessionIds.size === 0 ? [] : raw.transcript,
+  };
 }
 
 export function toHistoryModel(raw: RawData): HistoryModel {
