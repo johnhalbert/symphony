@@ -5,7 +5,11 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { LinearWorkflowTeamStates } from "./integrations/linear/LinearTrackerClient.js";
 import { createLinearTrackerClientForCapability } from "./integrations/linear/LinearCredentialResolver.js";
-import { createGitHubPullRequestClientForCapability } from "./integrations/github/GitHubCredentialResolver.js";
+import {
+  createGitHubPullRequestClientForCapability,
+  resolveGitHubClientConfig,
+  type GitHubCredentialCapability,
+} from "./integrations/github/GitHubCredentialResolver.js";
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { errorMessage } from "./core/errors.js";
 import type { ServiceConfig } from "./core/config/Config.js";
@@ -737,12 +741,16 @@ export async function githubPublicationDoctorCheck(config: ServiceConfig): Promi
     return { id: "github.pr_publication", status: "ok", message: "PR publication is disabled" };
   }
   try {
+    const configError = githubCredentialConfigError(config, "github.publication");
+    if (configError !== null) {
+      return { id: "github.pr_publication", status: "error", message: `github.publication: ${configError}` };
+    }
     const github = createGitHubPullRequestClientForCapability(config, "github.publication");
     await github.checkRepositoryAccess();
     return {
       id: "github.pr_publication",
       status: "ok",
-      message: githubAccessMessage("GitHub PR publication", config, github),
+      message: githubAccessMessage("GitHub PR publication", config, github, "github.publication"),
     };
   } catch (error) {
     return { id: "github.pr_publication", status: "error", message: `github.publication: ${errorMessage(error)}` };
@@ -751,12 +759,16 @@ export async function githubPublicationDoctorCheck(config: ServiceConfig): Promi
 
 export async function githubReviewFeedbackDoctorCheck(config: ServiceConfig): Promise<DoctorCheck> {
   try {
+    const configError = githubCredentialConfigError(config, "github.review_feedback_write");
+    if (configError !== null) {
+      return { id: "github.review_feedback_write", status: "error", message: `github.review_feedback_write: ${configError}` };
+    }
     const github = createGitHubPullRequestClientForCapability(config, "github.review_feedback_write");
     await github.checkRepositoryAccess();
     return {
       id: "github.review_feedback_write",
       status: "ok",
-      message: githubAccessMessage("GitHub PR review feedback", config, github),
+      message: githubAccessMessage("GitHub PR review feedback", config, github, "github.review_feedback_write"),
     };
   } catch (error) {
     return { id: "github.review_feedback_write", status: "error", message: `github.review_feedback_write: ${errorMessage(error)}` };
@@ -767,10 +779,55 @@ function githubAccessMessage(
   action: "GitHub PR publication" | "GitHub PR review feedback",
   config: ServiceConfig,
   github: ReturnType<typeof createGitHubPullRequestClientForCapability>,
+  capability: GitHubCredentialCapability,
 ): string {
   const base = `${action} can access ${config.github.owner}/${config.github.repo}`;
-  const authDescription = github.authenticationDescription();
+  const authDescription = githubCredentialAccessDescription(config, capability) ?? github.authenticationDescription();
   return authDescription ? `${base} using ${authDescription}` : base;
+}
+
+function githubCredentialConfigError(config: ServiceConfig, capability: GitHubCredentialCapability): string | null {
+  const resolved = resolveGitHubClientConfig(config, capability);
+  const credential = resolved.credential;
+  const app = resolved.github.app;
+  if (app === null) return null;
+
+  const label =
+    credential?.source === "profile" && credential.kind === "github_app"
+      ? `GitHub App profile ${credential.profileName} for ${capability}`
+      : credential === null
+      ? `top-level github.app for ${capability}`
+      : null;
+  if (label === null) return null;
+  if (!app.appId?.trim()) return `${label} is missing app_id`;
+  if (!app.installationId?.trim()) return `${label} is missing installation_id`;
+  if (!app.privateKey?.trim() && !app.privateKeyEnvVar?.trim() && !app.privateKeyPath?.trim()) {
+    return `${label} is missing private_key or private_key_path`;
+  }
+  return null;
+}
+
+function githubCredentialAccessDescription(
+  config: ServiceConfig,
+  capability: GitHubCredentialCapability,
+): string | null {
+  const resolved = resolveGitHubClientConfig(config, capability);
+  const credential = resolved.credential;
+  if (credential?.source === "profile" && credential.kind === "github_app") {
+    const installationId = credential.app?.installationId?.trim();
+    return `GitHub App profile ${credential.profileName}${installationId ? ` installation ${installationId}` : ""}`;
+  }
+  if (credential?.source === "profile") {
+    return `static GitHub token profile ${credential.profileName}`;
+  }
+  if (credential?.source === "legacy") {
+    return "legacy static GitHub token";
+  }
+  const installationId = resolved.github.app?.installationId?.trim();
+  if (resolved.github.app !== null) {
+    return `top-level GitHub App installation${installationId ? ` ${installationId}` : ""}`;
+  }
+  return null;
 }
 
 export function runtimeCredentialDoctorCheck(config: ServiceConfig): DoctorCheck {

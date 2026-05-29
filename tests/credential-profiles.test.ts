@@ -178,6 +178,114 @@ describe("credential profile config", () => {
     ).toThrow(SymphonyError);
   });
 
+  it("accepts explicit static-token profiles and app-backed GitHub profiles without serializing secrets", () => {
+    const secretPrivateKey = "profile-private-key-secret-material";
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        credential_profiles: {
+          profiles: {
+            publication: {
+              kind: "github_app",
+              app_id: "$GITHUB_PUBLICATION_APP_ID",
+              client_id: "$GITHUB_PUBLICATION_APP_CLIENT_ID",
+              installation_id: "$GITHUB_PUBLICATION_APP_INSTALLATION_ID",
+              private_key: "$GITHUB_PUBLICATION_APP_PRIVATE_KEY",
+              capabilities: ["github.publication", "github.merge"],
+            },
+            feedback: {
+              kind: "github_app",
+              app_id: "$GITHUB_REVIEW_APP_ID",
+              installation_id: "$GITHUB_REVIEW_APP_INSTALLATION_ID",
+              private_key_path: "$GITHUB_REVIEW_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.review_feedback_write"],
+            },
+            discovery: {
+              kind: "static_token",
+              value: "$GITHUB_DISCOVERY_TOKEN",
+              capabilities: ["github.discovery"],
+            },
+          },
+          roles: {
+            worker: { "github.discovery": "discovery" },
+            reviewer: { "github.review_feedback_write": "feedback" },
+            service: {
+              "github.publication": "publication",
+              "github.merge": "publication",
+            },
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_PUBLICATION_APP_ID: "111",
+        GITHUB_PUBLICATION_APP_CLIENT_ID: "Iv1.publication",
+        GITHUB_PUBLICATION_APP_INSTALLATION_ID: "222",
+        GITHUB_PUBLICATION_APP_PRIVATE_KEY: secretPrivateKey,
+        GITHUB_REVIEW_APP_ID: "333",
+        GITHUB_REVIEW_APP_INSTALLATION_ID: "444",
+        GITHUB_REVIEW_APP_PRIVATE_KEY_PATH: "/secrets/reviewer.pem",
+        GITHUB_DISCOVERY_TOKEN: "discovery-secret",
+      },
+    );
+
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "github_app",
+      source: "profile",
+      profileName: "publication",
+      app: {
+        appId: "111",
+        clientId: "Iv1.publication",
+        installationId: "222",
+        privateKeyEnvVar: "GITHUB_PUBLICATION_APP_PRIVATE_KEY",
+      },
+    });
+    expect(config.credentialProfiles.resolveForRole("service", "github.merge")).toMatchObject({
+      kind: "github_app",
+      profileName: "publication",
+    });
+    expect(config.credentialProfiles.resolveForRole("worker", "github.discovery")).toMatchObject({
+      kind: "static_token",
+      value: "discovery-secret",
+      profileName: "discovery",
+    });
+
+    const serialized = JSON.stringify(config.credentialProfiles);
+    expect(serialized).toContain("GITHUB_PUBLICATION_APP_PRIVATE_KEY");
+    expect(serialized).toContain("reviewer.pem");
+    expect(serialized).not.toContain(secretPrivateKey);
+    expect(serialized).not.toContain("discovery-secret");
+  });
+
+  it("rejects GitHub App profiles assigned to non-GitHub capabilities", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          credential_profiles: {
+            profiles: {
+              bad: {
+                kind: "github_app",
+                app_id: "$GITHUB_APP_ID",
+                installation_id: "$GITHUB_APP_INSTALLATION_ID",
+                private_key_path: "$GITHUB_APP_PRIVATE_KEY_PATH",
+                capabilities: ["linear.writeback"],
+              },
+            },
+          },
+        },
+        "/repo/WORKFLOW.md",
+        {
+          LINEAR_API_KEY: "linear-secret",
+          GITHUB_APP_ID: "111",
+          GITHUB_APP_INSTALLATION_ID: "222",
+          GITHUB_APP_PRIVATE_KEY_PATH: "/secrets/app.pem",
+        },
+      ),
+    ).toThrow(/kind github_app only supports github\.\*/);
+  });
+
   it("keeps legacy fallbacks when profiles are absent", () => {
     const config = parseServiceConfig(
       {

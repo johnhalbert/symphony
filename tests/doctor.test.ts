@@ -616,7 +616,7 @@ describe("doctor review-loop checks", () => {
     await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
       id: "github.pr_publication",
       status: "ok",
-      message: "GitHub PR publication can access acme/symphony using static GitHub token",
+      message: "GitHub PR publication can access acme/symphony using static GitHub token profile publication",
     });
     expect(authorizations).toEqual(["Bearer publication-secret"]);
   });
@@ -701,9 +701,50 @@ describe("doctor review-loop checks", () => {
     await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
       id: "github.review_feedback_write",
       status: "ok",
-      message: "GitHub PR review feedback can access acme/symphony using static GitHub token",
+      message: "GitHub PR review feedback can access acme/symphony using static GitHub token profile feedback",
     });
     expect(authorizations).toEqual(["Bearer feedback-secret"]);
+  });
+
+  it("reports missing app-backed reviewer feedback profile config with the profile name", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          api_base_url: "https://api.github.test",
+        },
+        credential_profiles: {
+          profiles: {
+            feedback: {
+              kind: "github_app",
+              app_id: "$GITHUB_REVIEW_APP_ID",
+              installation_id: "$GITHUB_REVIEW_APP_INSTALLATION_ID",
+              private_key_path: "$GITHUB_REVIEW_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.review_feedback_write"],
+            },
+          },
+          roles: {
+            reviewer: {
+              "github.review_feedback_write": "feedback",
+            },
+          },
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("fetch should not be called for missing app profile config");
+    });
+
+    await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
+      id: "github.review_feedback_write",
+      status: "error",
+      message:
+        "github.review_feedback_write: GitHub App profile feedback for github.review_feedback_write is missing app_id",
+    });
   });
 });
 

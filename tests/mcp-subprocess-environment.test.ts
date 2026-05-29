@@ -574,6 +574,114 @@ describe("MCP subprocess environment", () => {
     });
   });
 
+  it("injects only the selected GitHub App profile refs for completion and review-feedback MCP", () => {
+    const rawConfig = {
+      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      github: {
+        owner: "$GITHUB_OWNER",
+        repo: "$GITHUB_REPO",
+        head_owner: "$GITHUB_HEAD_OWNER",
+        publish_pull_requests: true,
+        pr_handoff: { enabled: false },
+      },
+      credential_profiles: {
+        profiles: {
+          publication: {
+            kind: "github_app",
+            app_id: "$GITHUB_PUBLICATION_APP_ID",
+            client_id: "$GITHUB_PUBLICATION_APP_CLIENT_ID",
+            installation_id: "$GITHUB_PUBLICATION_APP_INSTALLATION_ID",
+            private_key_path: "$GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH",
+            capabilities: ["github.publication", "github.merge"],
+          },
+          feedback: {
+            kind: "github_app",
+            app_id: "$GITHUB_REVIEW_APP_ID",
+            client_id: "$GITHUB_REVIEW_APP_CLIENT_ID",
+            installation_id: "$GITHUB_REVIEW_APP_INSTALLATION_ID",
+            private_key_path: "$GITHUB_REVIEW_APP_PRIVATE_KEY_PATH",
+            capabilities: ["github.review_feedback_write"],
+          },
+        },
+        roles: {
+          service: {
+            "github.publication": "publication",
+            "github.merge": "publication",
+          },
+          reviewer: {
+            "github.review_feedback_write": "feedback",
+          },
+        },
+      },
+    } as const;
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      GITHUB_OWNER: "acme",
+      GITHUB_REPO: "symphony",
+      GITHUB_HEAD_OWNER: "john",
+      GITHUB_PUBLICATION_APP_ID: "111",
+      GITHUB_PUBLICATION_APP_CLIENT_ID: "Iv1.publication",
+      GITHUB_PUBLICATION_APP_INSTALLATION_ID: "222",
+      GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH: "/secrets/publication.pem",
+      GITHUB_REVIEW_APP_ID: "333",
+      GITHUB_REVIEW_APP_CLIENT_ID: "Iv1.review",
+      GITHUB_REVIEW_APP_INSTALLATION_ID: "444",
+      GITHUB_REVIEW_APP_PRIVATE_KEY_PATH: "/secrets/reviewer.pem",
+      GITHUB_TOKEN: "decoy-github-secret",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+    const publicationKeyPath = config.credentialProfiles.resolveForRole("service", "github.publication")?.app?.privateKeyPath;
+    const reviewerKeyPath = config.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")?.app?.privateKeyPath;
+
+    const completionEnv = buildMcpSubprocessEnvironment({
+      config,
+      command: "completion-report-mcp",
+      parentEnv: { PATH: "/bin", ...sourceEnv },
+    });
+    expect(completionEnv).toMatchObject({
+      GITHUB_OWNER: "acme",
+      GITHUB_REPO: "symphony",
+      GITHUB_HEAD_OWNER: "john",
+      GITHUB_PUBLICATION_APP_ID: "111",
+      GITHUB_PUBLICATION_APP_CLIENT_ID: "Iv1.publication",
+      GITHUB_PUBLICATION_APP_INSTALLATION_ID: "222",
+      GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH: publicationKeyPath,
+    });
+    expect(completionEnv).not.toHaveProperty("GITHUB_REVIEW_APP_ID");
+    expect(completionEnv).not.toHaveProperty("GITHUB_REVIEW_APP_PRIVATE_KEY_PATH");
+    expect(completionEnv).not.toHaveProperty("GITHUB_TOKEN");
+
+    const completionChildConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", completionEnv);
+    expect(completionChildConfig.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "github_app",
+      app: { appId: "111", clientId: "Iv1.publication", installationId: "222", privateKeyPath: publicationKeyPath },
+    });
+
+    const reviewEnv = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-feedback-mcp",
+      parentEnv: { PATH: "/bin", ...sourceEnv },
+    });
+    expect(reviewEnv).toMatchObject({
+      GITHUB_OWNER: "acme",
+      GITHUB_REPO: "symphony",
+      GITHUB_HEAD_OWNER: "john",
+      GITHUB_REVIEW_APP_ID: "333",
+      GITHUB_REVIEW_APP_CLIENT_ID: "Iv1.review",
+      GITHUB_REVIEW_APP_INSTALLATION_ID: "444",
+      GITHUB_REVIEW_APP_PRIVATE_KEY_PATH: reviewerKeyPath,
+    });
+    expect(reviewEnv).not.toHaveProperty("GITHUB_PUBLICATION_APP_ID");
+    expect(reviewEnv).not.toHaveProperty("GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH");
+    expect(reviewEnv).not.toHaveProperty("GITHUB_TOKEN");
+
+    const reviewChildConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", reviewEnv);
+    expect(reviewChildConfig.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")).toMatchObject({
+      kind: "github_app",
+      app: { appId: "333", clientId: "Iv1.review", installationId: "444", privateKeyPath: reviewerKeyPath },
+    });
+  });
+
   it("injects only a custom github.token environment reference for publication", () => {
     const config = parseServiceConfig(
       {

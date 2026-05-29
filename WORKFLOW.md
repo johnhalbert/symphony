@@ -120,11 +120,6 @@ writeback:
 github:
   owner: johnhalbert
   repo: symphony
-  app:
-    app_id: $GITHUB_APP_ID
-    client_id: $GITHUB_APP_CLIENT_ID
-    installation_id: $GITHUB_APP_INSTALLATION_ID
-    private_key_path: $GITHUB_APP_PRIVATE_KEY_PATH
   head_owner: johnhalbert
   publish_pull_requests: true
   pr_handoff:
@@ -133,6 +128,32 @@ github:
     required_for_publication: false
     reject_policy: cancel
     poll_interval_ms: 2000
+
+credential_profiles:
+  profiles:
+    publication-app:
+      kind: github_app
+      app_id: $GITHUB_APP_ID
+      client_id: $GITHUB_APP_CLIENT_ID
+      installation_id: $GITHUB_APP_INSTALLATION_ID
+      private_key_path: $GITHUB_APP_PRIVATE_KEY_PATH
+      capabilities:
+        - github.publication
+        - github.merge
+    reviewer-app:
+      kind: github_app
+      app_id: $GITHUB_REVIEW_APP_ID
+      client_id: $GITHUB_REVIEW_APP_CLIENT_ID
+      installation_id: $GITHUB_REVIEW_APP_INSTALLATION_ID
+      private_key_path: $GITHUB_REVIEW_APP_PRIVATE_KEY_PATH
+      capabilities:
+        - github.review_feedback_write
+  roles:
+    service:
+      github.publication: publication-app
+      github.merge: publication-app
+    reviewer:
+      github.review_feedback_write: reviewer-app
 ---
 
 # Symphony Dogfood Worker

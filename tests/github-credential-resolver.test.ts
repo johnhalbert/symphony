@@ -114,6 +114,71 @@ describe("GitHub credential resolver", () => {
     }
   });
 
+  it("selects app-backed profiles per GitHub operation", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "$GITHUB_TOKEN",
+          app: { app_id: "global-app", installation_id: "global-install", private_key: "global-key" },
+        },
+        credential_profiles: {
+          profiles: {
+            publication: {
+              kind: "github_app",
+              app_id: "$GITHUB_PUBLICATION_APP_ID",
+              installation_id: "$GITHUB_PUBLICATION_APP_INSTALLATION_ID",
+              private_key_path: "$GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.publication", "github.merge"],
+            },
+            feedback: {
+              kind: "github_app",
+              app_id: "$GITHUB_REVIEW_APP_ID",
+              client_id: "$GITHUB_REVIEW_APP_CLIENT_ID",
+              installation_id: "$GITHUB_REVIEW_APP_INSTALLATION_ID",
+              private_key_path: "$GITHUB_REVIEW_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.review_feedback_write"],
+            },
+          },
+          roles: {
+            service: {
+              "github.publication": "publication",
+              "github.merge": "publication",
+            },
+            reviewer: { "github.review_feedback_write": "feedback" },
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_TOKEN: "legacy-github-secret",
+        GITHUB_PUBLICATION_APP_ID: "111",
+        GITHUB_PUBLICATION_APP_INSTALLATION_ID: "222",
+        GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH: "/secrets/publication.pem",
+        GITHUB_REVIEW_APP_ID: "333",
+        GITHUB_REVIEW_APP_CLIENT_ID: "Iv1.review",
+        GITHUB_REVIEW_APP_INSTALLATION_ID: "444",
+        GITHUB_REVIEW_APP_PRIVATE_KEY_PATH: "/secrets/reviewer.pem",
+      },
+    );
+
+    expect(resolveGitHubClientConfig(config, "github.publication")).toMatchObject({
+      github: { token: null, app: { appId: "111", installationId: "222" } },
+      credential: { kind: "github_app", source: "profile", profileName: "publication" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.merge")).toMatchObject({
+      github: { token: null, app: { appId: "111", installationId: "222" } },
+      credential: { kind: "github_app", source: "profile", profileName: "publication" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.review_feedback_write")).toMatchObject({
+      github: { token: null, app: { appId: "333", clientId: "Iv1.review", installationId: "444" } },
+      credential: { kind: "github_app", source: "profile", profileName: "feedback" },
+    });
+  });
+
   it("keeps explicit capability profile tokens ahead of App auth", () => {
     const config = parseServiceConfig(
       {

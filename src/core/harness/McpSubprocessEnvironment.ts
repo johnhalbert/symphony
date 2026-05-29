@@ -2,7 +2,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
-import type { ServiceConfig } from "../config/Config.js";
+import type { GitHubAppConfig, ServiceConfig } from "../config/Config.js";
 import type { CredentialRole } from "../config/CredentialProfiles.js";
 
 export type McpSubprocessCommand =
@@ -192,14 +192,23 @@ function addGitHubCapabilityEnvironment(
   capability: "github.publication" | "github.review_feedback_write",
 ): void {
   if (config.credentialProfiles.hasAssignment(role, capability)) {
+    const profile = config.credentialProfiles.profileForRole(role, capability);
     const credential = config.credentialProfiles.resolveForRole(role, capability);
-    const profileName = credential?.profileName;
-    const serialized = config.credentialProfiles.toJSON();
-    const envVar = profileName === undefined || profileName === null ? undefined : serialized.profiles[profileName]?.source.name;
-    if (envVar === undefined || credential?.source !== "profile") {
+    if (profile === null || credential?.source !== "profile") {
       throw new Error(`${role} ${capability} profile assignment could not be resolved`);
     }
-    env[envVar] = credential.value;
+    if (profile.kind === "github_app") {
+      const rawProfile = config.raw.credential_profiles?.profiles?.[profile.name];
+      if (rawProfile?.kind !== "github_app") {
+        throw new Error(`${role} ${capability} GitHub App profile assignment could not be resolved`);
+      }
+      addGitHubAppProfileCapabilityEnvironment(env, profile.app, rawProfile, parentEnv);
+      return;
+    }
+    if (credential.kind !== "static_token") {
+      throw new Error(`${role} ${capability} static profile assignment could not be resolved`);
+    }
+    env[profile.envVar] = credential.value;
     return;
   }
 
@@ -226,6 +235,27 @@ function addGitHubCapabilityEnvironment(
     return;
   }
   env.GITHUB_TOKEN = "";
+}
+
+interface RawGitHubAppEnvironmentSource {
+  app_id?: string | undefined;
+  client_id?: string | undefined;
+  installation_id?: string | undefined;
+  private_key?: string | undefined;
+  private_key_path?: string | undefined;
+}
+
+function addGitHubAppProfileCapabilityEnvironment(
+  env: Record<string, string>,
+  app: GitHubAppConfig,
+  rawApp: RawGitHubAppEnvironmentSource,
+  parentEnv: NodeJS.ProcessEnv,
+): void {
+  addGitHubAppStringEnvironment(env, rawApp.app_id, "GITHUB_APP_ID", app.appId);
+  addGitHubAppStringEnvironment(env, rawApp.client_id, "GITHUB_APP_CLIENT_ID", app.clientId);
+  addGitHubAppStringEnvironment(env, rawApp.installation_id, "GITHUB_APP_INSTALLATION_ID", app.installationId);
+  addGitHubAppPrivateKeyEnvironment(env, rawApp.private_key, app.privateKeyEnvVar, parentEnv);
+  addGitHubAppStringEnvironment(env, rawApp.private_key_path, "GITHUB_APP_PRIVATE_KEY_PATH", app.privateKeyPath);
 }
 
 function addGitHubAppCapabilityEnvironment(

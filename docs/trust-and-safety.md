@@ -91,7 +91,7 @@ During early Hermes dogfood, run a single Symphony process and keep `max_concurr
 
 ## Credential Profiles
 
-Symphony supports optional named credential profiles as a config-only foundation for future least-privilege execution. Profiles must point at environment variables; do not put secret material directly in workflow config.
+Symphony supports optional named credential profiles as a config-only foundation for least-privilege execution. Static-token profiles must point at environment variables; do not put secret material directly in workflow config.
 
 ```yaml
 credential_profiles:
@@ -119,11 +119,41 @@ credential_profiles:
       github.review_feedback_write: github-feedback
 ```
 
-The closed capability inventory is `github.discovery`, `github.publication`, `github.review_evidence_read`, `github.review_feedback_write`, `linear.tracker`, `linear.writeback`, `runtime.cursor`, `runtime.hermes`, legacy alias `cursor.runtime`, and `server.open_workspace`. `github.review_feedback_write` is consumed only by the reviewer feedback MCP server.
+GitHub capabilities may also use app-backed profiles. The dogfood workflow uses one GitHub App profile for service-owned publication/merge and a separate reviewer app profile for PR review feedback so GitHub does not reject self-approval attempts from the app that authored the PR.
+
+```yaml
+credential_profiles:
+  profiles:
+    publication-app:
+      kind: github_app
+      app_id: $GITHUB_APP_ID
+      client_id: $GITHUB_APP_CLIENT_ID
+      installation_id: $GITHUB_APP_INSTALLATION_ID
+      private_key_path: $GITHUB_APP_PRIVATE_KEY_PATH
+      capabilities:
+        - github.publication
+        - github.merge
+    reviewer-app:
+      kind: github_app
+      app_id: $GITHUB_REVIEW_APP_ID
+      client_id: $GITHUB_REVIEW_APP_CLIENT_ID
+      installation_id: $GITHUB_REVIEW_APP_INSTALLATION_ID
+      private_key_path: $GITHUB_REVIEW_APP_PRIVATE_KEY_PATH
+      capabilities:
+        - github.review_feedback_write
+  roles:
+    service:
+      github.publication: publication-app
+      github.merge: publication-app
+    reviewer:
+      github.review_feedback_write: reviewer-app
+```
+
+The closed capability inventory is `github.discovery`, `github.publication`, `github.review_evidence_read`, `github.review_feedback_write`, `github.merge`, `linear.tracker`, `linear.writeback`, `runtime.cursor`, `runtime.hermes`, legacy alias `cursor.runtime`, and `server.open_workspace`. `github.review_feedback_write` is consumed only by the reviewer feedback MCP server.
 
 When `credential_profiles` is absent, current behavior is unchanged. GitHub capabilities fall back to `github.token` or `GITHUB_TOKEN`; both Linear capabilities fall back to `tracker.api_key` or `LINEAR_API_KEY`; `runtime.cursor` and legacy `cursor.runtime` fall back to env-only `CURSOR_API_KEY`; `runtime.hermes` has no legacy fallback and must be assigned explicitly when the Hermes harness needs a runtime API key; and `server.open_workspace` falls back only to `server.open_workspace_token`. The reference workflow points `server.open_workspace_token` at `SYMPHONY_WORKSPACE_TOKEN`. Hermes `openai-codex` uses Hermes-owned OAuth instead of `runtime.hermes`: Symphony bootstraps selected provider state into `hermes.auth.managed_root` and passes it to generated profiles with `HERMES_AUTH_HOME`.
 
-Default role capability sets are intentionally narrow: workers use GitHub discovery/publication, Linear tracker/writeback, runtime harness, and workspace-open credentials; reviewers use GitHub review-evidence read, GitHub review-feedback write, Linear tracker/writeback, and runtime harness credentials. MCP context `token` and `expectedToken` fields in completion-report, review-feedback, and review-verdict handoff files are local handoff authentication, not GitHub, Linear, runtime, or server credentials, and must not be modeled as credential profiles.
+Default role capability sets are intentionally narrow: workers use GitHub discovery, Linear tracker/writeback, runtime harness, and workspace-open credentials; service code uses GitHub publication/merge and Linear writeback credentials; reviewers use GitHub review-evidence read, GitHub review-feedback write, Linear tracker/writeback, and runtime harness credentials. MCP context `token` and `expectedToken` fields in completion-report, review-feedback, and review-verdict handoff files are local handoff authentication, not GitHub, Linear, runtime, or server credentials, and must not be modeled as credential profiles.
 
 ## Runtime Harness
 

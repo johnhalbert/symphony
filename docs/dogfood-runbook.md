@@ -70,7 +70,7 @@ npm run doctor -- --strict --live-runtime
 npm run smoke:hermes-local
 ```
 
-Set `LINEAR_API_KEY`, scoped GitHub credential-profile variables such as `GITHUB_PUBLICATION_TOKEN` and `GITHUB_FEEDBACK_TOKEN`, and `SYMPHONY_WORKSPACE_TOKEN` in the workflow root `.env` file or process environment as needed.
+Set `LINEAR_API_KEY`, `SYMPHONY_WORKSPACE_TOKEN`, and the GitHub credential variables in the workflow root `.env` file or process environment as needed. The reference workflow uses app-backed credential profiles: existing `GITHUB_APP_*` variables identify the publication/merge app, and `GITHUB_REVIEW_APP_*` variables identify a separate reviewer app for PR approvals and change requests. Static-token profiles such as `GITHUB_PUBLICATION_TOKEN` and `GITHUB_FEEDBACK_TOKEN` remain supported for non-app deployments.
 
 Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable workspace paths, git availability, runtime harness/provider checks, Hermes paths, Python importability, managed auth readiness when `openai-codex` is selected, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, subprocess MCP tool availability, candidate isolation, and current Linear candidates.
 

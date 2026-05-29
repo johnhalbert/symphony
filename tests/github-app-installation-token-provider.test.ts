@@ -90,12 +90,12 @@ describe("GitHub App installation token auth", () => {
       await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
         id: "github.pr_publication",
         status: "ok",
-        message: "GitHub PR publication can access acme/symphony using GitHub App installation 67890",
+        message: "GitHub PR publication can access acme/symphony using top-level GitHub App installation 67890",
       });
       await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
         id: "github.review_feedback_write",
         status: "ok",
-        message: "GitHub PR review feedback can access acme/symphony using GitHub App installation 67890",
+        message: "GitHub PR review feedback can access acme/symphony using top-level GitHub App installation 67890",
       });
       expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
         "POST /app/installations/67890/access_tokens",
@@ -328,12 +328,12 @@ describe("GitHub App installation token auth", () => {
       await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
         id: "github.pr_publication",
         status: "ok",
-        message: "GitHub PR publication can access acme/symphony using GitHub App installation 67890",
+        message: "GitHub PR publication can access acme/symphony using top-level GitHub App installation 67890",
       });
       await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
         id: "github.review_feedback_write",
         status: "ok",
-        message: "GitHub PR review feedback can access acme/symphony using GitHub App installation 67890",
+        message: "GitHub PR review feedback can access acme/symphony using top-level GitHub App installation 67890",
       });
       expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
         "POST /app/installations/67890/access_tokens",
@@ -366,11 +366,90 @@ describe("GitHub App installation token auth", () => {
     await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
       id: "github.pr_publication",
       status: "ok",
-      message: "GitHub PR publication can access acme/symphony using GitHub App installation 67890",
+      message: "GitHub PR publication can access acme/symphony using top-level GitHub App installation 67890",
     });
     expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
       "POST /app/installations/67890/access_tokens",
       "GET /repos/acme/symphony",
+    ]);
+  });
+
+  it("mints installation tokens from distinct app-backed credential profiles", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          api_base_url: "https://api.github.test",
+          publish_pull_requests: true,
+          pr_handoff: { enabled: false },
+        },
+        credential_profiles: {
+          profiles: {
+            publication: {
+              kind: "github_app",
+              app_id: "111",
+              client_id: "Iv1.publication",
+              installation_id: "222",
+              private_key: generatePrivateKey(),
+              capabilities: ["github.publication", "github.merge"],
+            },
+            reviewer: {
+              kind: "github_app",
+              app_id: "333",
+              client_id: "Iv1.reviewer",
+              installation_id: "444",
+              private_key: generatePrivateKey(),
+              capabilities: ["github.review_feedback_write"],
+            },
+          },
+          roles: {
+            service: {
+              "github.publication": "publication",
+              "github.merge": "publication",
+            },
+            reviewer: {
+              "github.review_feedback_write": "reviewer",
+            },
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    const calls: FetchCall[] = [];
+    vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const call = recordFetchCall(input, init);
+      calls.push(call);
+      if (call.url.pathname === "/app/installations/222/access_tokens") {
+        return jsonResponse({ token: "ghs_publication_app_token", expires_at: "2026-01-01T01:00:00.000Z" });
+      }
+      if (call.url.pathname === "/app/installations/444/access_tokens") {
+        return jsonResponse({ token: "ghs_reviewer_app_token", expires_at: "2026-01-01T01:00:00.000Z" });
+      }
+      return jsonResponse({ id: 1, full_name: "acme/symphony" });
+    });
+
+    await expect(githubPublicationDoctorCheck(config)).resolves.toEqual({
+      id: "github.pr_publication",
+      status: "ok",
+      message: "GitHub PR publication can access acme/symphony using GitHub App profile publication installation 222",
+    });
+    await expect(githubReviewFeedbackDoctorCheck(config)).resolves.toEqual({
+      id: "github.review_feedback_write",
+      status: "ok",
+      message: "GitHub PR review feedback can access acme/symphony using GitHub App profile reviewer installation 444",
+    });
+    expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+      "POST /app/installations/222/access_tokens",
+      "GET /repos/acme/symphony",
+      "POST /app/installations/444/access_tokens",
+      "GET /repos/acme/symphony",
+    ]);
+    expect(calls.filter((call) => call.url.pathname === "/repos/acme/symphony").map((call) => call.authorization)).toEqual([
+      "Bearer ghs_publication_app_token",
+      "Bearer ghs_reviewer_app_token",
     ]);
   });
 });

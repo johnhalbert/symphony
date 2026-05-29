@@ -43,6 +43,19 @@ export function resolveGitHubClientConfig(
   }
 
   const credential = config.credentialProfiles.resolveForRole(role, capability);
+  if (credential?.source === "profile" && credential.kind === "github_app") {
+    return {
+      capability,
+      role,
+      github: {
+        ...config.github,
+        token: null,
+        app: credential.app,
+      },
+      credential,
+    };
+  }
+
   const selectedStaticCredential = shouldUseGitHubAppByDefault(config.github, capability, credential)
     ? null
     : credential;

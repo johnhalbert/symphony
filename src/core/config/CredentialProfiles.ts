@@ -1,3 +1,5 @@
+import os from "node:os";
+import path from "node:path";
 import { z } from "zod";
 import { SymphonyError } from "../errors.js";
 import type { AgentRunRole } from "../types.js";
@@ -21,17 +23,33 @@ const credentialCapabilitySchema = z.enum(CREDENTIAL_CAPABILITIES);
 export type CredentialCapability = z.infer<typeof credentialCapabilitySchema>;
 export type CredentialRole = AgentRunRole | "service";
 
+const rawCredentialProfileBaseSchema = z
+  .object({
+    capabilities: z.array(credentialCapabilitySchema).min(1),
+  })
+  .passthrough();
+
+const rawStaticCredentialProfileSchema = rawCredentialProfileBaseSchema.extend({
+  kind: z.literal("static_token").optional(),
+  value: z.string(),
+});
+
+const rawGitHubAppCredentialProfileSchema = rawCredentialProfileBaseSchema.extend({
+  kind: z.literal("github_app"),
+  app_id: z.string().optional(),
+  client_id: z.string().optional(),
+  installation_id: z.string().optional(),
+  private_key: z.string().optional(),
+  private_key_path: z.string().optional(),
+  token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
+});
+
 export const rawCredentialProfilesSchema = z
   .object({
     profiles: z
       .record(
         z.string(),
-        z
-          .object({
-            value: z.string(),
-            capabilities: z.array(credentialCapabilitySchema).min(1),
-          })
-          .passthrough(),
+        z.union([rawGitHubAppCredentialProfileSchema, rawStaticCredentialProfileSchema]),
       )
       .optional(),
     roles: z
@@ -54,16 +72,40 @@ export interface CredentialLegacyFallbacks {
   openWorkspaceToken: string | null;
 }
 
-export interface CredentialProfileDefinition {
+export interface CredentialProfileGitHubAppConfig {
+  appId: string | null;
+  clientId: string | null;
+  installationId: string | null;
+  privateKey: string | null;
+  privateKeyEnvVar: string | null;
+  privateKeyPath: string | null;
+  tokenRefreshBufferSeconds: number;
+}
+
+export interface StaticTokenCredentialProfileDefinition {
+  kind: "static_token";
   name: string;
   envVar: string;
   capabilities: CredentialCapability[];
 }
 
+export interface GitHubAppCredentialProfileDefinition {
+  kind: "github_app";
+  name: string;
+  app: CredentialProfileGitHubAppConfig;
+  capabilities: CredentialCapability[];
+}
+
+export type CredentialProfileDefinition =
+  | StaticTokenCredentialProfileDefinition
+  | GitHubAppCredentialProfileDefinition;
+
 export interface ResolvedCredential {
+  kind: "static_token" | "github_app";
   role: CredentialRole;
   capability: CredentialCapability;
   value: string;
+  app: CredentialProfileGitHubAppConfig | null;
   source: "profile" | "legacy";
   profileName: string | null;
 }
@@ -89,6 +131,7 @@ export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<CredentialRol
 const ROLE_NAMES: readonly CredentialRole[] = ["worker", "reviewer", "service"];
 const VALID_CAPABILITIES = new Set<CredentialCapability>(CREDENTIAL_CAPABILITIES);
 const ENV_REFERENCE_PATTERN = /^\$([A-Za-z_][A-Za-z0-9_]*)$/;
+const DEFAULT_GITHUB_APP_TOKEN_REFRESH_BUFFER_SECONDS = 300;
 
 export class CredentialProfileRegistry {
   readonly #profiles: Map<string, CredentialProfileDefinition>;
@@ -116,6 +159,17 @@ export class CredentialProfileRegistry {
       if (profile === undefined) {
         throw new SymphonyError("config_validation_error", `Credential profile "${profileName}" is not defined`);
       }
+      if (profile.kind === "github_app") {
+        return {
+          kind: "github_app",
+          role,
+          capability,
+          value: "",
+          app: profile.app,
+          source: "profile",
+          profileName: profile.name,
+        };
+      }
       const value = this.#env[profile.envVar] ?? "";
       if (value.length === 0) {
         throw new SymphonyError(
@@ -123,16 +177,22 @@ export class CredentialProfileRegistry {
           `Credential profile "${profile.name}" for ${role} ${capability} references unset or empty environment variable ${profile.envVar}`,
         );
       }
-      return { role, capability, value, source: "profile", profileName: profile.name };
+      return { kind: "static_token", role, capability, value, app: null, source: "profile", profileName: profile.name };
     }
 
     const fallbackValue = this.#legacyFallback(capability);
     if (fallbackValue === null || fallbackValue.length === 0) return null;
-    return { role, capability, value: fallbackValue, source: "legacy", profileName: null };
+    return { kind: "static_token", role, capability, value: fallbackValue, app: null, source: "legacy", profileName: null };
   }
 
   hasAssignment(role: CredentialRole, capability: CredentialCapability): boolean {
     return this.#assignmentFor(role, capability) !== null;
+  }
+
+  profileForRole(role: CredentialRole, capability: CredentialCapability): CredentialProfileDefinition | null {
+    const assignment = this.#assignmentFor(role, capability);
+    if (assignment === null) return null;
+    return this.#profiles.get(assignment.profileName) ?? null;
   }
 
   assignmentRolesFor(capability: CredentialCapability): CredentialRole[] {
@@ -150,14 +210,14 @@ export class CredentialProfileRegistry {
   }
 
   toJSON(): {
-    profiles: Record<string, { source: { kind: "env"; name: string }; capabilities: CredentialCapability[] }>;
+    profiles: Record<string, SerializedCredentialProfile>;
     roles: Record<CredentialRole, Partial<Record<CredentialCapability, string>>>;
   } {
     return {
       profiles: Object.fromEntries(
         Array.from(this.#profiles.entries()).map(([name, profile]) => [
           name,
-          { source: { kind: "env", name: profile.envVar }, capabilities: profile.capabilities },
+          serializeCredentialProfile(profile),
         ]),
       ),
       roles: {
@@ -194,9 +254,10 @@ export class CredentialProfileRegistry {
 export function createCredentialProfileRegistry(input: {
   raw: RawCredentialProfilesConfig | undefined;
   env: NodeJS.ProcessEnv;
+  workflowDir: string;
   fallbacks: CredentialLegacyFallbacks;
 }): CredentialProfileRegistry {
-  const profiles = parseProfiles(input.raw?.profiles);
+  const profiles = parseProfiles(input.raw?.profiles, input.workflowDir, input.env);
   const roleAssignments = parseRoleAssignments(input.raw?.roles, profiles);
   return new CredentialProfileRegistry({
     profiles,
@@ -208,6 +269,8 @@ export function createCredentialProfileRegistry(input: {
 
 function parseProfiles(
   rawProfiles: RawCredentialProfilesConfig["profiles"] | undefined,
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
 ): Map<string, CredentialProfileDefinition> {
   const profiles = new Map<string, CredentialProfileDefinition>();
   for (const [name, rawProfile] of Object.entries(rawProfiles ?? {})) {
@@ -215,11 +278,30 @@ function parseProfiles(
     if (trimmedName.length === 0) {
       throw new SymphonyError("config_validation_error", "Credential profile names must not be empty");
     }
+    const capabilities = [...new Set(rawProfile.capabilities)];
+    if (rawProfile.kind === "github_app") {
+      const nonGitHubCapabilities = capabilities.filter((capability) => !capability.startsWith("github."));
+      if (nonGitHubCapabilities.length > 0) {
+        throw new SymphonyError(
+          "config_validation_error",
+          `credential_profiles.profiles.${trimmedName} kind github_app only supports github.* capabilities: ${nonGitHubCapabilities.join(", ")}`,
+        );
+      }
+      profiles.set(trimmedName, {
+        kind: "github_app",
+        name: trimmedName,
+        app: normalizeGitHubAppProfileConfig(rawProfile, workflowDir, env),
+        capabilities,
+      });
+      continue;
+    }
+
     const envVar = parseEnvReference(rawProfile.value, `credential_profiles.profiles.${trimmedName}.value`);
     profiles.set(trimmedName, {
+      kind: "static_token",
       name: trimmedName,
       envVar,
-      capabilities: [...new Set(rawProfile.capabilities)],
+      capabilities,
     });
   }
   return profiles;
@@ -281,4 +363,130 @@ function parseEnvReference(value: string, path: string): string {
     throw new SymphonyError("config_validation_error", `${path} must reference an environment variable as $NAME`);
   }
   return match[1];
+}
+
+type RawGitHubAppCredentialProfile = z.infer<typeof rawGitHubAppCredentialProfileSchema>;
+
+type SerializedCredentialProfile =
+  | {
+      kind: "static_token";
+      source: { kind: "env"; name: string };
+      capabilities: CredentialCapability[];
+    }
+  | {
+      kind: "github_app";
+      source: {
+        kind: "github_app";
+        appId: string | null;
+        clientId: string | null;
+        installationId: string | null;
+        privateKey: { kind: "env"; name: string } | { kind: "inline"; redacted: true } | null;
+        privateKeyPath: string | null;
+        tokenRefreshBufferSeconds: number;
+      };
+      capabilities: CredentialCapability[];
+    };
+
+function serializeCredentialProfile(profile: CredentialProfileDefinition): SerializedCredentialProfile {
+  if (profile.kind === "static_token") {
+    return {
+      kind: "static_token",
+      source: { kind: "env", name: profile.envVar },
+      capabilities: profile.capabilities,
+    };
+  }
+
+  return {
+    kind: "github_app",
+    source: {
+      kind: "github_app",
+      appId: profile.app.appId,
+      clientId: profile.app.clientId,
+      installationId: profile.app.installationId,
+      privateKey:
+        profile.app.privateKeyEnvVar !== null
+          ? { kind: "env", name: profile.app.privateKeyEnvVar }
+          : profile.app.privateKey !== null
+          ? { kind: "inline", redacted: true }
+          : null,
+      privateKeyPath: profile.app.privateKeyPath,
+      tokenRefreshBufferSeconds: profile.app.tokenRefreshBufferSeconds,
+    },
+    capabilities: profile.capabilities,
+  };
+}
+
+function normalizeGitHubAppProfileConfig(
+  rawProfile: RawGitHubAppCredentialProfile,
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+): CredentialProfileGitHubAppConfig {
+  const appId = normalizeOptionalConfigString(resolveConfigString(rawProfile.app_id ?? "$GITHUB_APP_ID", env));
+  const clientId = normalizeOptionalConfigString(resolveConfigString(rawProfile.client_id ?? "$GITHUB_APP_CLIENT_ID", env));
+  const installationId = normalizeOptionalConfigString(
+    resolveConfigString(rawProfile.installation_id ?? "$GITHUB_APP_INSTALLATION_ID", env),
+  );
+  const privateKey = normalizeGitHubAppPrivateKey(rawProfile.private_key, env);
+  const privateKeyPath = normalizeGitHubAppPrivateKeyPath(rawProfile.private_key_path, workflowDir, env);
+
+  return {
+    appId,
+    clientId,
+    installationId,
+    privateKey: privateKey.value,
+    privateKeyEnvVar: privateKey.envVar,
+    privateKeyPath,
+    tokenRefreshBufferSeconds:
+      rawProfile.token_refresh_buffer_seconds ?? DEFAULT_GITHUB_APP_TOKEN_REFRESH_BUFFER_SECONDS,
+  };
+}
+
+interface NormalizedGitHubAppPrivateKey {
+  value: string | null;
+  envVar: string | null;
+}
+
+function normalizeGitHubAppPrivateKey(value: string | undefined, env: NodeJS.ProcessEnv): NormalizedGitHubAppPrivateKey {
+  if (value !== undefined) {
+    const envReference = ENV_REFERENCE_PATTERN.exec(value.trim());
+    if (envReference?.[1]) {
+      return { value: null, envVar: envReference[1] };
+    }
+    return { value: normalizeOptionalConfigString(value), envVar: null };
+  }
+  return normalizeOptionalConfigString(env.GITHUB_APP_PRIVATE_KEY) === null
+    ? { value: null, envVar: null }
+    : { value: null, envVar: "GITHUB_APP_PRIVATE_KEY" };
+}
+
+function normalizeGitHubAppPrivateKeyPath(
+  value: string | undefined,
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  const rawPath = value ?? "$GITHUB_APP_PRIVATE_KEY_PATH";
+  const resolvedPath = normalizeOptionalConfigString(resolveConfigString(rawPath, env));
+  if (resolvedPath === null) return null;
+  return resolvePathValue(resolvedPath, workflowDir, env);
+}
+
+function resolveConfigString(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
+  if (value === undefined) return undefined;
+  const varMatch = ENV_REFERENCE_PATTERN.exec(value);
+  if (varMatch) return env[varMatch[1] ?? ""] ?? "";
+  return value;
+}
+
+function resolvePathValue(value: string, baseDir: string, env: NodeJS.ProcessEnv): string {
+  const resolvedVariable = resolveConfigString(value, env) ?? "";
+  const homeExpanded =
+    resolvedVariable === "~" || resolvedVariable.startsWith(`~${path.sep}`)
+      ? path.join(os.homedir(), resolvedVariable.slice(2))
+      : resolvedVariable;
+  return path.resolve(baseDir, homeExpanded);
+}
+
+function normalizeOptionalConfigString(value: string | undefined): string | null {
+  const trimmed = value?.trim() ?? "";
+  return trimmed.length === 0 ? null : trimmed;
 }

@@ -673,6 +673,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const credentialProfiles = createCredentialProfileRegistry({
     raw: raw.credential_profiles,
     env,
+    workflowDir,
     fallbacks: {
       githubToken,
       linearApiKey: trackerApiKey,
