@@ -17,20 +17,33 @@ export function AppChrome({
   children,
   rightSlot,
   runningCount = 4,
+  repoLabel = "openai/symphony",
+  branch = "main",
+  pollLabel = "poll 22s · next in 8s",
+  agentUsageLabel,
+  dataSourceLabel = "api source · mock",
 }: {
   activeTab: AppTab;
   onTabChange: (tab: AppTab) => void;
   children: ReactNode;
   rightSlot?: ReactNode;
   runningCount?: number;
+  repoLabel?: string;
+  branch?: string;
+  pollLabel?: string;
+  agentUsageLabel?: string;
+  dataSourceLabel?: string;
 }) {
+  const repoBranchLabel = branch ? `${repoLabel}@${branch}` : repoLabel;
+  const runningLabel = agentUsageLabel ?? `${runningCount} agents running`;
+
   return (
     <div className="app">
       <div className="titlebar">
         <div className="titlebar__brand">
           <span className="dot" />
           Symphony
-          <span className="meta">main</span>
+          <span className="meta">{branch || "--"}</span>
         </div>
         <div className="tabs" role="tablist" aria-label="Symphony views">
           {appTabs.map((tab) => (
@@ -65,16 +78,16 @@ export function AppChrome({
       <div className="statusbar">
         <span className="statusbar__seg">
           <span className="pulse" />
-          {runningCount} agents running
+          {runningLabel}
         </span>
         <span className="statusbar__sep">·</span>
-        <span className="statusbar__seg mono">openai/symphony@main</span>
+        <span className="statusbar__seg mono">{repoBranchLabel}</span>
         <span className="statusbar__sep">·</span>
-        <span className="statusbar__seg mono">poll 22s · next in 8s</span>
+        <span className="statusbar__seg mono">{pollLabel}</span>
         <div className="statusbar__right">
           <span className="statusbar__seg mono">linear · connected</span>
           <span className="statusbar__sep">·</span>
-          <span className="statusbar__seg mono">api source · mock</span>
+          <span className="statusbar__seg mono">{dataSourceLabel}</span>
           <span className="statusbar__sep">·</span>
           <span className="statusbar__seg mono">0 errors · 24h</span>
         </div>

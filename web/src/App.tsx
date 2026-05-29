@@ -6,7 +6,7 @@ import { SidebarViews } from "./components/sidebar/SidebarViews";
 import { ChatHistoryView } from "./components/history/ChatHistoryView";
 import { DashboardView } from "./components/dashboard/DashboardView";
 import { IssuesView } from "./components/issues/IssuesView";
-import { DataSourceProvider } from "./data/dataSourceContext";
+import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
 import { ReferenceDataProvider } from "./data/referenceDataContext";
 import { useDashboard, useHistory, useIssueBoard, useReferenceData as useReferenceResource, useSidebar } from "./hooks/useSymphonyData";
 import type { AppTab, DashboardVariant, HistoryVariant, IssuesVariant, RunState, SidebarVariant } from "./types/symphony";
@@ -53,14 +53,21 @@ function AppShell() {
   const issueBoard = useIssueBoard();
   const history = useHistory();
   const sidebar = useSidebar();
-  const runningCount = dashboard.data?.runningAgents.length ?? 4;
+  const dashboardChrome = dashboard.data;
+  const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
+  const apiMode = defaultDataSourceConfig.mode === "api";
 
   return (
     <ThemeFrame>
       <AppChrome
         activeTab={activeTab}
         onTabChange={setActiveTab}
-        runningCount={runningCount}
+        runningCount={apiMode ? runningCount : undefined}
+        repoLabel={apiMode ? (dashboardChrome?.repoLabel ?? "") : undefined}
+        branch={apiMode ? (dashboardChrome?.branch ?? "") : undefined}
+        pollLabel={apiMode ? (dashboardChrome?.pollLabel ?? "poll pending") : undefined}
+        agentUsageLabel={apiMode ? (dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`) : undefined}
+        dataSourceLabel={`api source · ${defaultDataSourceConfig.mode}`}
         rightSlot={
           <ViewControls
             activeTab={activeTab}
@@ -75,7 +82,7 @@ function AppShell() {
           />
         }
       >
-        {activeTab === "dashboard" ? renderLoadable(dashboard, (data) => <DashboardView dashboard={data} variant={dashboardVariant} />) : null}
+        {activeTab === "dashboard" ? renderLoadable(dashboard, (data) => <DashboardView dashboard={data} variant={dashboardVariant} useModelBurnupTotals={apiMode} />) : null}
         {activeTab === "issues" ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} />) : null}
         {activeTab === "history" ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} />) : null}
         {activeTab === "sidebar" ? renderLoadable(sidebar, (data) => <SidebarViews sidebar={data} variant={sidebarVariant} />) : null}
