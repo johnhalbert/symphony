@@ -10,6 +10,7 @@ describe("LinearTrackerClient", () => {
       title: "Title",
       state: { name: "Todo" },
       assignee: { id: "user-1" },
+      delegate: { id: "delegate-1" },
       labels: { nodes: [{ name: "Bug" }] },
       inverseRelations: {
         nodes: [
@@ -24,7 +25,7 @@ describe("LinearTrackerClient", () => {
     expect(normalized?.labels).toEqual(["bug"]);
     expect(normalized?.blockedBy[0]?.identifier).toBe("T-0");
     expect(normalized?.assigneeId).toBe("user-1");
-    expect(normalized?.delegateId).toBeNull();
+    expect(normalized?.delegateId).toBe("delegate-1");
     expect(normalized?.assignedToWorker).toBe(true);
   });
 
