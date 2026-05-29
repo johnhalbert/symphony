@@ -55,6 +55,7 @@ export function TranscriptPane({
         </div>
       </div>
       <div className="transcript">
+        {messages.length === 0 ? <div className="transcript-status">No transcript messages for this session.</div> : null}
         {messages.map((message, index) => (
           <Message key={`${message.kind}-${index}`} message={message} open={openSet.has(index)} onToggle={() => toggle(index)} />
         ))}

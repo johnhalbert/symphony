@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
+import type { HistoryModel, TranscriptMessage } from "../src/types/symphony";
 
 const originalFetch = globalThis.fetch;
 
@@ -21,6 +22,49 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
     ...init,
   });
 }
+
+const historyModel: HistoryModel = {
+  sessions: [
+    {
+      id: "run/with space",
+      issue: "ENG-106",
+      title: "ENG-106: Integrate web history",
+      state: "finished",
+      model: "gpt-5.5",
+      startedAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:05:00.000Z",
+      msgCount: 2,
+      lastEvent: "ENG-106 run finished",
+      toolCount: 1,
+    },
+  ],
+  transcriptBySession: {},
+  timeline: [
+    {
+      t: "2026-05-29T00:05:00.000Z",
+      sess: "run/with space",
+      kind: "status",
+      text: "ENG-106 run finished",
+      state: "finished",
+    },
+  ],
+  defaultSessionId: "run/with space",
+};
+
+const transcript: TranscriptMessage[] = [
+  {
+    kind: "user",
+    ts: "2026-05-29T00:01:00.000Z",
+    from: "operator",
+    issue: "ENG-106",
+    text: "Load history from the API.",
+  },
+  {
+    kind: "assistant",
+    ts: "2026-05-29T00:02:00.000Z",
+    text: "History loaded.",
+  },
+];
 
 describe("API data source", () => {
   afterEach(() => {
@@ -106,6 +150,30 @@ describe("API data source", () => {
     });
   });
 
+  it("loads the web history model from GET /api/v1/web/history", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(historyModel));
+
+    await expect(createApiDataSource("http://localhost:7331/").getHistory()).resolves.toEqual(historyModel);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost:7331/api/v1/web/history", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
+  it("loads selected session transcripts using the encoded web session id", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(transcript));
+
+    await expect(createApiDataSource("").getTranscript("run/with space")).resolves.toEqual(transcript);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/sessions/run%2Fwith%20space/transcript", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
   it("posts orchestrator chat messages through the same relative API boundary", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse([{ speaker: "system", text: "Queued" }]));
 
@@ -137,6 +205,12 @@ describe("API data source", () => {
       headers: { Accept: "application/json" },
       signal: undefined,
     });
+  });
+
+  it("surfaces non-2xx history responses", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: "unavailable" }, { status: 503 }));
+
+    await expect(createApiDataSource("http://localhost:7331").getHistory()).rejects.toThrow("Symphony API returned HTTP 503");
   });
 });
 
