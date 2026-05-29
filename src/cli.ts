@@ -2,6 +2,7 @@
 import path from "node:path";
 import { Command } from "commander";
 import { StatusServer } from "./app/http.js";
+import type { ServiceConfig } from "./core/config/Config.js";
 import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
 import { Orchestrator } from "./core/orchestrator/Orchestrator.js";
@@ -207,6 +208,7 @@ program
             trackerStateLists: resolveTrackerStateLists(config),
             issueBoardColumns: config.issueBoard.columns,
             staleThresholdMs: config.polling.intervalMs,
+            dashboard: statusDashboardConfig(config),
           });
 
     if (statusServer) {
@@ -236,4 +238,15 @@ program.parseAsync().catch((error) => {
 
 function currentCliPath(): string {
   return path.resolve(process.argv[1] ?? "dist/cli.js");
+}
+
+function statusDashboardConfig(config: ServiceConfig) {
+  const githubRepoLabel = config.github.owner && config.github.repo ? `${config.github.owner}/${config.github.repo}` : null;
+  return {
+    repoLabel: githubRepoLabel ?? config.workspace.source.repository ?? config.workspace.source.path ?? "",
+    branch: config.workspace.source.ref ?? config.workspace.source.baseRef ?? "",
+    workflowLabel: path.basename(config.workflowPath),
+    pollIntervalMs: config.polling.intervalMs,
+    concurrencyCap: config.agent.maxConcurrentAgents,
+  };
 }

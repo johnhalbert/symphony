@@ -13,6 +13,7 @@ import {
   projectIssueBoardModel,
   projectWebReferenceData,
   projectIssueDetailModel,
+  projectWebDashboard,
   projectWebIssueBoard,
   projectTranscriptMessages,
   projectWebOrchestratorChat,
@@ -369,7 +370,7 @@ describe("web projection foundation", () => {
 
     const runtime = {
       generatedAt: "2026-01-01T00:11:00.000Z",
-      counts: { running: 0, retrying: 0, paused: 0, providerGates: 1 },
+      counts: { running: 1, retrying: 0, paused: 0, providerGates: 1 },
       providerGates: [
         {
           id: "provider-gate:openai-codex:test",
@@ -387,17 +388,66 @@ describe("web projection foundation", () => {
         },
       ],
       providerGateCounts: { active: 1, manual: 0, autoResume: 1 },
-      running: [],
+      running: [
+        {
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          runId: "run-1",
+          startedAt: "2026-01-01T00:01:00.000Z",
+          lastEvent: "progress",
+          lastMessage: "Implementing dashboard route",
+          issueDetails: { title: "Live dashboard run" },
+          liveness: { status: "active" },
+          tokens: { inputTokens: 5, outputTokens: 7, totalTokens: 12 },
+        },
+      ],
       retrying: [],
       paused: [],
       totals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, secondsRunning: 0 },
       rateLimits: null,
     } as any;
-    const dashboard = projectDashboardModel({ board: { issues: [card()] }, activity: activityInput, runs: [run()], runtime });
+    const dashboard = projectWebDashboard({
+      board: {
+        issues: [
+          webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
+          webCard("TEST-PROGRESS", { lane: "progress", state: "In Progress" }),
+          webCard("TEST-DONE", { lane: "done", state: "Done" }),
+          webCard("TEST-CANCELED", { lane: "canceled", state: "Canceled" }),
+        ],
+      },
+      activity: activityInput,
+      runtime,
+      config: {
+        repoLabel: "acme/symphony",
+        branch: "main",
+        workflowLabel: "WORKFLOW.md",
+        pollIntervalMs: 60_000,
+        concurrencyCap: 2,
+      },
+    });
     const detail = projectIssueDetailModel({ issue: "TEST-1", boardCard: card(), issueDetails: issueDetails(), latestRun: run(), runs: [run()], operatorLiveness: { agentId: "agent-1", sessionId: "session-1", workspacePath: "/tmp/workspaces/TEST-1", runId: "run-1", activeRunId: "run-1", status: "active" } });
     const history = projectHistoryModel({ runs: [run()], transcript: transcriptPage, selectedRunId: "run-1" });
 
-    expect(dashboard.board.counts.total).toBe(1);
+    expect(dashboard).toMatchObject({
+      projectName: "Symphony",
+      repoLabel: "acme/symphony",
+      branch: "main",
+      workflowLabel: "WORKFLOW.md",
+      pollLabel: "poll 60s",
+      agentUsageLabel: "1/2 agents",
+      concurrencyCap: 2,
+      chat: [],
+      totals: { backlog: 0, todo: 1, progress: 1, review: 0, done: 1, cancelled: 1, open: 2, all: 4, completeness: 25 },
+    });
+    expect(dashboard.runningAgents[0]).toMatchObject({
+      id: "run-1",
+      issue: "TEST-1",
+      title: "Live dashboard run",
+      state: "active",
+      step: "Implementing dashboard route",
+      duration: "10m",
+      tokens: "12",
+    });
     expect(dashboard.providerGates[0]).toMatchObject({
       provider: "openai-codex",
       kind: "windowed_bucket_exhausted",
@@ -405,12 +455,14 @@ describe("web projection foundation", () => {
       sourceIssue: "TEST-1",
     });
     expect(dashboard.activity.map((item) => item.verb)).toEqual(["run_started", "tool_call"]);
-    expect(dashboard.sessions[0]).toMatchObject({ id: "session-1", issue: "TEST-1", state: "succeeded", model: "gpt-test", msgCount: 2 });
+    expect(JSON.stringify(dashboard)).not.toContain("openai/symphony");
+    expect(JSON.stringify(dashboard)).not.toContain("poll 22s");
+    expect(JSON.stringify(dashboard)).not.toContain("mock");
     expect(detail.issue.id).toBe("TEST-1");
     expect(detail.runs).toHaveLength(1);
     expect(history.selectedSessionId).toBe("run-1");
     expect(history.transcript.map((message) => message.kind)).toEqual(["tool_call", "request"]);
-    expect(projectActivityModels(activityInput)[1]).toMatchObject({ who: "agent-1", issue: "TEST-1", runId: "run-1", text: "read_file" });
+    expect(projectActivityModels(activityInput)[1]).toMatchObject({ who: "agent-1", id: "TEST-1", extra: "read_file" });
     expect(projectTranscriptMessages(transcriptEvents)[0]).toMatchObject({ kind: "tool_call", text: "read_file" });
   });
 
@@ -469,9 +521,25 @@ describe("web projection foundation", () => {
   });
 
   it("returns empty models for unavailable projection sources", () => {
-    expect(emptyDashboardModel()).toMatchObject({ generatedAt: null, board: { counts: { total: 0 } }, runningAgents: [], activity: [], sessions: [] });
+    const emptyDashboard = {
+      projectName: "Symphony",
+      repoLabel: "",
+      branch: "",
+      workflowLabel: "",
+      pollLabel: "",
+      agentUsageLabel: "0 agents",
+      concurrencyCap: 0,
+      providerGates: [],
+      runningAgents: [],
+      activity: [],
+      chat: [],
+      totals: { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 },
+    };
+
+    expect(emptyDashboardModel()).toEqual(emptyDashboard);
     expect(projectIssueBoardModel(null)).toMatchObject({ counts: { total: 0 }, issues: [] });
-    expect(projectDashboardModel({ activity: null, board: null, runs: [] })).toMatchObject({ board: { counts: { total: 0 } }, activity: [], sessions: [] });
+    expect(projectWebDashboard({ activity: null, board: null, runs: [] })).toEqual(emptyDashboard);
+    expect(projectDashboardModel({ activity: null, board: null, runs: [] })).toEqual(emptyDashboard);
   });
 
   it("projects orchestrator chat as the exact empty default without mock content", () => {

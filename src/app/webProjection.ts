@@ -106,9 +106,9 @@ export interface RunningAgentModel {
   issue: string;
   title: string;
   state: string;
-  step: string | null;
-  duration: string | null;
-  tokens: string | null;
+  step: string;
+  duration: string;
+  tokens: string;
 }
 
 export interface ProviderGateModel {
@@ -124,13 +124,11 @@ export interface ProviderGateModel {
 }
 
 export interface ActivityModel {
-  id: string;
-  at: string;
-  who: string | null;
+  t: string;
+  who: string;
   verb: string;
-  issue: string | null;
-  runId: string | null;
-  text: string | null;
+  id: string;
+  extra: string;
 }
 
 export interface SessionModel {
@@ -163,15 +161,31 @@ export interface ChatMessage {
   suggestions?: string[];
 }
 
+export interface DashboardTotals {
+  backlog: number;
+  todo: number;
+  progress: number;
+  review: number;
+  done: number;
+  cancelled: number;
+  open: number;
+  all: number;
+  completeness: number;
+}
+
 export interface DashboardModel {
-  generatedAt: string | null;
-  reference: ReferenceData;
-  board: IssueBoardModel;
+  projectName: string;
+  repoLabel: string;
+  branch: string;
+  workflowLabel: string;
+  pollLabel: string;
+  agentUsageLabel: string;
+  concurrencyCap: number;
   providerGates: ProviderGateModel[];
   runningAgents: RunningAgentModel[];
   activity: ActivityModel[];
-  sessions: SessionModel[];
   chat: ChatMessage[];
+  totals: DashboardTotals;
 }
 
 export interface IssueDetailModel {
@@ -332,6 +346,14 @@ export interface ActivityFeedResponseProjectionInput {
   filter?: { issue?: string | null };
 }
 
+export interface DashboardRuntimeConfig {
+  repoLabel?: string | null;
+  branch?: string | null;
+  workflowLabel?: string | null;
+  pollIntervalMs?: number | null;
+  concurrencyCap?: number | null;
+}
+
 export interface ProjectIssueModelOptions {
   requestKey?: string;
   lane?: IssueBoardColumnId | "cancelled" | string | null;
@@ -347,6 +369,7 @@ export interface DashboardProjectionInput {
   activity?: ActivityFeedResponseProjectionInput | ActivityModel[] | null;
   runs?: RunRecord[];
   chat?: ChatMessage[];
+  config?: DashboardRuntimeConfig | null | undefined;
 }
 
 export interface SidebarProjectionInput {
@@ -470,14 +493,18 @@ export function emptyWebIssueBoardModel(): WebIssueBoardModel {
 
 export function emptyDashboardModel(): DashboardModel {
   return {
-    generatedAt: null,
-    reference: emptyReferenceData(),
-    board: emptyIssueBoardModel(),
+    projectName: "Symphony",
+    repoLabel: "",
+    branch: "",
+    workflowLabel: "",
+    pollLabel: "",
+    agentUsageLabel: "0 agents",
+    concurrencyCap: 0,
     providerGates: [],
     runningAgents: [],
     activity: [],
-    sessions: [],
     chat: [],
+    totals: emptyDashboardTotals(),
   };
 }
 
@@ -632,19 +659,29 @@ export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput |
   };
 }
 
-export function projectDashboardModel(input: DashboardProjectionInput = {}): DashboardModel {
+export function projectWebDashboard(input: DashboardProjectionInput = {}): DashboardModel {
   const board = projectIssueBoardModel(input.board ?? null);
-  const activity = projectActivityModels(input.activity ?? null);
+  const runtime = input.runtime ?? null;
+  const runningAgents = projectRunningAgents(runtime, runtime?.generatedAt ?? input.generatedAt ?? board.generatedAt ?? null);
+  const concurrencyCap = normalizeConcurrencyCap(input.config?.concurrencyCap);
   return {
-    generatedAt: input.generatedAt ?? board.generatedAt ?? null,
-    reference: cloneReferenceData(input.reference ?? emptyReferenceData()),
-    board,
-    providerGates: projectProviderGates(input.runtime ?? null),
-    runningAgents: projectRunningAgents(input.runtime ?? null),
-    activity,
-    sessions: (input.runs ?? []).map(projectSessionModel),
+    projectName: "Symphony",
+    repoLabel: firstNonEmpty(input.config?.repoLabel) ?? "",
+    branch: firstNonEmpty(input.config?.branch) ?? "",
+    workflowLabel: firstNonEmpty(input.config?.workflowLabel) ?? "",
+    pollLabel: formatPollLabel(input.config?.pollIntervalMs),
+    agentUsageLabel: formatAgentUsageLabel(runningAgents.length, concurrencyCap),
+    concurrencyCap,
+    providerGates: projectProviderGates(runtime),
+    runningAgents,
+    activity: projectActivityModels(input.activity ?? null),
     chat: cloneChatMessages(input.chat ?? []),
+    totals: dashboardTotalsFromBoard(board),
   };
+}
+
+export function projectDashboardModel(input: DashboardProjectionInput = {}): DashboardModel {
+  return projectWebDashboard(input);
 }
 
 export function projectHistoryModel(input: { runs?: RunRecord[]; transcript?: TranscriptPage | TranscriptEvent[] | null; selectedRunId?: string | null } = {}): HistoryModel {
@@ -675,13 +712,11 @@ export function projectActivityModels(input: ActivityFeedResponseProjectionInput
   if (!input) return [];
   if (Array.isArray(input)) return input.map(cloneActivityModel);
   return (input.activity ?? []).map((item) => ({
-    id: item.id,
-    at: item.at,
-    who: activityActor(item),
+    t: item.at,
+    who: activityActor(item) ?? "",
     verb: activityVerb(item),
-    issue: firstNonEmpty(item.issue?.identifier, item.issue?.id) ?? null,
-    runId: firstNonEmpty(item.run?.runId) ?? null,
-    text: item.transcript?.message ?? null,
+    id: activityDisplayId(item),
+    extra: activityExtra(item),
   }));
 }
 
@@ -714,15 +749,15 @@ export function projectSessionModel(run: RunRecord): SessionModel {
   };
 }
 
-export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefined): RunningAgentModel[] {
+export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefined, generatedAt: string | null | undefined = snapshot?.generatedAt ?? null): RunningAgentModel[] {
   return (snapshot?.running ?? []).map((row) => ({
     id: row.runId ?? row.issueIdentifier,
     issue: row.issueIdentifier,
     title: row.issueDetails.title ?? row.issueIdentifier,
     state: row.liveness.status,
-    step: row.lastMessage ?? row.lastEvent,
-    duration: null,
-    tokens: row.tokens.totalTokens > 0 ? String(row.tokens.totalTokens) : null,
+    step: firstNonEmpty(row.lastMessage, row.lastEvent) ?? "",
+    duration: formatRunDuration(row.startedAt, generatedAt),
+    tokens: row.tokens.totalTokens > 0 ? String(row.tokens.totalTokens) : "",
   }));
 }
 
@@ -781,6 +816,60 @@ export function deriveIssueStatus(input: {
     default:
       return "backlog";
   }
+}
+
+function emptyDashboardTotals(): DashboardTotals {
+  return {
+    backlog: 0,
+    todo: 0,
+    progress: 0,
+    review: 0,
+    done: 0,
+    cancelled: 0,
+    open: 0,
+    all: 0,
+    completeness: 0,
+  };
+}
+
+function dashboardTotalsFromBoard(board: IssueBoardModel): DashboardTotals {
+  const totals = emptyDashboardTotals();
+  for (const issue of board.issues) {
+    totals[issue.status] += 1;
+  }
+  totals.open = totals.backlog + totals.todo + totals.progress + totals.review;
+  totals.all = totals.open + totals.done + totals.cancelled;
+  totals.completeness = totals.all === 0 ? 0 : Math.round((totals.done / totals.all) * 100);
+  return totals;
+}
+
+function normalizeConcurrencyCap(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
+  return Math.floor(value);
+}
+
+function formatAgentUsageLabel(runningCount: number, concurrencyCap: number): string {
+  if (concurrencyCap > 0) return `${runningCount}/${concurrencyCap} agents`;
+  return `${runningCount} ${runningCount === 1 ? "agent" : "agents"}`;
+}
+
+function formatPollLabel(intervalMs: number | null | undefined): string {
+  if (typeof intervalMs !== "number" || !Number.isFinite(intervalMs) || intervalMs <= 0) return "";
+  if (intervalMs % 1000 === 0) return `poll ${intervalMs / 1000}s`;
+  return `poll ${intervalMs}ms`;
+}
+
+function formatRunDuration(startedAt: string | null | undefined, generatedAt: string | null | undefined): string {
+  const startedMs = Date.parse(startedAt ?? "");
+  const generatedMs = Date.parse(generatedAt ?? "");
+  if (!Number.isFinite(startedMs) || !Number.isFinite(generatedMs) || generatedMs < startedMs) return "";
+  const seconds = Math.floor((generatedMs - startedMs) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes === 0 ? `${hours}h` : `${hours}h ${remainingMinutes}m`;
 }
 
 function emptyIssueBoardCounts(): IssueBoardCountsModel {
@@ -1022,6 +1111,14 @@ function firstNonEmpty(...values: Array<string | null | undefined>): string | nu
 
 function activityActor(item: ActivityItemProjectionInput): string | null {
   return firstNonEmpty(item.run?.agentId, item.source);
+}
+
+function activityDisplayId(item: ActivityItemProjectionInput): string {
+  return firstNonEmpty(item.issue?.identifier, item.issue?.id, item.run?.runId, item.id) ?? "";
+}
+
+function activityExtra(item: ActivityItemProjectionInput): string {
+  return firstNonEmpty(item.transcript?.message, item.writeback?.status, item.run?.status, item.source) ?? "";
 }
 
 function activityVerb(item: ActivityItemProjectionInput): string {

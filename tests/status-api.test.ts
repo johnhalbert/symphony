@@ -2377,6 +2377,13 @@ describe("StatusServer durable API", () => {
         done: ["Done"],
         canceled: ["Canceled"],
       },
+      dashboard: {
+        repoLabel: "acme/symphony",
+        branch: "main",
+        workflowLabel: "WORKFLOW.md",
+        pollIntervalMs: 60_000,
+        concurrencyCap: 2,
+      },
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -2476,6 +2483,59 @@ describe("StatusServer durable API", () => {
       expect(webIssuesBody.issues.find((item) => item.id === "TEST-CANCELED")?.status).toBe("cancelled");
       expect(webIssuesBody.selectedIssueId).toBe("TEST-PROGRESS");
 
+      const dashboardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/dashboard`);
+      const dashboardBody = (await dashboardResponse.json()) as {
+        projectName: string;
+        repoLabel: string;
+        branch: string;
+        workflowLabel: string;
+        pollLabel: string;
+        agentUsageLabel: string;
+        concurrencyCap: number;
+        providerGates: unknown[];
+        runningAgents: Array<{ issue: string; title: string; state: string; duration: string }>;
+        activity: Array<{ verb: string; id: string }>;
+        chat: unknown[];
+        totals: Record<string, number>;
+      };
+      expect(dashboardResponse.status).toBe(200);
+      expect(Object.keys(dashboardBody).sort()).toEqual([
+        "activity",
+        "agentUsageLabel",
+        "branch",
+        "chat",
+        "concurrencyCap",
+        "pollLabel",
+        "projectName",
+        "providerGates",
+        "repoLabel",
+        "runningAgents",
+        "totals",
+        "workflowLabel",
+      ]);
+      expect(dashboardBody).toMatchObject({
+        projectName: "Symphony",
+        repoLabel: "acme/symphony",
+        branch: "main",
+        workflowLabel: "WORKFLOW.md",
+        pollLabel: "poll 60s",
+        agentUsageLabel: "1/2 agents",
+        concurrencyCap: 2,
+        providerGates: [],
+        chat: [],
+        totals: { backlog: 0, todo: 1, progress: 2, review: 2, done: 1, cancelled: 1, open: 5, all: 7, completeness: 14 },
+      });
+      expect(dashboardBody.runningAgents[0]).toMatchObject({
+        issue: "TEST-1",
+        title: "Stale live title",
+        state: "active",
+        duration: "10m",
+      });
+      expect(dashboardBody.activity[0]).toMatchObject({ verb: "run_started", id: "TEST-1" });
+      expect(JSON.stringify(dashboardBody)).not.toContain("openai/symphony");
+      expect(JSON.stringify(dashboardBody)).not.toContain("poll 22s");
+      expect(JSON.stringify(dashboardBody)).not.toContain("Mock");
+
       const boardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
       const boardBody = (await boardResponse.json()) as {
         columns: Array<{
@@ -2568,11 +2628,19 @@ describe("StatusServer durable API", () => {
       const response = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
       const acceptedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
       const referenceResponse = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/reference-data");
+      const dashboardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/dashboard`);
       const body = (await response.json()) as { error: { code: string; message: string } };
       const acceptedBody = (await acceptedResponse.json()) as { error: { code: string; message: string } };
       const referenceBody = (await referenceResponse.json()) as {
         labels: Record<string, { name: string; color: string | null }>;
         users: Record<string, { name: string; color: string | null }>;
+      };
+      const dashboardBody = (await dashboardResponse.json()) as {
+        projectName: string;
+        activity: unknown[];
+        providerGates: unknown[];
+        runningAgents: unknown[];
+        totals: { all: number; open: number; completeness: number };
       };
 
       expect(response.status).toBe(503);
@@ -2585,6 +2653,14 @@ describe("StatusServer durable API", () => {
       expect(referenceResponse.status).toBe(200);
       expect(referenceBody.labels).toEqual({});
       expect(referenceBody.users.unassigned).toMatchObject({ name: "Unassigned" });
+      expect(dashboardResponse.status).toBe(200);
+      expect(dashboardBody).toMatchObject({
+        projectName: "Symphony",
+        activity: [],
+        providerGates: [],
+        runningAgents: [],
+        totals: { all: 0, open: 0, completeness: 0 },
+      });
     } finally {
       await server.stop();
     }
