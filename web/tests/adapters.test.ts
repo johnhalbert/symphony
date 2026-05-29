@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeTotals, toDashboardModel, toHistoryModel, toIssueBoardModel, toIssueDetailModel } from "../src/data/adapters";
+import { computeTotals, toDashboardModel, toHistoryModel, toIssueBoardModel, toIssueDetailModel, toSidebarModel } from "../src/data/adapters";
 import { mockSymphonyData } from "../src/data/mockData";
 import type { IssueModel } from "../src/types/symphony";
 
@@ -37,5 +37,17 @@ describe("design-system data adapters", () => {
 
     expect(history.sessions.length).toBeGreaterThan(0);
     expect(history.transcriptBySession[history.defaultSessionId]?.length).toBeGreaterThan(0);
+  });
+
+  it("keeps mock sidebar mode sourced from the mock data model", () => {
+    const sidebar = toSidebarModel(raw);
+    const reviewIssues = raw.issues.filter((issue) => issue.status === "review").slice(0, 3);
+
+    expect(sidebar.runningAgents).toEqual(raw.runningAgents);
+    expect(sidebar.reviewIssues).toEqual(reviewIssues);
+    expect(sidebar.activity).toEqual(raw.activity);
+    expect(sidebar.sessions).toEqual(raw.sessions);
+    expect(sidebar.chat).toEqual(raw.dashChat);
+    expect(sidebar.totals).toEqual(computeTotals(raw.issues));
   });
 });

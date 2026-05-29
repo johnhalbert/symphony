@@ -21,27 +21,33 @@ export function SidebarChat({ messages }: { messages: ChatMessage[] }) {
       </div>
 
       <div style={{ overflow: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 14 }}>
-        {recent.map((message, index) => (
-          <div key={`${message.text}-${index}`} className="chat__msg">
-            <div className={`who ${message.who === "user" ? "who--user" : ""}`}>
-              <span className="av-tiny">{message.who === "user" ? "You" : "SY"}</span>
-              {message.who === "user" ? "You" : "Orchestrator"}
+        {recent.length ? (
+          recent.map((message, index) => (
+            <div key={`${message.text}-${index}`} className="chat__msg">
+              <div className={`who ${message.who === "user" ? "who--user" : ""}`}>
+                <span className="av-tiny">{message.who === "user" ? "You" : "SY"}</span>
+                {message.who === "user" ? "You" : "Orchestrator"}
+              </div>
+              <div className="body">
+                <p>{formatInlineText(message.text)}</p>
+                {message.suggestions?.length ? (
+                  <div style={{ marginTop: 4 }}>
+                    {message.suggestions.map((suggestion, suggestionIndex) => (
+                      <button className="chat__suggestion" key={suggestion} style={{ marginBottom: 4 }} type="button">
+                        {suggestionIndex === 0 ? Icon.bolt() : null}
+                        {suggestion}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
             </div>
-            <div className="body">
-              <p>{formatInlineText(message.text)}</p>
-              {message.suggestions ? (
-                <div style={{ marginTop: 4 }}>
-                  {message.suggestions.map((suggestion, suggestionIndex) => (
-                    <button className="chat__suggestion" key={suggestion} style={{ marginBottom: 4 }} type="button">
-                      {suggestionIndex === 0 ? Icon.bolt() : null}
-                      {suggestion}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-            </div>
+          ))
+        ) : (
+          <div style={{ color: "var(--text-4)", fontSize: 12, lineHeight: 1.5, padding: "6px 2px" }}>
+            No orchestrator messages yet.
           </div>
-        ))}
+        )}
       </div>
 
       <div className="chat__input">

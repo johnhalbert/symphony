@@ -35,6 +35,42 @@ describe("API data source", () => {
     });
   });
 
+  it("fetches the dedicated sidebar endpoint without remapping enriched issue fields", async () => {
+    const sidebar = {
+      providerGates: [],
+      runningAgents: [{ id: "agent-1", issue: "ENG-7", title: "Sidebar", state: "running", step: "render", duration: "1m", tokens: "1k" }],
+      reviewIssues: [
+        {
+          id: "ENG-8",
+          title: "Review enriched issue",
+          status: "review",
+          priority: "urgent",
+          labels: ["dogfood", "api"],
+          assignee: "reviewer-1",
+          agent: "agent-2",
+          project: "Symphony",
+          cycle: "Cycle 1",
+          activity: [{ t: "now", verb: "reviewed", val: "pass", who: "bot" }],
+          pr: "#123",
+          ci: "green",
+          workspace: "ENG-8",
+          session: "session-8",
+        },
+      ],
+      activity: [],
+      sessions: [],
+      chat: [],
+      totals: { backlog: 0, todo: 0, progress: 0, review: 1, done: 0, cancelled: 0, open: 1, all: 1, completeness: 0 },
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(sidebar));
+
+    await expect(createApiDataSource("").getSidebar()).resolves.toEqual(sidebar);
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/sidebar", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
   it("posts orchestrator chat messages through the same relative API boundary", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse([{ speaker: "system", text: "Queued" }]));
 

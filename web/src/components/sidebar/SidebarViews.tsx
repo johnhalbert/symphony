@@ -21,7 +21,7 @@ export function SidebarViews({ sidebar, variant }: { sidebar: SidebarModel; vari
       </div>
       <div className="state-card-grid">
         <p style={{ color: "var(--text-3)", fontSize: 13, lineHeight: 1.6, maxWidth: 480 }}>
-          Narrow views render from the same mock data source as the full app. Use the view switcher in the title bar to inspect status, chat, and history variants.
+          Narrow views render from the active Symphony data source. Use the view switcher in the title bar to inspect status, chat, and history variants.
         </p>
       </div>
     </div>
