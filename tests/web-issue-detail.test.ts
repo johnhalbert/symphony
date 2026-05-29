@@ -233,6 +233,13 @@ function transcriptEvent(overrides: Partial<TranscriptEvent> = {}): TranscriptEv
     source: "cursor",
     eventType: "tool_call",
     message: "read_file",
+    payload: {
+      call_id: "call-1",
+      name: "read_file",
+      status: "completed",
+      args: { path: "src/app/webProjection.ts" },
+      result: "read_file result",
+    },
     ...overrides,
   };
 }
@@ -370,16 +377,17 @@ describe("web issue detail projection", () => {
         {
           kind: "tool_call",
           ts: "2026-01-01T00:03:00.000Z",
-          text: "read_file",
-          runId: "run-1",
-          sequence: 1,
-          source: "cursor",
-          eventType: "tool_call",
-          payload: null,
+          call_id: "call-1",
+          name: "read_file",
+          status: "completed",
+          args: { preview: '{"path":"src/app/webProjection.ts"}' },
+          result: "read_file result",
         },
       ],
     });
     expect(Object.keys(detail ?? {})).toEqual(["issue", "activity", "runs", "transcript"]);
+    expect(detail?.transcript[0]).not.toHaveProperty("payload");
+    expect(detail?.transcript[0]).not.toHaveProperty("runId");
     expect(JSON.stringify(detail).toLowerCase()).not.toContain("mock");
   });
 
@@ -464,13 +472,24 @@ describe("GET /api/v1/web/issues/:issueId", () => {
       repoPath: "/repo",
       baseRef: "main",
     });
-    await runStore.appendEvent({
-      runId: "run-1",
-      at: "2026-01-01T00:03:00.000Z",
-      source: "cursor",
-      eventType: "tool_call",
-      message: "read_file",
-    });
+    await runStore.appendEvent(
+      transcriptEvent({
+        message: "read_file SECRET_MESSAGE access_token=message-token",
+        payload: {
+          call_id: "call-route-1",
+          name: "read_file",
+          status: "completed",
+          args: {
+            path: "src/app/webProjection.ts",
+            token: "argument-token",
+            nested: { client_secret: "argument-client-secret" },
+          },
+          result: "file contents SECRET_RESULT token=result-token",
+          output: "stdout SECRET_OUTPUT ghp_ABCDEFGH1",
+          error: "stderr SECRET_ERROR sk-ABCDEFGH1",
+        },
+      }),
+    );
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
       workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
@@ -525,18 +544,33 @@ describe("GET /api/v1/web/issues/:issueId", () => {
           msgCount: 1,
         }),
       ]);
-      expect(body.transcript).toEqual([
-        {
-          kind: "tool_call",
-          ts: "2026-01-01T00:03:00.000Z",
-          text: "read_file",
-          runId: "run-1",
-          sequence: 1,
-          source: "cursor",
-          eventType: "tool_call",
-          payload: null,
-        },
-      ]);
+      expect(body.transcript).toHaveLength(1);
+      expect(body.transcript[0]).toMatchObject({
+        kind: "tool_call",
+        ts: "2026-01-01T00:03:00.000Z",
+        call_id: "call-route-1",
+        name: "read_file",
+        status: "completed",
+        args: { preview: expect.stringContaining("src/app/webProjection.ts") },
+        result: expect.stringContaining("[redacted]"),
+        output: expect.stringContaining("[redacted]"),
+        error: expect.stringContaining("[redacted]"),
+      });
+      expect(body.transcript[0]).not.toHaveProperty("payload");
+      expect(body.transcript[0]).not.toHaveProperty("runId");
+      const transcriptResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sessions/session-1/transcript`);
+      const sessionTranscript = await transcriptResponse.json();
+      expect(transcriptResponse.status).toBe(200);
+      expect(body.transcript).toEqual(sessionTranscript);
+      const serializedTranscript = JSON.stringify(body.transcript);
+      expect(serializedTranscript).toContain("[redacted]");
+      expect(serializedTranscript).not.toContain("SECRET_");
+      expect(serializedTranscript).not.toContain("message-token");
+      expect(serializedTranscript).not.toContain("argument-token");
+      expect(serializedTranscript).not.toContain("argument-client-secret");
+      expect(serializedTranscript).not.toContain("result-token");
+      expect(serializedTranscript).not.toContain("ghp_ABCDEFGH1");
+      expect(serializedTranscript).not.toContain("sk-ABCDEFGH1");
       expect(JSON.stringify(body).toLowerCase()).not.toContain("mock");
       expect(tracker.fetchCount).toBe(1);
     } finally {

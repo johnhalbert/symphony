@@ -617,7 +617,14 @@ describe("web projection foundation", () => {
     expect(history.selectedSessionId).toBe("run-1");
     expect(history.transcript.map((message) => message.kind)).toEqual(["tool_call", "request"]);
     expect(projectActivityModels(activityInput)[1]).toMatchObject({ who: "agent-1", id: "TEST-1", extra: "read_file" });
-    expect(projectTranscriptMessages(transcriptEvents)[0]).toMatchObject({ kind: "tool_call", text: "read_file" });
+    expect(projectTranscriptMessages(transcriptEvents)[0]).toMatchObject({
+      kind: "tool_call",
+      call_id: "run-1:1",
+      name: "tool_call",
+      status: "unknown",
+      args: {},
+      result: null,
+    });
   });
 
   it("composes the web sidebar model directly from dashboard, issue, history, and chat projections", () => {

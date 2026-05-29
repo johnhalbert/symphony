@@ -1,6 +1,7 @@
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 import type { HistoryModel as WebHistoryModel } from "./WebHistoryProjection.js";
+import { projectWebTranscript, type TranscriptMessage as WebTranscriptMessage } from "./WebTranscriptProjection.js";
 import type {
   AgentRunKind,
   AgentRunPhase,
@@ -18,7 +19,8 @@ export type RuntimeRunningIssue = RuntimeSnapshot["running"][number];
 
 export type IssueStatus = "backlog" | "todo" | "progress" | "review" | "done" | "cancelled";
 export type IssuePriority = 0 | 1 | 2 | 3 | "urgent";
-export type TranscriptMessageKind = "system" | "user" | "assistant" | "thinking" | "tool_call" | "status" | "task" | "request";
+export type TranscriptMessageKind = WebTranscriptMessage["kind"];
+export type TranscriptMessage = WebTranscriptMessage;
 
 export interface ReferenceLabelModel {
   name: string;
@@ -143,17 +145,6 @@ export interface SessionModel {
   msgCount: number;
   lastEvent: string | null;
   toolCount: number;
-}
-
-export interface TranscriptMessage {
-  kind: TranscriptMessageKind;
-  ts: string;
-  text: string | null;
-  runId: string;
-  sequence: number;
-  source: TranscriptEvent["source"] | string;
-  eventType: string;
-  payload: unknown | null;
 }
 
 export interface ChatMessage {
@@ -769,16 +760,7 @@ export function projectActivityModels(input: ActivityFeedResponseProjectionInput
 
 export function projectTranscriptMessages(input: TranscriptPage | TranscriptEvent[] | null | undefined): TranscriptMessage[] {
   const events = Array.isArray(input) ? input : input?.events ?? [];
-  return events.map((event) => ({
-    kind: transcriptKind(event),
-    ts: event.at,
-    text: event.message ?? null,
-    runId: event.runId,
-    sequence: event.sequence,
-    source: event.source,
-    eventType: event.eventType,
-    payload: event.payload ?? null,
-  }));
+  return projectWebTranscript(events);
 }
 
 export function projectSessionModel(run: RunRecord): SessionModel {
@@ -1268,17 +1250,6 @@ function activityVerb(item: ActivityItemProjectionInput): string {
   if (item.kind === "transcript_event") return item.transcript?.eventType ?? item.kind;
   if (item.kind === "writeback_operation") return item.writeback?.operationKind ?? item.kind;
   return item.kind;
-}
-
-function transcriptKind(event: TranscriptEvent): TranscriptMessageKind {
-  const normalizedType = normalizeToken(event.eventType);
-  if (normalizedType.includes("tool")) return "tool_call";
-  if (normalizedType.includes("thought") || normalizedType.includes("thinking")) return "thinking";
-  if (normalizedType.includes("request") || normalizedType.includes("approval")) return "request";
-  if (normalizedType.includes("completed") || normalizedType.includes("task")) return "task";
-  if (event.source === "orchestrator") return "system";
-  if (event.source === "cursor") return "assistant";
-  return "status";
 }
 
 function isTranscriptPage(value: TranscriptPage | TranscriptEvent[] | null | undefined): value is TranscriptPage {

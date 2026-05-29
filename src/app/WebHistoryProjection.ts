@@ -37,6 +37,8 @@ export type TranscriptMessage =
       status: string;
       args: Record<string, unknown>;
       result: string | null;
+      output?: string | null;
+      error?: string | null;
       truncated?: boolean;
     }
   | { kind: "status"; state: string; ts: string; text: string }
