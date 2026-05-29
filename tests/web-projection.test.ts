@@ -12,11 +12,12 @@ import {
   projectDashboardModel,
   projectHistoryModel,
   projectIssueBoardModel,
-  projectSidebarModel,
+  projectIssueModel,
   projectWebReferenceData,
   projectIssueDetailModel,
   projectWebDashboard,
   projectWebIssueBoard,
+  projectWebSidebar,
   projectTranscriptMessages,
   projectWebOrchestratorChat,
   projectWebOrchestratorChatPost,
@@ -24,6 +25,7 @@ import {
   type IssueBoardCardProjectionInput,
   type IssueBoardResponseProjectionInput,
 } from "../src/app/webProjection.js";
+import { projectWebHistory } from "../src/app/WebHistoryProjection.js";
 
 function issueDetails(overrides: Partial<IssueDetailsEnvelope> = {}): IssueDetailsEnvelope {
   return {
@@ -249,6 +251,153 @@ describe("web projection foundation", () => {
     });
   });
 
+  it("enriches issue models from backend detail evidence and keeps missing evidence honest", () => {
+    const base = issueDetails();
+    const enriched = projectIssueModel(
+      card({
+        key: "TEST-ENRICH",
+        issueId: "issue-enrich",
+        issueIdentifier: "TEST-ENRICH",
+        lane: "unknown",
+        issueDetails: issueDetails({
+          issue: {
+            ...base.issue,
+            id: "issue-enrich",
+            identifier: "TEST-ENRICH",
+            title: "Enriched issue",
+            description: "Primary detail",
+            priority: 99,
+            state: null,
+            assigneeId: "assignee-1",
+            delegateId: "delegate-1",
+            labels: ["dogfood", "ui"],
+            blockedBy: [{ id: "issue-blocker", identifier: "TEST-BLOCKER", state: "Todo" }],
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:05:00.000Z",
+          },
+          tracker: { ...base.tracker, state: null, classification: null },
+          blockers: {
+            available: true,
+            totalCount: 1,
+            openCount: 1,
+            open: [{ id: "issue-blocker", identifier: "TEST-BLOCKER", state: "Todo" }],
+            blocked: true,
+            humanBlockedReason: null,
+          },
+          workspace: {
+            ...base.workspace,
+            workspaceKey: "TEST-ENRICH",
+            path: null,
+          },
+          pullRequest: {
+            url: null,
+            number: null,
+            headSha: "head-sha-9",
+            branch: "symphony/TEST-ENRICH",
+            ciStatus: null,
+            lastPushedAt: "2026-01-01T00:06:00.000Z",
+          },
+          latestRun: {
+            runId: "run-enrich",
+            runPhase: "implementation",
+            runKind: "implementation",
+            status: "failed",
+            terminalReason: "failed",
+            error: "Harness failed after report",
+            completedAt: "2026-01-01T00:07:00.000Z",
+          },
+        }),
+        live: null,
+        operatorLiveness: { agentId: null, sessionId: null, workspacePath: null, runId: "operator-run", activeRunId: "active-run", status: "failed" },
+        metadata: { prNumber: 9, ciStatus: "failure", prBranch: "symphony/TEST-ENRICH" },
+        reviewLoop: {
+          phase: "blocked",
+          blockedReason: "needs operator",
+          lastCompletionReport: { id: "report-1", summary: "Worker summary", acceptedAt: "2026-01-01T00:08:00.000Z" },
+          lastReviewVerdict: {
+            id: "verdict-1",
+            verdict: "fail",
+            findings: ["Fix invariant"],
+            evidence: ["review evidence"],
+            submittedAt: "2026-01-01T00:09:00.000Z",
+          },
+        },
+      }),
+    );
+
+    expect(enriched).toMatchObject({
+      id: "TEST-ENRICH",
+      title: "Enriched issue",
+      status: "progress",
+      priority: 3,
+      labels: ["dogfood", "ui"],
+      assignee: "assignee-1",
+      agent: "delegate-1",
+      pr: "#9",
+      ci: "failure",
+      workspace: "TEST-ENRICH",
+      session: "active-run",
+      desc: ["Primary detail", "Blocked by TEST-BLOCKER", "needs operator", "Worker summary", "Fix invariant", "Harness failed after report"],
+    });
+    expect(enriched.activity).toEqual([
+      { t: "2026-01-01T00:00:00.000Z", verb: "created", val: "TEST-ENRICH", who: "tracker" },
+      { t: "2026-01-01T00:05:00.000Z", verb: "updated", val: "TEST-ENRICH", who: "delegate-1" },
+      { t: "2026-01-01T00:06:00.000Z", verb: "pr pushed", val: "#9", who: "github" },
+      { t: "2026-01-01T00:07:00.000Z", verb: "run failed", val: "run-enrich", who: "delegate-1" },
+    ]);
+
+    const sparse = projectIssueModel(
+      card({
+        key: "TEST-SPARSE",
+        issueId: null,
+        issueIdentifier: "TEST-SPARSE",
+        lane: "unknown",
+        issueDetails: issueDetails({
+          issue: {
+            ...base.issue,
+            id: null,
+            identifier: "TEST-SPARSE",
+            title: null,
+            description: null,
+            priority: null,
+            state: null,
+            assigneeId: null,
+            delegateId: null,
+            labels: [],
+            blockedBy: [],
+            createdAt: null,
+            updatedAt: null,
+          },
+          tracker: { ...base.tracker, state: null, classification: null },
+          blockers: { available: false, totalCount: 0, openCount: 0, open: [], blocked: false, humanBlockedReason: null },
+          workspace: { ...base.workspace, workspaceKey: null, path: null },
+          pullRequest: { url: null, number: null, headSha: null, branch: null, ciStatus: null, lastPushedAt: null },
+          latestRun: { runId: null, runPhase: null, runKind: null, status: null, terminalReason: null, error: null, completedAt: null },
+        }),
+        live: null,
+        operatorLiveness: null,
+        metadata: null,
+        reviewLoop: null,
+      }),
+    );
+
+    expect(sparse).toMatchObject({
+      id: "TEST-SPARSE",
+      title: "TEST-SPARSE",
+      status: "backlog",
+      priority: 0,
+      labels: [],
+      assignee: "unassigned",
+      agent: null,
+      pr: null,
+      ci: null,
+      workspace: null,
+      session: null,
+      activity: [],
+    });
+    expect(sparse.desc).toBeUndefined();
+  });
+
   it("projects the React issue-board shape from backend board cards", () => {
     const board = projectWebIssueBoard({
       generatedAt: "2026-01-01T00:06:00.000Z",
@@ -332,6 +481,8 @@ describe("web projection foundation", () => {
     expect(deriveIssueStatus({ lane: "review", state: "Todo", classification: "active" })).toBe("review");
     expect(deriveIssueStatus({ lane: null, state: "Ready to Merge", classification: "active" })).toBe("review");
     expect(deriveIssueStatus({ lane: null, state: null, classification: "terminal" })).toBe("done");
+    expect(deriveIssueStatus({ lane: null, state: null, classification: null, lifecyclePhase: "review" })).toBe("review");
+    expect(deriveIssueStatus({ lane: null, state: null, classification: null, runStatus: "cancelled" })).toBe("cancelled");
     expect(deriveIssueStatus({ lane: null, state: null, classification: null })).toBe("backlog");
     expect(clampIssuePriority("urgent")).toBe("urgent");
     expect(clampIssuePriority(null)).toBe(0);
@@ -469,170 +620,106 @@ describe("web projection foundation", () => {
     expect(projectTranscriptMessages(transcriptEvents)[0]).toMatchObject({ kind: "tool_call", text: "read_file" });
   });
 
-  it("projects sidebar from web-facing board, runtime, activity, history, and chat sources", () => {
-    const activityInput: ActivityFeedResponseProjectionInput = {
-      generatedAt: "2026-01-01T00:11:00.000Z",
-      activity: [
-        {
-          id: "run:run-1:run_started",
-          at: "2026-01-01T00:00:00.000Z",
-          kind: "run_started",
-          source: "run",
-          issue: { id: "issue-1", identifier: "TEST-1" },
-          run: { runId: "run-1", role: "worker", runPhase: "implementation", runKind: "implementation", status: "running", agentId: "agent-1", sessionId: "session-1" },
-          transcript: null,
-          writeback: null,
-        },
+  it("composes the web sidebar model directly from dashboard, issue, history, and chat projections", () => {
+    const issues = projectWebIssueBoard({
+      issues: [
+        webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
+        webCard("TEST-REVIEW", { lane: "review", state: "In Review" }),
       ],
-    };
-    const runtime = {
-      generatedAt: "2026-01-01T00:11:00.000Z",
-      counts: { running: 1, retrying: 0, paused: 0, providerGates: 0 },
-      providerGates: [],
-      providerGateCounts: { active: 0, manual: 0, autoResume: 0 },
-      running: [
-        {
-          issueId: "issue-1",
-          issueIdentifier: "TEST-1",
-          runId: "run-1",
-          startedAt: "2026-01-01T00:01:00.000Z",
-          lastEvent: "progress",
-          lastMessage: "Mapping sidebar",
-          issueDetails: { title: "Live sidebar run" },
-          liveness: { status: "active" },
-          tokens: { inputTokens: 5, outputTokens: 7, totalTokens: 12 },
-        },
-      ],
-      retrying: [],
-      paused: [],
-      totals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, secondsRunning: 0 },
-      rateLimits: null,
-    } as any;
-    const sessions = [
+    });
+    const providerGates = [
       {
-        id: "run-1",
-        issue: "TEST-1",
-        title: "TEST-1: Sidebar mapping",
-        state: "running",
-        model: "gpt-test",
-        startedAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:10:00.000Z",
-        msgCount: 5,
-        lastEvent: "TEST-1 run started",
-        toolCount: 1,
+        id: "gate-1",
+        provider: "openai-codex",
+        kind: "windowed_bucket_exhausted",
+        message: "provider paused",
+        resumeAt: "2026-01-01T05:00:00.000Z",
+        resumePolicy: "auto_at_window_close",
+        sourceIssue: "TEST-REVIEW",
+        sourceRunId: "run-sidebar",
+        affected: "worker",
       },
     ];
-    const chat = [{ who: "agent" as const, text: "Sidebar chat is empty in the API route", suggestions: ["Open TEST-1"] }];
-
-    const sidebar = projectSidebarModel({
-      runtime,
-      board: {
-        issues: [
-          webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
-          webCard("TEST-REVIEW", { lane: "review", state: "In Review" }),
-        ],
+    const runningAgents = [
+      {
+        id: "run-sidebar",
+        issue: "TEST-REVIEW",
+        title: "Review issue",
+        state: "active",
+        step: "reviewing",
+        duration: "1m",
+        tokens: "12",
       },
-      activity: activityInput,
-      sessions,
-      chat,
-    });
+    ];
+    const activity = [{ t: "2026-01-01T00:00:00.000Z", who: "agent-1", verb: "run_started", id: "TEST-REVIEW", extra: "run-sidebar" }];
+    const totals = { backlog: 0, todo: 1, progress: 0, review: 1, done: 0, cancelled: 0, open: 2, all: 2, completeness: 0 };
+    const dashboard = {
+      projectName: "Symphony",
+      repoLabel: "acme/symphony",
+      branch: "main",
+      workflowLabel: "WORKFLOW.md",
+      pollLabel: "poll 60s",
+      agentUsageLabel: "1/2 agents",
+      concurrencyCap: 2,
+      providerGates,
+      runningAgents,
+      activity,
+      chat: [],
+      totals,
+    };
+    const history = projectWebHistory([run({ runId: "run-sidebar", issueIdentifier: "TEST-REVIEW" })], []);
+    const chat = [{ who: "user" as const, text: "show the sidebar" }];
 
-    expect(Object.keys(sidebar).sort()).toEqual(["activity", "chat", "providerGates", "reviewIssues", "runningAgents", "sessions", "totals"]);
-    expect(sidebar.reviewIssues.map((item) => item.id)).toEqual(["TEST-REVIEW"]);
-    expect(sidebar.activity).toEqual([{ t: "2026-01-01T00:00:00.000Z", who: "agent-1", verb: "run_started", id: "TEST-1", extra: "running" }]);
-    expect(sidebar.runningAgents[0]).toMatchObject({ issue: "TEST-1", title: "Live sidebar run", step: "Mapping sidebar", duration: "10m" });
-    expect(sidebar.sessions).toEqual(sessions);
-    expect(sidebar.chat).toEqual(chat);
-    expect(sidebar.totals).toMatchObject({ todo: 1, review: 1, open: 2, all: 2, completeness: 0 });
+    const sidebar = projectWebSidebar(dashboard, issues, history, chat);
+
+    expect(sidebar.providerGates).toBe(providerGates);
+    expect(sidebar.runningAgents).toBe(runningAgents);
+    expect(sidebar.reviewIssues).toEqual(issues.lanes.review);
+    expect(sidebar.activity).toBe(activity);
+    expect(sidebar.sessions).toBe(history.sessions);
+    expect(sidebar.chat).toBe(chat);
+    expect(sidebar.totals).toBe(totals);
   });
 
-  it("caps sidebar review issues to the first three enriched review-lane issues", () => {
-    const richReviewIssue = card({
-      key: "TEST-REVIEW-1",
-      issueId: "issue-review-1",
-      issueIdentifier: "TEST-REVIEW-1",
-      lane: "review",
-      issueDetails: issueDetails({
-        issue: {
-          ...issueDetails().issue,
-          id: "issue-review-1",
-          identifier: "TEST-REVIEW-1",
-          title: "First review issue",
-          description: "Preserve this review description.\n\nSecond review paragraph.",
-          priority: 2,
-          state: "In Review",
-          assigneeId: "assignee-review",
-          delegateId: "delegate-review",
-          labels: ["dogfood-ready", "sidebar"],
-        },
-        workspace: {
-          workspaceKey: "TEST-REVIEW-1",
-          path: "/tmp/workspaces/TEST-REVIEW-1",
-          sourceKind: "git_worktree",
-          branchName: "symphony/TEST-REVIEW-1",
-          gitBranchName: "symphony/TEST-REVIEW-1",
-          repoPath: "/repo",
-          baseRef: "main",
-        },
-        pullRequest: {
-          url: "https://github.com/acme/repo/pull/41",
-          number: 41,
-          headSha: "head-sha-41",
-          branch: "symphony/TEST-REVIEW-1",
-          ciStatus: "success",
-          lastPushedAt: "2026-01-01T00:04:00.000Z",
-        },
-      }),
-      live: {
-        role: "reviewer",
-        runPhase: "review",
-        runKind: "review",
-        state: "running",
-        runId: "run-review-1",
-        agentId: "agent-review-1",
-        sessionId: "session-review-1",
-      },
-      operatorLiveness: {
-        agentId: "agent-review-1",
-        sessionId: "session-review-1",
-        workspacePath: "/tmp/workspaces/TEST-REVIEW-1",
-        runId: "run-review-1",
-        activeRunId: "run-review-1",
-        status: "active",
-      },
+  it("caps sidebar review issues at three while preserving issue projection order", () => {
+    const issues = projectWebIssueBoard({
+      issues: [
+        webCard("TEST-REVIEW-1", { lane: "review", state: "In Review" }),
+        webCard("TEST-REVIEW-2", { lane: "review", state: "Ready to Merge" }),
+        webCard("TEST-REVIEW-3", { lane: "review", state: "In Review" }),
+        webCard("TEST-REVIEW-4", { lane: "review", state: "Ready to Merge" }),
+        webCard("TEST-PROGRESS", { lane: "progress", state: "In Progress" }),
+      ],
     });
 
-    const sidebar = projectSidebarModel({
-      board: {
-        issues: [
-          webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
-          richReviewIssue,
-          webCard("TEST-REVIEW-2", { lane: "review", state: "In Review", title: "Second review issue" }),
-          webCard("TEST-REVIEW-3", { lane: "review", state: "Ready to Merge", title: "Third review issue" }),
-          webCard("TEST-REVIEW-4", { lane: "review", state: "In Review", title: "Fourth review issue" }),
-        ],
-      },
-    });
+    const sidebar = projectWebSidebar(emptyDashboardModel(), issues, projectWebHistory([], []), []);
 
-    expect(sidebar.reviewIssues.map((item) => item.id)).toEqual(["TEST-REVIEW-1", "TEST-REVIEW-2", "TEST-REVIEW-3"]);
-    expect(sidebar.reviewIssues).toHaveLength(3);
-    expect(sidebar.reviewIssues.find((item) => item.id === "TEST-REVIEW-4")).toBeUndefined();
-    expect(sidebar.reviewIssues[0]).toMatchObject({
-      id: "TEST-REVIEW-1",
-      title: "First review issue",
-      status: "review",
-      priority: 2,
-      labels: ["dogfood-ready", "sidebar"],
-      assignee: "assignee-review",
-      agent: "agent-review-1",
-      pr: "#41",
-      ci: "success",
-      workspace: "/tmp/workspaces/TEST-REVIEW-1",
-      session: "session-review-1",
+    expect(issues.lanes.review.map((issue) => issue.id)).toEqual([
+      "TEST-REVIEW-1",
+      "TEST-REVIEW-2",
+      "TEST-REVIEW-3",
+      "TEST-REVIEW-4",
+    ]);
+    expect(sidebar.reviewIssues.map((issue) => issue.id)).toEqual(["TEST-REVIEW-1", "TEST-REVIEW-2", "TEST-REVIEW-3"]);
+    expect(sidebar.reviewIssues[0]).toBe(issues.lanes.review[0]);
+    expect(sidebar.reviewIssues[2]).toBe(issues.lanes.review[2]);
+  });
+
+  it("returns a complete empty sidebar model without mock sidebar-only data", () => {
+    const expected = {
+      providerGates: [],
+      runningAgents: [],
+      reviewIssues: [],
       activity: [],
-      desc: ["Preserve this review description.", "Second review paragraph."],
-    });
-    expect(sidebar.totals).toMatchObject({ todo: 1, review: 4, open: 5, all: 5, completeness: 0 });
+      sessions: [],
+      chat: [],
+      totals: { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 },
+    };
+
+    expect(emptySidebarModel()).toEqual(expected);
+    expect(projectWebSidebar(emptyDashboardModel(), projectWebIssueBoard(null), projectWebHistory([], []), projectWebOrchestratorChat())).toEqual(expected);
+    expect(JSON.stringify(expected)).not.toContain("mock");
+    expect(JSON.stringify(expected)).not.toContain("assistant");
   });
 
   it("projects deterministic reference data from board labels, assignees, and delegates", () => {
@@ -709,16 +796,83 @@ describe("web projection foundation", () => {
     expect(projectIssueBoardModel(null)).toMatchObject({ counts: { total: 0 }, issues: [] });
     expect(projectWebDashboard({ activity: null, board: null, runs: [] })).toEqual(emptyDashboard);
     expect(projectDashboardModel({ activity: null, board: null, runs: [] })).toEqual(emptyDashboard);
-    expect(emptySidebarModel()).toEqual({
-      providerGates: [],
-      runningAgents: [],
-      reviewIssues: [],
-      activity: [],
-      sessions: [],
-      chat: [],
-      totals: emptyDashboard.totals,
+  });
+
+  it("keeps dashboard mapping stable for partial runtime rows and unavailable board data", () => {
+    const dashboard = projectWebDashboard({
+      board: null,
+      runtime: {
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        running: [
+          {
+            issueId: "issue-live",
+            issueIdentifier: "",
+            runId: null,
+            state: "running",
+            lastMessage: "",
+            lastEvent: "executing tool",
+            startedAt: "2026-01-01T00:05:00.000Z",
+            tokens: {},
+          },
+        ],
+        providerGates: [
+          {
+            id: "gate-1",
+            scope: { harnessId: "hermes", providerId: "" },
+            kind: "manual_pause",
+            message: "Provider gate active",
+            window: null,
+            resumePolicy: "manual",
+            source: { issueId: "issue-source", issueIdentifier: "", runId: "" },
+            affectedRoles: [],
+            affectedRunPhases: null,
+          },
+        ],
+      } as any,
+      config: {
+        repoLabel: "acme/symphony",
+        branch: "main",
+        workflowLabel: "WORKFLOW.md",
+        pollIntervalMs: -1,
+        concurrencyCap: 1.9,
+      },
     });
-    expect(projectSidebarModel({ activity: null, board: null, sessions: null, chat: null })).toEqual(emptySidebarModel());
+
+    expect(dashboard).toMatchObject({
+      repoLabel: "acme/symphony",
+      branch: "main",
+      workflowLabel: "WORKFLOW.md",
+      pollLabel: "",
+      agentUsageLabel: "1/1 agents",
+      concurrencyCap: 1,
+      activity: [],
+      chat: [],
+      totals: { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 },
+    });
+    expect(dashboard.runningAgents).toEqual([
+      {
+        id: "issue-live",
+        issue: "issue-live",
+        title: "issue-live",
+        state: "running",
+        step: "executing tool",
+        duration: "",
+        tokens: "",
+      },
+    ]);
+    expect(dashboard.providerGates).toEqual([
+      {
+        id: "gate-1",
+        provider: "hermes",
+        kind: "manual_pause",
+        message: "Provider gate active",
+        resumeAt: null,
+        resumePolicy: "manual",
+        sourceIssue: "issue-source",
+        sourceRunId: null,
+        affected: "",
+      },
+    ]);
   });
 
   it("drops caller-provided dashboard chat input to keep chat behavior out of scope", () => {

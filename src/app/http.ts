@@ -11,7 +11,7 @@ import {
   projectWebOrchestratorChat,
   projectWebOrchestratorChatPost,
   projectWebReferenceData,
-  projectSidebarModel,
+  projectWebSidebar,
   type DashboardRuntimeConfig,
 } from "./webProjection.js";
 import {
@@ -846,7 +846,7 @@ export class StatusServer {
       }
     }
     const runs = (await this.options.runStore?.listRuns()) ?? [];
-    const activity = await buildActivityFeed({
+    const dashboardActivity = await buildActivityFeed({
       generatedAt: snapshot.generatedAt,
       runStore: this.options.runStore,
       runs,
@@ -855,14 +855,26 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: 20 },
       includeTranscriptEvents: false,
     });
-    const history = projectWebHistory(runs, activity.activity);
-    return projectSidebarModel({
-      runtime: snapshot,
-      board,
-      activity,
-      sessions: history.sessions,
-      chat: projectWebOrchestratorChat(),
+    const historyActivity = await buildActivityFeed({
+      generatedAt: snapshot.generatedAt,
+      runStore: this.options.runStore,
+      runs,
+      lifecycleStore: this.options.lifecycleStore,
+      writebackOutbox: this.options.writebackOutbox,
+      query: { issue: null, offset: 0, limit: Number.MAX_SAFE_INTEGER },
+      includeTranscriptEvents: false,
     });
+    return projectWebSidebar(
+      projectWebDashboard({
+        runtime: snapshot,
+        board,
+        activity: dashboardActivity,
+        config: this.options.dashboard ?? null,
+      }),
+      projectWebIssueBoard(board),
+      projectWebHistory(runs, historyActivity.activity),
+      projectWebOrchestratorChat(),
+    );
   }
 
   private async fetchIssueBoard(forceRefresh: boolean): Promise<IssueBoardResponse> {
