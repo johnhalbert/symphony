@@ -663,6 +663,19 @@ describe("StatusServer durable API", () => {
           msgCount: number;
           lastEvent: string;
           toolCount: number;
+          runSession: {
+            runId: string;
+            sessionId: string | null;
+            agentId: string | null;
+            role: string;
+            runPhase: string | null;
+            runKind: string | null;
+            harnessId: string | null;
+            runtime: { model: string | null };
+            cursor: { model: string | null };
+            workspace: { key: string; path: string; repoPath: string | null; baseRef: string | null; branch: string | null };
+            links: { run: string; transcript: string };
+          };
         }>;
         transcriptBySession: Record<string, unknown[]>;
         timeline: Array<{ sess: string; kind: string; text: string; state?: string }>;
@@ -680,6 +693,7 @@ describe("StatusServer durable API", () => {
         "lastEvent",
         "model",
         "msgCount",
+        "runSession",
         "startedAt",
         "state",
         "title",
@@ -695,7 +709,21 @@ describe("StatusServer durable API", () => {
         msgCount: 1,
         lastEvent: "TEST-1 run started",
         toolCount: 0,
+        runSession: {
+          runId: "web-run-1",
+          sessionId: "cursor-session-1",
+          agentId: "agent-1",
+          role: "worker",
+          runPhase: "implementation",
+          runKind: "implementation",
+          harnessId: "cursor",
+          runtime: { model: "claude-sonnet-4" },
+          cursor: { model: "claude-sonnet-4" },
+          workspace: { key: "TEST-1", repoPath: "/repo", baseRef: "main", branch: "symphony/TEST-1" },
+          links: { run: "/api/v1/runs/web-run-1", transcript: "/api/v1/web/sessions/web-run-1/transcript" },
+        },
       });
+
       expect(body.timeline).toHaveLength(1);
       expect(body.timeline[0]).toMatchObject({
         sess: "web-run-1",

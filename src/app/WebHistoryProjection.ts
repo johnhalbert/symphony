@@ -1,6 +1,97 @@
 import type { RunRecord, RunStatus } from "../core/persistence/RunTranscriptStore.js";
+import { sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
+import { runKindForPhase } from "../core/types.js";
+
+type PersistedModelParam = { id: string; value: string };
 
 export type WebRunState = "running" | "finished" | "error" | "cancelled" | "queued";
+
+export interface WebRunSessionRuntimeModel {
+  model: string | null;
+  modelParams: PersistedModelParam[];
+  settingSources: string[];
+  mode: string | null;
+  allowLargeContext: boolean | null;
+  agentLifecycle: string | null;
+}
+
+export interface WebRunSessionCursorModel {
+  model: string | null;
+  modelParams: PersistedModelParam[];
+  settingSources: string[];
+  mode: string | null;
+  allowLargeContext: boolean | null;
+  workerAgentLifecycle: string | null;
+}
+
+export interface WebRunSessionModel {
+  runId: string;
+  sessionId: string | null;
+  agentId: string | null;
+  role: RunRecord["role"];
+  runPhase: NonNullable<RunRecord["runPhase"]> | null;
+  runKind: NonNullable<RunRecord["runKind"]> | null;
+  attempt: number | null;
+  turnNumber: number;
+  harnessId: string | null;
+  status: RunStatus;
+  startedAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  error: string | null;
+  transcriptEventCount: number;
+  tokens: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  };
+  runtime: WebRunSessionRuntimeModel;
+  cursor: WebRunSessionCursorModel;
+  workspace: {
+    key: string;
+    path: string;
+    repoPath: string | null;
+    baseRef: string | null;
+    branch: string | null;
+  };
+  pullRequest: {
+    url: string | null;
+    number: number | null;
+    headSha: string | null;
+    branch: string | null;
+    ciStatus: string | null;
+    lastPushedAt: string | null;
+    lastEvidenceCursor: string | null;
+  };
+  approval: {
+    pendingRequestId: string | null;
+    requestedAt: string | null;
+  };
+  cancellation: {
+    requestedAt: string | null;
+    source: RunRecord["cancellationSource"] | null;
+    reason: string | null;
+    outcome: RunRecord["cancellationOutcome"] | null;
+    harnessStopRequestedAt: string | null;
+    harnessStopFailedAt: string | null;
+    harnessStopFailedReason: string | null;
+    cancelFailed: boolean;
+    cancelFailedAt: string | null;
+    cancelFailedReason: string | null;
+    cancelFailedSource: RunRecord["cancelFailedSource"] | null;
+  };
+  failure: {
+    kind: string | null;
+    diagnosticCode: string | null;
+    diagnosticMessage: string | null;
+    diagnosticAt: string | null;
+  };
+  links: {
+    issue: string;
+    run: string;
+    transcript: string;
+  };
+}
 
 export interface SessionModel {
   id: string;
@@ -13,6 +104,7 @@ export interface SessionModel {
   msgCount: number;
   lastEvent: string;
   toolCount: number;
+  runSession: WebRunSessionModel;
 }
 
 export type TranscriptMessage =
@@ -135,6 +227,93 @@ function projectSession(run: RunRecord, latestActivity: WebHistoryActivityItem |
     msgCount: run.transcriptEventCount ?? 0,
     lastEvent: latestActivity ? timelineText(latestActivity) : fallbackLastEvent(run),
     toolCount: 0,
+    runSession: projectRunSession(run),
+  };
+}
+
+export function projectRunSession(run: RunRecord): WebRunSessionModel {
+  const runPhase = run.runPhase ?? null;
+  return {
+    runId: run.runId,
+    sessionId: cleanString(run.sessionId),
+    agentId: cleanString(run.agentId),
+    role: run.role,
+    runPhase,
+    runKind: run.runKind ?? (runPhase ? runKindForPhase(runPhase) : null),
+    attempt: run.attempt,
+    turnNumber: run.turnNumber,
+    harnessId: cleanString(run.harnessId),
+    status: run.status,
+    startedAt: run.startedAt,
+    updatedAt: run.updatedAt,
+    completedAt: cleanString(run.completedAt),
+    error: publicText(run.error),
+    transcriptEventCount: run.transcriptEventCount ?? 0,
+    tokens: {
+      inputTokens: numericToken(run.tokens.inputTokens),
+      outputTokens: numericToken(run.tokens.outputTokens),
+      totalTokens: numericToken(run.tokens.totalTokens),
+    },
+    runtime: {
+      model: cleanString(run.runtimeModel),
+      modelParams: copyModelParams(run.runtimeModelParams),
+      settingSources: copyStrings(run.runtimeSettingSources),
+      mode: cleanString(run.runtimeMode),
+      allowLargeContext: run.runtimeAllowLargeContext ?? null,
+      agentLifecycle: cleanString(run.runtimeAgentLifecycle),
+    },
+    cursor: {
+      model: cleanString(run.cursorModel),
+      modelParams: copyModelParams(run.cursorModelParams),
+      settingSources: copyStrings(run.cursorSettingSources),
+      mode: cleanString(run.cursorMode),
+      allowLargeContext: run.cursorAllowLargeContext ?? null,
+      workerAgentLifecycle: cleanString(run.cursorWorkerAgentLifecycle),
+    },
+    workspace: {
+      key: run.workspaceKey,
+      path: run.workspacePath,
+      repoPath: cleanString(run.repoPath),
+      baseRef: cleanString(run.baseRef),
+      branch: cleanString(run.gitBranchName),
+    },
+    pullRequest: {
+      url: cleanString(run.prUrl),
+      number: typeof run.prNumber === "number" ? run.prNumber : null,
+      headSha: cleanString(run.prHeadSha),
+      branch: cleanString(run.prBranch),
+      ciStatus: cleanString(run.ciStatus),
+      lastPushedAt: cleanString(run.lastPushedAt),
+      lastEvidenceCursor: cleanString(run.lastEvidenceCursor),
+    },
+    approval: {
+      pendingRequestId: cleanString(run.pendingApprovalRequestId),
+      requestedAt: cleanString(run.pendingApprovalRequestedAt),
+    },
+    cancellation: {
+      requestedAt: cleanString(run.cancellationRequestedAt),
+      source: run.cancellationSource ?? null,
+      reason: publicText(run.cancellationReason),
+      outcome: run.cancellationOutcome ?? null,
+      harnessStopRequestedAt: cleanString(run.harnessStopRequestedAt),
+      harnessStopFailedAt: cleanString(run.harnessStopFailedAt),
+      harnessStopFailedReason: publicText(run.harnessStopFailedReason),
+      cancelFailed: run.cancelFailed ?? false,
+      cancelFailedAt: cleanString(run.cancelFailedAt),
+      cancelFailedReason: publicText(run.cancelFailedReason),
+      cancelFailedSource: run.cancelFailedSource ?? null,
+    },
+    failure: {
+      kind: cleanString(run.failureKind),
+      diagnosticCode: cleanString(run.failureDiagnosticCode),
+      diagnosticMessage: publicText(run.failureDiagnosticMessage),
+      diagnosticAt: cleanString(run.failureDiagnosticAt),
+    },
+    links: {
+      issue: `/api/v1/web/issues/${encodeURIComponent(run.issueIdentifier)}`,
+      run: `/api/v1/runs/${encodeURIComponent(run.runId)}`,
+      transcript: `/api/v1/web/sessions/${encodeURIComponent(run.runId)}/transcript`,
+    },
   };
 }
 
@@ -237,6 +416,49 @@ function cleanString(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function publicText(value: string | null | undefined): string | null {
+  const cleaned = cleanString(value);
+  if (!cleaned) return null;
+  return sanitizedPreviewValue(cleaned).preview ?? null;
+}
+
+function numericToken(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function copyStrings(values: readonly string[] | undefined): string[] {
+  if (!Array.isArray(values)) return [];
+  return values.map((value) => publicText(value)).filter((value): value is string => value !== null);
+}
+
+function copyModelParams(values: readonly PersistedModelParam[] | undefined): PersistedModelParam[] {
+  if (!Array.isArray(values)) return [];
+  const params: PersistedModelParam[] = [];
+  for (const param of values) {
+    const rawId = typeof param.id === "string" ? param.id : "";
+    const id = publicText(rawId);
+    if (!id) continue;
+    const sensitiveId = isSensitiveParamId(rawId) || isSensitiveParamId(id);
+    const value = sensitiveId ? "[redacted]" : (publicText(param.value) ?? "");
+    params.push({ id, value });
+  }
+  return params;
+}
+
+function isSensitiveParamId(id: string): boolean {
+  const normalized = id.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return (
+    normalized.includes("apikey") ||
+    normalized.includes("authorization") ||
+    normalized.includes("password") ||
+    normalized.includes("secret") ||
+    normalized.includes("privatekey") ||
+    normalized.includes("accesstoken") ||
+    normalized.includes("refreshtoken") ||
+    (normalized.endsWith("token") && !normalized.endsWith("tokens"))
+  );
 }
 
 function promptPreview(prompt: string): string {

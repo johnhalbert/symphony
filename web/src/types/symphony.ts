@@ -78,6 +78,66 @@ export interface ActivityModel {
   extra: string;
 }
 
+export interface RunSessionModelParam {
+  id: string;
+  value: string;
+}
+
+export interface RunSessionModelSettings {
+  model: string | null;
+  modelParams: RunSessionModelParam[];
+  settingSources: string[];
+  mode: string | null;
+  allowLargeContext: boolean | null;
+}
+
+export interface RunSessionModel {
+  runId: string;
+  sessionId: string | null;
+  agentId: string | null;
+  role: string;
+  runPhase: string | null;
+  runKind: string | null;
+  attempt: number | null;
+  turnNumber: number;
+  harnessId: string | null;
+  status: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  error: string | null;
+  transcriptEventCount: number;
+  tokens: { inputTokens: number; outputTokens: number; totalTokens: number };
+  runtime: RunSessionModelSettings & { agentLifecycle: string | null };
+  cursor: RunSessionModelSettings & { workerAgentLifecycle: string | null };
+  workspace: { key: string; path: string; repoPath: string | null; baseRef: string | null; branch: string | null };
+  pullRequest: {
+    url: string | null;
+    number: number | null;
+    headSha: string | null;
+    branch: string | null;
+    ciStatus: string | null;
+    lastPushedAt: string | null;
+    lastEvidenceCursor: string | null;
+  };
+  approval: { pendingRequestId: string | null; requestedAt: string | null };
+  cancellation: {
+    requestedAt: string | null;
+    source: string | null;
+    reason: string | null;
+    outcome: string | null;
+    harnessStopRequestedAt: string | null;
+    harnessStopFailedAt: string | null;
+    harnessStopFailedReason: string | null;
+    cancelFailed: boolean;
+    cancelFailedAt: string | null;
+    cancelFailedReason: string | null;
+    cancelFailedSource: string | null;
+  };
+  failure: { kind: string | null; diagnosticCode: string | null; diagnosticMessage: string | null; diagnosticAt: string | null };
+  links: { issue: string; run: string; transcript: string };
+}
+
 export interface SessionModel {
   id: string;
   issue: string;
@@ -89,6 +149,7 @@ export interface SessionModel {
   msgCount: number;
   lastEvent: string;
   toolCount: number;
+  runSession?: RunSessionModel;
 }
 
 export interface ChatMessage {
