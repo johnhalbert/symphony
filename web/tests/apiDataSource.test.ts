@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
-import type { ChatMessage, HistoryModel, TranscriptMessage } from "../src/types/symphony";
+import type { ChatMessage, DashboardModel, HistoryModel, IssueBoardModel, TranscriptMessage } from "../src/types/symphony";
 
 const originalFetch = globalThis.fetch;
 
@@ -66,6 +66,84 @@ const transcript: TranscriptMessage[] = [
   },
 ];
 
+const dashboardModel: DashboardModel = {
+  projectName: "Symphony API",
+  repoLabel: "johnhalbert/symphony",
+  branch: "sinfonista/api-source",
+  workflowLabel: "WORKFLOW.md@main",
+  pollLabel: "poll 10s",
+  agentUsageLabel: "1/2 agents",
+  concurrencyCap: 2,
+  providerGates: [],
+  runningAgents: [
+    {
+      id: "agent-api-1",
+      issue: "ENG-115",
+      title: "Add API data source tests",
+      state: "running",
+      step: "validating",
+      duration: "2m",
+      tokens: "4k",
+    },
+  ],
+  activity: [{ t: "now", who: "orchestrator", verb: "dispatched", id: "ENG-115", extra: "worker" }],
+  chat: [{ who: "agent", text: "Dashboard loaded from the API." }],
+  totals: { backlog: 1, todo: 1, progress: 1, review: 1, done: 2, cancelled: 0, open: 4, all: 6, completeness: 33 },
+};
+
+const issueBoardIssues: IssueBoardModel["issues"] = [
+  {
+    id: "ENG-2",
+    title: "Todo issue from API",
+    status: "todo",
+    priority: 1,
+    labels: ["dogfood-ready"],
+    assignee: "delegate-a",
+    agent: "agent-api-2",
+    project: "Symphony",
+    cycle: "Cycle API",
+    desc: ["Server-projected description should pass through unchanged."],
+    activity: [{ t: "now", verb: "queued", val: "worker", who: "orchestrator" }],
+    pr: "#84",
+    ci: "pending",
+    workspace: "ENG-2",
+    session: "session-api-2",
+  },
+  {
+    id: "ENG-1",
+    title: "Backlog issue from API",
+    status: "backlog",
+    priority: "urgent",
+    labels: ["api"],
+    assignee: "unassigned",
+    project: "Symphony",
+    cycle: "Cycle API",
+  },
+  {
+    id: "ENG-3",
+    title: "Review issue from API",
+    status: "review",
+    priority: 3,
+    labels: ["review-loop"],
+    assignee: "reviewer-a",
+    project: "Symphony",
+    cycle: "Cycle API",
+  },
+];
+
+const issueBoardModel: IssueBoardModel = {
+  issues: issueBoardIssues,
+  backlog: [issueBoardIssues[1], issueBoardIssues[0]],
+  lanes: {
+    todo: [issueBoardIssues[0]],
+    progress: [],
+    review: [issueBoardIssues[2]],
+  },
+  cycleLabel: "Symphony · API Cycle",
+  cycleDateRange: "May 29 - Jun 12",
+  selectedIssueId: "ENG-2",
+};
+
 describe("API data source", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -77,6 +155,30 @@ describe("API data source", () => {
     await createApiDataSource("").getDashboard();
 
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/dashboard", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
+  it("returns the dashboard payload from GET /api/v1/web/dashboard without mock fallbacks", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(dashboardModel));
+
+    await expect(createApiDataSource("/status-server/").getDashboard()).resolves.toEqual(dashboardModel);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/status-server/api/v1/web/dashboard", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
+  it("returns the issue-board payload from GET /api/v1/web/issues without client-side reshaping", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(issueBoardModel));
+
+    await expect(createApiDataSource("https://symphony.example.test/").getIssueBoard()).resolves.toEqual(issueBoardModel);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("https://symphony.example.test/api/v1/web/issues", {
       headers: { Accept: "application/json" },
       signal: undefined,
     });
@@ -162,6 +264,18 @@ describe("API data source", () => {
     });
   });
 
+  it("derives session lists from GET /api/v1/web/history instead of a legacy sessions endpoint", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(historyModel));
+
+    await expect(createApiDataSource("").getSessions()).resolves.toEqual(historyModel.sessions);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/history", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
   it("loads selected session transcripts using the encoded web session id", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(transcript));
 
@@ -207,6 +321,25 @@ describe("API data source", () => {
     });
   });
 
+  it("posts orchestrator chat input to the configured API base URL", async () => {
+    const responseChat: ChatMessage[] = [{ who: "agent", text: "Inspecting ENG-115 from the API." }];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(responseChat));
+
+    await expect(createApiDataSource("https://symphony.example///").sendOrchestratorMessage("inspect ENG-115")).resolves.toEqual(
+      responseChat,
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("https://symphony.example/api/v1/web/orchestrator-chat", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ input: "inspect ENG-115" }),
+    });
+  });
+
   it("surfaces non-2xx API responses as errors", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: "nope" }, { status: 502 }));
 
@@ -236,6 +369,14 @@ describe("API data source", () => {
 
     await expect(createApiDataSource("https://symphony.example").getOrchestratorChat()).rejects.toThrow(
       "Symphony API returned HTTP 503",
+    );
+  });
+
+  it("surfaces non-2xx orchestrator chat POST responses instead of appending mock chat", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: { code: "approval_required" } }, { status: 409 }));
+
+    await expect(createApiDataSource("").sendOrchestratorMessage("resume ENG-115")).rejects.toThrow(
+      "Symphony API returned HTTP 409",
     );
   });
 });
