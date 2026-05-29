@@ -1,4 +1,5 @@
-import { type CSSProperties, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, useEffect, useState } from "react";
+import { useIssueDetail } from "../../hooks/useSymphonyData";
 import type { IssueBoardModel, IssuesVariant } from "../../types/symphony";
 import { BacklogColumn } from "./BacklogColumn";
 import { DetailColumn } from "./DetailColumn";
@@ -28,7 +29,9 @@ export function IssuesView({
     setSelectedId((currentSelectedId) => resolveSelectedIssueId(currentSelectedId, board));
   }, [board.issues, board.selectedIssueId]);
 
-  const selectedIssue = useMemo(() => board.issues.find((issue) => issue.id === selectedId) ?? null, [board.issues, selectedId]);
+  const effectiveSelectedId = resolveSelectedIssueId(selectedId, board);
+  const selectedDetailId = detailOpen && effectiveSelectedId ? effectiveSelectedId : null;
+  const issueDetail = useIssueDetail(selectedDetailId);
   const columns = variant === "detail-heavy" ? "240px minmax(0, 1fr) 480px" : "280px minmax(0, 1fr) 400px";
   const closedColumns = `${columns.split(" ").slice(0, 2).join(" ")} 0`;
   const layoutStyle = {
@@ -47,9 +50,18 @@ export function IssuesView({
       data-detail={detailOpen}
       style={layoutStyle}
     >
-      <BacklogColumn backlog={board.backlog} selectedId={selectedId} onSelect={selectIssue} />
-      <Swimlanes board={board} selectedId={selectedId} onSelect={selectIssue} />
-      {detailOpen ? <DetailColumn issue={selectedIssue} onClose={() => setDetailOpen(false)} /> : null}
+      <BacklogColumn backlog={board.backlog} selectedId={effectiveSelectedId} onSelect={selectIssue} />
+      <Swimlanes board={board} selectedId={effectiveSelectedId} onSelect={selectIssue} />
+      {detailOpen ? (
+        <DetailColumn
+          issue={issueDetail.data?.issue ?? null}
+          issueId={selectedDetailId}
+          loading={Boolean(selectedDetailId) && issueDetail.loading}
+          error={issueDetail.error}
+          emptyMessage={selectedDetailId ? "Issue detail not found or unavailable." : undefined}
+          onClose={() => setDetailOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
