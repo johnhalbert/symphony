@@ -128,19 +128,6 @@ export function DetailColumn({
               {(issue.desc || ["No description."]).map((paragraph, index) => (
                 <p key={index}>{paragraph}</p>
               ))}
-              <h5>Acceptance</h5>
-              <ul>
-                <li>
-                  Backoff curve: <code>min(4_000 * 2^(attempt-1), 300_000)</code> ms.
-                </li>
-                <li>
-                  Apply full jitter via <code>:rand.uniform/1</code>.
-                </li>
-                <li>Cover with unit + property tests.</li>
-                <li>
-                  Document the chosen curve in <code>WORKFLOW.md</code>.
-                </li>
-              </ul>
             </div>
           </div>
           <div className="detail__section">
