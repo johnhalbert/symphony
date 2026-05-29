@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
-import type { HistoryModel, TranscriptMessage } from "../src/types/symphony";
+import type { ChatMessage, HistoryModel, TranscriptMessage } from "../src/types/symphony";
 
 const originalFetch = globalThis.fetch;
 
@@ -174,18 +174,36 @@ describe("API data source", () => {
     });
   });
 
-  it("posts orchestrator chat messages through the same relative API boundary", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse([{ speaker: "system", text: "Queued" }]));
+  it("loads GET /api/v1/web/orchestrator-chat from the configured API base URL", async () => {
+    const chat: ChatMessage[] = [
+      { who: "agent", text: "Chat loaded from the API.", suggestions: ["Inspect ENG-108"] },
+      { who: "user", text: "show active workers" },
+    ];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(chat));
 
-    await createApiDataSource("").sendOrchestratorMessage("refresh status");
+    await expect(createApiDataSource("https://symphony.example///").getOrchestratorChat()).resolves.toEqual(chat);
 
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("https://symphony.example/api/v1/web/orchestrator-chat", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
+  it("posts orchestrator chat input to the same relative API boundary and returns the response chat", async () => {
+    const responseChat: ChatMessage[] = [{ who: "user", text: "pause ENG-108" }];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(responseChat));
+
+    await expect(createApiDataSource("").sendOrchestratorMessage("pause ENG-108")).resolves.toEqual(responseChat);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/orchestrator-chat", {
       method: "POST",
       headers: {
         Accept: "application/json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ input: "refresh status" }),
+      body: JSON.stringify({ input: "pause ENG-108" }),
     });
   });
 
@@ -211,6 +229,14 @@ describe("API data source", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: "unavailable" }, { status: 503 }));
 
     await expect(createApiDataSource("http://localhost:7331").getHistory()).rejects.toThrow("Symphony API returned HTTP 503");
+  });
+
+  it("surfaces non-2xx orchestrator chat responses instead of substituting mock chat", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: { code: "unavailable" } }, { status: 503 }));
+
+    await expect(createApiDataSource("https://symphony.example").getOrchestratorChat()).rejects.toThrow(
+      "Symphony API returned HTTP 503",
+    );
   });
 });
 

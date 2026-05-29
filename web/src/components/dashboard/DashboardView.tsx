@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useDataSource } from "../../data/dataSourceContext";
-import type { DashboardModel, DashboardVariant } from "../../types/symphony";
+import type { ChatMessage, DashboardModel, DashboardVariant } from "../../types/symphony";
 import { Icon } from "../common";
 import { AgentRow } from "./AgentRow";
 import { BurndownCommandCenter, BurndownPanel, Sparkline, StatsGridDense, StatsRow } from "./Stats";
@@ -8,16 +8,27 @@ import { OrchestratorChat } from "./OrchestratorChat";
 
 export function DashboardView({
   dashboard,
+  orchestratorChat,
+  orchestratorChatError = null,
+  orchestratorChatLoading = false,
   variant = "cards",
   useModelBurnupTotals = true,
 }: {
   dashboard: DashboardModel;
+  orchestratorChat?: ChatMessage[];
+  orchestratorChatError?: string | null;
+  orchestratorChatLoading?: boolean;
   variant?: DashboardVariant;
   useModelBurnupTotals?: boolean;
 }) {
   const dataSource = useDataSource();
-  const [chat, setChat] = useState(dashboard.chat);
+  const sourceChat = orchestratorChat ?? dashboard.chat;
+  const [chat, setChat] = useState(sourceChat);
   const totals = dashboard.totals;
+
+  useEffect(() => {
+    setChat(sourceChat);
+  }, [sourceChat]);
 
   async function sendChat(input: string) {
     const nextMessages = await dataSource.sendOrchestratorMessage(input);
@@ -140,7 +151,13 @@ export function DashboardView({
         </div>
       </div>
 
-      <OrchestratorChat messages={chat} onSend={sendChat} subtitle={chatSubtitle(dashboard)} />
+      <OrchestratorChat
+        messages={chat}
+        onSend={sendChat}
+        subtitle={chatSubtitle(dashboard)}
+        loading={orchestratorChatLoading}
+        error={orchestratorChatError}
+      />
     </div>
   );
 }

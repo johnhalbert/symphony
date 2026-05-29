@@ -35,6 +35,10 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: npm ci --prefix web
+      - run: npm run typecheck --prefix web
+      - run: npm test --prefix web
+      - run: npm run build --prefix web
       - run: npm run extension:ci
       - run: npm run extension:typecheck
       - run: npm run extension:test

@@ -129,7 +129,7 @@ describe("sidebar views", () => {
     expect(primary).toContain("No review issues.");
     expect(primary).toContain("No recent activity.");
     expect(history).toContain("No sidebar sessions yet.");
-    expect(chat).toContain("No orchestrator messages yet.");
+    expect(chat).toContain("No durable orchestrator chat messages are available yet.");
     expect(chat).not.toContain("chat__suggestion");
     expect(chat).not.toContain("Show running agents");
   });
