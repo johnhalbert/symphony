@@ -248,6 +248,21 @@ export interface IssueBoardCardMetadataInput {
   baseRef?: string | null | undefined;
 }
 
+interface IssueBoardCardReviewLoopInput {
+  phase?: string | null;
+  blockedReason?: string | null;
+  reviewRound?: number | null;
+  incompleteTurnCount?: number | null;
+  lastCompletionReport?: { summary?: string | null; acceptedAt?: string | null; id?: string | null } | null;
+  lastReviewVerdict?: {
+    verdict?: string | null;
+    findings?: string[] | null;
+    evidence?: string[] | null;
+    submittedAt?: string | null;
+    id?: string | null;
+  } | null;
+}
+
 export interface IssueBoardCardProjectionInput {
   key: string;
   issueId: string | null;
@@ -258,6 +273,7 @@ export interface IssueBoardCardProjectionInput {
   paused?: boolean;
   live?: IssueBoardCardLiveInput | null;
   operatorLiveness?: WebOperatorLivenessInput | null;
+  reviewLoop?: IssueBoardCardReviewLoopInput | null;
   metadata?: IssueBoardCardMetadataInput | null;
 }
 
@@ -566,26 +582,42 @@ export function projectIssueModel(
   const issue = details.issue;
   const id =
     firstNonEmpty(issue.identifier, card?.issueIdentifier, issue.id, card?.issueId, card?.key, options.requestKey) ?? "";
-  const description = normalizeDescription(issue.description);
   const operatorLiveness = options.operatorLiveness ?? card?.operatorLiveness ?? null;
   const pullRequest = details.pullRequest;
   const model: IssueModel = {
     id,
     title: firstNonEmpty(issue.title) ?? id,
-    status: deriveIssueStatus({ lane: options.lane ?? card?.lane ?? null, state: issue.state, classification: details.tracker.classification }),
+    status: deriveIssueStatus({
+      lane: options.lane ?? card?.lane ?? null,
+      state: issue.state,
+      classification: details.tracker.classification,
+      lifecyclePhase: card?.reviewLoop?.phase ?? null,
+      runStatus: details.latestRun.status,
+    }),
     priority: clampIssuePriority(issue.priority),
     labels: Array.isArray(issue.labels) ? [...issue.labels] : [],
     assignee: firstNonEmpty(issue.assigneeId) ?? "unassigned",
     agent: agentIdFromInputs(card, operatorLiveness),
     project: "",
     cycle: "",
-    activity: [],
-    pr: formatPullRequest(pullRequest),
-    ci: pullRequest.ciStatus ?? card?.metadata?.ciStatus ?? null,
+    activity: projectIssueActivity(details, card, operatorLiveness),
+    pr: formatPullRequest(pullRequest, card?.metadata ?? null),
+    ci: pullRequest.ciStatus ?? card?.metadata?.ciStatus ?? options.latestRun?.ciStatus ?? null,
     workspace:
-      firstNonEmpty(details.workspace.path, operatorLiveness?.workspacePath, options.latestRun?.workspacePath) ?? null,
-    session: firstNonEmpty(operatorLiveness?.sessionId, options.latestRun?.sessionId) ?? null,
+      firstNonEmpty(details.workspace.path, operatorLiveness?.workspacePath, options.latestRun?.workspacePath, details.workspace.workspaceKey) ?? null,
+    session:
+      firstNonEmpty(
+        operatorLiveness?.sessionId,
+        card?.live?.sessionId,
+        options.latestRun?.sessionId,
+        operatorLiveness?.activeRunId,
+        operatorLiveness?.runId,
+        card?.live?.runId,
+        options.latestRun?.runId,
+        details.latestRun.runId,
+      ) ?? null,
   };
+  const description = projectIssueDescription(details, card?.reviewLoop ?? null);
   if (description.length > 0) model.desc = description;
   return model;
 }
@@ -801,6 +833,8 @@ export function deriveIssueStatus(input: {
   lane?: IssueBoardColumnId | "cancelled" | string | null;
   state?: string | null;
   classification?: IssueStateClassification | null;
+  lifecyclePhase?: string | null;
+  runStatus?: RunRecord["status"] | string | null;
 }): IssueStatus {
   const laneStatus = issueStatusFromLane(input.lane ?? null);
   if (laneStatus) return laneStatus;
@@ -818,10 +852,15 @@ export function deriveIssueStatus(input: {
     case "unknown":
     case null:
     case undefined:
-      return "backlog";
+      break;
     default:
-      return "backlog";
+      break;
   }
+  const lifecycleStatus = issueStatusFromLifecyclePhase(input.lifecyclePhase ?? null);
+  if (lifecycleStatus) return lifecycleStatus;
+  const runStatus = issueStatusFromRunStatus(input.runStatus ?? null);
+  if (runStatus) return runStatus;
+  return "backlog";
 }
 
 function emptyDashboardTotals(): DashboardTotals {
@@ -1053,7 +1092,7 @@ function normalizeReferenceKey(value: string | null | undefined): string | null 
 }
 
 function agentIdFromInputs(card: IssueBoardCardProjectionInput | null, operatorLiveness: WebOperatorLivenessInput | null): string | null {
-  return firstNonEmpty(operatorLiveness?.agentId, card?.live?.agentId) ?? null;
+  return firstNonEmpty(operatorLiveness?.agentId, card?.live?.agentId, card?.issueDetails.issue.delegateId) ?? null;
 }
 
 function issueStatusFromLane(lane: IssueBoardColumnId | "cancelled" | string | null): IssueStatus | null {
@@ -1084,6 +1123,27 @@ function issueStatusFromState(state: string | null): IssueStatus | null {
   return null;
 }
 
+function issueStatusFromLifecyclePhase(phase: string | null): IssueStatus | null {
+  if (!phase) return null;
+  const normalized = normalizeToken(phase);
+  if (normalized === "implementation" || normalized === "merge_conflict_resolution" || normalized === "blocked") {
+    return "progress";
+  }
+  if (normalized === "review" || normalized === "passed") return "review";
+  if (normalized === "terminal") return "done";
+  return null;
+}
+
+function issueStatusFromRunStatus(status: RunRecord["status"] | string | null): IssueStatus | null {
+  if (!status) return null;
+  const normalized = normalizeToken(status);
+  if (normalized === "running") return "progress";
+  if (normalized === "succeeded") return "done";
+  if (normalized === "cancelled" || normalized === "canceled") return "cancelled";
+  if (normalized === "failed") return "progress";
+  return null;
+}
+
 function isIssueStatus(value: string): value is IssueStatus {
   return ISSUE_STATUS_ORDER.includes(value as IssueStatus);
 }
@@ -1096,9 +1156,84 @@ function normalizeToken(value: string): string {
   return value.trim().toLowerCase().replace(/[\s-]+/g, "_");
 }
 
-function formatPullRequest(pullRequest: IssuePullRequestSummary): string | null {
+function projectIssueDescription(
+  details: IssueDetailsEnvelope,
+  reviewLoop: IssueBoardCardReviewLoopInput | null,
+): string[] {
+  const description = normalizeDescription(details.issue.description);
+  const blockerText = issueBlockerDescription(details);
+  if (blockerText) description.push(blockerText);
+  addUniqueText(description, reviewLoop?.blockedReason ?? null);
+  addUniqueText(description, reviewLoop?.lastCompletionReport?.summary ?? null);
+  for (const finding of reviewLoop?.lastReviewVerdict?.findings ?? []) {
+    addUniqueText(description, finding);
+  }
+  if (details.latestRun.error) addUniqueText(description, details.latestRun.error);
+  return description;
+}
+
+function issueBlockerDescription(details: IssueDetailsEnvelope): string | null {
+  if (details.blockers.humanBlockedReason) return `Blocked: ${details.blockers.humanBlockedReason}`;
+  if (details.blockers.openCount <= 0) return null;
+  const blockerIds = details.blockers.open
+    .map((blocker) => firstNonEmpty(blocker.identifier, blocker.id))
+    .filter((value): value is string => value !== null);
+  if (blockerIds.length === 0) return null;
+  return `Blocked by ${blockerIds.join(", ")}`;
+}
+
+function addUniqueText(target: string[], value: string | null | undefined): void {
+  const normalized = firstNonEmpty(value);
+  if (!normalized || target.includes(normalized)) return;
+  target.push(normalized);
+}
+
+function projectIssueActivity(
+  details: IssueDetailsEnvelope,
+  card: IssueBoardCardProjectionInput | null,
+  operatorLiveness: WebOperatorLivenessInput | null,
+): NonNullable<IssueModel["activity"]> {
+  const issue = details.issue;
+  const actor = firstNonEmpty(operatorLiveness?.agentId, card?.live?.agentId, issue.delegateId, issue.assigneeId, details.source) ?? "";
+  const activity: NonNullable<IssueModel["activity"]> = [];
+  appendIssueActivity(activity, issue.createdAt, "created", firstNonEmpty(issue.state, issue.identifier, issue.id) ?? "", details.source);
+  if (issue.updatedAt !== issue.createdAt) {
+    appendIssueActivity(activity, issue.updatedAt, "updated", firstNonEmpty(issue.state, issue.identifier, issue.id) ?? "", actor);
+  }
+  appendIssueActivity(
+    activity,
+    details.pullRequest.lastPushedAt,
+    "pr pushed",
+    formatPullRequest(details.pullRequest, card?.metadata ?? null) ?? firstNonEmpty(details.pullRequest.branch, card?.metadata?.prBranch) ?? "",
+    "github",
+  );
+  appendIssueActivity(
+    activity,
+    details.latestRun.completedAt,
+    "run " + (details.latestRun.status ?? "completed"),
+    details.latestRun.runId ?? "",
+    actor,
+  );
+  return activity;
+}
+
+function appendIssueActivity(
+  target: NonNullable<IssueModel["activity"]>,
+  at: string | null | undefined,
+  verb: string,
+  value: string,
+  who: string,
+): void {
+  const t = firstNonEmpty(at);
+  if (!t) return;
+  target.push({ t, verb, val: value, who });
+}
+
+function formatPullRequest(pullRequest: IssuePullRequestSummary, metadata?: IssueBoardCardMetadataInput | null): string | null {
   if (pullRequest.number !== null) return "#" + String(pullRequest.number);
-  return pullRequest.url ?? null;
+  if (pullRequest.url !== null) return pullRequest.url;
+  if (metadata?.prNumber !== null && metadata?.prNumber !== undefined) return "#" + String(metadata.prNumber);
+  return metadata?.prUrl ?? null;
 }
 
 function firstNonEmpty(...values: Array<string | null | undefined>): string | null {

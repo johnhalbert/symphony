@@ -11,6 +11,7 @@ import {
   projectDashboardModel,
   projectHistoryModel,
   projectIssueBoardModel,
+  projectIssueModel,
   projectWebReferenceData,
   projectIssueDetailModel,
   projectWebDashboard,
@@ -247,6 +248,153 @@ describe("web projection foundation", () => {
     });
   });
 
+  it("enriches issue models from backend detail evidence and keeps missing evidence honest", () => {
+    const base = issueDetails();
+    const enriched = projectIssueModel(
+      card({
+        key: "TEST-ENRICH",
+        issueId: "issue-enrich",
+        issueIdentifier: "TEST-ENRICH",
+        lane: "unknown",
+        issueDetails: issueDetails({
+          issue: {
+            ...base.issue,
+            id: "issue-enrich",
+            identifier: "TEST-ENRICH",
+            title: "Enriched issue",
+            description: "Primary detail",
+            priority: 99,
+            state: null,
+            assigneeId: "assignee-1",
+            delegateId: "delegate-1",
+            labels: ["dogfood", "ui"],
+            blockedBy: [{ id: "issue-blocker", identifier: "TEST-BLOCKER", state: "Todo" }],
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:05:00.000Z",
+          },
+          tracker: { ...base.tracker, state: null, classification: null },
+          blockers: {
+            available: true,
+            totalCount: 1,
+            openCount: 1,
+            open: [{ id: "issue-blocker", identifier: "TEST-BLOCKER", state: "Todo" }],
+            blocked: true,
+            humanBlockedReason: null,
+          },
+          workspace: {
+            ...base.workspace,
+            workspaceKey: "TEST-ENRICH",
+            path: null,
+          },
+          pullRequest: {
+            url: null,
+            number: null,
+            headSha: "head-sha-9",
+            branch: "symphony/TEST-ENRICH",
+            ciStatus: null,
+            lastPushedAt: "2026-01-01T00:06:00.000Z",
+          },
+          latestRun: {
+            runId: "run-enrich",
+            runPhase: "implementation",
+            runKind: "implementation",
+            status: "failed",
+            terminalReason: "failed",
+            error: "Harness failed after report",
+            completedAt: "2026-01-01T00:07:00.000Z",
+          },
+        }),
+        live: null,
+        operatorLiveness: { agentId: null, sessionId: null, workspacePath: null, runId: "operator-run", activeRunId: "active-run", status: "failed" },
+        metadata: { prNumber: 9, ciStatus: "failure", prBranch: "symphony/TEST-ENRICH" },
+        reviewLoop: {
+          phase: "blocked",
+          blockedReason: "needs operator",
+          lastCompletionReport: { id: "report-1", summary: "Worker summary", acceptedAt: "2026-01-01T00:08:00.000Z" },
+          lastReviewVerdict: {
+            id: "verdict-1",
+            verdict: "fail",
+            findings: ["Fix invariant"],
+            evidence: ["review evidence"],
+            submittedAt: "2026-01-01T00:09:00.000Z",
+          },
+        },
+      }),
+    );
+
+    expect(enriched).toMatchObject({
+      id: "TEST-ENRICH",
+      title: "Enriched issue",
+      status: "progress",
+      priority: 3,
+      labels: ["dogfood", "ui"],
+      assignee: "assignee-1",
+      agent: "delegate-1",
+      pr: "#9",
+      ci: "failure",
+      workspace: "TEST-ENRICH",
+      session: "active-run",
+      desc: ["Primary detail", "Blocked by TEST-BLOCKER", "needs operator", "Worker summary", "Fix invariant", "Harness failed after report"],
+    });
+    expect(enriched.activity).toEqual([
+      { t: "2026-01-01T00:00:00.000Z", verb: "created", val: "TEST-ENRICH", who: "tracker" },
+      { t: "2026-01-01T00:05:00.000Z", verb: "updated", val: "TEST-ENRICH", who: "delegate-1" },
+      { t: "2026-01-01T00:06:00.000Z", verb: "pr pushed", val: "#9", who: "github" },
+      { t: "2026-01-01T00:07:00.000Z", verb: "run failed", val: "run-enrich", who: "delegate-1" },
+    ]);
+
+    const sparse = projectIssueModel(
+      card({
+        key: "TEST-SPARSE",
+        issueId: null,
+        issueIdentifier: "TEST-SPARSE",
+        lane: "unknown",
+        issueDetails: issueDetails({
+          issue: {
+            ...base.issue,
+            id: null,
+            identifier: "TEST-SPARSE",
+            title: null,
+            description: null,
+            priority: null,
+            state: null,
+            assigneeId: null,
+            delegateId: null,
+            labels: [],
+            blockedBy: [],
+            createdAt: null,
+            updatedAt: null,
+          },
+          tracker: { ...base.tracker, state: null, classification: null },
+          blockers: { available: false, totalCount: 0, openCount: 0, open: [], blocked: false, humanBlockedReason: null },
+          workspace: { ...base.workspace, workspaceKey: null, path: null },
+          pullRequest: { url: null, number: null, headSha: null, branch: null, ciStatus: null, lastPushedAt: null },
+          latestRun: { runId: null, runPhase: null, runKind: null, status: null, terminalReason: null, error: null, completedAt: null },
+        }),
+        live: null,
+        operatorLiveness: null,
+        metadata: null,
+        reviewLoop: null,
+      }),
+    );
+
+    expect(sparse).toMatchObject({
+      id: "TEST-SPARSE",
+      title: "TEST-SPARSE",
+      status: "backlog",
+      priority: 0,
+      labels: [],
+      assignee: "unassigned",
+      agent: null,
+      pr: null,
+      ci: null,
+      workspace: null,
+      session: null,
+      activity: [],
+    });
+    expect(sparse.desc).toBeUndefined();
+  });
+
   it("projects the React issue-board shape from backend board cards", () => {
     const board = projectWebIssueBoard({
       generatedAt: "2026-01-01T00:06:00.000Z",
@@ -330,6 +478,8 @@ describe("web projection foundation", () => {
     expect(deriveIssueStatus({ lane: "review", state: "Todo", classification: "active" })).toBe("review");
     expect(deriveIssueStatus({ lane: null, state: "Ready to Merge", classification: "active" })).toBe("review");
     expect(deriveIssueStatus({ lane: null, state: null, classification: "terminal" })).toBe("done");
+    expect(deriveIssueStatus({ lane: null, state: null, classification: null, lifecyclePhase: "review" })).toBe("review");
+    expect(deriveIssueStatus({ lane: null, state: null, classification: null, runStatus: "cancelled" })).toBe("cancelled");
     expect(deriveIssueStatus({ lane: null, state: null, classification: null })).toBe("backlog");
     expect(clampIssuePriority("urgent")).toBe("urgent");
     expect(clampIssuePriority(null)).toBe(0);
