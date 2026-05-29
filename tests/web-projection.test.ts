@@ -431,6 +431,77 @@ describe("web projection foundation", () => {
     expect(board.selectedIssueId).toBe("TEST-CANCELED");
   });
 
+  it("derives review, done, cancelled, and blocked issue states from durable metadata without live liveness", () => {
+    const base = issueDetails();
+    const durableStateCard = (
+      identifier: string,
+      state: string,
+      overrides: Partial<IssueDetailsEnvelope> = {},
+    ): IssueBoardCardProjectionInput =>
+      card({
+        key: identifier,
+        issueId: "issue-" + identifier.toLowerCase(),
+        issueIdentifier: identifier,
+        lane: "unknown",
+        issueDetails: issueDetails({
+          issue: {
+            ...base.issue,
+            id: "issue-" + identifier.toLowerCase(),
+            identifier,
+            title: identifier + " title",
+            description: null,
+            priority: null,
+            state,
+            labels: [],
+            assigneeId: null,
+            delegateId: null,
+            createdAt: null,
+            updatedAt: null,
+          },
+          tracker: { ...base.tracker, state, classification: null },
+          workspace: { ...base.workspace, workspaceKey: null, path: null },
+          pullRequest: { url: null, number: null, headSha: null, branch: null, ciStatus: null, lastPushedAt: null },
+          latestRun: { runId: null, runPhase: null, runKind: null, status: null, terminalReason: null, error: null, completedAt: null },
+          ...overrides,
+        }),
+        live: null,
+        operatorLiveness: null,
+        metadata: null,
+      });
+
+    const board = projectWebIssueBoard({
+      issues: [
+        durableStateCard("TEST-REVIEW", "Ready to Merge"),
+        durableStateCard("TEST-DONE", "Closed"),
+        durableStateCard("TEST-CANCELED", "Canceled"),
+        durableStateCard("TEST-BLOCKED", "Blocked", {
+          blockers: {
+            available: true,
+            totalCount: 1,
+            openCount: 1,
+            open: [{ id: "issue-blocker", identifier: "TEST-BLOCKER", state: "Todo" }],
+            blocked: true,
+            humanBlockedReason: "Waiting for operator approval",
+          },
+        }),
+      ],
+    });
+
+    expect(Object.fromEntries(board.issues.map((issue) => [issue.id, issue.status]))).toEqual({
+      "TEST-REVIEW": "review",
+      "TEST-DONE": "done",
+      "TEST-CANCELED": "cancelled",
+      "TEST-BLOCKED": "progress",
+    });
+    expect(board.lanes.review.map((issue) => issue.id)).toEqual(["TEST-REVIEW"]);
+    expect(board.lanes.progress.map((issue) => issue.id)).toEqual(["TEST-BLOCKED"]);
+    expect(board.issues.find((issue) => issue.id === "TEST-BLOCKED")?.desc).toEqual(["Blocked: Waiting for operator approval"]);
+    expect(board.issues.every((issue) => issue.agent === null && issue.workspace === null && issue.session === null)).toBe(true);
+    expect(deriveIssueStatus({ state: "Blocked" })).toBe("progress");
+    expect(deriveIssueStatus({ lifecyclePhase: "blocked" })).toBe("progress");
+    expect(deriveIssueStatus({ runStatus: "canceled" })).toBe("cancelled");
+  });
+
   it("sorts React issue-board backlog by priority weight while preserving equal-priority order", () => {
     const board = projectWebIssueBoard({
       issues: [
