@@ -158,9 +158,9 @@ export interface TranscriptMessage {
 }
 
 export interface ChatMessage {
-  who: "agent" | "user" | "system";
+  who: "agent" | "user";
   text: string;
-  suggestions: string[];
+  suggestions?: string[];
 }
 
 export interface DashboardModel {
@@ -439,6 +439,10 @@ export function emptySidebarModel(): SidebarModel {
 
 export function emptyChatMessages(): ChatMessage[] {
   return [];
+}
+
+export function projectWebOrchestratorChat(): ChatMessage[] {
+  return emptyChatMessages();
 }
 
 export function projectIssueModel(
@@ -829,7 +833,10 @@ function cloneActivityModel(input: ActivityModel): ActivityModel {
 }
 
 function cloneChatMessages(input: ChatMessage[]): ChatMessage[] {
-  return input.map((message) => ({ ...message, suggestions: [...message.suggestions] }));
+  return input.map((message) => ({
+    ...message,
+    ...(message.suggestions ? { suggestions: [...message.suggestions] } : {}),
+  }));
 }
 
 function agentIdFromInputs(card: IssueBoardCardProjectionInput | null, operatorLiveness: WebOperatorLivenessInput | null): string | null {

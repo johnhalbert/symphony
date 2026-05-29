@@ -13,6 +13,7 @@ import {
   projectIssueDetailModel,
   projectWebIssueBoard,
   projectTranscriptMessages,
+  projectWebOrchestratorChat,
   type ActivityFeedResponseProjectionInput,
   type IssueBoardCardProjectionInput,
   type IssueBoardResponseProjectionInput,
@@ -415,5 +416,17 @@ describe("web projection foundation", () => {
     expect(emptyDashboardModel()).toMatchObject({ generatedAt: null, board: { counts: { total: 0 } }, runningAgents: [], activity: [], sessions: [] });
     expect(projectIssueBoardModel(null)).toMatchObject({ counts: { total: 0 }, issues: [] });
     expect(projectDashboardModel({ activity: null, board: null, runs: [] })).toMatchObject({ board: { counts: { total: 0 } }, activity: [], sessions: [] });
+  });
+
+  it("projects orchestrator chat as the exact empty default without mock content", () => {
+    const chat = projectWebOrchestratorChat();
+    const replay = projectWebOrchestratorChat();
+
+    expect(chat).toEqual([]);
+    expect(replay).toEqual([]);
+    expect(replay).not.toBe(chat);
+    expect(JSON.stringify(chat)).not.toContain("assistant");
+    expect(JSON.stringify(chat)).not.toContain("suggestion");
+    expect(JSON.stringify(chat)).not.toContain("command");
   });
 });
