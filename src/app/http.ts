@@ -798,7 +798,25 @@ export class StatusServer {
   private async fetchWebIssueDetail(issueId: string, forceRefresh: boolean) {
     try {
       const detail = await this.fetchBoardIssueDetail(issueId, forceRefresh);
-      return projectWebIssueDetail(detail, issueId);
+      const issueActivityKey =
+        detail.issueDetails.issue.identifier ??
+        detail.issueDetails.issue.id ??
+        detail.boardCard?.issueIdentifier ??
+        detail.boardCard?.issueId ??
+        issueId;
+      const latestRunId = detail.latestRun?.runId ?? detail.runs.at(-1)?.runId ?? null;
+      const activity = await buildActivityFeed({
+        generatedAt: detail.issueDetails.tracker.generatedAt ?? this.options.orchestrator.snapshot().generatedAt,
+        runStore: this.options.runStore,
+        runs: detail.runs,
+        lifecycleStore: this.options.lifecycleStore,
+        writebackOutbox: this.options.writebackOutbox,
+        query: { issue: issueActivityKey, offset: 0, limit: 50 },
+        includeTranscriptEvents: false,
+      });
+      const transcript =
+        this.options.runStore && latestRunId ? await readFullWebTranscript(this.options.runStore, latestRunId) : [];
+      return projectWebIssueDetail({ ...detail, activity, transcript }, issueId);
     } catch (error) {
       if (error instanceof SymphonyError && (error.code === "not_found" || error.code === "tracker_unavailable")) {
         return null;

@@ -12,7 +12,7 @@ import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
-import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileRunTranscriptStore, type RunRecord, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
 import type { Issue, IssueDetailsEnvelope, TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
@@ -194,6 +194,77 @@ function durableDetail(overrides: Partial<IssueDetailsEnvelope> = {}): BoardIssu
   };
 }
 
+function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
+  return {
+    runId: "run-1",
+    sessionId: "session-1",
+    agentId: "agent-1",
+    role: "worker",
+    runPhase: "implementation",
+    runKind: "implementation",
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    attempt: null,
+    turnNumber: 1,
+    prompt: "Implement web route",
+    promptCharCount: 19,
+    cursorModel: "gpt-5-test",
+    workspaceKey: "TEST-1",
+    workspacePath: "/tmp/workspaces/TEST-1",
+    gitBranchName: "symphony/TEST-1",
+    repoPath: "/repo",
+    baseRef: "main",
+    status: "running",
+    startedAt: "2026-01-01T00:01:00.000Z",
+    updatedAt: "2026-01-01T00:02:00.000Z",
+    completedAt: null,
+    error: null,
+    tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    transcriptEventCount: 1,
+    ...overrides,
+  };
+}
+
+function transcriptEvent(overrides: Partial<TranscriptEvent> = {}): TranscriptEvent {
+  return {
+    runId: "run-1",
+    sequence: 1,
+    at: "2026-01-01T00:03:00.000Z",
+    source: "cursor",
+    eventType: "tool_call",
+    message: "read_file",
+    payload: {
+      call_id: "call-1",
+      name: "read_file",
+      status: "completed",
+      args: { path: "src/app/webProjection.ts" },
+      result: "read_file result",
+    },
+    ...overrides,
+  };
+}
+
+function activityItem() {
+  return {
+    id: "run:run-1:run_started",
+    at: "2026-01-01T00:01:00.000Z",
+    kind: "run_started",
+    source: "run",
+    issue: { id: "issue-1", identifier: "TEST-1" },
+    run: {
+      runId: "run-1",
+      role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
+      status: "running",
+      agentId: "agent-1",
+      sessionId: "session-1",
+    },
+    transcript: null,
+    writeback: null,
+  };
+}
+
 function testTrackerStateLists(): TrackerStateLists {
   return {
     activeStates: ["Todo", "In Progress"],
@@ -249,6 +320,10 @@ describe("web issue detail projection", () => {
         issue: "TEST-1",
         boardCard: card(),
         issueDetails: issueDetails(),
+        latestRun: runRecord(),
+        runs: [runRecord()],
+        activity: { activity: [activityItem()] },
+        transcript: [transcriptEvent()],
         operatorLiveness: {
           agentId: "agent-1",
           sessionId: "session-1",
@@ -283,8 +358,36 @@ describe("web issue detail projection", () => {
         session: "session-1",
         desc: ["Real description from the tracker."],
       },
+      activity: [{ t: "2026-01-01T00:01:00.000Z", who: "agent-1", verb: "run_started", id: "TEST-1", extra: "running" }],
+      runs: [
+        {
+          id: "session-1",
+          issue: "TEST-1",
+          title: "TEST-1",
+          state: "running",
+          model: "gpt-5-test",
+          startedAt: "2026-01-01T00:01:00.000Z",
+          updatedAt: "2026-01-01T00:02:00.000Z",
+          msgCount: 1,
+          lastEvent: null,
+          toolCount: 0,
+        },
+      ],
+      transcript: [
+        {
+          kind: "tool_call",
+          ts: "2026-01-01T00:03:00.000Z",
+          call_id: "call-1",
+          name: "read_file",
+          status: "completed",
+          args: { preview: '{"path":"src/app/webProjection.ts"}' },
+          result: "read_file result",
+        },
+      ],
     });
-    expect(Object.keys(detail ?? {})).toEqual(["issue"]);
+    expect(Object.keys(detail ?? {})).toEqual(["issue", "activity", "runs", "transcript"]);
+    expect(detail?.transcript[0]).not.toHaveProperty("payload");
+    expect(detail?.transcript[0]).not.toHaveProperty("runId");
     expect(JSON.stringify(detail).toLowerCase()).not.toContain("mock");
   });
 
@@ -314,6 +417,9 @@ describe("web issue detail projection", () => {
         workspace: null,
         session: null,
       },
+      activity: [],
+      runs: [],
+      transcript: [],
     });
     expect(detail?.issue).not.toHaveProperty("desc");
     expect(requestFallback?.issue).toMatchObject({ id: "REQ-3", title: "REQ-3" });
@@ -349,6 +455,41 @@ describe("GET /api/v1/web/issues/:issueId", () => {
         assigneeId: "user-2",
       }),
     ]);
+    await runStore.startRun({
+      runId: "run-1",
+      sessionId: "session-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      cursorModel: "gpt-5-test",
+      workspaceKey: "TEST-1",
+      workspacePath: path.join(config.workspace.root, "TEST-1"),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await runStore.appendEvent(
+      transcriptEvent({
+        message: "read_file SECRET_MESSAGE access_token=message-token",
+        payload: {
+          call_id: "call-route-1",
+          name: "read_file",
+          status: "completed",
+          args: {
+            path: "src/app/webProjection.ts",
+            token: "argument-token",
+            nested: { client_secret: "argument-client-secret" },
+          },
+          result: "file contents SECRET_RESULT token=result-token",
+          output: "stdout SECRET_OUTPUT ghp_ABCDEFGH1",
+          error: "stderr SECRET_ERROR sk-ABCDEFGH1",
+        },
+      }),
+    );
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
       workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
@@ -365,28 +506,71 @@ describe("GET /api/v1/web/issues/:issueId", () => {
     const address = await server.start();
     try {
       const response = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues/TEST-1`);
-      const body = await response.json();
+      const body = (await response.json()) as {
+        issue: Record<string, unknown>;
+        activity: unknown[];
+        runs: unknown[];
+        transcript: unknown[];
+      };
 
       expect(response.status).toBe(200);
-      expect(body).toEqual({
-        issue: {
-          id: "TEST-1",
-          title: "Tracker detail title",
-          status: "progress",
-          priority: 3,
-          labels: ["web", "api"],
-          assignee: "user-2",
-          agent: null,
-          project: "",
-          cycle: "",
-          activity: [{ t: "2026-01-01T00:00:00Z", verb: "created", val: "In Progress", who: "tracker" }],
-          pr: null,
-          ci: null,
-          workspace: null,
-          session: null,
-          desc: ["Tracker detail description."],
-        },
+      expect(body.issue).toEqual({
+        id: "TEST-1",
+        title: "Tracker detail title",
+        status: "progress",
+        priority: 3,
+        labels: ["web", "api"],
+        assignee: "user-2",
+        agent: "agent-1",
+        project: "",
+        cycle: "",
+        activity: [{ t: "2026-01-01T00:00:00Z", verb: "created", val: "In Progress", who: "tracker" }],
+        pr: null,
+        ci: null,
+        workspace: path.join(config.workspace.root, "TEST-1"),
+        session: "session-1",
+        desc: ["Tracker detail description."],
       });
+      expect(body.activity).toEqual([
+        expect.objectContaining({ verb: "run_started", id: "TEST-1", extra: "running", who: "agent-1" }),
+      ]);
+      expect(body.runs).toEqual([
+        expect.objectContaining({
+          id: "session-1",
+          issue: "TEST-1",
+          title: "TEST-1",
+          state: "running",
+          model: "gpt-5-test",
+          msgCount: 1,
+        }),
+      ]);
+      expect(body.transcript).toHaveLength(1);
+      expect(body.transcript[0]).toMatchObject({
+        kind: "tool_call",
+        ts: "2026-01-01T00:03:00.000Z",
+        call_id: "call-route-1",
+        name: "read_file",
+        status: "completed",
+        args: { preview: expect.stringContaining("src/app/webProjection.ts") },
+        result: expect.stringContaining("[redacted]"),
+        output: expect.stringContaining("[redacted]"),
+        error: expect.stringContaining("[redacted]"),
+      });
+      expect(body.transcript[0]).not.toHaveProperty("payload");
+      expect(body.transcript[0]).not.toHaveProperty("runId");
+      const transcriptResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sessions/session-1/transcript`);
+      const sessionTranscript = await transcriptResponse.json();
+      expect(transcriptResponse.status).toBe(200);
+      expect(body.transcript).toEqual(sessionTranscript);
+      const serializedTranscript = JSON.stringify(body.transcript);
+      expect(serializedTranscript).toContain("[redacted]");
+      expect(serializedTranscript).not.toContain("SECRET_");
+      expect(serializedTranscript).not.toContain("message-token");
+      expect(serializedTranscript).not.toContain("argument-token");
+      expect(serializedTranscript).not.toContain("argument-client-secret");
+      expect(serializedTranscript).not.toContain("result-token");
+      expect(serializedTranscript).not.toContain("ghp_ABCDEFGH1");
+      expect(serializedTranscript).not.toContain("sk-ABCDEFGH1");
       expect(JSON.stringify(body).toLowerCase()).not.toContain("mock");
       expect(tracker.fetchCount).toBe(1);
     } finally {

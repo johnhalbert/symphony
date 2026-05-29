@@ -119,6 +119,8 @@ export type TranscriptMessage =
       status: string;
       args: Record<string, unknown>;
       result: string | null;
+      output?: string | null;
+      error?: string | null;
       truncated?: boolean;
     }
   | { kind: "status"; state: string; ts: string; text: string }
@@ -175,6 +177,9 @@ export interface IssueBoardModel {
 
 export interface IssueDetailModel {
   issue: IssueModel;
+  activity: ActivityModel[];
+  runs: SessionModel[];
+  transcript: TranscriptMessage[];
 }
 
 export interface HistoryModel {
