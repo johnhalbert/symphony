@@ -5,11 +5,13 @@ import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
+  projectWebDashboard,
   projectWebIssueBoard,
   projectWebIssueDetail,
   projectWebOrchestratorChat,
   projectWebOrchestratorChatPost,
   projectWebReferenceData,
+  type DashboardRuntimeConfig,
 } from "./webProjection.js";
 import {
   runKindForPhase,
@@ -91,6 +93,7 @@ export interface StatusServerOptions {
   trackerStateLists: TrackerStateLists;
   issueBoardColumns?: IssueBoardColumnMapping;
   staleThresholdMs: number;
+  dashboard?: DashboardRuntimeConfig | undefined;
 }
 
 export class StatusServer {
@@ -197,6 +200,14 @@ export class StatusServer {
           }
         }
         sendJson(response, 200, projectWebReferenceData(board));
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/web/dashboard") {
+        sendJson(
+          response,
+          200,
+          await this.fetchWebDashboard(url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true"),
+        );
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/board") {
@@ -785,6 +796,34 @@ export class StatusServer {
       }
       throw error;
     }
+  }
+
+  private async fetchWebDashboard(forceRefresh: boolean) {
+    const snapshot = this.options.orchestrator.snapshot();
+    let board: IssueBoardResponse | null = null;
+    try {
+      board = await this.fetchIssueBoard(forceRefresh);
+    } catch (error) {
+      if (!(error instanceof SymphonyError) || (error.code !== "tracker_error" && error.code !== "tracker_unavailable")) {
+        throw error;
+      }
+    }
+    const runs = (await this.options.runStore?.listRuns()) ?? [];
+    const activity = await buildActivityFeed({
+      generatedAt: snapshot.generatedAt,
+      runStore: this.options.runStore,
+      runs,
+      lifecycleStore: this.options.lifecycleStore,
+      writebackOutbox: this.options.writebackOutbox,
+      query: { issue: null, offset: 0, limit: 20 },
+      includeTranscriptEvents: false,
+    });
+    return projectWebDashboard({
+      runtime: snapshot,
+      board,
+      activity,
+      config: this.options.dashboard ?? null,
+    });
   }
 
   private async fetchIssueBoard(forceRefresh: boolean): Promise<IssueBoardResponse> {
