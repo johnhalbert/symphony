@@ -47,11 +47,15 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const directResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/shared-id/transcript`);
       expect(directResponse.status).toBe(200);
-      expect(await directResponse.json()).toMatchObject([{ kind: "assistant", text: "direct run transcript" }]);
+      const directBody = (await directResponse.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(directBody, { session: "direct-session", issue: "TEST-1" });
+      expect(directBody.at(-1)).toMatchObject({ kind: "assistant", text: "direct run transcript" });
 
       const fallbackResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/direct-session/transcript`);
       expect(fallbackResponse.status).toBe(200);
-      expect(await fallbackResponse.json()).toMatchObject([{ kind: "assistant", text: "direct run transcript" }]);
+      const fallbackBody = (await fallbackResponse.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(fallbackBody, { session: "direct-session", issue: "TEST-1" });
+      expect(fallbackBody.at(-1)).toMatchObject({ kind: "assistant", text: "direct run transcript" });
     } finally {
       await server.stop();
     }
@@ -114,8 +118,9 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/paged-run/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<{ kind: string; text: string }>;
-      expect(body.map((message) => message.text)).toEqual(["page one", "page two"]);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "paged-session", issue: "TEST-1" });
+      expect(body.slice(2).map((message) => message.text)).toEqual(["page one", "page two"]);
       expect(readCalls).toEqual([
         { offset: 0, limit: 1_000 },
         { offset: 1, limit: 1_000 },
@@ -172,7 +177,8 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/cursor-run/transcript`);
       expect(response.status).toBe(200);
       const body = (await response.json()) as Array<Record<string, unknown>>;
-      expect(body).toEqual([
+      expectRunPrelude(body, { session: "cursor-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "actual assistant text" },
         { kind: "thinking", ts: "2026-01-01T00:00:02.000Z", text: "actual reasoning summary" },
         {
@@ -195,6 +201,85 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(serialized).not.toContain("SECRET_REASONING_INTERNAL");
       expect(serialized).not.toContain("SECRET_RAW_TOOL_RESULT");
       expect(serialized).not.toContain("SECRET_RAW_TOOL_ARGS");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("coalesces Hermes runtime assistant and tool transcript events returned by readTranscript", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "hermes-run", sessionId: "hermes-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "hermes-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { textPreview: "partial assistant text" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "runtime",
+      eventType: "message_complete",
+      message: "Hermes message complete",
+      payload: { textPreview: "final assistant text", status: "completed", token: "SECRET_MESSAGE_TOKEN" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "runtime",
+      eventType: "tool_start",
+      message: "Hermes tool terminal started",
+      payload: { toolId: "tool-1", name: "terminal", argsPreview: 'cmd="npm test" token=[redacted]' },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-run",
+      at: "2026-01-01T00:00:04.000Z",
+      source: "runtime",
+      eventType: "tool_complete",
+      message: "Hermes tool terminal completed",
+      payload: { toolId: "tool-1", name: "terminal", resultPreview: "tests passed", rawResult: "SECRET_TOOL_RESULT" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-run",
+      at: "2026-01-01T00:00:05.000Z",
+      source: "orchestrator",
+      eventType: "approval_resolved",
+      message: "Operator approval approved: branch -> main",
+      payload: { status: "approved", decision: "approve" },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "hermes-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "final assistant text" },
+        {
+          kind: "tool_call",
+          ts: "2026-01-01T00:00:03.000Z",
+          call_id: "tool-1",
+          name: "terminal",
+          status: "completed",
+          args: { preview: 'cmd="npm test" token=[redacted]' },
+          result: "tests passed",
+        },
+        {
+          kind: "status",
+          state: "approved",
+          ts: "2026-01-01T00:00:05.000Z",
+          text: "Operator approval approved: branch -> main",
+        },
+      ]);
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("partial assistant text");
+      expect(serialized).not.toContain("SECRET_MESSAGE_TOKEN");
+      expect(serialized).not.toContain("SECRET_TOOL_RESULT");
     } finally {
       await server.stop();
     }
@@ -238,6 +323,13 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(response.status).toBe(200);
       const body = (await response.json()) as Array<Record<string, unknown>>;
       expect(body).toEqual([
+        {
+          kind: "user",
+          ts: expect.any(String),
+          from: "orchestrator",
+          issue: "TEST-1",
+          text: "Implement the requested web transcript route",
+        },
         { kind: "status", state: "warming", ts: "2026-01-01T00:00:01.000Z", text: "status public preview" },
         {
           kind: "system",
@@ -322,6 +414,28 @@ function transcriptEvent(overrides: Partial<TranscriptEvent>): TranscriptEvent {
 
 function baseUrl(address: { host: string; port: number }): string {
   return `http://${address.host}:${address.port}`;
+}
+
+function expectRunPrelude(body: Array<Record<string, unknown>>, expected: { session: string; issue: string }): void {
+  expect(body.slice(0, 2)).toEqual([
+    {
+      kind: "system",
+      ts: expect.any(String),
+      model: "claude-sonnet-4",
+      cwd: expect.any(String),
+      workspace: expected.issue,
+      session: expected.session,
+      tools: [],
+      note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+    },
+    {
+      kind: "user",
+      ts: expect.any(String),
+      from: "orchestrator",
+      issue: expected.issue,
+      text: "Implement the requested web transcript route",
+    },
+  ]);
 }
 
 function testTrackerStateLists(): TrackerStateLists {

@@ -1,5 +1,7 @@
-import { sanitizePublicJson, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
-import type { TranscriptEvent } from "../core/persistence/RunTranscriptStore.js";
+import { redactTranscriptText, sanitizePublicJson, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
+import type { RunRecord, TranscriptEvent } from "../core/persistence/RunTranscriptStore.js";
+
+const USER_PROMPT_MAX_LENGTH = 5_000;
 
 export type TranscriptMessage =
   | {
@@ -31,18 +33,78 @@ export type TranscriptMessage =
   | { kind: "task"; ts: string; title: string; desc: string }
   | { kind: "request"; ts: string; reason: string; q: string; actions: string[] };
 
-export function projectWebTranscript(events: readonly TranscriptEvent[]): TranscriptMessage[] {
-  return events.map(projectWebTranscriptEvent);
+export interface WebTranscriptProjectionOptions {
+  run?: RunRecord | null;
+  includeRunPrelude?: boolean;
+}
+
+export function projectWebTranscript(
+  events: readonly TranscriptEvent[],
+  options: WebTranscriptProjectionOptions = {},
+): TranscriptMessage[] {
+  const messages = projectTranscriptEvents(events);
+  if (!options.run || options.includeRunPrelude === false) return messages;
+  return [...projectRunPreludeMessages(options.run, messages), ...messages];
+}
+
+function projectTranscriptEvents(events: readonly TranscriptEvent[]): TranscriptMessage[] {
+  const messages: TranscriptMessage[] = [];
+  const toolMessageIndexByCallId = new Map<string, number>();
+  let pendingAssistantDeltaIndex: number | null = null;
+
+  for (const event of events) {
+    const projected = projectWebTranscriptEvent(event);
+    if (projected.kind === "tool_call") {
+      const existingIndex = toolMessageIndexByCallId.get(projected.call_id);
+      if (existingIndex !== undefined) {
+        const existing = messages[existingIndex];
+        if (existing?.kind === "tool_call") messages[existingIndex] = mergeToolMessages(existing, projected);
+      } else {
+        toolMessageIndexByCallId.set(projected.call_id, messages.length);
+        messages.push(projected);
+      }
+      pendingAssistantDeltaIndex = null;
+      continue;
+    }
+
+    if (projected.kind === "assistant" && isAssistantDeltaEvent(event)) {
+      if (pendingAssistantDeltaIndex !== null) {
+        const existing = messages[pendingAssistantDeltaIndex];
+        if (existing?.kind === "assistant") {
+          messages[pendingAssistantDeltaIndex] = { ...existing, text: combineAssistantDeltaText(existing.text, projected.text) };
+          continue;
+        }
+      }
+      pendingAssistantDeltaIndex = messages.length;
+      messages.push(projected);
+      continue;
+    }
+
+    if (projected.kind === "assistant" && isAssistantCompleteEvent(event) && pendingAssistantDeltaIndex !== null) {
+      const existing = messages[pendingAssistantDeltaIndex];
+      if (existing?.kind === "assistant") {
+        messages[pendingAssistantDeltaIndex] = projected;
+        pendingAssistantDeltaIndex = null;
+        continue;
+      }
+    }
+
+    messages.push(projected);
+    pendingAssistantDeltaIndex = null;
+  }
+
+  return messages;
 }
 
 function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
   const payloadKind = normalizedPayloadKind(payload);
-  if (isToolEvent(eventType, payloadKind)) return projectToolCallMessage(event, payload);
+  if (isToolEvent(eventType, payloadKind)) return projectToolCallMessage(event, payload, eventType);
   if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
   if (isTaskEvent(eventType, payloadKind)) return projectTaskMessage(event, payload);
   if (isRequestEvent(eventType, payloadKind)) return projectRequestMessage(event, payload);
+  if (isUserEvent(eventType, payloadKind)) return projectUserMessage(event, payload);
   if (isSystemEvent(eventType, payloadKind)) return projectSystemMessage(event, payload);
   if (isStatusEvent(eventType, payloadKind)) return projectStatusMessage(event, payload, eventType);
   if (isAssistantEvent(event, eventType, payloadKind)) {
@@ -51,17 +113,17 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
   return projectStatusMessage(event, payload, eventType);
 }
 
-function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, unknown>): TranscriptMessage {
-  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.args, payload.arguments, payload.input);
-  const resultPreview = firstPublicPreview(payload.resultPreview, payload.result);
+function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, unknown>, eventType: string): TranscriptMessage {
+  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.args, payload.arguments, payload.input);
+  const resultPreview = firstPublicPreview(payload.resultPreview, payload.result, payload.summary);
   const outputPreview = firstPublicPreview(payload.outputPreview, payload.output);
   const errorPreview = firstPublicPreview(payload.errorPreview, payload.error);
   return {
     kind: "tool_call",
     ts: event.at,
-    call_id: firstCleanString(payload.call_id, payload.callId, payload.id) ?? `${event.runId}:${event.sequence}`,
+    call_id: firstCleanString(payload.call_id, payload.callId, payload.id, payload.toolId, payload.tool_id) ?? `${event.runId}:${event.sequence}`,
     name: firstCleanString(payload.name, payload.tool, payload.toolName) ?? event.eventType,
-    status: firstCleanString(payload.status, payload.state) ?? "unknown",
+    status: inferredToolStatus(eventType, payload, errorPreview !== null),
     args: argsPreview ? { preview: argsPreview.preview } : {},
     result: resultPreview?.preview ?? outputPreview?.preview ?? errorPreview?.preview ?? null,
     ...(outputPreview ? { output: outputPreview.preview } : {}),
@@ -70,6 +132,37 @@ function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, 
       ? { truncated: true }
       : {}),
   };
+}
+
+function mergeToolMessages(existing: Extract<TranscriptMessage, { kind: "tool_call" }>, next: Extract<TranscriptMessage, { kind: "tool_call" }>): TranscriptMessage {
+  return {
+    kind: "tool_call",
+    ts: existing.ts,
+    call_id: existing.call_id,
+    name: next.name && next.name !== "unknown" ? next.name : existing.name,
+    status: mergeToolStatus(existing.status, next.status),
+    args: Object.keys(next.args).length > 0 ? next.args : existing.args,
+    result: next.result ?? existing.result,
+    ...(next.output !== undefined || existing.output !== undefined ? { output: next.output ?? existing.output ?? null } : {}),
+    ...(next.error !== undefined || existing.error !== undefined ? { error: next.error ?? existing.error ?? null } : {}),
+    ...(existing.truncated || next.truncated ? { truncated: true } : {}),
+  };
+}
+
+function mergeToolStatus(existingStatus: string, nextStatus: string): string {
+  if (!nextStatus || nextStatus === "unknown") return existingStatus;
+  if (nextStatus === "running" && existingStatus && existingStatus !== "unknown") return existingStatus;
+  return nextStatus;
+}
+
+function inferredToolStatus(eventType: string, payload: Record<string, unknown>, hasErrorPreview: boolean): string {
+  const explicit = firstCleanString(payload.status, payload.state);
+  if (explicit) return explicit;
+  if (eventType.includes("start") || eventType.includes("progress")) return "running";
+  if (eventType.includes("complete") || eventType.includes("completed") || eventType.includes("finish")) {
+    return hasErrorPreview ? "failed" : "completed";
+  }
+  return "unknown";
 }
 
 function projectTaskMessage(event: TranscriptEvent, payload: Record<string, unknown>): TranscriptMessage {
@@ -91,14 +184,24 @@ function projectRequestMessage(event: TranscriptEvent, payload: Record<string, u
   };
 }
 
+function projectUserMessage(event: TranscriptEvent, payload: Record<string, unknown>): TranscriptMessage {
+  return {
+    kind: "user",
+    ts: event.at,
+    from: firstCleanString(payload.from, payload.actor, payload.source) ?? event.source,
+    issue: firstCleanString(payload.issue, payload.issueIdentifier, payload.issueId) ?? "",
+    text: firstCleanString(payload.prompt, payload.question, payload.q, payload.textPreview, payload.text, payload.message, event.message) ?? event.eventType,
+  };
+}
+
 function projectSystemMessage(event: TranscriptEvent, payload: Record<string, unknown>): TranscriptMessage {
   return {
     kind: "system",
     ts: event.at,
-    model: firstCleanString(payload.model, payload.modelName) ?? "",
-    cwd: firstCleanString(payload.cwd, payload.workingDirectory) ?? "",
-    workspace: firstCleanString(payload.workspace, payload.workspaceKey, payload.workspacePath) ?? "",
-    session: firstCleanString(payload.session, payload.sessionId, payload.threadId) ?? event.runId,
+    model: firstCleanString(payload.model, payload.modelName, payload.runtimeModel, payload.cursorModel) ?? "",
+    cwd: firstCleanString(payload.cwd, payload.workingDirectory, payload.profileDir) ?? "",
+    workspace: firstCleanString(payload.workspace, payload.workspaceKey, payload.workspacePath, payload.templateDir) ?? "",
+    session: firstCleanString(payload.session, payload.sessionId, payload.gatewaySessionId, payload.threadId) ?? event.runId,
     tools: stringLabels(payload.tools),
     note: firstCleanString(payload.note, payload.messagePreview, payload.summary, payload.subtype, event.message) ?? event.eventType,
   };
@@ -111,9 +214,40 @@ function projectStatusMessage(
 ): TranscriptMessage {
   return {
     kind: "status",
-    state: firstCleanString(payload.state, payload.status, payload.subtype) ?? eventType,
+    state: firstCleanString(payload.state, payload.status, payload.subtype, payload.kind) ?? eventType,
     ts: event.at,
     text: eventText(event, payload),
+  };
+}
+
+function projectRunPreludeMessages(run: RunRecord, existingMessages: readonly TranscriptMessage[]): TranscriptMessage[] {
+  const messages: TranscriptMessage[] = [];
+  if (!existingMessages.some((message) => message.kind === "system")) messages.push(projectRunSystemMessage(run));
+  const promptText = publicMultilineText(run.prompt, USER_PROMPT_MAX_LENGTH);
+  if (promptText && !existingMessages.some((message) => message.kind === "user")) {
+    messages.push({
+      kind: "user",
+      ts: run.startedAt,
+      from: "orchestrator",
+      issue: firstCleanString(run.issueIdentifier, run.issueId) ?? "",
+      text: promptText,
+    });
+  }
+  return messages;
+}
+
+function projectRunSystemMessage(run: RunRecord): TranscriptMessage {
+  const phase = firstCleanString(run.runPhase, run.runKind, run.role) ?? run.role;
+  const note = `Initialized ${phase} run from persisted run metadata. System prompt redacted.`;
+  return {
+    kind: "system",
+    ts: run.startedAt,
+    model: firstCleanString(run.runtimeModel, run.cursorModel) ?? "",
+    cwd: firstCleanString(run.workspacePath) ?? "",
+    workspace: firstCleanString(run.workspaceKey) ?? "",
+    session: firstCleanString(run.sessionId, run.runId) ?? run.runId,
+    tools: [],
+    note: firstCleanString(note) ?? note,
   };
 }
 
@@ -138,28 +272,59 @@ function isTaskEvent(eventType: string, payloadKind: string | null): boolean {
 
 function isRequestEvent(eventType: string, payloadKind: string | null): boolean {
   return (
-    eventType.includes("approval") ||
-    eventType.includes("human_required") ||
-    eventType.includes("humanrequired") ||
-    eventType.includes("request") ||
-    payloadKindIncludes(payloadKind, "approval") ||
+    eventType === "approval_request" ||
+    eventType === "human_required" ||
+    eventType === "humanrequired" ||
+    eventType === "request" ||
+    payloadKindIncludes(payloadKind, "approval_request") ||
     payloadKindIncludes(payloadKind, "human_required") ||
     payloadKindIncludes(payloadKind, "humanrequired") ||
     payloadKindIncludes(payloadKind, "request")
   );
 }
 
+function isUserEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "user" || eventType === "prompt" || eventType === "user_prompt" || payloadKind === "user";
+}
+
 function isSystemEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType === "system" || payloadKind === "system";
+  return eventType === "system" || eventType === "session_info" || eventType === "hermes_profile" || payloadKind === "system";
 }
 
 function isStatusEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType === "status" || payloadKind === "status";
+  return eventType === "status" || eventType === "status_update" || payloadKind === "status";
 }
 
 function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind: string | null): boolean {
   if (eventType === "assistant" || payloadKind === "assistant") return true;
+  if (
+    eventType === "message_delta" ||
+    eventType === "message_complete" ||
+    eventType === "assistant_delta" ||
+    eventType === "assistant_complete" ||
+    eventType === "response_delta" ||
+    eventType === "response_complete"
+  ) {
+    return true;
+  }
   return event.source === "harness" && (eventType === "progress" || eventType === "completed");
+}
+
+function isAssistantDeltaEvent(event: TranscriptEvent): boolean {
+  const eventType = normalizeToken(event.eventType);
+  return eventType === "message_delta" || eventType === "assistant_delta" || eventType === "response_delta";
+}
+
+function isAssistantCompleteEvent(event: TranscriptEvent): boolean {
+  const eventType = normalizeToken(event.eventType);
+  return eventType === "message_complete" || eventType === "assistant_complete" || eventType === "response_complete" || eventType === "completed";
+}
+
+function combineAssistantDeltaText(existing: string, next: string): string {
+  if (existing.length === 0) return next;
+  if (next.length === 0) return existing;
+  if (/\s$/.test(existing) || /^\s/.test(next)) return existing + next;
+  return `${existing} ${next}`;
 }
 
 function sanitizedPayloadRecord(event: TranscriptEvent): Record<string, unknown> {
@@ -212,6 +377,13 @@ function firstCleanString(...values: unknown[]): string | null {
     if (preview && preview.length > 0) return preview;
   }
   return null;
+}
+
+function publicMultilineText(value: string, maxLength: number): string | null {
+  const redacted = redactTranscriptText(value).text.replace(/\r\n/g, "\n").trim();
+  if (redacted.length === 0) return null;
+  if (redacted.length <= maxLength) return redacted;
+  return `${redacted.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`;
 }
 
 function firstPublicPreview(...values: unknown[]): { preview: string; truncated: boolean } | null {
