@@ -6,11 +6,13 @@ import {
   deriveIssueStatus,
   deterministicColor,
   emptyDashboardModel,
+  emptySidebarModel,
   normalizeDescription,
   projectActivityModels,
   projectDashboardModel,
   projectHistoryModel,
   projectIssueBoardModel,
+  projectSidebarModel,
   projectWebReferenceData,
   projectIssueDetailModel,
   projectWebDashboard,
@@ -467,6 +469,83 @@ describe("web projection foundation", () => {
     expect(projectTranscriptMessages(transcriptEvents)[0]).toMatchObject({ kind: "tool_call", text: "read_file" });
   });
 
+  it("projects sidebar from web-facing board, runtime, activity, history, and chat sources", () => {
+    const activityInput: ActivityFeedResponseProjectionInput = {
+      generatedAt: "2026-01-01T00:11:00.000Z",
+      activity: [
+        {
+          id: "run:run-1:run_started",
+          at: "2026-01-01T00:00:00.000Z",
+          kind: "run_started",
+          source: "run",
+          issue: { id: "issue-1", identifier: "TEST-1" },
+          run: { runId: "run-1", role: "worker", runPhase: "implementation", runKind: "implementation", status: "running", agentId: "agent-1", sessionId: "session-1" },
+          transcript: null,
+          writeback: null,
+        },
+      ],
+    };
+    const runtime = {
+      generatedAt: "2026-01-01T00:11:00.000Z",
+      counts: { running: 1, retrying: 0, paused: 0, providerGates: 0 },
+      providerGates: [],
+      providerGateCounts: { active: 0, manual: 0, autoResume: 0 },
+      running: [
+        {
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          runId: "run-1",
+          startedAt: "2026-01-01T00:01:00.000Z",
+          lastEvent: "progress",
+          lastMessage: "Mapping sidebar",
+          issueDetails: { title: "Live sidebar run" },
+          liveness: { status: "active" },
+          tokens: { inputTokens: 5, outputTokens: 7, totalTokens: 12 },
+        },
+      ],
+      retrying: [],
+      paused: [],
+      totals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, secondsRunning: 0 },
+      rateLimits: null,
+    } as any;
+    const sessions = [
+      {
+        id: "run-1",
+        issue: "TEST-1",
+        title: "TEST-1: Sidebar mapping",
+        state: "running",
+        model: "gpt-test",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:10:00.000Z",
+        msgCount: 5,
+        lastEvent: "TEST-1 run started",
+        toolCount: 1,
+      },
+    ];
+    const chat = [{ who: "agent" as const, text: "Sidebar chat is empty in the API route", suggestions: ["Open TEST-1"] }];
+
+    const sidebar = projectSidebarModel({
+      runtime,
+      board: {
+        issues: [
+          webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
+          webCard("TEST-REVIEW", { lane: "review", state: "In Review" }),
+        ],
+      },
+      activity: activityInput,
+      sessions,
+      chat,
+    });
+
+    expect(Object.keys(sidebar).sort()).toEqual(["activity", "chat", "providerGates", "reviewIssues", "runningAgents", "sessions", "totals"]);
+    expect(sidebar.reviewIssues.map((item) => item.id)).toEqual(["TEST-REVIEW"]);
+    expect(sidebar.activity).toEqual([{ t: "2026-01-01T00:00:00.000Z", who: "agent-1", verb: "run_started", id: "TEST-1", extra: "running" }]);
+    expect(sidebar.runningAgents[0]).toMatchObject({ issue: "TEST-1", title: "Live sidebar run", step: "Mapping sidebar", duration: "10m" });
+    expect(sidebar.sessions).toEqual(sessions);
+    expect(sidebar.chat).toEqual(chat);
+    expect(sidebar.totals).toMatchObject({ todo: 1, review: 1, open: 2, all: 2, completeness: 0 });
+  });
+
   it("projects deterministic reference data from board labels, assignees, and delegates", () => {
     const firstIssue = {
       ...issueDetails().issue,
@@ -541,6 +620,16 @@ describe("web projection foundation", () => {
     expect(projectIssueBoardModel(null)).toMatchObject({ counts: { total: 0 }, issues: [] });
     expect(projectWebDashboard({ activity: null, board: null, runs: [] })).toEqual(emptyDashboard);
     expect(projectDashboardModel({ activity: null, board: null, runs: [] })).toEqual(emptyDashboard);
+    expect(emptySidebarModel()).toEqual({
+      providerGates: [],
+      runningAgents: [],
+      reviewIssues: [],
+      activity: [],
+      sessions: [],
+      chat: [],
+      totals: emptyDashboard.totals,
+    });
+    expect(projectSidebarModel({ activity: null, board: null, sessions: null, chat: null })).toEqual(emptySidebarModel());
   });
 
   it("drops caller-provided dashboard chat input to keep chat behavior out of scope", () => {

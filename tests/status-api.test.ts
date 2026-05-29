@@ -2536,6 +2536,44 @@ describe("StatusServer durable API", () => {
       expect(JSON.stringify(dashboardBody)).not.toContain("poll 22s");
       expect(JSON.stringify(dashboardBody)).not.toContain("Mock");
 
+      const sidebarResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sidebar`);
+      const sidebarBody = (await sidebarResponse.json()) as {
+        providerGates: unknown[];
+        runningAgents: Array<{ issue: string; title: string; state: string; duration: string }>;
+        reviewIssues: Array<{ id: string; status: string }>;
+        activity: Array<{ verb: string; id: string }>;
+        sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
+        chat: unknown[];
+        totals: Record<string, number>;
+      };
+      expect(sidebarResponse.status).toBe(200);
+      expect(Object.keys(sidebarBody).sort()).toEqual([
+        "activity",
+        "chat",
+        "providerGates",
+        "reviewIssues",
+        "runningAgents",
+        "sessions",
+        "totals",
+      ]);
+      expect(sidebarBody).toMatchObject({
+        providerGates: [],
+        chat: [],
+        totals: { backlog: 0, todo: 1, progress: 2, review: 2, done: 1, cancelled: 1, open: 5, all: 7, completeness: 14 },
+      });
+      expect(sidebarBody.runningAgents[0]).toMatchObject({
+        issue: "TEST-1",
+        title: "Stale live title",
+        state: "active",
+        duration: "10m",
+      });
+      expect(sidebarBody.reviewIssues.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE"]);
+      expect(sidebarBody.activity[0]).toMatchObject({ verb: "run_started", id: "TEST-1" });
+      expect(sidebarBody.sessions[0]).toMatchObject({ id: "run-test-1", issue: "TEST-1", state: "running", lastEvent: "TEST-1 run started" });
+      expect(JSON.stringify(sidebarBody)).not.toContain("openai/symphony");
+      expect(JSON.stringify(sidebarBody)).not.toContain("poll 22s");
+      expect(JSON.stringify(sidebarBody)).not.toContain("Mock");
+
       const boardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
       const boardBody = (await boardResponse.json()) as {
         columns: Array<{
@@ -2629,6 +2667,7 @@ describe("StatusServer durable API", () => {
       const acceptedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
       const referenceResponse = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/reference-data");
       const dashboardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/dashboard`);
+      const sidebarResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sidebar`);
       const body = (await response.json()) as { error: { code: string; message: string } };
       const acceptedBody = (await acceptedResponse.json()) as { error: { code: string; message: string } };
       const referenceBody = (await referenceResponse.json()) as {
@@ -2640,6 +2679,15 @@ describe("StatusServer durable API", () => {
         activity: unknown[];
         providerGates: unknown[];
         runningAgents: unknown[];
+        totals: { all: number; open: number; completeness: number };
+      };
+      const sidebarBody = (await sidebarResponse.json()) as {
+        activity: unknown[];
+        providerGates: unknown[];
+        runningAgents: unknown[];
+        reviewIssues: unknown[];
+        sessions: unknown[];
+        chat: unknown[];
         totals: { all: number; open: number; completeness: number };
       };
 
@@ -2659,6 +2707,16 @@ describe("StatusServer durable API", () => {
         activity: [],
         providerGates: [],
         runningAgents: [],
+        totals: { all: 0, open: 0, completeness: 0 },
+      });
+      expect(sidebarResponse.status).toBe(200);
+      expect(sidebarBody).toMatchObject({
+        activity: [],
+        providerGates: [],
+        runningAgents: [],
+        reviewIssues: [],
+        sessions: [],
+        chat: [],
         totals: { all: 0, open: 0, completeness: 0 },
       });
     } finally {

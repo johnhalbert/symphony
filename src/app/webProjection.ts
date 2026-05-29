@@ -208,12 +208,11 @@ export interface HistoryModel {
 export interface SidebarModel {
   providerGates: ProviderGateModel[];
   runningAgents: RunningAgentModel[];
-  reviewQueue: IssueModel[];
-  recentActivity: ActivityModel[];
-  poll: {
-    nextPollAt: string | null;
-    errorCount24h: number | null;
-  };
+  reviewIssues: IssueModel[];
+  activity: ActivityModel[];
+  sessions: SessionModel[];
+  chat: ChatMessage[];
+  totals: DashboardTotals;
 }
 
 export interface WebOperatorLivenessInput {
@@ -376,8 +375,8 @@ export interface SidebarProjectionInput {
   runtime?: RuntimeSnapshot | null;
   board?: IssueBoardResponseProjectionInput | IssueBoardModel | null;
   activity?: ActivityFeedResponseProjectionInput | ActivityModel[] | null;
-  nextPollAt?: string | null;
-  errorCount24h?: number | null;
+  sessions?: SessionModel[] | null;
+  chat?: ChatMessage[] | null;
 }
 
 const ISSUE_STATUS_ORDER: IssueStatus[] = ["backlog", "todo", "progress", "review", "done", "cancelled"];
@@ -529,12 +528,11 @@ export function emptySidebarModel(): SidebarModel {
   return {
     providerGates: [],
     runningAgents: [],
-    reviewQueue: [],
-    recentActivity: [],
-    poll: {
-      nextPollAt: null,
-      errorCount24h: null,
-    },
+    reviewIssues: [],
+    activity: [],
+    sessions: [],
+    chat: [],
+    totals: emptyDashboardTotals(),
   };
 }
 
@@ -705,12 +703,11 @@ export function projectSidebarModel(input: SidebarProjectionInput = {}): Sidebar
   return {
     providerGates: projectProviderGates(input.runtime ?? null),
     runningAgents: projectRunningAgents(input.runtime ?? null),
-    reviewQueue: board.issues.filter((issue) => issue.status === "review"),
-    recentActivity: projectActivityModels(input.activity ?? null),
-    poll: {
-      nextPollAt: input.nextPollAt ?? null,
-      errorCount24h: input.errorCount24h ?? null,
-    },
+    reviewIssues: board.issues.filter((issue) => issue.status === "review").map(cloneIssueModel),
+    activity: projectActivityModels(input.activity ?? null),
+    sessions: (input.sessions ?? []).map(cloneSessionModel),
+    chat: (input.chat ?? []).map(cloneChatMessage),
+    totals: dashboardTotalsFromBoard(board),
   };
 }
 
@@ -1019,6 +1016,17 @@ function cloneReferenceData(input: ReferenceData): ReferenceData {
 
 function cloneActivityModel(input: ActivityModel): ActivityModel {
   return { ...input };
+}
+
+function cloneSessionModel(input: SessionModel): SessionModel {
+  return { ...input };
+}
+
+function cloneChatMessage(input: ChatMessage): ChatMessage {
+  return {
+    ...input,
+    ...(input.suggestions === undefined ? {} : { suggestions: [...input.suggestions] }),
+  };
 }
 
 function addReferenceLabel(labels: Map<string, ReferenceLabelModel>, value: string | null | undefined): void {
