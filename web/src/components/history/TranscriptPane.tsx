@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import type { SessionModel, TranscriptMessage } from "../../types/symphony";
 import { Icon, SessionStateChip } from "../common";
 import { Message } from "../messages/Message";
@@ -6,9 +7,11 @@ import { Message } from "../messages/Message";
 export function TranscriptPane({
   session,
   messages,
+  status = null,
 }: {
   session: SessionModel;
   messages: TranscriptMessage[];
+  status?: ReactNode;
 }) {
   const initialOpenSet = useMemo(() => new Set([5, 9, 10]), []);
   const [openSet, setOpenSet] = useState(initialOpenSet);
@@ -55,6 +58,7 @@ export function TranscriptPane({
         </div>
       </div>
       <div className="transcript">
+        {status}
         {messages.length === 0 ? <div className="transcript-status">No transcript messages for this session.</div> : null}
         {messages.map((message, index) => (
           <Message key={`${message.kind}-${index}`} message={message} open={openSet.has(index)} onToggle={() => toggle(index)} />

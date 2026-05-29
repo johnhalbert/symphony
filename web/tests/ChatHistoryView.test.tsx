@@ -1,13 +1,13 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ChatHistoryView } from "../src/components/history/ChatHistoryView";
 import type { HistoryModel, SessionModel, TranscriptMessage } from "../src/types/symphony";
 
-vi.mock("../src/hooks/useSymphonyData", () => ({
-  useTranscript: () => {
-    throw new Error("History view must not fetch selected-session transcripts in ENG-106");
-  },
+const hookMocks = vi.hoisted(() => ({
+  useTranscript: vi.fn(),
 }));
+
+vi.mock("../src/hooks/useSymphonyData", () => hookMocks);
 
 const sessions: SessionModel[] = [
   {
@@ -46,6 +46,14 @@ const embeddedTranscript: TranscriptMessage[] = [
   },
 ];
 
+const selectedTranscript: TranscriptMessage[] = [
+  {
+    kind: "assistant",
+    ts: "2026-05-29T00:15:00.000Z",
+    text: "Selected transcript loaded from the dedicated session endpoint.",
+  },
+];
+
 function history(overrides: Partial<HistoryModel> = {}): HistoryModel {
   return {
     sessions,
@@ -65,6 +73,14 @@ function history(overrides: Partial<HistoryModel> = {}): HistoryModel {
 }
 
 describe("ChatHistoryView", () => {
+  beforeEach(() => {
+    hookMocks.useTranscript.mockImplementation((sessionId: string | null) => ({
+      data: sessionId === "run-two" ? selectedTranscript : [],
+      loading: false,
+      error: null,
+    }));
+  });
+
   it("renders API history default selection safely when transcriptBySession is empty or omitted", () => {
     const markup = renderToStaticMarkup(<ChatHistoryView history={history()} />);
     const omittedTranscriptMarkup = renderToStaticMarkup(
@@ -74,18 +90,29 @@ describe("ChatHistoryView", () => {
     expect(markup).toContain("Sessions");
     expect(markup).toContain("API selected session");
     expect(markup).toContain("History API loaded");
-    expect(markup).toContain("No transcript messages for this session.");
+    expect(markup).toContain("Selected transcript loaded from the dedicated session endpoint.");
     expect(omittedTranscriptMarkup).toContain("API selected session");
-    expect(omittedTranscriptMarkup).toContain("No transcript messages for this session.");
+    expect(omittedTranscriptMarkup).toContain("Selected transcript loaded from the dedicated session endpoint.");
+    expect(hookMocks.useTranscript).toHaveBeenCalledWith("run-two");
   });
 
-  it("preserves embedded mock transcript fallback when provided in the history model", () => {
+  it("renders selected-session transcript hook data instead of embedded history-model transcript data", () => {
     const markup = renderToStaticMarkup(
       <ChatHistoryView history={history({ transcriptBySession: { "run-two": embeddedTranscript } })} />,
     );
 
-    expect(markup).toContain("Mock transcript remains embedded.");
+    expect(markup).toContain("Selected transcript loaded from the dedicated session endpoint.");
+    expect(markup).not.toContain("Mock transcript remains embedded.");
     expect(markup).not.toContain("No transcript messages for this session.");
+  });
+
+  it("surfaces selected-session transcript loading and error states", () => {
+    hookMocks.useTranscript.mockReturnValue({ data: null, loading: true, error: "Symphony API returned HTTP 503" });
+
+    const markup = renderToStaticMarkup(<ChatHistoryView history={history()} />);
+
+    expect(markup).toContain("Loading transcript");
+    expect(markup).toContain("Unable to load transcript: Symphony API returned HTTP 503");
   });
 
   it("renders timeline and empty-session variants from the history model", () => {

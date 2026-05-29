@@ -34,6 +34,13 @@ const runningAgent = {
   tokens: "42",
 };
 
+const sidebarRunningAgent = {
+  ...runningAgent,
+  id: "sidebar-summary-agent",
+  title: "Sidebar summary API agent",
+  step: "Loaded through sidebar summary API",
+};
+
 const activity = [
   {
     t: "now",
@@ -44,9 +51,41 @@ const activity = [
   },
 ];
 
-const chat = [{ who: "agent", text: "Proxy smoke chat from API", suggestions: ["Smoke suggestion from API"] }];
+const sidebarActivity = [
+  {
+    t: "now",
+    who: "sidebar-summary-worker",
+    verb: "summarized",
+    id: "SIDEBAR-SMOKE",
+    extra: "from sidebar endpoint",
+  },
+];
 
-const issue = {
+const staleDashboardChat = [
+  {
+    who: "agent",
+    text: "STALE dashboard embedded chat should not render",
+    suggestions: ["STALE dashboard suggestion should not render"],
+  },
+];
+
+const staleSidebarChat = [
+  {
+    who: "agent",
+    text: "STALE sidebar embedded chat should not render",
+    suggestions: ["STALE sidebar suggestion should not render"],
+  },
+];
+
+const orchestratorChat = [
+  {
+    who: "agent",
+    text: "Dedicated orchestrator chat from API endpoint",
+    suggestions: ["Dedicated smoke suggestion"],
+  },
+];
+
+const issueSummary = {
   id: "PROXY-1",
   title: "Browser smoke through Vite proxy",
   status: "progress",
@@ -64,6 +103,45 @@ const issue = {
   session: "smoke-session",
 };
 
+const staleIssueSummary = {
+  ...issueSummary,
+  id: "PROXY-0",
+  title: "Default issue summary before smoke selection",
+  status: "todo",
+  labels: ["web"],
+  agent: null,
+  desc: ["Summary-only issue card before the smoke selects PROXY-1."],
+  activity: [],
+  workspace: "summary-only-workspace",
+  session: "summary-only-session",
+};
+
+const issueDetail = {
+  ...issueSummary,
+  desc: ["Dedicated issue detail via Vite proxy."],
+  workspace: "web-smoke-detail-workspace",
+  session: "smoke-session-detail",
+  activity: [{ t: "now", verb: "inspected", val: "dedicated issue detail endpoint", who: "smoke-api-worker" }],
+};
+
+const staleIssueDetail = {
+  ...staleIssueSummary,
+  desc: ["Default stale issue detail before browser selection."],
+};
+
+const staleSession = {
+  id: "stale-session",
+  issue: "PROXY-0",
+  title: "Default stale history session",
+  state: "finished",
+  model: "browser-smoke-stale",
+  startedAt: "2026-05-28T00:00:00.000Z",
+  updatedAt: "2026-05-28T00:00:01.000Z",
+  msgCount: 1,
+  lastEvent: "Default stale transcript should not satisfy smoke",
+  toolCount: 0,
+};
+
 const session = {
   id: "smoke-session",
   issue: "PROXY-1",
@@ -76,6 +154,9 @@ const session = {
   lastEvent: "Loaded through Vite proxy",
   toolCount: 0,
 };
+
+const transcript = [{ kind: "assistant", ts: session.updatedAt, text: "Dedicated session transcript from API endpoint" }];
+const staleTranscript = [{ kind: "assistant", ts: staleSession.updatedAt, text: "STALE embedded history transcript should not render" }];
 
 const referenceData = {
   users: {
@@ -98,39 +179,40 @@ const dashboard = {
   providerGates: [],
   runningAgents: [runningAgent],
   activity,
-  chat,
+  chat: staleDashboardChat,
   totals,
 };
 
 const issueBoard = {
-  issues: [issue],
+  issues: [staleIssueSummary, issueSummary],
   backlog: [],
   lanes: {
-    todo: [],
-    progress: [issue],
+    todo: [staleIssueSummary],
+    progress: [issueSummary],
     review: [],
   },
   cycleLabel: "Proxy smoke cycle",
   cycleDateRange: "today",
-  selectedIssueId: issue.id,
+  selectedIssueId: staleIssueSummary.id,
 };
 
 const history = {
-  sessions: [session],
+  sessions: [staleSession, session],
   transcriptBySession: {
-    [session.id]: [{ kind: "assistant", ts: session.updatedAt, text: "Loaded through Vite proxy" }],
+    [staleSession.id]: staleTranscript,
+    [session.id]: staleTranscript,
   },
   timeline: [{ t: session.updatedAt, sess: session.id, kind: "status", text: "Loaded through Vite proxy", state: "running" }],
-  defaultSessionId: session.id,
+  defaultSessionId: staleSession.id,
 };
 
 const sidebar = {
   providerGates: [],
-  runningAgents: [runningAgent],
+  runningAgents: [sidebarRunningAgent],
   reviewIssues: [],
-  activity,
+  activity: sidebarActivity,
   sessions: [session],
-  chat,
+  chat: staleSidebarChat,
   totals,
 };
 
@@ -185,43 +267,95 @@ async function main() {
     await page.command("Page.navigate", { url: `${viteOrigin}/` });
     await page.waitForEvent("Page.loadEventFired", 10_000).catch(() => undefined);
 
-    let lastBrowserState = null;
-    const browserState = await waitFor(async () => {
-      const state = await page.evaluate(`(() => {
-        const body = document.body?.innerText ?? "";
-        const statusbar = document.querySelector(".statusbar")?.textContent ?? "";
-        const combinedText = [body, statusbar].join(" ");
-        const errors = Array.from(document.querySelectorAll(".view-error")).map((element) => element.textContent?.trim() ?? "");
-        return {
-          body,
-          statusbar,
-          errors,
-          hasApiMode: combinedText.includes("api source · api"),
-          hasDashboardData: body.includes("proxy/symphony") && body.includes("vite-proxy-smoke") && body.includes("Proxy Smoke Vite agent"),
-          hasProxyActivity: body.includes("smoke-api-worker") && body.includes("through Vite proxy"),
-          hasProxyChat: body.includes("Proxy smoke chat from API"),
-          leakedMockData: combinedText.includes("openai/symphony") || body.includes("Restart SYM-42"),
-        };
-      })()`);
-      lastBrowserState = state;
-      if (state.hasApiMode && state.hasDashboardData && state.hasProxyActivity && state.hasProxyChat) return state;
-      return null;
-    }, 10_000, 250, "browser to render API data through the Vite proxy", () => describeBrowserState(lastBrowserState));
+    const staleChatMarkers = [
+      "STALE dashboard embedded chat should not render",
+      "STALE dashboard suggestion should not render",
+      "STALE sidebar embedded chat should not render",
+      "STALE sidebar suggestion should not render",
+    ];
+    const staleTranscriptMarkers = [
+      "STALE embedded history transcript should not render",
+    ];
+    const mockUiMarkers = ["openai/symphony", "Restart SYM-42"];
+    const forbiddenMarkers = [...mockUiMarkers, ...staleChatMarkers];
+    const forbiddenSelectedTranscriptMarkers = [...forbiddenMarkers, ...staleTranscriptMarkers];
 
-    assert(!browserState.leakedMockData, "Browser rendered mock data while API mode was expected");
-    assert(browserState.errors.length === 0, `Browser rendered error state: ${browserState.errors.join(" | ")}`);
+    await waitForBrowserText(page, "dashboard API-mode data through the Vite proxy", {
+      include: [
+        "api source · api",
+        "proxy/symphony",
+        "vite-proxy-smoke",
+        "Proxy Smoke Vite agent",
+        "smoke-api-worker",
+        "through Vite proxy",
+        "Dedicated orchestrator chat from API endpoint",
+      ],
+      exclude: forbiddenMarkers,
+    });
 
-    const observed = new Set(requestLog.map((entry) => `${entry.method} ${entry.path}`));
-    for (const endpoint of [
+    await clickButtonByText(page, "Dedicated smoke suggestion", "dedicated orchestrator chat suggestion");
+    await waitForBrowserText(page, "orchestrator chat POST response through the Vite proxy", {
+      include: ["Dedicated smoke suggestion", "Dedicated chat POST acknowledgement from API"],
+      exclude: forbiddenMarkers,
+    });
+
+    await clickButtonByAriaLabel(page, "Issues", "Issues tab");
+    await waitForBrowserText(page, "issues tab issue cards", {
+      include: ["Proxy smoke cycle", "Default issue summary before smoke selection", "PROXY-1"],
+      exclude: forbiddenMarkers,
+    });
+    await clickButtonByText(page, "PROXY-1", "PROXY-1 issue card");
+    await waitForBrowserText(page, "PROXY-1 issue detail rendered from the dedicated API endpoint", {
+      include: [
+        "Dedicated issue detail via Vite proxy.",
+        "web-smoke-detail-workspace",
+        "smoke-session-detail",
+        "dedicated issue detail endpoint",
+      ],
+      exclude: forbiddenMarkers,
+    });
+
+    await clickButtonByAriaLabel(page, "Chat history", "Chat history tab");
+    await waitForBrowserText(page, "history session list", {
+      include: ["Default stale history session", "Browser proxy smoke session"],
+      exclude: forbiddenMarkers,
+    });
+    await clickButtonByText(page, "Browser proxy smoke session", "smoke transcript session row");
+    await waitForBrowserText(page, "selected history transcript rendered from the transcript API endpoint", {
+      include: ["Browser proxy smoke session", "smoke-session", "Dedicated session transcript from API endpoint"],
+      exclude: forbiddenSelectedTranscriptMarkers,
+    });
+
+    await clickButtonByAriaLabel(page, "Sidebars", "Sidebars tab");
+    await waitForBrowserText(page, "sidebar summary rendered from API data", {
+      include: [
+        "Sidebar summary API agent",
+        "Loaded through sidebar summary API",
+        "sidebar-summary-worker",
+        "summarized",
+        "SIDEBAR-SMOKE",
+        "33%",
+        "3 total issues",
+      ],
+      exclude: forbiddenMarkers,
+    });
+    await selectOption(page, 'select[aria-label="Sidebar variant"]', "chat", "sidebar chat variant");
+    await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload", {
+      include: ["Dedicated orchestrator chat from API endpoint", "Dedicated smoke suggestion"],
+      exclude: forbiddenMarkers,
+    });
+
+    assertObservedEndpoints([
       "GET /api/v1/web/reference-data",
       "GET /api/v1/web/dashboard",
       "GET /api/v1/web/issues",
+      "GET /api/v1/web/issues/PROXY-1",
       "GET /api/v1/web/history",
+      "GET /api/v1/web/sessions/smoke-session/transcript",
       "GET /api/v1/web/sidebar",
       "GET /api/v1/web/orchestrator-chat",
-    ]) {
-      assert(observed.has(endpoint), `Expected fake API to receive ${endpoint} through the Vite proxy`);
-    }
+      "POST /api/v1/web/orchestrator-chat",
+    ]);
 
     await page.close();
     await stopBrowserProcess(browserProcess);
@@ -255,12 +389,23 @@ async function startFakeApiServer() {
     if (request.method === "GET" && url.pathname === "/api/v1/web/issues") return sendJson(response, 200, issueBoard);
     if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") return sendJson(response, 200, sidebar);
     if (request.method === "GET" && url.pathname === "/api/v1/web/history") return sendJson(response, 200, history);
-    if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") return sendJson(response, 200, chat);
-    if (request.method === "GET" && /^\/api\/v1\/web\/issues\//.test(url.pathname)) return sendJson(response, 200, { issue, activity, runs: [session], transcript: history.transcriptBySession[session.id] });
-    if (request.method === "GET" && /^\/api\/v1\/web\/sessions\//.test(url.pathname)) return sendJson(response, 200, history.transcriptBySession[session.id]);
+    if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") return sendJson(response, 200, orchestratorChat);
+    if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-1") {
+      return sendJson(response, 200, { issue: issueDetail, activity: issueDetail.activity, runs: [session], transcript });
+    }
+    if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-0") {
+      return sendJson(response, 200, { issue: staleIssueDetail, activity: [], runs: [staleSession], transcript: staleTranscript });
+    }
+    if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/smoke-session/transcript") return sendJson(response, 200, transcript);
+    if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/stale-session/transcript") return sendJson(response, 200, staleTranscript);
     if (request.method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
-      await readRequestBody(request);
-      return sendJson(response, 200, [...chat, { who: "user", text: "browser smoke input" }]);
+      const bodyText = await readRequestBody(request);
+      const input = parseChatInput(bodyText) ?? "browser smoke input";
+      return sendJson(response, 200, [
+        ...orchestratorChat,
+        { who: "user", text: input },
+        { who: "agent", text: "Dedicated chat POST acknowledgement from API", suggestions: ["POST guard observed"] },
+      ]);
     }
 
     return sendJson(response, 404, { error: { code: "not_found", path: url.pathname } });
@@ -286,8 +431,19 @@ function sendJson(response, status, body) {
 }
 
 async function readRequestBody(request) {
-  for await (const _chunk of request) {
-    // Drain the request so Node can reuse the socket.
+  let body = "";
+  for await (const chunk of request) {
+    body += String(chunk);
+  }
+  return body;
+}
+
+function parseChatInput(bodyText) {
+  try {
+    const body = JSON.parse(bodyText);
+    return typeof body.input === "string" && body.input.trim() ? body.input.trim() : null;
+  } catch {
+    return null;
   }
 }
 
@@ -526,15 +682,103 @@ async function waitForProcessExit(childProcess, timeoutMs) {
   });
 }
 
-function describeBrowserState(state) {
+async function waitForBrowserText(page, description, { include = [], exclude = [] }) {
+  let lastBrowserState = null;
+  return waitFor(async () => {
+    const state = await readBrowserTextState(page, include, exclude);
+    lastBrowserState = state;
+    if (state.missing.length === 0 && state.presentForbidden.length === 0 && state.errors.length === 0) return state;
+    return null;
+  }, 10_000, 250, `browser to render ${description}`, () => describeBrowserTextState(lastBrowserState));
+}
+
+async function readBrowserTextState(page, include, exclude) {
+  const snapshot = await page.evaluate(`(() => {
+    const body = document.body?.innerText ?? "";
+    const statusbar = document.querySelector(".statusbar")?.textContent ?? "";
+    const errors = Array.from(document.querySelectorAll(".view-error")).map((element) => element.textContent?.trim() ?? "");
+    return { body, statusbar, errors };
+  })()`);
+  const combinedText = [snapshot.body, snapshot.statusbar].join(" ");
+  return {
+    ...snapshot,
+    missing: include.filter((marker) => !combinedText.includes(marker)),
+    presentForbidden: exclude.filter((marker) => combinedText.includes(marker)),
+  };
+}
+
+async function clickButtonByAriaLabel(page, label, description) {
+  await clickElementFromExpression(
+    page,
+    `(() => Array.from(document.querySelectorAll("button")).find((button) => button.getAttribute("aria-label") === ${JSON.stringify(label)}))()`,
+    description,
+  );
+}
+
+async function clickButtonByText(page, text, description) {
+  await clickElementFromExpression(
+    page,
+    `(() => {
+      const expected = ${JSON.stringify(text)};
+      const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
+      return Array.from(document.querySelectorAll("button")).find((button) => normalize(button.innerText || button.textContent).includes(expected));
+    })()`,
+    description,
+  );
+}
+
+async function clickElementFromExpression(page, elementExpression, description) {
+  const rect = await page.evaluate(`(() => {
+    const element = ${elementExpression};
+    if (!element) return { found: false };
+    element.scrollIntoView({ block: "center", inline: "center" });
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return {
+      found: true,
+      visible: rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none",
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      width: rect.width,
+      height: rect.height,
+      text: (element.innerText || element.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 160),
+    };
+  })()`);
+  assert(rect?.found, `Could not find ${description} in the browser`);
+  assert(rect.visible, `Found ${description}, but it was not visible/clickable: ${JSON.stringify(rect)}`);
+  await page.command("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y });
+  await page.command("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 });
+  await page.command("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "left", clickCount: 1 });
+}
+
+async function selectOption(page, selector, value, description) {
+  const result = await page.evaluate(`(() => {
+    const select = document.querySelector(${JSON.stringify(selector)});
+    if (!select) return { found: false };
+    select.value = ${JSON.stringify(value)};
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    return { found: true, value: select.value, text: (select.textContent || "").replace(/\\s+/g, " ").trim() };
+  })()`);
+  assert(result?.found, `Could not find ${description} select ${selector}`);
+  assert(result.value === value, `Could not select ${description}; expected ${value}, got ${JSON.stringify(result)}`);
+}
+
+function assertObservedEndpoints(endpoints) {
+  const observed = new Set(requestLog.map((entry) => `${entry.method} ${entry.path}`));
+  for (const endpoint of endpoints) {
+    assert(observed.has(endpoint), `Expected fake API to receive ${endpoint} through the Vite proxy`);
+  }
+}
+
+function describeBrowserTextState(state) {
   if (!state) return "no browser state captured";
-  const flags = ["hasApiMode", "hasDashboardData", "hasProxyActivity", "hasProxyChat", "leakedMockData"]
-    .map((key) => `${key}=${Boolean(state[key])}`)
-    .join(", ");
+  const missing = state.missing?.length ? ` missing=${state.missing.join(" | ")}` : "";
+  const forbidden = state.presentForbidden?.length ? ` forbidden=${state.presentForbidden.join(" | ")}` : "";
   const errors = state.errors?.length ? ` errors=${state.errors.join(" | ")}` : "";
   const statusbar = typeof state.statusbar === "string" ? state.statusbar.replace(/\s+/g, " ").slice(0, 240) : "";
-  const body = typeof state.body === "string" ? state.body.replace(/\s+/g, " ").slice(0, 600) : "";
-  return `${flags}${errors} statusbar=${JSON.stringify(statusbar)} body=${JSON.stringify(body)}`;
+  const body = typeof state.body === "string" ? state.body.replace(/\s+/g, " ").slice(0, 800) : "";
+  return `${missing}${forbidden}${errors} statusbar=${JSON.stringify(statusbar)} body=${JSON.stringify(body)}`;
 }
 
 async function waitFor(probe, timeoutMs, intervalMs, description, describeLast = null) {
