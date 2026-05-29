@@ -77,7 +77,7 @@ describe("Orchestrator", () => {
   afterEach(async () => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
   });
 
   it("sorts issues by priority, creation date, then identifier", () => {
