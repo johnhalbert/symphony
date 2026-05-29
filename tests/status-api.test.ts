@@ -2439,6 +2439,42 @@ describe("StatusServer durable API", () => {
         },
       });
 
+      const webIssuesResponse = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/issues");
+      const webIssuesBody = (await webIssuesResponse.json()) as {
+        issues: Array<{ id: string; status: string }>;
+        backlog: Array<{ id: string; status: string }>;
+        lanes: { todo: Array<{ id: string }>; progress: Array<{ id: string }>; review: Array<{ id: string }> };
+        cycleLabel: string;
+        cycleDateRange: string;
+        selectedIssueId: string;
+      };
+      expect(webIssuesResponse.status).toBe(200);
+      expect(Object.keys(webIssuesBody).sort()).toEqual([
+        "backlog",
+        "cycleDateRange",
+        "cycleLabel",
+        "issues",
+        "lanes",
+        "selectedIssueId",
+      ]);
+      expect(webIssuesBody.cycleLabel).toBe("");
+      expect(webIssuesBody.cycleDateRange).toBe("");
+      expect(webIssuesBody.issues.map((item) => item.id)).toEqual([
+        "TEST-TODO",
+        "TEST-PROGRESS",
+        "TEST-1",
+        "TEST-MERGE",
+        "TEST-DONE",
+        "TEST-CANCELED",
+        "TEST-BLOCKED",
+      ]);
+      expect(webIssuesBody.backlog.map((item) => item.id)).toEqual(["TEST-TODO"]);
+      expect(webIssuesBody.lanes.todo.map((item) => item.id)).toEqual(["TEST-TODO"]);
+      expect(webIssuesBody.lanes.progress.map((item) => item.id)).toEqual(["TEST-PROGRESS", "TEST-BLOCKED"]);
+      expect(webIssuesBody.lanes.review.map((item) => item.id)).toEqual(["TEST-1", "TEST-MERGE"]);
+      expect(webIssuesBody.issues.find((item) => item.id === "TEST-CANCELED")?.status).toBe("cancelled");
+      expect(webIssuesBody.selectedIssueId).toBe("TEST-PROGRESS");
+
       const boardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
       const boardBody = (await boardResponse.json()) as {
         columns: Array<{

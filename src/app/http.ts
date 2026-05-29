@@ -4,10 +4,15 @@ import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
-import { projectWebIssueDetail, projectWebOrchestratorChat } from "./webProjection.js";
+import {
+  projectWebIssueBoard,
+  projectWebIssueDetail,
+  projectWebOrchestratorChat
+} from "./webProjection.js";
 import {
   runKindForPhase,
   toIssueStatusView,
+  type AgentRunKind,
   type AgentRunPhase,
   type AgentRunRole,
   type Issue,
@@ -186,6 +191,19 @@ export class StatusServer {
             ),
           ),
         );
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/web/issues") {
+        const forceRefresh = url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true";
+        let board: IssueBoardResponse | null = null;
+        try {
+          board = await this.fetchIssueBoard(forceRefresh);
+        } catch (error) {
+          if (!(error instanceof SymphonyError) || (error.code !== "tracker_error" && error.code !== "tracker_unavailable")) {
+            throw error;
+          }
+        }
+        sendJson(response, 200, projectWebIssueBoard(board));
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/issue-board") {
@@ -1073,7 +1091,7 @@ interface IssueBoardCard {
   lane: IssueBoardColumnId;
   issueDetails: IssueDetailsEnvelope;
   paused: boolean;
-  live: { role: AgentRunRole; runPhase: AgentRunPhase; runKind: string; state: string; runId: string | null } | null;
+  live: { role: AgentRunRole; runPhase: AgentRunPhase; runKind: AgentRunKind; state: string; runId: string | null } | null;
   operatorLiveness: Awaited<ReturnType<typeof issueOperatorLiveness>>;
   reviewLoop: ReturnType<typeof reviewLoopStatus>;
   metadata: ReturnType<typeof statusMetadata>;

@@ -11,6 +11,7 @@ import {
   projectHistoryModel,
   projectIssueBoardModel,
   projectIssueDetailModel,
+  projectWebIssueBoard,
   projectTranscriptMessages,
   projectWebOrchestratorChat,
   type ActivityFeedResponseProjectionInput,
@@ -123,6 +124,34 @@ function card(overrides: Partial<IssueBoardCardProjectionInput> = {}): IssueBoar
   };
 }
 
+function webCard(
+  identifier: string,
+  overrides: { lane: IssueBoardCardProjectionInput["lane"]; state: string; priority?: number | null; title?: string } & Partial<
+    Pick<IssueBoardCardProjectionInput, "issueId" | "key" | "live" | "operatorLiveness">
+  >,
+): IssueBoardCardProjectionInput {
+  const issueId = overrides.issueId ?? "issue-" + identifier.toLowerCase();
+  return card({
+    key: overrides.key ?? identifier,
+    issueId,
+    issueIdentifier: identifier,
+    lane: overrides.lane,
+    issueDetails: issueDetails({
+      issue: {
+        ...issueDetails().issue,
+        id: issueId,
+        identifier,
+        title: overrides.title ?? identifier + " title",
+        state: overrides.state,
+        priority: overrides.priority ?? null,
+        labels: [],
+      },
+    }),
+    live: overrides.live ?? null,
+    operatorLiveness: overrides.operatorLiveness ?? null,
+  });
+}
+
 function run(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
     runId: "run-1",
@@ -212,6 +241,85 @@ describe("web projection foundation", () => {
       session: "session-1",
       desc: ["First paragraph.", "Second paragraph with extra whitespace."],
     });
+  });
+
+  it("projects the React issue-board shape from backend board cards", () => {
+    const board = projectWebIssueBoard({
+      generatedAt: "2026-01-01T00:06:00.000Z",
+      issues: [
+        webCard("TEST-TODO", { lane: "todo", state: "Todo", priority: 1 }),
+        webCard("TEST-PROGRESS", { lane: "progress", state: "In Progress", priority: 2 }),
+        webCard("TEST-REVIEW", { lane: "review", state: "In Review", priority: 3 }),
+        webCard("TEST-DONE", { lane: "done", state: "Done", priority: 0 }),
+      ],
+    });
+
+    expect(board).toMatchObject({
+      cycleLabel: "",
+      cycleDateRange: "",
+      selectedIssueId: "TEST-PROGRESS",
+    });
+    expect(board.issues.map((issue) => issue.id)).toEqual(["TEST-TODO", "TEST-PROGRESS", "TEST-REVIEW", "TEST-DONE"]);
+    expect(board.backlog.map((issue) => issue.id)).toEqual(["TEST-TODO"]);
+    expect(board.lanes.todo.map((issue) => issue.id)).toEqual(["TEST-TODO"]);
+    expect(board.lanes.progress.map((issue) => issue.id)).toEqual(["TEST-PROGRESS"]);
+    expect(board.lanes.review.map((issue) => issue.id)).toEqual(["TEST-REVIEW"]);
+  });
+
+  it("normalizes canceled backend board cards to cancelled for the React issue board", () => {
+    const board = projectWebIssueBoard({
+      issues: [webCard("TEST-CANCELED", { lane: "canceled", state: "Canceled", title: "Canceled issue" })],
+    });
+
+    expect(board.issues[0]).toMatchObject({ id: "TEST-CANCELED", title: "Canceled issue", status: "cancelled" });
+    expect(board.lanes).toEqual({ todo: [], progress: [], review: [] });
+    expect(board.selectedIssueId).toBe("TEST-CANCELED");
+  });
+
+  it("sorts React issue-board backlog by priority weight while preserving equal-priority order", () => {
+    const board = projectWebIssueBoard({
+      issues: [
+        webCard("TEST-LOW", { lane: "backlog", state: "Backlog", priority: 1 }),
+        webCard("TEST-HIGH-A", { lane: "backlog", state: "Backlog", priority: 3 }),
+        webCard("TEST-HIGH-B", { lane: "todo", state: "Todo", priority: 3 }),
+        webCard("TEST-MED", { lane: "todo", state: "Todo", priority: 2 }),
+      ],
+    });
+
+    expect(board.issues.map((issue) => issue.id)).toEqual(["TEST-LOW", "TEST-HIGH-A", "TEST-HIGH-B", "TEST-MED"]);
+    expect(board.backlog.map((issue) => issue.id)).toEqual(["TEST-HIGH-A", "TEST-HIGH-B", "TEST-MED", "TEST-LOW"]);
+  });
+
+  it("returns an empty React issue-board model when board data is unavailable", () => {
+    expect(projectWebIssueBoard(null)).toEqual({
+      issues: [],
+      backlog: [],
+      lanes: { todo: [], progress: [], review: [] },
+      cycleLabel: "",
+      cycleDateRange: "",
+      selectedIssueId: "",
+    });
+  });
+
+  it("selects the React issue-board issue by progress, todo, backlog, all-issue, then empty fallback order", () => {
+    expect(
+      projectWebIssueBoard({
+        issues: [
+          webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
+          webCard("TEST-PROGRESS", { lane: "progress", state: "In Progress" }),
+        ],
+      }).selectedIssueId,
+    ).toBe("TEST-PROGRESS");
+    expect(projectWebIssueBoard({ issues: [webCard("TEST-TODO", { lane: "todo", state: "Todo" })] }).selectedIssueId).toBe(
+      "TEST-TODO",
+    );
+    expect(
+      projectWebIssueBoard({ issues: [webCard("TEST-BACKLOG", { lane: "backlog", state: "Backlog" })] }).selectedIssueId,
+    ).toBe("TEST-BACKLOG");
+    expect(projectWebIssueBoard({ issues: [webCard("TEST-DONE", { lane: "done", state: "Done" })] }).selectedIssueId).toBe(
+      "TEST-DONE",
+    );
+    expect(projectWebIssueBoard(null).selectedIssueId).toBe("");
   });
 
   it("normalizes status, priority, and description boundary cases", () => {
