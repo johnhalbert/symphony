@@ -78,3 +78,8 @@ export function useSidebar() {
   const dataSource = useDataSource();
   return useAsyncResource(useCallback(() => dataSource.getSidebar(), [dataSource]), [dataSource]);
 }
+
+export function useOrchestratorChat() {
+  const dataSource = useDataSource();
+  return useAsyncResource(useCallback(() => dataSource.getOrchestratorChat(), [dataSource]), [dataSource]);
+}

@@ -1,5 +1,5 @@
 import type { SymphonyDataSource } from "./dataSource";
-import type { ReferenceData } from "../types/symphony";
+import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
   name?: string | null;
@@ -69,7 +69,7 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       return fetchJson(normalizedBaseUrl, "/api/v1/web/sidebar");
     },
     async getOrchestratorChat() {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/orchestrator-chat");
+      return fetchJson<ChatMessage[]>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat");
     },
     async sendOrchestratorMessage(input) {
       const response = await fetch(`${normalizedBaseUrl}/api/v1/web/orchestrator-chat`, {
@@ -81,7 +81,7 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
         body: JSON.stringify({ input }),
       });
       if (!response.ok) throw new Error(`Symphony API returned HTTP ${response.status}`);
-      return response.json();
+      return response.json() as Promise<ChatMessage[]>;
     },
   };
 }

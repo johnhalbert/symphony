@@ -4,10 +4,14 @@ import type { ChatMessage } from "../../types/symphony";
 import { formatInlineText } from "../messages/messageFormat";
 
 export function OrchestratorChat({
+  error = null,
+  loading = false,
   messages,
   onSend,
   subtitle,
 }: {
+  error?: string | null;
+  loading?: boolean;
   messages: ChatMessage[];
   onSend: (input: string) => Promise<void>;
   subtitle?: string;
@@ -41,6 +45,8 @@ export function OrchestratorChat({
         </button>
       </div>
       <div className="chat__body">
+        {loading && messages.length === 0 ? <div className="view-loading">Loading orchestrator chat...</div> : null}
+        {error ? <div className="view-error">Orchestrator chat unavailable: {error}</div> : null}
         {messages.map((message, index) => (
           <div className="chat__msg" key={`${message.who}-${index}-${message.text}`}>
             <div className={`who ${message.who === "user" ? "who--user" : ""}`}>

@@ -8,7 +8,14 @@ import { DashboardView } from "./components/dashboard/DashboardView";
 import { IssuesView } from "./components/issues/IssuesView";
 import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
 import { ReferenceDataProvider } from "./data/referenceDataContext";
-import { useDashboard, useHistory, useIssueBoard, useReferenceData as useReferenceResource, useSidebar } from "./hooks/useSymphonyData";
+import {
+  useDashboard,
+  useHistory,
+  useIssueBoard,
+  useOrchestratorChat,
+  useReferenceData as useReferenceResource,
+  useSidebar,
+} from "./hooks/useSymphonyData";
 import type { AppTab, DashboardVariant, HistoryVariant, IssuesVariant, RunState, SidebarVariant } from "./types/symphony";
 
 export function App() {
@@ -53,6 +60,7 @@ function AppShell() {
   const issueBoard = useIssueBoard();
   const history = useHistory();
   const sidebar = useSidebar();
+  const orchestratorChat = useOrchestratorChat();
   const dashboardChrome = dashboard.data;
   const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
   const apiMode = defaultDataSourceConfig.mode === "api";
@@ -82,7 +90,18 @@ function AppShell() {
           />
         }
       >
-        {activeTab === "dashboard" ? renderLoadable(dashboard, (data) => <DashboardView dashboard={data} variant={dashboardVariant} useModelBurnupTotals={apiMode} />) : null}
+        {activeTab === "dashboard"
+          ? renderLoadable(dashboard, (data) => (
+              <DashboardView
+                dashboard={data}
+                variant={dashboardVariant}
+                useModelBurnupTotals={apiMode}
+                orchestratorChat={orchestratorChat.data ?? []}
+                orchestratorChatError={orchestratorChat.error}
+                orchestratorChatLoading={orchestratorChat.loading}
+              />
+            ))
+          : null}
         {activeTab === "issues" ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} />) : null}
         {activeTab === "history" ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} />) : null}
         {activeTab === "sidebar" ? renderLoadable(sidebar, (data) => <SidebarViews sidebar={data} variant={sidebarVariant} />) : null}
