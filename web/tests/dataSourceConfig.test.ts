@@ -13,6 +13,13 @@ describe("web data-source configuration", () => {
     });
   });
 
+  it("treats a slash API base URL as configured same-origin API mode", () => {
+    expect(resolveDataSourceConfig({ VITE_SYMPHONY_API_BASE_URL: " / " })).toEqual({
+      mode: "api",
+      apiBaseUrl: "/",
+    });
+  });
+
   it("activates API mode with same-origin requests when Vite proxy mode is selected", () => {
     expect(resolveDataSourceConfig({ VITE_SYMPHONY_DATA_SOURCE: " api " })).toEqual({ mode: "api", apiBaseUrl: "" });
   });

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
+import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
 import type { ChatMessage, DashboardModel, HistoryModel, IssueBoardModel, TranscriptMessage } from "../src/types/symphony";
 
 const originalFetch = globalThis.fetch;
@@ -154,6 +155,21 @@ describe("API data source", () => {
 
     await createApiDataSource("").getDashboard();
 
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/dashboard", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
+  it("uses configured slash API mode for same-origin requests instead of mock fallback", async () => {
+    const config = resolveDataSourceConfig({ VITE_SYMPHONY_API_BASE_URL: " / " });
+    expect(config).toEqual({ mode: "api", apiBaseUrl: "/" });
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(dashboardModel));
+
+    await expect(createDataSource(config).getDashboard()).resolves.toEqual(dashboardModel);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/dashboard", {
       headers: { Accept: "application/json" },
       signal: undefined,
