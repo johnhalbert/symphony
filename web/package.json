@@ -10,7 +10,8 @@
     "smoke:browser-harness": "node scripts/browser-smoke.mjs",
     "typecheck": "tsc -b --pretty false",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "smoke:browser": "node scripts/browser-vite-proxy-smoke.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

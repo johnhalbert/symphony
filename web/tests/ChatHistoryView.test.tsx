@@ -110,6 +110,20 @@ describe("ChatHistoryView", () => {
     expect(markup).not.toContain("No transcript messages for this session.");
   });
 
+  it("renders dedicated selected-session transcript data even when embedded history data is present or omitted", () => {
+    const embeddedMarkup = renderToStaticMarkup(
+      <ChatHistoryView history={history({ transcriptBySession: { "run-two": embeddedTranscript } })} />,
+    );
+    const omittedTranscriptMarkup = renderToStaticMarkup(
+      <ChatHistoryView history={history({ transcriptBySession: undefined as unknown as HistoryModel["transcriptBySession"] })} />,
+    );
+
+    expect(embeddedMarkup).toContain("Dedicated session transcript loaded from the API.");
+    expect(embeddedMarkup).not.toContain("Mock transcript remains embedded.");
+    expect(omittedTranscriptMarkup).toContain("API selected session");
+    expect(omittedTranscriptMarkup).toContain("Dedicated session transcript loaded from the API.");
+  });
+
   it("treats an exact empty transcript response as loaded-empty instead of substituting embedded messages", () => {
     useTranscriptMock.mockReturnValue(transcriptState({ data: [] }));
 
