@@ -1,5 +1,36 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { withHermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
+
+const touchedEnvKeys = [
+  "HERMES_API_KEY",
+  "HERMES_AUTH_HOME",
+  "HERMES_CWD",
+  "HERMES_HOME",
+  "HERMES_MODEL",
+  "HERMES_PYTHON",
+  "HERMES_PYTHON_SRC_ROOT",
+  "HERMES_TUI_AGENT_INIT_TIMEOUT_MS",
+  "HERMES_TUI_GATEWAY_URL",
+  "HERMES_TUI_PROVIDER",
+  "HERMES_TUI_RPC_TIMEOUT_MS",
+  "HERMES_TUI_SIDECAR_URL",
+  "HERMES_TUI_STARTUP_TIMEOUT_MS",
+  "TERMINAL_CWD",
+] as const;
+
+const originalEnv = new Map<string, string | undefined>(
+  touchedEnvKeys.map((key) => [key, process.env[key]]),
+);
+
+afterEach(() => {
+  for (const [key, value] of originalEnv) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+});
 
 describe("withHermesGatewayEnvironment", () => {
   it("scopes Hermes gateway environment overrides to a synchronous request start", () => {
@@ -52,6 +83,8 @@ describe("withHermesGatewayEnvironment", () => {
   });
 
   it("passes the request timeout through for deferred Hermes agent initialization", () => {
+    process.env.HERMES_TUI_AGENT_INIT_TIMEOUT_MS = "existing-timeout";
+
     const observed = withHermesGatewayEnvironment(
       {
         upstreamRoot: "/repo/hermes",
@@ -63,6 +96,6 @@ describe("withHermesGatewayEnvironment", () => {
     );
 
     expect(observed).toBe("120000");
-    expect(process.env.HERMES_TUI_AGENT_INIT_TIMEOUT_MS).toBeUndefined();
+    expect(process.env.HERMES_TUI_AGENT_INIT_TIMEOUT_MS).toBe("existing-timeout");
   });
 });
