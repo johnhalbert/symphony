@@ -1,4 +1,15 @@
 import type { SymphonyDataSource } from "./dataSource";
+import type { ReferenceData } from "../types/symphony";
+
+interface ApiReferenceEntry {
+  name?: string | null;
+  color?: string | null;
+}
+
+interface ApiReferenceData {
+  users?: Record<string, ApiReferenceEntry | null> | null;
+  labels?: Record<string, ApiReferenceEntry | null> | null;
+}
 
 async function fetchJson<T>(baseUrl: string, path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -9,12 +20,31 @@ async function fetchJson<T>(baseUrl: string, path: string, signal?: AbortSignal)
   return response.json() as Promise<T>;
 }
 
+function normalizeReferenceRecord(record: Record<string, ApiReferenceEntry | null> | null | undefined) {
+  return Object.fromEntries(
+    Object.entries(record ?? {}).map(([key, entry]) => [
+      key,
+      {
+        name: entry?.name?.trim() || key,
+        color: entry?.color ?? null,
+      },
+    ]),
+  );
+}
+
+export function normalizeReferenceData(input: ApiReferenceData): ReferenceData {
+  return {
+    users: normalizeReferenceRecord(input.users),
+    labels: normalizeReferenceRecord(input.labels),
+  };
+}
+
 export function createApiDataSource(baseUrl: string): SymphonyDataSource {
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
 
   return {
     async getReferenceData() {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/reference-data");
+      return normalizeReferenceData(await fetchJson<ApiReferenceData>(normalizedBaseUrl, "/api/v1/web/reference-data"));
     },
     async getDashboard() {
       return fetchJson(normalizedBaseUrl, "/api/v1/web/dashboard");

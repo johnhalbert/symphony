@@ -19,12 +19,12 @@ export type SidebarVariant = "primary" | "chat" | "history";
 
 export interface LabelDef {
   name: string;
-  color: string;
+  color: string | null;
 }
 
 export interface UserDef {
   name: string;
-  color: string;
+  color: string | null;
 }
 
 export type LabelMap = Record<string, LabelDef>;

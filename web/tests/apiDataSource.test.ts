@@ -1,5 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createApiDataSource } from "../src/data/apiDataSource";
+import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
+
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  globalThis.fetch = originalFetch;
+});
+
+function mockJsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), {
@@ -90,5 +104,72 @@ describe("API data source", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: "nope" }, { status: 502 }));
 
     await expect(createApiDataSource("").getIssueBoard()).rejects.toThrow("Symphony API returned HTTP 502");
+  });
+});
+
+describe("api data source reference data", () => {
+  it("loads GET /api/v1/web/reference-data from the configured API base URL", async () => {
+    const fetchMock = vi.fn(async () =>
+      mockJsonResponse({
+        users: {
+          unassigned: { name: "Unassigned", color: "#6f7785" },
+          "delegate-review": { name: "delegate-review", color: null },
+        },
+        labels: {
+          "dogfood-ready": { name: "dogfood-ready", color: "#7fc28b" },
+        },
+      }),
+    );
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const dataSource = createApiDataSource("https://symphony.example///");
+    const reference = await dataSource.getReferenceData();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("https://symphony.example/api/v1/web/reference-data", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+    expect(reference).toEqual({
+      users: {
+        unassigned: { name: "Unassigned", color: "#6f7785" },
+        "delegate-review": { name: "delegate-review", color: null },
+      },
+      labels: {
+        "dogfood-ready": { name: "dogfood-ready", color: "#7fc28b" },
+      },
+    });
+  });
+
+  it("normalizes sparse reference records without dropping usable keys", () => {
+    expect(
+      normalizeReferenceData({
+        users: {
+          "delegate-a": { name: "  ", color: null },
+          "user-b": null,
+        },
+        labels: {
+          alpha: { color: "#123456" },
+          beta: { name: "Beta", color: undefined },
+        },
+      }),
+    ).toEqual({
+      users: {
+        "delegate-a": { name: "delegate-a", color: null },
+        "user-b": { name: "user-b", color: null },
+      },
+      labels: {
+        alpha: { name: "alpha", color: "#123456" },
+        beta: { name: "Beta", color: null },
+      },
+    });
+  });
+
+  it("surfaces HTTP failures while loading reference data", async () => {
+    globalThis.fetch = vi.fn(async () => mockJsonResponse({ error: { code: "tracker_unavailable" } }, 503)) as typeof fetch;
+
+    await expect(createApiDataSource("https://symphony.example").getReferenceData()).rejects.toThrow(
+      "Symphony API returned HTTP 503",
+    );
   });
 });

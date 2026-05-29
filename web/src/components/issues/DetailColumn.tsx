@@ -1,6 +1,7 @@
 import type { IssueModel } from "../../types/symphony";
 import { Avatar, Icon, Label, Priority, STATUS_LABEL, StatusIcon } from "../common";
 import { useReferenceData } from "../../data/referenceDataContext";
+import { referenceDisplayName } from "../../data/referenceData";
 
 function priorityLabel(priority: IssueModel["priority"]): string {
   if (priority === "urgent") return "Urgent";
@@ -58,7 +59,7 @@ export function DetailColumn({ issue, onClose }: { issue: IssueModel | null; onC
               {priorityLabel(issue.priority)}
             </button>
             <button className="btn" type="button">
-              <Avatar user={issue.assignee} /> {assigneeName}
+              <Avatar user={issue.assignee} /> {referenceDisplayName(issue.assignee, users[issue.assignee])}
             </button>
           </div>
         </div>
@@ -79,7 +80,7 @@ export function DetailColumn({ issue, onClose }: { issue: IssueModel | null; onC
               <span className="k">Assignee</span>
               <span className="v">
                 <Avatar user={issue.assignee} />
-                {assigneeName}
+                {referenceDisplayName(issue.assignee, users[issue.assignee])}
               </span>
               <span className="k">Labels</span>
               <span className="v">
