@@ -642,11 +642,11 @@ describe("approval status API", () => {
       const runningRun = await waitForRunMatch(
         runStore,
         "live-report-run",
-        (run) => run.pendingApprovalRequestId === pending.requestId,
-        "pending approval metadata",
+        (run) => run.status === "running" && run.pendingApprovalRequestId === pending.requestId,
+        "live pending publication approval metadata",
       );
       expect(runningRun).toMatchObject({ status: "running", pendingApprovalRequestId: pending.requestId });
-      expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
+      expect(runningRun.cancellationRequestedAt ?? null).toBeNull();
       await waitFor(async () => {
         const lifecycle = await lifecycleStore.get(candidate.id);
         return lifecycle?.blockedReason === PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON;
