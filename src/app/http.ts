@@ -8,6 +8,7 @@ import {
   projectWebIssueBoard,
   projectWebIssueDetail,
   projectWebOrchestratorChat,
+  projectWebOrchestratorChatPost,
   projectWebReferenceData,
 } from "./webProjection.js";
 import {
@@ -278,9 +279,44 @@ export class StatusServer {
         sendJson(response, 200, projectWebTranscript(await readFullWebTranscript(this.options.runStore, run.runId)));
         return;
       }
-      if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") {
-        sendJson(response, 200, projectWebOrchestratorChat());
-        return;
+      if (url.pathname === "/api/v1/web/orchestrator-chat") {
+        if (request.method === "GET") {
+          sendJson(response, 200, projectWebOrchestratorChat());
+          return;
+        }
+        if (request.method === "POST") {
+          let body: unknown;
+          try {
+            body = await readJsonBody(request);
+          } catch {
+            sendJson(response, 400, {
+              error: {
+                code: "invalid_request",
+                message: "Web orchestrator chat request body must be valid JSON",
+              },
+            });
+            return;
+          }
+
+          let input: string;
+          try {
+            input = parseWebOrchestratorChatPostRequest(body);
+          } catch (error) {
+            if (error instanceof SymphonyError && error.code === "invalid_request") {
+              sendJson(response, 400, {
+                error: {
+                  code: error.code,
+                  message: errorMessage(error),
+                },
+              });
+              return;
+            }
+            throw error;
+          }
+
+          sendJson(response, 200, projectWebOrchestratorChatPost(input));
+          return;
+        }
       }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
         sendJson(response, 200, {
@@ -868,6 +904,23 @@ function parseApprovalDecision(body: unknown): "approve" | "reject" {
     throw new SymphonyError("invalid_request", "Approval decision must be approve or reject");
   }
   return decision;
+}
+
+function parseWebOrchestratorChatPostRequest(body: unknown): string {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Web orchestrator chat request body must be a JSON object with a non-empty string input",
+    );
+  }
+  const input = (body as { input?: unknown }).input;
+  if (typeof input !== "string" || input.trim().length === 0) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Web orchestrator chat request body must include a non-empty string input",
+    );
+  }
+  return input;
 }
 
 function parseIssueBreakdownApplyRequest(body: unknown): { dryRun: boolean } {

@@ -519,6 +519,11 @@ export function projectWebOrchestratorChat(): ChatMessage[] {
   return emptyChatMessages();
 }
 
+export function projectWebOrchestratorChatPost(input: string): ChatMessage[] {
+  void input;
+  return emptyChatMessages();
+}
+
 export function projectIssueModel(
   source: IssueBoardCardProjectionInput | IssueDetailsEnvelope,
   options: ProjectIssueModelOptions = {},

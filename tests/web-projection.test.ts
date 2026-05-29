@@ -16,6 +16,7 @@ import {
   projectWebIssueBoard,
   projectTranscriptMessages,
   projectWebOrchestratorChat,
+  projectWebOrchestratorChatPost,
   type ActivityFeedResponseProjectionInput,
   type IssueBoardCardProjectionInput,
   type IssueBoardResponseProjectionInput,
@@ -477,12 +478,17 @@ describe("web projection foundation", () => {
   it("projects orchestrator chat as the exact empty default without mock content", () => {
     const chat = projectWebOrchestratorChat();
     const replay = projectWebOrchestratorChat();
+    const postChat = projectWebOrchestratorChatPost("please inspect ENG-94");
 
     expect(chat).toEqual([]);
     expect(replay).toEqual([]);
+    expect(postChat).toEqual([]);
     expect(replay).not.toBe(chat);
+    expect(postChat).not.toBe(chat);
     expect(JSON.stringify(chat)).not.toContain("assistant");
-    expect(JSON.stringify(chat)).not.toContain("suggestion");
-    expect(JSON.stringify(chat)).not.toContain("command");
+    expect(JSON.stringify(postChat)).not.toContain("assistant");
+    expect(JSON.stringify(postChat)).not.toContain("please inspect ENG-94");
+    expect(JSON.stringify(postChat)).not.toContain("suggestion");
+    expect(JSON.stringify(postChat)).not.toContain("command");
   });
 });
