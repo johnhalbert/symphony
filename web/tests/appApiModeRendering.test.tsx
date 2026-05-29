@@ -354,6 +354,17 @@ async function renderIssuesViewWithDetail({
 
 async function renderHistoryView(history: HistoryModel, variant: "list" | "timeline" | "focused" = "list") {
   vi.resetModules();
+
+  vi.doMock("../src/hooks/useSymphonyData", () => ({
+    useTranscript: (sessionId: string | null): Loadable<TranscriptMessage[]> => {
+      if (!sessionId) return loaded([]);
+      if (Object.prototype.hasOwnProperty.call(history.transcriptBySession ?? {}, sessionId)) {
+        return loaded(history.transcriptBySession?.[sessionId] ?? []);
+      }
+      return failed(`Unexpected transcript request for ${sessionId}`);
+    },
+  }));
+
   const { ChatHistoryView } = await import("../src/components/history/ChatHistoryView");
   return renderToStaticMarkup(<ChatHistoryView history={history} variant={variant} />);
 }
