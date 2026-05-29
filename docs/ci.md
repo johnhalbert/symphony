@@ -25,7 +25,7 @@ The Cursor extension under `extension/` has its own lockfile and install step. `
 
 ## Web Browser Smoke
 
-`npm run smoke:browser --prefix web` starts a fake local Symphony web API, starts the Vite development server in `VITE_SYMPHONY_DATA_SOURCE=api` mode, points the `/api` dev proxy at the fake API with `SYMPHONY_WEB_API_PROXY_TARGET`, and launches a headless Chromium-compatible browser. The smoke fails if the browser renders mock dashboard data, if any web API endpoint is not observed through the Vite proxy, or if the API-mode dashboard markers do not appear.
+`npm run smoke:browser --prefix web` starts a fake local Symphony web API, starts the Vite development server in `VITE_SYMPHONY_DATA_SOURCE=api` mode, points the `/api` dev proxy at the fake API with `SYMPHONY_WEB_API_PROXY_TARGET`, and launches a headless Chromium-compatible browser. The smoke fails if the browser renders mock data, if any required web API endpoint is not observed through the Vite proxy, or if API-mode dashboard, issue-detail, history transcript, sidebar summary, and dedicated orchestrator-chat guard markers do not appear.
 
 The smoke needs a Chromium-compatible executable. CI runners provide Chrome; local runs can override discovery with `SYMPHONY_WEB_BROWSER_EXECUTABLE` or `CHROME_BIN`.
 
