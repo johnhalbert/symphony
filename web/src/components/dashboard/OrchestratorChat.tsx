@@ -8,21 +8,25 @@ export function OrchestratorChat({
   loading = false,
   messages,
   onSend,
+  readOnly = false,
   subtitle,
 }: {
   error?: string | null;
   loading?: boolean;
   messages: ChatMessage[];
   onSend: (input: string) => Promise<void>;
+  readOnly?: boolean;
   subtitle?: string;
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const hasNoMessages = messages.length === 0;
+  const readOnlyNotice =
+    "API mode shows durable chat history only. Sending commands from this web chat is not supported yet; no orchestrator action will be dispatched.";
 
   async function submit(input = draft) {
     const trimmed = input.trim();
-    if (!trimmed || sending) return;
+    if (readOnly || !trimmed || sending) return;
     setSending(true);
     try {
       await onSend(trimmed);
@@ -62,7 +66,7 @@ export function OrchestratorChat({
               {message.suggestions ? (
                 <div style={{ marginTop: 4 }}>
                   {message.suggestions.map((suggestion, suggestionIndex) => (
-                    <button className="chat__suggestion" key={suggestion} onClick={() => submit(suggestion)} type="button">
+                    <button className="chat__suggestion" disabled={readOnly || sending} key={suggestion} onClick={() => submit(suggestion)} type="button">
                       {suggestionIndex === 0 ? Icon.bolt() : null}
                       {suggestion}
                     </button>
@@ -73,35 +77,41 @@ export function OrchestratorChat({
           </div>
         ))}
       </div>
-      <form
-        className="chat__input"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void submit();
-        }}
-      >
-        <div className="box">
-          <textarea
-            placeholder="Ask about the project, or issue a command (e.g. 'pause SYM-42', 'show stalled agents')..."
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-          />
-          <div className="row">
-            <button className="btn btn--ghost" type="button" style={{ padding: "2px 6px" }}>
-              @ context
-            </button>
-            <button className="btn btn--ghost" type="button" style={{ padding: "2px 6px" }}>
-              / commands
-            </button>
-            <div className="grow" />
-            <span style={{ color: "var(--text-4)", fontFamily: "var(--font-mono)", fontSize: 10.5 }}>codex-1</span>
-            <button className="btn btn--primary" type="submit" style={{ padding: "3px 9px" }} disabled={sending || !draft.trim()}>
-              {Icon.send()}
-              {sending ? "Sending" : "Send"}
-            </button>
-          </div>
+      {readOnly ? (
+        <div className="chat__input chat__input--readonly" role="status" aria-live="polite">
+          <div className="view-empty">{readOnlyNotice}</div>
         </div>
-      </form>
+      ) : (
+        <form
+          className="chat__input"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
+          <div className="box">
+            <textarea
+              placeholder="Ask about the project, or issue a command (e.g. 'pause SYM-42', 'show stalled agents')..."
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+            />
+            <div className="row">
+              <button className="btn btn--ghost" type="button" style={{ padding: "2px 6px" }}>
+                @ context
+              </button>
+              <button className="btn btn--ghost" type="button" style={{ padding: "2px 6px" }}>
+                / commands
+              </button>
+              <div className="grow" />
+              <span style={{ color: "var(--text-4)", fontFamily: "var(--font-mono)", fontSize: 10.5 }}>codex-1</span>
+              <button className="btn btn--primary" type="submit" style={{ padding: "3px 9px" }} disabled={sending || !draft.trim()}>
+                {Icon.send()}
+                {sending ? "Sending" : "Send"}
+              </button>
+            </div>
+          </div>
+        </form>
+      )}
     </div>
   );
 }

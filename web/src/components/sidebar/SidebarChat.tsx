@@ -2,8 +2,20 @@ import type { ChatMessage } from "../../types/symphony";
 import { Icon } from "../common";
 import { formatInlineText } from "../messages/messageFormat";
 
-export function SidebarChat({ error = null, loading = false, messages }: { error?: string | null; loading?: boolean; messages: ChatMessage[] }) {
+export function SidebarChat({
+  error = null,
+  loading = false,
+  messages,
+  readOnly = false,
+}: {
+  error?: string | null;
+  loading?: boolean;
+  messages: ChatMessage[];
+  readOnly?: boolean;
+}) {
   const recent = messages.slice(-3);
+  const readOnlyNotice =
+    "API mode shows durable chat history only. Sending commands from this compact chat is not supported yet; no orchestrator action will be dispatched.";
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "40px 1fr auto", background: "var(--panel)" }}>
       <div style={{ display: "flex", alignItems: "center", padding: "0 12px", gap: 10, background: "var(--panel)", borderBottom: "1px solid var(--border)" }}>
@@ -12,7 +24,9 @@ export function SidebarChat({ error = null, loading = false, messages }: { error
         </div>
         <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
           <span style={{ fontSize: 12, fontWeight: 500 }}>Orchestrator</span>
-          <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>codex-1 · cycle 14</span>
+          <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {readOnly ? "read-only API mode" : "codex-1 · cycle 14"}
+          </span>
         </div>
         <div style={{ flex: 1 }} />
         <button className="icon-btn" type="button">
@@ -35,7 +49,7 @@ export function SidebarChat({ error = null, loading = false, messages }: { error
               {message.suggestions?.length ? (
                 <div style={{ marginTop: 4 }}>
                   {message.suggestions.map((suggestion, suggestionIndex) => (
-                    <button className="chat__suggestion" key={suggestion} style={{ marginBottom: 4 }} type="button">
+                    <button className="chat__suggestion" disabled={readOnly} key={suggestion} style={{ marginBottom: 4 }} type="button">
                       {suggestionIndex === 0 ? Icon.bolt() : null}
                       {suggestion}
                     </button>
@@ -47,23 +61,29 @@ export function SidebarChat({ error = null, loading = false, messages }: { error
         ))}
       </div>
 
-      <div className="chat__input">
-        <div className="box">
-          <textarea placeholder="Ask or command..." defaultValue="" style={{ minHeight: 34 }} />
-          <div className="row">
-            <button className="btn btn--ghost" type="button" style={{ padding: "1px 6px", fontSize: 10.5 }}>
-              @ context
-            </button>
-            <button className="btn btn--ghost" type="button" style={{ padding: "1px 6px", fontSize: 10.5 }}>
-              /
-            </button>
-            <div className="grow" />
-            <button className="btn btn--primary" type="button" style={{ padding: "2px 8px" }}>
-              {Icon.send()}
-            </button>
+      {readOnly ? (
+        <div className="chat__input chat__input--readonly" role="status" aria-live="polite">
+          <div className="view-empty">{readOnlyNotice}</div>
+        </div>
+      ) : (
+        <div className="chat__input">
+          <div className="box">
+            <textarea placeholder="Ask or command..." defaultValue="" style={{ minHeight: 34 }} />
+            <div className="row">
+              <button className="btn btn--ghost" type="button" style={{ padding: "1px 6px", fontSize: 10.5 }}>
+                @ context
+              </button>
+              <button className="btn btn--ghost" type="button" style={{ padding: "1px 6px", fontSize: 10.5 }}>
+                /
+              </button>
+              <div className="grow" />
+              <button className="btn btn--primary" type="button" style={{ padding: "2px 8px" }}>
+                {Icon.send()}
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

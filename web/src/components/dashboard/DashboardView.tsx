@@ -11,6 +11,7 @@ export function DashboardView({
   orchestratorChat,
   orchestratorChatError = null,
   orchestratorChatLoading = false,
+  orchestratorChatReadOnly = false,
   variant = "cards",
   useModelBurnupTotals = true,
 }: {
@@ -18,6 +19,7 @@ export function DashboardView({
   orchestratorChat?: ChatMessage[];
   orchestratorChatError?: string | null;
   orchestratorChatLoading?: boolean;
+  orchestratorChatReadOnly?: boolean;
   variant?: DashboardVariant;
   useModelBurnupTotals?: boolean;
 }) {
@@ -31,6 +33,7 @@ export function DashboardView({
   }, [sourceChat]);
 
   async function sendChat(input: string) {
+    if (orchestratorChatReadOnly) return;
     const nextMessages = await dataSource.sendOrchestratorMessage(input);
     setChat(nextMessages);
   }
@@ -157,6 +160,7 @@ export function DashboardView({
         subtitle={chatSubtitle(dashboard)}
         loading={orchestratorChatLoading}
         error={orchestratorChatError}
+        readOnly={orchestratorChatReadOnly}
       />
     </div>
   );
