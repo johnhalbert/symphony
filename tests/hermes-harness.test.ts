@@ -71,6 +71,23 @@ describe("HermesHarness", () => {
     expect(new Set(clients.slice(1).map((client) => client.env.hermesHome)).size).toBe(2);
     expect(clients.slice(1).every((client) => client.env.extraEnv?.HERMES_API_KEY === "reviewer-hermes-secret")).toBe(true);
 
+    const workerProfile = JSON.parse(
+      await readFile(path.join(clients[0]!.env.hermesHome, ".symphony-hermes-profile.json"), "utf8"),
+    ) as { profileKey: string };
+    const reviewerProfileKeys = await Promise.all(
+      clients.slice(1).map(async (client) => {
+        const profile = JSON.parse(await readFile(path.join(client.env.hermesHome, ".symphony-hermes-profile.json"), "utf8")) as {
+          profileKey: string;
+        };
+        return profile.profileKey;
+      }),
+    );
+    expect(workerProfile.profileKey).toBe("sym_workspace-1_worker_test-1_implementation_reuse_by_issue");
+    expect(reviewerProfileKeys).toHaveLength(2);
+    expect(reviewerProfileKeys[0]).toMatch(/^[a-z0-9][a-z0-9_-]{0,63}$/);
+    expect(reviewerProfileKeys[1]).toMatch(/^[a-z0-9][a-z0-9_-]{0,63}$/);
+    expect(reviewerProfileKeys[0]).not.toBe(reviewerProfileKeys[1]);
+
     const workerConfig = YAML.parse(await readFile(path.join(clients[0]!.env.hermesHome, "config.yaml"), "utf8")) as Record<
       string,
       unknown

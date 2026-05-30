@@ -21,7 +21,7 @@ import {
   normalizeHermesAuthProvider,
 } from "./HermesAuthManager.js";
 import { SYMPHONY_HERMES_AGENT_MAX_TURNS, writeHermesMcpConfig } from "./HermesMcpConfig.js";
-import { HermesProfileManager, safeProfileKey, type HermesProfile } from "./HermesProfileManager.js";
+import { hermesAcpProfileName, HermesProfileManager, type HermesProfile } from "./HermesProfileManager.js";
 
 export interface HermesHarnessOptions {
   runStore?: RunTranscriptStore;
@@ -239,13 +239,14 @@ export class HermesHarness implements AgentHarness {
 
   private async getOrCreateLease(ctx: AgentRunContext): Promise<HermesLease> {
     const reusable = shouldReuseLease(ctx);
-    const key = reusable ? reusableLeaseKey(ctx) : `fresh:${randomUUID()}`;
+    const freshLeaseId = reusable ? null : randomUUID();
+    const key = reusable ? reusableLeaseKey(ctx) : `fresh:${freshLeaseId}`;
     const existing = reusable ? this.leases.get(key) : undefined;
     if (existing && !existing.disposed) return existing;
 
     const manager = this.effectiveProfileManager(ctx);
     const phase = currentRunPhase(ctx);
-    const profileKey = hermesRunProfileKey(ctx.issue.identifier, phase, reusable);
+    const profileKey = hermesRunProfileKey(ctx, phase, reusable, freshLeaseId);
     const profile = await manager.materialize({
       workspaceKey: ctx.workspace.workspaceKey,
       role: ctx.role,
@@ -470,9 +471,15 @@ function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
   return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
 }
 
-function hermesRunProfileKey(issueIdentifier: string, phase: AgentRunPhase, reusable: boolean): string {
-  const suffix = reusable ? "" : `-${randomUUID().slice(0, 8)}`;
-  return safeProfileKey(`${issueIdentifier}-${phase}${suffix}`);
+function hermesRunProfileKey(ctx: AgentRunContext, phase: AgentRunPhase, reusable: boolean, freshLeaseId: string | null): string {
+  return hermesAcpProfileName({
+    workspaceKey: ctx.workspace.workspaceKey,
+    role: ctx.role,
+    issueIdentifier: ctx.issue.identifier,
+    phase,
+    reuseMode: reusable ? "reuse_by_issue" : "fresh_per_run",
+    freshLeaseId,
+  });
 }
 
 function acceptGatewayEvent(event: GatewayEvent, sessionId: string | null): boolean {
