@@ -3,19 +3,23 @@ import { useDataSource } from "../data/dataSourceContext";
 import { useAsyncResource } from "./useAsyncResource";
 import type { IssueDetailModel, Loadable, TranscriptMessage } from "../types/symphony";
 
-export function useReferenceData() {
-  const dataSource = useDataSource();
-  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getReferenceData(signal), [dataSource]), [dataSource]);
+interface SymphonyResourceOptions {
+  enabled?: boolean;
 }
 
-export function useDashboard(enabled = true) {
+export function useReferenceData(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getDashboard(signal), [dataSource]), [dataSource], { enabled });
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getReferenceData(signal), [dataSource]), [dataSource], options);
 }
 
-export function useIssueBoard(enabled = true) {
+export function useDashboard(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getIssueBoard(signal), [dataSource]), [dataSource], { enabled });
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getDashboard(signal), [dataSource]), [dataSource], options);
+}
+
+export function useIssueBoard(options: SymphonyResourceOptions = {}) {
+  const dataSource = useDataSource();
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getIssueBoard(signal), [dataSource]), [dataSource], options);
 }
 
 export function useIssueDetail(issueId: string | null): Loadable<IssueDetailModel | null> {
@@ -63,9 +67,9 @@ export function useIssueDetail(issueId: string | null): Loadable<IssueDetailMode
   return { data: state.data, loading: state.loading, error: state.error };
 }
 
-export function useHistory(enabled = true) {
+export function useHistory(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getHistory(signal), [dataSource]), [dataSource], { enabled });
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getHistory(signal), [dataSource]), [dataSource], options);
 }
 
 export function useTranscript(sessionId: string | null): Loadable<TranscriptMessage[]> {
@@ -113,12 +117,12 @@ export function useTranscript(sessionId: string | null): Loadable<TranscriptMess
   return { data: state.data, loading: state.loading, error: state.error };
 }
 
-export function useSidebar(enabled = true) {
+export function useSidebar(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getSidebar(signal), [dataSource]), [dataSource], { enabled });
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getSidebar(signal), [dataSource]), [dataSource], options);
 }
 
-export function useOrchestratorChat(enabled = true) {
+export function useOrchestratorChat(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getOrchestratorChat(signal), [dataSource]), [dataSource], { enabled });
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getOrchestratorChat(signal), [dataSource]), [dataSource], options);
 }

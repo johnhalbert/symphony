@@ -5,6 +5,7 @@ import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
 import { latestFreshIssueBreakdownPlan } from "../IssueBreakdownPlanService.js";
 import type { IssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
+import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "../persistence/ProjectionRevision.js";
 import type { TrackerWriteEvidence, TrackerWriteResult, TrackerWriter } from "../tracker/TrackerWriter.js";
 import type { Issue } from "../types.js";
 import { errorMessage } from "../errors.js";
@@ -146,8 +147,17 @@ type LifecycleGuardResult =
 export class FileWritebackOutboxStore {
   private readonly claimLocks = new Set<string>();
   private readonly writeLocks = new Map<string, Promise<void>>();
+  private readonly projectionNotifier = new ProjectionRevisionNotifier();
 
   constructor(private readonly stateDir: string) {}
+
+  projectionRevision(): number {
+    return this.projectionNotifier.currentRevision();
+  }
+
+  onProjectionChanged(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe {
+    return this.projectionNotifier.subscribe(listener);
+  }
 
   async enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation> {
     const existing = await this.get(operation.idempotencyKey);
@@ -166,6 +176,7 @@ export class FileWritebackOutboxStore {
       resultEvidence: null,
     } as WritebackOperation;
     await this.write(record);
+    this.notifyProjectionChanged();
     return record;
   }
 
@@ -190,6 +201,7 @@ export class FileWritebackOutboxStore {
         current.status = "in_flight";
         current.updatedAt = new Date().toISOString();
         await this.write(current);
+        this.notifyProjectionChanged();
         claimed.push(current);
       } finally {
         this.claimLocks.delete(record.idempotencyKey);
@@ -260,7 +272,12 @@ export class FileWritebackOutboxStore {
   private async update(record: WritebackOperation, patch: Partial<WritebackOperation>): Promise<WritebackOperation> {
     const updated = { ...record, ...patch, updatedAt: new Date().toISOString() } as WritebackOperation;
     await this.write(updated);
+    this.notifyProjectionChanged();
     return updated;
+  }
+
+  private notifyProjectionChanged(): void {
+    this.projectionNotifier.notify("writeback");
   }
 
   private async write(record: WritebackOperation): Promise<void> {

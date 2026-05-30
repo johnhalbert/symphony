@@ -18,14 +18,12 @@ export function useAsyncResource<T>(
   const [state, setState] = useState<AsyncResourceState<T>>({ data: null, loading: enabled, error: null, enabled });
 
   useEffect(() => {
-    let active = true;
     if (!enabled) {
       setState((current) => ({ data: current.data, loading: false, error: null, enabled: false }));
-      return () => {
-        active = false;
-      };
+      return;
     }
 
+    let active = true;
     const controller = new AbortController();
     setState((current) => ({ data: current.data, loading: true, error: null, enabled: true }));
     load(controller.signal)

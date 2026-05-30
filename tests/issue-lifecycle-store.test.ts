@@ -1,7 +1,8 @@
+import { promises as nodeFs } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SymphonyError } from "../src/core/errors.js";
 import {
   buildWorkerHandoffPacket,
@@ -18,6 +19,7 @@ describe("FileIssueLifecycleStore", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -91,6 +93,52 @@ describe("FileIssueLifecycleStore", () => {
         lastPushedAt: "2026-01-01T00:00:00.000Z",
       },
     });
+  });
+
+
+  it("tracks projection revisions for successful lifecycle writes only", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const events: Array<{ source: string; revision: number }> = [];
+    store.onProjectionChanged(() => {
+      throw new Error("listener failure must not affect durable writes");
+    });
+    const unsubscribe = store.onProjectionChanged((event) => events.push(event));
+
+    expect(store.projectionRevision()).toBe(0);
+    await expect(store.get("TEST-404")).resolves.toBeNull();
+    await expect(store.list()).resolves.toEqual([]);
+    expect(store.projectionRevision()).toBe(0);
+    expect(events).toEqual([]);
+
+    await store.ensureIssue(issue(), { phase: "review" });
+    await store.updateIssue(issue(), { incompleteTurnCount: 1 });
+
+    expect(store.projectionRevision()).toBe(2);
+    expect(events).toEqual([
+      { source: "lifecycle", revision: 1 },
+      { source: "lifecycle", revision: 2 },
+    ]);
+
+    await expect(store.get("issue-1")).resolves.toMatchObject({ issueIdentifier: "TEST-1" });
+    await expect(store.list()).resolves.toHaveLength(1);
+    expect(store.projectionRevision()).toBe(2);
+    expect(events).toHaveLength(2);
+
+    unsubscribe();
+    await store.ensureIssue(issue(), { phase: "blocked", blockedReason: "operator" });
+    expect(store.projectionRevision()).toBe(3);
+    expect(events).toHaveLength(2);
+  });
+
+  it("does not advance projection revisions when lifecycle writes fail", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const events: Array<{ source: string; revision: number }> = [];
+    store.onProjectionChanged((event) => events.push(event));
+    vi.spyOn(nodeFs, "writeFile").mockRejectedValueOnce(new Error("lifecycle disk full"));
+
+    await expect(store.ensureIssue(issue())).rejects.toThrow("lifecycle disk full");
+    expect(store.projectionRevision()).toBe(0);
+    expect(events).toEqual([]);
   });
 
   it("returns null for missing lifecycle records", async () => {

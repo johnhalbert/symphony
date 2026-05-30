@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue } from "../types.js";
+import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 
 export type IssueLifecyclePhase =
   | "implementation"
@@ -437,7 +438,17 @@ export interface IssueLifecyclePatch {
 export type IssueLifecycleStore = FileIssueLifecycleStore;
 
 export class FileIssueLifecycleStore {
+  private readonly projectionNotifier = new ProjectionRevisionNotifier();
+
   constructor(private readonly stateDir: string) {}
+
+  projectionRevision(): number {
+    return this.projectionNotifier.currentRevision();
+  }
+
+  onProjectionChanged(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe {
+    return this.projectionNotifier.subscribe(listener);
+  }
 
   async ensureIssue(issue: Pick<Issue, "id" | "identifier">, patch: IssueLifecyclePatch = {}): Promise<IssueLifecycleRecord> {
     const existing = await this.find(issue.id, issue.identifier);
@@ -488,6 +499,7 @@ export class FileIssueLifecycleStore {
       handoff: patch.handoff ?? buildIssueHandoffState(baseRecord),
     };
     await this.write(record);
+    this.notifyProjectionChanged();
     return record;
   }
 
@@ -535,6 +547,10 @@ export class FileIssueLifecycleStore {
       await fs.rm(target, { force: true });
     }
     await fs.rename(temp, target);
+  }
+
+  private notifyProjectionChanged(): void {
+    this.projectionNotifier.notify("lifecycle");
   }
 
   private recordsDir(): string {

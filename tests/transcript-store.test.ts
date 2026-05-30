@@ -1,3 +1,4 @@
+import { promises as nodeFs } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +13,7 @@ describe("FileRunTranscriptStore", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     vi.useRealTimers();
     await rm(root, { recursive: true, force: true });
   });
@@ -223,6 +225,138 @@ describe("FileRunTranscriptStore", () => {
     expect(page.events[0]?.message).toContain("inputTokens: 7");
     expect(page.events[0]?.message).toContain("totalTokens: 9");
     expect(page.events[0]?.message).toContain("tokenConfigured: true");
+  });
+
+
+  it("tracks projection revisions for successful run and workspace writes only", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const events: Array<{ source: string; revision: number }> = [];
+    store.onProjectionChanged(() => {
+      throw new Error("listener failure must not affect durable writes");
+    });
+    const unsubscribe = store.onProjectionChanged((event) => events.push(event));
+
+    expect(store.projectionRevision()).toBe(0);
+    await expect(store.getRun("missing-run")).resolves.toBeNull();
+    await expect(store.updateRun("missing-run", { status: "failed" })).resolves.toBeNull();
+    await expect(store.findWorkspace("missing-workspace")).resolves.toBeNull();
+    await store.deleteWorkspace("missing-workspace");
+    await expect(store.listRuns()).resolves.toEqual([]);
+    expect(store.projectionRevision()).toBe(0);
+    expect(events).toEqual([]);
+
+    await store.startRun({
+      runId: "run-projection",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+    await store.appendEvent({
+      runId: "run-projection",
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+    });
+    await store.updateRun("run-projection", { status: "succeeded", completedAt: "2026-01-01T00:00:01.000Z" });
+    await store.upsertWorkspace({
+      workspaceKey: "TEST-1",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      path: "/tmp/workspace",
+      sourceKind: "dogfood",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await store.deleteWorkspace("TEST-1");
+
+    expect(store.projectionRevision()).toBe(5);
+    expect(events).toEqual([
+      { source: "runs", revision: 1 },
+      { source: "runs", revision: 2 },
+      { source: "runs", revision: 3 },
+      { source: "workspaces", revision: 4 },
+      { source: "workspaces", revision: 5 },
+    ]);
+
+    await expect(store.getRun("run-projection")).resolves.toMatchObject({ runId: "run-projection" });
+    await expect(store.listRunsForIssue("TEST-1")).resolves.toHaveLength(1);
+    await expect(store.readTranscript("run-projection", { offset: 0, limit: 10 })).resolves.toMatchObject({
+      events: [{ eventType: "progress" }],
+    });
+    await expect(store.readTranscriptEventCount("run-projection")).resolves.toBe(1);
+    await expect(store.listWorkspaces()).resolves.toEqual([]);
+    await expect(store.findWorkspace("TEST-1")).resolves.toBeNull();
+    expect(store.projectionRevision()).toBe(5);
+    expect(events).toHaveLength(5);
+
+    unsubscribe();
+    await store.updateRun("run-projection", { status: "failed", error: "after unsubscribe" });
+    expect(store.projectionRevision()).toBe(6);
+    expect(events).toHaveLength(5);
+  });
+
+  it("tracks transcript event count repairs as projection writes while read-only counts stay stable", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await store.startRun({
+      runId: "run-repair",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+    await store.appendEvent({
+      runId: "run-repair",
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+    });
+    const events: Array<{ source: string; revision: number }> = [];
+    store.onProjectionChanged((event) => events.push(event));
+    const beforeLegacyEditRevision = store.projectionRevision();
+    const metaPath = path.join(root, "runs", "run-repair", "meta.json");
+    const metadata = JSON.parse(await readFile(metaPath, "utf8")) as { transcriptEventCount?: number };
+    delete metadata.transcriptEventCount;
+    await writeFile(metaPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+
+    await expect(store.readTranscriptEventCount("run-repair")).resolves.toBe(1);
+    expect(store.projectionRevision()).toBe(beforeLegacyEditRevision);
+    expect(events).toEqual([]);
+
+    await expect(store.ensureTranscriptEventCount("run-repair")).resolves.toBe(1);
+    expect(store.projectionRevision()).toBe(beforeLegacyEditRevision + 1);
+    expect(events).toEqual([{ source: "runs", revision: beforeLegacyEditRevision + 1 }]);
+  });
+
+  it("does not advance projection revisions when run writes fail", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const events: Array<{ source: string; revision: number }> = [];
+    store.onProjectionChanged((event) => events.push(event));
+    vi.spyOn(nodeFs, "writeFile").mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(
+      store.startRun({
+        runId: "run-fail",
+        role: "worker",
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "work",
+        workspaceKey: "TEST-1",
+        workspacePath: "/tmp/workspace",
+      }),
+    ).rejects.toThrow("disk full");
+    expect(store.projectionRevision()).toBe(0);
+    expect(events).toEqual([]);
   });
 
   it("can scope latest issue run lookup by role", async () => {
