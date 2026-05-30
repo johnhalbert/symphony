@@ -78,6 +78,84 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.transitions).toHaveLength(1);
   });
 
+
+  it("tracks projection revisions for successful outbox writes only", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const events: Array<{ source: string; revision: number }> = [];
+    store.onProjectionChanged(() => {
+      throw new Error("listener failure must not affect durable writes");
+    });
+    const unsubscribe = store.onProjectionChanged((event) => events.push(event));
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "transition:issue-1:dispatch",
+      kind: "transition",
+      issueId: "issue-1",
+      payload: { fromStates: ["Todo"], toState: "In Progress" },
+    };
+
+    expect(store.projectionRevision()).toBe(0);
+    await expect(store.get("missing")).resolves.toBeNull();
+    await expect(store.list()).resolves.toEqual([]);
+    await expect(store.claimDue(new Date("9999-01-01T00:00:00.000Z"))).resolves.toEqual([]);
+    expect(store.projectionRevision()).toBe(0);
+    expect(events).toEqual([]);
+
+    const enqueued = await store.enqueueOnce(operation);
+    await store.enqueueOnce(operation);
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ status: "pending" });
+    await expect(store.list()).resolves.toHaveLength(1);
+    expect(store.projectionRevision()).toBe(1);
+    expect(events).toEqual([{ source: "writeback", revision: 1 }]);
+
+    const [claimed] = await store.claimDue(new Date("9999-01-01T00:00:00.000Z"));
+    expect(claimed).toMatchObject({ idempotencyKey: enqueued.idempotencyKey, status: "in_flight" });
+    const succeeded = await store.markSucceeded(claimed!);
+
+    const skippedBase = await store.enqueueOnce({
+      idempotencyKey: "comment:issue-1:skip",
+      kind: "comment",
+      issueId: "issue-1",
+      payload: { body: "skip", dedupeKey: "skip" },
+    });
+    const skipped = await store.markSkipped(skippedBase, "skip reason");
+    const pending = await store.requeueSkipped(skipped);
+    const retrying = await store.markRetry(pending, "retry reason", "9999-01-01T00:00:00.000Z");
+    const dead = await store.markDeadLetter(retrying, "dead reason");
+    await expect(store.requeueSkipped(dead)).resolves.toBe(dead);
+
+    expect(succeeded.status).toBe("succeeded");
+    expect(store.projectionRevision()).toBe(8);
+    expect(events).toEqual(Array.from({ length: 8 }, (_, index) => ({ source: "writeback", revision: index + 1 })));
+
+    unsubscribe();
+    await store.enqueueOnce({
+      idempotencyKey: "comment:issue-1:after-unsubscribe",
+      kind: "comment",
+      issueId: "issue-1",
+      payload: { body: "after unsubscribe", dedupeKey: "after-unsubscribe" },
+    });
+    expect(store.projectionRevision()).toBe(9);
+    expect(events).toHaveLength(8);
+  });
+
+  it("does not advance projection revisions when outbox writes fail", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const events: Array<{ source: string; revision: number }> = [];
+    store.onProjectionChanged((event) => events.push(event));
+    vi.spyOn(nodeFs, "writeFile").mockRejectedValueOnce(new Error("outbox disk full"));
+
+    await expect(
+      store.enqueueOnce({
+        idempotencyKey: "comment:issue-1:fail",
+        kind: "comment",
+        issueId: "issue-1",
+        payload: { body: "fail", dedupeKey: "fail" },
+      }),
+    ).rejects.toThrow("outbox disk full");
+    expect(store.projectionRevision()).toBe(0);
+    expect(events).toEqual([]);
+  });
+
   it("uses collision-resistant temp files for concurrent record updates", async () => {
     vi.spyOn(Date, "now").mockReturnValue(1_779_817_298_603);
     const store = new FileWritebackOutboxStore(root);
