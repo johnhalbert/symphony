@@ -18,33 +18,72 @@ interface CachedGetResponse {
   expiresAt: number;
 }
 
+interface FetchJsonOptions {
+  signal?: AbortSignal;
+  cacheable?: boolean;
+}
+
 function createGetJsonFetcher() {
   const inFlight = new Map<string, Promise<unknown>>();
   const successCache = new Map<string, CachedGetResponse>();
 
-  return async function fetchJson<T>(baseUrl: string, path: string, signal?: AbortSignal): Promise<T> {
+  return async function fetchJson<T>(baseUrl: string, path: string, options: FetchJsonOptions = {}): Promise<T> {
     const url = `${baseUrl}${path}`;
-    if (!signal) {
-      const cached = successCache.get(url);
-      if (cached && cached.expiresAt > Date.now()) return cached.data as T;
+    const { signal, cacheable = true } = options;
+    if (!cacheable) return fetchJsonOnce<T>(url, signal);
 
-      const pending = inFlight.get(url);
-      if (pending) return pending as Promise<T>;
+    const cached = successCache.get(url);
+    if (cached && cached.expiresAt > Date.now()) return resolveCachedGet(cached.data as T, signal);
 
-      const promise = fetchJsonOnce<T>(url).then((data) => {
-        successCache.set(url, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS });
-        return data;
-      });
-      inFlight.set(url, promise);
-      void promise.then(
-        () => inFlight.delete(url),
-        () => inFlight.delete(url),
-      );
-      return promise;
-    }
+    const pending = inFlight.get(url);
+    if (pending) return resolveSharedGet(pending as Promise<T>, signal);
 
-    return fetchJsonOnce<T>(url, signal);
+    const promise = fetchJsonOnce<T>(url).then((data) => {
+      successCache.set(url, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS });
+      return data;
+    });
+    inFlight.set(url, promise);
+    void promise.then(
+      () => inFlight.delete(url),
+      () => inFlight.delete(url),
+    );
+    return resolveSharedGet(promise, signal);
   };
+}
+
+function resolveCachedGet<T>(data: T, signal?: AbortSignal): Promise<T> {
+  if (signal?.aborted) return Promise.reject(createAbortError());
+  return Promise.resolve(data);
+}
+
+function resolveSharedGet<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(createAbortError());
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(createAbortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (data) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(data);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function createAbortError(): Error {
+  if (typeof DOMException !== "undefined") return new DOMException("The operation was aborted.", "AbortError");
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
 }
 
 async function fetchJsonOnce<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -81,32 +120,32 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
 
   return {
     async getReferenceData(signal) {
-      return normalizeReferenceData(await fetchJson<ApiReferenceData>(normalizedBaseUrl, "/api/v1/web/reference-data", signal));
+      return normalizeReferenceData(await fetchJson<ApiReferenceData>(normalizedBaseUrl, "/api/v1/web/reference-data", { signal }));
     },
     async getDashboard(signal) {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/dashboard", signal);
+      return fetchJson(normalizedBaseUrl, "/api/v1/web/dashboard", { signal });
     },
     async getIssueBoard(signal) {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/issues", signal);
+      return fetchJson(normalizedBaseUrl, "/api/v1/web/issues", { signal });
     },
     async getIssueDetail(issueId, signal) {
-      return fetchJson(normalizedBaseUrl, `/api/v1/web/issues/${encodeURIComponent(issueId)}`, signal);
+      return fetchJson(normalizedBaseUrl, `/api/v1/web/issues/${encodeURIComponent(issueId)}`, { signal, cacheable: false });
     },
     async getHistory(signal) {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/history", signal);
+      return fetchJson(normalizedBaseUrl, "/api/v1/web/history", { signal });
     },
     async getSessions(signal) {
       const history = await this.getHistory(signal);
       return history.sessions;
     },
     async getTranscript(sessionId, signal) {
-      return fetchJson(normalizedBaseUrl, `/api/v1/web/sessions/${encodeURIComponent(sessionId)}/transcript`, signal);
+      return fetchJson(normalizedBaseUrl, `/api/v1/web/sessions/${encodeURIComponent(sessionId)}/transcript`, { signal, cacheable: false });
     },
     async getSidebar(signal) {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/sidebar", signal);
+      return fetchJson(normalizedBaseUrl, "/api/v1/web/sidebar", { signal });
     },
     async getOrchestratorChat(signal) {
-      return fetchJson<ChatMessage[]>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat", signal);
+      return fetchJson<ChatMessage[]>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat", { signal });
     },
     async sendOrchestratorMessage(input) {
       const response = await fetch(`${normalizedBaseUrl}/api/v1/web/orchestrator-chat`, {
