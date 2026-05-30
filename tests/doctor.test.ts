@@ -14,8 +14,10 @@ import {
   hermesLiveRuntimeDoctorCheck,
   hermesRuntimeDoctorChecks,
   reviewLoopDoctorChecks,
+  runDoctor,
   runtimeCredentialDoctorCheck,
   runtimeHarnessDoctorChecks,
+  trackerHandoffDoctorCheck,
 } from "../src/doctor.js";
 import { testConfig } from "./helpers.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
@@ -107,6 +109,100 @@ describe("doctor review-loop checks", () => {
       },
     ]);
     expect(hermesRuntimeDoctorChecks(config)[0]).toMatchObject({ id: "hermes.runtime", status: "ok" });
+  });
+
+  it("accepts empty handoff_states when PR handoff is disabled and reviewer states route directly", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST", handoff_states: [] },
+        review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge" },
+        github: { publish_pull_requests: true, pr_handoff: { enabled: false } },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(trackerHandoffDoctorCheck(config)).toEqual({
+      id: "tracker.handoff",
+      status: "ok",
+      message: "No handoff_states configured; PR handoff is disabled and review_states route directly to In Review",
+    });
+  });
+
+  it("reports configured handoff_states for enabled PR handoff flows", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST", handoff_states: ["Human Review"] },
+        review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge" },
+        github: {
+          publish_pull_requests: true,
+          pr_handoff: { enabled: true, target_state: "Human Review", required_checks: ["Typecheck and test"] },
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(trackerHandoffDoctorCheck(config)).toEqual({
+      id: "tracker.handoff",
+      status: "ok",
+      message: "handoff_states: Human Review",
+    });
+  });
+
+  it("keeps guidance when PR handoff is enabled without configured handoff_states", async () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.tracker.handoffStates = [];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = null;
+
+    expect(trackerHandoffDoctorCheck(config)).toEqual({
+      id: "tracker.handoff",
+      status: "warn",
+      message: "No handoff_states configured; PR handoff requires github.pr_handoff.target_state to resolve to tracker.handoff_states",
+    });
+
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-pr-handoff-"));
+    try {
+      const workflowPath = path.join(root, "WORKFLOW.md");
+      await writeFile(
+        workflowPath,
+        `---
+tracker:
+  kind: linear
+  api_key: linear-test-key
+  project_slug: TEST
+  handoff_states: []
+review_loop:
+  review_states:
+    - In Review
+  review_pass_state: Ready to Merge
+github:
+  publish_pull_requests: true
+  pr_handoff:
+    enabled: true
+    required_checks:
+      - Typecheck and test
+---
+`,
+        "utf8",
+      );
+
+      await expect(runDoctor({ workflowPath })).resolves.toEqual({
+        ok: false,
+        checks: [
+          {
+            id: "workflow.parse",
+            status: "error",
+            message: "github.pr_handoff.target_state must resolve to a tracker.handoff_states value",
+          },
+        ],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("errors when Hermes dogfood would run without an explicit model", async () => {
