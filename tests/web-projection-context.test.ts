@@ -6,7 +6,10 @@ import {
   isWebProjectionRefreshRequested,
   shouldForceWebProjectionRefresh,
   webProjectionAliasesFromValues,
+<<<<<<< HEAD
   WebProjectionContextCache,
+=======
+>>>>>>> origin/main
   webProjectionIssueKeyAliases,
   type WebProjectionContext,
   type WebProjectionSourceIndex,
@@ -177,6 +180,7 @@ describe("WebProjectionContext contracts and cache key utilities", () => {
     });
     expect("events" in context.sourceIndex.transcript).toBe(false);
   });
+<<<<<<< HEAD
 
   it("caches shared contexts until forced refresh, expiration, or source fingerprint changes", async () => {
     let now = new Date("2026-01-01T00:00:00.000Z");
@@ -294,3 +298,6 @@ function sourceIndexFixture(runtimeGeneratedAt: string): WebProjectionSourceInde
     durableSourceRevisions: [{ source: "runs", revision: runtimeGeneratedAt, observedAt: runtimeGeneratedAt }],
   };
 }
+=======
+});
+>>>>>>> origin/main

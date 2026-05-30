@@ -145,16 +145,25 @@ export interface WebProjectionBuildInput<TSourceIndex extends WebProjectionSourc
 
 export type WebProjectionBuildHook<
   TSourceIndex extends WebProjectionSourceIndex = WebProjectionSourceIndex,
+<<<<<<< HEAD
   TContext extends WebProjectionContext<TSourceIndex, object> = WebProjectionContext<TSourceIndex>,
+=======
+  TContext extends WebProjectionContext<TSourceIndex> = WebProjectionContext<TSourceIndex>,
+>>>>>>> origin/main
 > = (input: WebProjectionBuildInput<TSourceIndex>) => TContext | Promise<TContext>;
 
 export interface WebProjectionAcquireOptions<
   TSourceIndex extends WebProjectionSourceIndex = WebProjectionSourceIndex,
+<<<<<<< HEAD
   TContext extends WebProjectionContext<TSourceIndex, object> = WebProjectionContext<TSourceIndex>,
+=======
+  TContext extends WebProjectionContext<TSourceIndex> = WebProjectionContext<TSourceIndex>,
+>>>>>>> origin/main
 > extends WebProjectionBuildOptions {
   build?: WebProjectionBuildHook<TSourceIndex, TContext>;
 }
 
+<<<<<<< HEAD
 export interface WebProjectionCacheAcquireRequest<
   TSourceIndex extends WebProjectionSourceIndex = WebProjectionSourceIndex,
   TContext extends WebProjectionContext<TSourceIndex, object> = WebProjectionContext<TSourceIndex>,
@@ -245,6 +254,8 @@ export class WebProjectionContextCache<
   }
 }
 
+=======
+>>>>>>> origin/main
 export function normalizeWebProjectionAlias(value: WebProjectionAliasValue): string | null {
   if (value === null || value === undefined) return null;
   const normalized = value.trim();
@@ -335,6 +346,7 @@ export function createWebProjectionFingerprint(input: {
   };
 }
 
+<<<<<<< HEAD
 export function createWebProjectionFingerprintFromSourceIndex(
   sourceIndex: Pick<WebProjectionSourceIndex, "runtime" | "trackerIssues" | "durableSourceRevisions">,
 ): WebProjectionCacheFingerprint {
@@ -369,6 +381,8 @@ function defaultWebProjectionBuildHook<
   return { metadata: input.metadata, sourceIndex: input.sourceIndex, projections: {} } as TContext;
 }
 
+=======
+>>>>>>> origin/main
 function stableCacheDimensions(dimensions: Readonly<Record<string, WebProjectionCacheKeyValue>>): Array<[string, string[]]> {
   const entries: Array<[string, string[]]> = [];
   for (const key of Object.keys(dimensions).sort()) {

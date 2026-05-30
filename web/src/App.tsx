@@ -7,7 +7,7 @@ import { ChatHistoryView } from "./components/history/ChatHistoryView";
 import { DashboardView } from "./components/dashboard/DashboardView";
 import { IssuesView } from "./components/issues/IssuesView";
 import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
-import { ReferenceDataProvider } from "./data/referenceDataContext";
+import { ReferenceDataProvider, fallbackReferenceData } from "./data/referenceDataContext";
 import {
   useDashboard,
   useHistory,
@@ -28,28 +28,37 @@ export function App() {
 
 function AppDataBoundary() {
   const reference = useReferenceResource();
-  if (reference.loading && !reference.data) {
+  const apiMode = defaultDataSourceConfig.mode === "api";
+
+  if (!apiMode && reference.loading && !reference.data) {
     return (
       <ThemeFrame>
         <div className="view-loading">Loading Symphony design data...</div>
       </ThemeFrame>
     );
   }
-  if (reference.error || !reference.data) {
+  if (!apiMode && (reference.error || !reference.data)) {
     return (
       <ThemeFrame>
         <div className="view-error">{reference.error || "Reference data unavailable."}</div>
       </ThemeFrame>
     );
   }
+
   return (
-    <ReferenceDataProvider value={reference.data}>
-      <AppShell />
+    <ReferenceDataProvider value={reference.data ?? fallbackReferenceData}>
+      <AppShell referenceStatusLabel={referenceStatusLabel(reference)} />
     </ReferenceDataProvider>
   );
 }
 
-function AppShell() {
+function referenceStatusLabel(reference: { data: unknown | null; loading: boolean; error: string | null }) {
+  if (reference.error && !reference.data) return "reference unavailable";
+  if (reference.loading && !reference.data) return "reference loading";
+  return null;
+}
+
+function AppShell({ referenceStatusLabel }: { referenceStatusLabel: string | null }) {
   const [activeTab, setActiveTab] = useState<AppTab>("dashboard");
   const [dashboardVariant, setDashboardVariant] = useState<DashboardVariant>("cards");
   const [issuesVariant, setIssuesVariant] = useState<IssuesVariant>("balanced");
@@ -75,7 +84,12 @@ function AppShell() {
         branch={apiMode ? (dashboardChrome?.branch ?? "") : undefined}
         pollLabel={apiMode ? (dashboardChrome?.pollLabel ?? "poll pending") : undefined}
         agentUsageLabel={apiMode ? (dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`) : undefined}
-        dataSourceLabel={`api source · ${defaultDataSourceConfig.mode}`}
+        dataSourceLabel={[
+          `api source · ${defaultDataSourceConfig.mode}`,
+          apiMode ? referenceStatusLabel : null,
+        ]
+          .filter(Boolean)
+          .join(" · ")}
         rightSlot={
           <ViewControls
             activeTab={activeTab}
