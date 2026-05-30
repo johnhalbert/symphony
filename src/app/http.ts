@@ -76,7 +76,9 @@ import {
   type WebProjectionCacheMetadata,
   type WebProjectionClock,
   type WebProjectionContext,
+  type WebProjectionRevisionListener,
   type WebProjectionRevisionProvider,
+  type WebProjectionRevisionUnsubscribe,
   type WebProjectionSourceRevision,
 } from "./WebProjectionContext.js";
 import type {
@@ -96,6 +98,14 @@ import type {
 export const WEB_PROJECTION_CONTEXT_TTL_MS = 5_000;
 
 export type StatusServerWebProjectionContext = WebProjectionContext<BuiltWebProjectionSourceIndex, Record<string, unknown>>;
+
+type StatusServerWritebackOutbox = Pick<FileWritebackOutboxStore, "list"> &
+  Partial<Pick<FileWritebackOutboxStore, "projectionRevision" | "onProjectionChanged">>;
+
+interface StatusServerProjectionRevisionStore {
+  projectionRevision(): number;
+  onProjectionChanged(listener: (event: { source: string; revision: number }) => void): () => void;
+}
 
 export interface StatusServerWebProjectionContextBuildInput {
   metadata: WebProjectionCacheMetadata;
@@ -122,7 +132,7 @@ export interface StatusServerOptions {
   runStore?: RunTranscriptStore;
   lifecycleStore?: IssueLifecycleStore;
   mcpExposureDiagnosticsStore?: FileMcpExposureDiagnosticsStore;
-  writebackOutbox?: Pick<FileWritebackOutboxStore, "list">;
+  writebackOutbox?: StatusServerWritebackOutbox;
   operatorApproval?: Pick<
     OperatorApprovalService,
     "get" | "resolve" | "findPendingForIssue" | "findPendingForRun" | "rejectPolicy" | "isRequired"
@@ -151,13 +161,18 @@ export class StatusServer {
   private completedWebProjectionContext: StatusServerWebProjectionContext | null = null;
   private readonly pendingWebProjectionContexts = new Map<string, Promise<StatusServerWebProjectionContext>>();
   private readonly webAssetsRoot: string | null;
+  private readonly webProjectionRevisionProviders: readonly WebProjectionRevisionProvider[];
+  private readonly webProjectionRevisionUnsubscribes: WebProjectionRevisionUnsubscribe[] = [];
+  private webProjectionDirtyGeneration = 0;
 
   constructor(private readonly options: StatusServerOptions) {
     this.webAssetsRoot = resolveWebAssetsRootOption(options.webAssetsRoot);
+    this.webProjectionRevisionProviders = createStatusServerWebProjectionRevisionProviders(options);
   }
 
   async start(): Promise<{ host: string; port: number }> {
     if (this.server) {
+      this.registerWebProjectionRevisionListeners();
       const address = this.server.address();
       return typeof address === "object" && address
         ? { host: address.address, port: address.port }
@@ -169,18 +184,53 @@ export class StatusServer {
     await new Promise<void>((resolve) => {
       this.server?.listen(this.options.port, this.options.host, resolve);
     });
+    this.registerWebProjectionRevisionListeners();
     const address = this.server.address();
     if (typeof address === "object" && address) return { host: address.address, port: address.port };
     return { host: this.options.host, port: this.options.port };
   }
 
   async stop(): Promise<void> {
-    if (!this.server) return;
+    if (!this.server) {
+      this.unsubscribeWebProjectionRevisionListeners();
+      return;
+    }
     const server = this.server;
     this.server = null;
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => (error ? reject(error) : resolve()));
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    } finally {
+      this.unsubscribeWebProjectionRevisionListeners();
+    }
+  }
+
+  private registerWebProjectionRevisionListeners(): void {
+    if (this.webProjectionRevisionUnsubscribes.length > 0) return;
+    for (const provider of this.webProjectionRevisionProviders) {
+      if (!provider.subscribe) continue;
+      const unsubscribe = provider.subscribe((revision) => {
+        this.markCompletedWebProjectionContextDirty(revision);
+      });
+      this.webProjectionRevisionUnsubscribes.push(unsubscribe);
+    }
+  }
+
+  private unsubscribeWebProjectionRevisionListeners(): void {
+    while (this.webProjectionRevisionUnsubscribes.length > 0) {
+      const unsubscribe = this.webProjectionRevisionUnsubscribes.pop();
+      try {
+        unsubscribe?.();
+      } catch {
+        // Projection invalidation cleanup is best-effort; stop should still close the status server.
+      }
+    }
+  }
+
+  private markCompletedWebProjectionContextDirty(_revision: WebProjectionSourceRevision): void {
+    this.webProjectionDirtyGeneration += 1;
+    this.completedWebProjectionContext = null;
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -1080,7 +1130,10 @@ export class StatusServer {
 
     try {
       const context = await promise;
-      if (this.pendingWebProjectionContexts.get(pendingKey) === promise) {
+      if (
+        this.pendingWebProjectionContexts.get(pendingKey) === promise &&
+        (await this.isWebProjectionContextCurrent(context, issueBoardColumns))
+      ) {
         this.completedWebProjectionContext = context;
       }
       return { context, reusedCompleted: false };
@@ -1130,9 +1183,24 @@ export class StatusServer {
   }
 
   private async resolveWebProjectionSourceRevisions(): Promise<readonly WebProjectionSourceRevision[]> {
-    const providers = this.options.webProjectionRevisionProviders ?? [];
+    const providers = this.webProjectionRevisionProviders;
     if (providers.length === 0) return [];
     return Promise.all(providers.map((provider) => provider.getRevision()));
+  }
+
+  private async isWebProjectionContextCurrent(
+    context: StatusServerWebProjectionContext,
+    issueBoardColumns: IssueBoardColumnMapping,
+  ): Promise<boolean> {
+    const generationBeforeFingerprint = this.webProjectionDirtyGeneration;
+    const currentFingerprint = await this.createWebProjectionContextFingerprint(
+      this.options.orchestrator.snapshot(),
+      issueBoardColumns,
+    );
+    return (
+      this.webProjectionDirtyGeneration === generationBeforeFingerprint &&
+      webProjectionFingerprintCacheKey(context.metadata.fingerprint) === webProjectionFingerprintCacheKey(currentFingerprint)
+    );
   }
 
   private async fetchIssueBoardTrackerProjection(
@@ -1178,6 +1246,42 @@ export class StatusServer {
   }
 }
 
+function createStatusServerWebProjectionRevisionProviders(
+  options: StatusServerOptions,
+): readonly WebProjectionRevisionProvider[] {
+  const providers: WebProjectionRevisionProvider[] = [...(options.webProjectionRevisionProviders ?? [])];
+  const runStoreProvider = createStatusServerStoreRevisionProvider("runStore", options.runStore);
+  if (runStoreProvider) providers.push(runStoreProvider);
+  const lifecycleStoreProvider = createStatusServerStoreRevisionProvider("lifecycleStore", options.lifecycleStore);
+  if (lifecycleStoreProvider) providers.push(lifecycleStoreProvider);
+  const writebackOutboxProvider = createStatusServerStoreRevisionProvider("writebackOutbox", options.writebackOutbox);
+  if (writebackOutboxProvider) providers.push(writebackOutboxProvider);
+  return providers;
+}
+
+function createStatusServerStoreRevisionProvider(
+  source: string,
+  store: unknown,
+): WebProjectionRevisionProvider | null {
+  if (!isStatusServerProjectionRevisionStore(store)) return null;
+  return {
+    source,
+    getRevision: () => ({ source, revision: store.projectionRevision(), observedAt: null }),
+    subscribe: (listener: WebProjectionRevisionListener) =>
+      store.onProjectionChanged((event) => {
+        listener({ source: event.source || source, revision: event.revision, observedAt: null });
+      }),
+  };
+}
+
+function isStatusServerProjectionRevisionStore(store: unknown): store is StatusServerProjectionRevisionStore {
+  return Boolean(
+    store &&
+      typeof (store as Partial<StatusServerProjectionRevisionStore>).projectionRevision === "function" &&
+      typeof (store as Partial<StatusServerProjectionRevisionStore>).onProjectionChanged === "function",
+  );
+}
+
 const STATUS_SERVER_WEB_PROJECTION_COLUMN_IDS: readonly IssueBoardColumnId[] = [
   "backlog",
   "todo",
@@ -1188,7 +1292,6 @@ const STATUS_SERVER_WEB_PROJECTION_COLUMN_IDS: readonly IssueBoardColumnId[] = [
 ] as const;
 
 const STATUS_SERVER_RUNTIME_FINGERPRINT_VOLATILE_FIELDS = new Set([
-  "generatedAt",
   "secondsRunning",
   "secondsSinceLastActivity",
 ]);

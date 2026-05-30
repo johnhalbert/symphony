@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
 import { resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
-import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileIssueLifecycleStore, type IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "../src/core/persistence/McpExposureDiagnosticsStore.js";
 import { FileRunTranscriptStore, type RunRecord } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
@@ -2395,8 +2395,9 @@ describe("StatusServer durable API", () => {
     config.reviewLoop.reviewPassState = "Ready to Merge";
     config.mergePolicy.sourceStates = ["Ready to Merge"];
 
-    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new CountingRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new CountingIssueLifecycleStore(config.workspace.stateDir);
+
     await runStore.upsertWorkspace({
       workspaceKey: "TEST-1",
       issueId: "issue-1",
@@ -2438,6 +2439,27 @@ describe("StatusServer durable API", () => {
       at: "2026-01-01T00:01:30.000Z",
       ciStatus: "success",
     });
+    await lifecycleStore.ensureIssue(
+      { id: "issue-1", identifier: "TEST-1" },
+      {
+        phase: "review",
+        reviewRound: 1,
+        blockedReason: null,
+        summaryPointers: {
+          workspaceKey: "TEST-1",
+          workspacePath: path.join(config.workspace.root, "TEST-1"),
+          branchName: "symphony/TEST-1",
+          gitBranchName: "symphony/TEST-1",
+          repoPath: "/repo",
+          baseRef: "main",
+          lastRunId: "run-test-1",
+          prUrl: "https://github.com/acme/repo/pull/67",
+          prNumber: 67,
+          ciStatus: "success",
+          lastPushedAt: "2026-01-01T00:00:30.000Z",
+        },
+      },
+    );
     await lifecycleStore.ensureIssue(
       { id: "issue-blocked", identifier: "TEST-BLOCKED" },
       { phase: "blocked", blockedReason: "needs operator", summaryPointers: {} },
@@ -2524,6 +2546,7 @@ describe("StatusServer durable API", () => {
       }),
     ]);
 
+    lifecycleStore.resetReadCounts();
     const server = new StatusServer({
       orchestrator: fakeOrchestrator([liveRunning], { paused: ["TEST-BLOCKED"] }),
       workspaceManager: new WorkspaceManager({
@@ -2567,6 +2590,13 @@ describe("StatusServer durable API", () => {
       };
 
       expect(response.status).toBe(200);
+      expect(runStore.listWorkspacesCount).toBe(1);
+      expect(runStore.listRunsCount).toBe(1);
+      expect(runStore.findWorkspaceCount).toBe(0);
+      expect(runStore.listRunsForIssueCount).toBe(0);
+      expect(runStore.latestRunForIssueCount).toBe(0);
+      expect(lifecycleStore.listCount).toBe(1);
+      expect(lifecycleStore.getCount).toBe(0);
       expect(tracker.requestedStates).toEqual(["Backlog", "Todo", "In Progress", "Blocked", "In Review", "Ready to Merge", "Done", "Canceled"]);
       expect(tracker.fetchCount).toBe(1);
       expect(body.tracker).toMatchObject({ issueCount: 8, cached: false });
@@ -2867,6 +2897,90 @@ describe("StatusServer durable API", () => {
         blockers: { openCount: 1, blocked: true },
         capabilities: { openWorkspace: false, transcript: false },
       });
+
+      const reviewBoardDetailResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board/issues/TEST-1`);
+      const reviewBoardDetail = (await reviewBoardDetailResponse.json()) as {
+        boardCard: { issueIdentifier: string | null; live: { state: string; runId: string | null } | null };
+        issueDetails: IssueDetailsEnvelope;
+        live: { state: string; runId: string | null } | null;
+        workspace: { workspaceKey: string; path: string | null; gitBranchName: string | null } | null;
+        latestRun: { runId: string; sessionId: string | null; status: string; ciStatus?: string | null } | null;
+        runs: Array<{ runId: string; sessionId: string | null; status: string }>;
+        lifecycle: { phase: string; reviewRound: number } | null;
+        pullRequest: IssueDetailsEnvelope["pullRequest"];
+        capabilities: { openWorkspace: boolean; transcript: boolean };
+      };
+      expect(reviewBoardDetailResponse.status).toBe(200);
+      expect(reviewBoardDetail).toMatchObject({
+        boardCard: { issueIdentifier: "TEST-1", live: { state: "In Progress", runId: "run-test-1" } },
+        issueDetails: {
+          source: "tracker",
+          issue: {
+            identifier: "TEST-1",
+            title: "Linear review title",
+            description: "Review route description.\n\nSecond route paragraph.",
+            state: "In Review",
+            labels: ["dogfood-ready"],
+          },
+          tracker: { classification: "handoff", stale: false },
+          workspace: { workspaceKey: "TEST-1", path: path.join(config.workspace.root, "TEST-1"), gitBranchName: "symphony/TEST-1" },
+          latestRun: { runId: "run-test-1", status: "running" },
+          pullRequest: { url: "https://github.com/acme/repo/pull/67", number: 67, ciStatus: "success" },
+        },
+        live: { state: "In Progress", runId: "run-test-1" },
+        workspace: { workspaceKey: "TEST-1", path: path.join(config.workspace.root, "TEST-1"), gitBranchName: "symphony/TEST-1" },
+        latestRun: { runId: "run-test-1", sessionId: "session-1", status: "running", ciStatus: "success" },
+        lifecycle: { phase: "review", reviewRound: 1 },
+        pullRequest: { url: "https://github.com/acme/repo/pull/67", number: 67, ciStatus: "success" },
+        capabilities: { openWorkspace: false, transcript: true },
+      });
+      expect(reviewBoardDetail.runs).toHaveLength(1);
+      expect(reviewBoardDetail.runs[0]).toMatchObject({ runId: "run-test-1", sessionId: "session-1", status: "running" });
+
+      const webDetailResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues/TEST-1`);
+      const webDetail = (await webDetailResponse.json()) as {
+        issue: {
+          id: string;
+          title: string;
+          status: string;
+          priority: number | string;
+          labels: string[];
+          assignee: string;
+          agent: string | null;
+          pr: string | null;
+          ci: string | null;
+          workspace: string | null;
+          session: string | null;
+          desc?: string[];
+          activity: Array<{ verb: string; val: string | null; who: string | null }>;
+        };
+        activity: Array<{ verb: string; id: string }>;
+        runs: Array<{ id: string; issue: string; state: string }>;
+        transcript: unknown[];
+      };
+      expect(webDetailResponse.status).toBe(200);
+      expect(webDetail.issue).toMatchObject({
+        id: "TEST-1",
+        title: "Linear review title",
+        status: "review",
+        priority: 2,
+        labels: ["dogfood-ready"],
+        assignee: "review-assignee",
+        agent: "agent-1",
+        pr: "#67",
+        ci: "success",
+        workspace: path.join(config.workspace.root, "TEST-1"),
+        session: "session-1",
+      });
+      expect(webDetail.issue.desc).toEqual(expect.arrayContaining(["Review route description.", "Second route paragraph.", "Blocked by TEST-0"]));
+      expect(webDetail.issue.activity.map((item) => item.verb)).toEqual(expect.arrayContaining(["created", "updated", "pr pushed"]));
+      expect(webDetail.activity[0]).toMatchObject({ verb: "run_started", id: "TEST-1" });
+      expect(webDetail.runs).toEqual([expect.objectContaining({ id: "session-1", issue: "TEST-1", state: "running" })]);
+      expect(webDetail.transcript).toEqual(expect.any(Array));
+      expect(runStore.findWorkspaceCount).toBe(0);
+      expect(runStore.listRunsForIssueCount).toBe(0);
+      expect(runStore.latestRunForIssueCount).toBe(0);
+      expect(lifecycleStore.getCount).toBe(0);
 
       const cachedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
       const cachedBody = (await cachedResponse.json()) as { tracker: { cached: boolean } };
@@ -4093,6 +4207,62 @@ class FakeTracker implements TrackerClient {
 
   async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
     return this.issues.filter((item) => issueIds.includes(item.id));
+  }
+}
+
+class CountingRunTranscriptStore extends FileRunTranscriptStore {
+  listWorkspacesCount = 0;
+  listRunsCount = 0;
+  findWorkspaceCount = 0;
+  listRunsForIssueCount = 0;
+  latestRunForIssueCount = 0;
+
+  override async listWorkspaces() {
+    this.listWorkspacesCount += 1;
+    return super.listWorkspaces();
+  }
+
+  override async listRuns() {
+    this.listRunsCount += 1;
+    return super.listRuns();
+  }
+
+  override async findWorkspace(issueIdOrIdentifierOrKey: string) {
+    this.findWorkspaceCount += 1;
+    return super.findWorkspace(issueIdOrIdentifierOrKey);
+  }
+
+  override async listRunsForIssue(issueIdOrIdentifier: string): Promise<RunRecord[]> {
+    this.listRunsForIssueCount += 1;
+    return super.listRunsForIssue(issueIdOrIdentifier);
+  }
+
+  override async latestRunForIssue(
+    issueIdOrIdentifier: string,
+    options: Parameters<FileRunTranscriptStore["latestRunForIssue"]>[1] = {},
+  ): Promise<RunRecord | null> {
+    this.latestRunForIssueCount += 1;
+    return super.latestRunForIssue(issueIdOrIdentifier, options);
+  }
+}
+
+class CountingIssueLifecycleStore extends FileIssueLifecycleStore {
+  listCount = 0;
+  getCount = 0;
+
+  resetReadCounts(): void {
+    this.listCount = 0;
+    this.getCount = 0;
+  }
+
+  override async list(): Promise<IssueLifecycleRecord[]> {
+    this.listCount += 1;
+    return super.list();
+  }
+
+  override async get(issueIdOrIdentifier: string): Promise<IssueLifecycleRecord | null> {
+    this.getCount += 1;
+    return super.get(issueIdOrIdentifier);
   }
 }
 

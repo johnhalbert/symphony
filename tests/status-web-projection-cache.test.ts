@@ -1,3 +1,6 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import {
   StatusServer,
@@ -6,7 +9,14 @@ import {
   type StatusServerWebProjectionContextBuildInput,
   type StatusServerWebProjectionContextBuilder,
 } from "../src/app/http.js";
-import { isWebProjectionRefreshRequested } from "../src/app/WebProjectionContext.js";
+import {
+  isWebProjectionRefreshRequested,
+  type WebProjectionRevisionListener,
+  type WebProjectionRevisionProvider,
+} from "../src/app/WebProjectionContext.js";
+import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileRunTranscriptStore, type StartRunInput, type WorkspaceRecord } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileWritebackOutboxStore, type NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 
 interface TestableStatusServer extends StatusServer {
@@ -14,7 +24,7 @@ interface TestableStatusServer extends StatusServer {
 }
 
 describe("StatusServer web projection context cache", () => {
-  it("reuses a completed context before the fixed TTL despite volatile snapshot generatedAt and rebuilds after expiry", async () => {
+  it("bypasses a completed context before TTL expiry when runtime generatedAt changes and rebuilds after expiry", async () => {
     const startedAt = Date.parse("2026-01-01T00:00:00.000Z");
     let nowMs = startedAt;
     let generatedAtMs = startedAt;
@@ -32,16 +42,18 @@ describe("StatusServer web projection context cache", () => {
     const first = await acquire(false);
     generatedAtMs = startedAt + 5;
     nowMs = startedAt + WEB_PROJECTION_CONTEXT_TTL_MS - 1;
-    const second = await acquire(false);
-    expect(second).toBe(first);
-    expect(builds).toBe(1);
+    const runtimeChanged = await acquire(false);
+    expect(runtimeChanged).not.toBe(first);
+    expect(projectedBuild(runtimeChanged)).toBe(2);
 
-    generatedAtMs = startedAt + WEB_PROJECTION_CONTEXT_TTL_MS;
-    nowMs = startedAt + WEB_PROJECTION_CONTEXT_TTL_MS;
-    const expired = await acquire(false);
-    expect(expired).not.toBe(first);
-    expect(projectedBuild(expired)).toBe(2);
+    await expect(acquire(false)).resolves.toBe(runtimeChanged);
     expect(builds).toBe(2);
+
+    nowMs = startedAt + WEB_PROJECTION_CONTEXT_TTL_MS * 2;
+    const expired = await acquire(false);
+    expect(expired).not.toBe(runtimeChanged);
+    expect(projectedBuild(expired)).toBe(3);
+    expect(builds).toBe(3);
   });
 
   it("rebuilds before TTL expiry when stable runtime state or durable-source fingerprint changes", async () => {
@@ -96,7 +108,6 @@ describe("StatusServer web projection context cache", () => {
     const acquire = acquireFrom(server);
 
     const first = acquire(false);
-    generatedAtMs = startedAt + 10;
     const second = acquire(false);
     await settleMicrotasks();
 
@@ -166,9 +177,7 @@ describe("StatusServer web projection context cache", () => {
     expect(projectedBuild(completed)).toBe(1);
 
     deferRefresh = true;
-    generatedAtMs = startedAt + 10;
     const firstRefresh = acquire(true);
-    generatedAtMs = startedAt + 20;
     const secondRefresh = acquire(true);
     await settleMicrotasks();
 
@@ -270,7 +279,6 @@ describe("StatusServer web projection context cache", () => {
     expect(trackerCalls).toBe(1);
 
     durableRevision = "revision-2";
-    generatedAtMs = startedAt + 10;
     trackerMode = "fail";
     const failedFirst = acquire(false);
     const failedSecond = acquire(false);
@@ -281,12 +289,10 @@ describe("StatusServer web projection context cache", () => {
     expect(trackerCalls).toBe(2);
 
     durableRevision = "revision-1";
-    generatedAtMs = startedAt + 20;
     await expect(acquire(false)).resolves.toBe(completed);
     expect(trackerCalls).toBe(2);
 
     durableRevision = "revision-2";
-    generatedAtMs = startedAt + 30;
     trackerMode = "ok";
     const recovered = await acquire(false);
     expect(recovered).not.toBe(completed);
@@ -296,6 +302,158 @@ describe("StatusServer web projection context cache", () => {
     await expect(acquire(false)).resolves.toBe(recovered);
     expect(trackerCalls).toBe(3);
   });
+
+  it("registers durable-store listeners and dirties completed contexts for run, workspace, lifecycle, and writeback writes", async () => {
+    await withTempStateDir(async (stateDir) => {
+      const runStore = new FileRunTranscriptStore(stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+      const writebackOutbox = new FileWritebackOutboxStore(stateDir);
+      let builds = 0;
+      const server = createStatusServer({
+        generatedAt: () => "2026-01-01T00:00:00.000Z",
+        clock: () => new Date("2026-01-01T00:00:00.000Z"),
+        runStore,
+        lifecycleStore,
+        writebackOutbox,
+        builder: (input) => {
+          builds += 1;
+          return contextFixture(input, builds);
+        },
+      });
+      const acquire = acquireFrom(server);
+      await server.start();
+      try {
+        let current = await acquire(false);
+        expect(projectedBuild(current)).toBe(1);
+
+        const expectDirtyAfter = async (mutation: () => Promise<void>, expectedBuild: number): Promise<void> => {
+          const previous = current;
+          await mutation();
+          current = await acquire(false);
+          expect(current).not.toBe(previous);
+          expect(projectedBuild(current)).toBe(expectedBuild);
+        };
+
+        await expectDirtyAfter(() => runStore.startRun(startRunInputFixture(stateDir, "run-1")).then(() => undefined), 2);
+        await expectDirtyAfter(() => runStore.upsertWorkspace(workspaceRecordFixture(stateDir, "workspace-1")), 3);
+        await expectDirtyAfter(() => runStore.deleteWorkspace("workspace-1"), 4);
+        await expectDirtyAfter(
+          () => lifecycleStore.ensureIssue({ id: "issue-lifecycle", identifier: "ENG-LIFE" }, { phase: "review" }).then(() => undefined),
+          5,
+        );
+        const beforeWritebackEnqueue = current;
+        let writeback = await writebackOutbox.enqueueOnce(writebackOperationFixture("writeback-1"));
+        current = await acquire(false);
+        expect(current).not.toBe(beforeWritebackEnqueue);
+        expect(projectedBuild(current)).toBe(6);
+        const beforeWritebackStatus = current;
+        writeback = await writebackOutbox.markSucceeded(writeback, { status: "applied", message: "applied" });
+        current = await acquire(false);
+        expect(current).not.toBe(beforeWritebackStatus);
+        expect(writeback.status).toBe("succeeded");
+        expect(projectedBuild(current)).toBe(7);
+        expect(builds).toBe(7);
+      } finally {
+        await server.stop();
+      }
+    });
+  });
+
+  it("unsubscribes projection listeners on stop so later notifications do not dirty the completed context", async () => {
+    const revisionProvider = controllableRevisionProvider();
+    let builds = 0;
+    const server = createStatusServer({
+      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      clock: () => new Date("2026-01-01T00:00:00.000Z"),
+      revisionProviders: [revisionProvider.provider],
+      builder: (input) => {
+        builds += 1;
+        return contextFixture(input, builds);
+      },
+    });
+    const acquire = acquireFrom(server);
+
+    await server.start();
+    const completed = await acquire(false);
+    expect(projectedBuild(completed)).toBe(1);
+    expect(revisionProvider.listenerCount()).toBe(1);
+    await server.stop();
+    expect(revisionProvider.listenerCount()).toBe(0);
+
+    revisionProvider.emit(2);
+    await expect(acquire(false)).resolves.toBe(completed);
+    expect(builds).toBe(1);
+  });
+
+  it("does not promote an in-flight build as completed when a store changes during the build", async () => {
+    await withTempStateDir(async (stateDir) => {
+      const runStore = new FileRunTranscriptStore(stateDir);
+      const pendingBuilds: Array<{
+        build: number;
+        input: StatusServerWebProjectionContextBuildInput;
+        deferred: Deferred<StatusServerWebProjectionContext>;
+      }> = [];
+      let builds = 0;
+      let deferNextBuild = false;
+      const server = createStatusServer({
+        generatedAt: () => "2026-01-01T00:00:00.000Z",
+        clock: () => new Date("2026-01-01T00:00:00.000Z"),
+        runStore,
+        builder: (input) => {
+          builds += 1;
+          if (deferNextBuild) {
+            const deferredBuild = deferred<StatusServerWebProjectionContext>();
+            pendingBuilds.push({ build: builds, input, deferred: deferredBuild });
+            return deferredBuild.promise;
+          }
+          return contextFixture(input, builds);
+        },
+      });
+      const acquire = acquireFrom(server);
+      await server.start();
+      try {
+        const completed = await acquire(false);
+        expect(projectedBuild(completed)).toBe(1);
+
+        deferNextBuild = true;
+        const rebuilding = acquire(true);
+        await settleMicrotasks();
+        const pending = pendingBuilds[0];
+        if (!pending) throw new Error("expected a pending build");
+        await runStore.startRun(startRunInputFixture(stateDir, "run-during-build"));
+        const staleBuild = contextFixture(pending.input, pending.build);
+        pending.deferred.resolve(staleBuild);
+
+        await expect(rebuilding).resolves.toBe(staleBuild);
+        expect(projectedBuild(staleBuild)).toBe(2);
+
+        deferNextBuild = false;
+        const current = await acquire(false);
+        expect(current).not.toBe(staleBuild);
+        expect(projectedBuild(current)).toBe(3);
+        expect(builds).toBe(3);
+      } finally {
+        await server.stop();
+      }
+    });
+  });
+
+  it("functions without optional durable stores using TTL and runtime fingerprint behavior", async () => {
+    let builds = 0;
+    const server = createStatusServer({
+      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      clock: () => new Date("2026-01-01T00:00:00.000Z"),
+      builder: (input) => {
+        builds += 1;
+        return contextFixture(input, builds);
+      },
+    });
+    const acquire = acquireFrom(server);
+
+    const completed = await acquire(false);
+    await expect(acquire(false)).resolves.toBe(completed);
+    expect(builds).toBe(1);
+  });
 });
 
 function createStatusServer(input: {
@@ -304,9 +462,20 @@ function createStatusServer(input: {
   builder?: StatusServerWebProjectionContextBuilder;
   runtimeCounts?: () => Partial<ReturnType<ConstructorParameters<typeof StatusServer>[0]["orchestrator"]["snapshot"]>["counts"]>;
   revisionProvider?: () => { source: string; revision: string | number; observedAt: string | null };
+  revisionProviders?: readonly WebProjectionRevisionProvider[];
+  runStore?: ConstructorParameters<typeof StatusServer>[0]["runStore"];
+  lifecycleStore?: ConstructorParameters<typeof StatusServer>[0]["lifecycleStore"];
+  writebackOutbox?: ConstructorParameters<typeof StatusServer>[0]["writebackOutbox"];
   tracker?: ConstructorParameters<typeof StatusServer>[0]["tracker"];
   staleThresholdMs?: number;
 }): StatusServer {
+  const revisionProviders: WebProjectionRevisionProvider[] = [...(input.revisionProviders ?? [])];
+  if (input.revisionProvider) {
+    revisionProviders.push({
+      source: "test",
+      getRevision: input.revisionProvider,
+    });
+  }
   const options: ConstructorParameters<typeof StatusServer>[0] = {
     orchestrator: fakeOrchestrator(input.generatedAt, input.runtimeCounts),
     workspaceManager: {} as ConstructorParameters<typeof StatusServer>[0]["workspaceManager"],
@@ -320,16 +489,10 @@ function createStatusServer(input: {
     webProjectionContextClock: input.clock,
     ...(input.builder ? { webProjectionContextBuilder: input.builder } : {}),
     ...(input.tracker ? { tracker: input.tracker } : {}),
-    ...(input.revisionProvider
-      ? {
-          webProjectionRevisionProviders: [
-            {
-              source: "test",
-              getRevision: input.revisionProvider,
-            },
-          ],
-        }
-      : {}),
+    ...(input.runStore ? { runStore: input.runStore } : {}),
+    ...(input.lifecycleStore ? { lifecycleStore: input.lifecycleStore } : {}),
+    ...(input.writebackOutbox ? { writebackOutbox: input.writebackOutbox } : {}),
+    ...(revisionProviders.length > 0 ? { webProjectionRevisionProviders: revisionProviders } : {}),
   };
   return new StatusServer(options);
 }
@@ -345,7 +508,7 @@ function contextFixture(
 ): StatusServerWebProjectionContext {
   return {
     metadata: input.metadata,
-    sourceIndex: sourceIndexFixture(input.snapshot.generatedAt, build),
+    sourceIndex: sourceIndexFixture(input.snapshot.generatedAt, build, input.fingerprint.durableSourceRevisions),
     projections: { build, forceRefresh: input.forceRefresh },
   };
 }
@@ -358,7 +521,13 @@ function projectedForceRefresh(context: StatusServerWebProjectionContext): boole
   return context.projections.forceRefresh as boolean;
 }
 
-function sourceIndexFixture(generatedAt: string, build: number): StatusServerWebProjectionContext["sourceIndex"] {
+function sourceIndexFixture(
+  generatedAt: string,
+  build: number,
+  durableSourceRevisions: StatusServerWebProjectionContext["sourceIndex"]["durableSourceRevisions"] = [
+    { source: "test", revision: build, observedAt: generatedAt },
+  ],
+): StatusServerWebProjectionContext["sourceIndex"] {
   const snapshot = runtimeSnapshot(generatedAt);
   return {
     generatedAt,
@@ -406,7 +575,7 @@ function sourceIndexFixture(generatedAt: string, build: number): StatusServerWeb
       hydration: "excluded",
       eventCountsByRunId: new Map<string, number | null>(),
     },
-    durableSourceRevisions: [{ source: "test", revision: build, observedAt: generatedAt }],
+    durableSourceRevisions,
   };
 }
 
@@ -480,6 +649,82 @@ function testTrackerStateLists(): TrackerStateLists {
     reviewStates: ["In Review"],
     blockedStates: ["Blocked"],
     terminalStates: ["Done", "Closed", "Cancelled", "Canceled", "Duplicate"],
+  };
+}
+
+async function withTempStateDir<T>(fn: (stateDir: string) => Promise<T>): Promise<T> {
+  const stateDir = await fs.mkdtemp(path.join(tmpdir(), "symphony-status-cache-"));
+  try {
+    return await fn(stateDir);
+  } finally {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+}
+
+function startRunInputFixture(stateDir: string, runId: string): StartRunInput {
+  return {
+    runId,
+    role: "worker",
+    issueId: `issue-${runId}`,
+    issueIdentifier: `ENG-${runId.toUpperCase()}`,
+    attempt: 1,
+    turnNumber: 1,
+    prompt: `Prompt for ${runId}`,
+    workspaceKey: `workspace-${runId}`,
+    workspacePath: path.join(stateDir, `workspace-${runId}`),
+  };
+}
+
+function workspaceRecordFixture(stateDir: string, workspaceKey: string): WorkspaceRecord {
+  const now = "2026-01-01T00:00:00.000Z";
+  return {
+    workspaceKey,
+    issueId: `issue-${workspaceKey}`,
+    issueIdentifier: `ENG-${workspaceKey.toUpperCase()}`,
+    path: path.join(stateDir, workspaceKey),
+    sourceKind: "worktree",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function writebackOperationFixture(id: string): NewWritebackOperation {
+  return {
+    idempotencyKey: `writeback:${id}`,
+    kind: "comment",
+    issueId: `issue-${id}`,
+    payload: {
+      body: `Body for ${id}`,
+      dedupeKey: `dedupe:${id}`,
+    },
+  };
+}
+
+function controllableRevisionProvider(): {
+  provider: WebProjectionRevisionProvider;
+  emit(revision: number): void;
+  listenerCount(): number;
+} {
+  const listeners = new Set<WebProjectionRevisionListener>();
+  return {
+    provider: {
+      source: "controllable",
+      getRevision: () => ({ source: "controllable", revision: 1, observedAt: null }),
+      subscribe: (listener) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    },
+    emit(revision: number) {
+      for (const listener of Array.from(listeners)) {
+        listener({ source: "controllable", revision, observedAt: null });
+      }
+    },
+    listenerCount() {
+      return listeners.size;
+    },
   };
 }
 
