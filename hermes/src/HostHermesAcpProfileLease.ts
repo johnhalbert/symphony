@@ -1,0 +1,359 @@
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+
+export type HostHermesAcpProfileRetention = "always" | "failed" | "never";
+export type HostHermesAcpTerminalStatus = "succeeded" | "failed" | "cancelled" | null;
+export type HostHermesAcpLeaseDisposeReason = "already_disposed" | "retained" | "deleted";
+
+export interface HostHermesAcpCommandOptions {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+}
+
+export interface HostHermesAcpCommandResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+}
+
+export type HostHermesAcpCommandRunner = (
+  file: string,
+  args: readonly string[],
+  options: HostHermesAcpCommandOptions,
+) => Promise<HostHermesAcpCommandResult>;
+
+export interface HostHermesAcpProfileNameInput {
+  workspaceKey: string;
+  issueIdentifier: string;
+  role: string;
+  phase: string;
+  runId?: string | null;
+  attempt?: number | null;
+  prefix?: string | null;
+  reservedNames?: Iterable<string>;
+}
+
+export interface HostHermesAcpProfileLeaseOptions {
+  binaryPath: string;
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  sourceProfile?: string | null;
+  profileName?: string | null;
+  nameInput?: HostHermesAcpProfileNameInput;
+  reservedProfileNames?: Iterable<string>;
+  keepProfiles?: HostHermesAcpProfileRetention;
+  runner?: HostHermesAcpCommandRunner;
+}
+
+export interface HostHermesAcpProcessCommand {
+  file: string;
+  args: readonly string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}
+
+export interface HostHermesAcpProfileLease {
+  profileName: string;
+  sourceProfile: string;
+  acpCommand: HostHermesAcpProcessCommand;
+  dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
+}
+
+export interface HostHermesAcpProfileLeaseDisposeResult {
+  profileName: string;
+  reason: HostHermesAcpLeaseDisposeReason;
+  deleted: boolean;
+}
+
+export const HOST_HERMES_ACP_PROFILE_NAME_LIMIT = 64;
+
+export const HOST_HERMES_ACP_STRIPPED_ENV_KEYS = [
+  "HERMES_HOME",
+  "HERMES_AUTH_HOME",
+  "HERMES_PYTHON_SRC_ROOT",
+  "PYTHONPATH",
+  "HERMES_MODEL",
+  "HERMES_TUI_PROVIDER",
+] as const;
+
+const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_PROFILE_PREFIX = "symphony";
+const DEFAULT_RESERVED_PROFILE_NAMES = new Set(["default"]);
+
+export async function createHostHermesAcpProfileLease(
+  options: HostHermesAcpProfileLeaseOptions,
+): Promise<HostHermesAcpProfileLease> {
+  const binaryPath = requireNonEmpty(options.binaryPath, "Host Hermes binary path");
+  const cwd = requireNonEmpty(options.cwd, "Host Hermes ACP working directory");
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const env = hostHermesAcpCommandEnvironment(options.env ?? process.env);
+  const runner = options.runner ?? defaultHostHermesAcpCommandRunner;
+  const keepProfiles = options.keepProfiles ?? "failed";
+  const reservedProfileNames = combineReservedProfileNames(options.reservedProfileNames);
+  const profileName = resolveRequestedProfileName(options, reservedProfileNames);
+  const sourceProfile = await resolveHostHermesAcpSourceProfile({
+    binaryPath,
+    cwd,
+    env,
+    timeoutMs,
+    ...(options.sourceProfile !== undefined ? { sourceProfile: options.sourceProfile } : {}),
+    runner,
+  });
+
+  await runRequiredHostHermesAcpCommand(runner, binaryPath, buildHostHermesAcpCreateProfileArgs(profileName, sourceProfile), {
+    cwd,
+    env,
+    timeoutMs,
+  });
+
+  const acpCommand = buildHostHermesAcpLaunchCommand({ binaryPath, profileName, cwd, env });
+  let disposed = false;
+
+  return {
+    profileName,
+    sourceProfile,
+    acpCommand,
+    async dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult> {
+      if (disposed) return { profileName, reason: "already_disposed", deleted: false };
+      disposed = true;
+      if (!shouldDeleteHostHermesAcpProfile({ keepProfiles, terminalStatus })) {
+        return { profileName, reason: "retained", deleted: false };
+      }
+      await runRequiredHostHermesAcpCommand(runner, binaryPath, buildHostHermesAcpDeleteProfileArgs(profileName), {
+        cwd,
+        env,
+        timeoutMs,
+      });
+      return { profileName, reason: "deleted", deleted: true };
+    },
+  };
+}
+
+export function buildHostHermesAcpProfileName(input: HostHermesAcpProfileNameInput): string {
+  const reservedNames = combineReservedProfileNames(input.reservedNames);
+  const components = [
+    input.prefix ?? DEFAULT_PROFILE_PREFIX,
+    input.workspaceKey,
+    input.issueIdentifier,
+    input.role,
+    input.phase,
+    input.attempt === null || input.attempt === undefined ? null : `attempt-${input.attempt}`,
+    input.runId ?? null,
+  ];
+  const rawName = components.filter((component): component is string => typeof component === "string" && component.trim().length > 0).join("-");
+  return normalizeHostHermesAcpProfileName(rawName, { reservedNames, hashSeed: JSON.stringify(components) });
+}
+
+export function normalizeHostHermesAcpProfileName(
+  value: string,
+  options: { reservedNames?: Iterable<string>; hashSeed?: string | null } = {},
+): string {
+  const reservedNames = combineReservedProfileNames(options.reservedNames);
+  const hashSeed = options.hashSeed ?? value;
+  const hash = createHash("sha256").update(hashSeed).digest("hex").slice(0, 10);
+  const normalized = slugifyHostHermesProfileName(value);
+  const base = normalized.length > 0 ? normalized : DEFAULT_PROFILE_PREFIX;
+  let candidate = withStableHash(base, hash);
+  if (isReservedHostHermesProfileName(candidate, reservedNames)) {
+    candidate = withStableHash(`${DEFAULT_PROFILE_PREFIX}-${candidate}`, hash);
+  }
+  if (isReservedHostHermesProfileName(candidate, reservedNames)) {
+    candidate = withStableHash(`${DEFAULT_PROFILE_PREFIX}-acp-${hash}`, hash);
+  }
+  return candidate;
+}
+
+export function buildHostHermesAcpCreateProfileArgs(profileName: string, sourceProfile: string): readonly string[] {
+  return ["profile", "create", profileName, "--clone", "--clone-from", sourceProfile, "--no-alias"];
+}
+
+export function buildHostHermesAcpLaunchArgs(profileName: string): readonly string[] {
+  return ["-p", profileName, "acp"];
+}
+
+export function buildHostHermesAcpDeleteProfileArgs(profileName: string): readonly string[] {
+  return ["profile", "delete", profileName, "--yes"];
+}
+
+export function buildHostHermesAcpLaunchCommand(input: {
+  binaryPath: string;
+  profileName: string;
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+}): HostHermesAcpProcessCommand {
+  return {
+    file: input.binaryPath,
+    args: buildHostHermesAcpLaunchArgs(input.profileName),
+    cwd: input.cwd,
+    env: hostHermesAcpCommandEnvironment(input.env ?? process.env),
+  };
+}
+
+export function hostHermesAcpCommandEnvironment(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  for (const key of HOST_HERMES_ACP_STRIPPED_ENV_KEYS) {
+    deleteCaseInsensitiveEnvKey(env, key);
+  }
+  return env;
+}
+
+export async function resolveHostHermesAcpSourceProfile(input: {
+  binaryPath: string;
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  sourceProfile?: string | null;
+  runner?: HostHermesAcpCommandRunner;
+}): Promise<string> {
+  const configured = normalizeOptionalString(input.sourceProfile);
+  if (configured) return configured;
+
+  const env = hostHermesAcpCommandEnvironment(input.env ?? process.env);
+  const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const runner = input.runner ?? defaultHostHermesAcpCommandRunner;
+  const probe = await runRequiredHostHermesAcpCommand(runner, input.binaryPath, ["profile"], {
+    cwd: input.cwd,
+    env,
+    timeoutMs,
+  });
+  const activeProfile = parseHostHermesAcpActiveProfile(`${probe.stdout}\n${probe.stderr}`);
+  if (!activeProfile) {
+    throw new Error("Host Hermes active profile probe did not include an `Active profile:` line.");
+  }
+  return activeProfile;
+}
+
+export function parseHostHermesAcpActiveProfile(output: string): string | null {
+  const sanitized = stripAnsi(output).replace(/\r/g, "");
+  const match = sanitized.match(/^\s*Active profile:\s*([^\s]+)\s*$/im);
+  return normalizeOptionalString(match?.[1]) ?? null;
+}
+
+export function shouldDeleteHostHermesAcpProfile(input: {
+  keepProfiles: HostHermesAcpProfileRetention;
+  terminalStatus: HostHermesAcpTerminalStatus;
+}): boolean {
+  if (input.keepProfiles === "always") return false;
+  if (input.keepProfiles === "failed" && input.terminalStatus === "failed") return false;
+  return true;
+}
+
+async function runRequiredHostHermesAcpCommand(
+  runner: HostHermesAcpCommandRunner,
+  file: string,
+  args: readonly string[],
+  options: HostHermesAcpCommandOptions,
+): Promise<HostHermesAcpCommandResult> {
+  let result: HostHermesAcpCommandResult;
+  try {
+    result = await runner(file, args, options);
+  } catch (error) {
+    throw new Error(`Host Hermes command failed: ${file} ${args.join(" ")}: ${errorMessage(error)}`);
+  }
+  const exitCode = result.exitCode ?? 0;
+  if (exitCode !== 0) {
+    const output = [result.stdout, result.stderr].map((part) => part.trim()).filter((part) => part.length > 0).join("\n");
+    throw new Error(
+      `Host Hermes command failed with exit code ${exitCode}: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`,
+    );
+  }
+  return { ...result, exitCode };
+}
+
+function defaultHostHermesAcpCommandRunner(
+  file: string,
+  args: readonly string[],
+  options: HostHermesAcpCommandOptions,
+): Promise<HostHermesAcpCommandResult> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      file,
+      [...args],
+      { cwd: options.cwd, env: options.env, timeout: options.timeoutMs, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) {
+          Object.assign(error, { stdout, stderr });
+          reject(error);
+          return;
+        }
+        resolve({ stdout: commandOutputToString(stdout), stderr: commandOutputToString(stderr), exitCode: 0 });
+      },
+    );
+  });
+}
+
+function resolveRequestedProfileName(options: HostHermesAcpProfileLeaseOptions, reservedProfileNames: ReadonlySet<string>): string {
+  const explicit = normalizeOptionalString(options.profileName);
+  if (explicit) return normalizeHostHermesAcpProfileName(explicit, { reservedNames: reservedProfileNames });
+  if (options.nameInput) {
+    return buildHostHermesAcpProfileName({ ...options.nameInput, reservedNames: reservedProfileNames });
+  }
+  throw new Error("Host Hermes ACP profile lease requires either profileName or nameInput.");
+}
+
+function combineReservedProfileNames(extra: Iterable<string> | undefined): ReadonlySet<string> {
+  const names = new Set(DEFAULT_RESERVED_PROFILE_NAMES);
+  for (const name of extra ?? []) {
+    const normalized = slugifyHostHermesProfileName(name);
+    if (normalized) names.add(normalized);
+  }
+  return names;
+}
+
+function isReservedHostHermesProfileName(profileName: string, reservedNames: ReadonlySet<string>): boolean {
+  return reservedNames.has(profileName.toLowerCase());
+}
+
+function slugifyHostHermesProfileName(value: string): string {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/[-_]{2,}/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  if (/^[a-z0-9]/.test(slug)) return slug;
+  return slug.length > 0 ? `${DEFAULT_PROFILE_PREFIX}-${slug}` : "";
+}
+
+function withStableHash(base: string, hash: string): string {
+  const suffix = `-${hash}`;
+  if (base.endsWith(suffix) && base.length <= HOST_HERMES_ACP_PROFILE_NAME_LIMIT) return base;
+  const full = `${base}${suffix}`;
+  if (full.length <= HOST_HERMES_ACP_PROFILE_NAME_LIMIT) return full;
+  const prefixLength = HOST_HERMES_ACP_PROFILE_NAME_LIMIT - suffix.length;
+  const prefix = (base.slice(0, prefixLength).replace(/[-_]+$/g, "") || DEFAULT_PROFILE_PREFIX).slice(0, prefixLength);
+  return `${prefix}${suffix}`;
+}
+
+function deleteCaseInsensitiveEnvKey(env: NodeJS.ProcessEnv, key: string): void {
+  const lowerKey = key.toLowerCase();
+  for (const candidateKey of Object.keys(env)) {
+    if (candidateKey.toLowerCase() === lowerKey) delete env[candidateKey];
+  }
+}
+
+function normalizeOptionalString(value: string | null | undefined): string | null {
+  const normalized = value?.trim() ?? "";
+  return normalized.length > 0 ? normalized : null;
+}
+
+function requireNonEmpty(value: string, label: string): string {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) throw new Error(`${label} is required.`);
+  return normalized;
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+function commandOutputToString(value: string | Buffer): string {
+  return typeof value === "string" ? value : value.toString("utf8");
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
