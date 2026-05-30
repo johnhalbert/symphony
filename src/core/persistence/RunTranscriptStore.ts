@@ -428,6 +428,14 @@ export class FileRunTranscriptStore {
     return { runId, offset, limit, nextOffset, events };
   }
 
+  async readTranscriptTail(runId: string, options: { limit?: number } = {}): Promise<TranscriptPage> {
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 1_000);
+    const total = await this.readTranscriptEventCount(runId);
+    const events = (await readJsonlTailPage<TranscriptEvent>(this.eventsPath(runId), limit)).map(projectTranscriptEventForPublicRead);
+    const offset = Math.max(0, total - events.length);
+    return { runId, offset, limit, nextOffset: null, events };
+  }
+
   async readTranscriptEventCount(runId: string): Promise<number> {
     const record = await this.getRun(runId);
     if (typeof record?.transcriptEventCount === "number") return record.transcriptEventCount;
@@ -699,6 +707,55 @@ async function readJsonlPage<T>(filePath: string, offset: number, limit: number)
     throw error;
   }
   return events;
+}
+
+async function readJsonlTailPage<T>(filePath: string, limit: number): Promise<T[]> {
+  if (limit <= 0) return [];
+  const chunkSize = 64 * 1024;
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    handle = await fs.open(filePath, "r");
+    const stat = await handle.stat();
+    let position = stat.size;
+    let pendingPrefix = Buffer.alloc(0);
+    let lines: Buffer[] = [];
+
+    while (position > 0 && lines.length < limit) {
+      const readLength = Math.min(chunkSize, position);
+      position -= readLength;
+      const buffer = Buffer.allocUnsafe(readLength);
+      const { bytesRead } = await handle.read(buffer, 0, readLength, position);
+      const combined = Buffer.concat([buffer.subarray(0, bytesRead), pendingPrefix]);
+      const completeLines: Buffer[] = [];
+      let lineEnd = combined.length;
+      for (let index = combined.length - 1; index >= 0; index -= 1) {
+        if (combined[index] === 0x0a) {
+          const line = trimJsonlCarriageReturn(combined.subarray(index + 1, lineEnd));
+          if (line.length > 0) completeLines.unshift(line);
+          lineEnd = index;
+        }
+      }
+      pendingPrefix = combined.subarray(0, lineEnd);
+      if (completeLines.length > 0) {
+        lines = [...completeLines, ...lines].slice(-limit);
+      }
+    }
+
+    if (position === 0 && pendingPrefix.length > 0 && lines.length < limit) {
+      lines = [trimJsonlCarriageReturn(pendingPrefix), ...lines].slice(-limit);
+    }
+
+    return lines.slice(-limit).map((line) => JSON.parse(line.toString("utf8")) as T);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function trimJsonlCarriageReturn(line: Buffer): Buffer {
+  return line.at(-1) === 0x0d ? line.subarray(0, -1) : line;
 }
 
 async function countJsonlLines(filePath: string): Promise<number> {

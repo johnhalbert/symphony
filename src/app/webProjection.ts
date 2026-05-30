@@ -633,6 +633,8 @@ export function projectWebIssueDetail(
   requestKey: string,
 ): WebIssueDetailModel | null {
   if (!input) return null;
+  const transcriptEvents = Array.isArray(input.transcript) ? input.transcript : (input.transcript?.events ?? []);
+  const includeRunPrelude = transcriptEvents.length > 0;
   return {
     issue: projectIssueModel(input.boardCard ?? input.issueDetails, {
       requestKey,
@@ -642,7 +644,10 @@ export function projectWebIssueDetail(
     }),
     activity: projectActivityModels(input.activity ?? null),
     runs: (input.runs ?? []).map(projectSessionModel),
-    transcript: projectTranscriptMessages(input.transcript ?? null, { run: input.latestRun ?? null }),
+    transcript: projectTranscriptMessages(input.transcript ?? null, {
+      run: input.latestRun ?? null,
+      includeRunPrelude,
+    }),
   };
 }
 
