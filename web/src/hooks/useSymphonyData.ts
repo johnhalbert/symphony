@@ -3,19 +3,23 @@ import { useDataSource } from "../data/dataSourceContext";
 import { useAsyncResource } from "./useAsyncResource";
 import type { IssueDetailModel, Loadable, TranscriptMessage } from "../types/symphony";
 
-export function useReferenceData() {
-  const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getReferenceData(), [dataSource]), [dataSource]);
+interface SymphonyResourceOptions {
+  enabled?: boolean;
 }
 
-export function useDashboard() {
+export function useReferenceData(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getDashboard(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback(() => dataSource.getReferenceData(), [dataSource]), [dataSource], options);
 }
 
-export function useIssueBoard() {
+export function useDashboard(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getIssueBoard(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback(() => dataSource.getDashboard(), [dataSource]), [dataSource], options);
+}
+
+export function useIssueBoard(options: SymphonyResourceOptions = {}) {
+  const dataSource = useDataSource();
+  return useAsyncResource(useCallback(() => dataSource.getIssueBoard(), [dataSource]), [dataSource], options);
 }
 
 export function useIssueDetail(issueId: string | null): Loadable<IssueDetailModel | null> {
@@ -61,9 +65,9 @@ export function useIssueDetail(issueId: string | null): Loadable<IssueDetailMode
   return { data: state.data, loading: state.loading, error: state.error };
 }
 
-export function useHistory() {
+export function useHistory(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getHistory(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback(() => dataSource.getHistory(), [dataSource]), [dataSource], options);
 }
 
 export function useTranscript(sessionId: string | null): Loadable<TranscriptMessage[]> {
@@ -109,12 +113,12 @@ export function useTranscript(sessionId: string | null): Loadable<TranscriptMess
   return { data: state.data, loading: state.loading, error: state.error };
 }
 
-export function useSidebar() {
+export function useSidebar(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getSidebar(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback(() => dataSource.getSidebar(), [dataSource]), [dataSource], options);
 }
 
-export function useOrchestratorChat() {
+export function useOrchestratorChat(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getOrchestratorChat(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback(() => dataSource.getOrchestratorChat(), [dataSource]), [dataSource], options);
 }

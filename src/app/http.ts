@@ -62,6 +62,12 @@ import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import { projectWebHistory } from "./WebHistoryProjection.js";
 import { projectWebTranscript } from "./WebTranscriptProjection.js";
+import {
+  buildWebProjectionSourceIndex,
+  defaultWebProjectionIssueBoardColumns,
+  webProjectionIssueBoardFetchStates,
+  type BuiltWebProjectionSourceIndex,
+} from "./WebProjectionContext.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -909,59 +915,70 @@ export class StatusServer {
   }
 
   private async fetchIssueBoard(forceRefresh: boolean): Promise<IssueBoardResponse> {
-    return (await this.fetchIssueBoardContext(forceRefresh)).board;
-  }
-
-  private async fetchIssueBoardContext(forceRefresh: boolean): Promise<IssueBoardContext> {
-    const issueBoardColumns = this.options.issueBoardColumns ?? defaultIssueBoardColumns(this.options.trackerStateLists);
-    const trackerProjection = await this.fetchIssueBoardTrackerProjection(issueBoardColumns, forceRefresh);
-    const durableSnapshot = await loadIssueBoardDurableSnapshot(this.options.runStore, this.options.lifecycleStore);
-    const board = await buildIssueBoard(
-      this.options.orchestrator.snapshot(),
-      Boolean(this.options.openWorkspaceToken),
-      trackerProjection,
-      this.options.runStore,
-      this.options.lifecycleStore,
-      durableSnapshot,
-      this.options.trackerStateLists,
+    const { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
+    return buildIssueBoard({
+      sourceIndex,
+      mutationsConfigured: Boolean(this.options.openWorkspaceToken),
+      runStore: this.options.runStore,
+      trackerStateLists: this.options.trackerStateLists,
       issueBoardColumns,
-      this.options.staleThresholdMs,
-    );
-    return { board, durableSnapshot };
+      staleThresholdMs: this.options.staleThresholdMs,
+      continuationSummaryAvailable: Boolean(this.options.lifecycleStore && this.options.runStore),
+    });
   }
 
   private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
-    let boardContext: IssueBoardContext | null = null;
+    const { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
+    let board: IssueBoardResponse | null = null;
     let trackerFailure: SymphonyError | null = null;
-    try {
-      boardContext = await this.fetchIssueBoardContext(forceRefresh);
-    } catch (error) {
-      if (error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")) {
-        trackerFailure = error;
-      } else {
-        throw error;
-      }
+    if (sourceIndex.trackerIssues.error) {
+      trackerFailure = trackerFailureFromSourceIndex(sourceIndex);
+    } else {
+      board = await buildIssueBoard({
+        sourceIndex,
+        mutationsConfigured: Boolean(this.options.openWorkspaceToken),
+        runStore: this.options.runStore,
+        trackerStateLists: this.options.trackerStateLists,
+        issueBoardColumns,
+        staleThresholdMs: this.options.staleThresholdMs,
+        continuationSummaryAvailable: Boolean(this.options.lifecycleStore && this.options.runStore),
+      });
     }
 
-    const board = boardContext?.board ?? null;
-    const durableSnapshot =
-      boardContext?.durableSnapshot ?? (await loadIssueBoardDurableSnapshot(this.options.runStore, this.options.lifecycleStore));
     const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [issueId])) ?? null;
     const detail = await buildBoardIssueDetail({
       requestKey: issueId,
       card,
-      snapshot: this.options.orchestrator.snapshot(),
+      sourceIndex,
       mutationsConfigured: Boolean(this.options.openWorkspaceToken),
       runStore: this.options.runStore,
-      lifecycleStore: this.options.lifecycleStore,
-      durableSnapshot,
       mcpExposureDiagnosticsStore: this.options.mcpExposureDiagnosticsStore,
       trackerStateLists: this.options.trackerStateLists,
       staleThresholdMs: this.options.staleThresholdMs,
+      continuationSummaryAvailable: Boolean(this.options.lifecycleStore && this.options.runStore),
     });
     if (detail) return detail;
     if (trackerFailure) throw trackerFailure;
     throw new SymphonyError("not_found", `Board issue not found: ${issueId}`);
+  }
+
+  private async fetchWebProjectionSourceIndex(forceRefresh: boolean): Promise<{
+    sourceIndex: BuiltWebProjectionSourceIndex;
+    issueBoardColumns: IssueBoardColumnMapping;
+  }> {
+    const issueBoardColumns = this.options.issueBoardColumns ?? defaultWebProjectionIssueBoardColumns(this.options.trackerStateLists);
+    const sourceIndex = await buildWebProjectionSourceIndex({
+      snapshot: this.options.orchestrator.snapshot(),
+      issueBoardColumns,
+      ...(this.options.tracker
+        ? { fetchTrackerProjection: ({ columns, forceRefresh }) => this.fetchIssueBoardTrackerProjection(columns, forceRefresh) }
+        : {}),
+      forceRefresh,
+      ...(this.options.runStore ? { runStore: this.options.runStore } : {}),
+      ...(this.options.lifecycleStore ? { lifecycleStore: this.options.lifecycleStore } : {}),
+      ...(this.options.writebackOutbox ? { writebackOutbox: this.options.writebackOutbox } : {}),
+    });
+    return { sourceIndex, issueBoardColumns };
   }
 
   private async fetchIssueBoardTrackerProjection(
@@ -973,7 +990,7 @@ export class StatusServer {
       throw new SymphonyError("tracker_unavailable", "Issue board requires a configured tracker client");
     }
 
-    const fetchedStates = boardFetchStates(columns);
+    const fetchedStates = webProjectionIssueBoardFetchStates(columns);
     const cacheKey = fetchedStates.map((state) => state.toLowerCase()).join("\0");
     const now = Date.now();
     const cached = this.issueBoardTrackerCache;
@@ -1488,13 +1505,6 @@ interface IssueBoardTrackerCache {
   projection: IssueBoardTrackerProjection;
 }
 
-interface IssueBoardDurableSnapshot {
-  workspacesByKey: Map<string, WorkspaceRecord>;
-  runsByIssueKey: Map<string, RunRecord[]>;
-  lifecycles: IssueLifecycleRecord[];
-  lifecyclesByKey: Map<string, IssueLifecycleRecord>;
-}
-
 interface ActivityQuery {
   issue: string | null;
   offset: number;
@@ -1574,50 +1584,48 @@ interface IssueBoardLane {
   issues: IssueBoardCard[];
 }
 
-async function buildIssueBoard(
-  snapshot: RuntimeSnapshot,
-  mutationsConfigured: boolean,
-  trackerProjection: IssueBoardTrackerProjection,
-  runStore: RunTranscriptStore | undefined,
-  lifecycleStore: IssueLifecycleStore | undefined,
-  durableSnapshot: IssueBoardDurableSnapshot,
-  trackerStateLists: TrackerStateLists,
-  issueBoardColumns: IssueBoardColumnMapping,
-  staleThresholdMs: number,
-) {
+async function buildIssueBoard(input: {
+  sourceIndex: BuiltWebProjectionSourceIndex;
+  mutationsConfigured: boolean;
+  runStore: RunTranscriptStore | undefined;
+  trackerStateLists: TrackerStateLists;
+  issueBoardColumns: IssueBoardColumnMapping;
+  staleThresholdMs: number;
+  continuationSummaryAvailable: boolean;
+}) {
+  if (input.sourceIndex.trackerIssues.error) throw trackerFailureFromSourceIndex(input.sourceIndex);
+  const snapshot = input.sourceIndex.runtime.snapshot;
   const representedKeys = new Set<string>();
   const cards: IssueBoardCard[] = [];
-  for (const issue of trackerProjection.trackerIssues) {
+  for (const issue of input.sourceIndex.trackerIssues.issues) {
     addBoardKeys(representedKeys, [issue.id, issue.identifier]);
     cards.push(
       await buildTrackerBoardCard({
         issue,
-        snapshot,
-        mutationsConfigured,
-        runStore,
-        lifecycleStore,
-        durableSnapshot,
-        trackerStateLists,
-        issueBoardColumns,
-        staleThresholdMs,
+        sourceIndex: input.sourceIndex,
+        mutationsConfigured: input.mutationsConfigured,
+        runStore: input.runStore,
+        trackerStateLists: input.trackerStateLists,
+        issueBoardColumns: input.issueBoardColumns,
+        staleThresholdMs: input.staleThresholdMs,
+        continuationSummaryAvailable: input.continuationSummaryAvailable,
       }),
     );
   }
 
   const symphonyOnlyCards = await buildSymphonyOnlyBoardCards({
-    snapshot,
-    mutationsConfigured,
-    runStore,
-    lifecycleStore,
-    durableSnapshot,
-    trackerStateLists,
-    issueBoardColumns,
-    staleThresholdMs,
+    sourceIndex: input.sourceIndex,
+    mutationsConfigured: input.mutationsConfigured,
+    runStore: input.runStore,
+    trackerStateLists: input.trackerStateLists,
+    issueBoardColumns: input.issueBoardColumns,
+    staleThresholdMs: input.staleThresholdMs,
+    continuationSummaryAvailable: input.continuationSummaryAvailable,
     representedKeys,
   });
   cards.push(...symphonyOnlyCards);
 
-  const lanes = boardLanes(issueBoardColumns).map((lane) => ({
+  const lanes = boardLanes(input.issueBoardColumns).map((lane) => ({
     ...lane,
     issues: cards.filter((card) => card.lane === lane.id),
   }));
@@ -1626,10 +1634,10 @@ async function buildIssueBoard(
     generatedAt: snapshot.generatedAt,
     tracker: {
       status: "ok" as const,
-      fetchedStates: trackerProjection.fetchedStates,
-      fetchedAt: trackerProjection.fetchedAt,
-      cached: trackerProjection.cached,
-      issueCount: trackerProjection.trackerIssues.length,
+      fetchedStates: input.sourceIndex.trackerIssues.fetchedStates,
+      fetchedAt: input.sourceIndex.trackerIssues.fetchedAt,
+      cached: input.sourceIndex.trackerIssues.cached,
+      issueCount: input.sourceIndex.trackerIssues.issues.length,
       error: null,
     },
     lanes,
@@ -1647,9 +1655,10 @@ async function buildIssueBoard(
 
 type IssueBoardResponse = Awaited<ReturnType<typeof buildIssueBoard>>;
 
-interface IssueBoardContext {
-  board: IssueBoardResponse;
-  durableSnapshot: IssueBoardDurableSnapshot;
+function trackerFailureFromSourceIndex(sourceIndex: BuiltWebProjectionSourceIndex): SymphonyError {
+  const failure = sourceIndex.trackerIssues.error;
+  if (!failure) return new SymphonyError("tracker_error", "Issue board tracker fetch failed");
+  return new SymphonyError(failure.code === "tracker_unavailable" ? "tracker_unavailable" : "tracker_error", failure.message);
 }
 
 function acceptedBoardResponse(board: IssueBoardResponse) {
@@ -1683,38 +1692,38 @@ function acceptedBoardCard(card: IssueBoardCard): IssueBoardCard {
 async function buildBoardIssueDetail(input: {
   requestKey: string;
   card: IssueBoardCard | null;
-  snapshot: RuntimeSnapshot;
+  sourceIndex: BuiltWebProjectionSourceIndex;
   mutationsConfigured: boolean;
   runStore: RunTranscriptStore | undefined;
-  lifecycleStore: IssueLifecycleStore | undefined;
-  durableSnapshot: IssueBoardDurableSnapshot;
   mcpExposureDiagnosticsStore: FileMcpExposureDiagnosticsStore | undefined;
   trackerStateLists: TrackerStateLists;
   staleThresholdMs: number;
+  continuationSummaryAvailable: boolean;
 }) {
+  const snapshot = input.sourceIndex.runtime.snapshot;
   const keys = input.card ? boardCardKeys(input.card) : [input.requestKey];
-  const live = liveIssueByKeys(input.snapshot, keys);
-  const workspace = workspaceByKeysFromDurableSnapshot(input.durableSnapshot, keys);
-  const latestRun = latestRunByKeysFromDurableSnapshot(input.durableSnapshot, keys);
-  const rawLifecycle = lifecycleByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+  const live = liveIssueByKeys(input.sourceIndex, keys);
+  const workspace = workspaceByKeys(input.sourceIndex, keys);
+  const latestRun = latestRunByKeys(input.sourceIndex, keys);
+  const rawLifecycle = lifecycleByKeys(input.sourceIndex, keys);
   const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
   if (!input.card && !live && !workspace && !latestRun && !lifecycle) return null;
 
   const issueKey = input.card?.issueIdentifier ?? input.card?.issueId ?? input.requestKey;
-  const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
-  const runs = runsByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+  const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore, input.sourceIndex.runs);
+  const runs = runsByKeys(input.sourceIndex, keys);
   const enrichedRuns = await Promise.all(
     runs.map(async (run) => ({
       ...publicRunRecord(run),
-      operatorLiveness: await runOperatorLiveness(run, input.snapshot, lifecycle, runs, input.runStore),
-      livenessSummary: runLivenessSummary(run, input.snapshot, lifecycle, runs),
+      operatorLiveness: await runOperatorLiveness(run, snapshot, lifecycle, runs, input.runStore),
+      livenessSummary: runLivenessSummary(run, snapshot, lifecycle, runs),
     })),
   );
   const issueDetails =
     input.card?.issueDetails ??
     buildIssueDetailsEnvelope({
       requestKey: input.requestKey,
-      generatedAt: input.snapshot.generatedAt,
+      generatedAt: snapshot.generatedAt,
       trackerStateLists: input.trackerStateLists,
       staleThresholdMs: input.staleThresholdMs,
       live,
@@ -1724,8 +1733,8 @@ async function buildBoardIssueDetail(input: {
       lifecycle,
     });
   const allKeys = issueKeys(issueKey, { live, latestRun, lifecycle });
-  const paused = isIssuePaused(input.snapshot, [input.requestKey, ...keys, ...allKeys]);
-  const resolvedAgentId = live ? await resolveRunningAgentId(live, input.runStore) : null;
+  const paused = isIssuePaused(snapshot, [input.requestKey, ...keys, ...allKeys]);
+  const resolvedAgentId = live ? await resolveRunningAgentId(live, input.runStore, input.sourceIndex.runs) : null;
   const operatorLiveness = await issueOperatorLiveness({
     live,
     latestRun,
@@ -1738,7 +1747,7 @@ async function buildBoardIssueDetail(input: {
   const affordances = operatorAffordances({
     issueKey,
     lifecycle,
-    continuationSummaryAvailable: Boolean(input.lifecycleStore && input.runStore),
+    continuationSummaryAvailable: input.continuationSummaryAvailable,
     mutationsRequireToken: controls.mutationsRequireToken,
   });
   const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
@@ -2017,30 +2026,30 @@ function kindRank(kind: ActivityItem["kind"]): number {
 
 async function buildTrackerBoardCard(input: {
   issue: Issue;
-  snapshot: RuntimeSnapshot;
+  sourceIndex: BuiltWebProjectionSourceIndex;
   mutationsConfigured: boolean;
   runStore: RunTranscriptStore | undefined;
-  lifecycleStore: IssueLifecycleStore | undefined;
-  durableSnapshot: IssueBoardDurableSnapshot;
   trackerStateLists: TrackerStateLists;
   issueBoardColumns: IssueBoardColumnMapping;
   staleThresholdMs: number;
+  continuationSummaryAvailable: boolean;
 }): Promise<IssueBoardCard> {
+  const snapshot = input.sourceIndex.runtime.snapshot;
   const issueStatus = toIssueStatusView(input.issue);
   const keys = [input.issue.id, input.issue.identifier];
-  const live = liveIssueByKeys(input.snapshot, keys);
-  const workspace = workspaceByKeysFromDurableSnapshot(input.durableSnapshot, keys);
-  const latestRun = latestRunByKeysFromDurableSnapshot(input.durableSnapshot, keys);
-  const rawLifecycle = lifecycleByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+  const live = liveIssueByKeys(input.sourceIndex, keys);
+  const workspace = workspaceByKeys(input.sourceIndex, keys);
+  const latestRun = latestRunByKeys(input.sourceIndex, keys);
+  const rawLifecycle = lifecycleByKeys(input.sourceIndex, keys);
   const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
-  const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
-  const paused = isIssuePaused(input.snapshot, [
+  const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore, input.sourceIndex.runs);
+  const paused = isIssuePaused(snapshot, [
     ...keys,
     ...issueKeys(input.issue.identifier, { live, latestRun, lifecycle }),
   ]);
   const issueDetails = buildIssueDetailsEnvelope({
     requestKey: input.issue.identifier,
-    generatedAt: input.snapshot.generatedAt,
+    generatedAt: snapshot.generatedAt,
     trackerStateLists: input.trackerStateLists,
     staleThresholdMs: input.staleThresholdMs,
     live,
@@ -2062,42 +2071,43 @@ async function buildTrackerBoardCard(input: {
     paused,
     mutationsConfigured: input.mutationsConfigured,
     runStore: input.runStore,
-    continuationSummaryAvailable: Boolean(input.lifecycleStore && input.runStore),
+    runIndex: input.sourceIndex.runs,
+    continuationSummaryAvailable: input.continuationSummaryAvailable,
   });
 }
 
 async function buildSymphonyOnlyBoardCards(input: {
-  snapshot: RuntimeSnapshot;
+  sourceIndex: BuiltWebProjectionSourceIndex;
   mutationsConfigured: boolean;
   runStore: RunTranscriptStore | undefined;
-  lifecycleStore: IssueLifecycleStore | undefined;
-  durableSnapshot: IssueBoardDurableSnapshot;
   trackerStateLists: TrackerStateLists;
   issueBoardColumns: IssueBoardColumnMapping;
   staleThresholdMs: number;
+  continuationSummaryAvailable: boolean;
   representedKeys: Set<string>;
 }): Promise<IssueBoardCard[]> {
+  const snapshot = input.sourceIndex.runtime.snapshot;
   const cards: IssueBoardCard[] = [];
   const localKeys = new Set<string>();
   const maybeAdd = async (requestKey: string, forcedLive: RunningRow | null = null) => {
     if (hasBoardKey(input.representedKeys, [requestKey]) || hasBoardKey(localKeys, [requestKey])) return;
     const keys = [requestKey];
-    const live = forcedLive ?? liveIssueByKeys(input.snapshot, keys);
-    const workspace = workspaceByKeysFromDurableSnapshot(input.durableSnapshot, keys);
-    const latestRun = latestRunByKeysFromDurableSnapshot(input.durableSnapshot, keys);
-    const rawLifecycle = lifecycleByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+    const live = forcedLive ?? liveIssueByKeys(input.sourceIndex, keys);
+    const workspace = workspaceByKeys(input.sourceIndex, keys);
+    const latestRun = latestRunByKeys(input.sourceIndex, keys);
+    const rawLifecycle = lifecycleByKeys(input.sourceIndex, keys);
     const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
     const isBlocked = isLifecycleBlocked(lifecycle);
-    const isPaused = isIssuePaused(input.snapshot, [
+    const isPaused = isIssuePaused(snapshot, [
       requestKey,
       ...issueKeys(requestKey, { live, latestRun, lifecycle }),
     ]);
     if (!live && !isPaused && !isBlocked) return;
     if (!live && !isPaused && lifecycle?.phase === "terminal") return;
-    const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
+    const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore, input.sourceIndex.runs);
     const issueDetails = buildIssueDetailsEnvelope({
       requestKey,
-      generatedAt: input.snapshot.generatedAt,
+      generatedAt: snapshot.generatedAt,
       trackerStateLists: input.trackerStateLists,
       staleThresholdMs: input.staleThresholdMs,
       live,
@@ -2118,19 +2128,20 @@ async function buildSymphonyOnlyBoardCards(input: {
       paused: isPaused,
       mutationsConfigured: input.mutationsConfigured,
       runStore: input.runStore,
-      continuationSummaryAvailable: Boolean(input.lifecycleStore && input.runStore),
+      runIndex: input.sourceIndex.runs,
+      continuationSummaryAvailable: input.continuationSummaryAvailable,
     });
     addBoardKeys(localKeys, boardCardKeys(card));
     cards.push(card);
   };
 
-  for (const live of input.snapshot.running) {
+  for (const live of snapshot.running) {
     await maybeAdd(live.issueIdentifier, live);
   }
-  for (const pausedKey of input.snapshot.paused) {
+  for (const pausedKey of snapshot.paused) {
     await maybeAdd(pausedKey);
   }
-  for (const lifecycle of input.durableSnapshot.lifecycles) {
+  for (const lifecycle of input.sourceIndex.lifecycles.records) {
     if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueIdentifier);
   }
   return cards;
@@ -2148,6 +2159,7 @@ async function buildBoardCard(input: {
   paused: boolean;
   mutationsConfigured: boolean;
   runStore: RunTranscriptStore | undefined;
+  runIndex?: BuiltWebProjectionSourceIndex["runs"];
   continuationSummaryAvailable: boolean;
 }): Promise<IssueBoardCard> {
   const issueKey = input.issueDetails.issue.identifier ?? input.issueDetails.issue.id ?? input.key;
@@ -2157,7 +2169,7 @@ async function buildBoardCard(input: {
     latestRun: input.latestRun,
     lifecycle: input.lifecycle,
   });
-  const resolvedAgentId = input.live ? await resolveRunningAgentId(input.live, input.runStore) : null;
+  const resolvedAgentId = input.live ? await resolveRunningAgentId(input.live, input.runStore, input.runIndex) : null;
   const operatorLiveness = await issueOperatorLiveness({
     live: input.live,
     latestRun: input.latestRun,
@@ -2270,105 +2282,42 @@ function classifyBoardLane(
   return "backlog";
 }
 
-async function loadIssueBoardDurableSnapshot(
-  runStore: RunTranscriptStore | undefined,
-  lifecycleStore: IssueLifecycleStore | undefined,
-): Promise<IssueBoardDurableSnapshot> {
-  const [workspaces, runs, lifecycles] = await Promise.all([
-    runStore?.listWorkspaces() ?? Promise.resolve([]),
-    runStore?.listRuns() ?? Promise.resolve([]),
-    lifecycleStore?.list() ?? Promise.resolve([]),
-  ]);
-  return {
-    workspacesByKey: indexIssueBoardWorkspaces(workspaces),
-    runsByIssueKey: indexIssueBoardRuns(runs),
-    lifecycles,
-    lifecyclesByKey: indexIssueBoardLifecycles(lifecycles),
-  };
-}
-
-function indexIssueBoardWorkspaces(workspaces: WorkspaceRecord[]): Map<string, WorkspaceRecord> {
-  const byKey = new Map<string, WorkspaceRecord>();
-  for (const workspace of workspaces) {
-    byKey.set(workspace.workspaceKey, workspace);
-  }
-  for (const workspace of workspaces) {
-    setIndexIfMissing(byKey, workspace.issueId, workspace);
-    setIndexIfMissing(byKey, workspace.issueIdentifier, workspace);
-  }
-  return byKey;
-}
-
-function indexIssueBoardRuns(runs: RunRecord[]): Map<string, RunRecord[]> {
-  const byIssueKey = new Map<string, RunRecord[]>();
-  for (const run of [...runs].sort(compareRunChronology)) {
-    addIndexValue(byIssueKey, run.issueId, run);
-    addIndexValue(byIssueKey, run.issueIdentifier, run);
-  }
-  return byIssueKey;
-}
-
-function indexIssueBoardLifecycles(lifecycles: IssueLifecycleRecord[]): Map<string, IssueLifecycleRecord> {
-  const byKey = new Map<string, IssueLifecycleRecord>();
-  for (const lifecycle of lifecycles) {
-    byKey.set(lifecycle.issueId, lifecycle);
-  }
-  for (const lifecycle of lifecycles) {
-    setIndexIfMissing(byKey, lifecycle.issueIdentifier, lifecycle);
-  }
-  return byKey;
-}
-
-function setIndexIfMissing<T>(index: Map<string, T>, key: string | null | undefined, value: T): void {
-  if (!key || index.has(key)) return;
-  index.set(key, value);
-}
-
-function addIndexValue<T>(index: Map<string, T[]>, key: string | null | undefined, value: T): void {
-  if (!key) return;
-  const values = index.get(key);
-  if (values) {
-    values.push(value);
-    return;
-  }
-  index.set(key, [value]);
-}
-
-function workspaceByKeysFromDurableSnapshot(snapshot: IssueBoardDurableSnapshot, keys: string[]): WorkspaceRecord | null {
+function liveIssueByKeys(sourceIndex: BuiltWebProjectionSourceIndex, keys: string[]): RunningRow | null {
   for (const key of keys) {
-    const workspace = snapshot.workspacesByKey.get(key);
+    const live = sourceIndex.runtime.liveByIssueKey.get(key);
+    if (live) return live;
+  }
+  return null;
+}
+
+function workspaceByKeys(sourceIndex: BuiltWebProjectionSourceIndex, keys: string[]): WorkspaceRecord | null {
+  for (const key of keys) {
+    const workspace = sourceIndex.workspaces.workspaceByIssueKey.get(key);
     if (workspace) return workspace;
   }
   return null;
 }
 
-function latestRunByKeysFromDurableSnapshot(snapshot: IssueBoardDurableSnapshot, keys: string[]): RunRecord | null {
-  return runsByKeysFromDurableSnapshot(snapshot, keys).at(-1) ?? null;
+function latestRunByKeys(sourceIndex: BuiltWebProjectionSourceIndex, keys: string[]): RunRecord | null {
+  return runsByKeys(sourceIndex, keys).at(-1) ?? null;
 }
 
-function runsByKeysFromDurableSnapshot(snapshot: IssueBoardDurableSnapshot, keys: string[]): RunRecord[] {
+function runsByKeys(sourceIndex: BuiltWebProjectionSourceIndex, keys: string[]): RunRecord[] {
   const byRunId = new Map<string, RunRecord>();
   for (const key of keys) {
-    for (const run of snapshot.runsByIssueKey.get(key) ?? []) {
+    for (const run of sourceIndex.runs.runsByIssueKey.get(key) ?? []) {
       byRunId.set(run.runId, run);
     }
   }
   return [...byRunId.values()].sort(compareRunChronology);
 }
 
-function lifecycleByKeysFromDurableSnapshot(
-  snapshot: IssueBoardDurableSnapshot,
-  keys: string[],
-): IssueLifecycleRecord | null {
+function lifecycleByKeys(sourceIndex: BuiltWebProjectionSourceIndex, keys: string[]): IssueLifecycleRecord | null {
   for (const key of keys) {
-    const lifecycle = snapshot.lifecyclesByKey.get(key);
+    const lifecycle = sourceIndex.lifecycles.lifecycleByIssueKey.get(key);
     if (lifecycle) return lifecycle;
   }
   return null;
-}
-
-function liveIssueByKeys(snapshot: RuntimeSnapshot, keys: string[]): RunningRow | null {
-  return snapshot.running.find((row) => keys.includes(row.issueId) || keys.includes(row.issueIdentifier)) ?? null;
 }
 
 function addBoardKeys(target: Set<string>, keys: Array<string | null | undefined>): void {
@@ -2744,9 +2693,23 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
   };
 }
 
-async function resolveRunningAgentId(row: RunningRow, runStore?: RunTranscriptStore): Promise<string | null> {
-  if (!runStore) return null;
+async function resolveRunningAgentId(
+  row: RunningRow,
+  runStore?: RunTranscriptStore,
+  runIndex?: BuiltWebProjectionSourceIndex["runs"],
+): Promise<string | null> {
   const runId = row.liveness.activeRunId ?? row.runId;
+  if (runId && runIndex) {
+    const run = runIndex.runById.get(runId) ?? null;
+    if (runMatchesLiveRow(row, run)) return run.agentId;
+  }
+  if (runIndex) {
+    for (const issueKey of [row.issueId, row.issueIdentifier]) {
+      const run = runIndex.latestRunByIssueKey.get(issueKey) ?? null;
+      if (runMatchesLiveRow(row, run)) return run.agentId;
+    }
+  }
+  if (!runStore) return null;
   if (runId) {
     const run = await runStore.getRun(runId);
     if (runMatchesLiveRow(row, run)) return run.agentId;
@@ -3450,9 +3413,14 @@ async function resolveIssueDetailsSummaryRun(
   live: RunningRow | null,
   issueWideLatestRun: RunRecord | null | undefined,
   runStore?: RunTranscriptStore,
+  runIndex?: BuiltWebProjectionSourceIndex["runs"],
 ): Promise<RunRecord | null> {
   if (!live) return issueWideLatestRun ?? null;
   const activeRunId = live.liveness.activeRunId ?? live.runId;
+  if (activeRunId && runIndex) {
+    const activeRun = runIndex.runById.get(activeRunId) ?? null;
+    if (runMatchesLiveRow(live, activeRun)) return activeRun;
+  }
   if (activeRunId && runStore) {
     const activeRun = await runStore.getRun(activeRunId);
     if (runMatchesLiveRow(live, activeRun)) return activeRun;
