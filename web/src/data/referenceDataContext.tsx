@@ -1,7 +1,7 @@
 import { createContext, useContext, type ReactNode } from "react";
 import type { ReferenceData } from "../types/symphony";
 
-const fallbackReferenceData: ReferenceData = {
+export const fallbackReferenceData: ReferenceData = {
   users: {},
   labels: {},
 };

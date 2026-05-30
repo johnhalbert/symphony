@@ -11,8 +11,44 @@ interface ApiReferenceData {
   labels?: Record<string, ApiReferenceEntry | null> | null;
 }
 
-async function fetchJson<T>(baseUrl: string, path: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(`${baseUrl}${path}`, {
+const GET_SUCCESS_CACHE_MS = 5_000;
+
+interface CachedGetResponse {
+  data: unknown;
+  expiresAt: number;
+}
+
+function createGetJsonFetcher() {
+  const inFlight = new Map<string, Promise<unknown>>();
+  const successCache = new Map<string, CachedGetResponse>();
+
+  return async function fetchJson<T>(baseUrl: string, path: string, signal?: AbortSignal): Promise<T> {
+    const url = `${baseUrl}${path}`;
+    if (!signal) {
+      const cached = successCache.get(url);
+      if (cached && cached.expiresAt > Date.now()) return cached.data as T;
+
+      const pending = inFlight.get(url);
+      if (pending) return pending as Promise<T>;
+
+      const promise = fetchJsonOnce<T>(url).then((data) => {
+        successCache.set(url, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS });
+        return data;
+      });
+      inFlight.set(url, promise);
+      void promise.then(
+        () => inFlight.delete(url),
+        () => inFlight.delete(url),
+      );
+      return promise;
+    }
+
+    return fetchJsonOnce<T>(url, signal);
+  };
+}
+
+async function fetchJsonOnce<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(url, {
     headers: { Accept: "application/json" },
     signal,
   });
@@ -41,6 +77,7 @@ export function normalizeReferenceData(input: ApiReferenceData): ReferenceData {
 
 export function createApiDataSource(baseUrl: string): SymphonyDataSource {
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
+  const fetchJson = createGetJsonFetcher();
 
   return {
     async getReferenceData() {

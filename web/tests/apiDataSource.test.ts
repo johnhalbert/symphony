@@ -24,6 +24,18 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
   });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+const chatResponse: ChatMessage[] = [{ who: "agent", text: "Chat loaded from the API." }];
+
 const historyModel: HistoryModel = {
   sessions: [
     {
@@ -185,6 +197,83 @@ describe("API data source", () => {
     expect(fetchMock).toHaveBeenCalledWith("/status-server/api/v1/web/dashboard", {
       headers: { Accept: "application/json" },
       signal: undefined,
+    });
+  });
+
+  it("deduplicates simultaneous duplicate GET requests through one in-flight API call", async () => {
+    const gate = deferred<Response>();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockReturnValue(gate.promise);
+    const dataSource = createApiDataSource("/status-server/");
+
+    const first = dataSource.getDashboard();
+    const second = dataSource.getDashboard();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/status-server/api/v1/web/dashboard", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+
+    gate.resolve(jsonResponse(dashboardModel));
+    await expect(Promise.all([first, second])).resolves.toEqual([dashboardModel, dashboardModel]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses successful duplicate GET responses briefly before refreshing after the cache window", async () => {
+    const dateNow = vi.spyOn(Date, "now");
+    dateNow.mockReturnValue(1_000);
+    const refreshedDashboard = { ...dashboardModel, pollLabel: "poll refreshed" };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(dashboardModel))
+      .mockResolvedValueOnce(jsonResponse(refreshedDashboard));
+    const dataSource = createApiDataSource("/status-server/");
+
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    dateNow.mockReturnValue(5_999);
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    dateNow.mockReturnValue(6_001);
+    await expect(dataSource.getDashboard()).resolves.toEqual(refreshedDashboard);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache failed GET responses", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ error: "temporarily unavailable" }, { status: 503 }))
+      .mockResolvedValueOnce(jsonResponse(dashboardModel));
+    const dataSource = createApiDataSource("/status-server/");
+
+    await expect(dataSource.getDashboard()).rejects.toThrow("Symphony API returned HTTP 503");
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not deduplicate orchestrator chat POST requests", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => jsonResponse(chatResponse));
+    const dataSource = createApiDataSource("/status-server/");
+
+    await expect(dataSource.sendOrchestratorMessage("status")).resolves.toEqual(chatResponse);
+    await expect(dataSource.sendOrchestratorMessage("status")).resolves.toEqual(chatResponse);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/status-server/api/v1/web/orchestrator-chat", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ input: "status" }),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/status-server/api/v1/web/orchestrator-chat", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ input: "status" }),
     });
   });
 

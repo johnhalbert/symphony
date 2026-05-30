@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { AppChrome } from "./app/AppChrome";
+import { resolveAppResourceLoading } from "./app/resourceLoading";
 import { ThemeFrame } from "./app/ThemeFrame";
 import { AgentStateCard } from "./components/sidebar/AgentStateCard";
 import { SidebarViews } from "./components/sidebar/SidebarViews";
@@ -7,7 +8,7 @@ import { ChatHistoryView } from "./components/history/ChatHistoryView";
 import { DashboardView } from "./components/dashboard/DashboardView";
 import { IssuesView } from "./components/issues/IssuesView";
 import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
-import { ReferenceDataProvider } from "./data/referenceDataContext";
+import { fallbackReferenceData, ReferenceDataProvider } from "./data/referenceDataContext";
 import {
   useDashboard,
   useHistory,
@@ -16,7 +17,15 @@ import {
   useReferenceData as useReferenceResource,
   useSidebar,
 } from "./hooks/useSymphonyData";
-import type { AppTab, DashboardVariant, HistoryVariant, IssuesVariant, RunState, SidebarVariant } from "./types/symphony";
+import type {
+  AppTab,
+  DashboardVariant,
+  HistoryVariant,
+  IssuesVariant,
+  ReferenceData,
+  RunState,
+  SidebarVariant,
+} from "./types/symphony";
 
 export function App() {
   return (
@@ -27,6 +36,14 @@ export function App() {
 }
 
 function AppDataBoundary() {
+  const apiMode = defaultDataSourceConfig.mode === "api";
+  if (apiMode) {
+    return <AppShell initialReferenceData={fallbackReferenceData} lazyReferenceData />;
+  }
+  return <MockReferenceDataBoundary />;
+}
+
+function MockReferenceDataBoundary() {
   const reference = useReferenceResource();
   if (reference.loading && !reference.data) {
     return (
@@ -42,84 +59,91 @@ function AppDataBoundary() {
       </ThemeFrame>
     );
   }
-  return (
-    <ReferenceDataProvider value={reference.data}>
-      <AppShell />
-    </ReferenceDataProvider>
-  );
+  return <AppShell initialReferenceData={reference.data} />;
 }
 
-function AppShell() {
+function AppShell({
+  initialReferenceData,
+  lazyReferenceData = false,
+}: {
+  initialReferenceData: ReferenceData;
+  lazyReferenceData?: boolean;
+}) {
   const [activeTab, setActiveTab] = useState<AppTab>("dashboard");
   const [dashboardVariant, setDashboardVariant] = useState<DashboardVariant>("cards");
   const [issuesVariant, setIssuesVariant] = useState<IssuesVariant>("balanced");
   const [historyVariant, setHistoryVariant] = useState<HistoryVariant>("list");
   const [sidebarVariant, setSidebarVariant] = useState<SidebarVariant>("primary");
+  const apiMode = defaultDataSourceConfig.mode === "api";
+  const resourceLoading = resolveAppResourceLoading(activeTab, apiMode);
 
-  const dashboard = useDashboard();
-  const issueBoard = useIssueBoard();
-  const history = useHistory();
-  const sidebar = useSidebar();
-  const orchestratorChat = useOrchestratorChat();
+  const reference = useReferenceResource({ enabled: lazyReferenceData && resourceLoading.referenceData });
+  const referenceData = lazyReferenceData ? (reference.data ?? initialReferenceData) : initialReferenceData;
+  const dashboard = useDashboard({ enabled: resourceLoading.dashboard });
+  const issueBoard = useIssueBoard({ enabled: resourceLoading.issueBoard });
+  const history = useHistory({ enabled: resourceLoading.history });
+  const sidebar = useSidebar({ enabled: resourceLoading.sidebar });
+  const orchestratorChat = useOrchestratorChat({ enabled: resourceLoading.orchestratorChat });
   const dashboardChrome = dashboard.data;
   const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
-  const apiMode = defaultDataSourceConfig.mode === "api";
 
   return (
-    <ThemeFrame>
-      <AppChrome
-        activeTab={activeTab}
-        onTabChange={setActiveTab}
-        runningCount={apiMode ? runningCount : undefined}
-        repoLabel={apiMode ? (dashboardChrome?.repoLabel ?? "") : undefined}
-        branch={apiMode ? (dashboardChrome?.branch ?? "") : undefined}
-        pollLabel={apiMode ? (dashboardChrome?.pollLabel ?? "poll pending") : undefined}
-        agentUsageLabel={apiMode ? (dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`) : undefined}
-        dataSourceLabel={`api source · ${defaultDataSourceConfig.mode}`}
-        rightSlot={
-          <ViewControls
-            activeTab={activeTab}
-            dashboardVariant={dashboardVariant}
-            historyVariant={historyVariant}
-            issuesVariant={issuesVariant}
-            sidebarVariant={sidebarVariant}
-            onDashboardVariant={setDashboardVariant}
-            onHistoryVariant={setHistoryVariant}
-            onIssuesVariant={setIssuesVariant}
-            onSidebarVariant={setSidebarVariant}
-          />
-        }
-      >
-        {activeTab === "dashboard"
-          ? renderLoadable(dashboard, (data) => (
-              <DashboardView
-                dashboard={data}
-                variant={dashboardVariant}
-                useModelBurnupTotals={apiMode}
-                orchestratorChatReadOnly={apiMode}
-                orchestratorChat={orchestratorChat.data ?? []}
-                orchestratorChatError={orchestratorChat.error}
-                orchestratorChatLoading={orchestratorChat.loading}
-              />
-            ))
-          : null}
-        {activeTab === "issues" ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} />) : null}
-        {activeTab === "history" ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} />) : null}
-        {activeTab === "sidebar"
-          ? renderLoadable(sidebar, (data) => (
-              <SidebarViews
-                sidebar={data}
-                variant={sidebarVariant}
-                orchestratorChatReadOnly={apiMode}
-                orchestratorChat={orchestratorChat.data ?? []}
-                orchestratorChatError={orchestratorChat.error}
-                orchestratorChatLoading={orchestratorChat.loading}
-              />
-            ))
-          : null}
-        {activeTab === "states" ? renderLoadable(sidebar, (data) => <StateCardsView />) : null}
-      </AppChrome>
-    </ThemeFrame>
+    <ReferenceDataProvider value={referenceData}>
+      <ThemeFrame>
+        <AppChrome
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          runningCount={apiMode ? runningCount : undefined}
+          repoLabel={apiMode ? (dashboardChrome?.repoLabel ?? "") : undefined}
+          branch={apiMode ? (dashboardChrome?.branch ?? "") : undefined}
+          pollLabel={apiMode ? (dashboardChrome?.pollLabel ?? "poll pending") : undefined}
+          agentUsageLabel={apiMode ? (dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`) : undefined}
+          dataSourceLabel={`api source · ${defaultDataSourceConfig.mode}`}
+          rightSlot={
+            <ViewControls
+              activeTab={activeTab}
+              dashboardVariant={dashboardVariant}
+              historyVariant={historyVariant}
+              issuesVariant={issuesVariant}
+              sidebarVariant={sidebarVariant}
+              onDashboardVariant={setDashboardVariant}
+              onHistoryVariant={setHistoryVariant}
+              onIssuesVariant={setIssuesVariant}
+              onSidebarVariant={setSidebarVariant}
+            />
+          }
+        >
+          {activeTab === "dashboard"
+            ? renderLoadable(dashboard, (data) => (
+                <DashboardView
+                  dashboard={data}
+                  variant={dashboardVariant}
+                  useModelBurnupTotals={apiMode}
+                  orchestratorChatReadOnly={apiMode}
+                  orchestratorChat={orchestratorChat.data ?? []}
+                  orchestratorChatError={orchestratorChat.error}
+                  orchestratorChatLoading={orchestratorChat.loading}
+                />
+              ))
+            : null}
+          {activeTab === "issues" ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} />) : null}
+          {activeTab === "history" ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} />) : null}
+          {activeTab === "sidebar"
+            ? renderLoadable(sidebar, (data) => (
+                <SidebarViews
+                  sidebar={data}
+                  variant={sidebarVariant}
+                  orchestratorChatReadOnly={apiMode}
+                  orchestratorChat={orchestratorChat.data ?? []}
+                  orchestratorChatError={orchestratorChat.error}
+                  orchestratorChatLoading={orchestratorChat.loading}
+                />
+              ))
+            : null}
+          {activeTab === "states" ? <StateCardsView /> : null}
+        </AppChrome>
+      </ThemeFrame>
+    </ReferenceDataProvider>
   );
 }
 
