@@ -197,6 +197,54 @@ describe("HostHermesAcpProfileLease", () => {
     ]);
   });
 
+  it("keeps failed profile deletion retryable until cleanup succeeds", async () => {
+    const { calls, runner } = commandRecorder([
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "delete failed", exitCode: 23 },
+      { stdout: "", stderr: "", exitCode: 0 },
+    ]);
+
+    const lease = await createHostHermesAcpProfileLease({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      profileName: "worker-run",
+      sourceProfile: "operator",
+      keepProfiles: "never",
+      runner,
+    });
+
+    await expect(lease.dispose("succeeded")).rejects.toThrow(/delete failed/);
+    await expect(lease.dispose("succeeded")).resolves.toEqual({
+      profileName: lease.profileName,
+      reason: "deleted",
+      deleted: true,
+    });
+    await expect(lease.dispose("succeeded")).resolves.toEqual({
+      profileName: lease.profileName,
+      reason: "already_disposed",
+      deleted: false,
+    });
+    expect(calls.map((call) => call.args)).toEqual([
+      ["profile", "create", lease.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
+      ["profile", "delete", lease.profileName, "--yes"],
+      ["profile", "delete", lease.profileName, "--yes"],
+    ]);
+  });
+
+  it("treats interrupted profile create commands as failures", async () => {
+    const { runner } = commandRecorder([{ stdout: "", stderr: "terminated", exitCode: null }]);
+
+    await expect(
+      createHostHermesAcpProfileLease({
+        binaryPath: "hermes",
+        cwd: "/workspace",
+        profileName: "worker-run",
+        sourceProfile: "operator",
+        runner,
+      }),
+    ).rejects.toThrow(/without an exit code.*terminated/s);
+  });
+
   it("parses active profile output and applies retention policy boundaries", () => {
     expect(parseHostHermesAcpActiveProfile("\u001b[32mActive profile: work\u001b[0m\nPath: /tmp")).toBe("work");
     expect(parseHostHermesAcpActiveProfile("Path only")).toBeNull();

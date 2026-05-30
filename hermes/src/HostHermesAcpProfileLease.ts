@@ -117,8 +117,8 @@ export async function createHostHermesAcpProfileLease(
     acpCommand,
     async dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult> {
       if (disposed) return { profileName, reason: "already_disposed", deleted: false };
-      disposed = true;
       if (!shouldDeleteHostHermesAcpProfile({ keepProfiles, terminalStatus })) {
+        disposed = true;
         return { profileName, reason: "retained", deleted: false };
       }
       await runRequiredHostHermesAcpCommand(runner, binaryPath, buildHostHermesAcpDeleteProfileArgs(profileName), {
@@ -126,6 +126,7 @@ export async function createHostHermesAcpProfileLease(
         env,
         timeoutMs,
       });
+      disposed = true;
       return { profileName, reason: "deleted", deleted: true };
     },
   };
@@ -250,11 +251,16 @@ async function runRequiredHostHermesAcpCommand(
   try {
     result = await runner(file, args, options);
   } catch (error) {
-    throw new Error(`Host Hermes command failed: ${file} ${args.join(" ")}: ${errorMessage(error)}`);
+    const output = commandFailureOutput(commandErrorOutput(error, "stdout"), commandErrorOutput(error, "stderr"));
+    throw new Error(`Host Hermes command failed: ${file} ${args.join(" ")}: ${errorMessage(error)}${output ? `\n${output}` : ""}`);
   }
-  const exitCode = result.exitCode ?? 0;
+  if (result.exitCode === null) {
+    const output = commandFailureOutput(result.stdout, result.stderr);
+    throw new Error(`Host Hermes command ended without an exit code: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`);
+  }
+  const exitCode = result.exitCode;
   if (exitCode !== 0) {
-    const output = [result.stdout, result.stderr].map((part) => part.trim()).filter((part) => part.length > 0).join("\n");
+    const output = commandFailureOutput(result.stdout, result.stderr);
     throw new Error(
       `Host Hermes command failed with exit code ${exitCode}: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`,
     );
@@ -273,12 +279,23 @@ function defaultHostHermesAcpCommandRunner(
       [...args],
       { cwd: options.cwd, env: options.env, timeout: options.timeoutMs, windowsHide: true },
       (error, stdout, stderr) => {
+        const stdoutText = commandOutputToString(stdout);
+        const stderrText = commandOutputToString(stderr);
         if (error) {
-          Object.assign(error, { stdout, stderr });
+          const commandError = error as NodeJS.ErrnoException & { killed?: boolean; signal?: NodeJS.Signals | string | null };
+          if (typeof commandError.code === "number") {
+            resolve({ stdout: stdoutText, stderr: stderrText, exitCode: commandError.code });
+            return;
+          }
+          if (commandError.killed || commandError.signal) {
+            resolve({ stdout: stdoutText, stderr: stderrText, exitCode: null });
+            return;
+          }
+          Object.assign(error, { stdout: stdoutText, stderr: stderrText });
           reject(error);
           return;
         }
-        resolve({ stdout: commandOutputToString(stdout), stderr: commandOutputToString(stderr), exitCode: 0 });
+        resolve({ stdout: stdoutText, stderr: stderrText, exitCode: 0 });
       },
     );
   });
@@ -351,6 +368,21 @@ function stripAnsi(value: string): string {
 
 function commandOutputToString(value: string | Buffer): string {
   return typeof value === "string" ? value : value.toString("utf8");
+}
+
+function commandFailureOutput(stdout: string, stderr: string): string {
+  return [stdout, stderr]
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .join("\n");
+}
+
+function commandErrorOutput(error: unknown, key: "stdout" | "stderr"): string {
+  if (!error || typeof error !== "object") return "";
+  const value = (error as Record<string, unknown>)[key];
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  return "";
 }
 
 function errorMessage(error: unknown): string {
