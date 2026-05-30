@@ -110,6 +110,7 @@ server:
   host: 127.0.0.1
   port: 7331
   open_workspace_token: $SYMPHONY_WORKSPACE_TOKEN
+  web_assets_root: ./web/dist
 
 writeback:
   enabled: true
