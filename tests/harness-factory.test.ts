@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CursorHarness } from "../cursor/src/CursorHarness.js";
+import { HermesAcpHarness } from "../hermes/src/HermesAcpHarness.js";
 import { HermesHarness } from "../hermes/src/HermesHarness.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { createAgentHarness } from "../src/core/harness/HarnessFactory.js";
@@ -12,6 +13,13 @@ describe("createAgentHarness", () => {
 
   it("creates the Hermes harness from the built-in registry", () => {
     expect(createAgentHarness(config("hermes"))).toBeInstanceOf(HermesHarness);
+  });
+
+  it("creates the host Hermes ACP harness from the built-in registry", () => {
+    const serviceConfig = config("hermes_acp");
+
+    expect(serviceConfig.hermesAcp.workerSessionLifecycle).toBe("fresh_per_run");
+    expect(createAgentHarness(serviceConfig)).toBeInstanceOf(HermesAcpHarness);
   });
 
   it("parses unknown harness ids but fails clearly when no provider is registered", () => {

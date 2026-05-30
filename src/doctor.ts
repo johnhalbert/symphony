@@ -226,12 +226,26 @@ export function runtimeHarnessDoctorChecks(config: ServiceConfig): DoctorCheck[]
   ];
   if (config.agent.harness === "cursor") return [...checks, ...cursorPolicyDoctorChecks(config)];
   if (config.agent.harness === "hermes") return [...checks, ...hermesRuntimeDoctorChecks(config)];
+  if (config.agent.harness === "hermes_acp") return [...checks, ...hermesAcpRuntimeDoctorChecks(config)];
   return [
     ...checks,
     {
       id: "runtime.provider_checks",
       status: "warn",
       message: `No provider-specific doctor checks are registered for runtime harness ${config.agent.harness}`,
+    },
+  ];
+}
+
+export function hermesAcpRuntimeDoctorChecks(config: ServiceConfig): DoctorCheck[] {
+  return [
+    {
+      id: "hermes_acp.runtime",
+      status: "ok",
+      message:
+        `Host Hermes ACP binary is ${config.hermesAcp.binaryPath ?? "auto-discovered"}; ` +
+        `source profile is ${config.hermesAcp.sourceProfile ?? "active host profile"}; ` +
+        `worker lifecycle is ${config.hermesAcp.workerSessionLifecycle}; profile retention is ${config.hermesAcp.keepProfiles}`,
     },
   ];
 }
@@ -833,6 +847,7 @@ function githubCredentialAccessDescription(
 export function runtimeCredentialDoctorCheck(config: ServiceConfig): DoctorCheck {
   if (config.agent.harness === "cursor") return cursorRuntimeDoctorCheck(config);
   if (config.agent.harness === "hermes") return hermesRuntimeCredentialDoctorCheck(config);
+  if (config.agent.harness === "hermes_acp") return hermesAcpRuntimeCredentialDoctorCheck(config);
   return {
     id: "env.runtime",
     status: "warn",
@@ -854,6 +869,14 @@ function cursorRuntimeDoctorCheck(config: ServiceConfig): DoctorCheck {
   } catch (error) {
     return { id: "env.cursor", status: "error", message: `runtime.cursor: ${errorMessage(error)}` };
   }
+}
+
+function hermesAcpRuntimeCredentialDoctorCheck(config: ServiceConfig): DoctorCheck {
+  return {
+    id: "env.hermes_acp",
+    status: "ok",
+    message: `Host Hermes ACP uses cloned host profile credentials from ${config.hermesAcp.sourceProfile ?? "the active profile"}; no Symphony runtime API key is injected`,
+  };
 }
 
 function hermesRuntimeCredentialDoctorCheck(config: ServiceConfig): DoctorCheck {
