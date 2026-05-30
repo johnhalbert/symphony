@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
+import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type PersistedRunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
@@ -220,8 +221,17 @@ export interface CiStatusTranscriptInput extends RunMetadata {
 
 export class FileRunTranscriptStore {
   private readonly runUpdateLocks = new Map<string, Promise<void>>();
+  private readonly projectionNotifier = new ProjectionRevisionNotifier();
 
   constructor(private readonly stateDir: string) {}
+
+  projectionRevision(): number {
+    return this.projectionNotifier.currentRevision();
+  }
+
+  onProjectionChanged(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe {
+    return this.projectionNotifier.subscribe(listener);
+  }
 
   async upsertWorkspace(record: WorkspaceRecord): Promise<void> {
     await fs.mkdir(this.workspacesDir(), { recursive: true });
@@ -231,6 +241,7 @@ export class FileRunTranscriptStore {
       createdAt: existing?.createdAt ?? record.createdAt,
       updatedAt: record.updatedAt,
     });
+    this.notifyProjectionChanged("workspaces");
   }
 
   async getWorkspace(workspaceKey: string): Promise<WorkspaceRecord | null> {
@@ -238,7 +249,10 @@ export class FileRunTranscriptStore {
   }
 
   async deleteWorkspace(workspaceKey: string): Promise<void> {
+    const existing = await this.getWorkspace(workspaceKey);
+    if (!existing) return;
     await fs.rm(this.workspacePath(workspaceKey), { force: true });
+    this.notifyProjectionChanged("workspaces");
   }
 
   async listWorkspaces(): Promise<WorkspaceRecord[]> {
@@ -308,6 +322,7 @@ export class FileRunTranscriptStore {
       transcriptEventCount: existing?.transcriptEventCount ?? 0,
     };
     await this.writeRun(record);
+    this.notifyProjectionChanged("runs");
     return record;
   }
 
@@ -327,6 +342,7 @@ export class FileRunTranscriptStore {
         updatedAt: new Date().toISOString(),
       };
       await this.writeRun(updated);
+      this.notifyProjectionChanged("runs");
       return updated;
     });
   }
@@ -369,7 +385,10 @@ export class FileRunTranscriptStore {
       };
       await fs.appendFile(this.eventsPath(input.runId), `${JSON.stringify(event)}\n`, "utf8");
       const record = await this.getRun(input.runId);
-      if (record) await this.writeRun({ ...record, transcriptEventCount: count + 1, updatedAt: new Date().toISOString() });
+      if (record) {
+        await this.writeRun({ ...record, transcriptEventCount: count + 1, updatedAt: new Date().toISOString() });
+      }
+      this.notifyProjectionChanged("runs");
       return event;
     });
   }
@@ -452,8 +471,15 @@ export class FileRunTranscriptStore {
     const record = await this.getRun(runId);
     if (typeof record?.transcriptEventCount === "number") return record.transcriptEventCount;
     const count = await countJsonlLines(this.eventsPath(runId));
-    if (record) await this.writeRun({ ...record, transcriptEventCount: count });
+    if (record) {
+      await this.writeRun({ ...record, transcriptEventCount: count });
+      this.notifyProjectionChanged("runs");
+    }
     return count;
+  }
+
+  private notifyProjectionChanged(source: "runs" | "workspaces"): void {
+    this.projectionNotifier.notify(source);
   }
 
   private workspacesDir(): string {
