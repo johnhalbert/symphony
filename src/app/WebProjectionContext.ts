@@ -145,14 +145,104 @@ export interface WebProjectionBuildInput<TSourceIndex extends WebProjectionSourc
 
 export type WebProjectionBuildHook<
   TSourceIndex extends WebProjectionSourceIndex = WebProjectionSourceIndex,
-  TContext extends WebProjectionContext<TSourceIndex> = WebProjectionContext<TSourceIndex>,
+  TContext extends WebProjectionContext<TSourceIndex, object> = WebProjectionContext<TSourceIndex>,
 > = (input: WebProjectionBuildInput<TSourceIndex>) => TContext | Promise<TContext>;
 
 export interface WebProjectionAcquireOptions<
   TSourceIndex extends WebProjectionSourceIndex = WebProjectionSourceIndex,
-  TContext extends WebProjectionContext<TSourceIndex> = WebProjectionContext<TSourceIndex>,
+  TContext extends WebProjectionContext<TSourceIndex, object> = WebProjectionContext<TSourceIndex>,
 > extends WebProjectionBuildOptions {
   build?: WebProjectionBuildHook<TSourceIndex, TContext>;
+}
+
+export interface WebProjectionCacheAcquireRequest<
+  TSourceIndex extends WebProjectionSourceIndex = WebProjectionSourceIndex,
+  TContext extends WebProjectionContext<TSourceIndex, object> = WebProjectionContext<TSourceIndex>,
+> extends WebProjectionAcquireOptions<TSourceIndex, TContext> {
+  cacheKey: string;
+  sourceIndex: TSourceIndex;
+  fingerprint?: WebProjectionCacheFingerprint;
+}
+
+export interface WebProjectionCacheEntry<TContext> {
+  cacheKey: string;
+  storedAt: string;
+  context: TContext;
+}
+
+interface WebProjectionInFlightEntry<TContext> {
+  fingerprintKey: string;
+  promise: Promise<TContext>;
+}
+
+export class WebProjectionContextCache<
+  TSourceIndex extends WebProjectionSourceIndex = WebProjectionSourceIndex,
+  TContext extends WebProjectionContext<TSourceIndex, object> = WebProjectionContext<TSourceIndex>,
+> {
+  private readonly entries = new Map<string, WebProjectionCacheEntry<TContext>>();
+  private readonly inFlight = new Map<string, WebProjectionInFlightEntry<TContext>>();
+
+  get(cacheKey: string, now: Date = new Date()): TContext | null {
+    const entry = this.entries.get(cacheKey);
+    if (!entry || isWebProjectionContextExpired(entry.context, now)) return null;
+    return entry.context;
+  }
+
+  delete(cacheKey: string): boolean {
+    this.inFlight.delete(cacheKey);
+    return this.entries.delete(cacheKey);
+  }
+
+  clear(): void {
+    this.inFlight.clear();
+    this.entries.clear();
+  }
+
+  async acquire(request: WebProjectionCacheAcquireRequest<TSourceIndex, TContext>): Promise<TContext> {
+    const clock = request.clock ?? (() => new Date());
+    const now = clock();
+    const forceRefresh = shouldForceWebProjectionRefresh(request);
+    const fingerprint = request.fingerprint ?? createWebProjectionFingerprintFromSourceIndex(request.sourceIndex);
+    const fingerprintKey = webProjectionFingerprintCacheKey(fingerprint);
+    const cached = this.entries.get(request.cacheKey);
+    if (
+      cached &&
+      !forceRefresh &&
+      !isWebProjectionContextExpired(cached.context, now) &&
+      webProjectionFingerprintCacheKey(cached.context.metadata.fingerprint) === fingerprintKey
+    ) {
+      return cached.context;
+    }
+
+    const active = this.inFlight.get(request.cacheKey);
+    if (active && !forceRefresh && active.fingerprintKey === fingerprintKey) return active.promise;
+
+    const promise = this.buildContext(request, fingerprint, clock);
+    this.inFlight.set(request.cacheKey, { fingerprintKey, promise });
+    try {
+      const context = await promise;
+      if (this.inFlight.get(request.cacheKey)?.promise === promise) {
+        this.entries.set(request.cacheKey, { cacheKey: request.cacheKey, storedAt: context.metadata.builtAt, context });
+      }
+      return context;
+    } finally {
+      if (this.inFlight.get(request.cacheKey)?.promise === promise) this.inFlight.delete(request.cacheKey);
+    }
+  }
+
+  private async buildContext(
+    request: WebProjectionCacheAcquireRequest<TSourceIndex, TContext>,
+    fingerprint: WebProjectionCacheFingerprint,
+    clock: WebProjectionClock,
+  ): Promise<TContext> {
+    const metadata = createWebProjectionCacheMetadata({
+      clock,
+      ...(request.maxAgeMs !== undefined ? { maxAgeMs: request.maxAgeMs } : {}),
+      fingerprint,
+    });
+    const build = request.build ?? defaultWebProjectionBuildHook<TSourceIndex, TContext>;
+    return build({ metadata, sourceIndex: request.sourceIndex });
+  }
 }
 
 export function normalizeWebProjectionAlias(value: WebProjectionAliasValue): string | null {
@@ -243,6 +333,40 @@ export function createWebProjectionFingerprint(input: {
     issueBoardColumnKey: webProjectionAliasesFromValues(input.issueBoardColumns ?? []).join(","),
     durableSourceRevisions: [...(input.durableSourceRevisions ?? [])].sort(compareSourceRevisions),
   };
+}
+
+export function createWebProjectionFingerprintFromSourceIndex(
+  sourceIndex: Pick<WebProjectionSourceIndex, "runtime" | "trackerIssues" | "durableSourceRevisions">,
+): WebProjectionCacheFingerprint {
+  return createWebProjectionFingerprint({
+    runtimeGeneratedAt: sourceIndex.runtime.generatedAt,
+    issueBoardStates: [sourceIndex.trackerIssues.fetchedStateKey],
+    durableSourceRevisions: sourceIndex.durableSourceRevisions,
+  });
+}
+
+export function isWebProjectionContextExpired(
+  context: Pick<WebProjectionContext<WebProjectionSourceIndex, object>, "metadata">,
+  now: Date = new Date(),
+): boolean {
+  const expiresAt = context.metadata.expiresAt;
+  return expiresAt !== null && Date.parse(expiresAt) <= now.getTime();
+}
+
+export function webProjectionFingerprintCacheKey(fingerprint: WebProjectionCacheFingerprint): string {
+  return JSON.stringify({
+    runtimeGeneratedAt: fingerprint.runtimeGeneratedAt ?? null,
+    issueBoardStateKey: fingerprint.issueBoardStateKey,
+    issueBoardColumnKey: fingerprint.issueBoardColumnKey,
+    durableSourceRevisions: [...fingerprint.durableSourceRevisions].sort(compareSourceRevisions),
+  });
+}
+
+function defaultWebProjectionBuildHook<
+  TSourceIndex extends WebProjectionSourceIndex,
+  TContext extends WebProjectionContext<TSourceIndex, object>,
+>(input: WebProjectionBuildInput<TSourceIndex>): TContext {
+  return { metadata: input.metadata, sourceIndex: input.sourceIndex, projections: {} } as TContext;
 }
 
 function stableCacheDimensions(dimensions: Readonly<Record<string, WebProjectionCacheKeyValue>>): Array<[string, string[]]> {

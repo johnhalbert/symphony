@@ -6,6 +6,7 @@ import {
   isWebProjectionRefreshRequested,
   shouldForceWebProjectionRefresh,
   webProjectionAliasesFromValues,
+  WebProjectionContextCache,
   webProjectionIssueKeyAliases,
   type WebProjectionContext,
   type WebProjectionSourceIndex,
@@ -176,4 +177,120 @@ describe("WebProjectionContext contracts and cache key utilities", () => {
     });
     expect("events" in context.sourceIndex.transcript).toBe(false);
   });
+
+  it("caches shared contexts until forced refresh, expiration, or source fingerprint changes", async () => {
+    let now = new Date("2026-01-01T00:00:00.000Z");
+    let builds = 0;
+    const sourceIndex = sourceIndexFixture("2026-01-01T00:00:00.000Z");
+    const cache = new WebProjectionContextCache<WebProjectionSourceIndex, WebProjectionContext<WebProjectionSourceIndex, { build: number }>>();
+    const cacheKey = createWebProjectionCacheKey({ namespace: "web/dashboard", dimensions: { states: ["Todo", "In Review"] } });
+    const acquire = (nextSourceIndex: WebProjectionSourceIndex, refresh?: string) =>
+      cache.acquire({
+        cacheKey,
+        sourceIndex: nextSourceIndex,
+        refresh,
+        clock: () => now,
+        maxAgeMs: 1_000,
+        build: ({ metadata, sourceIndex }) => {
+          builds += 1;
+          return { metadata, sourceIndex, projections: { build: builds } };
+        },
+      });
+
+    const first = await acquire(sourceIndex);
+    const second = await acquire(sourceIndex);
+    expect(second).toBe(first);
+    expect(second.projections.build).toBe(1);
+    expect(cache.get(cacheKey, now)).toBe(first);
+
+    now = new Date("2026-01-01T00:00:00.500Z");
+    const forced = await acquire(sourceIndex, "1");
+    expect(forced).not.toBe(first);
+    expect(forced.projections.build).toBe(2);
+    expect(await acquire(sourceIndex)).toBe(forced);
+
+    now = new Date("2026-01-01T00:00:02.000Z");
+    expect(cache.get(cacheKey, now)).toBe(null);
+    const expired = await acquire(sourceIndex);
+    expect(expired).not.toBe(forced);
+    expect(expired.projections.build).toBe(3);
+
+    const changedSourceIndex = sourceIndexFixture("2026-01-01T00:00:03.000Z");
+    const changed = await acquire(changedSourceIndex);
+    expect(changed).not.toBe(expired);
+    expect(changed.projections.build).toBe(4);
+  });
+
+  it("coalesces concurrent shared context builds for the same cache key and fingerprint", async () => {
+    const sourceIndex = sourceIndexFixture("2026-01-01T00:00:00.000Z");
+    const cache = new WebProjectionContextCache<WebProjectionSourceIndex, WebProjectionContext<WebProjectionSourceIndex, { build: number }>>();
+    const cacheKey = createWebProjectionCacheKey({ namespace: "web/sidebar", dimensions: { states: ["Todo"] } });
+    let builds = 0;
+    let releaseBuild: (() => void) | null = null;
+    const first = cache.acquire({
+      cacheKey,
+      sourceIndex,
+      maxAgeMs: 1_000,
+      build: async ({ metadata, sourceIndex }) => {
+        builds += 1;
+        await new Promise<void>((resolve) => {
+          releaseBuild = resolve;
+        });
+        return { metadata, sourceIndex, projections: { build: builds } };
+      },
+    });
+    const second = cache.acquire({
+      cacheKey,
+      sourceIndex,
+      maxAgeMs: 1_000,
+      build: () => {
+        throw new Error("second acquire should reuse the in-flight build");
+      },
+    });
+
+    expect(builds).toBe(1);
+    const release = releaseBuild as (() => void) | null;
+    expect(release).not.toBeNull();
+    if (!release) throw new Error("build did not start");
+    release();
+    const [firstContext, secondContext] = await Promise.all([first, second]);
+    expect(secondContext).toBe(firstContext);
+    expect(firstContext.projections.build).toBe(1);
+    expect(cache.get(cacheKey)).toBe(firstContext);
+  });
 });
+
+function sourceIndexFixture(runtimeGeneratedAt: string): WebProjectionSourceIndex {
+  return {
+    generatedAt: runtimeGeneratedAt,
+    runtime: {
+      generatedAt: runtimeGeneratedAt,
+      snapshot: { running: [] },
+      runningByAlias: new Map<string, never>(),
+    },
+    trackerIssues: {
+      fetchedStateKey: "Todo,In Review",
+      issues: [],
+      byAlias: new Map<string, never>(),
+    },
+    runs: {
+      runs: [],
+      byAlias: new Map<string, readonly never[]>(),
+      latestByAlias: new Map<string, never>(),
+      transcriptEventCountsByRunId: new Map<string, number | null>(),
+    },
+    workspaces: {
+      workspaces: [],
+      byAlias: new Map<string, never>(),
+    },
+    lifecycles: {
+      records: [],
+      byAlias: new Map<string, never>(),
+    },
+    transcript: {
+      hydration: "excluded",
+      eventCountsByRunId: new Map<string, number | null>(),
+    },
+    durableSourceRevisions: [{ source: "runs", revision: runtimeGeneratedAt, observedAt: runtimeGeneratedAt }],
+  };
+}
