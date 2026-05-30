@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StatusServer } from "../src/app/http.js";
 import {
   projectWebIssueDetail,
@@ -507,6 +507,8 @@ describe("GET /api/v1/web/issues/:issueId", () => {
         },
       }),
     );
+    const readTranscriptSpy = vi.spyOn(runStore, "readTranscript");
+    const readTailSpy = vi.spyOn(runStore, "readTranscriptTail");
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
       workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
@@ -561,21 +563,30 @@ describe("GET /api/v1/web/issues/:issueId", () => {
           msgCount: 1,
         }),
       ]);
-      expect(body.transcript).toHaveLength(3);
-      expect(body.transcript[0]).toMatchObject({
+      expect(body.transcript).toEqual([]);
+      expect(readTranscriptSpy.mock.calls.filter(([, options]) => options?.limit === 500 || options?.limit === 1_000)).toEqual([]);
+      expect(readTailSpy).not.toHaveBeenCalled();
+
+      const explicitResponse = await fetch(
+        `http://${address.host}:${address.port}/api/v1/web/issues/TEST-1?includeTranscript=1`,
+      );
+      const explicitBody = (await explicitResponse.json()) as { transcript: unknown[] };
+      expect(explicitResponse.status).toBe(200);
+      expect(explicitBody.transcript).toHaveLength(3);
+      expect(explicitBody.transcript[0]).toMatchObject({
         kind: "system",
         model: "gpt-5-test",
         workspace: "TEST-1",
         session: "session-1",
         note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
       });
-      expect(body.transcript[1]).toMatchObject({
+      expect(explicitBody.transcript[1]).toMatchObject({
         kind: "user",
         from: "orchestrator",
         issue: "TEST-1",
         text: "work",
       });
-      expect(body.transcript[2]).toMatchObject({
+      expect(explicitBody.transcript[2]).toMatchObject({
         kind: "tool_call",
         ts: "2026-01-01T00:03:00.000Z",
         call_id: "call-route-1",
@@ -586,13 +597,15 @@ describe("GET /api/v1/web/issues/:issueId", () => {
         output: expect.stringContaining("[redacted]"),
         error: expect.stringContaining("[redacted]"),
       });
-      expect(body.transcript[2]).not.toHaveProperty("payload");
-      expect(body.transcript[2]).not.toHaveProperty("runId");
+      expect(explicitBody.transcript[2]).not.toHaveProperty("payload");
+      expect(explicitBody.transcript[2]).not.toHaveProperty("runId");
+      expect(readTailSpy).toHaveBeenCalledWith("run-1", { limit: 500 });
+
       const transcriptResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sessions/session-1/transcript`);
       const sessionTranscript = await transcriptResponse.json();
       expect(transcriptResponse.status).toBe(200);
-      expect(body.transcript).toEqual(sessionTranscript);
-      const serializedTranscript = JSON.stringify(body.transcript);
+      expect(explicitBody.transcript).toEqual(sessionTranscript);
+      const serializedTranscript = JSON.stringify(explicitBody.transcript);
       expect(serializedTranscript).toContain("[redacted]");
       expect(serializedTranscript).not.toContain("SECRET_");
       expect(serializedTranscript).not.toContain("message-token");
@@ -602,7 +615,95 @@ describe("GET /api/v1/web/issues/:issueId", () => {
       expect(serializedTranscript).not.toContain("ghp_ABCDEFGH1");
       expect(serializedTranscript).not.toContain("sk-ABCDEFGH1");
       expect(JSON.stringify(body).toLowerCase()).not.toContain("mock");
+      expect(JSON.stringify(explicitBody).toLowerCase()).not.toContain("mock");
       expect(tracker.fetchCount).toBe(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("bounds issue detail runs to recent runs through the HTTP route", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const tracker = new FakeTracker([
+      trackerIssue({
+        id: "issue-1",
+        identifier: "TEST-1",
+        title: "Tracker detail title",
+        description: "Tracker detail description.",
+        state: "In Progress",
+      }),
+    ]);
+    for (let index = 0; index < 30; index += 1) {
+      const suffix = String(index).padStart(2, "0");
+      await runStore.startRun({
+        runId: `run-${suffix}`,
+        sessionId: `session-${suffix}`,
+        agentId: `agent-${suffix}`,
+        role: "worker",
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: index + 1,
+        prompt: `work ${suffix}`,
+        cursorModel: "gpt-5-test",
+        workspaceKey: "TEST-1",
+        workspacePath: path.join(config.workspace.root, "TEST-1"),
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      });
+    }
+    await runStore.appendEvent({
+      runId: "run-29",
+      at: "2026-01-01T00:03:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "latest transcript event",
+    });
+    const readTranscriptSpy = vi.spyOn(runStore, "readTranscript");
+    const readTailSpy = vi.spyOn(runStore, "readTranscriptTail");
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      tracker,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues/TEST-1`);
+      const body = (await response.json()) as {
+        runs: Array<{ id: string; issue: string }>;
+        transcript: Array<{ kind: string; text?: string }>;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.runs).toHaveLength(25);
+      expect(body.runs.map((run) => run.id)).not.toContain("session-00");
+      expect(body.runs.map((run) => run.id)).toContain("session-29");
+      expect(body.runs.every((run) => run.issue === "TEST-1")).toBe(true);
+      expect(body.transcript).toEqual([]);
+      expect(readTranscriptSpy.mock.calls.filter(([, options]) => options?.limit === 500 || options?.limit === 1_000)).toEqual([]);
+      expect(readTailSpy).not.toHaveBeenCalled();
+
+      const cappedTranscriptResponse = await fetch(
+        `http://${address.host}:${address.port}/api/v1/web/issues/TEST-1?includeTranscript=1&offset=0&limit=9999`,
+      );
+      const cappedTranscriptBody = (await cappedTranscriptResponse.json()) as { transcript: Array<{ kind: string; text?: string }> };
+      expect(cappedTranscriptResponse.status).toBe(200);
+      expect(readTranscriptSpy).toHaveBeenCalledWith("run-29", { offset: 0, limit: 1_000 });
+      expect(cappedTranscriptBody.transcript).toContainEqual(
+        expect.objectContaining({ kind: "assistant", text: "latest transcript event" }),
+      );
     } finally {
       await server.stop();
     }

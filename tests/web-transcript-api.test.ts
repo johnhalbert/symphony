@@ -89,27 +89,34 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
-  it("reads every transcript page through RunTranscriptStore.readTranscript", async () => {
+  it("defaults web transcripts to a bounded recent tail instead of walking every page", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await startRun(runStore, config, { runId: "paged-run", sessionId: "paged-session", issueIdentifier: "TEST-1" });
-    const readCalls: Array<{ offset: number | undefined; limit: number | undefined }> = [];
-    runStore.readTranscript = async (runId, options = {}) => {
-      readCalls.push({ offset: options.offset, limit: options.limit });
-      const offset = options.offset ?? 0;
+    const tailCalls: Array<{ limit: number | undefined }> = [];
+    runStore.readTranscriptEventCount = async () => {
+      throw new Error("default web transcripts should use the bounded tail reader instead of counting every event");
+    };
+    runStore.readTranscript = async () => {
+      throw new Error("default web transcripts should not use offset pagination");
+    };
+    runStore.readTranscriptTail = async (runId, options = {}) => {
+      tailCalls.push({ limit: options.limit });
+      const limit = options.limit ?? 100;
       return {
         runId,
-        offset,
-        limit: options.limit ?? 100,
-        nextOffset: offset === 0 ? 1 : null,
-        events: [
-          transcriptEvent({
+        offset: 100,
+        limit,
+        nextOffset: null,
+        events: Array.from({ length: limit }, (_, index) => {
+          const sequence = index + 101;
+          return transcriptEvent({
             runId,
-            sequence: offset + 1,
-            at: offset === 0 ? "2026-01-01T00:00:01.000Z" : "2026-01-01T00:00:02.000Z",
-            message: offset === 0 ? "page one" : "page two",
-          }),
-        ],
+            sequence,
+            at: "2026-01-01T00:00:01.000Z",
+            message: `event ${sequence}`,
+          });
+        }),
       };
     };
 
@@ -120,10 +127,73 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(response.status).toBe(200);
       const body = (await response.json()) as Array<Record<string, unknown>>;
       expectRunPrelude(body, { session: "paged-session", issue: "TEST-1" });
-      expect(body.slice(2).map((message) => message.text)).toEqual(["page one", "page two"]);
+      expect(body.slice(2)).toHaveLength(500);
+      expect(body[2]).toMatchObject({ kind: "assistant", text: "event 101" });
+      expect(body.at(-1)).toMatchObject({ kind: "assistant", text: "event 600" });
+      expect(tailCalls).toEqual([{ limit: 500 }]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("honors explicit bounded transcript pagination", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "query-run", sessionId: "query-session", issueIdentifier: "TEST-1" });
+    const readCalls: Array<{ offset: number | undefined; limit: number | undefined }> = [];
+    runStore.readTranscriptEventCount = async () => {
+      throw new Error("explicit transcript pages should not need a total count");
+    };
+    runStore.readTranscriptTail = async () => {
+      throw new Error("explicit transcript pages should not use the tail reader");
+    };
+    runStore.readTranscript = async (runId, options = {}) => {
+      readCalls.push({ offset: options.offset, limit: options.limit });
+      const offset = options.offset ?? 0;
+      const limit = options.limit ?? 100;
+      return {
+        runId,
+        offset,
+        limit,
+        nextOffset: null,
+        events: Array.from({ length: Math.min(limit, 3) }, (_, index) => {
+          const sequence = offset + index + 1;
+          return transcriptEvent({
+            runId,
+            sequence,
+            at: "2026-01-01T00:00:01.000Z",
+            message: `query event ${sequence}`,
+          });
+        }),
+      };
+    };
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/query-run/transcript?offset=2&limit=9999`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "query-session", issue: "TEST-1" });
+      expect(body.slice(2).map((message) => message.text)).toEqual(["query event 3", "query event 4", "query event 5"]);
+
+      for (const query of ["?offset=&limit=", "?offset=bogus&limit=0", "?offset=-2&limit=-1"]) {
+        const invalidResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/query-run/transcript${query}`);
+        expect(invalidResponse.status).toBe(200);
+        const invalidBody = (await invalidResponse.json()) as Array<Record<string, unknown>>;
+        expectRunPrelude(invalidBody, { session: "query-session", issue: "TEST-1" });
+        expect(invalidBody.slice(2).map((message) => message.text)).toEqual([
+          "query event 1",
+          "query event 2",
+          "query event 3",
+        ]);
+      }
+
       expect(readCalls).toEqual([
-        { offset: 0, limit: 1_000 },
-        { offset: 1, limit: 1_000 },
+        { offset: 2, limit: 1_000 },
+        { offset: 0, limit: 500 },
+        { offset: 0, limit: 500 },
+        { offset: 0, limit: 500 },
       ]);
     } finally {
       await server.stop();

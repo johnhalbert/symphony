@@ -19,6 +19,7 @@ interface SourceCalls {
   listWritebacks: number;
   getRun: number;
   readTranscript: number;
+  readTranscriptTail: number;
   readTranscriptEventCount: number;
 }
 
@@ -74,6 +75,7 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
         listLifecycles: 1,
         listWritebacks: 1,
         readTranscript: 0,
+        readTranscriptTail: 0,
         readTranscriptEventCount: 0,
       });
     } finally {
@@ -128,7 +130,7 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
         ]),
       );
       expect(contextBuilds).toBe(0);
-      expect(calls).toMatchObject({ getRun: 1, listRuns: 0, readTranscript: 1 });
+      expect(calls).toMatchObject({ getRun: 1, listRuns: 0, readTranscript: 0, readTranscriptTail: 1 });
     } finally {
       await server.stop();
     }
@@ -174,6 +176,7 @@ function recordingSources(options: {
     listWritebacks: 0,
     getRun: 0,
     readTranscript: 0,
+    readTranscriptTail: 0,
     readTranscriptEventCount: 0,
   };
   const waitForGate = async () => {
@@ -220,6 +223,13 @@ function recordingSources(options: {
         const page = events.slice(offset, offset + limit);
         const nextOffset = offset + page.length < events.length ? offset + page.length : null;
         return { runId, offset, limit, nextOffset, events: page };
+      },
+      async readTranscriptTail(runId: string, input: { limit?: number } = {}) {
+        calls.readTranscriptTail += 1;
+        const limit = input.limit ?? 100;
+        const events = [...(transcriptEventsByRunId.get(runId) ?? [])];
+        const offset = Math.max(0, events.length - limit);
+        return { runId, offset, limit, nextOffset: null, events: events.slice(offset) };
       },
     } as unknown as RunTranscriptStore,
     lifecycleStore: {

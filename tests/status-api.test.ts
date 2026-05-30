@@ -768,46 +768,41 @@ describe("StatusServer durable API", () => {
     }
   });
 
-  it("serves sidebar sessions from the full web history projection while keeping dashboard activity previewed", async () => {
+  it("bounds sidebar and history defaults and honors capped history query limits", async () => {
     const config = testConfig(path.join(root, "workspaces"));
-    const makeRun = (index: number, issueIdentifier: string, startedAt: string, completedAt: string): RunRecord => ({
-      runId: index === 0 ? "run-history-boundary" : `run-history-newer-${index}`,
-      sessionId: index === 0 ? "session-history-boundary" : `session-history-newer-${index}`,
-      agentId: index === 0 ? "agent-history-boundary" : `agent-history-newer-${index}`,
-      role: "worker",
-      runPhase: "implementation",
-      runKind: "implementation",
-      issueId: index === 0 ? "issue-history-boundary" : `issue-history-newer-${index}`,
-      issueIdentifier,
-      attempt: null,
-      turnNumber: 1,
-      prompt: `work ${issueIdentifier}`,
-      promptCharCount: `work ${issueIdentifier}`.length,
-      cursorModel: "gpt-test",
-      workspaceKey: issueIdentifier,
-      workspacePath: path.join(config.workspace.root, issueIdentifier),
-      gitBranchName: `symphony/${issueIdentifier}`,
-      repoPath: "/repo",
-      baseRef: "main",
-      status: "succeeded",
-      startedAt,
-      updatedAt: completedAt,
-      completedAt,
-      error: null,
-      tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-      transcriptEventCount: 0,
-    });
-    const boundaryRun = makeRun(0, "TEST-HISTORY", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:30.000Z");
-    const newerRuns = Array.from({ length: 20 }, (_, index) => {
-      const minute = String(index + 1).padStart(2, "0");
-      return makeRun(
-        index + 1,
-        `TEST-HISTORY-NEWER-${index + 1}`,
-        `2026-01-01T00:${minute}:00.000Z`,
-        `2026-01-01T00:${minute}:30.000Z`,
-      );
-    });
-    const runs = [boundaryRun, ...newerRuns];
+    const timestamp = (index: number, seconds = 0) => new Date(Date.UTC(2026, 0, 1, 0, index, seconds)).toISOString();
+    const makeRun = (index: number): RunRecord => {
+      const suffix = String(index).padStart(3, "0");
+      const issueIdentifier = index === 0 ? "TEST-HISTORY-BOUNDARY" : `TEST-HISTORY-${suffix}`;
+      return {
+        runId: index === 0 ? "run-history-boundary" : `run-history-${suffix}`,
+        sessionId: index === 0 ? "session-history-boundary" : `session-history-${suffix}`,
+        agentId: index === 0 ? "agent-history-boundary" : `agent-history-${suffix}`,
+        role: "worker",
+        runPhase: "implementation",
+        runKind: "implementation",
+        issueId: index === 0 ? "issue-history-boundary" : `issue-history-${suffix}`,
+        issueIdentifier,
+        attempt: null,
+        turnNumber: 1,
+        prompt: `work ${issueIdentifier}`,
+        promptCharCount: `work ${issueIdentifier}`.length,
+        cursorModel: "gpt-test",
+        workspaceKey: issueIdentifier,
+        workspacePath: path.join(config.workspace.root, issueIdentifier),
+        gitBranchName: `symphony/${issueIdentifier}`,
+        repoPath: "/repo",
+        baseRef: "main",
+        status: "succeeded",
+        startedAt: timestamp(index),
+        updatedAt: timestamp(index, 30),
+        completedAt: timestamp(index, 30),
+        error: null,
+        tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        transcriptEventCount: 0,
+      };
+    };
+    const runs = Array.from({ length: 501 }, (_, index) => makeRun(index));
     let runListCalls = 0;
     let writebackListCalls = 0;
     const runStore = {
@@ -840,41 +835,74 @@ describe("StatusServer durable API", () => {
     });
     const address = await server.start();
     try {
+      type HistoryBody = {
+        sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
+        transcriptBySession: Record<string, unknown[]>;
+        timeline: Array<{ sess: string; kind: string; text: string; state?: string }>;
+      };
+      const fetchHistory = async (query = "") => {
+        const response = await fetch(`http://${address.host}:${address.port}/api/v1/web/history${query}`);
+        return { response, body: (await response.json()) as HistoryBody };
+      };
+
       const sidebarResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sidebar`);
+      const { response: historyResponse, body: historyBody } = await fetchHistory();
       const sidebarBody = (await sidebarResponse.json()) as {
         activity: Array<{ id: string; verb: string }>;
         sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
       };
-      expect(sidebarResponse.status).toBe(200);
-      expect(runListCalls).toBe(1);
-      expect(writebackListCalls).toBe(1);
-
-      const historyResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/history`);
-      const historyBody = (await historyResponse.json()) as {
-        sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
-        transcriptBySession: Record<string, unknown[]>;
-      };
 
       expect(historyResponse.status).toBe(200);
+      expect(sidebarResponse.status).toBe(200);
+      expect(runListCalls).toBeGreaterThan(0);
+      expect(writebackListCalls).toBeGreaterThan(0);
       expect(sidebarBody.activity).toHaveLength(20);
-      expect(sidebarBody.activity.map((item) => item.id)).not.toContain("TEST-HISTORY");
-      const sidebarBoundarySession = sidebarBody.sessions.find((session) => session.id === "run-history-boundary");
-      const historyBoundarySession = historyBody.sessions.find((session) => session.id === "run-history-boundary");
-      expect(sidebarBoundarySession).toEqual(historyBoundarySession);
-      expect(sidebarBoundarySession).toMatchObject({
-        id: "run-history-boundary",
-        issue: "TEST-HISTORY",
+      expect(sidebarBody.activity.map((item) => item.id)).not.toContain("TEST-HISTORY-BOUNDARY");
+      expect(sidebarBody.sessions).toHaveLength(10);
+      expect(sidebarBody.sessions.find((session) => session.id === "run-history-boundary")).toBeUndefined();
+      expect(sidebarBody.sessions[0]?.id).toBe("run-history-500");
+      expect(sidebarBody.sessions.at(-1)?.id).toBe("run-history-491");
+
+      expect(historyBody.sessions).toHaveLength(100);
+      expect(historyBody.timeline).toHaveLength(250);
+      expect(historyBody.sessions.find((session) => session.id === "run-history-boundary")).toBeUndefined();
+      expect(JSON.stringify(historyBody.timeline)).not.toContain("TEST-HISTORY-BOUNDARY");
+      expect(historyBody.sessions[0]).toMatchObject({
+        id: "run-history-500",
+        issue: "TEST-HISTORY-500",
         state: "finished",
-        lastEvent: "TEST-HISTORY run finished",
+        lastEvent: "TEST-HISTORY-500 run finished",
       });
-      expect(sidebarBody.sessions).toHaveLength(21);
-      expect(historyBody.sessions).toHaveLength(21);
+      expect(historyBody.sessions.at(-1)?.id).toBe("run-history-401");
       expect(historyBody.transcriptBySession).toEqual({});
+
+      const { response: smallResponse, body: smallBody } = await fetchHistory("?sessionLimit=5&timelineLimit=7");
+      expect(smallResponse.status).toBe(200);
+      expect(smallBody.sessions.map((session) => session.id)).toEqual([
+        "run-history-500",
+        "run-history-499",
+        "run-history-498",
+        "run-history-497",
+        "run-history-496",
+      ]);
+      expect(smallBody.timeline).toHaveLength(7);
+
+      const { response: cappedResponse, body: cappedBody } = await fetchHistory("?sessionLimit=9999&timelineLimit=9999");
+      expect(cappedResponse.status).toBe(200);
+      expect(cappedBody.sessions).toHaveLength(500);
+      expect(cappedBody.timeline).toHaveLength(500);
+      expect(cappedBody.sessions.find((session) => session.id === "run-history-boundary")).toBeUndefined();
+
+      for (const query of ["?sessionLimit=&timelineLimit=bogus", "?sessionLimit=0&timelineLimit=-3"]) {
+        const { response, body } = await fetchHistory(query);
+        expect(response.status).toBe(200);
+        expect(body.sessions).toHaveLength(100);
+        expect(body.timeline).toHaveLength(250);
+      }
     } finally {
       await server.stop();
     }
   });
-
   it("scrubs inactive merge-gate blockers from durable status responses", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);

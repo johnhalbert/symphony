@@ -116,6 +116,67 @@ describe("FileRunTranscriptStore", () => {
     expect(page.nextOffset).toBeNull();
   });
 
+  it("reads bounded file-backed transcript tails without parsing the whole JSONL body", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await store.startRun({
+      runId: "run-tail",
+      sessionId: "session-tail",
+      agentId: "agent-tail",
+      role: "worker",
+      issueId: "issue-tail",
+      issueIdentifier: "TEST-TAIL",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "tail",
+      workspaceKey: "TEST-TAIL",
+      workspacePath: "/tmp/workspace",
+    });
+    const metaPath = path.join(root, "runs", "run-tail", "meta.json");
+    const eventsPath = path.join(root, "runs", "run-tail", "events.jsonl");
+    const metadata = JSON.parse(await readFile(metaPath, "utf8")) as { transcriptEventCount?: number };
+    metadata.transcriptEventCount = 1_205;
+    await writeFile(metaPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+
+    const malformedHugeFirstLine = `{not-json:${"x".repeat(2 * 1024 * 1024)}}\n`;
+    const validTailLines = Array.from({ length: 1_204 }, (_, index) => {
+      const sequence = index + 2;
+      return JSON.stringify({
+        runId: "run-tail",
+        sequence,
+        at: `2026-01-01T00:00:${String(sequence % 60).padStart(2, "0")}.000Z`,
+        source: "harness",
+        eventType: "progress",
+        message: `event ${sequence}`,
+      });
+    }).join("\n");
+    await writeFile(eventsPath, `${malformedHugeFirstLine}${validTailLines}\n`, "utf8");
+
+    const tail = await store.readTranscriptTail("run-tail", { limit: 5 });
+    expect(tail).toMatchObject({ runId: "run-tail", offset: 1_200, limit: 5, nextOffset: null });
+    expect(tail.events.map((event) => event.sequence)).toEqual([1_201, 1_202, 1_203, 1_204, 1_205]);
+    expect(tail.events.map((event) => event.message)).toEqual([
+      "event 1201",
+      "event 1202",
+      "event 1203",
+      "event 1204",
+      "event 1205",
+    ]);
+
+    const capped = await store.readTranscriptTail("run-tail", { limit: 9_999 });
+    expect(capped).toMatchObject({ runId: "run-tail", offset: 205, limit: 1_000, nextOffset: null });
+    expect(capped.events).toHaveLength(1_000);
+    expect(capped.events[0]?.sequence).toBe(206);
+    expect(capped.events.at(-1)?.sequence).toBe(1_205);
+
+    await expect(store.readTranscriptTail("missing-run", { limit: 5 })).resolves.toMatchObject({
+      runId: "missing-run",
+      offset: 0,
+      limit: 5,
+      nextOffset: null,
+      events: [],
+    });
+  });
+
   it("assigns contiguous sequences when appends race", async () => {
     const store = new FileRunTranscriptStore(root);
     await store.startRun({
