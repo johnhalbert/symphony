@@ -136,7 +136,8 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.hermes.provider = "openai-codex";
     config.hermes.model = "gpt-5-test";
-    const resumeAt = new Date(Date.now() + 120).toISOString();
+    const providerWindowMs = 3_000;
+    const resumeAt = new Date(Date.now() + providerWindowMs).toISOString();
     const candidate = issue({ state: "Todo" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -170,6 +171,7 @@ describe("Orchestrator", () => {
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "provider-limit run dispatched");
     await waitFor(() => orchestrator.snapshot().counts.running === 0, "provider-limit run exited");
+    await waitFor(() => orchestrator.snapshot().providerGates.length === 1, "active provider-limit gate");
     const gatedSnapshot = orchestrator.snapshot();
 
     expect(gatedSnapshot.counts.retrying).toBe(0);
@@ -190,7 +192,10 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     expect(harness.runs).toHaveLength(1);
-    await new Promise((resolve) => setTimeout(resolve, 170));
+    const msUntilWindowCloses = Math.max(Date.parse(resumeAt) - Date.now() + 50, 0);
+    if (msUntilWindowCloses > 0) {
+      await new Promise((resolve) => setTimeout(resolve, msUntilWindowCloses));
+    }
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 2, "dispatch after provider window closes");
     await orchestrator.stop();
