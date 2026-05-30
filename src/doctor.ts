@@ -103,14 +103,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
       status: config.agent.maxConcurrentAgents === 1 ? "ok" : "warn",
       message: `max_concurrent_agents is ${config.agent.maxConcurrentAgents}`,
     });
-    checks.push({
-      id: "tracker.handoff",
-      status: config.tracker.handoffStates.length > 0 ? "ok" : "warn",
-      message:
-        config.tracker.handoffStates.length > 0
-          ? `handoff_states: ${config.tracker.handoffStates.join(", ")}`
-          : "No handoff_states configured",
-    });
+    checks.push(trackerHandoffDoctorCheck(config));
     checks.push(...(await reviewLoopDoctorChecks(config, { workflowPath, cliPath: options.cliPath })));
     checks.push(...continuationContextDoctorChecks(config));
 
@@ -148,6 +141,32 @@ export function formatDoctorResult(result: DoctorResult): string {
   return result.checks
     .map((check) => `[${check.status.toUpperCase()}] ${check.id}: ${check.message}`)
     .join("\n");
+}
+
+export function trackerHandoffDoctorCheck(config: ServiceConfig): DoctorCheck {
+  if (config.tracker.handoffStates.length > 0) {
+    return {
+      id: "tracker.handoff",
+      status: "ok",
+      message: `handoff_states: ${config.tracker.handoffStates.join(", ")}`,
+    };
+  }
+
+  if (!config.github.prHandoff.enabled && config.reviewLoop.reviewStates.length > 0) {
+    return {
+      id: "tracker.handoff",
+      status: "ok",
+      message: `No handoff_states configured; PR handoff is disabled and review_states route directly to ${config.reviewLoop.reviewStates.join(", ")}`,
+    };
+  }
+
+  return {
+    id: "tracker.handoff",
+    status: "warn",
+    message: config.github.prHandoff.enabled
+      ? "No handoff_states configured; PR handoff requires github.pr_handoff.target_state to resolve to tracker.handoff_states"
+      : "No handoff_states configured",
+  };
 }
 
 export function continuationContextDoctorChecks(config: ServiceConfig): DoctorCheck[] {
