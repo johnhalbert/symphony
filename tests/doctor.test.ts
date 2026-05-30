@@ -109,6 +109,38 @@ describe("doctor review-loop checks", () => {
     expect(hermesRuntimeDoctorChecks(config)[0]).toMatchObject({ id: "hermes.runtime", status: "ok" });
   });
 
+  it("runs host Hermes ACP runtime checks without requiring Symphony runtime credentials", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { harness: "hermes_acp" },
+        hermes_acp: {
+          binary: "/usr/local/bin/hermes",
+          source_profile: "operator",
+          worker_session_lifecycle: "reuse_by_issue",
+          keep_profiles: "failed",
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(runtimeHarnessDoctorChecks(config)).toEqual([
+      { id: "runtime.harness", status: "ok", message: "Runtime harness is hermes_acp" },
+      {
+        id: "hermes_acp.runtime",
+        status: "ok",
+        message:
+          "Host Hermes ACP binary is /usr/local/bin/hermes; source profile is operator; worker lifecycle is reuse_by_issue; profile retention is failed",
+      },
+    ]);
+    expect(runtimeCredentialDoctorCheck(config)).toEqual({
+      id: "env.hermes_acp",
+      status: "ok",
+      message: "Host Hermes ACP uses cloned host profile credentials from operator; no Symphony runtime API key is injected",
+    });
+  });
+
   it("errors when Hermes dogfood would run without an explicit model", async () => {
     const config = parseServiceConfig(
       {
