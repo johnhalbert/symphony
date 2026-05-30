@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CursorHarness } from "../cursor/src/CursorHarness.js";
+import { HermesAcpHarness } from "../hermes/src/HermesAcpHarness.js";
 import { HermesHarness } from "../hermes/src/HermesHarness.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { createAgentHarness } from "../src/core/harness/HarnessFactory.js";
@@ -11,6 +12,11 @@ describe("createAgentHarness", () => {
   });
 
   it("creates the Hermes harness from the built-in registry", () => {
+    expect(createAgentHarness(config("hermes"))).toBeInstanceOf(HermesHarness);
+  });
+
+  it("creates the Hermes ACP harness from the built-in registry without changing Hermes TUI registration", () => {
+    expect(createAgentHarness(config("hermes_acp"))).toBeInstanceOf(HermesAcpHarness);
     expect(createAgentHarness(config("hermes"))).toBeInstanceOf(HermesHarness);
   });
 
