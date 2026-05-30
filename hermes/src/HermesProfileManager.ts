@@ -4,6 +4,7 @@ import path from "node:path";
 import { SymphonyError } from "../../src/core/errors.js";
 
 export type HermesProfileMaterializeMode = "reuse" | "fresh";
+export type HermesProfileReuseMode = "reuse_by_issue" | "fresh_per_run";
 
 export interface HermesProfileManagerOptions {
   templatesDir: string;
@@ -19,6 +20,15 @@ export interface HermesProfileRequest {
   mode: HermesProfileMaterializeMode;
 }
 
+export interface HermesAcpProfileNameRequest {
+  workspaceKey: string;
+  role: string;
+  issueIdentifier: string;
+  phase: string;
+  reuseMode: HermesProfileReuseMode;
+  freshLeaseId?: string | null;
+}
+
 export interface HermesProfile {
   profileDir: string;
   templateDir: string;
@@ -27,7 +37,59 @@ export interface HermesProfile {
 }
 
 const PROFILE_DIRS = ["memories", "sessions", "skills", "skins", "logs", "plans", "workspace", "cron", "home"] as const;
-const MAX_PROFILE_PATH_SEGMENT_LENGTH = 40;
+const MAX_HERMES_PROFILE_NAME_LENGTH = 64;
+const PROFILE_NAME_HASH_LENGTH = 16;
+const PROFILE_NAME_COLLISION_PREFIX = "sym";
+
+// Mirrors the upstream Hermes profile-name/alias collision surfaces in
+// hermes_cli.profiles so generated ACP profile names never land on the
+// special default profile, Hermes subcommands, or common host command names.
+const RESERVED_HERMES_PROFILE_NAMES = new Set([
+  "hermes",
+  "default",
+  "test",
+  "tmp",
+  "root",
+  "sudo",
+  "chat",
+  "model",
+  "gateway",
+  "setup",
+  "whatsapp",
+  "login",
+  "logout",
+  "status",
+  "cron",
+  "doctor",
+  "dump",
+  "config",
+  "pairing",
+  "skills",
+  "tools",
+  "mcp",
+  "sessions",
+  "insights",
+  "version",
+  "update",
+  "uninstall",
+  "profile",
+  "plugins",
+  "honcho",
+  "acp",
+  "git",
+  "node",
+  "npm",
+  "npx",
+  "python",
+  "python3",
+  "bash",
+  "sh",
+  "cmd",
+  "powershell",
+  "pwsh",
+  "curl",
+  "ssh",
+]);
 
 export class HermesProfileManager {
   constructor(private readonly options: HermesProfileManagerOptions) {}
@@ -101,17 +163,77 @@ export async function ensureProfileShape(profileDir: string): Promise<void> {
   await Promise.all(PROFILE_DIRS.map((entry) => fs.mkdir(path.join(profileDir, entry), { recursive: true })));
 }
 
+export function hermesAcpProfileName(request: HermesAcpProfileNameRequest): string {
+  const freshLeaseId = request.reuseMode === "fresh_per_run" ? nonEmptyString(request.freshLeaseId) : null;
+  if (request.reuseMode === "fresh_per_run" && !freshLeaseId) {
+    throw new SymphonyError("config_validation_error", "Fresh Hermes ACP profile names require a fresh lease id");
+  }
+
+  const rawComponents = {
+    workspaceKey: request.workspaceKey,
+    role: request.role,
+    issueIdentifier: request.issueIdentifier,
+    phase: request.phase,
+    reuseMode: request.reuseMode,
+    freshLeaseId,
+  };
+  const readableName = [
+    PROFILE_NAME_COLLISION_PREFIX,
+    profileNamePart(request.workspaceKey, "workspace"),
+    profileNamePart(request.role, "role"),
+    profileNamePart(request.issueIdentifier, "issue"),
+    profileNamePart(request.phase, "phase"),
+    profileNamePart(request.reuseMode, "mode"),
+    ...(freshLeaseId ? [profileNamePart(freshLeaseId, "lease")] : []),
+  ].join("_");
+
+  return profileNameFromSource(readableName, JSON.stringify(rawComponents));
+}
+
 export function safeProfileKey(value: string): string {
-  return safeSegment(value);
+  return profileNameFromSource(value, value);
 }
 
 function safeSegment(value: string): string {
-  const sanitized = value.replace(/[^A-Za-z0-9._-]/g, "_").replace(/_+/g, "_") || "profile";
-  if (sanitized.length <= MAX_PROFILE_PATH_SEGMENT_LENGTH) return sanitized;
-  const hash = createHash("sha256").update(sanitized).digest("hex").slice(0, 10);
-  const prefixLength = MAX_PROFILE_PATH_SEGMENT_LENGTH - hash.length - 1;
-  const prefix = sanitized.slice(0, prefixLength).replace(/[._-]+$/g, "") || "profile";
-  return `${prefix}_${hash}`;
+  return safeProfileKey(value);
+}
+
+function profileNameFromSource(value: string, hashSource: string): string {
+  const normalized = normalizeProfileNameStem(value);
+  const candidate = RESERVED_HERMES_PROFILE_NAMES.has(normalized) ? `${PROFILE_NAME_COLLISION_PREFIX}_${normalized}` : normalized;
+  return compactProfileName(candidate, hashSource);
+}
+
+function compactProfileName(candidate: string, hashSource: string): string {
+  if (candidate.length <= MAX_HERMES_PROFILE_NAME_LENGTH && !RESERVED_HERMES_PROFILE_NAMES.has(candidate)) return candidate;
+
+  const hash = createHash("sha256").update(hashSource).digest("hex").slice(0, PROFILE_NAME_HASH_LENGTH);
+  const prefixLength = MAX_HERMES_PROFILE_NAME_LENGTH - hash.length - 1;
+  const prefix = candidate.slice(0, prefixLength).replace(/[_-]+$/g, "") || "profile";
+  const compact = `${prefix}_${hash}`;
+  if (!RESERVED_HERMES_PROFILE_NAMES.has(compact)) return compact;
+  return `${PROFILE_NAME_COLLISION_PREFIX}_${hash}`;
+}
+
+function profileNamePart(value: string, fallback: string): string {
+  const normalized = normalizeProfileNameStem(value);
+  return normalized === "profile" && !/[A-Za-z0-9]/.test(value) ? fallback : normalized;
+}
+
+function normalizeProfileNameStem(value: string): string {
+  const normalized = String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/[_-]{2,}/g, "_")
+    .replace(/^[_-]+|[_-]+$/g, "");
+  return normalized || "profile";
+}
+
+function nonEmptyString(value: string | null | undefined): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 function assertPathInsideRoot(targetPath: string, rootPath: string): void {
