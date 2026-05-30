@@ -265,6 +265,14 @@ type AppHookState = {
   orchestratorChat: Loadable<ChatMessage[]>;
 };
 
+type AppHookCallLog = {
+  dashboard: boolean[];
+  issueBoard: boolean[];
+  history: boolean[];
+  sidebar: boolean[];
+  orchestratorChat: boolean[];
+};
+
 function loaded<T>(data: T): Loadable<T> {
   return { data, loading: false, error: null };
 }
@@ -285,12 +293,24 @@ function appHookState(overrides: Partial<AppHookState> = {}): AppHookState {
   };
 }
 
+function appHookCallLog(): AppHookCallLog {
+  return {
+    dashboard: [],
+    issueBoard: [],
+    history: [],
+    sidebar: [],
+    orchestratorChat: [],
+  };
+}
+
 async function renderAppWithMocks({
   mode = "api",
   hooks = appHookState(),
+  calls,
 }: {
   mode?: "api" | "mock";
   hooks?: AppHookState;
+  calls?: AppHookCallLog;
 } = {}) {
   vi.resetModules();
 
@@ -309,12 +329,27 @@ async function renderAppWithMocks({
 
   vi.doMock("../src/hooks/useSymphonyData", () => ({
     useReferenceData: () => hooks.reference,
-    useDashboard: () => hooks.dashboard,
-    useIssueBoard: () => hooks.issueBoard,
+    useDashboard: (enabled = true) => {
+      calls?.dashboard.push(enabled);
+      return hooks.dashboard;
+    },
+    useIssueBoard: (enabled = true) => {
+      calls?.issueBoard.push(enabled);
+      return hooks.issueBoard;
+    },
     useIssueDetail: () => loaded(null),
-    useHistory: () => hooks.history,
-    useSidebar: () => hooks.sidebar,
-    useOrchestratorChat: () => hooks.orchestratorChat,
+    useHistory: (enabled = true) => {
+      calls?.history.push(enabled);
+      return hooks.history;
+    },
+    useSidebar: (enabled = true) => {
+      calls?.sidebar.push(enabled);
+      return hooks.sidebar;
+    },
+    useOrchestratorChat: (enabled = true) => {
+      calls?.orchestratorChat.push(enabled);
+      return hooks.orchestratorChat;
+    },
   }));
 
   const { App } = await import("../src/App");
@@ -378,8 +413,16 @@ afterEach(() => {
 
 describe("App API-mode rendering", () => {
   it("renders the loaded API dashboard through the app shell without mock chrome or embedded chat fallbacks", async () => {
-    const markup = await renderAppWithMocks();
+    const calls = appHookCallLog();
+    const markup = await renderAppWithMocks({ calls });
 
+    expect(calls).toEqual({
+      dashboard: [true],
+      issueBoard: [false],
+      history: [false],
+      sidebar: [false],
+      orchestratorChat: [true],
+    });
     expect(markup).toContain("api source · api");
     expect(markup).toContain("api/repo@api-branch");
     expect(markup).toContain("Symphony · api-branch");
@@ -402,7 +445,9 @@ describe("App API-mode rendering", () => {
   });
 
   it("keeps API-mode chrome in an API state when the dashboard request fails", async () => {
+    const calls = appHookCallLog();
     const markup = await renderAppWithMocks({
+      calls,
       hooks: appHookState({
         dashboard: failed("Symphony API returned HTTP 503"),
         sidebar: loaded(sidebarWithOneAgent),
@@ -410,6 +455,13 @@ describe("App API-mode rendering", () => {
       }),
     });
 
+    expect(calls).toEqual({
+      dashboard: [true],
+      issueBoard: [false],
+      history: [false],
+      sidebar: [true],
+      orchestratorChat: [true],
+    });
     expect(markup).toContain("Symphony API returned HTTP 503");
     expect(markup).toContain("api source · api");
     expect(markup).toContain("1 agents running");
@@ -422,10 +474,13 @@ describe("App API-mode rendering", () => {
   });
 
   it("holds the reference-data loading boundary without rendering API or mock dashboard content", async () => {
+    const calls = appHookCallLog();
     const markup = await renderAppWithMocks({
+      calls,
       hooks: appHookState({ reference: { data: null, loading: true, error: null } }),
     });
 
+    expect(calls).toEqual({ dashboard: [], issueBoard: [], history: [], sidebar: [], orchestratorChat: [] });
     expect(markup).toContain("Loading Symphony design data...");
     expect(markup).not.toContain("api/repo");
     expect(markup).not.toContain("openai/symphony");

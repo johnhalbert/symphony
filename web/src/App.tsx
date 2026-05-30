@@ -55,15 +55,15 @@ function AppShell() {
   const [issuesVariant, setIssuesVariant] = useState<IssuesVariant>("balanced");
   const [historyVariant, setHistoryVariant] = useState<HistoryVariant>("list");
   const [sidebarVariant, setSidebarVariant] = useState<SidebarVariant>("primary");
+  const apiMode = defaultDataSourceConfig.mode === "api";
 
   const dashboard = useDashboard();
-  const issueBoard = useIssueBoard();
-  const history = useHistory();
-  const sidebar = useSidebar();
-  const orchestratorChat = useOrchestratorChat();
+  const issueBoard = useIssueBoard(activeTab === "issues");
+  const history = useHistory(activeTab === "history");
+  const sidebar = useSidebar(activeTab === "sidebar" || (apiMode && Boolean(dashboard.error)));
+  const orchestratorChat = useOrchestratorChat(activeTab === "dashboard" || activeTab === "sidebar");
   const dashboardChrome = dashboard.data;
   const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
-  const apiMode = defaultDataSourceConfig.mode === "api";
 
   return (
     <ThemeFrame>
@@ -117,7 +117,7 @@ function AppShell() {
               />
             ))
           : null}
-        {activeTab === "states" ? renderLoadable(sidebar, (data) => <StateCardsView />) : null}
+        {activeTab === "states" ? <StateCardsView /> : null}
       </AppChrome>
     </ThemeFrame>
   );

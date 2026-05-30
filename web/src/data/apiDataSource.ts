@@ -43,33 +43,33 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
 
   return {
-    async getReferenceData() {
-      return normalizeReferenceData(await fetchJson<ApiReferenceData>(normalizedBaseUrl, "/api/v1/web/reference-data"));
+    async getReferenceData(signal) {
+      return normalizeReferenceData(await fetchJson<ApiReferenceData>(normalizedBaseUrl, "/api/v1/web/reference-data", signal));
     },
-    async getDashboard() {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/dashboard");
+    async getDashboard(signal) {
+      return fetchJson(normalizedBaseUrl, "/api/v1/web/dashboard", signal);
     },
-    async getIssueBoard() {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/issues");
+    async getIssueBoard(signal) {
+      return fetchJson(normalizedBaseUrl, "/api/v1/web/issues", signal);
     },
-    async getIssueDetail(issueId) {
-      return fetchJson(normalizedBaseUrl, `/api/v1/web/issues/${encodeURIComponent(issueId)}`);
+    async getIssueDetail(issueId, signal) {
+      return fetchJson(normalizedBaseUrl, `/api/v1/web/issues/${encodeURIComponent(issueId)}`, signal);
     },
-    async getHistory() {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/history");
+    async getHistory(signal) {
+      return fetchJson(normalizedBaseUrl, "/api/v1/web/history", signal);
     },
-    async getSessions() {
-      const history = await this.getHistory();
+    async getSessions(signal) {
+      const history = await this.getHistory(signal);
       return history.sessions;
     },
-    async getTranscript(sessionId) {
-      return fetchJson(normalizedBaseUrl, `/api/v1/web/sessions/${encodeURIComponent(sessionId)}/transcript`);
+    async getTranscript(sessionId, signal) {
+      return fetchJson(normalizedBaseUrl, `/api/v1/web/sessions/${encodeURIComponent(sessionId)}/transcript`, signal);
     },
-    async getSidebar() {
-      return fetchJson(normalizedBaseUrl, "/api/v1/web/sidebar");
+    async getSidebar(signal) {
+      return fetchJson(normalizedBaseUrl, "/api/v1/web/sidebar", signal);
     },
-    async getOrchestratorChat() {
-      return fetchJson<ChatMessage[]>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat");
+    async getOrchestratorChat(signal) {
+      return fetchJson<ChatMessage[]>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat", signal);
     },
     async sendOrchestratorMessage(input) {
       const response = await fetch(`${normalizedBaseUrl}/api/v1/web/orchestrator-chat`, {

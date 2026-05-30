@@ -808,9 +808,20 @@ describe("StatusServer durable API", () => {
       );
     });
     const runs = [boundaryRun, ...newerRuns];
+    let runListCalls = 0;
+    let writebackListCalls = 0;
     const runStore = {
-      listRuns: async () => runs,
+      listRuns: async () => {
+        runListCalls += 1;
+        return runs;
+      },
     } as unknown as FileRunTranscriptStore;
+    const writebackOutbox = {
+      list: async () => {
+        writebackListCalls += 1;
+        return [];
+      },
+    } as unknown as FileWritebackOutboxStore;
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
       workspaceManager: new WorkspaceManager({
@@ -820,6 +831,7 @@ describe("StatusServer durable API", () => {
       }),
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
       runStore,
+      writebackOutbox,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: null,
@@ -829,17 +841,20 @@ describe("StatusServer durable API", () => {
     const address = await server.start();
     try {
       const sidebarResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sidebar`);
-      const historyResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/history`);
       const sidebarBody = (await sidebarResponse.json()) as {
         activity: Array<{ id: string; verb: string }>;
         sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
       };
+      expect(sidebarResponse.status).toBe(200);
+      expect(runListCalls).toBe(1);
+      expect(writebackListCalls).toBe(1);
+
+      const historyResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/history`);
       const historyBody = (await historyResponse.json()) as {
         sessions: Array<{ id: string; issue: string; state: string; lastEvent: string }>;
         transcriptBySession: Record<string, unknown[]>;
       };
 
-      expect(sidebarResponse.status).toBe(200);
       expect(historyResponse.status).toBe(200);
       expect(sidebarBody.activity).toHaveLength(20);
       expect(sidebarBody.activity.map((item) => item.id)).not.toContain("TEST-HISTORY");

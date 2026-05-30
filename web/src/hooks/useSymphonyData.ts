@@ -5,17 +5,17 @@ import type { IssueDetailModel, Loadable, TranscriptMessage } from "../types/sym
 
 export function useReferenceData() {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getReferenceData(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getReferenceData(signal), [dataSource]), [dataSource]);
 }
 
-export function useDashboard() {
+export function useDashboard(enabled = true) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getDashboard(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getDashboard(signal), [dataSource]), [dataSource], { enabled });
 }
 
-export function useIssueBoard() {
+export function useIssueBoard(enabled = true) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getIssueBoard(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getIssueBoard(signal), [dataSource]), [dataSource], { enabled });
 }
 
 export function useIssueDetail(issueId: string | null): Loadable<IssueDetailModel | null> {
@@ -37,9 +37,10 @@ export function useIssueDetail(issueId: string | null): Loadable<IssueDetailMode
       };
     }
 
+    const controller = new AbortController();
     setState({ issueId: normalizedIssueId, data: null, loading: true, error: null });
     dataSource
-      .getIssueDetail(normalizedIssueId)
+      .getIssueDetail(normalizedIssueId, controller.signal)
       .then((data) => {
         if (active) setState({ issueId: normalizedIssueId, data, loading: false, error: null });
       })
@@ -51,6 +52,7 @@ export function useIssueDetail(issueId: string | null): Loadable<IssueDetailMode
 
     return () => {
       active = false;
+      controller.abort();
     };
   }, [dataSource, normalizedIssueId]);
 
@@ -61,9 +63,9 @@ export function useIssueDetail(issueId: string | null): Loadable<IssueDetailMode
   return { data: state.data, loading: state.loading, error: state.error };
 }
 
-export function useHistory() {
+export function useHistory(enabled = true) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getHistory(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getHistory(signal), [dataSource]), [dataSource], { enabled });
 }
 
 export function useTranscript(sessionId: string | null): Loadable<TranscriptMessage[]> {
@@ -85,9 +87,10 @@ export function useTranscript(sessionId: string | null): Loadable<TranscriptMess
       };
     }
 
+    const controller = new AbortController();
     setState({ sessionId: normalizedSessionId, data: null, loading: true, error: null });
     dataSource
-      .getTranscript(normalizedSessionId)
+      .getTranscript(normalizedSessionId, controller.signal)
       .then((data) => {
         if (active) setState({ sessionId: normalizedSessionId, data, loading: false, error: null });
       })
@@ -99,6 +102,7 @@ export function useTranscript(sessionId: string | null): Loadable<TranscriptMess
 
     return () => {
       active = false;
+      controller.abort();
     };
   }, [dataSource, normalizedSessionId]);
 
@@ -109,12 +113,12 @@ export function useTranscript(sessionId: string | null): Loadable<TranscriptMess
   return { data: state.data, loading: state.loading, error: state.error };
 }
 
-export function useSidebar() {
+export function useSidebar(enabled = true) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getSidebar(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getSidebar(signal), [dataSource]), [dataSource], { enabled });
 }
 
-export function useOrchestratorChat() {
+export function useOrchestratorChat(enabled = true) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getOrchestratorChat(), [dataSource]), [dataSource]);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getOrchestratorChat(signal), [dataSource]), [dataSource], { enabled });
 }

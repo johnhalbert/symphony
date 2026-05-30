@@ -304,6 +304,24 @@ describe("API data source", () => {
     });
   });
 
+  it("passes AbortSignal through read requests so stale API loads can be cancelled", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => jsonResponse({}));
+    const controller = new AbortController();
+    const dataSource = createApiDataSource("");
+
+    await dataSource.getIssueDetail("ENG-124", controller.signal);
+    await dataSource.getTranscript("run-124", controller.signal);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/web/issues/ENG-124", {
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/web/sessions/run-124/transcript", {
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+  });
+
   it("loads GET /api/v1/web/orchestrator-chat from the configured API base URL", async () => {
     const chat: ChatMessage[] = [
       { who: "agent", text: "Chat loaded from the API.", suggestions: ["Inspect ENG-108"] },
