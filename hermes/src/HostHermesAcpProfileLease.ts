@@ -82,6 +82,8 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_PROFILE_PREFIX = "symphony";
 const DEFAULT_RESERVED_PROFILE_NAMES = new Set(["default"]);
 
+type HostHermesAcpProfileLeaseProfileDisposition = "created" | "reused";
+
 export async function createHostHermesAcpProfileLease(
   options: HostHermesAcpProfileLeaseOptions,
 ): Promise<HostHermesAcpProfileLease> {
@@ -102,7 +104,7 @@ export async function createHostHermesAcpProfileLease(
     runner,
   });
 
-  await runRequiredHostHermesAcpCommand(runner, binaryPath, buildHostHermesAcpCreateProfileArgs(profileName, sourceProfile), {
+  const profileDisposition = await acquireHostHermesAcpLeaseProfile(runner, binaryPath, profileName, sourceProfile, {
     cwd,
     env,
     timeoutMs,
@@ -117,8 +119,12 @@ export async function createHostHermesAcpProfileLease(
     acpCommand,
     async dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult> {
       if (disposed) return { profileName, reason: "already_disposed", deleted: false };
-      disposed = true;
+      if (profileDisposition === "reused") {
+        disposed = true;
+        return { profileName, reason: "retained", deleted: false };
+      }
       if (!shouldDeleteHostHermesAcpProfile({ keepProfiles, terminalStatus })) {
+        disposed = true;
         return { profileName, reason: "retained", deleted: false };
       }
       await runRequiredHostHermesAcpCommand(runner, binaryPath, buildHostHermesAcpDeleteProfileArgs(profileName), {
@@ -126,6 +132,7 @@ export async function createHostHermesAcpProfileLease(
         env,
         timeoutMs,
       });
+      disposed = true;
       return { profileName, reason: "deleted", deleted: true };
     },
   };
@@ -240,26 +247,72 @@ export function shouldDeleteHostHermesAcpProfile(input: {
   return true;
 }
 
+async function acquireHostHermesAcpLeaseProfile(
+  runner: HostHermesAcpCommandRunner,
+  file: string,
+  profileName: string,
+  sourceProfile: string,
+  options: HostHermesAcpCommandOptions,
+): Promise<HostHermesAcpProfileLeaseProfileDisposition> {
+  if (isSameHostHermesAcpProfileName(profileName, sourceProfile)) return "reused";
+
+  const args = buildHostHermesAcpCreateProfileArgs(profileName, sourceProfile);
+  const result = await runHostHermesAcpCommand(runner, file, args, options);
+  if (result.exitCode === 0) return "created";
+  if (typeof result.exitCode === "number" && isExpectedExistingHostHermesAcpProfile(result, profileName)) return "reused";
+  throw hostHermesAcpCommandResultError(result, file, args);
+}
+
 async function runRequiredHostHermesAcpCommand(
   runner: HostHermesAcpCommandRunner,
   file: string,
   args: readonly string[],
   options: HostHermesAcpCommandOptions,
 ): Promise<HostHermesAcpCommandResult> {
-  let result: HostHermesAcpCommandResult;
+  const result = await runHostHermesAcpCommand(runner, file, args, options);
+  if (result.exitCode !== 0) throw hostHermesAcpCommandResultError(result, file, args);
+  return { ...result, exitCode: result.exitCode };
+}
+
+async function runHostHermesAcpCommand(
+  runner: HostHermesAcpCommandRunner,
+  file: string,
+  args: readonly string[],
+  options: HostHermesAcpCommandOptions,
+): Promise<HostHermesAcpCommandResult> {
   try {
-    result = await runner(file, args, options);
+    return await runner(file, args, options);
   } catch (error) {
-    throw new Error(`Host Hermes command failed: ${file} ${args.join(" ")}: ${errorMessage(error)}`);
+    const output = commandFailureOutput(commandErrorOutput(error, "stdout"), commandErrorOutput(error, "stderr"));
+    throw new Error(`Host Hermes command failed: ${file} ${args.join(" ")}: ${errorMessage(error)}${output ? `\n${output}` : ""}`);
   }
-  const exitCode = result.exitCode ?? 0;
-  if (exitCode !== 0) {
-    const output = [result.stdout, result.stderr].map((part) => part.trim()).filter((part) => part.length > 0).join("\n");
-    throw new Error(
-      `Host Hermes command failed with exit code ${exitCode}: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`,
-    );
+}
+
+function hostHermesAcpCommandResultError(result: HostHermesAcpCommandResult, file: string, args: readonly string[]): Error {
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const exitCode = result.exitCode;
+  if (exitCode === null || exitCode === undefined) {
+    const output = commandFailureOutput(stdout, stderr);
+    return new Error(`Host Hermes command ended without an exit code: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`);
   }
-  return { ...result, exitCode };
+  const output = commandFailureOutput(stdout, stderr);
+  return new Error(
+    `Host Hermes command failed with exit code ${exitCode}: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`,
+  );
+}
+
+function isExpectedExistingHostHermesAcpProfile(result: HostHermesAcpCommandResult, profileName: string): boolean {
+  const output = stripAnsi(`${result.stdout}\n${result.stderr}`).replace(/\r/g, "");
+  const escapedProfileName = escapeRegExp(profileName);
+  return (
+    /\balready\s+exists\b/i.test(output) &&
+    new RegExp(`(^|[^a-z0-9_-])${escapedProfileName}([^a-z0-9_-]|$)`, "i").test(output)
+  );
+}
+
+function isSameHostHermesAcpProfileName(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
 function defaultHostHermesAcpCommandRunner(
@@ -273,12 +326,23 @@ function defaultHostHermesAcpCommandRunner(
       [...args],
       { cwd: options.cwd, env: options.env, timeout: options.timeoutMs, windowsHide: true },
       (error, stdout, stderr) => {
+        const stdoutText = commandOutputToString(stdout);
+        const stderrText = commandOutputToString(stderr);
         if (error) {
-          Object.assign(error, { stdout, stderr });
+          const commandError = error as NodeJS.ErrnoException & { killed?: boolean; signal?: NodeJS.Signals | string | null };
+          if (typeof commandError.code === "number") {
+            resolve({ stdout: stdoutText, stderr: stderrText, exitCode: commandError.code });
+            return;
+          }
+          if (commandError.killed || commandError.signal) {
+            resolve({ stdout: stdoutText, stderr: stderrText, exitCode: null });
+            return;
+          }
+          Object.assign(error, { stdout: stdoutText, stderr: stderrText });
           reject(error);
           return;
         }
-        resolve({ stdout: commandOutputToString(stdout), stderr: commandOutputToString(stderr), exitCode: 0 });
+        resolve({ stdout: stdoutText, stderr: stderrText, exitCode: 0 });
       },
     );
   });
@@ -353,7 +417,26 @@ function commandOutputToString(value: string | Buffer): string {
   return typeof value === "string" ? value : value.toString("utf8");
 }
 
+function commandFailureOutput(stdout: string, stderr: string): string {
+  return [stdout, stderr]
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .join("\n");
+}
+
+function commandErrorOutput(error: unknown, key: "stdout" | "stderr"): string {
+  if (!error || typeof error !== "object") return "";
+  const value = (error as Record<string, unknown>)[key];
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  return "";
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
