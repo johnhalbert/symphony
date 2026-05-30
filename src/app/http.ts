@@ -110,7 +110,8 @@ export class StatusServer {
   constructor(private readonly options: StatusServerOptions) {}
 
   configuredWebAssetsRoot(): string | null {
-    return this.options.webAssetsRoot ?? null;
+    const configured = this.options.webAssetsRoot?.trim() ?? "";
+    return configured.length > 0 ? configured : null;
   }
 
   async start(): Promise<{ host: string; port: number }> {
@@ -751,8 +752,13 @@ export class StatusServer {
     const assetsRoot = this.configuredWebAssetsRoot();
     if (assetsRoot === null) return false;
 
-    const resolvedRoot = path.resolve(assetsRoot);
     const sendBody = request.method !== "HEAD";
+    const resolvedRoot = await resolveWebAssetsRoot(assetsRoot);
+    if (resolvedRoot === null) {
+      sendPlain(response, 404, "Web asset not found\n", sendBody);
+      return true;
+    }
+
     if (url.pathname === "/web") {
       response.writeHead(308, { location: "/web/", "cache-control": "no-cache" });
       response.end();
@@ -765,25 +771,11 @@ export class StatusServer {
       return true;
     }
 
-    const assetPath = resolveWebAssetPath(resolvedRoot, relativePath);
-    if (assetPath === null) {
-      sendPlain(response, 404, "Web asset not found\n", sendBody);
+    const webPath = relativePath === "" ? "index.html" : relativePath;
+    const asset = await resolveRegularWebAsset(resolvedRoot, webPath);
+    if (asset) {
+      await sendFile(response, asset.path, asset.stat, webPath, sendBody);
       return true;
-    }
-
-    const assetStat = await statRegularFile(assetPath);
-    if (assetStat) {
-      await sendFile(response, assetPath, assetStat, relativePath, sendBody);
-      return true;
-    }
-
-    if (shouldServeWebIndexFallback(relativePath)) {
-      const indexPath = resolveWebAssetPath(resolvedRoot, "index.html");
-      const indexStat = indexPath === null ? null : await statRegularFile(indexPath);
-      if (indexPath !== null && indexStat) {
-        await sendFile(response, indexPath, indexStat, "index.html", sendBody, { cacheControl: "no-cache" });
-        return true;
-      }
     }
 
     sendPlain(response, 404, "Web asset not found\n", sendBody);
@@ -1092,29 +1084,42 @@ function decodeWebAssetRelativePath(pathname: string): string | null {
   }
 }
 
-function resolveWebAssetPath(root: string, relativePath: string): string | null {
-  const candidate = path.resolve(root, relativePath || ".");
-  const relativeFromRoot = path.relative(root, candidate);
-  if (relativeFromRoot === "" || (!relativeFromRoot.startsWith("..") && !path.isAbsolute(relativeFromRoot))) {
-    return candidate;
-  }
-  return null;
+interface ResolvedWebAsset {
+  path: string;
+  stat: Stats;
 }
 
-async function statRegularFile(filePath: string): Promise<Stats | null> {
+async function resolveWebAssetsRoot(root: string): Promise<string | null> {
   try {
-    const stat = await fs.stat(filePath);
-    return stat.isFile() ? stat : null;
+    const realRoot = await fs.realpath(path.resolve(root));
+    const stat = await fs.stat(realRoot);
+    return stat.isDirectory() ? realRoot : null;
   } catch {
     return null;
   }
 }
 
-function shouldServeWebIndexFallback(relativePath: string): boolean {
-  if (relativePath === "") return true;
-  if (relativePath === "index.html") return true;
-  if (relativePath.startsWith("assets/")) return false;
-  return !path.posix.basename(relativePath).includes(".");
+function isPathInsideRoot(root: string, target: string): boolean {
+  const relativeFromRoot = path.relative(root, target);
+  return relativeFromRoot === "" || (!relativeFromRoot.startsWith("..") && !path.isAbsolute(relativeFromRoot));
+}
+
+function resolveWebAssetPath(root: string, relativePath: string): string | null {
+  const candidate = path.resolve(root, relativePath || ".");
+  return isPathInsideRoot(root, candidate) ? candidate : null;
+}
+
+async function resolveRegularWebAsset(root: string, relativePath: string): Promise<ResolvedWebAsset | null> {
+  const candidate = resolveWebAssetPath(root, relativePath);
+  if (candidate === null) return null;
+  try {
+    const realPath = await fs.realpath(candidate);
+    if (!isPathInsideRoot(root, realPath)) return null;
+    const stat = await fs.stat(realPath);
+    return stat.isFile() ? { path: realPath, stat } : null;
+  } catch {
+    return null;
+  }
 }
 
 function cacheControlForWebPath(webPath: string): string {
