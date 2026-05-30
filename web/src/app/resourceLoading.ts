@@ -22,7 +22,7 @@ export function resolveAppResourceLoading(activeTab: AppTab, apiMode: boolean): 
   }
 
   return {
-    referenceData: activeTab === "issues",
+    referenceData: true,
     dashboard: activeTab === "dashboard",
     issueBoard: activeTab === "issues",
     history: activeTab === "history",

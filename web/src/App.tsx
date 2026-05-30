@@ -62,6 +62,12 @@ function MockReferenceDataBoundary() {
   return <AppShell initialReferenceData={reference.data} />;
 }
 
+function referenceStatusLabel(reference: { data: ReferenceData | null; loading: boolean; error: string | null }) {
+  if (reference.error && !reference.data) return "reference unavailable";
+  if (reference.loading && !reference.data) return "reference loading";
+  return null;
+}
+
 function AppShell({
   initialReferenceData,
   lazyReferenceData = false,
@@ -79,6 +85,7 @@ function AppShell({
 
   const reference = useReferenceResource({ enabled: lazyReferenceData && resourceLoading.referenceData });
   const referenceData = lazyReferenceData ? (reference.data ?? initialReferenceData) : initialReferenceData;
+  const referenceLabel = lazyReferenceData ? referenceStatusLabel(reference) : null;
   const dashboard = useDashboard({ enabled: resourceLoading.dashboard });
   const issueBoard = useIssueBoard({ enabled: resourceLoading.issueBoard });
   const history = useHistory({ enabled: resourceLoading.history });
@@ -98,7 +105,12 @@ function AppShell({
           branch={apiMode ? (dashboardChrome?.branch ?? "") : undefined}
           pollLabel={apiMode ? (dashboardChrome?.pollLabel ?? "poll pending") : undefined}
           agentUsageLabel={apiMode ? (dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`) : undefined}
-          dataSourceLabel={`api source · ${defaultDataSourceConfig.mode}`}
+          dataSourceLabel={[
+            `api source · ${defaultDataSourceConfig.mode}`,
+            apiMode ? referenceLabel : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
           rightSlot={
             <ViewControls
               activeTab={activeTab}

@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveAppResourceLoading } from "../src/app/resourceLoading";
 import type { SymphonyDataSource } from "../src/data/dataSource";
+import { fallbackReferenceData } from "../src/data/referenceDataContext";
 import type {
   AppTab,
   ChatMessage,
@@ -372,9 +373,11 @@ async function renderAppWithMocks({
 async function renderIssuesViewWithDetail({
   board,
   detail = loaded(apiSelectedIssueDetail),
+  referenceData = apiReferenceData,
 }: {
   board: IssueBoardModel;
   detail?: Loadable<IssueDetailModel | null>;
+  referenceData?: ReferenceData;
 }) {
   vi.resetModules();
   const requestedIssueIds: Array<string | null> = [];
@@ -392,7 +395,7 @@ async function renderIssuesViewWithDetail({
   ]);
 
   const markup = renderToStaticMarkup(
-    <ReferenceDataProvider value={apiReferenceData}>
+    <ReferenceDataProvider value={referenceData}>
       <IssuesView board={board} />
     </ReferenceDataProvider>,
   );
@@ -425,7 +428,7 @@ afterEach(() => {
 });
 
 describe("App API-mode rendering", () => {
-  it("resolves tab-scoped resource loading for API mode and preserves mock-mode eager loading", () => {
+  it("resolves global reference-data and tab-scoped resource loading for API mode while preserving mock-mode eager loading", () => {
     const allResourcesEnabled = {
       referenceData: true,
       dashboard: true,
@@ -438,7 +441,7 @@ describe("App API-mode rendering", () => {
 
     const expectedApiLoadingByTab: Record<AppTab, ReturnType<typeof resolveAppResourceLoading>> = {
       dashboard: {
-        referenceData: false,
+        referenceData: true,
         dashboard: true,
         issueBoard: false,
         history: false,
@@ -454,7 +457,7 @@ describe("App API-mode rendering", () => {
         orchestratorChat: false,
       },
       history: {
-        referenceData: false,
+        referenceData: true,
         dashboard: false,
         issueBoard: false,
         history: true,
@@ -462,7 +465,7 @@ describe("App API-mode rendering", () => {
         orchestratorChat: false,
       },
       sidebar: {
-        referenceData: false,
+        referenceData: true,
         dashboard: false,
         issueBoard: false,
         history: false,
@@ -470,7 +473,7 @@ describe("App API-mode rendering", () => {
         orchestratorChat: true,
       },
       states: {
-        referenceData: false,
+        referenceData: true,
         dashboard: false,
         issueBoard: false,
         history: false,
@@ -490,7 +493,7 @@ describe("App API-mode rendering", () => {
   it("renders the loaded API dashboard through the app shell without mock chrome or embedded chat fallbacks", async () => {
     const { hookCalls, markup } = await renderAppWithMocks();
 
-    expect(hookCalls.reference).toEqual([{ enabled: false }]);
+    expect(hookCalls.reference).toEqual([{ enabled: true }]);
     expect(hookCalls.dashboard).toEqual([{ enabled: true }]);
     expect(hookCalls.issueBoard).toEqual([{ enabled: false }]);
     expect(hookCalls.history).toEqual([{ enabled: false }]);
@@ -538,7 +541,7 @@ describe("App API-mode rendering", () => {
       }),
     });
 
-    expect(hookCalls.reference).toEqual([{ enabled: false }]);
+    expect(hookCalls.reference).toEqual([{ enabled: true }]);
     expect(hookCalls.sidebar).toEqual([{ enabled: false }]);
     expect(markup).toContain("Symphony API returned HTTP 503");
     expect(markup).toContain("api source · api");
@@ -551,20 +554,43 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("dashboard embedded fallback should not render");
   });
 
-  it("does not start or block on API reference data while the dashboard is active and keeps inactive API views disabled", async () => {
+  it("starts non-blocking API reference data while the dashboard is active and keeps inactive API views disabled", async () => {
     const { hookCalls, markup } = await renderAppWithMocks({
       hooks: appHookState({ reference: { data: null, loading: true, error: null } }),
     });
 
-    expect(hookCalls.reference).toEqual([{ enabled: false }]);
+    expect(hookCalls.reference).toEqual([{ enabled: true }]);
     expect(hookCalls.dashboard).toEqual([{ enabled: true }]);
     expect(hookCalls.issueBoard).toEqual([{ enabled: false }]);
     expect(hookCalls.history).toEqual([{ enabled: false }]);
     expect(hookCalls.sidebar).toEqual([{ enabled: false }]);
     expect(hookCalls.orchestratorChat).toEqual([{ enabled: true }]);
+    expect(markup).toContain("api source · api · reference loading");
     expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("Symphony · api-branch");
     expect(markup).toContain("API full-app chat");
     expect(markup).not.toContain("Loading Symphony design data...");
+    expect(markup).not.toContain("Reference data unavailable.");
+    expect(markup).not.toContain("openai/symphony");
+  });
+
+  it("keeps the API app shell usable when reference data fails", async () => {
+    const { hookCalls, markup } = await renderAppWithMocks({
+      hooks: appHookState({ reference: failed("Symphony API returned HTTP 503 for reference data") }),
+    });
+
+    expect(hookCalls.reference).toEqual([{ enabled: true }]);
+    expect(hookCalls.dashboard).toEqual([{ enabled: true }]);
+    expect(hookCalls.issueBoard).toEqual([{ enabled: false }]);
+    expect(hookCalls.history).toEqual([{ enabled: false }]);
+    expect(hookCalls.sidebar).toEqual([{ enabled: false }]);
+    expect(hookCalls.orchestratorChat).toEqual([{ enabled: true }]);
+    expect(markup).toContain("api source · api · reference unavailable");
+    expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("Symphony · api-branch");
+    expect(markup).toContain("API full-app chat");
+    expect(markup).not.toContain("Loading Symphony design data...");
+    expect(markup).not.toContain("Reference data unavailable.");
     expect(markup).not.toContain("openai/symphony");
   });
 
@@ -581,8 +607,7 @@ describe("App API-mode rendering", () => {
     expect(hookCalls.sidebar).toEqual([]);
     expect(hookCalls.orchestratorChat).toEqual([]);
     expect(markup).toContain("Loading Symphony design data...");
-    expect(markup).not.toContain("api/repo");
-    expect(markup).not.toContain("openai/symphony");
+    expect(markup).not.toContain("api source · mock");
     expect(markup).not.toContain("API full-app chat");
   });
 
@@ -611,6 +636,20 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("Add exponential backoff to retry queue with jitter");
     expect(markup).not.toContain("Backoff curve");
     expect(markup).not.toContain("No issue activity in the mock data.");
+  });
+
+  it("renders API issue references with deterministic fallback labels and users", async () => {
+    const { markup } = await renderIssuesViewWithDetail({ board: apiIssueBoard, referenceData: fallbackReferenceData });
+
+    expect(markup).toContain("api-render");
+    expect(markup).toContain("api-detail");
+    expect(markup).toContain("api-owner");
+    expect(markup).toContain("API issue detail title from GET /api/v1/web/issues/API-SELECTED");
+
+    expect(markup).not.toContain("API Owner");
+    expect(markup).not.toContain("API Reviewer");
+    expect(markup).not.toContain("orchestrator");
+    expect(markup).not.toContain("feature");
   });
 
   it("renders API empty-board and 200-null issue-detail boundaries without mock fallbacks", async () => {
