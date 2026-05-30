@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,7 @@ import { createServer } from "vite";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(__dirname, "..");
+const webDistRoot = path.resolve(webRoot, "dist");
 const requestLog = [];
 const browserDevtoolsTimeoutMs = parsePositiveInteger(process.env.SYMPHONY_WEB_BROWSER_DEVTOOLS_TIMEOUT_MS, 30_000);
 
@@ -217,7 +218,19 @@ const sidebar = {
   totals,
 };
 
+function smokeModeFromArgs(args) {
+  if (args.includes("--production") || args.includes("--prod")) return "production";
+  return "vite";
+}
+
 async function main() {
+  requestLog.length = 0;
+  const mode = smokeModeFromArgs(process.argv.slice(2));
+  if (mode === "production") await runProductionServingSmoke();
+  else await runViteProxySmoke();
+}
+
+async function runViteProxySmoke() {
   let apiServer = null;
   let viteServer = null;
   let userDataDir = null;
@@ -262,115 +275,8 @@ async function main() {
     const browser = await openBrowserPage(browserExecutable, `${viteOrigin}/`, userDataDir);
     browserProcess = browser.process;
     const page = browser.page;
-
-    await page.command("Runtime.enable");
-    await page.command("Page.enable");
-    await page.command("Page.navigate", { url: `${viteOrigin}/` });
-    await page.waitForEvent("Page.loadEventFired", 10_000).catch(() => undefined);
-
-    const staleChatMarkers = [
-      "STALE dashboard embedded chat should not render",
-      "STALE dashboard suggestion should not render",
-      "STALE sidebar embedded chat should not render",
-      "STALE sidebar suggestion should not render",
-    ];
-    const staleTranscriptMarkers = [
-      "STALE embedded history transcript should not render",
-    ];
-    const mockUiMarkers = ["openai/symphony", "Restart SYM-42"];
-    const forbiddenMarkers = [...mockUiMarkers, ...staleChatMarkers];
-    const forbiddenSelectedTranscriptMarkers = [...forbiddenMarkers, ...staleTranscriptMarkers];
-
-    await waitForBrowserText(page, "dashboard API-mode data through the Vite proxy", {
-      include: [
-        "api source · api",
-        "proxy/symphony",
-        "vite-proxy-smoke",
-        "Proxy Smoke Vite agent",
-        "smoke-api-worker",
-        "through Vite proxy",
-        "Dedicated orchestrator chat from API endpoint",
-      ],
-      exclude: forbiddenMarkers,
-    });
-
-    await waitForBrowserText(page, "dashboard orchestrator chat read-only API-mode guard", {
-      include: [
-        "Dedicated smoke suggestion",
-        "API mode shows durable chat history only",
-        "Sending commands from this web chat is not supported yet",
-        "no orchestrator action will be dispatched",
-      ],
-      exclude: forbiddenMarkers,
-    });
-    await assertButtonDisabledByText(page, "Dedicated smoke suggestion", "dedicated orchestrator chat suggestion");
-    await clickButtonByText(page, "Dedicated smoke suggestion", "disabled dedicated orchestrator chat suggestion");
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    assertNoObservedEndpoint("POST /api/v1/web/orchestrator-chat");
-
-    await clickButtonByAriaLabel(page, "Issues", "Issues tab");
-    await waitForBrowserText(page, "issues tab issue cards", {
-      include: ["Proxy smoke cycle", "Default issue summary before smoke selection", "PROXY-1"],
-      exclude: forbiddenMarkers,
-    });
-    await clickButtonByText(page, "PROXY-1", "PROXY-1 issue card");
-    await waitForBrowserText(page, "PROXY-1 issue detail rendered from the dedicated API endpoint", {
-      include: [
-        "Dedicated issue detail via Vite proxy.",
-        "web-smoke-detail-workspace",
-        "smoke-session-detail",
-        "dedicated issue detail endpoint",
-      ],
-      exclude: forbiddenMarkers,
-    });
-
-    await clickButtonByAriaLabel(page, "Chat history", "Chat history tab");
-    await waitForBrowserText(page, "history session list", {
-      include: ["Default stale history session", "Browser proxy smoke session"],
-      exclude: forbiddenMarkers,
-    });
-    await clickButtonByText(page, "Browser proxy smoke session", "smoke transcript session row");
-    await waitForBrowserText(page, "selected history transcript rendered from the transcript API endpoint", {
-      include: ["Browser proxy smoke session", "smoke-session", "Dedicated session transcript from API endpoint"],
-      exclude: forbiddenSelectedTranscriptMarkers,
-    });
-
-    await clickButtonByAriaLabel(page, "Sidebars", "Sidebars tab");
-    await waitForBrowserText(page, "sidebar summary rendered from API data", {
-      include: [
-        "Sidebar summary API agent",
-        "Loaded through sidebar summary API",
-        "sidebar-summary-worker",
-        "summarized",
-        "SIDEBAR-SMOKE",
-        "33%",
-        "3 total issues",
-      ],
-      exclude: forbiddenMarkers,
-    });
-    await selectOption(page, 'select[aria-label="Sidebar variant"]', "chat", "sidebar chat variant");
-    await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload and read-only guard", {
-      include: [
-        "Dedicated orchestrator chat from API endpoint",
-        "Dedicated smoke suggestion",
-        "read-only API mode",
-        "Sending commands from this compact chat is not supported yet",
-      ],
-      exclude: forbiddenMarkers,
-    });
-    await assertButtonDisabledByText(page, "Dedicated smoke suggestion", "sidebar dedicated orchestrator chat suggestion");
-
-    assertObservedEndpoints([
-      "GET /api/v1/web/reference-data",
-      "GET /api/v1/web/dashboard",
-      "GET /api/v1/web/issues",
-      "GET /api/v1/web/issues/PROXY-1",
-      "GET /api/v1/web/history",
-      "GET /api/v1/web/sessions/smoke-session/transcript",
-      "GET /api/v1/web/sidebar",
-      "GET /api/v1/web/orchestrator-chat",
-    ]);
-    assertNoObservedEndpoint("POST /api/v1/web/orchestrator-chat");
+    await prepareBrowserPage(page, `${viteOrigin}/`);
+    await runBrowserSmokeAssertions(page);
 
     await page.close();
     await stopBrowserProcess(browserProcess);
@@ -387,6 +293,194 @@ async function main() {
   }
 }
 
+async function runProductionServingSmoke() {
+  let productionServer = null;
+  let userDataDir = null;
+  let browserProcess = null;
+
+  try {
+    const production = await startProductionWebServer();
+    productionServer = production.server;
+    const productionOrigin = production.origin;
+
+    await assertProductionStaticServing(productionOrigin);
+    const dashboardFromSameOriginApi = await fetchJson(`${productionOrigin}/api/v1/web/dashboard`);
+    assert(
+      dashboardFromSameOriginApi.branch === dashboard.branch,
+      `Expected production same-origin API to return dashboard branch ${dashboard.branch}, got ${dashboardFromSameOriginApi.branch}`,
+    );
+
+    const browserExecutable = await findBrowserExecutable();
+    userDataDir = await mkdtemp(path.join(os.tmpdir(), "symphony-web-production-smoke-"));
+    const browser = await openBrowserPage(browserExecutable, `${productionOrigin}/web/issues/PROXY-1`, userDataDir);
+    browserProcess = browser.process;
+    const page = browser.page;
+    await prepareBrowserPage(page, `${productionOrigin}/web/issues/PROXY-1`);
+    await runBrowserSmokeAssertions(page);
+
+    await page.close();
+    await stopBrowserProcess(browserProcess);
+    browserProcess = null;
+    console.log(
+      `Browser production smoke passed: built assets from ${webDistRoot} served at ${productionOrigin}/web/ with ${requestLog.length} same-origin API request(s).`,
+    );
+  } finally {
+    if (browserProcess) await stopBrowserProcess(browserProcess);
+    if (productionServer) await closeServer(productionServer);
+    if (userDataDir) await rm(userDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  }
+}
+
+async function prepareBrowserPage(page, url) {
+  await page.command("Runtime.enable");
+  await page.command("Page.enable");
+  await page.command("Page.navigate", { url });
+  await page.waitForEvent("Page.loadEventFired", 10_000).catch(() => undefined);
+}
+
+async function runBrowserSmokeAssertions(page) {
+  const staleChatMarkers = [
+    "STALE dashboard embedded chat should not render",
+    "STALE dashboard suggestion should not render",
+    "STALE sidebar embedded chat should not render",
+    "STALE sidebar suggestion should not render",
+  ];
+  const staleTranscriptMarkers = [
+    "STALE embedded history transcript should not render",
+  ];
+  const mockUiMarkers = ["openai/symphony", "Restart SYM-42"];
+  const forbiddenMarkers = [...mockUiMarkers, ...staleChatMarkers];
+  const forbiddenSelectedTranscriptMarkers = [...forbiddenMarkers, ...staleTranscriptMarkers];
+
+  await waitForBrowserText(page, "dashboard API-mode data", {
+    include: [
+      "api source · api",
+      "proxy/symphony",
+      "vite-proxy-smoke",
+      "Proxy Smoke Vite agent",
+      "smoke-api-worker",
+      "through Vite proxy",
+      "Dedicated orchestrator chat from API endpoint",
+    ],
+    exclude: forbiddenMarkers,
+  });
+
+  await waitForBrowserText(page, "dashboard orchestrator chat read-only API-mode guard", {
+    include: [
+      "Dedicated smoke suggestion",
+      "API mode shows durable chat history only",
+      "Sending commands from this web chat is not supported yet",
+      "no orchestrator action will be dispatched",
+    ],
+    exclude: forbiddenMarkers,
+  });
+  await assertButtonDisabledByText(page, "Dedicated smoke suggestion", "dedicated orchestrator chat suggestion");
+  await clickButtonByText(page, "Dedicated smoke suggestion", "disabled dedicated orchestrator chat suggestion");
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assertNoObservedEndpoint("POST /api/v1/web/orchestrator-chat");
+
+  await clickButtonByAriaLabel(page, "Issues", "Issues tab");
+  await waitForBrowserText(page, "issues tab issue cards", {
+    include: ["Proxy smoke cycle", "Default issue summary before smoke selection", "PROXY-1"],
+    exclude: forbiddenMarkers,
+  });
+  await clickButtonByText(page, "PROXY-1", "PROXY-1 issue card");
+  await waitForBrowserText(page, "PROXY-1 issue detail rendered from the dedicated API endpoint", {
+    include: [
+      "Dedicated issue detail via Vite proxy.",
+      "web-smoke-detail-workspace",
+      "smoke-session-detail",
+      "dedicated issue detail endpoint",
+    ],
+    exclude: forbiddenMarkers,
+  });
+
+  await clickButtonByAriaLabel(page, "Chat history", "Chat history tab");
+  await waitForBrowserText(page, "history session list", {
+    include: ["Default stale history session", "Browser proxy smoke session"],
+    exclude: forbiddenMarkers,
+  });
+  await clickButtonByText(page, "Browser proxy smoke session", "smoke transcript session row");
+  await waitForBrowserText(page, "selected history transcript rendered from the transcript API endpoint", {
+    include: ["Browser proxy smoke session", "smoke-session", "Dedicated session transcript from API endpoint"],
+    exclude: forbiddenSelectedTranscriptMarkers,
+  });
+
+  await clickButtonByAriaLabel(page, "Sidebars", "Sidebars tab");
+  await waitForBrowserText(page, "sidebar summary rendered from API data", {
+    include: [
+      "Sidebar summary API agent",
+      "Loaded through sidebar summary API",
+      "sidebar-summary-worker",
+      "summarized",
+      "SIDEBAR-SMOKE",
+      "33%",
+      "3 total issues",
+    ],
+    exclude: forbiddenMarkers,
+  });
+  await selectOption(page, 'select[aria-label="Sidebar variant"]', "chat", "sidebar chat variant");
+  await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload and read-only guard", {
+    include: [
+      "Dedicated orchestrator chat from API endpoint",
+      "Dedicated smoke suggestion",
+      "read-only API mode",
+      "Sending commands from this compact chat is not supported yet",
+    ],
+    exclude: forbiddenMarkers,
+  });
+  await assertButtonDisabledByText(page, "Dedicated smoke suggestion", "sidebar dedicated orchestrator chat suggestion");
+
+  assertObservedEndpoints([
+    "GET /api/v1/web/reference-data",
+    "GET /api/v1/web/dashboard",
+    "GET /api/v1/web/issues",
+    "GET /api/v1/web/issues/PROXY-1",
+    "GET /api/v1/web/history",
+    "GET /api/v1/web/sessions/smoke-session/transcript",
+    "GET /api/v1/web/sidebar",
+    "GET /api/v1/web/orchestrator-chat",
+  ]);
+  assertNoObservedEndpoint("POST /api/v1/web/orchestrator-chat");
+}
+
+async function assertProductionStaticServing(origin) {
+  const root = await fetch(`${origin}/web/`);
+  assert(root.ok, `Expected production /web/ to return 2xx, got HTTP ${root.status}`);
+  assert(root.headers.get("content-type")?.includes("text/html"), `Expected /web/ HTML content-type, got ${root.headers.get("content-type")}`);
+  assert(root.headers.get("cache-control") === "no-cache", `Expected /web/ no-cache, got ${root.headers.get("cache-control")}`);
+  const html = await root.text();
+  assert(html.includes('<div id="root"'), "Production /web/ did not return the built React shell");
+  assert(html.includes('/web/assets/'), "Production /web/ shell does not reference /web/-scoped built assets");
+  assert(!html.includes('/src/main.tsx'), "Production /web/ returned a dev-server HTML entry instead of built assets");
+
+  const assetPaths = Array.from(html.matchAll(/(?:src|href)="(\/web\/assets\/[^"]+)"/g), (match) => match[1]);
+  assert(assetPaths.length > 0, "Production /web/ shell did not include built asset URLs");
+  for (const assetPath of assetPaths.slice(0, 2)) {
+    const asset = await fetch(`${origin}${assetPath}`);
+    assert(asset.ok, `Expected built asset ${assetPath} to return 2xx, got HTTP ${asset.status}`);
+    assert(
+      asset.headers.get("cache-control") === "public, max-age=31536000, immutable",
+      `Expected immutable cache header for ${assetPath}, got ${asset.headers.get("cache-control")}`,
+    );
+    await asset.arrayBuffer();
+  }
+
+  const deepLink = await fetch(`${origin}/web/issues/PROXY-1`);
+  assert(deepLink.ok, `Expected /web/issues/PROXY-1 SPA fallback to return 2xx, got HTTP ${deepLink.status}`);
+  assert(deepLink.headers.get("content-type")?.includes("text/html"), `Expected deep-link HTML, got ${deepLink.headers.get("content-type")}`);
+  const deepLinkHtml = await deepLink.text();
+  assert(deepLinkHtml.includes('<div id="root"'), "Production deep-link fallback did not return the built React shell");
+
+  const missingAsset = await fetch(`${origin}/web/assets/missing.js`, { headers: { Accept: "application/json" } });
+  assert(missingAsset.status === 404, `Expected missing production asset to return 404, got HTTP ${missingAsset.status}`);
+  const missingBody = await missingAsset.json();
+  assert(
+    missingBody?.error?.message === "Static asset not found",
+    `Expected missing production asset JSON 404, got ${JSON.stringify(missingBody)}`,
+  );
+}
+
 function restoreEnv(originalEnv) {
   for (const [key, value] of Object.entries(originalEnv)) {
     if (value === undefined) delete process.env[key];
@@ -398,32 +492,7 @@ async function startFakeApiServer() {
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     requestLog.push({ method: request.method ?? "GET", path: url.pathname });
-
-    if (request.method === "GET" && url.pathname === "/api/v1/web/reference-data") return sendJson(response, 200, referenceData);
-    if (request.method === "GET" && url.pathname === "/api/v1/web/dashboard") return sendJson(response, 200, dashboard);
-    if (request.method === "GET" && url.pathname === "/api/v1/web/issues") return sendJson(response, 200, issueBoard);
-    if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") return sendJson(response, 200, sidebar);
-    if (request.method === "GET" && url.pathname === "/api/v1/web/history") return sendJson(response, 200, history);
-    if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") return sendJson(response, 200, orchestratorChat);
-    if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-1") {
-      return sendJson(response, 200, { issue: issueDetail, activity: issueDetail.activity, runs: [session], transcript });
-    }
-    if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-0") {
-      return sendJson(response, 200, { issue: staleIssueDetail, activity: [], runs: [staleSession], transcript: staleTranscript });
-    }
-    if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/smoke-session/transcript") return sendJson(response, 200, transcript);
-    if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/stale-session/transcript") return sendJson(response, 200, staleTranscript);
-    if (request.method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
-      const bodyText = await readRequestBody(request);
-      const input = parseChatInput(bodyText) ?? "browser smoke input";
-      return sendJson(response, 200, [
-        ...orchestratorChat,
-        { who: "user", text: input },
-        { who: "agent", text: "Dedicated chat POST acknowledgement from API", suggestions: ["POST guard observed"] },
-      ]);
-    }
-
-    return sendJson(response, 404, { error: { code: "not_found", path: url.pathname } });
+    await handleFakeApiRequest(request, response, url);
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -435,6 +504,174 @@ async function startFakeApiServer() {
   const address = server.address();
   assert(address && typeof address === "object", "Fake API server did not expose a TCP address");
   return { server, origin: `http://127.0.0.1:${address.port}` };
+}
+
+async function handleFakeApiRequest(request, response, url) {
+  if (request.method === "GET" && url.pathname === "/api/v1/web/reference-data") return sendJson(response, 200, referenceData);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/dashboard") return sendJson(response, 200, dashboard);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/issues") return sendJson(response, 200, issueBoard);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") return sendJson(response, 200, sidebar);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/history") return sendJson(response, 200, history);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") return sendJson(response, 200, orchestratorChat);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-1") {
+    return sendJson(response, 200, { issue: issueDetail, activity: issueDetail.activity, runs: [session], transcript });
+  }
+  if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-0") {
+    return sendJson(response, 200, { issue: staleIssueDetail, activity: [], runs: [staleSession], transcript: staleTranscript });
+  }
+  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/smoke-session/transcript") return sendJson(response, 200, transcript);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/stale-session/transcript") return sendJson(response, 200, staleTranscript);
+  if (request.method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
+    const bodyText = await readRequestBody(request);
+    const input = parseChatInput(bodyText) ?? "browser smoke input";
+    return sendJson(response, 200, [
+      ...orchestratorChat,
+      { who: "user", text: input },
+      { who: "agent", text: "Dedicated chat POST acknowledgement from API", suggestions: ["POST guard observed"] },
+    ]);
+  }
+
+  return sendJson(response, 404, { error: { code: "not_found", path: url.pathname } });
+}
+
+async function startProductionWebServer() {
+  await assertReadableProductionAsset(path.join(webDistRoot, "index.html"));
+  const resolvedDistRoot = await realpath(webDistRoot);
+  const server = http.createServer(async (request, response) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    try {
+      if (url.pathname.startsWith("/api/")) {
+        requestLog.push({ method: request.method ?? "GET", path: url.pathname });
+        await handleFakeApiRequest(request, response, url);
+        return;
+      }
+
+      if ((request.method === "GET" || request.method === "HEAD") && (url.pathname === "/web" || url.pathname.startsWith("/web/"))) {
+        await serveProductionWebAsset(request, response, url, resolvedDistRoot);
+        return;
+      }
+
+      sendJson(response, 404, { error: { code: "not_found", message: "Route not found" } });
+    } catch (error) {
+      sendJson(response, 500, { error: { code: "production_smoke_error", message: error instanceof Error ? error.message : String(error) } });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  assert(address && typeof address === "object", "Production smoke server did not expose a TCP address");
+  return { server, origin: `http://127.0.0.1:${address.port}` };
+}
+
+async function assertReadableProductionAsset(filePath) {
+  try {
+    const assetStat = await stat(filePath);
+    assert(assetStat.isFile(), `Production smoke requires ${filePath} to be a file`);
+  } catch (error) {
+    throw new Error(
+      `Production smoke requires a built web bundle at ${webDistRoot}. Run npm run build --prefix web before npm run smoke:browser-production --prefix web. ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+async function serveProductionWebAsset(request, response, url, resolvedDistRoot) {
+  const assetRequest = resolveProductionWebAssetRequest(url.pathname, resolvedDistRoot);
+  if (!assetRequest) {
+    sendStaticAssetNotFound(response, request.method ?? "GET");
+    return;
+  }
+
+  if (assetRequest.relativePath === "index.html" || assetRequest.assetLike) {
+    if (await sendProductionWebAssetFile(response, request.method ?? "GET", assetRequest, resolvedDistRoot)) return;
+    sendStaticAssetNotFound(response, request.method ?? "GET");
+    return;
+  }
+
+  const fallback = { filePath: path.join(resolvedDistRoot, "index.html"), relativePath: "index.html" };
+  if (await sendProductionWebAssetFile(response, request.method ?? "GET", fallback, resolvedDistRoot)) return;
+  sendStaticAssetNotFound(response, request.method ?? "GET");
+}
+
+function resolveProductionWebAssetRequest(pathname, resolvedDistRoot) {
+  const mountRelativePath = pathname === "/web" ? "" : pathname.slice("/web/".length);
+  let decodedRelativePath;
+  try {
+    decodedRelativePath = decodeURIComponent(mountRelativePath);
+  } catch {
+    return null;
+  }
+  const segments = decodedRelativePath.split("/").filter(Boolean);
+  if (segments.some((segment) => segment === "." || segment === "..")) return null;
+  const relativePath = segments.length === 0 ? "index.html" : segments.join("/");
+  const filePath = path.resolve(resolvedDistRoot, relativePath);
+  if (!pathIsWithin(resolvedDistRoot, filePath)) return null;
+  return { filePath, relativePath, assetLike: isProductionAssetLike(relativePath, segments) };
+}
+
+function isProductionAssetLike(relativePath, segments) {
+  const firstSegment = (segments[0] ?? "").toLowerCase();
+  return ["assets", "static", "media", "images", "img", "fonts", "icons"].includes(firstSegment) || path.posix.extname(relativePath).length > 0;
+}
+
+async function sendProductionWebAssetFile(response, method, assetRequest, resolvedDistRoot) {
+  let filePath;
+  let assetStat;
+  try {
+    filePath = await realpath(assetRequest.filePath);
+    if (!pathIsWithin(resolvedDistRoot, filePath)) return false;
+    assetStat = await stat(filePath);
+  } catch {
+    return false;
+  }
+  if (!assetStat.isFile()) return false;
+
+  response.writeHead(200, {
+    "content-type": contentTypeForProductionAsset(filePath),
+    "content-length": String(assetStat.size),
+    "cache-control": assetRequest.relativePath === "index.html" ? "no-cache" : "public, max-age=31536000, immutable",
+  });
+  if (method === "HEAD") {
+    response.end();
+    return true;
+  }
+  response.end(await readFile(filePath));
+  return true;
+}
+
+function sendStaticAssetNotFound(response, method) {
+  response.writeHead(404, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  if (method === "HEAD") response.end();
+  else response.end(JSON.stringify({ error: { code: "not_found", message: "Static asset not found" } }));
+}
+
+function pathIsWithin(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function contentTypeForProductionAsset(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".html") return "text/html; charset=utf-8";
+  if (extension === ".css") return "text/css; charset=utf-8";
+  if (extension === ".js" || extension === ".mjs") return "text/javascript; charset=utf-8";
+  if (extension === ".json") return "application/json; charset=utf-8";
+  if (extension === ".svg") return "image/svg+xml";
+  if (extension === ".png") return "image/png";
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  if (extension === ".ico") return "image/x-icon";
+  if (extension === ".woff2") return "font/woff2";
+  if (extension === ".woff") return "font/woff";
+  return "application/octet-stream";
 }
 
 function sendJson(response, status, body) {
@@ -505,7 +742,7 @@ async function findBrowserExecutable() {
     if (candidate && (await canAccess(candidate))) return candidate;
   }
   throw new Error(
-    "No Chromium-compatible browser executable found. Set SYMPHONY_WEB_BROWSER_EXECUTABLE or CHROME_BIN to run the browser Vite proxy smoke.",
+    "No Chromium-compatible browser executable found. Set SYMPHONY_WEB_BROWSER_EXECUTABLE or CHROME_BIN to run the browser smoke.",
   );
 }
 
@@ -864,13 +1101,13 @@ async function selectOption(page, selector, value, description) {
 function assertObservedEndpoints(endpoints) {
   const observed = new Set(requestLog.map((entry) => `${entry.method} ${entry.path}`));
   for (const endpoint of endpoints) {
-    assert(observed.has(endpoint), `Expected fake API to receive ${endpoint} through the Vite proxy`);
+    assert(observed.has(endpoint), `Expected fake API to receive ${endpoint}`);
   }
 }
 
 function assertNoObservedEndpoint(endpoint) {
   const observed = new Set(requestLog.map((entry) => `${entry.method} ${entry.path}`));
-  assert(!observed.has(endpoint), `Expected API-mode read-only guard not to call ${endpoint} through the Vite proxy`);
+  assert(!observed.has(endpoint), `Expected API-mode read-only guard not to call ${endpoint}`);
 }
 
 function describeBrowserTextState(state) {

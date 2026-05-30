@@ -11,7 +11,8 @@
     "typecheck": "tsc -b --pretty false",
     "test": "vitest run",
     "test:watch": "vitest",
-    "smoke:browser": "node scripts/browser-vite-proxy-smoke.mjs"
+    "smoke:browser": "node scripts/browser-vite-proxy-smoke.mjs",
+    "smoke:browser-production": "node scripts/browser-vite-proxy-smoke.mjs --production"
   },
   "dependencies": {
     "react": "^18.3.1",
