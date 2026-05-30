@@ -333,6 +333,7 @@ export interface WebProjectionCacheEntry<TContext> {
 }
 
 interface WebProjectionInFlightEntry<TContext> {
+  cacheKey: string;
   fingerprintKey: string;
   promise: Promise<TContext>;
 }
@@ -351,7 +352,9 @@ export class WebProjectionContextCache<
   }
 
   delete(cacheKey: string): boolean {
-    this.inFlight.delete(cacheKey);
+    for (const [inFlightKey, entry] of this.inFlight.entries()) {
+      if (entry.cacheKey === cacheKey) this.inFlight.delete(inFlightKey);
+    }
     return this.entries.delete(cacheKey);
   }
 
@@ -376,19 +379,20 @@ export class WebProjectionContextCache<
       return cached.context;
     }
 
-    const active = this.inFlight.get(request.cacheKey);
-    if (active && !forceRefresh && active.fingerprintKey === fingerprintKey) return active.promise;
+    const inFlightKey = webProjectionInFlightCacheKey(request.cacheKey, forceRefresh, fingerprintKey);
+    const active = this.inFlight.get(inFlightKey);
+    if (active) return active.promise;
 
     const promise = this.buildContext(request, fingerprint, clock);
-    this.inFlight.set(request.cacheKey, { fingerprintKey, promise });
+    this.inFlight.set(inFlightKey, { cacheKey: request.cacheKey, fingerprintKey, promise });
     try {
       const context = await promise;
-      if (this.inFlight.get(request.cacheKey)?.promise === promise) {
+      if (this.inFlight.get(inFlightKey)?.promise === promise) {
         this.entries.set(request.cacheKey, { cacheKey: request.cacheKey, storedAt: context.metadata.builtAt, context });
       }
       return context;
     } finally {
-      if (this.inFlight.get(request.cacheKey)?.promise === promise) this.inFlight.delete(request.cacheKey);
+      if (this.inFlight.get(inFlightKey)?.promise === promise) this.inFlight.delete(inFlightKey);
     }
   }
 
@@ -405,6 +409,10 @@ export class WebProjectionContextCache<
     const build = request.build ?? defaultWebProjectionBuildHook<TSourceIndex, TContext>;
     return build({ metadata, sourceIndex: request.sourceIndex });
   }
+}
+
+function webProjectionInFlightCacheKey(cacheKey: string, forceRefresh: boolean, fingerprintKey: string): string {
+  return `${cacheKey}\0${forceRefresh ? "refresh" : "default"}\0${fingerprintKey}`;
 }
 
 export function normalizeWebProjectionAlias(value: WebProjectionAliasValue): string | null {
