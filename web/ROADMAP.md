@@ -407,10 +407,13 @@ Acceptance criteria:
 Steps:
 
 1. Add `src/data/apiDataSource.ts`.
-2. Configure API mode and optional API base URL with environment variables:
-   - `VITE_SYMPHONY_DATA_SOURCE=api` enables same-origin API mode for the Vite `/api` proxy.
+2. Configure build and runtime API mode with Vite/build-time environment variables:
+   - Production builds default Vite `base` to `/web/`, so emitted JS and CSS asset URLs resolve when the built app is mounted at `/web/`; `SYMPHONY_WEB_BASE_PATH` (or `VITE_SYMPHONY_WEB_BASE_PATH`) can override that build-time base path, and dev-server mode keeps `/` by default.
+   - Production builds default the React data source to API mode with an empty API base URL, which makes runtime requests same-origin `/api/v1/web/*` calls. No runtime config file is required for the default production mount.
+   - `VITE_SYMPHONY_DATA_SOURCE=api` enables same-origin API mode for local/dev use with the Vite `/api` proxy, while `mock`, `demo`, or `local` keep mock data available even if a production/API fallback would otherwise apply.
    - `VITE_SYMPHONY_API_BASE_URL` keeps supporting absolute or relative API base URLs and also activates API mode when no data-source mode is set.
    - `SYMPHONY_WEB_API_PROXY_TARGET` or `SYMPHONY_API_PROXY_TARGET` can override the Vite dev proxy target; otherwise `/api` proxies to the default Symphony status server at `http://127.0.0.1:7331`.
+   - These settings only configure the static web artifact and Vite dev/preview behavior; backend `StatusServer` static file serving remains outside this phase.
 3. Implement the same `SymphonyDataSource` interface.
 4. Keep mock data available as local/demo mode.
 5. Add adapters from API responses into view models.
