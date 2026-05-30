@@ -370,21 +370,11 @@ export class StatusServer {
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/history") {
-        if (!this.options.runStore) {
-          sendJson(response, 200, projectWebHistory([], []));
-          return;
-        }
-        const runs = await this.options.runStore.listRuns();
-        const activityFeed = await buildActivityFeed({
-          generatedAt: this.options.orchestrator.snapshot().generatedAt,
-          runStore: this.options.runStore,
-          runs,
-          lifecycleStore: this.options.lifecycleStore,
-          writebackOutbox: this.options.writebackOutbox,
-          query: { issue: null, offset: 0, limit: Number.MAX_SAFE_INTEGER },
-          includeTranscriptEvents: false,
-        });
-        sendJson(response, 200, projectWebHistory(runs, activityFeed.activity));
+        sendJson(
+          response,
+          200,
+          await this.fetchWebHistory(isWebProjectionRefreshRequested(url.searchParams.get("refresh"))),
+        );
         return;
       }
       const webTranscriptMatch = /^\/api\/v1\/web\/sessions\/([^/]+)\/transcript$/.exec(url.pathname);
@@ -933,22 +923,28 @@ export class StatusServer {
   }
 
   private async fetchWebDashboard(forceRefresh: boolean) {
-    const snapshot = this.options.orchestrator.snapshot();
+    const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
+    const sourceIndex = projection?.sourceIndex ?? null;
+    const snapshot = sourceIndex?.runtime.snapshot ?? this.options.orchestrator.snapshot();
     let board: IssueBoardResponse | null = null;
-    try {
-      board = await this.fetchIssueBoard(forceRefresh);
-    } catch (error) {
-      if (!(error instanceof SymphonyError) || (error.code !== "tracker_error" && error.code !== "tracker_unavailable")) {
-        throw error;
+    if (projection) {
+      try {
+        board = await this.buildIssueBoardFromSourceIndex(projection.sourceIndex, projection.issueBoardColumns);
+      } catch (error) {
+        if (!isTrackerProjectionFailure(error)) {
+          throw error;
+        }
       }
     }
-    const runs = (await this.options.runStore?.listRuns()) ?? [];
+    const activitySources = await this.fetchWebCollectionActivitySources(sourceIndex);
     const activity = await buildActivityFeed({
       generatedAt: snapshot.generatedAt,
       runStore: this.options.runStore,
-      runs,
+      runs: activitySources.runs,
       lifecycleStore: this.options.lifecycleStore,
+      lifecycleRecords: activitySources.lifecycleRecords,
       writebackOutbox: this.options.writebackOutbox,
+      writebackOperations: activitySources.writebackOperations,
       query: { issue: null, offset: 0, limit: 20 },
       includeTranscriptEvents: false,
     });
@@ -961,31 +957,39 @@ export class StatusServer {
   }
 
   private async fetchWebSidebar(forceRefresh: boolean) {
-    const snapshot = this.options.orchestrator.snapshot();
+    const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
+    const sourceIndex = projection?.sourceIndex ?? null;
+    const snapshot = sourceIndex?.runtime.snapshot ?? this.options.orchestrator.snapshot();
     let board: IssueBoardResponse | null = null;
-    try {
-      board = await this.fetchIssueBoard(forceRefresh);
-    } catch (error) {
-      if (!(error instanceof SymphonyError) || (error.code !== "tracker_error" && error.code !== "tracker_unavailable")) {
-        throw error;
+    if (projection) {
+      try {
+        board = await this.buildIssueBoardFromSourceIndex(projection.sourceIndex, projection.issueBoardColumns);
+      } catch (error) {
+        if (!isTrackerProjectionFailure(error)) {
+          throw error;
+        }
       }
     }
-    const runs = (await this.options.runStore?.listRuns()) ?? [];
+    const activitySources = await this.fetchWebCollectionActivitySources(sourceIndex);
     const dashboardActivity = await buildActivityFeed({
       generatedAt: snapshot.generatedAt,
       runStore: this.options.runStore,
-      runs,
+      runs: activitySources.runs,
       lifecycleStore: this.options.lifecycleStore,
+      lifecycleRecords: activitySources.lifecycleRecords,
       writebackOutbox: this.options.writebackOutbox,
+      writebackOperations: activitySources.writebackOperations,
       query: { issue: null, offset: 0, limit: 20 },
       includeTranscriptEvents: false,
     });
     const historyActivity = await buildActivityFeed({
       generatedAt: snapshot.generatedAt,
       runStore: this.options.runStore,
-      runs,
+      runs: activitySources.runs,
       lifecycleStore: this.options.lifecycleStore,
+      lifecycleRecords: activitySources.lifecycleRecords,
       writebackOutbox: this.options.writebackOutbox,
+      writebackOperations: activitySources.writebackOperations,
       query: { issue: null, offset: 0, limit: Number.MAX_SAFE_INTEGER },
       includeTranscriptEvents: false,
     });
@@ -997,13 +1001,70 @@ export class StatusServer {
         config: this.options.dashboard ?? null,
       }),
       projectWebIssueBoard(board),
-      projectWebHistory(runs, historyActivity.activity),
+      projectWebHistory(activitySources.runs, historyActivity.activity),
       projectWebOrchestratorChat(),
     );
   }
 
+  private async fetchWebHistory(forceRefresh: boolean) {
+    const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
+    const sourceIndex = projection?.sourceIndex ?? null;
+    const activitySources = await this.fetchWebCollectionActivitySources(sourceIndex);
+    const activityFeed = await buildActivityFeed({
+      generatedAt: sourceIndex?.runtime.snapshot.generatedAt ?? this.options.orchestrator.snapshot().generatedAt,
+      runStore: this.options.runStore,
+      runs: activitySources.runs,
+      lifecycleStore: this.options.lifecycleStore,
+      lifecycleRecords: activitySources.lifecycleRecords,
+      writebackOutbox: this.options.writebackOutbox,
+      writebackOperations: activitySources.writebackOperations,
+      query: { issue: null, offset: 0, limit: Number.MAX_SAFE_INTEGER },
+      includeTranscriptEvents: false,
+    });
+    return projectWebHistory(activitySources.runs, activityFeed.activity);
+  }
+
+  private async fetchOptionalWebProjectionSourceIndex(forceRefresh: boolean): Promise<{
+    sourceIndex: BuiltWebProjectionSourceIndex;
+    issueBoardColumns: IssueBoardColumnMapping;
+  } | null> {
+    try {
+      return await this.fetchWebProjectionSourceIndex(forceRefresh);
+    } catch (error) {
+      if (isTrackerProjectionFailure(error)) return null;
+      throw error;
+    }
+  }
+
+  private async fetchWebCollectionActivitySources(sourceIndex: BuiltWebProjectionSourceIndex | null): Promise<{
+    runs: readonly RunRecord[];
+    lifecycleRecords: readonly IssueLifecycleRecord[];
+    writebackOperations: readonly WritebackOperation[];
+  }> {
+    if (sourceIndex) {
+      return {
+        runs: sourceIndex.runs.runs,
+        lifecycleRecords: sourceIndex.lifecycles.records,
+        writebackOperations: sourceIndex.writebacks.operations,
+      };
+    }
+    const [runs, lifecycleRecords, writebackOperations] = await Promise.all([
+      this.options.runStore?.listRuns() ?? Promise.resolve([]),
+      this.options.lifecycleStore?.list() ?? Promise.resolve([]),
+      this.options.writebackOutbox?.list() ?? Promise.resolve([]),
+    ]);
+    return { runs, lifecycleRecords, writebackOperations };
+  }
+
   private async fetchIssueBoard(forceRefresh: boolean): Promise<IssueBoardResponse> {
     const { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
+    return this.buildIssueBoardFromSourceIndex(sourceIndex, issueBoardColumns);
+  }
+
+  private async buildIssueBoardFromSourceIndex(
+    sourceIndex: BuiltWebProjectionSourceIndex,
+    issueBoardColumns: IssueBoardColumnMapping,
+  ): Promise<IssueBoardResponse> {
     return buildIssueBoard({
       sourceIndex,
       mutationsConfigured: Boolean(this.options.openWorkspaceToken),
@@ -1064,7 +1125,9 @@ export class StatusServer {
   }
 
   async acquireWebProjectionContext(forceRefresh: boolean): Promise<StatusServerWebProjectionContext> {
-    return (await this.acquireWebProjectionContextEntry(forceRefresh)).context;
+    const context = (await this.acquireWebProjectionContextEntry(forceRefresh)).context;
+    assertCompletedWebProjectionContextCacheable(context);
+    return context;
   }
 
   private async acquireWebProjectionContextEntry(
@@ -1102,9 +1165,6 @@ export class StatusServer {
       snapshot,
       issueBoardColumns,
       clock,
-    }).then((context) => {
-      assertCompletedWebProjectionContextCacheable(context);
-      return context;
     });
     this.pendingWebProjectionContexts.set(pendingKey, promise);
 
@@ -1112,6 +1172,7 @@ export class StatusServer {
       const context = await promise;
       if (
         this.pendingWebProjectionContexts.get(pendingKey) === promise &&
+        isCompletedWebProjectionContextCacheable(context) &&
         (await this.isWebProjectionContextCurrent(context, issueBoardColumns))
       ) {
         this.completedWebProjectionContext = context;
@@ -1296,9 +1357,13 @@ function statusServerRuntimeFingerprintValue(value: unknown, key?: string): unkn
 }
 
 function assertCompletedWebProjectionContextCacheable(context: StatusServerWebProjectionContext): void {
-  const trackerFailure = context.sourceIndex.trackerIssues.error;
-  if (!trackerFailure || trackerFailure.code === "tracker_unavailable") return;
+  if (isCompletedWebProjectionContextCacheable(context)) return;
   throw trackerFailureFromSourceIndex(context.sourceIndex);
+}
+
+function isCompletedWebProjectionContextCacheable(context: StatusServerWebProjectionContext): boolean {
+  const trackerFailure = context.sourceIndex.trackerIssues.error;
+  return !trackerFailure || trackerFailure.code === "tracker_unavailable";
 }
 
 function webProjectionContextPendingKey(forceRefresh: boolean, fingerprintKey: string): string {
@@ -1965,6 +2030,10 @@ function trackerFailureFromSourceIndex(sourceIndex: BuiltWebProjectionSourceInde
   return new SymphonyError(failure.code === "tracker_unavailable" ? "tracker_unavailable" : "tracker_error", failure.message);
 }
 
+function isTrackerProjectionFailure(error: unknown): error is SymphonyError {
+  return error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable");
+}
+
 function acceptedBoardResponse(board: IssueBoardResponse) {
   const columns = board.lanes.map((lane) => ({
     id: lane.id,
@@ -2094,15 +2163,17 @@ const TERMINAL_ACTIVITY_TRANSCRIPT_TAIL = 256;
 async function buildActivityFeed(input: {
   generatedAt: string;
   runStore: RunTranscriptStore | undefined;
-  runs?: RunRecord[];
+  runs?: readonly RunRecord[];
   lifecycleStore: IssueLifecycleStore | undefined;
+  lifecycleRecords?: readonly IssueLifecycleRecord[];
   writebackOutbox: Pick<FileWritebackOutboxStore, "list"> | undefined;
+  writebackOperations?: readonly WritebackOperation[];
   query: ActivityQuery;
   includeTranscriptEvents?: boolean;
 }) {
   const allRuns = input.runs ?? (input.runStore ? await input.runStore.listRuns() : []);
   const includeTranscriptEvents = input.includeTranscriptEvents ?? true;
-  const lifecycleRecords = (await input.lifecycleStore?.list()) ?? [];
+  const lifecycleRecords = input.lifecycleRecords ?? (await input.lifecycleStore?.list()) ?? [];
   const issueFilter = input.query.issue;
   const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : allRuns;
   const activity: ActivityItem[] = [];
@@ -2134,7 +2205,7 @@ async function buildActivityFeed(input: {
     }
   }
 
-  const writebackOperations = (await input.writebackOutbox?.list()) ?? [];
+  const writebackOperations = input.writebackOperations ?? (await input.writebackOutbox?.list()) ?? [];
   const filteredWritebackOperations = issueFilter
     ? writebackOperations.filter((operation) => writebackOperationMatchesIssue(operation, issueFilter, allRuns, lifecycleRecords))
     : writebackOperations;
@@ -2206,8 +2277,8 @@ function activityItemForTranscriptEvent(run: RunRecord, event: TranscriptEvent):
 
 function activityItemForWritebackOperation(
   operation: WritebackOperation,
-  runs: RunRecord[],
-  lifecycles: IssueLifecycleRecord[],
+  runs: readonly RunRecord[],
+  lifecycles: readonly IssueLifecycleRecord[],
 ): ActivityItem {
   const run = operation.runId ? (runs.find((candidate) => candidate.runId === operation.runId) ?? null) : null;
   const lifecycle =
@@ -2645,8 +2716,8 @@ function activityRunMatchesIssue(run: RunRecord, issue: string): boolean {
 function writebackOperationMatchesIssue(
   operation: WritebackOperation,
   issue: string,
-  runs: RunRecord[],
-  lifecycles: IssueLifecycleRecord[],
+  runs: readonly RunRecord[],
+  lifecycles: readonly IssueLifecycleRecord[],
 ): boolean {
   if (operation.issueId === issue) return true;
   const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
