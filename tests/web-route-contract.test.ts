@@ -222,14 +222,17 @@ describe("/api/v1/web route contracts", () => {
       expect(assetHead.headers.get("content-length")).toBe(String("console.log('symphony static shell');\n".length));
       expect(await assetHead.text()).toBe("");
 
-      const missingAsset = await getJson(`${baseUrl}/web/assets/missing.js`);
-      expect(missingAsset.response.status).toBe(404);
-      expect(missingAsset.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+      const deepLink = await getText(`${baseUrl}/web/issues/ENG-119`);
+      expect(deepLink.response.status).toBe(200);
+      expect(deepLink.response.headers.get("content-type")).toContain("text/html");
+      expect(deepLink.response.headers.get("cache-control")).toBe("no-cache");
+      expect(deepLink.text).toContain("Symphony static shell");
 
-      const extensionlessUnknown = await getJson(`${baseUrl}/web/issues/ENG-119`);
-      expect(extensionlessUnknown.response.status).toBe(404);
-      expect(extensionlessUnknown.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
-      expect(extensionlessUnknown.text).not.toContain("Symphony static shell");
+      const deepLinkHead = await fetch(`${baseUrl}/web/history/session-1`, { method: "HEAD" });
+      expect(deepLinkHead.status).toBe(200);
+      expect(deepLinkHead.headers.get("content-type")).toContain("text/html");
+      expect(deepLinkHead.headers.get("cache-control")).toBe("no-cache");
+      expect(await deepLinkHead.text()).toBe("");
 
       const traversal = await getJson(`${baseUrl}/web/..%2fpackage.json`);
       expect(traversal.response.status).toBe(404);
@@ -255,6 +258,24 @@ describe("/api/v1/web route contracts", () => {
       const unsupportedApi = await getJson(`${baseUrl}/api/v1/web/unknown`);
       expect(unsupportedApi.response.status).toBe(404);
       expect(unsupportedApi.body).toEqual({ error: { code: "not_found", message: "Route not found" } });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("returns static 404s for missing asset-like /web paths instead of the SPA fallback", async () => {
+    const webAssetsRoot = await createWebAssets(root);
+    const { server } = createStatusServer(root, { webAssetsRoot });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const cases = ["/web/assets/missing.js", "/web/assets", "/web/static/missing", "/web/missing.css", "/web/favicon.ico"];
+      for (const route of cases) {
+        const missingAsset = await getJson(`${baseUrl}${route}`);
+        expect({ route, status: missingAsset.response.status }).toEqual({ route, status: 404 });
+        expect(missingAsset.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+        expect(missingAsset.text).not.toContain("Symphony static shell");
+      }
     } finally {
       await server.stop();
     }
@@ -297,6 +318,19 @@ describe("/api/v1/web route contracts", () => {
   it("does not serve files outside the configured /web asset root", async () => {
     const webAssetsRoot = await createWebAssets(root);
     await writeFile(path.join(root, "secret.txt"), "do not serve", "utf8");
+    await writeFile(path.join(webAssetsRoot, ".env"), "SYMPHONY_SECRET=do not serve env", "utf8");
+    await writeFile(path.join(webAssetsRoot, "package.json"), '{"secret":"do not serve package"}\n', "utf8");
+    await writeFile(path.join(webAssetsRoot, "LICENSE"), "do not serve repository license", "utf8");
+    await mkdir(path.join(webAssetsRoot, "src"), { recursive: true });
+    await writeFile(path.join(webAssetsRoot, "src", "App.tsx"), "do not serve source", "utf8");
+    await mkdir(path.join(webAssetsRoot, ".symphony"), { recursive: true });
+    await writeFile(path.join(webAssetsRoot, ".symphony", "state.json"), "do not serve runtime state", "utf8");
+    await mkdir(path.join(webAssetsRoot, "symphony_workspaces", "ENG-1"), { recursive: true });
+    await writeFile(
+      path.join(webAssetsRoot, "symphony_workspaces", "ENG-1", "package.json"),
+      '{"secret":"do not serve workspace"}\n',
+      "utf8",
+    );
     const outsideRoot = path.join(root, "outside-web-dist");
     await mkdir(outsideRoot, { recursive: true });
     await writeFile(path.join(outsideRoot, "secret.txt"), "do not serve via link", "utf8");
@@ -322,6 +356,22 @@ describe("/api/v1/web route contracts", () => {
       expect(linkedEscape.response.status).toBe(404);
       expect(linkedEscape.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
       expect(linkedEscape.text).not.toContain("do not serve via link");
+
+      const deniedRoutes = [
+        { route: "/web/.env", secret: "do not serve env" },
+        { route: "/web/package.json", secret: "do not serve package" },
+        { route: "/web/LICENSE", secret: "do not serve repository license" },
+        { route: "/web/src/App.tsx", secret: "do not serve source" },
+        { route: "/web/.symphony/state.json", secret: "do not serve runtime state" },
+        { route: "/web/symphony_workspaces/ENG-1/package.json", secret: "do not serve workspace" },
+      ];
+      for (const { route, secret } of deniedRoutes) {
+        const denied = await getJson(`${baseUrl}${route}`);
+        expect({ route, status: denied.response.status }).toEqual({ route, status: 404 });
+        expect(denied.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+        expect(denied.text).not.toContain(secret);
+        expect(denied.text).not.toContain("Symphony static shell");
+      }
     } finally {
       await server.stop();
     }

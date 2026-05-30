@@ -1011,6 +1011,66 @@ const WEB_INDEX_FILE = "index.html";
 const WEB_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const WEB_HTML_CACHE_CONTROL = "no-cache";
 const STATIC_ASSET_NOT_FOUND = { error: { code: "not_found", message: "Static asset not found" } } as const;
+const WEB_ASSET_DIRECTORIES = new Set(["assets", "static", "media", "images", "img", "fonts", "icons"]);
+const WEB_STATIC_FORBIDDEN_DIRECTORIES = new Set([
+  ".git",
+  ".symphony",
+  "coverage",
+  "cursor",
+  "dist",
+  "docs",
+  "extension",
+  "hermes",
+  "node_modules",
+  "scripts",
+  "src",
+  "symphony_workspaces",
+  "test",
+  "tests",
+]);
+const WEB_STATIC_FORBIDDEN_FILENAMES = new Set([
+  "agents.md",
+  "bun.lockb",
+  "claude.md",
+  "dockerfile",
+  "license",
+  "makefile",
+  "package-lock.json",
+  "package.json",
+  "pnpm-lock.yaml",
+  "readme",
+  "tsconfig.json",
+  "vite.config.ts",
+  "vitest.config.ts",
+  "workflow.md",
+  "yarn.lock",
+]);
+const WEB_STATIC_FORBIDDEN_EXTENSIONS = new Set([
+  ".crt",
+  ".db",
+  ".key",
+  ".lock",
+  ".log",
+  ".md",
+  ".pem",
+  ".py",
+  ".sqlite",
+  ".toml",
+  ".ts",
+  ".tsbuildinfo",
+  ".tsx",
+  ".yaml",
+  ".yml",
+]);
+
+type WebAssetFileResult = "served" | "missing" | "blocked";
+
+interface WebAssetRequest {
+  filePath: string;
+  relativePath: string;
+  segments: string[];
+  assetLike: boolean;
+}
 
 function resolveWebAssetsRootOption(configuredWebAssetsRoot: string | null | undefined): string | null {
   if (configuredWebAssetsRoot === null) return null;
@@ -1037,40 +1097,23 @@ async function serveWebAsset(
   }
 
   const request = resolveWebAssetRequest(pathname, resolvedRoot);
-  if (!request) {
+  if (!request || isForbiddenWebStaticPath(request)) {
     sendStaticAssetNotFound(response, method);
     return true;
   }
 
-  let filePath: string;
-  let stat: Stats;
-  try {
-    filePath = await fs.realpath(request.filePath);
-    if (!pathIsWithin(resolvedRoot, filePath)) {
-      sendStaticAssetNotFound(response, method);
-      return true;
-    }
-    stat = await fs.stat(filePath);
-  } catch {
+  if (request.relativePath === WEB_INDEX_FILE || request.assetLike) {
+    const exactResult = await serveExistingWebAssetFile(response, method, request, resolvedRoot);
+    if (exactResult === "served") return true;
     sendStaticAssetNotFound(response, method);
     return true;
   }
 
-  if (!stat.isFile()) {
-    sendStaticAssetNotFound(response, method);
-    return true;
-  }
+  const fallback = resolveWebIndexFallback(resolvedRoot);
+  const fallbackResult = await serveExistingWebAssetFile(response, method, fallback, resolvedRoot);
+  if (fallbackResult === "served") return true;
 
-  response.writeHead(200, {
-    "content-type": contentTypeForStaticAsset(filePath),
-    "content-length": String(stat.size),
-    "cache-control": request.relativePath === WEB_INDEX_FILE ? WEB_HTML_CACHE_CONTROL : WEB_ASSET_CACHE_CONTROL,
-  });
-  if (method === "HEAD") {
-    response.end();
-    return true;
-  }
-  response.end(await fs.readFile(filePath));
+  sendStaticAssetNotFound(response, method);
   return true;
 }
 
@@ -1084,7 +1127,7 @@ async function resolveExistingWebAssetsRoot(root: string): Promise<string | null
   }
 }
 
-function resolveWebAssetRequest(pathname: string, webAssetsRoot: string): { filePath: string; relativePath: string } | null {
+function resolveWebAssetRequest(pathname: string, webAssetsRoot: string): WebAssetRequest | null {
   const mountRelativePath = pathname === WEB_MOUNT_PATH ? "" : pathname.slice(WEB_MOUNT_PATH.length + 1);
   let decodedRelativePath: string;
   try {
@@ -1099,7 +1142,66 @@ function resolveWebAssetRequest(pathname: string, webAssetsRoot: string): { file
 
   const relativePath = segments.length === 0 ? WEB_INDEX_FILE : segments.join("/");
   const filePath = path.resolve(webAssetsRoot, relativePath);
-  return pathIsWithin(webAssetsRoot, filePath) ? { filePath, relativePath } : null;
+  return pathIsWithin(webAssetsRoot, filePath)
+    ? { filePath, relativePath, segments, assetLike: isAssetLikeWebPath(relativePath, segments) }
+    : null;
+}
+
+function resolveWebIndexFallback(webAssetsRoot: string): WebAssetRequest {
+  const filePath = path.resolve(webAssetsRoot, WEB_INDEX_FILE);
+  return { filePath, relativePath: WEB_INDEX_FILE, segments: [WEB_INDEX_FILE], assetLike: true };
+}
+
+async function serveExistingWebAssetFile(
+  response: ServerResponse,
+  method: "GET" | "HEAD",
+  request: Pick<WebAssetRequest, "filePath" | "relativePath">,
+  resolvedRoot: string,
+): Promise<WebAssetFileResult> {
+  let filePath: string;
+  let stat: Stats;
+  try {
+    filePath = await fs.realpath(request.filePath);
+    if (!pathIsWithin(resolvedRoot, filePath)) return "blocked";
+    stat = await fs.stat(filePath);
+  } catch {
+    return "missing";
+  }
+
+  if (!stat.isFile()) return "missing";
+
+  response.writeHead(200, {
+    "content-type": contentTypeForStaticAsset(filePath),
+    "content-length": String(stat.size),
+    "cache-control": request.relativePath === WEB_INDEX_FILE ? WEB_HTML_CACHE_CONTROL : WEB_ASSET_CACHE_CONTROL,
+  });
+  if (method === "HEAD") {
+    response.end();
+    return "served";
+  }
+  response.end(await fs.readFile(filePath));
+  return "served";
+}
+
+function isAssetLikeWebPath(relativePath: string, segments: string[]): boolean {
+  const basename = webRelativeBasename(relativePath);
+  return WEB_ASSET_DIRECTORIES.has((segments[0] ?? "").toLowerCase()) || path.posix.extname(basename).length > 0;
+}
+
+function isForbiddenWebStaticPath(request: WebAssetRequest): boolean {
+  return request.segments.some((segment) => {
+    const lower = segment.toLowerCase();
+    return (
+      lower.startsWith(".") ||
+      WEB_STATIC_FORBIDDEN_DIRECTORIES.has(lower) ||
+      WEB_STATIC_FORBIDDEN_FILENAMES.has(lower) ||
+      WEB_STATIC_FORBIDDEN_EXTENSIONS.has(path.posix.extname(lower))
+    );
+  });
+}
+
+function webRelativeBasename(relativePath: string): string {
+  return relativePath.split("/").at(-1) ?? relativePath;
 }
 
 function pathIsWithin(root: string, target: string): boolean {
