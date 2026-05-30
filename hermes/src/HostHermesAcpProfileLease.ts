@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export type HostHermesAcpProfileRetention = "always" | "failed" | "never";
 export type HostHermesAcpTerminalStatus = "succeeded" | "failed" | "cancelled" | null;
@@ -34,6 +34,45 @@ export interface HostHermesAcpProfileNameInput {
   reservedNames?: Iterable<string>;
 }
 
+export type HostHermesAcpWorkerSessionLifecycle = "fresh_per_run" | "reuse_by_issue";
+export type HostHermesAcpLeaseLifecycleHook = "run_finished" | "process_exit" | "harness_dispose" | "startup_failure" | "manual_dispose";
+
+export interface HostHermesAcpLeaseProcessHandle {
+  kill?(reason?: string): void | Promise<void>;
+  close?(reason?: string): void | Promise<void>;
+  dispose?(reason?: string): void | Promise<void>;
+}
+
+export interface HostHermesAcpLeasePolicyInput {
+  role: string;
+  phase?: string | null;
+  workerSessionLifecycle?: HostHermesAcpWorkerSessionLifecycle | null;
+}
+
+export interface HostHermesAcpRunLeaseInput extends HostHermesAcpLeasePolicyInput {
+  workspaceKey: string;
+  issueIdentifier: string;
+  runId?: string | null;
+  attempt?: number | null;
+  profileName?: string | null;
+  sourceProfile?: string | null;
+  keepProfiles?: HostHermesAcpProfileRetention;
+  reservedProfileNames?: Iterable<string>;
+}
+
+export interface HostHermesAcpLeaseManagerOptions
+  extends Omit<
+    HostHermesAcpProfileLeaseOptions,
+    "profileName" | "nameInput" | "sourceProfile" | "keepProfiles" | "reservedProfileNames" | "reusable" | "processHandle" | "acpSessionId" | "onDisposed"
+  > {
+  sourceProfile?: string | null;
+  keepProfiles?: HostHermesAcpProfileRetention;
+  reservedProfileNames?: Iterable<string>;
+  workerSessionLifecycle?: HostHermesAcpWorkerSessionLifecycle;
+  profilePrefix?: string | null;
+  freshLeaseIdFactory?: () => string;
+}
+
 export interface HostHermesAcpProfileLeaseOptions {
   binaryPath: string;
   cwd: string;
@@ -44,7 +83,15 @@ export interface HostHermesAcpProfileLeaseOptions {
   nameInput?: HostHermesAcpProfileNameInput;
   reservedProfileNames?: Iterable<string>;
   keepProfiles?: HostHermesAcpProfileRetention;
+  reusable?: boolean;
+  processHandle?: HostHermesAcpLeaseProcessHandle | null;
+  acpSessionId?: string | null;
   runner?: HostHermesAcpCommandRunner;
+  onDisposed?: (
+    lease: HostHermesAcpProfileLease,
+    result: HostHermesAcpProfileLeaseDisposeResult,
+    hook: HostHermesAcpLeaseLifecycleHook,
+  ) => void;
 }
 
 export interface HostHermesAcpProcessCommand {
@@ -57,7 +104,17 @@ export interface HostHermesAcpProcessCommand {
 export interface HostHermesAcpProfileLease {
   profileName: string;
   sourceProfile: string;
+  reusable: boolean;
   acpCommand: HostHermesAcpProcessCommand;
+  processHandle: HostHermesAcpLeaseProcessHandle | null;
+  acpSessionId: string | null;
+  disposed: boolean;
+  markProcessStarted(processHandle: HostHermesAcpLeaseProcessHandle): void;
+  markAcpSessionStarted(sessionId: string): void;
+  afterRunFinished(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
+  afterProcessExit(terminalStatus?: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
+  afterHarnessDispose(terminalStatus?: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
+  afterStartupFailure(terminalStatus?: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
   dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
 }
 
@@ -111,31 +168,191 @@ export async function createHostHermesAcpProfileLease(
   });
 
   const acpCommand = buildHostHermesAcpLaunchCommand({ binaryPath, profileName, cwd, env });
+  const reusable = options.reusable ?? false;
   let disposed = false;
+  let processHandle = options.processHandle ?? null;
+  let acpSessionId = normalizeOptionalString(options.acpSessionId);
+  let lease: HostHermesAcpProfileLease;
 
-  return {
-    profileName,
-    sourceProfile,
-    acpCommand,
-    async dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult> {
-      if (disposed) return { profileName, reason: "already_disposed", deleted: false };
-      if (profileDisposition === "reused") {
-        disposed = true;
-        return { profileName, reason: "retained", deleted: false };
+  async function cleanupLease(
+    hook: HostHermesAcpLeaseLifecycleHook,
+    terminalStatus: HostHermesAcpTerminalStatus,
+    input: { terminateProcess: boolean } = { terminateProcess: true },
+  ): Promise<HostHermesAcpProfileLeaseDisposeResult> {
+    if (disposed) return { profileName, reason: "already_disposed", deleted: false };
+
+    let processCleanupError: unknown = null;
+    if (input.terminateProcess) {
+      try {
+        await terminateHostHermesAcpLeaseProcess(processHandle, hook);
+      } catch (error) {
+        processCleanupError = error;
+      } finally {
+        processHandle = null;
+        acpSessionId = null;
       }
-      if (!shouldDeleteHostHermesAcpProfile({ keepProfiles, terminalStatus })) {
-        disposed = true;
-        return { profileName, reason: "retained", deleted: false };
-      }
+    }
+
+    let result: HostHermesAcpProfileLeaseDisposeResult;
+    if (profileDisposition === "reused") {
+      disposed = true;
+      result = { profileName, reason: "retained", deleted: false };
+    } else if (!shouldDeleteHostHermesAcpProfile({ keepProfiles, terminalStatus })) {
+      disposed = true;
+      result = { profileName, reason: "retained", deleted: false };
+    } else {
       await runRequiredHostHermesAcpCommand(runner, binaryPath, buildHostHermesAcpDeleteProfileArgs(profileName), {
         cwd,
         env,
         timeoutMs,
       });
       disposed = true;
-      return { profileName, reason: "deleted", deleted: true };
+      result = { profileName, reason: "deleted", deleted: true };
+    }
+
+    options.onDisposed?.(lease, result, hook);
+    if (processCleanupError) {
+      throw new Error(`Host Hermes ACP process cleanup failed during ${hook}: ${errorMessage(processCleanupError)}`);
+    }
+    return result;
+  }
+
+  lease = {
+    profileName,
+    sourceProfile,
+    reusable,
+    acpCommand,
+    get processHandle() {
+      return processHandle;
+    },
+    set processHandle(value: HostHermesAcpLeaseProcessHandle | null) {
+      processHandle = value ?? null;
+    },
+    get acpSessionId() {
+      return acpSessionId;
+    },
+    set acpSessionId(value: string | null) {
+      acpSessionId = normalizeOptionalString(value);
+    },
+    get disposed() {
+      return disposed;
+    },
+    markProcessStarted(handle: HostHermesAcpLeaseProcessHandle): void {
+      processHandle = handle;
+    },
+    markAcpSessionStarted(sessionId: string): void {
+      acpSessionId = requireNonEmpty(sessionId, "Host Hermes ACP session id");
+    },
+    async afterRunFinished(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult> {
+      if (disposed) return { profileName, reason: "already_disposed", deleted: false };
+      if (reusable) return { profileName, reason: "retained", deleted: false };
+      return cleanupLease("run_finished", terminalStatus);
+    },
+    async afterProcessExit(terminalStatus: HostHermesAcpTerminalStatus = "failed"): Promise<HostHermesAcpProfileLeaseDisposeResult> {
+      processHandle = null;
+      acpSessionId = null;
+      return cleanupLease("process_exit", terminalStatus, { terminateProcess: false });
+    },
+    async afterHarnessDispose(terminalStatus: HostHermesAcpTerminalStatus = null): Promise<HostHermesAcpProfileLeaseDisposeResult> {
+      return cleanupLease("harness_dispose", terminalStatus);
+    },
+    async afterStartupFailure(terminalStatus: HostHermesAcpTerminalStatus = "failed"): Promise<HostHermesAcpProfileLeaseDisposeResult> {
+      return cleanupLease("startup_failure", terminalStatus);
+    },
+    async dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult> {
+      return cleanupLease("manual_dispose", terminalStatus);
     },
   };
+  return lease;
+}
+
+export class HostHermesAcpLeaseManager {
+  private readonly leases = new Map<string, HostHermesAcpProfileLease>();
+
+  constructor(private readonly options: HostHermesAcpLeaseManagerOptions) {}
+
+  async acquire(input: HostHermesAcpRunLeaseInput): Promise<HostHermesAcpProfileLease> {
+    const phase = resolveHostHermesAcpRunPhase(input);
+    const workerSessionLifecycle = input.workerSessionLifecycle ?? this.options.workerSessionLifecycle ?? "reuse_by_issue";
+    const reusable = shouldReuseHostHermesAcpLease({ role: input.role, phase, workerSessionLifecycle });
+    const freshLeaseId = reusable ? null : normalizeOptionalString(input.runId) ?? this.options.freshLeaseIdFactory?.() ?? randomUUID();
+    const key = reusable
+      ? buildHostHermesAcpReusableLeaseKey({ ...input, phase })
+      : `fresh:${freshLeaseId}`;
+    const existing = reusable ? this.leases.get(key) : undefined;
+    if (existing && !existing.disposed) return existing;
+    if (existing?.disposed) this.leases.delete(key);
+
+    const requestedProfileName = normalizeOptionalString(input.profileName);
+    const reservedProfileNames = input.reservedProfileNames ?? this.options.reservedProfileNames;
+    const keepProfiles = input.keepProfiles ?? this.options.keepProfiles;
+    const leaseOptions: HostHermesAcpProfileLeaseOptions = {
+      binaryPath: this.options.binaryPath,
+      cwd: this.options.cwd,
+      sourceProfile: input.sourceProfile ?? this.options.sourceProfile ?? null,
+      reusable,
+      onDisposed: (disposedLease) => {
+        if (reusable && disposedLease.disposed) this.leases.delete(key);
+      },
+    };
+    if (this.options.env !== undefined) leaseOptions.env = this.options.env;
+    if (this.options.timeoutMs !== undefined) leaseOptions.timeoutMs = this.options.timeoutMs;
+    if (this.options.runner !== undefined) leaseOptions.runner = this.options.runner;
+    if (reservedProfileNames !== undefined) leaseOptions.reservedProfileNames = reservedProfileNames;
+    if (keepProfiles !== undefined) leaseOptions.keepProfiles = keepProfiles;
+    if (requestedProfileName) {
+      leaseOptions.profileName = requestedProfileName;
+    } else {
+      leaseOptions.nameInput = {
+        workspaceKey: input.workspaceKey,
+        issueIdentifier: input.issueIdentifier,
+        role: input.role,
+        phase,
+        runId: reusable ? null : freshLeaseId,
+        attempt: reusable ? null : input.attempt ?? null,
+        prefix: this.options.profilePrefix ?? null,
+      };
+    }
+
+    const lease = await createHostHermesAcpProfileLease(leaseOptions);
+    if (reusable) this.leases.set(key, lease);
+    return lease;
+  }
+
+  async dispose(terminalStatus: HostHermesAcpTerminalStatus = null): Promise<HostHermesAcpProfileLeaseDisposeResult[]> {
+    const leases = [...this.leases.values()];
+    const results = await Promise.all(leases.map((lease) => lease.afterHarnessDispose(terminalStatus)));
+    this.leases.clear();
+    return results;
+  }
+
+  get activeLeaseCount(): number {
+    return this.leases.size;
+  }
+}
+
+export function shouldReuseHostHermesAcpLease(input: HostHermesAcpLeasePolicyInput): boolean {
+  const role = input.role.trim().toLowerCase();
+  const phase = resolveHostHermesAcpRunPhase(input).toLowerCase();
+  const workerSessionLifecycle = input.workerSessionLifecycle ?? "reuse_by_issue";
+  return role === "worker" && phase === "implementation" && workerSessionLifecycle === "reuse_by_issue";
+}
+
+export function buildHostHermesAcpReusableLeaseKey(input: {
+  workspaceKey: string;
+  issueIdentifier: string;
+  role: string;
+  phase?: string | null;
+}): string {
+  return [input.workspaceKey, input.issueIdentifier, input.role, resolveHostHermesAcpRunPhase(input)]
+    .map((part) => part.trim().toLowerCase())
+    .join(":");
+}
+
+export function resolveHostHermesAcpRunPhase(input: { role: string; phase?: string | null }): string {
+  const configured = normalizeOptionalString(input.phase);
+  if (configured) return configured;
+  return input.role.trim().toLowerCase() === "reviewer" ? "review" : "implementation";
 }
 
 export function buildHostHermesAcpProfileName(input: HostHermesAcpProfileNameInput): string {
@@ -245,6 +462,25 @@ export function shouldDeleteHostHermesAcpProfile(input: {
   if (input.keepProfiles === "always") return false;
   if (input.keepProfiles === "failed" && input.terminalStatus === "failed") return false;
   return true;
+}
+
+async function terminateHostHermesAcpLeaseProcess(
+  processHandle: HostHermesAcpLeaseProcessHandle | null,
+  hook: HostHermesAcpLeaseLifecycleHook,
+): Promise<void> {
+  if (!processHandle) return;
+  const reason = `hermes.${hook}`;
+  if (typeof processHandle.kill === "function") {
+    await processHandle.kill(reason);
+    return;
+  }
+  if (typeof processHandle.close === "function") {
+    await processHandle.close(reason);
+    return;
+  }
+  if (typeof processHandle.dispose === "function") {
+    await processHandle.dispose(reason);
+  }
 }
 
 async function acquireHostHermesAcpLeaseProfile(
