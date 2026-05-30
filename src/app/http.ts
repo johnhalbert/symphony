@@ -1052,8 +1052,12 @@ export class StatusServer {
       snapshot,
       issueBoardColumns,
       clock,
+    }).then((context) => {
+      assertCompletedWebProjectionContextCacheable(context);
+      return context;
     });
     this.pendingWebProjectionContexts.set(pendingKey, promise);
+
     try {
       const context = await promise;
       if (this.pendingWebProjectionContexts.get(pendingKey) === promise) {
@@ -1098,7 +1102,7 @@ export class StatusServer {
   ): Promise<WebProjectionCacheFingerprint> {
     const fetchedStates = webProjectionIssueBoardFetchStates(issueBoardColumns);
     return createWebProjectionFingerprint({
-      runtimeGeneratedAt: snapshot.generatedAt,
+      runtimeGeneratedAt: statusServerRuntimeFingerprintKey(snapshot),
       issueBoardStates: [issueBoardFetchedStateCacheKey(fetchedStates)],
       issueBoardColumns: issueBoardColumnCacheKeyValues(issueBoardColumns),
       durableSourceRevisions: await this.resolveWebProjectionSourceRevisions(),
@@ -1162,6 +1166,37 @@ const STATUS_SERVER_WEB_PROJECTION_COLUMN_IDS: readonly IssueBoardColumnId[] = [
   "done",
   "canceled",
 ] as const;
+
+const STATUS_SERVER_RUNTIME_FINGERPRINT_VOLATILE_FIELDS = new Set([
+  "generatedAt",
+  "secondsRunning",
+  "secondsSinceLastActivity",
+]);
+
+function statusServerRuntimeFingerprintKey(snapshot: ReturnType<Orchestrator["snapshot"]>): string {
+  return JSON.stringify(statusServerRuntimeFingerprintValue(snapshot));
+}
+
+function statusServerRuntimeFingerprintValue(value: unknown, key?: string): unknown {
+  if (key && STATUS_SERVER_RUNTIME_FINGERPRINT_VOLATILE_FIELDS.has(key)) return undefined;
+  if (Array.isArray(value)) return value.map((item) => statusServerRuntimeFingerprintValue(item));
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const output: Record<string, unknown> = {};
+    for (const childKey of Object.keys(record).sort()) {
+      const childValue = statusServerRuntimeFingerprintValue(record[childKey], childKey);
+      if (childValue !== undefined) output[childKey] = childValue;
+    }
+    return output;
+  }
+  return value;
+}
+
+function assertCompletedWebProjectionContextCacheable(context: StatusServerWebProjectionContext): void {
+  const trackerFailure = context.sourceIndex.trackerIssues.error;
+  if (!trackerFailure || trackerFailure.code === "tracker_unavailable") return;
+  throw trackerFailureFromSourceIndex(context.sourceIndex);
+}
 
 function webProjectionContextPendingKey(forceRefresh: boolean, fingerprintKey: string): string {
   return `${forceRefresh ? "refresh" : "default"}\0${fingerprintKey}`;

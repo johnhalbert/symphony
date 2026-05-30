@@ -14,12 +14,13 @@ interface TestableStatusServer extends StatusServer {
 }
 
 describe("StatusServer web projection context cache", () => {
-  it("reuses a completed context before the fixed TTL and rebuilds after expiry", async () => {
+  it("reuses a completed context before the fixed TTL despite volatile snapshot generatedAt and rebuilds after expiry", async () => {
     const startedAt = Date.parse("2026-01-01T00:00:00.000Z");
     let nowMs = startedAt;
+    let generatedAtMs = startedAt;
     let builds = 0;
     const server = createStatusServer({
-      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      generatedAt: () => new Date(generatedAtMs).toISOString(),
       clock: () => new Date(nowMs),
       builder: (input) => {
         builds += 1;
@@ -29,11 +30,13 @@ describe("StatusServer web projection context cache", () => {
     const acquire = acquireFrom(server);
 
     const first = await acquire(false);
+    generatedAtMs = startedAt + 5;
     nowMs = startedAt + WEB_PROJECTION_CONTEXT_TTL_MS - 1;
     const second = await acquire(false);
     expect(second).toBe(first);
     expect(builds).toBe(1);
 
+    generatedAtMs = startedAt + WEB_PROJECTION_CONTEXT_TTL_MS;
     nowMs = startedAt + WEB_PROJECTION_CONTEXT_TTL_MS;
     const expired = await acquire(false);
     expect(expired).not.toBe(first);
@@ -41,12 +44,14 @@ describe("StatusServer web projection context cache", () => {
     expect(builds).toBe(2);
   });
 
-  it("rebuilds before TTL expiry when the runtime or durable-source fingerprint changes", async () => {
-    let generatedAt = "2026-01-01T00:00:00.000Z";
+  it("rebuilds before TTL expiry when stable runtime state or durable-source fingerprint changes", async () => {
+    const generatedAt = "2026-01-01T00:00:00.000Z";
+    let runningCount = 0;
     let durableRevision = "revision-1";
     let builds = 0;
     const server = createStatusServer({
       generatedAt: () => generatedAt,
+      runtimeCounts: () => ({ running: runningCount }),
       clock: () => new Date("2026-01-01T00:00:00.000Z"),
       revisionProvider: () => ({ source: "runs", revision: durableRevision, observedAt: generatedAt }),
       builder: (input) => {
@@ -62,7 +67,7 @@ describe("StatusServer web projection context cache", () => {
     expect(revisionChanged).not.toBe(first);
     expect(projectedBuild(revisionChanged)).toBe(2);
 
-    generatedAt = "2026-01-01T00:00:01.000Z";
+    runningCount = 1;
     const runtimeChanged = await acquire(false);
     expect(runtimeChanged).not.toBe(revisionChanged);
     expect(projectedBuild(runtimeChanged)).toBe(3);
@@ -75,9 +80,11 @@ describe("StatusServer web projection context cache", () => {
       input: StatusServerWebProjectionContextBuildInput;
       deferred: Deferred<StatusServerWebProjectionContext>;
     }> = [];
+    const startedAt = Date.parse("2026-01-01T00:00:00.000Z");
+    let generatedAtMs = startedAt;
     let builds = 0;
     const server = createStatusServer({
-      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      generatedAt: () => new Date(generatedAtMs).toISOString(),
       clock: () => new Date("2026-01-01T00:00:00.000Z"),
       builder: (input) => {
         builds += 1;
@@ -89,6 +96,7 @@ describe("StatusServer web projection context cache", () => {
     const acquire = acquireFrom(server);
 
     const first = acquire(false);
+    generatedAtMs = startedAt + 10;
     const second = acquire(false);
     await settleMicrotasks();
 
@@ -130,6 +138,8 @@ describe("StatusServer web projection context cache", () => {
   });
 
   it("bypasses a completed context for refresh requests and coalesces concurrent refresh builds", async () => {
+    const startedAt = Date.parse("2026-01-01T00:00:00.000Z");
+    let generatedAtMs = startedAt;
     let builds = 0;
     let deferRefresh = false;
     const pendingRefreshBuilds: Array<{
@@ -138,7 +148,7 @@ describe("StatusServer web projection context cache", () => {
       deferred: Deferred<StatusServerWebProjectionContext>;
     }> = [];
     const server = createStatusServer({
-      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      generatedAt: () => new Date(generatedAtMs).toISOString(),
       clock: () => new Date("2026-01-01T00:00:00.000Z"),
       builder: (input) => {
         builds += 1;
@@ -156,7 +166,9 @@ describe("StatusServer web projection context cache", () => {
     expect(projectedBuild(completed)).toBe(1);
 
     deferRefresh = true;
+    generatedAtMs = startedAt + 10;
     const firstRefresh = acquire(true);
+    generatedAtMs = startedAt + 20;
     const secondRefresh = acquire(true);
     await settleMicrotasks();
 
@@ -174,13 +186,15 @@ describe("StatusServer web projection context cache", () => {
   });
 
   it("clears failed pending builds, preserves the last good completed context, and allows retry", async () => {
-    let generatedAt = "2026-01-01T00:00:00.000Z";
+    const generatedAt = "2026-01-01T00:00:00.000Z";
+    let durableRevision = "revision-1";
     let builds = 0;
     let failNext = false;
     const pendingFailure: { current: Deferred<StatusServerWebProjectionContext> | null } = { current: null };
     const server = createStatusServer({
       generatedAt: () => generatedAt,
       clock: () => new Date("2026-01-01T00:00:00.000Z"),
+      revisionProvider: () => ({ source: "runs", revision: durableRevision, observedAt: generatedAt }),
       builder: (input) => {
         builds += 1;
         if (failNext) {
@@ -196,7 +210,7 @@ describe("StatusServer web projection context cache", () => {
     const completed = await acquire(false);
     expect(projectedBuild(completed)).toBe(1);
 
-    generatedAt = "2026-01-01T00:00:01.000Z";
+    durableRevision = "revision-2";
     failNext = true;
     const failedFirst = acquire(false);
     const failedSecond = acquire(false);
@@ -209,36 +223,103 @@ describe("StatusServer web projection context cache", () => {
     await expect(failedFirst).rejects.toThrow("context build failed");
     await expect(failedSecond).rejects.toThrow("context build failed");
 
-    generatedAt = "2026-01-01T00:00:00.000Z";
+    durableRevision = "revision-1";
     await expect(acquire(false)).resolves.toBe(completed);
     expect(builds).toBe(2);
 
-    generatedAt = "2026-01-01T00:00:01.000Z";
+    durableRevision = "revision-2";
     const retried = await acquire(false);
     expect(projectedBuild(retried)).toBe(3);
     expect(retried).not.toBe(completed);
     expect(builds).toBe(3);
+  });
+
+  it("does not cache default-builder tracker failures and retries after recovery", async () => {
+    const startedAt = Date.parse("2026-01-01T00:00:00.000Z");
+    let generatedAtMs = startedAt;
+    let durableRevision = "revision-1";
+    let trackerMode: "ok" | "fail" = "ok";
+    let trackerCalls = 0;
+    const server = createStatusServer({
+      generatedAt: () => new Date(generatedAtMs).toISOString(),
+      clock: () => new Date(generatedAtMs),
+      staleThresholdMs: -1,
+      revisionProvider: () => ({
+        source: "runs",
+        revision: durableRevision,
+        observedAt: null,
+      }),
+      tracker: {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          trackerCalls += 1;
+          if (trackerMode === "fail") throw new Error("temporary tracker outage");
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [];
+        },
+      },
+    });
+    const acquire = acquireFrom(server);
+
+    const completed = await acquire(false);
+    expect(completed.sourceIndex.trackerIssues.status).toBe("ok");
+    expect(trackerCalls).toBe(1);
+
+    durableRevision = "revision-2";
+    generatedAtMs = startedAt + 10;
+    trackerMode = "fail";
+    const failedFirst = acquire(false);
+    const failedSecond = acquire(false);
+    await settleMicrotasks();
+
+    await expect(failedFirst).rejects.toMatchObject({ code: "tracker_error" });
+    await expect(failedSecond).rejects.toMatchObject({ code: "tracker_error" });
+    expect(trackerCalls).toBe(2);
+
+    durableRevision = "revision-1";
+    generatedAtMs = startedAt + 20;
+    await expect(acquire(false)).resolves.toBe(completed);
+    expect(trackerCalls).toBe(2);
+
+    durableRevision = "revision-2";
+    generatedAtMs = startedAt + 30;
+    trackerMode = "ok";
+    const recovered = await acquire(false);
+    expect(recovered).not.toBe(completed);
+    expect(recovered.sourceIndex.trackerIssues.status).toBe("ok");
+    expect(trackerCalls).toBe(3);
+
+    await expect(acquire(false)).resolves.toBe(recovered);
+    expect(trackerCalls).toBe(3);
   });
 });
 
 function createStatusServer(input: {
   generatedAt: () => string;
   clock: () => Date;
-  builder: StatusServerWebProjectionContextBuilder;
+  builder?: StatusServerWebProjectionContextBuilder;
+  runtimeCounts?: () => Partial<ReturnType<ConstructorParameters<typeof StatusServer>[0]["orchestrator"]["snapshot"]>["counts"]>;
   revisionProvider?: () => { source: string; revision: string | number; observedAt: string | null };
+  tracker?: ConstructorParameters<typeof StatusServer>[0]["tracker"];
+  staleThresholdMs?: number;
 }): StatusServer {
   const options: ConstructorParameters<typeof StatusServer>[0] = {
-    orchestrator: fakeOrchestrator(input.generatedAt),
+    orchestrator: fakeOrchestrator(input.generatedAt, input.runtimeCounts),
     workspaceManager: {} as ConstructorParameters<typeof StatusServer>[0]["workspaceManager"],
     workspaceOpener: {} as ConstructorParameters<typeof StatusServer>[0]["workspaceOpener"],
     host: "127.0.0.1",
     port: 0,
     openWorkspaceToken: null,
     trackerStateLists: testTrackerStateLists(),
-    staleThresholdMs: 300_000,
+    staleThresholdMs: input.staleThresholdMs ?? 300_000,
     webAssetsRoot: null,
     webProjectionContextClock: input.clock,
-    webProjectionContextBuilder: input.builder,
+    ...(input.builder ? { webProjectionContextBuilder: input.builder } : {}),
+    ...(input.tracker ? { tracker: input.tracker } : {}),
     ...(input.revisionProvider
       ? {
           webProjectionRevisionProviders: [
@@ -329,10 +410,18 @@ function sourceIndexFixture(generatedAt: string, build: number): StatusServerWeb
   };
 }
 
-function runtimeSnapshot(generatedAt: string): ReturnType<ConstructorParameters<typeof StatusServer>[0]["orchestrator"]["snapshot"]> {
+function runtimeSnapshot(
+  generatedAt: string,
+  counts: Partial<ReturnType<ConstructorParameters<typeof StatusServer>[0]["orchestrator"]["snapshot"]>["counts"]> = {},
+): ReturnType<ConstructorParameters<typeof StatusServer>[0]["orchestrator"]["snapshot"]> {
   return {
     generatedAt,
-    counts: { running: 0, retrying: 0, paused: 0, providerGates: 0 },
+    counts: {
+      running: counts.running ?? 0,
+      retrying: counts.retrying ?? 0,
+      paused: counts.paused ?? 0,
+      providerGates: counts.providerGates ?? 0,
+    },
     providerGates: [],
     providerGateCounts: { active: 0, manual: 0, autoResume: 0 },
     running: [],
@@ -345,10 +434,11 @@ function runtimeSnapshot(generatedAt: string): ReturnType<ConstructorParameters<
 
 function fakeOrchestrator(
   generatedAt: () => string,
+  runtimeCounts?: () => Partial<ReturnType<ConstructorParameters<typeof StatusServer>[0]["orchestrator"]["snapshot"]>["counts"]>,
 ): ConstructorParameters<typeof StatusServer>[0]["orchestrator"] {
   return {
     snapshot() {
-      return runtimeSnapshot(generatedAt());
+      return runtimeSnapshot(generatedAt(), runtimeCounts?.());
     },
     getIssueDetails() {
       return null;
