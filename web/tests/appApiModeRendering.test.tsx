@@ -542,10 +542,14 @@ describe("App API-mode rendering", () => {
     });
 
     expect(hookCalls.reference).toEqual([{ enabled: true }]);
-    expect(hookCalls.sidebar).toEqual([{ enabled: false }]);
+    expect(hookCalls.dashboard).toEqual([{ enabled: true }]);
+    expect(hookCalls.issueBoard).toEqual([{ enabled: false }]);
+    expect(hookCalls.history).toEqual([{ enabled: false }]);
+    expect(hookCalls.sidebar).toEqual([{ enabled: true }]);
+    expect(hookCalls.orchestratorChat).toEqual([{ enabled: true }]);
     expect(markup).toContain("Symphony API returned HTTP 503");
     expect(markup).toContain("api source · api");
-    expect(markup).toContain("0 agents running");
+    expect(markup).toContain("1 agents running");
     expect(markup).toContain("poll pending");
 
     expect(markup).not.toContain("openai/symphony@main");

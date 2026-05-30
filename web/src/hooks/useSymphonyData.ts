@@ -9,17 +9,17 @@ interface SymphonyResourceOptions {
 
 export function useReferenceData(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getReferenceData(), [dataSource]), [dataSource], options);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getReferenceData(signal), [dataSource]), [dataSource], options);
 }
 
 export function useDashboard(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getDashboard(), [dataSource]), [dataSource], options);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getDashboard(signal), [dataSource]), [dataSource], options);
 }
 
 export function useIssueBoard(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getIssueBoard(), [dataSource]), [dataSource], options);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getIssueBoard(signal), [dataSource]), [dataSource], options);
 }
 
 export function useIssueDetail(issueId: string | null): Loadable<IssueDetailModel | null> {
@@ -41,9 +41,10 @@ export function useIssueDetail(issueId: string | null): Loadable<IssueDetailMode
       };
     }
 
+    const controller = new AbortController();
     setState({ issueId: normalizedIssueId, data: null, loading: true, error: null });
     dataSource
-      .getIssueDetail(normalizedIssueId)
+      .getIssueDetail(normalizedIssueId, controller.signal)
       .then((data) => {
         if (active) setState({ issueId: normalizedIssueId, data, loading: false, error: null });
       })
@@ -55,6 +56,7 @@ export function useIssueDetail(issueId: string | null): Loadable<IssueDetailMode
 
     return () => {
       active = false;
+      controller.abort();
     };
   }, [dataSource, normalizedIssueId]);
 
@@ -67,7 +69,7 @@ export function useIssueDetail(issueId: string | null): Loadable<IssueDetailMode
 
 export function useHistory(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getHistory(), [dataSource]), [dataSource], options);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getHistory(signal), [dataSource]), [dataSource], options);
 }
 
 export function useTranscript(sessionId: string | null): Loadable<TranscriptMessage[]> {
@@ -89,9 +91,10 @@ export function useTranscript(sessionId: string | null): Loadable<TranscriptMess
       };
     }
 
+    const controller = new AbortController();
     setState({ sessionId: normalizedSessionId, data: null, loading: true, error: null });
     dataSource
-      .getTranscript(normalizedSessionId)
+      .getTranscript(normalizedSessionId, controller.signal)
       .then((data) => {
         if (active) setState({ sessionId: normalizedSessionId, data, loading: false, error: null });
       })
@@ -103,6 +106,7 @@ export function useTranscript(sessionId: string | null): Loadable<TranscriptMess
 
     return () => {
       active = false;
+      controller.abort();
     };
   }, [dataSource, normalizedSessionId]);
 
@@ -115,10 +119,10 @@ export function useTranscript(sessionId: string | null): Loadable<TranscriptMess
 
 export function useSidebar(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getSidebar(), [dataSource]), [dataSource], options);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getSidebar(signal), [dataSource]), [dataSource], options);
 }
 
 export function useOrchestratorChat(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback(() => dataSource.getOrchestratorChat(), [dataSource]), [dataSource], options);
+  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getOrchestratorChat(signal), [dataSource]), [dataSource], options);
 }

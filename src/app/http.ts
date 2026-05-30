@@ -971,17 +971,6 @@ export class StatusServer {
       }
     }
     const activitySources = await this.fetchWebCollectionActivitySources(sourceIndex);
-    const dashboardActivity = await buildActivityFeed({
-      generatedAt: snapshot.generatedAt,
-      runStore: this.options.runStore,
-      runs: activitySources.runs,
-      lifecycleStore: this.options.lifecycleStore,
-      lifecycleRecords: activitySources.lifecycleRecords,
-      writebackOutbox: this.options.writebackOutbox,
-      writebackOperations: activitySources.writebackOperations,
-      query: { issue: null, offset: 0, limit: 20 },
-      includeTranscriptEvents: false,
-    });
     const historyActivity = await buildActivityFeed({
       generatedAt: snapshot.generatedAt,
       runStore: this.options.runStore,
@@ -993,6 +982,7 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: Number.MAX_SAFE_INTEGER },
       includeTranscriptEvents: false,
     });
+    const dashboardActivity = previewActivityFeed(historyActivity, 20);
     return projectWebSidebar(
       projectWebDashboard({
         runtime: snapshot,
@@ -2234,12 +2224,22 @@ async function buildActivityFeed(input: {
     source: {
       kind: "durable_activity" as const,
       runStoreAvailable: Boolean(input.runStore),
-      writebackOutboxAvailable: Boolean(input.writebackOutbox),
+      writebackOutboxAvailable: Boolean(input.writebackOutbox || input.writebackOperations),
       transcriptTailPerRun: ACTIVITY_TRANSCRIPT_TAIL_PER_RUN,
     },
     filter: {
       issue: input.query.issue,
     },
+  };
+}
+
+function previewActivityFeed<T extends { limit: number; nextOffset: number | null; activity: ActivityItem[] }>(feed: T, limit: number): T {
+  const activity = feed.activity.slice(0, limit);
+  return {
+    ...feed,
+    limit,
+    nextOffset: feed.activity.length > activity.length ? activity.length : null,
+    activity,
   };
 }
 

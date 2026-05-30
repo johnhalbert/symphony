@@ -89,7 +89,8 @@ function AppShell({
   const dashboard = useDashboard({ enabled: resourceLoading.dashboard });
   const issueBoard = useIssueBoard({ enabled: resourceLoading.issueBoard });
   const history = useHistory({ enabled: resourceLoading.history });
-  const sidebar = useSidebar({ enabled: resourceLoading.sidebar });
+  const sidebarEnabled = resourceLoading.sidebar || (apiMode && Boolean(dashboard.error));
+  const sidebar = useSidebar({ enabled: sidebarEnabled });
   const orchestratorChat = useOrchestratorChat({ enabled: resourceLoading.orchestratorChat });
   const dashboardChrome = dashboard.data;
   const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;

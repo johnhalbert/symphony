@@ -219,6 +219,50 @@ describe("API data source", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("deduplicates hook-style signaled duplicate cacheable GET requests and reuses their successful response", async () => {
+    const gate = deferred<Response>();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockReturnValue(gate.promise);
+    const dataSource = createApiDataSource("/status-server/");
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+
+    const first = dataSource.getDashboard(firstController.signal);
+    const second = dataSource.getDashboard(secondController.signal);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/status-server/api/v1/web/dashboard", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+
+    gate.resolve(jsonResponse(dashboardModel));
+    await expect(Promise.all([first, second])).resolves.toEqual([dashboardModel, dashboardModel]);
+
+    const cacheController = new AbortController();
+    await expect(dataSource.getDashboard(cacheController.signal)).resolves.toEqual(dashboardModel);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a stale signaled subscriber without breaking the shared cacheable GET for active subscribers", async () => {
+    const gate = deferred<Response>();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockReturnValue(gate.promise);
+    const dataSource = createApiDataSource("/status-server/");
+    const staleController = new AbortController();
+    const activeController = new AbortController();
+
+    const staleRequest = dataSource.getDashboard(staleController.signal);
+    const activeRequest = dataSource.getDashboard(activeController.signal);
+    staleController.abort();
+
+    await expect(staleRequest).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    gate.resolve(jsonResponse(dashboardModel));
+    await expect(activeRequest).resolves.toEqual(dashboardModel);
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("reuses successful duplicate GET responses briefly before refreshing after the cache window", async () => {
     const dateNow = vi.spyOn(Date, "now");
     dateNow.mockReturnValue(1_000);
@@ -390,6 +434,44 @@ describe("API data source", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/sessions/run%2Fwith%20space/transcript", {
       headers: { Accept: "application/json" },
       signal: undefined,
+    });
+  });
+
+  it("passes AbortSignal through selected detail and transcript reads without sharing stale responses", async () => {
+    const firstDetail = { issue: { id: "ENG-124", title: "first detail" }, activity: [], runs: [], transcript: [] };
+    const secondDetail = { issue: { id: "ENG-124", title: "second detail" }, activity: [], runs: [], transcript: [] };
+    const firstTranscript: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-05-30T00:00:00.000Z", text: "first transcript" }];
+    const secondTranscript: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-05-30T00:00:01.000Z", text: "second transcript" }];
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(firstDetail))
+      .mockResolvedValueOnce(jsonResponse(secondDetail))
+      .mockResolvedValueOnce(jsonResponse(firstTranscript))
+      .mockResolvedValueOnce(jsonResponse(secondTranscript));
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const dataSource = createApiDataSource("");
+
+    await expect(dataSource.getIssueDetail("ENG-124", firstController.signal)).resolves.toEqual(firstDetail);
+    await expect(dataSource.getIssueDetail("ENG-124", secondController.signal)).resolves.toEqual(secondDetail);
+    await expect(dataSource.getTranscript("run-124", firstController.signal)).resolves.toEqual(firstTranscript);
+    await expect(dataSource.getTranscript("run-124", secondController.signal)).resolves.toEqual(secondTranscript);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/web/issues/ENG-124", {
+      headers: { Accept: "application/json" },
+      signal: firstController.signal,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/web/issues/ENG-124", {
+      headers: { Accept: "application/json" },
+      signal: secondController.signal,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/web/sessions/run-124/transcript", {
+      headers: { Accept: "application/json" },
+      signal: firstController.signal,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/v1/web/sessions/run-124/transcript", {
+      headers: { Accept: "application/json" },
+      signal: secondController.signal,
     });
   });
 
