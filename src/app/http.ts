@@ -64,9 +64,20 @@ import { projectWebHistory } from "./WebHistoryProjection.js";
 import { projectWebTranscript } from "./WebTranscriptProjection.js";
 import {
   buildWebProjectionSourceIndex,
+  createWebProjectionCacheMetadata,
+  createWebProjectionFingerprint,
   defaultWebProjectionIssueBoardColumns,
+  isWebProjectionContextExpired,
+  isWebProjectionRefreshRequested,
+  webProjectionFingerprintCacheKey,
   webProjectionIssueBoardFetchStates,
   type BuiltWebProjectionSourceIndex,
+  type WebProjectionCacheFingerprint,
+  type WebProjectionCacheMetadata,
+  type WebProjectionClock,
+  type WebProjectionContext,
+  type WebProjectionRevisionProvider,
+  type WebProjectionSourceRevision,
 } from "./WebProjectionContext.js";
 import type {
   IssueBlockerRef,
@@ -81,6 +92,28 @@ import type {
   RunTerminalReason,
   TrackerStateLists,
 } from "../core/types.js";
+
+export const WEB_PROJECTION_CONTEXT_TTL_MS = 5_000;
+
+export type StatusServerWebProjectionContext = WebProjectionContext<BuiltWebProjectionSourceIndex, Record<string, unknown>>;
+
+export interface StatusServerWebProjectionContextBuildInput {
+  metadata: WebProjectionCacheMetadata;
+  fingerprint: WebProjectionCacheFingerprint;
+  forceRefresh: boolean;
+  snapshot: ReturnType<Orchestrator["snapshot"]>;
+  issueBoardColumns: IssueBoardColumnMapping;
+  clock: WebProjectionClock;
+}
+
+export type StatusServerWebProjectionContextBuilder = (
+  input: StatusServerWebProjectionContextBuildInput,
+) => StatusServerWebProjectionContext | Promise<StatusServerWebProjectionContext>;
+
+interface StatusServerWebProjectionContextAcquireResult {
+  context: StatusServerWebProjectionContext;
+  reusedCompleted: boolean;
+}
 
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
@@ -107,11 +140,16 @@ export interface StatusServerOptions {
    * Undefined or blank values default to `process.cwd()/web/dist`; null disables static serving.
    */
   webAssetsRoot?: string | null | undefined;
+  webProjectionContextClock?: WebProjectionClock;
+  webProjectionContextBuilder?: StatusServerWebProjectionContextBuilder;
+  webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
 }
 
 export class StatusServer {
   private server: http.Server | null = null;
   private issueBoardTrackerCache: IssueBoardTrackerCache | null = null;
+  private completedWebProjectionContext: StatusServerWebProjectionContext | null = null;
+  private readonly pendingWebProjectionContexts = new Map<string, Promise<StatusServerWebProjectionContext>>();
   private readonly webAssetsRoot: string | null;
 
   constructor(private readonly options: StatusServerOptions) {
@@ -187,7 +225,7 @@ export class StatusServer {
           200,
           await this.fetchWebIssueDetail(
             issueId,
-            url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true",
+            isWebProjectionRefreshRequested(url.searchParams.get("refresh")),
           ),
         );
         return;
@@ -197,7 +235,7 @@ export class StatusServer {
         const issueId = decodeURIComponent(boardIssueMatch[1] ?? "");
         const detail = await this.fetchBoardIssueDetail(
           issueId,
-          url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true",
+          isWebProjectionRefreshRequested(url.searchParams.get("refresh")),
         );
         sendJson(response, 200, detail);
         return;
@@ -206,7 +244,7 @@ export class StatusServer {
       if (request.method === "GET" && url.pathname === "/api/v1/web/reference-data") {
         let board: IssueBoardResponse | null = null;
         try {
-          board = await this.fetchIssueBoard(url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true");
+          board = await this.fetchIssueBoard(isWebProjectionRefreshRequested(url.searchParams.get("refresh")));
         } catch (error) {
           if (
             !(error instanceof SymphonyError) ||
@@ -222,7 +260,7 @@ export class StatusServer {
         sendJson(
           response,
           200,
-          await this.fetchWebDashboard(url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true"),
+          await this.fetchWebDashboard(isWebProjectionRefreshRequested(url.searchParams.get("refresh"))),
         );
         return;
       }
@@ -230,7 +268,7 @@ export class StatusServer {
         sendJson(
           response,
           200,
-          await this.fetchWebSidebar(url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true"),
+          await this.fetchWebSidebar(isWebProjectionRefreshRequested(url.searchParams.get("refresh"))),
         );
         return;
       }
@@ -240,14 +278,14 @@ export class StatusServer {
           200,
           acceptedBoardResponse(
             await this.fetchIssueBoard(
-              url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true",
+              isWebProjectionRefreshRequested(url.searchParams.get("refresh")),
             ),
           ),
         );
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/issues") {
-        const forceRefresh = url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true";
+        const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
         let board: IssueBoardResponse | null = null;
         try {
           board = await this.fetchIssueBoard(forceRefresh);
@@ -263,7 +301,7 @@ export class StatusServer {
         sendJson(
           response,
           200,
-          await this.fetchIssueBoard(url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true"),
+          await this.fetchIssueBoard(isWebProjectionRefreshRequested(url.searchParams.get("refresh"))),
         );
         return;
       }
@@ -966,19 +1004,111 @@ export class StatusServer {
     sourceIndex: BuiltWebProjectionSourceIndex;
     issueBoardColumns: IssueBoardColumnMapping;
   }> {
-    const issueBoardColumns = this.options.issueBoardColumns ?? defaultWebProjectionIssueBoardColumns(this.options.trackerStateLists);
-    const sourceIndex = await buildWebProjectionSourceIndex({
-      snapshot: this.options.orchestrator.snapshot(),
+    const acquired = await this.acquireWebProjectionContextEntry(forceRefresh);
+    return {
+      sourceIndex: acquired.reusedCompleted
+        ? webProjectionSourceIndexWithTrackerCacheHit(acquired.context.sourceIndex)
+        : acquired.context.sourceIndex,
+      issueBoardColumns: this.resolveWebProjectionIssueBoardColumns(),
+    };
+  }
+
+  async acquireWebProjectionContext(forceRefresh: boolean): Promise<StatusServerWebProjectionContext> {
+    return (await this.acquireWebProjectionContextEntry(forceRefresh)).context;
+  }
+
+  private async acquireWebProjectionContextEntry(
+    forceRefresh: boolean,
+  ): Promise<StatusServerWebProjectionContextAcquireResult> {
+    const clock = this.options.webProjectionContextClock ?? (() => new Date());
+    const now = clock();
+    const snapshot = this.options.orchestrator.snapshot();
+    const issueBoardColumns = this.resolveWebProjectionIssueBoardColumns();
+    const fingerprint = await this.createWebProjectionContextFingerprint(snapshot, issueBoardColumns);
+    const fingerprintKey = webProjectionFingerprintCacheKey(fingerprint);
+    const completed = this.completedWebProjectionContext;
+    if (
+      completed &&
+      !forceRefresh &&
+      !isWebProjectionContextExpired(completed, now) &&
+      webProjectionFingerprintCacheKey(completed.metadata.fingerprint) === fingerprintKey
+    ) {
+      return { context: completed, reusedCompleted: true };
+    }
+
+    const pendingKey = webProjectionContextPendingKey(forceRefresh, fingerprintKey);
+    const pending = this.pendingWebProjectionContexts.get(pendingKey);
+    if (pending) return { context: await pending, reusedCompleted: false };
+
+    const metadata = createWebProjectionCacheMetadata({
+      builtAt: now,
+      maxAgeMs: WEB_PROJECTION_CONTEXT_TTL_MS,
+      fingerprint,
+    });
+    const promise = this.buildWebProjectionContext({
+      metadata,
+      fingerprint,
+      forceRefresh,
+      snapshot,
       issueBoardColumns,
+      clock,
+    });
+    this.pendingWebProjectionContexts.set(pendingKey, promise);
+    try {
+      const context = await promise;
+      if (this.pendingWebProjectionContexts.get(pendingKey) === promise) {
+        this.completedWebProjectionContext = context;
+      }
+      return { context, reusedCompleted: false };
+    } finally {
+      if (this.pendingWebProjectionContexts.get(pendingKey) === promise) {
+        this.pendingWebProjectionContexts.delete(pendingKey);
+      }
+    }
+  }
+
+  private async buildWebProjectionContext(
+    input: StatusServerWebProjectionContextBuildInput,
+  ): Promise<StatusServerWebProjectionContext> {
+    const builder = this.options.webProjectionContextBuilder;
+    if (builder) return builder(input);
+    const sourceIndex = await buildWebProjectionSourceIndex({
+      snapshot: input.snapshot,
+      issueBoardColumns: input.issueBoardColumns,
       ...(this.options.tracker
         ? { fetchTrackerProjection: ({ columns, forceRefresh }) => this.fetchIssueBoardTrackerProjection(columns, forceRefresh) }
         : {}),
-      forceRefresh,
+      forceRefresh: input.forceRefresh,
+      clock: input.clock,
+      durableSourceRevisions: input.fingerprint.durableSourceRevisions,
       ...(this.options.runStore ? { runStore: this.options.runStore } : {}),
       ...(this.options.lifecycleStore ? { lifecycleStore: this.options.lifecycleStore } : {}),
       ...(this.options.writebackOutbox ? { writebackOutbox: this.options.writebackOutbox } : {}),
     });
-    return { sourceIndex, issueBoardColumns };
+    return { metadata: input.metadata, sourceIndex, projections: {} };
+  }
+
+  private resolveWebProjectionIssueBoardColumns(): IssueBoardColumnMapping {
+    return this.options.issueBoardColumns ?? defaultWebProjectionIssueBoardColumns(this.options.trackerStateLists);
+  }
+
+  private async createWebProjectionContextFingerprint(
+    snapshot: ReturnType<Orchestrator["snapshot"]>,
+    issueBoardColumns: IssueBoardColumnMapping,
+  ): Promise<WebProjectionCacheFingerprint> {
+    const fetchedStates = webProjectionIssueBoardFetchStates(issueBoardColumns);
+    return createWebProjectionFingerprint({
+      runtimeGeneratedAt: snapshot.generatedAt,
+      issueBoardStates: [issueBoardFetchedStateCacheKey(fetchedStates)],
+      issueBoardColumns: issueBoardColumnCacheKeyValues(issueBoardColumns),
+      durableSourceRevisions: await this.resolveWebProjectionSourceRevisions(),
+    });
+  }
+
+  private async resolveWebProjectionSourceRevisions(): Promise<readonly WebProjectionSourceRevision[]> {
+    const providers = this.options.webProjectionRevisionProviders ?? [];
+    if (providers.length === 0) return [];
+    return Promise.all(providers.map((provider) => provider.getRevision()));
   }
 
   private async fetchIssueBoardTrackerProjection(
@@ -991,7 +1121,7 @@ export class StatusServer {
     }
 
     const fetchedStates = webProjectionIssueBoardFetchStates(columns);
-    const cacheKey = fetchedStates.map((state) => state.toLowerCase()).join("\0");
+    const cacheKey = issueBoardFetchedStateCacheKey(fetchedStates);
     const now = Date.now();
     const cached = this.issueBoardTrackerCache;
     if (
@@ -1022,6 +1152,42 @@ export class StatusServer {
       throw new SymphonyError("tracker_error", `Issue board tracker fetch failed: ${errorMessage(error)}`);
     }
   }
+}
+
+const STATUS_SERVER_WEB_PROJECTION_COLUMN_IDS: readonly IssueBoardColumnId[] = [
+  "backlog",
+  "todo",
+  "progress",
+  "review",
+  "done",
+  "canceled",
+] as const;
+
+function webProjectionContextPendingKey(forceRefresh: boolean, fingerprintKey: string): string {
+  return `${forceRefresh ? "refresh" : "default"}\0${fingerprintKey}`;
+}
+
+function issueBoardFetchedStateCacheKey(fetchedStates: readonly string[]): string {
+  return fetchedStates.map((state) => state.trim().toLowerCase()).join("\0");
+}
+
+function issueBoardColumnCacheKeyValues(columns: IssueBoardColumnMapping): string[] {
+  return STATUS_SERVER_WEB_PROJECTION_COLUMN_IDS.map(
+    (column) => `${column}:${issueBoardFetchedStateCacheKey(columns[column] ?? [])}`,
+  );
+}
+
+function webProjectionSourceIndexWithTrackerCacheHit(
+  sourceIndex: BuiltWebProjectionSourceIndex,
+): BuiltWebProjectionSourceIndex {
+  if (sourceIndex.trackerIssues.status !== "ok" || sourceIndex.trackerIssues.cached) return sourceIndex;
+  return {
+    ...sourceIndex,
+    trackerIssues: {
+      ...sourceIndex.trackerIssues,
+      cached: true,
+    },
+  };
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
