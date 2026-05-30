@@ -209,6 +209,7 @@ const rawConfigSchema = z
         port: z.number().int().min(0).optional(),
         host: z.string().optional(),
         open_workspace_token: z.string().optional(),
+        web_assets_root: z.string().nullable().optional(),
       })
       .passthrough()
       .optional(),
@@ -390,6 +391,7 @@ export interface ServerConfig {
   port: number | null;
   host: string;
   openWorkspaceToken: string | null;
+  webAssetsRoot: string | null;
 }
 
 export interface WritebackConfig {
@@ -670,6 +672,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const hermesProvider = normalizeOptionalConfigString(resolveConfigString(raw.hermes?.provider, env));
   const cursorRuntimeApiKey = normalizeOptionalConfigString(resolveConfigString("$CURSOR_API_KEY", env));
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
+  const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
   const credentialProfiles = createCredentialProfileRegistry({
     raw: raw.credential_profiles,
     env,
@@ -794,6 +797,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       port: raw.server?.port ?? null,
       host: raw.server?.host ?? "127.0.0.1",
       openWorkspaceToken: serverOpenWorkspaceToken,
+      webAssetsRoot: serverWebAssetsRoot,
     },
     writeback: {
       enabled: raw.writeback?.enabled ?? false,
@@ -868,6 +872,13 @@ export function resolvePathValue(value: string, baseDir: string, env: NodeJS.Pro
       ? path.join(os.homedir(), resolvedVariable.slice(2))
       : resolvedVariable;
   return path.resolve(baseDir, homeExpanded);
+}
+
+function resolveOptionalPathValue(value: string | null | undefined, baseDir: string, env: NodeJS.ProcessEnv): string | null {
+  if (value === null || value === undefined) return null;
+  const resolved = normalizeOptionalConfigString(resolveConfigString(value, env));
+  if (resolved === null) return null;
+  return resolvePathValue(resolved, baseDir, env);
 }
 
 function normalizeGitHubAppConfig(

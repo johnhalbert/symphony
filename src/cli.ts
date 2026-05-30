@@ -132,7 +132,11 @@ program
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .option("--port <port>", "enable local HTTP status server on this port")
   .option("--host <host>", "HTTP bind host")
-  .action(async (workflow: string, options: { port?: string; host?: string }) => {
+  .option(
+    "--web-assets-root <path>",
+    "serve the built React web asset root under /web (usually web/dist)",
+  )
+  .action(async (workflow: string, options: { port?: string; host?: string; webAssetsRoot?: string }) => {
     const logger = new StructuredLogger();
     const workflowPath = path.resolve(process.cwd(), workflow);
     const loader = new WorkflowLoader(workflowPath);
@@ -143,8 +147,13 @@ program
         ...loaded.serviceConfig.server,
         port: options.port === undefined ? loaded.serviceConfig.server.port : Number(options.port),
         host: options.host ?? loaded.serviceConfig.server.host,
+        webAssetsRoot:
+          options.webAssetsRoot === undefined
+            ? loaded.serviceConfig.server.webAssetsRoot
+            : resolveCliPathOption(options.webAssetsRoot),
       },
     };
+
     const configRef = { value: config };
 
     const tracker = createRuntimeTrackerClient(config);
@@ -209,6 +218,7 @@ program
             issueBoardColumns: config.issueBoard.columns,
             staleThresholdMs: config.polling.intervalMs,
             dashboard: statusDashboardConfig(config),
+            webAssetsRoot: config.server.webAssetsRoot,
           });
 
     if (statusServer) {
@@ -249,4 +259,10 @@ function statusDashboardConfig(config: ServiceConfig) {
     pollIntervalMs: config.polling.intervalMs,
     concurrencyCap: config.agent.maxConcurrentAgents,
   };
+}
+
+function resolveCliPathOption(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  return path.resolve(process.cwd(), trimmed);
 }

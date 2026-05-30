@@ -1,6 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
-import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
+import { constants as fsConstants, promises as fs, type Stats } from "node:fs";
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
@@ -96,16 +96,20 @@ export interface StatusServerOptions {
   issueBoardColumns?: IssueBoardColumnMapping;
   staleThresholdMs: number;
   dashboard?: DashboardRuntimeConfig | undefined;
-  webAssetsDir?: string | null | undefined;
+  /**
+   * Absolute root of the generated React web bundle, normally `web/dist`.
+   * Undefined or blank values default to `process.cwd()/web/dist`; null disables static serving.
+   */
+  webAssetsRoot?: string | null | undefined;
 }
 
 export class StatusServer {
   private server: http.Server | null = null;
   private issueBoardTrackerCache: IssueBoardTrackerCache | null = null;
-  private readonly webAssetsDir: string | null;
+  private readonly webAssetsRoot: string | null;
 
   constructor(private readonly options: StatusServerOptions) {
-    this.webAssetsDir = resolveWebAssetsDir(options.webAssetsDir);
+    this.webAssetsRoot = resolveWebAssetsRootOption(options.webAssetsRoot);
   }
 
   async start(): Promise<{ host: string; port: number }> {
@@ -717,7 +721,7 @@ export class StatusServer {
       }
 
       if ((request.method === "GET" || request.method === "HEAD") && isWebAssetRoute(url.pathname)) {
-        if (await serveWebAsset(response, request.method, url.pathname, this.webAssetsDir)) return;
+        if (await serveWebAsset(response, request.method, url.pathname, this.webAssetsRoot)) return;
       }
 
       sendJson(response, 404, { error: { code: "not_found", message: "Route not found" } });
@@ -1006,10 +1010,11 @@ const WEB_MOUNT_PATH = "/web";
 const WEB_INDEX_FILE = "index.html";
 const WEB_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const WEB_HTML_CACHE_CONTROL = "no-cache";
+const STATIC_ASSET_NOT_FOUND = { error: { code: "not_found", message: "Static asset not found" } } as const;
 
-function resolveWebAssetsDir(configuredWebAssetsDir: string | null | undefined): string | null {
-  if (configuredWebAssetsDir === null) return null;
-  const configured = configuredWebAssetsDir?.trim();
+function resolveWebAssetsRootOption(configuredWebAssetsRoot: string | null | undefined): string | null {
+  if (configuredWebAssetsRoot === null) return null;
+  const configured = configuredWebAssetsRoot?.trim();
   return path.resolve(configured && configured.length > 0 ? configured : path.join(process.cwd(), "web", "dist"));
 }
 
@@ -1021,45 +1026,65 @@ async function serveWebAsset(
   response: ServerResponse,
   method: "GET" | "HEAD",
   pathname: string,
-  webAssetsDir: string | null,
+  webAssetsRoot: string | null,
 ): Promise<boolean> {
-  if (!webAssetsDir) return false;
-  const request = resolveWebAssetRequest(pathname, webAssetsDir);
+  if (!webAssetsRoot) return false;
+
+  const resolvedRoot = await resolveExistingWebAssetsRoot(webAssetsRoot);
+  if (!resolvedRoot) {
+    sendStaticAssetNotFound(response, method);
+    return true;
+  }
+
+  const request = resolveWebAssetRequest(pathname, resolvedRoot);
   if (!request) {
-    sendStaticAssetNotFound(response);
+    sendStaticAssetNotFound(response, method);
     return true;
   }
 
-  let stat;
+  let filePath: string;
+  let stat: Stats;
   try {
-    stat = await fs.stat(request.filePath);
+    filePath = await fs.realpath(request.filePath);
+    if (!pathIsWithin(resolvedRoot, filePath)) {
+      sendStaticAssetNotFound(response, method);
+      return true;
+    }
+    stat = await fs.stat(filePath);
   } catch {
-    sendStaticAssetNotFound(response);
-    return true;
-  }
-  if (!stat.isFile()) {
-    sendStaticAssetNotFound(response);
+    sendStaticAssetNotFound(response, method);
     return true;
   }
 
-  const headers: Record<string, string | number> = {
-    "content-type": contentTypeForStaticAsset(request.filePath),
-    "content-length": stat.size,
+  if (!stat.isFile()) {
+    sendStaticAssetNotFound(response, method);
+    return true;
+  }
+
+  response.writeHead(200, {
+    "content-type": contentTypeForStaticAsset(filePath),
+    "content-length": String(stat.size),
     "cache-control": request.relativePath === WEB_INDEX_FILE ? WEB_HTML_CACHE_CONTROL : WEB_ASSET_CACHE_CONTROL,
-  };
-  response.writeHead(200, headers);
+  });
   if (method === "HEAD") {
     response.end();
     return true;
   }
-  response.end(await fs.readFile(request.filePath));
+  response.end(await fs.readFile(filePath));
   return true;
 }
 
-function resolveWebAssetRequest(
-  pathname: string,
-  webAssetsDir: string,
-): { filePath: string; relativePath: string } | null {
+async function resolveExistingWebAssetsRoot(root: string): Promise<string | null> {
+  try {
+    const realRoot = await fs.realpath(path.resolve(root));
+    const stat = await fs.stat(realRoot);
+    return stat.isDirectory() ? realRoot : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveWebAssetRequest(pathname: string, webAssetsRoot: string): { filePath: string; relativePath: string } | null {
   const mountRelativePath = pathname === WEB_MOUNT_PATH ? "" : pathname.slice(WEB_MOUNT_PATH.length + 1);
   let decodedRelativePath: string;
   try {
@@ -1067,13 +1092,14 @@ function resolveWebAssetRequest(
   } catch {
     return null;
   }
+
   if (decodedRelativePath.includes("\0") || decodedRelativePath.includes("\\")) return null;
   const segments = decodedRelativePath.split("/").filter((segment) => segment.length > 0);
-  if (segments.some((segment) => segment === ".." || segment === ".")) return null;
+  if (segments.some((segment) => segment === "." || segment === "..")) return null;
 
   const relativePath = segments.length === 0 ? WEB_INDEX_FILE : segments.join("/");
-  const filePath = path.resolve(webAssetsDir, relativePath);
-  return pathIsWithin(webAssetsDir, filePath) ? { filePath, relativePath } : null;
+  const filePath = path.resolve(webAssetsRoot, relativePath);
+  return pathIsWithin(webAssetsRoot, filePath) ? { filePath, relativePath } : null;
 }
 
 function pathIsWithin(root: string, target: string): boolean {
@@ -1091,6 +1117,7 @@ function contentTypeForStaticAsset(filePath: string): string {
     case ".css":
       return "text/css; charset=utf-8";
     case ".json":
+    case ".map":
       return "application/json; charset=utf-8";
     case ".svg":
       return "image/svg+xml";
@@ -1105,8 +1132,8 @@ function contentTypeForStaticAsset(filePath: string): string {
       return "image/webp";
     case ".ico":
       return "image/x-icon";
-    case ".map":
-      return "application/json; charset=utf-8";
+    case ".webmanifest":
+      return "application/manifest+json; charset=utf-8";
     case ".wasm":
       return "application/wasm";
     case ".woff":
@@ -1122,8 +1149,14 @@ function contentTypeForStaticAsset(filePath: string): string {
   }
 }
 
-function sendStaticAssetNotFound(response: ServerResponse): void {
-  sendJson(response, 404, { error: { code: "not_found", message: "Static asset not found" } });
+function sendStaticAssetNotFound(response: ServerResponse, method: "GET" | "HEAD" = "GET"): void {
+  const body = `${JSON.stringify(STATIC_ASSET_NOT_FOUND, null, 2)}\n`;
+  response.writeHead(404, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": String(Buffer.byteLength(body)),
+    "cache-control": "no-cache",
+  });
+  response.end(method === "HEAD" ? undefined : body);
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
