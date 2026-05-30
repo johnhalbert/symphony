@@ -287,6 +287,63 @@ describe("HermesHarness", () => {
     expect(events.map((event) => event.type)).toContain("failed");
   });
 
+  it("ignores Hermes provider.limit events without structured limit evidence", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const message = "Review approved: https://github.com/johnhalbert/symphony/pull/89#pullrequestreview-4394293143";
+    const providerLimit = {
+      provider_id: "openai-codex",
+      model: "gpt-5-test",
+      kind: "unknown_limit",
+      message,
+      resume_policy: "manual",
+      resume_at: null,
+      retry_after_ms: null,
+      raw: {
+        reason: null,
+        status_code: null,
+        error_context: {},
+      },
+    };
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      authManager: acceptingHermesAuthManager(),
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
+          eventsOnPrompt: [
+            {
+              type: "provider.limit",
+              session_id: `gw-${clients.length + 1}`,
+              payload: providerLimit,
+            } as GatewayEvent,
+            {
+              type: "message.complete",
+              session_id: `gw-${clients.length + 1}`,
+              payload: {
+                text: message,
+                status: "complete",
+                provider_limit: providerLimit,
+                usage: { calls: 1, input: 1, output: 2, total: 3 },
+              },
+            } as GatewayEvent,
+          ],
+        });
+        clients.push(client);
+        return client;
+      },
+    });
+    const config = configForHarness();
+    config.hermes.provider = "openai-codex";
+    config.hermes.model = "gpt-5-test";
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "worker prompt"));
+
+    expect(events.map((event) => event.type)).not.toContain("provider_limit");
+    expect(events.map((event) => event.type)).not.toContain("failed");
+    expect(events.find((event) => event.type === "completed")).toMatchObject({ message });
+  });
+
   it("maps structured Hermes JSON-RPC provider-limit errors into provider_limit harness events", async () => {
     const clients: FakeGatewayClient[] = [];
     const harness = new HermesHarness({
@@ -335,7 +392,13 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   constructor(
     readonly env: HermesGatewayEnvironment,
     private readonly sessionId: string,
-    private readonly options: { exitOnPrompt?: boolean; logTail?: string; promptError?: Error; providerLimitOnPrompt?: Record<string, unknown> } = {},
+    private readonly options: {
+      exitOnPrompt?: boolean;
+      logTail?: string;
+      promptError?: Error;
+      providerLimitOnPrompt?: Record<string, unknown>;
+      eventsOnPrompt?: GatewayEvent[];
+    } = {},
   ) {
     super();
   }
@@ -366,7 +429,9 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
         return { ok: true } as T;
       }
       queueMicrotask(() => {
-        if (this.options.providerLimitOnPrompt) {
+        if (this.options.eventsOnPrompt) {
+          for (const event of this.options.eventsOnPrompt) this.emit("event", event);
+        } else if (this.options.providerLimitOnPrompt) {
           this.emit("event", {
             type: "provider.limit",
             session_id: this.sessionId,

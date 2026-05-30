@@ -559,12 +559,52 @@ function providerLimitSignalFromHermesPayload(
   };
 }
 
+function credibleProviderLimitSignalFromHermesPayload(
+  payload: unknown,
+  defaults: HermesLimitMappingDefaults = {},
+): ProviderLimitSignal | null {
+  const signal = providerLimitSignalFromHermesPayload(payload, defaults);
+  if (!signal || hasEmptyHermesResultClassifierEvidence(signal)) return null;
+  return signal;
+}
+
+function hasEmptyHermesResultClassifierEvidence(signal: ProviderLimitSignal): boolean {
+  const window = signal.window;
+  if (
+    window?.resumeAt ||
+    window?.retryAfterMs != null ||
+    window?.windowLabel ||
+    window?.windowKind
+  ) {
+    return false;
+  }
+  if (!isRecord(signal.raw)) return false;
+  const rawHasHermesClassifierShape =
+    "reason" in signal.raw ||
+    "status_code" in signal.raw ||
+    "statusCode" in signal.raw ||
+    "error_context" in signal.raw ||
+    "errorContext" in signal.raw;
+  if (!rawHasHermesClassifierShape) return false;
+  const errorContext = isRecord(signal.raw.error_context)
+    ? signal.raw.error_context
+    : isRecord(signal.raw.errorContext)
+      ? signal.raw.errorContext
+      : {};
+  return (
+    !hasMeaningfulValue(signal.raw.reason) &&
+    !hasMeaningfulValue(signal.raw.status_code) &&
+    !hasMeaningfulValue(signal.raw.statusCode) &&
+    !hasMeaningfulValue(errorContext)
+  );
+}
+
 function providerLimitSignalFromHermesError(error: unknown, defaults: HermesLimitMappingDefaults = {}): ProviderLimitSignal | null {
   const errorRecord = errorRecordWithProperties(error);
   const data = isRecord(errorRecord.data) ? errorRecord.data : {};
   const directPayload =
-    providerLimitSignalFromHermesPayload(data.provider_limit, defaults) ??
-    providerLimitSignalFromHermesPayload(data.providerLimit, defaults);
+    credibleProviderLimitSignalFromHermesPayload(data.provider_limit, defaults) ??
+    credibleProviderLimitSignalFromHermesPayload(data.providerLimit, defaults);
   if (directPayload) return directPayload;
 
   const message = errorMessage(error);
@@ -650,7 +690,7 @@ function mapHermesGatewayEvent(event: GatewayEvent, input: { cancelled: boolean 
     case "tool.complete":
       return [{ type: "progress", activitySource: "tool", message: `Hermes tool ${event.payload.name ?? "unknown"} completed` }];
     case "provider.limit": {
-      const signal = providerLimitSignalFromHermesPayload(event.payload, input);
+      const signal = credibleProviderLimitSignalFromHermesPayload(event.payload, input);
       if (!signal) return [];
       return [{ type: "provider_limit", signal }, { type: "failed", error: signal.message }];
     }
@@ -658,9 +698,9 @@ function mapHermesGatewayEvent(event: GatewayEvent, input: { cancelled: boolean 
       {
         const payloadRecord: Record<string, unknown> = isRecord(event.payload) ? event.payload : {};
         const signal =
-          providerLimitSignalFromHermesPayload(payloadRecord.provider_limit, input) ??
-          providerLimitSignalFromHermesPayload(payloadRecord.providerLimit, input) ??
-          providerLimitSignalFromHermesPayload(event.payload, input);
+          credibleProviderLimitSignalFromHermesPayload(payloadRecord.provider_limit, input) ??
+          credibleProviderLimitSignalFromHermesPayload(payloadRecord.providerLimit, input) ??
+          credibleProviderLimitSignalFromHermesPayload(event.payload, input);
         if (signal && looksLikeProviderLimit(`${signal.kind} ${signal.message}`)) {
           return [
             { type: "provider_limit", signal },
@@ -687,8 +727,8 @@ function mapHermesGatewayEvent(event: GatewayEvent, input: { cancelled: boolean 
       const payload = event.payload as { provider_limit?: unknown; providerLimit?: unknown; status?: unknown; text?: unknown; usage?: unknown } | undefined;
       const usage = usageTokens(payload?.usage);
       const providerLimit =
-        providerLimitSignalFromHermesPayload(payload?.provider_limit, input) ??
-        providerLimitSignalFromHermesPayload(payload?.providerLimit, input) ??
+        credibleProviderLimitSignalFromHermesPayload(payload?.provider_limit, input) ??
+        credibleProviderLimitSignalFromHermesPayload(payload?.providerLimit, input) ??
         (payload?.status === "error" && looksLikeProviderLimit(String(payload.text ?? ""))
           ? providerLimitSignalFromHermesPayload({ message: payload.text, provider_id: input.providerId, model: input.model }, input)
           : null);
@@ -848,6 +888,14 @@ function looksLikeProviderLimit(value: string): boolean {
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function hasMeaningfulValue(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.some(hasMeaningfulValue);
+  if (isRecord(value)) return Object.values(value).some(hasMeaningfulValue);
+  return true;
 }
 
 function numberFromUnknown(value: unknown): number | null {
