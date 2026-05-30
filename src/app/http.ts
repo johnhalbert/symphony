@@ -1477,6 +1477,13 @@ interface IssueBoardTrackerCache {
   projection: IssueBoardTrackerProjection;
 }
 
+interface IssueBoardDurableSnapshot {
+  workspacesByKey: Map<string, WorkspaceRecord>;
+  runsByIssueKey: Map<string, RunRecord[]>;
+  lifecycles: IssueLifecycleRecord[];
+  lifecyclesByKey: Map<string, IssueLifecycleRecord>;
+}
+
 interface ActivityQuery {
   issue: string | null;
   offset: number;
@@ -1566,6 +1573,7 @@ async function buildIssueBoard(
   issueBoardColumns: IssueBoardColumnMapping,
   staleThresholdMs: number,
 ) {
+  const durableSnapshot = await loadIssueBoardDurableSnapshot(runStore, lifecycleStore);
   const representedKeys = new Set<string>();
   const cards: IssueBoardCard[] = [];
   for (const issue of trackerProjection.trackerIssues) {
@@ -1577,6 +1585,7 @@ async function buildIssueBoard(
         mutationsConfigured,
         runStore,
         lifecycleStore,
+        durableSnapshot,
         trackerStateLists,
         issueBoardColumns,
         staleThresholdMs,
@@ -1589,6 +1598,7 @@ async function buildIssueBoard(
     mutationsConfigured,
     runStore,
     lifecycleStore,
+    durableSnapshot,
     trackerStateLists,
     issueBoardColumns,
     staleThresholdMs,
@@ -1994,6 +2004,7 @@ async function buildTrackerBoardCard(input: {
   mutationsConfigured: boolean;
   runStore: RunTranscriptStore | undefined;
   lifecycleStore: IssueLifecycleStore | undefined;
+  durableSnapshot: IssueBoardDurableSnapshot;
   trackerStateLists: TrackerStateLists;
   issueBoardColumns: IssueBoardColumnMapping;
   staleThresholdMs: number;
@@ -2001,9 +2012,9 @@ async function buildTrackerBoardCard(input: {
   const issueStatus = toIssueStatusView(input.issue);
   const keys = [input.issue.id, input.issue.identifier];
   const live = liveIssueByKeys(input.snapshot, keys);
-  const workspace = await workspaceByKeys(input.runStore, keys);
-  const latestRun = await latestRunByKeys(input.runStore, keys);
-  const rawLifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  const workspace = workspaceByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+  const latestRun = latestRunByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+  const rawLifecycle = lifecycleByKeysFromDurableSnapshot(input.durableSnapshot, keys);
   const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
   const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
   const paused = isIssuePaused(input.snapshot, [
@@ -2043,6 +2054,7 @@ async function buildSymphonyOnlyBoardCards(input: {
   mutationsConfigured: boolean;
   runStore: RunTranscriptStore | undefined;
   lifecycleStore: IssueLifecycleStore | undefined;
+  durableSnapshot: IssueBoardDurableSnapshot;
   trackerStateLists: TrackerStateLists;
   issueBoardColumns: IssueBoardColumnMapping;
   staleThresholdMs: number;
@@ -2054,9 +2066,9 @@ async function buildSymphonyOnlyBoardCards(input: {
     if (hasBoardKey(input.representedKeys, [requestKey]) || hasBoardKey(localKeys, [requestKey])) return;
     const keys = [requestKey];
     const live = forcedLive ?? liveIssueByKeys(input.snapshot, keys);
-    const workspace = await workspaceByKeys(input.runStore, keys);
-    const latestRun = await latestRunByKeys(input.runStore, keys);
-    const rawLifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+    const workspace = workspaceByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+    const latestRun = latestRunByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+    const rawLifecycle = lifecycleByKeysFromDurableSnapshot(input.durableSnapshot, keys);
     const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
     const isBlocked = isLifecycleBlocked(lifecycle);
     const isPaused = isIssuePaused(input.snapshot, [
@@ -2101,7 +2113,7 @@ async function buildSymphonyOnlyBoardCards(input: {
   for (const pausedKey of input.snapshot.paused) {
     await maybeAdd(pausedKey);
   }
-  for (const lifecycle of (await input.lifecycleStore?.list()) ?? []) {
+  for (const lifecycle of input.durableSnapshot.lifecycles) {
     if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueIdentifier);
   }
   return cards;
@@ -2239,6 +2251,99 @@ function classifyBoardLane(
   if (role === "worker") return "progress";
   if (lifecycle?.phase === "terminal") return "done";
   return "backlog";
+}
+
+async function loadIssueBoardDurableSnapshot(
+  runStore: RunTranscriptStore | undefined,
+  lifecycleStore: IssueLifecycleStore | undefined,
+): Promise<IssueBoardDurableSnapshot> {
+  const [workspaces, runs, lifecycles] = await Promise.all([
+    runStore?.listWorkspaces() ?? Promise.resolve([]),
+    runStore?.listRuns() ?? Promise.resolve([]),
+    lifecycleStore?.list() ?? Promise.resolve([]),
+  ]);
+  return {
+    workspacesByKey: indexIssueBoardWorkspaces(workspaces),
+    runsByIssueKey: indexIssueBoardRuns(runs),
+    lifecycles,
+    lifecyclesByKey: indexIssueBoardLifecycles(lifecycles),
+  };
+}
+
+function indexIssueBoardWorkspaces(workspaces: WorkspaceRecord[]): Map<string, WorkspaceRecord> {
+  const byKey = new Map<string, WorkspaceRecord>();
+  for (const workspace of workspaces) {
+    byKey.set(workspace.workspaceKey, workspace);
+  }
+  for (const workspace of workspaces) {
+    setIndexIfMissing(byKey, workspace.issueId, workspace);
+    setIndexIfMissing(byKey, workspace.issueIdentifier, workspace);
+  }
+  return byKey;
+}
+
+function indexIssueBoardRuns(runs: RunRecord[]): Map<string, RunRecord[]> {
+  const byIssueKey = new Map<string, RunRecord[]>();
+  for (const run of [...runs].sort(compareRunChronology)) {
+    addIndexValue(byIssueKey, run.issueId, run);
+    addIndexValue(byIssueKey, run.issueIdentifier, run);
+  }
+  return byIssueKey;
+}
+
+function indexIssueBoardLifecycles(lifecycles: IssueLifecycleRecord[]): Map<string, IssueLifecycleRecord> {
+  const byKey = new Map<string, IssueLifecycleRecord>();
+  for (const lifecycle of lifecycles) {
+    byKey.set(lifecycle.issueId, lifecycle);
+  }
+  for (const lifecycle of lifecycles) {
+    setIndexIfMissing(byKey, lifecycle.issueIdentifier, lifecycle);
+  }
+  return byKey;
+}
+
+function setIndexIfMissing<T>(index: Map<string, T>, key: string | null | undefined, value: T): void {
+  if (!key || index.has(key)) return;
+  index.set(key, value);
+}
+
+function addIndexValue<T>(index: Map<string, T[]>, key: string | null | undefined, value: T): void {
+  if (!key) return;
+  const values = index.get(key);
+  if (values) {
+    values.push(value);
+    return;
+  }
+  index.set(key, [value]);
+}
+
+function workspaceByKeysFromDurableSnapshot(snapshot: IssueBoardDurableSnapshot, keys: string[]): WorkspaceRecord | null {
+  for (const key of keys) {
+    const workspace = snapshot.workspacesByKey.get(key);
+    if (workspace) return workspace;
+  }
+  return null;
+}
+
+function latestRunByKeysFromDurableSnapshot(snapshot: IssueBoardDurableSnapshot, keys: string[]): RunRecord | null {
+  const byRunId = new Map<string, RunRecord>();
+  for (const key of keys) {
+    for (const run of snapshot.runsByIssueKey.get(key) ?? []) {
+      byRunId.set(run.runId, run);
+    }
+  }
+  return [...byRunId.values()].sort(compareRunChronology).at(-1) ?? null;
+}
+
+function lifecycleByKeysFromDurableSnapshot(
+  snapshot: IssueBoardDurableSnapshot,
+  keys: string[],
+): IssueLifecycleRecord | null {
+  for (const key of keys) {
+    const lifecycle = snapshot.lifecyclesByKey.get(key);
+    if (lifecycle) return lifecycle;
+  }
+  return null;
 }
 
 function liveIssueByKeys(snapshot: RuntimeSnapshot, keys: string[]): RunningRow | null {

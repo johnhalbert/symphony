@@ -2380,8 +2380,9 @@ describe("StatusServer durable API", () => {
     config.reviewLoop.reviewPassState = "Ready to Merge";
     config.mergePolicy.sourceStates = ["Ready to Merge"];
 
-    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const runStore = new CountingRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+
     await runStore.upsertWorkspace({
       workspaceKey: "TEST-1",
       issueId: "issue-1",
@@ -2552,6 +2553,9 @@ describe("StatusServer durable API", () => {
       };
 
       expect(response.status).toBe(200);
+      expect(runStore.listWorkspacesCount).toBe(1);
+      expect(runStore.listRunsCount).toBe(1);
+      expect(runStore.findWorkspaceCount).toBe(0);
       expect(tracker.requestedStates).toEqual(["Backlog", "Todo", "In Progress", "Blocked", "In Review", "Ready to Merge", "Done", "Canceled"]);
       expect(tracker.fetchCount).toBe(1);
       expect(body.tracker).toMatchObject({ issueCount: 8, cached: false });
@@ -4078,6 +4082,27 @@ class FakeTracker implements TrackerClient {
 
   async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
     return this.issues.filter((item) => issueIds.includes(item.id));
+  }
+}
+
+class CountingRunTranscriptStore extends FileRunTranscriptStore {
+  listWorkspacesCount = 0;
+  listRunsCount = 0;
+  findWorkspaceCount = 0;
+
+  override async listWorkspaces() {
+    this.listWorkspacesCount += 1;
+    return super.listWorkspaces();
+  }
+
+  override async listRuns() {
+    this.listRunsCount += 1;
+    return super.listRuns();
+  }
+
+  override async findWorkspace(issueIdOrIdentifierOrKey: string) {
+    this.findWorkspaceCount += 1;
+    return super.findWorkspace(issueIdOrIdentifierOrKey);
   }
 }
 
