@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -194,6 +194,136 @@ describe("/api/v1/web route contracts", () => {
       await server.stop();
     }
   });
+
+  it("serves configured production web assets under /web while preserving same-origin web APIs", async () => {
+    const webAssetsRoot = await createWebAssets(root);
+    const { server } = createStatusServer(root, { webAssetsRoot });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const redirect = await fetch(`${baseUrl}/web`, { redirect: "manual" });
+      expect(redirect.status).toBe(308);
+      expect(redirect.headers.get("location")).toBe("/web/");
+
+      const index = await fetch(`${baseUrl}/web/`);
+      const indexText = await index.text();
+      expect(index.status).toBe(200);
+      expect(index.headers.get("content-type")).toContain("text/html");
+      expect(index.headers.get("cache-control")).toBe("no-cache");
+      expect(indexText).toContain("Symphony Web App");
+      expect(indexText).toContain('/web/assets/app.js');
+
+      const extensionlessUnknown = await fetch(`${baseUrl}/web/issues/ENG-119`);
+      expect(extensionlessUnknown.status).toBe(404);
+      expect(extensionlessUnknown.headers.get("content-type")).toContain("text/plain");
+      expect(await extensionlessUnknown.text()).not.toContain("Symphony Web App");
+
+      const asset = await fetch(`${baseUrl}/web/assets/app.js`);
+      expect(asset.status).toBe(200);
+      expect(asset.headers.get("content-type")).toContain("javascript");
+      expect(asset.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+      expect(await asset.text()).toContain("web asset loaded");
+
+      const assetHead = await fetch(`${baseUrl}/web/assets/app.js`, { method: "HEAD" });
+      expect(assetHead.status).toBe(200);
+      expect(assetHead.headers.get("content-type")).toContain("javascript");
+      expect(assetHead.headers.get("content-length")).toBe(String("console.log('web asset loaded');\n".length));
+      expect(await assetHead.text()).toBe("");
+
+      const api = await getJson(`${baseUrl}/api/v1/web/dashboard`);
+      expect(api.response.status).toBe(200);
+      expectTopLevelKeys(api.body, [
+        "activity",
+        "agentUsageLabel",
+        "branch",
+        "chat",
+        "concurrencyCap",
+        "pollLabel",
+        "projectName",
+        "providerGates",
+        "repoLabel",
+        "runningAgents",
+        "totals",
+        "workflowLabel",
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps /web unclaimed when assets are not configured", async () => {
+    const { server } = createStatusServer(root);
+    const address = await server.start();
+    try {
+      const { response, body } = await getJson(`${baseUrlFor(address)}/web/`);
+      expect(response.status).toBe(404);
+      expect(body).toEqual({ error: { code: "not_found", message: "Route not found" } });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("returns safe 404s when the configured /web asset root is missing or not a directory", async () => {
+    const nonDirectoryRoot = path.join(root, "web-dist-file");
+    await writeFile(nonDirectoryRoot, "not a directory", "utf8");
+    const invalidRoots = [path.join(root, "missing-web-dist"), nonDirectoryRoot];
+
+    for (const webAssetsRoot of invalidRoots) {
+      const { server } = createStatusServer(root, { webAssetsRoot });
+      const address = await server.start();
+      const baseUrl = baseUrlFor(address);
+      try {
+        const bareWeb = await fetch(`${baseUrl}/web`, { redirect: "manual" });
+        expect({ webAssetsRoot, status: bareWeb.status }).toEqual({ webAssetsRoot, status: 404 });
+        expect(bareWeb.headers.get("location")).toBeNull();
+
+        const index = await fetch(`${baseUrl}/web/`);
+        expect({ webAssetsRoot, status: index.status }).toEqual({ webAssetsRoot, status: 404 });
+        expect(index.headers.get("content-type")).toContain("text/plain");
+        expect(await index.text()).not.toContain("Symphony Web App");
+
+        const asset = await fetch(`${baseUrl}/web/assets/app.js`);
+        expect({ webAssetsRoot, status: asset.status }).toEqual({ webAssetsRoot, status: 404 });
+        expect(await asset.text()).not.toContain("web asset loaded");
+      } finally {
+        await server.stop();
+      }
+    }
+  });
+
+  it("does not serve files outside the configured /web asset root", async () => {
+    const webAssetsRoot = await createWebAssets(root);
+    await writeFile(path.join(root, "secret.txt"), "do not serve", "utf8");
+    const outsideRoot = path.join(root, "outside-web-dist");
+    await mkdir(outsideRoot, { recursive: true });
+    await writeFile(path.join(outsideRoot, "secret.txt"), "do not serve via link", "utf8");
+    await symlink(
+      outsideRoot,
+      path.join(webAssetsRoot, "linked-outside"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const { server } = createStatusServer(root, { webAssetsRoot });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const traversal = await fetch(`${baseUrl}/web/%2e%2e%2fsecret.txt`);
+      expect(traversal.status).toBe(404);
+      expect(traversal.headers.get("content-type")).toContain("text/plain");
+      expect(await traversal.text()).not.toContain("do not serve");
+
+      const missingAsset = await fetch(`${baseUrl}/web/assets/missing.js`);
+      expect(missingAsset.status).toBe(404);
+      expect(missingAsset.headers.get("content-type")).toContain("text/plain");
+      expect(await missingAsset.text()).toContain("Web asset not found");
+
+      const linkedEscape = await fetch(`${baseUrl}/web/linked-outside/secret.txt`);
+      expect(linkedEscape.status).toBe(404);
+      expect(linkedEscape.headers.get("content-type")).toContain("text/plain");
+      expect(await linkedEscape.text()).not.toContain("do not serve via link");
+    } finally {
+      await server.stop();
+    }
+  });
 });
 
 interface OrchestratorCallCounts {
@@ -205,7 +335,14 @@ interface OrchestratorCallCounts {
   cancelIssue: number;
 }
 
-function createStatusServer(root: string): { server: StatusServer; calls: OrchestratorCallCounts } {
+interface CreateStatusServerOptions {
+  webAssetsRoot?: string | null;
+}
+
+function createStatusServer(
+  root: string,
+  options: CreateStatusServerOptions = {},
+): { server: StatusServer; calls: OrchestratorCallCounts } {
   const config = testConfig(path.join(root, "workspaces"));
   const { orchestrator, calls } = instrumentedOrchestrator();
   return {
@@ -223,8 +360,29 @@ function createStatusServer(root: string): { server: StatusServer; calls: Orches
       openWorkspaceToken: null,
       trackerStateLists: testTrackerStateLists(),
       staleThresholdMs: 300_000,
+      webAssetsRoot: options.webAssetsRoot,
     }),
   };
+}
+
+async function createWebAssets(root: string): Promise<string> {
+  const webAssetsRoot = path.join(root, "web-dist");
+  await mkdir(path.join(webAssetsRoot, "assets"), { recursive: true });
+  await writeFile(
+    path.join(webAssetsRoot, "index.html"),
+    `<!doctype html>
+<html>
+  <head><title>Symphony Web App</title></head>
+  <body>
+    <div id="root">Symphony Web App</div>
+    <script type="module" src="/web/assets/app.js"></script>
+  </body>
+</html>
+`,
+    "utf8",
+  );
+  await writeFile(path.join(webAssetsRoot, "assets", "app.js"), "console.log('web asset loaded');\n", "utf8");
+  return webAssetsRoot;
 }
 
 function instrumentedOrchestrator(): { orchestrator: Orchestrator; calls: OrchestratorCallCounts } {

@@ -76,6 +76,12 @@ Work on {{ issue.identifier }}.`,
       searchEnabled: false,
       summarizationEnabled: false,
     });
+    expect(config.server).toEqual({
+      port: null,
+      host: "127.0.0.1",
+      openWorkspaceToken: null,
+      webAssetsRoot: null,
+    });
     expect(config.issueBreakdown).toEqual({
       enabled: false,
       cursorMode: "plan",
@@ -127,6 +133,7 @@ Work on {{ issue.identifier }}.`,
           "WORKFLOW_TEST_LINEAR_PROJECT=TEST",
           "WORKFLOW_TEST_GITHUB=github-secret",
           "WORKFLOW_TEST_WORKSPACE=workspace-secret",
+          "WORKFLOW_TEST_WEB_ASSETS=dist-web",
           "",
         ].join("\n"),
         "utf8",
@@ -142,6 +149,7 @@ github:
   token: $WORKFLOW_TEST_GITHUB
 server:
   open_workspace_token: $WORKFLOW_TEST_WORKSPACE
+  web_assets_root: $WORKFLOW_TEST_WEB_ASSETS
 ---
 Work on {{ issue.identifier }}.
 `,
@@ -154,6 +162,7 @@ Work on {{ issue.identifier }}.
       expect(loaded.serviceConfig.tracker.projectSlug).toBe("TEST");
       expect(loaded.serviceConfig.github.token).toBe("github-secret");
       expect(loaded.serviceConfig.server.openWorkspaceToken).toBe("workspace-secret");
+      expect(loaded.serviceConfig.server.webAssetsRoot?.replace(/\\/g, "/")).toMatch(/\/dist-web$/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
