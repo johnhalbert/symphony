@@ -909,25 +909,32 @@ export class StatusServer {
   }
 
   private async fetchIssueBoard(forceRefresh: boolean): Promise<IssueBoardResponse> {
+    return (await this.fetchIssueBoardContext(forceRefresh)).board;
+  }
+
+  private async fetchIssueBoardContext(forceRefresh: boolean): Promise<IssueBoardContext> {
     const issueBoardColumns = this.options.issueBoardColumns ?? defaultIssueBoardColumns(this.options.trackerStateLists);
     const trackerProjection = await this.fetchIssueBoardTrackerProjection(issueBoardColumns, forceRefresh);
-    return buildIssueBoard(
+    const durableSnapshot = await loadIssueBoardDurableSnapshot(this.options.runStore, this.options.lifecycleStore);
+    const board = await buildIssueBoard(
       this.options.orchestrator.snapshot(),
       Boolean(this.options.openWorkspaceToken),
       trackerProjection,
       this.options.runStore,
       this.options.lifecycleStore,
+      durableSnapshot,
       this.options.trackerStateLists,
       issueBoardColumns,
       this.options.staleThresholdMs,
     );
+    return { board, durableSnapshot };
   }
 
   private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
-    let board: IssueBoardResponse | null = null;
+    let boardContext: IssueBoardContext | null = null;
     let trackerFailure: SymphonyError | null = null;
     try {
-      board = await this.fetchIssueBoard(forceRefresh);
+      boardContext = await this.fetchIssueBoardContext(forceRefresh);
     } catch (error) {
       if (error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")) {
         trackerFailure = error;
@@ -936,6 +943,9 @@ export class StatusServer {
       }
     }
 
+    const board = boardContext?.board ?? null;
+    const durableSnapshot =
+      boardContext?.durableSnapshot ?? (await loadIssueBoardDurableSnapshot(this.options.runStore, this.options.lifecycleStore));
     const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [issueId])) ?? null;
     const detail = await buildBoardIssueDetail({
       requestKey: issueId,
@@ -944,6 +954,7 @@ export class StatusServer {
       mutationsConfigured: Boolean(this.options.openWorkspaceToken),
       runStore: this.options.runStore,
       lifecycleStore: this.options.lifecycleStore,
+      durableSnapshot,
       mcpExposureDiagnosticsStore: this.options.mcpExposureDiagnosticsStore,
       trackerStateLists: this.options.trackerStateLists,
       staleThresholdMs: this.options.staleThresholdMs,
@@ -1569,11 +1580,11 @@ async function buildIssueBoard(
   trackerProjection: IssueBoardTrackerProjection,
   runStore: RunTranscriptStore | undefined,
   lifecycleStore: IssueLifecycleStore | undefined,
+  durableSnapshot: IssueBoardDurableSnapshot,
   trackerStateLists: TrackerStateLists,
   issueBoardColumns: IssueBoardColumnMapping,
   staleThresholdMs: number,
 ) {
-  const durableSnapshot = await loadIssueBoardDurableSnapshot(runStore, lifecycleStore);
   const representedKeys = new Set<string>();
   const cards: IssueBoardCard[] = [];
   for (const issue of trackerProjection.trackerIssues) {
@@ -1636,6 +1647,11 @@ async function buildIssueBoard(
 
 type IssueBoardResponse = Awaited<ReturnType<typeof buildIssueBoard>>;
 
+interface IssueBoardContext {
+  board: IssueBoardResponse;
+  durableSnapshot: IssueBoardDurableSnapshot;
+}
+
 function acceptedBoardResponse(board: IssueBoardResponse) {
   const columns = board.lanes.map((lane) => ({
     id: lane.id,
@@ -1671,21 +1687,22 @@ async function buildBoardIssueDetail(input: {
   mutationsConfigured: boolean;
   runStore: RunTranscriptStore | undefined;
   lifecycleStore: IssueLifecycleStore | undefined;
+  durableSnapshot: IssueBoardDurableSnapshot;
   mcpExposureDiagnosticsStore: FileMcpExposureDiagnosticsStore | undefined;
   trackerStateLists: TrackerStateLists;
   staleThresholdMs: number;
 }) {
   const keys = input.card ? boardCardKeys(input.card) : [input.requestKey];
   const live = liveIssueByKeys(input.snapshot, keys);
-  const workspace = await workspaceByKeys(input.runStore, keys);
-  const latestRun = await latestRunByKeys(input.runStore, keys);
-  const rawLifecycle = await lifecycleByKeys(input.lifecycleStore, keys);
+  const workspace = workspaceByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+  const latestRun = latestRunByKeysFromDurableSnapshot(input.durableSnapshot, keys);
+  const rawLifecycle = lifecycleByKeysFromDurableSnapshot(input.durableSnapshot, keys);
   const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
   if (!input.card && !live && !workspace && !latestRun && !lifecycle) return null;
 
   const issueKey = input.card?.issueIdentifier ?? input.card?.issueId ?? input.requestKey;
   const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore);
-  const runs = await runsByKeys(input.runStore, keys);
+  const runs = runsByKeysFromDurableSnapshot(input.durableSnapshot, keys);
   const enrichedRuns = await Promise.all(
     runs.map(async (run) => ({
       ...publicRunRecord(run),
@@ -2326,13 +2343,17 @@ function workspaceByKeysFromDurableSnapshot(snapshot: IssueBoardDurableSnapshot,
 }
 
 function latestRunByKeysFromDurableSnapshot(snapshot: IssueBoardDurableSnapshot, keys: string[]): RunRecord | null {
+  return runsByKeysFromDurableSnapshot(snapshot, keys).at(-1) ?? null;
+}
+
+function runsByKeysFromDurableSnapshot(snapshot: IssueBoardDurableSnapshot, keys: string[]): RunRecord[] {
   const byRunId = new Map<string, RunRecord>();
   for (const key of keys) {
     for (const run of snapshot.runsByIssueKey.get(key) ?? []) {
       byRunId.set(run.runId, run);
     }
   }
-  return [...byRunId.values()].sort(compareRunChronology).at(-1) ?? null;
+  return [...byRunId.values()].sort(compareRunChronology);
 }
 
 function lifecycleByKeysFromDurableSnapshot(
@@ -2348,46 +2369,6 @@ function lifecycleByKeysFromDurableSnapshot(
 
 function liveIssueByKeys(snapshot: RuntimeSnapshot, keys: string[]): RunningRow | null {
   return snapshot.running.find((row) => keys.includes(row.issueId) || keys.includes(row.issueIdentifier)) ?? null;
-}
-
-async function workspaceByKeys(runStore: RunTranscriptStore | undefined, keys: string[]): Promise<WorkspaceRecord | null> {
-  if (!runStore) return null;
-  for (const key of keys) {
-    const workspace = await runStore.findWorkspace(key);
-    if (workspace) return workspace;
-  }
-  return null;
-}
-
-async function latestRunByKeys(runStore: RunTranscriptStore | undefined, keys: string[]): Promise<RunRecord | null> {
-  if (!runStore) return null;
-  const byRunId = new Map<string, RunRecord>();
-  for (const key of keys) {
-    for (const run of await runStore.listRunsForIssue(key)) {
-      byRunId.set(run.runId, run);
-    }
-  }
-  return [...byRunId.values()].sort(compareRunChronology).at(-1) ?? null;
-}
-
-async function runsByKeys(runStore: RunTranscriptStore | undefined, keys: string[]): Promise<RunRecord[]> {
-  if (!runStore) return [];
-  const byRunId = new Map<string, RunRecord>();
-  for (const key of keys) {
-    for (const run of await runStore.listRunsForIssue(key)) {
-      byRunId.set(run.runId, run);
-    }
-  }
-  return [...byRunId.values()].sort(compareRunChronology);
-}
-
-async function lifecycleByKeys(lifecycleStore: IssueLifecycleStore | undefined, keys: string[]): Promise<IssueLifecycleRecord | null> {
-  if (!lifecycleStore) return null;
-  for (const key of keys) {
-    const lifecycle = await lifecycleStore.get(key);
-    if (lifecycle) return lifecycle;
-  }
-  return null;
 }
 
 function addBoardKeys(target: Set<string>, keys: Array<string | null | undefined>): void {
