@@ -608,6 +608,79 @@ describe("GET /api/v1/web/issues/:issueId", () => {
     }
   });
 
+  it("bounds issue detail runs to recent runs through the HTTP route", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const tracker = new FakeTracker([
+      trackerIssue({
+        id: "issue-1",
+        identifier: "TEST-1",
+        title: "Tracker detail title",
+        description: "Tracker detail description.",
+        state: "In Progress",
+      }),
+    ]);
+    for (let index = 0; index < 30; index += 1) {
+      const suffix = String(index).padStart(2, "0");
+      await runStore.startRun({
+        runId: `run-${suffix}`,
+        sessionId: `session-${suffix}`,
+        agentId: `agent-${suffix}`,
+        role: "worker",
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: index + 1,
+        prompt: `work ${suffix}`,
+        cursorModel: "gpt-5-test",
+        workspaceKey: "TEST-1",
+        workspacePath: path.join(config.workspace.root, "TEST-1"),
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      });
+    }
+    await runStore.appendEvent({
+      runId: "run-29",
+      at: "2026-01-01T00:03:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "latest transcript event",
+    });
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      tracker,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues/TEST-1`);
+      const body = (await response.json()) as {
+        runs: Array<{ id: string; issue: string }>;
+        transcript: Array<{ kind: string; text?: string }>;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.runs).toHaveLength(25);
+      expect(body.runs.map((run) => run.id)).not.toContain("session-00");
+      expect(body.runs.map((run) => run.id)).toContain("session-29");
+      expect(body.runs.every((run) => run.issue === "TEST-1")).toBe(true);
+      expect(body.transcript).toContainEqual(expect.objectContaining({ kind: "assistant", text: "latest transcript event" }));
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("returns a durable-only web issue detail through the HTTP route when tracker data is unavailable", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const logger = new StructuredLogger(() => undefined);

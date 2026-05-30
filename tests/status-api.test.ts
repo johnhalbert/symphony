@@ -768,7 +768,7 @@ describe("StatusServer durable API", () => {
     }
   });
 
-  it("serves sidebar sessions from the full web history projection while keeping dashboard activity previewed", async () => {
+  it("bounds sidebar and history sessions to recent runs while keeping dashboard activity previewed", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const makeRun = (index: number, issueIdentifier: string, startedAt: string, completedAt: string): RunRecord => ({
       runId: index === 0 ? "run-history-boundary" : `run-history-newer-${index}`,
@@ -798,7 +798,7 @@ describe("StatusServer durable API", () => {
       transcriptEventCount: 0,
     });
     const boundaryRun = makeRun(0, "TEST-HISTORY", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:30.000Z");
-    const newerRuns = Array.from({ length: 20 }, (_, index) => {
+    const newerRuns = Array.from({ length: 50 }, (_, index) => {
       const minute = String(index + 1).padStart(2, "0");
       return makeRun(
         index + 1,
@@ -858,17 +858,19 @@ describe("StatusServer durable API", () => {
       expect(historyResponse.status).toBe(200);
       expect(sidebarBody.activity).toHaveLength(20);
       expect(sidebarBody.activity.map((item) => item.id)).not.toContain("TEST-HISTORY");
-      const sidebarBoundarySession = sidebarBody.sessions.find((session) => session.id === "run-history-boundary");
-      const historyBoundarySession = historyBody.sessions.find((session) => session.id === "run-history-boundary");
-      expect(sidebarBoundarySession).toEqual(historyBoundarySession);
-      expect(sidebarBoundarySession).toMatchObject({
-        id: "run-history-boundary",
-        issue: "TEST-HISTORY",
-        state: "finished",
-        lastEvent: "TEST-HISTORY run finished",
-      });
-      expect(sidebarBody.sessions).toHaveLength(21);
-      expect(historyBody.sessions).toHaveLength(21);
+      expect(sidebarBody.sessions.find((session) => session.id === "run-history-boundary")).toBeUndefined();
+      expect(historyBody.sessions.find((session) => session.id === "run-history-boundary")).toBeUndefined();
+      expect(sidebarBody.sessions).toHaveLength(50);
+      expect(historyBody.sessions).toHaveLength(50);
+      expect(sidebarBody.sessions).toEqual(historyBody.sessions);
+      expect(sidebarBody.sessions).toContainEqual(
+        expect.objectContaining({
+          id: "run-history-newer-50",
+          issue: "TEST-HISTORY-NEWER-50",
+          state: "finished",
+          lastEvent: "TEST-HISTORY-NEWER-50 run finished",
+        }),
+      );
       expect(historyBody.transcriptBySession).toEqual({});
     } finally {
       await server.stop();

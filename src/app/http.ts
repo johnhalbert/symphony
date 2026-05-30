@@ -373,7 +373,7 @@ export class StatusServer {
         sendJson(
           response,
           200,
-          await this.fetchWebHistory(isWebProjectionRefreshRequested(url.searchParams.get("refresh"))),
+          await this.fetchWebHistory(isWebProjectionRefreshRequested(url.searchParams.get("refresh")), url),
         );
         return;
       }
@@ -389,7 +389,7 @@ export class StatusServer {
           sendJson(response, 200, []);
           return;
         }
-        sendJson(response, 200, projectWebTranscript(await readFullWebTranscript(this.options.runStore, run.runId), { run }));
+        sendJson(response, 200, projectWebTranscript(await readBoundedWebTranscript(this.options.runStore, run.runId, url), { run }));
         return;
       }
       if (url.pathname === "/api/v1/web/orchestrator-chat") {
@@ -902,18 +902,19 @@ export class StatusServer {
         detail.boardCard?.issueId ??
         issueId;
       const latestRunId = detail.latestRun?.runId ?? detail.runs.at(-1)?.runId ?? null;
+      const detailRuns = selectLatestChronologicalRuns(detail.runs, WEB_ISSUE_DETAIL_RUN_LIMIT);
       const activity = await buildActivityFeed({
         generatedAt: detail.issueDetails.tracker.generatedAt ?? this.options.orchestrator.snapshot().generatedAt,
         runStore: this.options.runStore,
-        runs: detail.runs,
+        runs: detailRuns,
         lifecycleStore: this.options.lifecycleStore,
         writebackOutbox: this.options.writebackOutbox,
         query: { issue: issueActivityKey, offset: 0, limit: 50 },
         includeTranscriptEvents: false,
       });
       const transcript =
-        this.options.runStore && latestRunId ? await readFullWebTranscript(this.options.runStore, latestRunId) : [];
-      return projectWebIssueDetail({ ...detail, activity, transcript }, issueId);
+        this.options.runStore && latestRunId ? await readBoundedWebTranscript(this.options.runStore, latestRunId) : [];
+      return projectWebIssueDetail({ ...detail, runs: detailRuns, activity, transcript }, issueId);
     } catch (error) {
       if (error instanceof SymphonyError && (error.code === "not_found" || error.code === "tracker_unavailable")) {
         return null;
@@ -936,7 +937,7 @@ export class StatusServer {
         }
       }
     }
-    const activitySources = await this.fetchWebCollectionActivitySources(sourceIndex);
+    const activitySources = await this.fetchWebCollectionActivitySources(sourceIndex, WEB_DASHBOARD_RUN_LIMIT);
     const activity = await buildActivityFeed({
       generatedAt: snapshot.generatedAt,
       runStore: this.options.runStore,
@@ -970,16 +971,15 @@ export class StatusServer {
         }
       }
     }
-    const activitySources = await this.fetchWebCollectionActivitySources(sourceIndex);
+    const activitySources = await this.fetchWebCollectionActivitySources(sourceIndex, WEB_SIDEBAR_SESSION_LIMIT);
     const historyActivity = await buildActivityFeed({
       generatedAt: snapshot.generatedAt,
       runStore: this.options.runStore,
       runs: activitySources.runs,
       lifecycleStore: this.options.lifecycleStore,
       lifecycleRecords: activitySources.lifecycleRecords,
-      writebackOutbox: this.options.writebackOutbox,
       writebackOperations: activitySources.writebackOperations,
-      query: { issue: null, offset: 0, limit: Number.MAX_SAFE_INTEGER },
+      query: { issue: null, offset: 0, limit: WEB_SIDEBAR_HISTORY_TIMELINE_LIMIT },
       includeTranscriptEvents: false,
     });
     const dashboardActivity = previewActivityFeed(historyActivity, 20);
@@ -2147,6 +2147,10 @@ async function buildBoardIssueDetail(input: {
   };
 }
 
+const WEB_HISTORY_RUN_LIMIT = 50;
+const WEB_HISTORY_ACTIVITY_LIMIT = 100;
+const WEB_ISSUE_DETAIL_RUN_LIMIT = 25;
+const WEB_TRANSCRIPT_EVENT_LIMIT = 500;
 const ACTIVITY_TRANSCRIPT_TAIL_PER_RUN = 500;
 const TERMINAL_ACTIVITY_TRANSCRIPT_TAIL = 256;
 
@@ -2687,6 +2691,19 @@ function runsByKeys(sourceIndex: BuiltWebProjectionSourceIndex, keys: string[]):
   return [...byRunId.values()].sort(compareRunChronology);
 }
 
+function selectRecentRuns(runs: readonly RunRecord[], limit: number): RunRecord[] {
+  if (limit <= 0) return [];
+  return [...runs].sort(compareRunRecencyDesc).slice(0, limit);
+}
+
+function selectLatestChronologicalRuns(runs: readonly RunRecord[], limit: number): RunRecord[] {
+  return selectRecentRuns(runs, limit).sort(compareRunChronology);
+}
+
+function compareRunRecencyDesc(left: RunRecord, right: RunRecord): number {
+  return compareIsoDesc(left.updatedAt, right.updatedAt) || compareIsoDesc(left.startedAt, right.startedAt) || compareString(right.runId, left.runId);
+}
+
 function lifecycleByKeys(sourceIndex: BuiltWebProjectionSourceIndex, keys: string[]): IssueLifecycleRecord | null {
   for (const key of keys) {
     const lifecycle = sourceIndex.lifecycles.lifecycleByIssueKey.get(key);
@@ -3203,17 +3220,24 @@ async function resolveWebTranscriptRun(runStore: RunTranscriptStore, sessionIdOr
   return runs.find((run) => run.sessionId === sessionIdOrRunId) ?? null;
 }
 
-async function readFullWebTranscript(runStore: RunTranscriptStore, runId: string): Promise<TranscriptEvent[]> {
-  const events: TranscriptEvent[] = [];
-  let offset = 0;
-  do {
-    const page = await runStore.readTranscript(runId, { offset, limit: WEB_TRANSCRIPT_PAGE_LIMIT });
-    events.push(...page.events);
-    if (page.nextOffset === null) break;
-    if (page.nextOffset <= offset) break;
-    offset = page.nextOffset;
-  } while (true);
-  return events;
+async function readBoundedWebTranscript(runStore: RunTranscriptStore, runId: string, url?: URL): Promise<TranscriptEvent[]> {
+  const requestedPage = parseWebTranscriptPagination(url);
+  if (requestedPage) return (await runStore.readTranscript(runId, requestedPage)).events;
+
+  const totalEvents = await runStore.readTranscriptEventCount(runId);
+  const limit = Math.min(WEB_TRANSCRIPT_EVENT_LIMIT, WEB_TRANSCRIPT_PAGE_LIMIT);
+  const offset = Math.max(0, totalEvents - limit);
+  return (await runStore.readTranscript(runId, { offset, limit })).events;
+}
+
+function parseWebTranscriptPagination(url: URL | undefined): { offset: number; limit: number } | null {
+  if (!url || (!url.searchParams.has("offset") && !url.searchParams.has("limit"))) return null;
+  const offset = Number(url.searchParams.get("offset") ?? "0");
+  const limit = Number(url.searchParams.get("limit") ?? String(WEB_TRANSCRIPT_EVENT_LIMIT));
+  return {
+    offset: Number.isFinite(offset) ? Math.max(Math.floor(offset), 0) : 0,
+    limit: Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 1), WEB_TRANSCRIPT_EVENT_LIMIT) : WEB_TRANSCRIPT_EVENT_LIMIT,
+  };
 }
 
 async function runTelemetrySummary(runId: string, runStore?: RunTranscriptStore): Promise<{
