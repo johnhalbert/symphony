@@ -24,6 +24,11 @@ describe("web data-source configuration", () => {
     expect(resolveDataSourceConfig({ VITE_SYMPHONY_DATA_SOURCE: " api " })).toEqual({ mode: "api", apiBaseUrl: "" });
   });
 
+  it("defaults production builds to same-origin API mode", () => {
+    expect(resolveDataSourceConfig({ PROD: true })).toEqual({ mode: "api", apiBaseUrl: "" });
+    expect(resolveDataSourceConfig({ MODE: " production " })).toEqual({ mode: "api", apiBaseUrl: "" });
+  });
+
   it("lets an explicit mock mode override an API base URL", () => {
     expect(
       resolveDataSourceConfig({
@@ -31,6 +36,10 @@ describe("web data-source configuration", () => {
         VITE_SYMPHONY_API_BASE_URL: "https://symphony.test",
       }),
     ).toEqual({ mode: "mock", apiBaseUrl: "https://symphony.test" });
+  });
+
+  it("keeps explicit mock aliases available in production builds", () => {
+    expect(resolveDataSourceConfig({ PROD: true, VITE_SYMPHONY_DATA_SOURCE: "local" })).toEqual({ mode: "mock", apiBaseUrl: "" });
   });
 
   it("treats invalid mode values as unset instead of disabling the base-URL fallback", () => {

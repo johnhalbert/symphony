@@ -7,6 +7,8 @@ export type DataSourceMode = "mock" | "api";
 export interface DataSourceEnv {
   VITE_SYMPHONY_DATA_SOURCE?: string;
   VITE_SYMPHONY_API_BASE_URL?: string;
+  MODE?: string;
+  PROD?: boolean;
 }
 
 export interface DataSourceConfig {
@@ -22,6 +24,10 @@ function normalizeMode(value: string | undefined): DataSourceMode | null {
   return null;
 }
 
+function isProductionBuild(env: DataSourceEnv): boolean {
+  return env.PROD === true || env.MODE?.trim().toLowerCase() === "production";
+}
+
 export function resolveDataSourceConfig(env: DataSourceEnv): DataSourceConfig {
   const apiBaseUrl = env.VITE_SYMPHONY_API_BASE_URL?.trim() ?? "";
   const explicitMode = normalizeMode(env.VITE_SYMPHONY_DATA_SOURCE);
@@ -31,7 +37,7 @@ export function resolveDataSourceConfig(env: DataSourceEnv): DataSourceConfig {
   }
 
   return {
-    mode: apiBaseUrl ? "api" : "mock",
+    mode: apiBaseUrl || isProductionBuild(env) ? "api" : "mock",
     apiBaseUrl,
   };
 }
