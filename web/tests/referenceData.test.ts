@@ -2,7 +2,8 @@ import { createElement, Fragment } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { Avatar, Label } from "../src/components/common";
-import { ReferenceDataProvider } from "../src/data/referenceDataContext";
+import { labels as mockLabels, users as mockUsers } from "../src/data/mockData";
+import { ReferenceDataProvider, fallbackReferenceData } from "../src/data/referenceDataContext";
 
 describe("reference data consumers", () => {
   it("renders fallback names and colors when API reference entries are missing or nullable", () => {
@@ -31,5 +32,36 @@ describe("reference data consumers", () => {
     expect(markup).toContain(">A<");
     expect(markup).toContain("bug");
     expect(markup).toContain("unknown-label");
+  });
+
+  it("keeps the deterministic unassigned user entry in fallback reference data", () => {
+    const markup = renderToStaticMarkup(
+      createElement(ReferenceDataProvider, {
+        value: fallbackReferenceData,
+        children: createElement(Avatar, { user: "unassigned" }),
+      }),
+    );
+
+    expect(markup).toContain("#5a5a62");
+    expect(markup).toContain(">U<");
+  });
+
+  it("renders provided mock reference data without falling back to raw IDs", () => {
+    const markup = renderToStaticMarkup(
+      createElement(ReferenceDataProvider, {
+        value: { users: mockUsers, labels: mockLabels },
+        children: createElement(
+          Fragment,
+          null,
+          createElement(Avatar, { user: "sherwinwu" }),
+          createElement(Label, { name: "orchestrator" }),
+        ),
+      }),
+    );
+
+    expect(markup).toContain("#7fc28b");
+    expect(markup).toContain(">SW<");
+    expect(markup).toContain("#f0b86c");
+    expect(markup).toContain("orchestrator");
   });
 });

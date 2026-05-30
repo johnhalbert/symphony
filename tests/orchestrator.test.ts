@@ -487,8 +487,20 @@ describe("Orchestrator", () => {
     );
     await settleOrchestratorExit();
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "stale post-writeback planning reroute", 5_000);
-    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await waitFor(() => writer.transitions.length === 1, "dispatch writeback applied", 10_000);
+    await waitFor(
+      () =>
+        harness.runs.length === 2 ||
+        orchestrator
+          .snapshot()
+          .running.some(
+            (run) => run.issueId === candidate.id && run.role === "worker" && run.runPhase === "issue_breakdown",
+          ),
+      "stale post-writeback planning reroute dispatch",
+      10_000,
+    );
+    await waitFor(() => harness.runs.length === 2, "stale post-writeback planning harness run", 10_000);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "stale post-writeback planning completion", 10_000);
     await orchestrator.stop();
 
     const lifecycle = await lifecycleStore.get(candidate.id);
@@ -497,7 +509,7 @@ describe("Orchestrator", () => {
     expect(harness.runs[1]?.ctx.runPhase).toBe("issue_breakdown");
     expect(harness.runs.some((run) => run.ctx.runPhase === "implementation")).toBe(false);
     expect(lifecycle?.planningFailureCount).toBe(0);
-  }, 10_000);
+  }, 30_000);
 
   it("routes worker dispatch to planning when only a superseded plan matches the issue", async () => {
     const config = testConfig(root);

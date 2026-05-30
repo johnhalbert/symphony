@@ -1,8 +1,11 @@
 import { createContext, useContext, type ReactNode } from "react";
+import { fallbackReferenceColor } from "./referenceData";
 import type { ReferenceData } from "../types/symphony";
 
-const fallbackReferenceData: ReferenceData = {
-  users: {},
+export const fallbackReferenceData: ReferenceData = {
+  users: {
+    unassigned: { name: "Unassigned", color: fallbackReferenceColor },
+  },
   labels: {},
 };
 
