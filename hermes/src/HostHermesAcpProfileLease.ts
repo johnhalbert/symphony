@@ -82,6 +82,8 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_PROFILE_PREFIX = "symphony";
 const DEFAULT_RESERVED_PROFILE_NAMES = new Set(["default"]);
 
+type HostHermesAcpProfileLeaseProfileDisposition = "created" | "reused";
+
 export async function createHostHermesAcpProfileLease(
   options: HostHermesAcpProfileLeaseOptions,
 ): Promise<HostHermesAcpProfileLease> {
@@ -102,7 +104,7 @@ export async function createHostHermesAcpProfileLease(
     runner,
   });
 
-  await runRequiredHostHermesAcpCommand(runner, binaryPath, buildHostHermesAcpCreateProfileArgs(profileName, sourceProfile), {
+  const profileDisposition = await acquireHostHermesAcpLeaseProfile(runner, binaryPath, profileName, sourceProfile, {
     cwd,
     env,
     timeoutMs,
@@ -117,6 +119,10 @@ export async function createHostHermesAcpProfileLease(
     acpCommand,
     async dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult> {
       if (disposed) return { profileName, reason: "already_disposed", deleted: false };
+      if (profileDisposition === "reused") {
+        disposed = true;
+        return { profileName, reason: "retained", deleted: false };
+      }
       if (!shouldDeleteHostHermesAcpProfile({ keepProfiles, terminalStatus })) {
         disposed = true;
         return { profileName, reason: "retained", deleted: false };
@@ -241,31 +247,72 @@ export function shouldDeleteHostHermesAcpProfile(input: {
   return true;
 }
 
+async function acquireHostHermesAcpLeaseProfile(
+  runner: HostHermesAcpCommandRunner,
+  file: string,
+  profileName: string,
+  sourceProfile: string,
+  options: HostHermesAcpCommandOptions,
+): Promise<HostHermesAcpProfileLeaseProfileDisposition> {
+  if (isSameHostHermesAcpProfileName(profileName, sourceProfile)) return "reused";
+
+  const args = buildHostHermesAcpCreateProfileArgs(profileName, sourceProfile);
+  const result = await runHostHermesAcpCommand(runner, file, args, options);
+  if (result.exitCode === 0) return "created";
+  if (typeof result.exitCode === "number" && isExpectedExistingHostHermesAcpProfile(result, profileName)) return "reused";
+  throw hostHermesAcpCommandResultError(result, file, args);
+}
+
 async function runRequiredHostHermesAcpCommand(
   runner: HostHermesAcpCommandRunner,
   file: string,
   args: readonly string[],
   options: HostHermesAcpCommandOptions,
 ): Promise<HostHermesAcpCommandResult> {
-  let result: HostHermesAcpCommandResult;
+  const result = await runHostHermesAcpCommand(runner, file, args, options);
+  if (result.exitCode !== 0) throw hostHermesAcpCommandResultError(result, file, args);
+  return { ...result, exitCode: result.exitCode };
+}
+
+async function runHostHermesAcpCommand(
+  runner: HostHermesAcpCommandRunner,
+  file: string,
+  args: readonly string[],
+  options: HostHermesAcpCommandOptions,
+): Promise<HostHermesAcpCommandResult> {
   try {
-    result = await runner(file, args, options);
+    return await runner(file, args, options);
   } catch (error) {
     const output = commandFailureOutput(commandErrorOutput(error, "stdout"), commandErrorOutput(error, "stderr"));
     throw new Error(`Host Hermes command failed: ${file} ${args.join(" ")}: ${errorMessage(error)}${output ? `\n${output}` : ""}`);
   }
-  if (result.exitCode === null) {
-    const output = commandFailureOutput(result.stdout, result.stderr);
-    throw new Error(`Host Hermes command ended without an exit code: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`);
-  }
+}
+
+function hostHermesAcpCommandResultError(result: HostHermesAcpCommandResult, file: string, args: readonly string[]): Error {
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
   const exitCode = result.exitCode;
-  if (exitCode !== 0) {
-    const output = commandFailureOutput(result.stdout, result.stderr);
-    throw new Error(
-      `Host Hermes command failed with exit code ${exitCode}: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`,
-    );
+  if (exitCode === null || exitCode === undefined) {
+    const output = commandFailureOutput(stdout, stderr);
+    return new Error(`Host Hermes command ended without an exit code: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`);
   }
-  return { ...result, exitCode };
+  const output = commandFailureOutput(stdout, stderr);
+  return new Error(
+    `Host Hermes command failed with exit code ${exitCode}: ${file} ${args.join(" ")}${output ? `\n${output}` : ""}`,
+  );
+}
+
+function isExpectedExistingHostHermesAcpProfile(result: HostHermesAcpCommandResult, profileName: string): boolean {
+  const output = stripAnsi(`${result.stdout}\n${result.stderr}`).replace(/\r/g, "");
+  const escapedProfileName = escapeRegExp(profileName);
+  return (
+    /\balready\s+exists\b/i.test(output) &&
+    new RegExp(`(^|[^a-z0-9_-])${escapedProfileName}([^a-z0-9_-]|$)`, "i").test(output)
+  );
+}
+
+function isSameHostHermesAcpProfileName(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
 function defaultHostHermesAcpCommandRunner(
@@ -388,4 +435,8 @@ function commandErrorOutput(error: unknown, key: "stdout" | "stderr"): string {
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

@@ -170,6 +170,109 @@ describe("HostHermesAcpProfileLease", () => {
     expect(calls).toHaveLength(2);
   });
 
+  it("reuses an expected already-existing profile without deleting it as a disposable clone", async () => {
+    const expectedProfileName = normalizeHostHermesAcpProfileName("worker-run");
+    const { calls, runner } = commandRecorder([
+      { stdout: "", stderr: `Profile '${expectedProfileName}' already exists.`, exitCode: 2 },
+    ]);
+
+    const lease = await createHostHermesAcpProfileLease({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      profileName: "worker-run",
+      sourceProfile: "operator",
+      keepProfiles: "never",
+      runner,
+    });
+
+    expect(lease.profileName).toBe(expectedProfileName);
+    expect(calls.map((call) => call.args)).toEqual([
+      ["profile", "create", expectedProfileName, "--clone", "--clone-from", "operator", "--no-alias"],
+    ]);
+    await expect(lease.dispose("succeeded")).resolves.toEqual({
+      profileName: expectedProfileName,
+      reason: "retained",
+      deleted: false,
+    });
+    await expect(lease.dispose("succeeded")).resolves.toEqual({
+      profileName: expectedProfileName,
+      reason: "already_disposed",
+      deleted: false,
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("rejects non-reusable profile create failures with command, exit code, and stderr diagnostics", async () => {
+    const expectedProfileName = normalizeHostHermesAcpProfileName("worker-run");
+    const { runner } = commandRecorder([
+      { stdout: "", stderr: "Profile 'someone-else' already exists.", exitCode: 17 },
+    ]);
+
+    await expect(
+      createHostHermesAcpProfileLease({
+        binaryPath: "hermes",
+        cwd: "/workspace",
+        profileName: "worker-run",
+        sourceProfile: "operator",
+        runner,
+      }),
+    ).rejects.toThrow(
+      new RegExp(
+        `Host Hermes command failed with exit code 17: hermes profile create ${expectedProfileName} --clone --clone-from operator --no-alias.*someone-else`,
+        "s",
+      ),
+    );
+  });
+
+  it("protects a configured source profile that matches the resolved lease profile from create and delete", async () => {
+    const expectedProfileName = normalizeHostHermesAcpProfileName("worker-run");
+    const { calls, runner } = commandRecorder([]);
+
+    const lease = await createHostHermesAcpProfileLease({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      profileName: "worker-run",
+      sourceProfile: expectedProfileName,
+      keepProfiles: "never",
+      runner,
+    });
+
+    expect(lease.profileName).toBe(expectedProfileName);
+    expect(lease.sourceProfile).toBe(expectedProfileName);
+    expect(calls).toHaveLength(0);
+    await expect(lease.dispose("succeeded")).resolves.toEqual({
+      profileName: expectedProfileName,
+      reason: "retained",
+      deleted: false,
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("protects an active source profile that matches the resolved lease profile from clone and delete", async () => {
+    const expectedProfileName = normalizeHostHermesAcpProfileName("active-worker-run");
+    const { calls, runner } = commandRecorder([
+      { stdout: `\nActive profile: ${expectedProfileName}\nPath: /home/me/.hermes\n`, stderr: "", exitCode: 0 },
+    ]);
+
+    const lease = await createHostHermesAcpProfileLease({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      profileName: "active-worker-run",
+      keepProfiles: "never",
+      runner,
+    });
+
+    expect(lease.profileName).toBe(expectedProfileName);
+    expect(lease.sourceProfile).toBe(expectedProfileName);
+    expect(calls.map((call) => call.args)).toEqual([["profile"]]);
+    await expect(lease.dispose("succeeded")).resolves.toEqual({
+      profileName: expectedProfileName,
+      reason: "retained",
+      deleted: false,
+    });
+    expect(calls.map((call) => call.args)).toEqual([["profile"]]);
+  });
+
   it("makes disposal idempotent after the first cleanup action", async () => {
     const { calls, runner } = commandRecorder([
       { stdout: "", stderr: "", exitCode: 0 },
