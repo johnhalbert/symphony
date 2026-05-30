@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -145,6 +145,65 @@ describe("/api/v1/web route contracts", () => {
     }
   });
 
+  it("serves web build assets under /web after API routes have precedence", async () => {
+    const webAssetsDir = await createTestWebDist(root);
+    const { server } = createStatusServer(root, { webAssetsDir });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      for (const route of ["/web", "/web/", "/web/index.html"]) {
+        const { response, text } = await getText(`${baseUrl}${route}`);
+        expect({ route, status: response.status }).toEqual({ route, status: 200 });
+        expect(response.headers.get("content-type")).toContain("text/html");
+        expect(response.headers.get("cache-control")).toBe("no-cache");
+        expect(text).toContain("Symphony static shell");
+        expect(text).toContain('/web/assets/app.css');
+      }
+
+      const css = await getText(`${baseUrl}/web/assets/app.css?cache-bust=1`);
+      expect(css.response.status).toBe(200);
+      expect(css.response.headers.get("content-type")).toContain("text/css");
+      expect(css.response.headers.get("cache-control")).toContain("immutable");
+      expect(css.text).toContain("color: papayawhip");
+
+      const head = await fetch(`${baseUrl}/web/assets/app.js`, { method: "HEAD" });
+      expect(head.status).toBe(200);
+      expect(head.headers.get("content-type")).toContain("text/javascript");
+      expect(await head.text()).toBe("");
+
+      const missingAsset = await getJson(`${baseUrl}/web/assets/missing.js`);
+      expect(missingAsset.response.status).toBe(404);
+      expect(missingAsset.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+
+      const traversal = await getJson(`${baseUrl}/web/..%2fpackage.json`);
+      expect(traversal.response.status).toBe(404);
+      expect(traversal.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+
+      const api = await getJson(`${baseUrl}/api/v1/web/dashboard`);
+      expect(api.response.status).toBe(200);
+      expectTopLevelKeys(api.body, [
+        "activity",
+        "agentUsageLabel",
+        "branch",
+        "chat",
+        "concurrencyCap",
+        "pollLabel",
+        "projectName",
+        "providerGates",
+        "repoLabel",
+        "runningAgents",
+        "totals",
+        "workflowLabel",
+      ]);
+
+      const unsupportedApi = await getJson(`${baseUrl}/api/v1/web/unknown`);
+      expect(unsupportedApi.response.status).toBe(404);
+      expect(unsupportedApi.body).toEqual({ error: { code: "not_found", message: "Route not found" } });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("keeps the orchestrator chat POST contract side-effect-free and validates malformed input", async () => {
     const { server, calls } = createStatusServer(root);
     const address = await server.start();
@@ -205,7 +264,10 @@ interface OrchestratorCallCounts {
   cancelIssue: number;
 }
 
-function createStatusServer(root: string): { server: StatusServer; calls: OrchestratorCallCounts } {
+function createStatusServer(
+  root: string,
+  options: { webAssetsDir?: string | null } = {},
+): { server: StatusServer; calls: OrchestratorCallCounts } {
   const config = testConfig(path.join(root, "workspaces"));
   const { orchestrator, calls } = instrumentedOrchestrator();
   return {
@@ -223,8 +285,36 @@ function createStatusServer(root: string): { server: StatusServer; calls: Orches
       openWorkspaceToken: null,
       trackerStateLists: testTrackerStateLists(),
       staleThresholdMs: 300_000,
+      webAssetsDir: options.webAssetsDir,
     }),
   };
+}
+
+async function createTestWebDist(root: string): Promise<string> {
+  const webAssetsDir = path.join(root, "web-dist");
+  const assetDir = path.join(webAssetsDir, "assets");
+  await mkdir(assetDir, { recursive: true });
+  await writeFile(
+    path.join(webAssetsDir, "index.html"),
+    [
+      "<!doctype html>",
+      '<html lang="en">',
+      "<head>",
+      '  <meta charset="UTF-8" />',
+      '  <link rel="stylesheet" href="/web/assets/app.css" />',
+      "  <title>Symphony static shell</title>",
+      "</head>",
+      "<body>",
+      "  <div id=\"root\">Symphony static shell</div>",
+      '  <script type="module" src="/web/assets/app.js"></script>',
+      "</body>",
+      "</html>",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(path.join(assetDir, "app.css"), "body { color: papayawhip; }\n");
+  await writeFile(path.join(assetDir, "app.js"), "console.log('symphony static shell');\n");
+  return webAssetsDir;
 }
 
 function instrumentedOrchestrator(): { orchestrator: Orchestrator; calls: OrchestratorCallCounts } {
@@ -291,6 +381,11 @@ async function getJson(url: string, init?: RequestInit): Promise<{ response: Res
   const text = await response.text();
   expect(response.headers.get("content-type")).toContain("application/json");
   return { response, text, body: JSON.parse(text) as unknown };
+}
+
+async function getText(url: string, init?: RequestInit): Promise<{ response: Response; text: string }> {
+  const response = await fetch(url, init);
+  return { response, text: await response.text() };
 }
 
 async function postJson(url: string, body: unknown): Promise<{ response: Response; text: string; body: unknown }> {

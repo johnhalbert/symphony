@@ -7,6 +7,7 @@ export default defineConfig(({ mode }) => {
   const apiProxyTarget = resolveApiProxyTarget(env);
 
   return {
+    base: "/web/",
     plugins: [react()],
     server: {
       proxy: {

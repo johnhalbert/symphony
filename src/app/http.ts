@@ -1,5 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { constants as fsConstants, promises as fs } from "node:fs";
+import path from "node:path";
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
@@ -95,13 +96,17 @@ export interface StatusServerOptions {
   issueBoardColumns?: IssueBoardColumnMapping;
   staleThresholdMs: number;
   dashboard?: DashboardRuntimeConfig | undefined;
+  webAssetsDir?: string | null | undefined;
 }
 
 export class StatusServer {
   private server: http.Server | null = null;
   private issueBoardTrackerCache: IssueBoardTrackerCache | null = null;
+  private readonly webAssetsDir: string | null;
 
-  constructor(private readonly options: StatusServerOptions) {}
+  constructor(private readonly options: StatusServerOptions) {
+    this.webAssetsDir = resolveWebAssetsDir(options.webAssetsDir);
+  }
 
   async start(): Promise<{ host: string; port: number }> {
     if (this.server) {
@@ -711,6 +716,10 @@ export class StatusServer {
         return;
       }
 
+      if ((request.method === "GET" || request.method === "HEAD") && isWebAssetRoute(url.pathname)) {
+        if (await serveWebAsset(response, request.method, url.pathname, this.webAssetsDir)) return;
+      }
+
       sendJson(response, 404, { error: { code: "not_found", message: "Route not found" } });
     } catch (error) {
       const status =
@@ -991,6 +1000,130 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
 function sendHtml(response: ServerResponse, body: string): void {
   response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   response.end(body);
+}
+
+const WEB_MOUNT_PATH = "/web";
+const WEB_INDEX_FILE = "index.html";
+const WEB_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
+const WEB_HTML_CACHE_CONTROL = "no-cache";
+
+function resolveWebAssetsDir(configuredWebAssetsDir: string | null | undefined): string | null {
+  if (configuredWebAssetsDir === null) return null;
+  const configured = configuredWebAssetsDir?.trim();
+  return path.resolve(configured && configured.length > 0 ? configured : path.join(process.cwd(), "web", "dist"));
+}
+
+function isWebAssetRoute(pathname: string): boolean {
+  return pathname === WEB_MOUNT_PATH || pathname.startsWith(`${WEB_MOUNT_PATH}/`);
+}
+
+async function serveWebAsset(
+  response: ServerResponse,
+  method: "GET" | "HEAD",
+  pathname: string,
+  webAssetsDir: string | null,
+): Promise<boolean> {
+  if (!webAssetsDir) return false;
+  const request = resolveWebAssetRequest(pathname, webAssetsDir);
+  if (!request) {
+    sendStaticAssetNotFound(response);
+    return true;
+  }
+
+  let stat;
+  try {
+    stat = await fs.stat(request.filePath);
+  } catch {
+    sendStaticAssetNotFound(response);
+    return true;
+  }
+  if (!stat.isFile()) {
+    sendStaticAssetNotFound(response);
+    return true;
+  }
+
+  const headers: Record<string, string | number> = {
+    "content-type": contentTypeForStaticAsset(request.filePath),
+    "content-length": stat.size,
+    "cache-control": request.relativePath === WEB_INDEX_FILE ? WEB_HTML_CACHE_CONTROL : WEB_ASSET_CACHE_CONTROL,
+  };
+  response.writeHead(200, headers);
+  if (method === "HEAD") {
+    response.end();
+    return true;
+  }
+  response.end(await fs.readFile(request.filePath));
+  return true;
+}
+
+function resolveWebAssetRequest(
+  pathname: string,
+  webAssetsDir: string,
+): { filePath: string; relativePath: string } | null {
+  const mountRelativePath = pathname === WEB_MOUNT_PATH ? "" : pathname.slice(WEB_MOUNT_PATH.length + 1);
+  let decodedRelativePath: string;
+  try {
+    decodedRelativePath = decodeURIComponent(mountRelativePath);
+  } catch {
+    return null;
+  }
+  if (decodedRelativePath.includes("\0") || decodedRelativePath.includes("\\")) return null;
+  const segments = decodedRelativePath.split("/").filter((segment) => segment.length > 0);
+  if (segments.some((segment) => segment === ".." || segment === ".")) return null;
+
+  const relativePath = segments.length === 0 ? WEB_INDEX_FILE : segments.join("/");
+  const filePath = path.resolve(webAssetsDir, relativePath);
+  return pathIsWithin(webAssetsDir, filePath) ? { filePath, relativePath } : null;
+}
+
+function pathIsWithin(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), target);
+  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function contentTypeForStaticAsset(filePath: string): string {
+  switch (path.extname(filePath).toLowerCase()) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+    case ".mjs":
+      return "text/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".ico":
+      return "image/x-icon";
+    case ".map":
+      return "application/json; charset=utf-8";
+    case ".wasm":
+      return "application/wasm";
+    case ".woff":
+      return "font/woff";
+    case ".woff2":
+      return "font/woff2";
+    case ".ttf":
+      return "font/ttf";
+    case ".txt":
+      return "text/plain; charset=utf-8";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function sendStaticAssetNotFound(response: ServerResponse): void {
+  sendJson(response, 404, { error: { code: "not_found", message: "Static asset not found" } });
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
