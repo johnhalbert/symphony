@@ -2,6 +2,7 @@ import { Fragment, createElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SymphonyDataSource } from "../src/data/dataSource";
+import { fallbackReferenceData } from "../src/data/referenceDataContext";
 import type {
   ChatMessage,
   DashboardModel,
@@ -324,9 +325,11 @@ async function renderAppWithMocks({
 async function renderIssuesViewWithDetail({
   board,
   detail = loaded(apiSelectedIssueDetail),
+  referenceData = apiReferenceData,
 }: {
   board: IssueBoardModel;
   detail?: Loadable<IssueDetailModel | null>;
+  referenceData?: ReferenceData;
 }) {
   vi.resetModules();
   const requestedIssueIds: Array<string | null> = [];
@@ -344,7 +347,7 @@ async function renderIssuesViewWithDetail({
   ]);
 
   const markup = renderToStaticMarkup(
-    <ReferenceDataProvider value={apiReferenceData}>
+    <ReferenceDataProvider value={referenceData}>
       <IssuesView board={board} />
     </ReferenceDataProvider>,
   );
@@ -421,14 +424,44 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("dashboard embedded fallback should not render");
   });
 
-  it("holds the reference-data loading boundary without rendering API or mock dashboard content", async () => {
+  it("renders the API app shell while reference data is pending", async () => {
     const markup = await renderAppWithMocks({
       hooks: appHookState({ reference: { data: null, loading: true, error: null } }),
     });
 
-    expect(markup).toContain("Loading Symphony design data...");
-    expect(markup).not.toContain("api/repo");
+    expect(markup).toContain("api source · api · reference loading");
+    expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("Symphony · api-branch");
+    expect(markup).toContain("API full-app chat");
+
+    expect(markup).not.toContain("Loading Symphony design data...");
+    expect(markup).not.toContain("Reference data unavailable.");
     expect(markup).not.toContain("openai/symphony");
+  });
+
+  it("keeps the API app shell usable when reference data fails", async () => {
+    const markup = await renderAppWithMocks({
+      hooks: appHookState({ reference: failed("Symphony API returned HTTP 503 for reference data") }),
+    });
+
+    expect(markup).toContain("api source · api · reference unavailable");
+    expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("Symphony · api-branch");
+    expect(markup).toContain("API full-app chat");
+
+    expect(markup).not.toContain("Loading Symphony design data...");
+    expect(markup).not.toContain("Reference data unavailable.");
+    expect(markup).not.toContain("openai/symphony");
+  });
+
+  it("preserves the mock-mode reference-data loading boundary", async () => {
+    const markup = await renderAppWithMocks({
+      mode: "mock",
+      hooks: appHookState({ reference: { data: null, loading: true, error: null } }),
+    });
+
+    expect(markup).toContain("Loading Symphony design data...");
+    expect(markup).not.toContain("api source · mock");
     expect(markup).not.toContain("API full-app chat");
   });
 
@@ -457,6 +490,20 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("Add exponential backoff to retry queue with jitter");
     expect(markup).not.toContain("Backoff curve");
     expect(markup).not.toContain("No issue activity in the mock data.");
+  });
+
+  it("renders API issue references with deterministic fallback labels and users", async () => {
+    const { markup } = await renderIssuesViewWithDetail({ board: apiIssueBoard, referenceData: fallbackReferenceData });
+
+    expect(markup).toContain("api-render");
+    expect(markup).toContain("api-detail");
+    expect(markup).toContain("api-owner");
+    expect(markup).toContain("API issue detail title from GET /api/v1/web/issues/API-SELECTED");
+
+    expect(markup).not.toContain("API Owner");
+    expect(markup).not.toContain("API Reviewer");
+    expect(markup).not.toContain("orchestrator");
+    expect(markup).not.toContain("feature");
   });
 
   it("renders API empty-board and 200-null issue-detail boundaries without mock fallbacks", async () => {
