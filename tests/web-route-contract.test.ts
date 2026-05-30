@@ -195,40 +195,45 @@ describe("/api/v1/web route contracts", () => {
     }
   });
 
-  it("serves configured production web assets under /web while preserving same-origin web APIs", async () => {
+  it("serves configured production web assets under /web after API routes have precedence", async () => {
     const webAssetsRoot = await createWebAssets(root);
     const { server } = createStatusServer(root, { webAssetsRoot });
     const address = await server.start();
     const baseUrl = baseUrlFor(address);
     try {
-      const redirect = await fetch(`${baseUrl}/web`, { redirect: "manual" });
-      expect(redirect.status).toBe(308);
-      expect(redirect.headers.get("location")).toBe("/web/");
+      for (const route of ["/web", "/web/", "/web/index.html"]) {
+        const { response, text } = await getText(`${baseUrl}${route}`);
+        expect({ route, status: response.status }).toEqual({ route, status: 200 });
+        expect(response.headers.get("content-type")).toContain("text/html");
+        expect(response.headers.get("cache-control")).toBe("no-cache");
+        expect(text).toContain("Symphony static shell");
+        expect(text).toContain('/web/assets/app.css');
+      }
 
-      const index = await fetch(`${baseUrl}/web/`);
-      const indexText = await index.text();
-      expect(index.status).toBe(200);
-      expect(index.headers.get("content-type")).toContain("text/html");
-      expect(index.headers.get("cache-control")).toBe("no-cache");
-      expect(indexText).toContain("Symphony Web App");
-      expect(indexText).toContain('/web/assets/app.js');
-
-      const extensionlessUnknown = await fetch(`${baseUrl}/web/issues/ENG-119`);
-      expect(extensionlessUnknown.status).toBe(404);
-      expect(extensionlessUnknown.headers.get("content-type")).toContain("text/plain");
-      expect(await extensionlessUnknown.text()).not.toContain("Symphony Web App");
-
-      const asset = await fetch(`${baseUrl}/web/assets/app.js`);
-      expect(asset.status).toBe(200);
-      expect(asset.headers.get("content-type")).toContain("javascript");
-      expect(asset.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
-      expect(await asset.text()).toContain("web asset loaded");
+      const css = await getText(`${baseUrl}/web/assets/app.css?cache-bust=1`);
+      expect(css.response.status).toBe(200);
+      expect(css.response.headers.get("content-type")).toContain("text/css");
+      expect(css.response.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+      expect(css.text).toContain("color: papayawhip");
 
       const assetHead = await fetch(`${baseUrl}/web/assets/app.js`, { method: "HEAD" });
       expect(assetHead.status).toBe(200);
       expect(assetHead.headers.get("content-type")).toContain("javascript");
-      expect(assetHead.headers.get("content-length")).toBe(String("console.log('web asset loaded');\n".length));
+      expect(assetHead.headers.get("content-length")).toBe(String("console.log('symphony static shell');\n".length));
       expect(await assetHead.text()).toBe("");
+
+      const missingAsset = await getJson(`${baseUrl}/web/assets/missing.js`);
+      expect(missingAsset.response.status).toBe(404);
+      expect(missingAsset.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+
+      const extensionlessUnknown = await getJson(`${baseUrl}/web/issues/ENG-119`);
+      expect(extensionlessUnknown.response.status).toBe(404);
+      expect(extensionlessUnknown.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+      expect(extensionlessUnknown.text).not.toContain("Symphony static shell");
+
+      const traversal = await getJson(`${baseUrl}/web/..%2fpackage.json`);
+      expect(traversal.response.status).toBe(404);
+      expect(traversal.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
 
       const api = await getJson(`${baseUrl}/api/v1/web/dashboard`);
       expect(api.response.status).toBe(200);
@@ -246,13 +251,17 @@ describe("/api/v1/web route contracts", () => {
         "totals",
         "workflowLabel",
       ]);
+
+      const unsupportedApi = await getJson(`${baseUrl}/api/v1/web/unknown`);
+      expect(unsupportedApi.response.status).toBe(404);
+      expect(unsupportedApi.body).toEqual({ error: { code: "not_found", message: "Route not found" } });
     } finally {
       await server.stop();
     }
   });
 
-  it("keeps /web unclaimed when assets are not configured", async () => {
-    const { server } = createStatusServer(root);
+  it("can explicitly disable /web static serving", async () => {
+    const { server } = createStatusServer(root, { webAssetsRoot: null });
     const address = await server.start();
     try {
       const { response, body } = await getJson(`${baseUrlFor(address)}/web/`);
@@ -263,7 +272,7 @@ describe("/api/v1/web route contracts", () => {
     }
   });
 
-  it("returns safe 404s when the configured /web asset root is missing or not a directory", async () => {
+  it("returns safe static 404s when the configured /web asset root is missing or not a directory", async () => {
     const nonDirectoryRoot = path.join(root, "web-dist-file");
     await writeFile(nonDirectoryRoot, "not a directory", "utf8");
     const invalidRoots = [path.join(root, "missing-web-dist"), nonDirectoryRoot];
@@ -273,18 +282,12 @@ describe("/api/v1/web route contracts", () => {
       const address = await server.start();
       const baseUrl = baseUrlFor(address);
       try {
-        const bareWeb = await fetch(`${baseUrl}/web`, { redirect: "manual" });
-        expect({ webAssetsRoot, status: bareWeb.status }).toEqual({ webAssetsRoot, status: 404 });
-        expect(bareWeb.headers.get("location")).toBeNull();
-
-        const index = await fetch(`${baseUrl}/web/`);
-        expect({ webAssetsRoot, status: index.status }).toEqual({ webAssetsRoot, status: 404 });
-        expect(index.headers.get("content-type")).toContain("text/plain");
-        expect(await index.text()).not.toContain("Symphony Web App");
-
-        const asset = await fetch(`${baseUrl}/web/assets/app.js`);
-        expect({ webAssetsRoot, status: asset.status }).toEqual({ webAssetsRoot, status: 404 });
-        expect(await asset.text()).not.toContain("web asset loaded");
+        for (const route of ["/web", "/web/", "/web/assets/app.js"]) {
+          const { response, body, text } = await getJson(`${baseUrl}${route}`);
+          expect({ route, webAssetsRoot, status: response.status }).toEqual({ route, webAssetsRoot, status: 404 });
+          expect(body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+          expect(text).not.toContain("Symphony static shell");
+        }
       } finally {
         await server.stop();
       }
@@ -306,20 +309,19 @@ describe("/api/v1/web route contracts", () => {
     const address = await server.start();
     const baseUrl = baseUrlFor(address);
     try {
-      const traversal = await fetch(`${baseUrl}/web/%2e%2e%2fsecret.txt`);
-      expect(traversal.status).toBe(404);
-      expect(traversal.headers.get("content-type")).toContain("text/plain");
-      expect(await traversal.text()).not.toContain("do not serve");
+      const traversal = await getJson(`${baseUrl}/web/%2e%2e%2fsecret.txt`);
+      expect(traversal.response.status).toBe(404);
+      expect(traversal.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+      expect(traversal.text).not.toContain("do not serve");
 
-      const missingAsset = await fetch(`${baseUrl}/web/assets/missing.js`);
-      expect(missingAsset.status).toBe(404);
-      expect(missingAsset.headers.get("content-type")).toContain("text/plain");
-      expect(await missingAsset.text()).toContain("Web asset not found");
+      const missingAsset = await getJson(`${baseUrl}/web/assets/missing.js`);
+      expect(missingAsset.response.status).toBe(404);
+      expect(missingAsset.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
 
-      const linkedEscape = await fetch(`${baseUrl}/web/linked-outside/secret.txt`);
-      expect(linkedEscape.status).toBe(404);
-      expect(linkedEscape.headers.get("content-type")).toContain("text/plain");
-      expect(await linkedEscape.text()).not.toContain("do not serve via link");
+      const linkedEscape = await getJson(`${baseUrl}/web/linked-outside/secret.txt`);
+      expect(linkedEscape.response.status).toBe(404);
+      expect(linkedEscape.body).toEqual({ error: { code: "not_found", message: "Static asset not found" } });
+      expect(linkedEscape.text).not.toContain("do not serve via link");
     } finally {
       await server.stop();
     }
@@ -367,21 +369,29 @@ function createStatusServer(
 
 async function createWebAssets(root: string): Promise<string> {
   const webAssetsRoot = path.join(root, "web-dist");
-  await mkdir(path.join(webAssetsRoot, "assets"), { recursive: true });
+  const assetDir = path.join(webAssetsRoot, "assets");
+  await mkdir(assetDir, { recursive: true });
   await writeFile(
     path.join(webAssetsRoot, "index.html"),
-    `<!doctype html>
-<html>
-  <head><title>Symphony Web App</title></head>
-  <body>
-    <div id="root">Symphony Web App</div>
-    <script type="module" src="/web/assets/app.js"></script>
-  </body>
-</html>
-`,
+    [
+      "<!doctype html>",
+      '<html lang="en">',
+      "<head>",
+      '  <meta charset="UTF-8" />',
+      '  <link rel="stylesheet" href="/web/assets/app.css" />',
+      "  <title>Symphony static shell</title>",
+      "</head>",
+      "<body>",
+      "  <div id=\"root\">Symphony static shell</div>",
+      '  <script type="module" src="/web/assets/app.js"></script>',
+      "</body>",
+      "</html>",
+      "",
+    ].join("\n"),
     "utf8",
   );
-  await writeFile(path.join(webAssetsRoot, "assets", "app.js"), "console.log('web asset loaded');\n", "utf8");
+  await writeFile(path.join(assetDir, "app.css"), "body { color: papayawhip; }\n", "utf8");
+  await writeFile(path.join(assetDir, "app.js"), "console.log('symphony static shell');\n", "utf8");
   return webAssetsRoot;
 }
 
@@ -449,6 +459,11 @@ async function getJson(url: string, init?: RequestInit): Promise<{ response: Res
   const text = await response.text();
   expect(response.headers.get("content-type")).toContain("application/json");
   return { response, text, body: JSON.parse(text) as unknown };
+}
+
+async function getText(url: string, init?: RequestInit): Promise<{ response: Response; text: string }> {
+  const response = await fetch(url, init);
+  return { response, text: await response.text() };
 }
 
 async function postJson(url: string, body: unknown): Promise<{ response: Response; text: string; body: unknown }> {

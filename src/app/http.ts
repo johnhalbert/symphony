@@ -98,7 +98,7 @@ export interface StatusServerOptions {
   dashboard?: DashboardRuntimeConfig | undefined;
   /**
    * Absolute root of the generated React web bundle, normally `web/dist`.
-   * When set, StatusServer serves the production React app under `/web/`.
+   * Undefined or blank values default to `process.cwd()/web/dist`; null disables static serving.
    */
   webAssetsRoot?: string | null | undefined;
 }
@@ -106,12 +106,10 @@ export interface StatusServerOptions {
 export class StatusServer {
   private server: http.Server | null = null;
   private issueBoardTrackerCache: IssueBoardTrackerCache | null = null;
+  private readonly webAssetsRoot: string | null;
 
-  constructor(private readonly options: StatusServerOptions) {}
-
-  configuredWebAssetsRoot(): string | null {
-    const configured = this.options.webAssetsRoot?.trim() ?? "";
-    return configured.length > 0 ? configured : null;
+  constructor(private readonly options: StatusServerOptions) {
+    this.webAssetsRoot = resolveWebAssetsRootOption(options.webAssetsRoot);
   }
 
   async start(): Promise<{ host: string; port: number }> {
@@ -144,9 +142,6 @@ export class StatusServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-      if (await this.serveWebAsset(request, response, url)) {
-        return;
-      }
       if (request.method === "GET" && url.pathname === "/") {
         const snapshot = publicRuntimeSnapshot(this.options.orchestrator.snapshot());
         sendHtml(
@@ -725,6 +720,10 @@ export class StatusServer {
         return;
       }
 
+      if ((request.method === "GET" || request.method === "HEAD") && isWebAssetRoute(url.pathname)) {
+        if (await serveWebAsset(response, request.method, url.pathname, this.webAssetsRoot)) return;
+      }
+
       sendJson(response, 404, { error: { code: "not_found", message: "Route not found" } });
     } catch (error) {
       const status =
@@ -744,42 +743,6 @@ export class StatusServer {
         },
       });
     }
-  }
-
-  private async serveWebAsset(request: IncomingMessage, response: ServerResponse, url: URL): Promise<boolean> {
-    if (!isWebAssetRoute(url.pathname) || (request.method !== "GET" && request.method !== "HEAD")) return false;
-
-    const assetsRoot = this.configuredWebAssetsRoot();
-    if (assetsRoot === null) return false;
-
-    const sendBody = request.method !== "HEAD";
-    const resolvedRoot = await resolveWebAssetsRoot(assetsRoot);
-    if (resolvedRoot === null) {
-      sendPlain(response, 404, "Web asset not found\n", sendBody);
-      return true;
-    }
-
-    if (url.pathname === "/web") {
-      response.writeHead(308, { location: "/web/", "cache-control": "no-cache" });
-      response.end();
-      return true;
-    }
-
-    const relativePath = decodeWebAssetRelativePath(url.pathname);
-    if (relativePath === null) {
-      sendPlain(response, 400, "Invalid web asset path\n", sendBody);
-      return true;
-    }
-
-    const webPath = relativePath === "" ? "index.html" : relativePath;
-    const asset = await resolveRegularWebAsset(resolvedRoot, webPath);
-    if (asset) {
-      await sendFile(response, asset.path, asset.stat, webPath, sendBody);
-      return true;
-    }
-
-    sendPlain(response, 404, "Web asset not found\n", sendBody);
-    return true;
   }
 
   private requireApprovalMutationToken(request: IncomingMessage): void {
@@ -1043,53 +1006,75 @@ function sendHtml(response: ServerResponse, body: string): void {
   response.end(body);
 }
 
-async function sendFile(
-  response: ServerResponse,
-  filePath: string,
-  stat: Stats,
-  webPath: string,
-  sendBody: boolean,
-  options: { cacheControl?: string } = {},
-): Promise<void> {
-  const body = sendBody ? await fs.readFile(filePath) : null;
-  response.writeHead(200, {
-    "content-type": contentTypeForPath(filePath),
-    "content-length": String(stat.size),
-    "cache-control": options.cacheControl ?? cacheControlForWebPath(webPath),
-  });
-  response.end(body);
-}
+const WEB_MOUNT_PATH = "/web";
+const WEB_INDEX_FILE = "index.html";
+const WEB_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
+const WEB_HTML_CACHE_CONTROL = "no-cache";
+const STATIC_ASSET_NOT_FOUND = { error: { code: "not_found", message: "Static asset not found" } } as const;
 
-function sendPlain(response: ServerResponse, status: number, body: string, sendBody = true): void {
-  response.writeHead(status, {
-    "content-type": "text/plain; charset=utf-8",
-    "content-length": String(Buffer.byteLength(body)),
-    "cache-control": "no-cache",
-  });
-  response.end(sendBody ? body : undefined);
+function resolveWebAssetsRootOption(configuredWebAssetsRoot: string | null | undefined): string | null {
+  if (configuredWebAssetsRoot === null) return null;
+  const configured = configuredWebAssetsRoot?.trim();
+  return path.resolve(configured && configured.length > 0 ? configured : path.join(process.cwd(), "web", "dist"));
 }
 
 function isWebAssetRoute(pathname: string): boolean {
-  return pathname === "/web" || pathname.startsWith("/web/");
+  return pathname === WEB_MOUNT_PATH || pathname.startsWith(`${WEB_MOUNT_PATH}/`);
 }
 
-function decodeWebAssetRelativePath(pathname: string): string | null {
-  if (!pathname.startsWith("/web/")) return null;
-  try {
-    const decoded = decodeURIComponent(pathname.slice("/web/".length));
-    if (decoded.includes("\0") || decoded.includes("\\")) return null;
-    return decoded;
-  } catch {
-    return null;
+async function serveWebAsset(
+  response: ServerResponse,
+  method: "GET" | "HEAD",
+  pathname: string,
+  webAssetsRoot: string | null,
+): Promise<boolean> {
+  if (!webAssetsRoot) return false;
+
+  const resolvedRoot = await resolveExistingWebAssetsRoot(webAssetsRoot);
+  if (!resolvedRoot) {
+    sendStaticAssetNotFound(response, method);
+    return true;
   }
+
+  const request = resolveWebAssetRequest(pathname, resolvedRoot);
+  if (!request) {
+    sendStaticAssetNotFound(response, method);
+    return true;
+  }
+
+  let filePath: string;
+  let stat: Stats;
+  try {
+    filePath = await fs.realpath(request.filePath);
+    if (!pathIsWithin(resolvedRoot, filePath)) {
+      sendStaticAssetNotFound(response, method);
+      return true;
+    }
+    stat = await fs.stat(filePath);
+  } catch {
+    sendStaticAssetNotFound(response, method);
+    return true;
+  }
+
+  if (!stat.isFile()) {
+    sendStaticAssetNotFound(response, method);
+    return true;
+  }
+
+  response.writeHead(200, {
+    "content-type": contentTypeForStaticAsset(filePath),
+    "content-length": String(stat.size),
+    "cache-control": request.relativePath === WEB_INDEX_FILE ? WEB_HTML_CACHE_CONTROL : WEB_ASSET_CACHE_CONTROL,
+  });
+  if (method === "HEAD") {
+    response.end();
+    return true;
+  }
+  response.end(await fs.readFile(filePath));
+  return true;
 }
 
-interface ResolvedWebAsset {
-  path: string;
-  stat: Stats;
-}
-
-async function resolveWebAssetsRoot(root: string): Promise<string | null> {
+async function resolveExistingWebAssetsRoot(root: string): Promise<string | null> {
   try {
     const realRoot = await fs.realpath(path.resolve(root));
     const stat = await fs.stat(realRoot);
@@ -1099,42 +1084,38 @@ async function resolveWebAssetsRoot(root: string): Promise<string | null> {
   }
 }
 
-function isPathInsideRoot(root: string, target: string): boolean {
-  const relativeFromRoot = path.relative(root, target);
-  return relativeFromRoot === "" || (!relativeFromRoot.startsWith("..") && !path.isAbsolute(relativeFromRoot));
-}
-
-function resolveWebAssetPath(root: string, relativePath: string): string | null {
-  const candidate = path.resolve(root, relativePath || ".");
-  return isPathInsideRoot(root, candidate) ? candidate : null;
-}
-
-async function resolveRegularWebAsset(root: string, relativePath: string): Promise<ResolvedWebAsset | null> {
-  const candidate = resolveWebAssetPath(root, relativePath);
-  if (candidate === null) return null;
+function resolveWebAssetRequest(pathname: string, webAssetsRoot: string): { filePath: string; relativePath: string } | null {
+  const mountRelativePath = pathname === WEB_MOUNT_PATH ? "" : pathname.slice(WEB_MOUNT_PATH.length + 1);
+  let decodedRelativePath: string;
   try {
-    const realPath = await fs.realpath(candidate);
-    if (!isPathInsideRoot(root, realPath)) return null;
-    const stat = await fs.stat(realPath);
-    return stat.isFile() ? { path: realPath, stat } : null;
+    decodedRelativePath = decodeURIComponent(mountRelativePath);
   } catch {
     return null;
   }
+
+  if (decodedRelativePath.includes("\0") || decodedRelativePath.includes("\\")) return null;
+  const segments = decodedRelativePath.split("/").filter((segment) => segment.length > 0);
+  if (segments.some((segment) => segment === "." || segment === "..")) return null;
+
+  const relativePath = segments.length === 0 ? WEB_INDEX_FILE : segments.join("/");
+  const filePath = path.resolve(webAssetsRoot, relativePath);
+  return pathIsWithin(webAssetsRoot, filePath) ? { filePath, relativePath } : null;
 }
 
-function cacheControlForWebPath(webPath: string): string {
-  return webPath.startsWith("assets/") ? "public, max-age=31536000, immutable" : "no-cache";
+function pathIsWithin(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), target);
+  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function contentTypeForPath(filePath: string): string {
+function contentTypeForStaticAsset(filePath: string): string {
   switch (path.extname(filePath).toLowerCase()) {
-    case ".css":
-      return "text/css; charset=utf-8";
     case ".html":
       return "text/html; charset=utf-8";
     case ".js":
     case ".mjs":
-      return "application/javascript; charset=utf-8";
+      return "text/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
     case ".json":
     case ".map":
       return "application/json; charset=utf-8";
@@ -1145,17 +1126,37 @@ function contentTypeForPath(filePath: string): string {
     case ".jpg":
     case ".jpeg":
       return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
     case ".ico":
       return "image/x-icon";
     case ".webmanifest":
       return "application/manifest+json; charset=utf-8";
+    case ".wasm":
+      return "application/wasm";
+    case ".woff":
+      return "font/woff";
     case ".woff2":
       return "font/woff2";
+    case ".ttf":
+      return "font/ttf";
     case ".txt":
       return "text/plain; charset=utf-8";
     default:
       return "application/octet-stream";
   }
+}
+
+function sendStaticAssetNotFound(response: ServerResponse, method: "GET" | "HEAD" = "GET"): void {
+  const body = `${JSON.stringify(STATIC_ASSET_NOT_FOUND, null, 2)}\n`;
+  response.writeHead(404, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": String(Buffer.byteLength(body)),
+    "cache-control": "no-cache",
+  });
+  response.end(method === "HEAD" ? undefined : body);
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {

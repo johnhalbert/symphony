@@ -11,6 +11,7 @@ import { createServer } from "vite";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(__dirname, "..");
 const requestLog = [];
+const browserDevtoolsTimeoutMs = parsePositiveInteger(process.env.SYMPHONY_WEB_BROWSER_DEVTOOLS_TIMEOUT_MS, 30_000);
 
 const totals = {
   backlog: 0,
@@ -469,6 +470,28 @@ function resolveViteOrigin(server) {
   return `http://127.0.0.1:${address.port}`;
 }
 
+async function reserveTcpPort() {
+  const server = http.createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  assert(address && typeof address === "object", "Could not reserve a TCP port for browser DevTools");
+  const port = address.port;
+  await closeServer(server);
+  return port;
+}
+
+function parsePositiveInteger(value, fallback) {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
 async function fetchJson(url) {
   const response = await fetch(url, { headers: { Accept: "application/json" } });
   assert(response.ok, `Expected ${url} to return 2xx, got HTTP ${response.status}`);
@@ -527,9 +550,12 @@ async function canAccess(filePath) {
 
 async function openBrowserPage(executable, url, userDataDir) {
   const stderrLines = [];
+  const debugPort = await reserveTcpPort();
   const args = [
     "--headless=new",
-    "--remote-debugging-port=0",
+    "--remote-debugging-address=127.0.0.1",
+    `--remote-debugging-port=${debugPort}`,
+    "--remote-allow-origins=*",
     "--disable-background-networking",
     "--disable-default-apps",
     "--disable-extensions",
@@ -540,48 +566,84 @@ async function openBrowserPage(executable, url, userDataDir) {
     `--user-data-dir=${userDataDir}`,
     "about:blank",
   ];
-  if (process.platform === "linux") args.splice(1, 0, "--no-sandbox");
+  if (process.platform === "linux") args.splice(1, 0, "--no-sandbox", "--disable-dev-shm-usage");
 
   const browserProcess = spawn(executable, args, { stdio: ["ignore", "ignore", "pipe"] });
-  const devtoolsUrl = await waitForDevtoolsUrl(browserProcess, stderrLines);
-  const debugOrigin = devtoolsUrl.replace(/^ws:\/\//, "http://").replace(/\/devtools\/browser\/.+$/, "");
-  const target = await createBrowserTarget(debugOrigin, url);
-  const page = await connectCdp(target.webSocketDebuggerUrl);
-  page.stderrLines = stderrLines;
-  return { process: browserProcess, page };
+  try {
+    const debugOrigin = await waitForDevtoolsOrigin(browserProcess, stderrLines, debugPort);
+    const target = await createBrowserTarget(debugOrigin, url);
+    const page = await connectCdp(target.webSocketDebuggerUrl);
+    page.stderrLines = stderrLines;
+    return { process: browserProcess, page };
+  } catch (error) {
+    await stopBrowserProcess(browserProcess).catch(() => undefined);
+    throw error;
+  }
 }
 
-async function waitForDevtoolsUrl(browserProcess, stderrLines) {
+async function waitForDevtoolsOrigin(browserProcess, stderrLines, debugPort) {
   let buffer = "";
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error(`Timed out waiting for browser DevTools endpoint. Browser stderr:\n${stderrLines.join("")}`));
-    }, 10_000);
+  let stderrDevtoolsOrigin = null;
+  let browserExit = null;
+  let lastPollError = null;
 
-    const onData = (data) => {
-      const text = String(data);
-      stderrLines.push(text);
-      buffer += text;
-      const match = /DevTools listening on (ws:\/\/[^\s]+)/.exec(buffer);
-      if (match) {
-        cleanup();
-        resolve(match[1]);
-      }
-    };
-    const onExit = (code, signal) => {
-      cleanup();
-      reject(new Error(`Browser exited before DevTools was ready (code ${code}, signal ${signal}). Browser stderr:\n${stderrLines.join("")}`));
-    };
-    const cleanup = () => {
-      clearTimeout(timeout);
-      browserProcess.stderr?.off("data", onData);
-      browserProcess.off("exit", onExit);
-    };
+  const onData = (data) => {
+    const text = String(data);
+    stderrLines.push(text);
+    buffer += text;
+    const match = /DevTools listening on (ws:\/\/[^\s]+)/.exec(buffer);
+    if (match) stderrDevtoolsOrigin = debugOriginFromWebSocketUrl(match[1]);
+  };
+  const onExit = (code, signal) => {
+    browserExit = { code, signal };
+  };
 
+  try {
     browserProcess.stderr?.on("data", onData);
     browserProcess.once("exit", onExit);
+    const deadline = Date.now() + browserDevtoolsTimeoutMs;
+    while (Date.now() < deadline) {
+      if (stderrDevtoolsOrigin) return stderrDevtoolsOrigin;
+      if (browserExit) throw browserExitedBeforeDevtoolsError(browserExit, stderrLines);
+      try {
+        const polledOrigin = await pollDevtoolsOrigin(debugPort);
+        if (polledOrigin) return polledOrigin;
+      } catch (error) {
+        lastPollError = error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (browserExit) throw browserExitedBeforeDevtoolsError(browserExit, stderrLines);
+    const pollDetail = lastPollError instanceof Error ? ` Last poll error: ${lastPollError.message}` : "";
+    throw new Error(
+      `Timed out waiting for browser DevTools endpoint on 127.0.0.1:${debugPort}.${pollDetail} Browser stderr:\n${stderrLines.join("")}`,
+    );
+  } finally {
+    browserProcess.stderr?.off("data", onData);
+    browserProcess.off("exit", onExit);
+  }
+}
+
+function browserExitedBeforeDevtoolsError(browserExit, stderrLines) {
+  return new Error(
+    `Browser exited before DevTools was ready (code ${browserExit.code}, signal ${browserExit.signal}). Browser stderr:\n${stderrLines.join("")}`,
+  );
+}
+
+async function pollDevtoolsOrigin(debugPort) {
+  const response = await fetch(`http://127.0.0.1:${debugPort}/json/version`, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(500),
   });
+  if (!response.ok) return null;
+  const version = await response.json();
+  return typeof version.webSocketDebuggerUrl === "string" ? debugOriginFromWebSocketUrl(version.webSocketDebuggerUrl) : null;
+}
+
+function debugOriginFromWebSocketUrl(webSocketUrl) {
+  const parsed = new URL(webSocketUrl);
+  const protocol = parsed.protocol === "wss:" ? "https" : "http";
+  return `${protocol}://${parsed.host}`;
 }
 
 async function createBrowserTarget(debugOrigin, url) {
