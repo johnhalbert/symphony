@@ -43,4 +43,6 @@ The manual job sets `SYMPHONY_REAL_SMOKE=1` and runs only `tests/real-smoke.test
 
 `npm run smoke:hermes-local` remains a local operator check because it requires local Hermes installation, Hermes-owned OpenAI Codex auth, Python dependencies, and the reference Hermes `gpt-5.5` model to be available to the authenticated provider. It is not run by the hosted CI workflow.
 
+`npm run smoke:hermes-acp` is also local/operator-only. It requires a host `hermes` binary with ACP support and a source profile that can be cloned. The script first runs live host ACP doctor checks against disposable clones, then optionally sends a tiny prompt through `HermesAcpHarness`; it verifies that the active host profile is unchanged before and after the run. Use `--doctor-only` for clone/ACP readiness without an LLM prompt.
+
 `npm run smoke:sdk-local` remains available for Cursor-provider checks, but Cursor is no longer the default dogfood runtime.

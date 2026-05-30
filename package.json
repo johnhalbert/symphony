@@ -15,6 +15,7 @@
     "extension:test": "npm run test --prefix extension",
     "extension:typecheck": "npm run typecheck --prefix extension",
     "smoke:active-context-governor": "tsx scripts/active-context-governor-poc.ts",
+    "smoke:hermes-acp": "tsx scripts/hermes-acp-smoke.ts",
     "smoke:hermes-local": "tsx scripts/hermes-local-smoke.ts",
     "smoke:mcp-exposure": "tsx scripts/mcp-tool-exposure-probe.ts",
     "smoke:sdk-local": "tsx scripts/sdk-local-smoke.ts",

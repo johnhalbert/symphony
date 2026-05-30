@@ -67,14 +67,20 @@ npm run typecheck
 npm test
 npm run doctor -- --strict
 npm run doctor -- --strict --live-runtime
+# Run the smoke that matches agent.harness:
 npm run smoke:hermes-local
+npm run smoke:hermes-acp -- --expect "Symphony Hermes ACP smoke OK"
 ```
 
 Set `LINEAR_API_KEY`, `SYMPHONY_WORKSPACE_TOKEN`, and the GitHub credential variables in the workflow root `.env` file or process environment as needed. The reference workflow uses app-backed credential profiles: existing `GITHUB_APP_*` variables identify the publication/merge app, and `GITHUB_REVIEW_APP_*` variables identify a separate reviewer app for PR approvals and change requests. Static-token profiles such as `GITHUB_PUBLICATION_TOKEN` and `GITHUB_FEEDBACK_TOKEN` remain supported for non-app deployments.
 
 Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable workspace paths, git availability, runtime harness/provider checks, Hermes paths, Python importability, managed auth readiness when `openai-codex` is selected, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, subprocess MCP tool availability, candidate isolation, and current Linear candidates.
 
-`doctor --live-runtime` is the opt-in live Hermes gateway readiness check. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory.
+For `agent.harness: hermes_acp`, normal doctor discovers the host `hermes` binary, probes `hermes --version`, resolves the configured or active source profile, creates and deletes a disposable cloned profile with `keep_profiles: never`, and redacts token-shaped diagnostics. `doctor --live-runtime` additionally launches `hermes -p <disposable-clone> acp`, initializes ACP, creates a diagnostic ACP session, closes it, and deletes the disposable clone. The source profile must remain selected and unmodified.
+
+`doctor --live-runtime` is the opt-in live Hermes gateway readiness check for `agent.harness: hermes`. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory.
+
+`npm run smoke:hermes-acp` is the opt-in host Hermes ACP prompt smoke for `agent.harness: hermes_acp`. It uses a temporary workspace/state area, forces smoke profiles to be disposable (`keep_profiles: never`, `worker_session_lifecycle: fresh_per_run`), runs the host ACP live doctor checks first, starts `HermesAcpHarness` against a cloned host profile, sends a tiny no-tools prompt, and verifies the active host profile is unchanged before and after the smoke. Use `--doctor-only` for the clone/live-session readiness checks without a prompt, `--expect ""` to accept any completed response, and `--keep-temp` only when preserving the temporary smoke workspace for inspection.
 
 ## 5. Promotion Policy
 
@@ -116,6 +122,7 @@ Before the smoke:
 - `npm run doctor -- --strict` has no errors and only understood warnings.
 - `npm run doctor -- --strict --live-runtime` succeeds.
 - `npm run smoke:hermes-local` succeeds.
+- For `agent.harness: hermes_acp`, `npm run smoke:hermes-acp -- --expect "Symphony Hermes ACP smoke OK"` succeeds, and `hermes profile` reports the same active/source profile before and after the smoke.
 - There are zero current `Todo` or `In Progress` candidates before intentional promotion.
 - The target issue is the only issue with `dogfood-ready` and no `dogfood-blocked` or `safety-blocked` label.
 - `Ready to Merge` exists in Linear and is not listed as an active, review, blocked, or terminal state.

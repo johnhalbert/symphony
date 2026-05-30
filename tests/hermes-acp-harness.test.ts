@@ -91,6 +91,50 @@ describe("HermesAcpHarness", () => {
     expect(disposals).toEqual([{ profileName: "profile-1", status: null }]);
   });
 
+  it("retires a reusable worker lease after an idle ACP exit and creates a fresh session on the next turn", async () => {
+    const clients: FakeHermesAcpClient[] = [];
+    const leaseOptions: HostHermesAcpProfileLeaseOptions[] = [];
+    const disposals: Array<{ profileName: string; status: HostHermesAcpTerminalStatus }> = [];
+    const harness = new HermesAcpHarness({
+      cliPath: path.join(root, "cli.js"),
+      profileLeaseFactory: async (options) => {
+        leaseOptions.push(options);
+        return fakeLease(`profile-${leaseOptions.length}`, disposals);
+      },
+      acpClientFactory: (command, options) => {
+        const client = new FakeHermesAcpClient(command, options);
+        clients.push(client);
+        return client;
+      },
+    });
+    const config = configForHarness({ worker_session_lifecycle: "reuse_by_issue", keep_profiles: "never" });
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const first = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "first prompt"));
+    expect(first.map((event) => event.type)).toContain("completed");
+    expect(clients).toHaveLength(1);
+    expect(leaseOptions).toHaveLength(1);
+    expect(clients[0]?.prompts).toEqual([{ sessionId: "sess-1", prompt: "first prompt" }]);
+
+    clients[0]?.emitIdleExit(0);
+    await flushAsyncDisposal();
+
+    const second = await collect(harness.run(context(config, { workspacePath, turnNumber: 2 }), "second prompt"));
+
+    expect(second.map((event) => event.type)).toContain("completed");
+    expect(leaseOptions).toHaveLength(2);
+    expect(clients).toHaveLength(2);
+    expect(clients[0]?.prompts).toEqual([{ sessionId: "sess-1", prompt: "first prompt" }]);
+    expect(clients[1]?.initializeCalls).toBe(1);
+    expect(clients[1]?.sessions).toHaveLength(1);
+    expect(clients[1]?.prompts).toEqual([{ sessionId: "sess-1", prompt: "second prompt" }]);
+    expect(disposals).toContainEqual({ profileName: "profile-1", status: "failed" });
+
+    await harness.dispose();
+    expect(disposals).toContainEqual({ profileName: "profile-2", status: null });
+  });
+
   it("uses fresh reviewer ACP profiles and disposes them after each review run", async () => {
     const clients: FakeHermesAcpClient[] = [];
     const disposals: Array<{ profileName: string; status: HostHermesAcpTerminalStatus }> = [];
@@ -252,6 +296,14 @@ class FakeHermesAcpClient implements HermesAcpClient {
   getLogTail(): string {
     return this.behavior.logTail ?? "";
   }
+
+  emitIdleExit(code: number | null = 0, signal: NodeJS.Signals | null = null): void {
+    this.emitter.emit("exit", code, signal);
+  }
+}
+
+async function flushAsyncDisposal(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 function configForHarness(hermesAcp: Record<string, unknown> = {}): ServiceConfig {

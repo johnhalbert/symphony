@@ -15,10 +15,26 @@ import {
   hermesRuntimeDoctorChecks,
   reviewLoopDoctorChecks,
   runtimeCredentialDoctorCheck,
+  runtimeHarnessDependencyDoctorChecks,
   runtimeHarnessDoctorChecks,
 } from "../src/doctor.js";
 import { testConfig } from "./helpers.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
+import type {
+  AcpMcpServerStdio,
+  HermesAcpClient,
+  HermesAcpFacadeEvent,
+  HermesAcpFacadeOptions,
+  HermesAcpPromptResult,
+  HermesAcpSession,
+} from "../hermes/src/HermesAcpFacade.js";
+import type { HostHermesDiscoveryResult } from "../hermes/src/HostHermesDiscovery.js";
+import type {
+  HostHermesAcpProcessCommand,
+  HostHermesAcpProfileLease,
+  HostHermesAcpProfileLeaseOptions,
+  HostHermesAcpTerminalStatus,
+} from "../hermes/src/HostHermesAcpProfileLease.js";
 
 describe("doctor review-loop checks", () => {
   afterEach(() => {
@@ -139,6 +155,195 @@ describe("doctor review-loop checks", () => {
       status: "ok",
       message: "Host Hermes ACP uses cloned host profile credentials from operator; no Symphony runtime API key is injected",
     });
+  });
+
+  it("checks host Hermes ACP discovery, disposable profile clone creation, and cleanup", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-acp-"));
+    try {
+      const workflowPath = path.join(root, "WORKFLOW.md");
+      const config = hermesAcpDoctorConfig(workflowPath);
+      const leaseOptions: HostHermesAcpProfileLeaseOptions[] = [];
+      const disposals: Array<{ profileName: string; status: HostHermesAcpTerminalStatus }> = [];
+
+      const checks = await runtimeHarnessDependencyDoctorChecks(config, {
+        workflowPath,
+        hostHermesDiscovery: async (options) => {
+          expect(options).toMatchObject({
+            binaryPath: "/opt/hermes/bin/hermes",
+            sourceProfile: "operator",
+            cwd: root,
+            timeoutMs: config.hermesAcp.discoveryTimeoutMs,
+          });
+          return okHostHermesDiscovery();
+        },
+        hostHermesAcpProfileLeaseFactory: async (options) => {
+          leaseOptions.push(options);
+          return doctorFakeHermesAcpLease("doctor-profile", options, disposals);
+        },
+      });
+
+      expect(checks).toEqual([
+        {
+          id: "hermes_acp.host_binary",
+          status: "ok",
+          message: "Host Hermes binary /opt/hermes/bin/hermes (config) responded with hermes 1.2.3",
+        },
+        {
+          id: "hermes_acp.source_profile",
+          status: "ok",
+          message: "Host Hermes source profile operator (config) selected; disposable clone check validates launch safety",
+        },
+        {
+          id: "hermes_acp.profile_clone",
+          status: "ok",
+          message:
+            "Created disposable cloned host Hermes profile doctor-profile from operator; ACP command is /opt/hermes/bin/hermes -p doctor-profile acp",
+        },
+        {
+          id: "hermes_acp.profile_cleanup",
+          status: "ok",
+          message: "Deleted disposable cloned host Hermes profile doctor-profile; source profile operator was not selected or mutated",
+        },
+      ]);
+      expect(leaseOptions).toHaveLength(1);
+      expect(leaseOptions[0]).toMatchObject({
+        binaryPath: "/opt/hermes/bin/hermes",
+        cwd: root,
+        sourceProfile: "operator",
+        keepProfiles: "never",
+      });
+      expect(leaseOptions[0]?.profileName).toMatch(/^dogfood-doctor-[a-f0-9]{8}$/);
+      expect(disposals).toEqual([{ profileName: "doctor-profile", status: "succeeded" }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports host Hermes ACP binary/profile discovery failures without cloning profiles", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-acp-missing-"));
+    try {
+      const workflowPath = path.join(root, "WORKFLOW.md");
+      const config = hermesAcpDoctorConfig(workflowPath);
+      const secret = "x".repeat(90);
+      const checks = await runtimeHarnessDependencyDoctorChecks(config, {
+        workflowPath,
+        hostHermesDiscovery: async () => ({
+          ok: false,
+          binary: null,
+          sourceProfile: null,
+          diagnostics: [
+            {
+              code: "host_hermes_binary_missing",
+              severity: "error",
+              message: "Host Hermes executable was not found on PATH",
+            },
+            {
+              code: "host_hermes_active_profile_unparseable",
+              severity: "error",
+              message: `Host Hermes profile output was invalid; access_token=${secret}`,
+            },
+          ],
+        }),
+        hostHermesAcpProfileLeaseFactory: async () => {
+          throw new Error("clone should not be attempted when discovery fails");
+        },
+      });
+
+      expect(checks).toEqual([
+        {
+          id: "hermes_acp.host_binary",
+          status: "error",
+          message: "Host Hermes binary discovery failed: Host Hermes executable was not found on PATH",
+        },
+        {
+          id: "hermes_acp.source_profile",
+          status: "error",
+          message: "Host Hermes source profile discovery failed: Host Hermes profile output was invalid; access_token=[redacted]",
+        },
+      ]);
+      expect(JSON.stringify(checks)).not.toContain(secret);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports disposable profile clone failures with redacted diagnostics and skips live ACP launch", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-acp-clone-fail-"));
+    try {
+      const workflowPath = path.join(root, "WORKFLOW.md");
+      const config = hermesAcpDoctorConfig(workflowPath);
+      const secret = "y".repeat(90);
+      const clients: DoctorFakeHermesAcpClient[] = [];
+
+      const checks = await runtimeHarnessDependencyDoctorChecks(config, {
+        workflowPath,
+        liveRuntime: true,
+        hostHermesDiscovery: async () => okHostHermesDiscovery(),
+        hostHermesAcpProfileLeaseFactory: async () => {
+          throw new Error(`profile clone failed with refresh_token=${secret}`);
+        },
+        hermesAcpClientFactory: (command, options) => {
+          const client = new DoctorFakeHermesAcpClient(command, options);
+          clients.push(client);
+          return client;
+        },
+      });
+
+      expect(checks).toContainEqual({
+        id: "hermes_acp.profile_clone",
+        status: "error",
+        message: "Host Hermes ACP disposable clone check failed: profile clone failed with refresh_token=[redacted]",
+      });
+      expect(checks).toContainEqual({
+        id: "hermes_acp.live_runtime",
+        status: "error",
+        message: "Host Hermes ACP live runtime check requires a disposable cloned profile",
+      });
+      expect(JSON.stringify(checks)).not.toContain(secret);
+      expect(clients).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("runs the opt-in host Hermes ACP live runtime doctor check with a disposable cloned profile", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-acp-live-"));
+    try {
+      const workflowPath = path.join(root, "WORKFLOW.md");
+      const config = hermesAcpDoctorConfig(workflowPath);
+      const disposals: Array<{ profileName: string; status: HostHermesAcpTerminalStatus }> = [];
+      const clients: DoctorFakeHermesAcpClient[] = [];
+
+      const checks = await runtimeHarnessDependencyDoctorChecks(config, {
+        workflowPath,
+        liveRuntime: true,
+        hostHermesDiscovery: async () => okHostHermesDiscovery(),
+        hostHermesAcpProfileLeaseFactory: async (options) => doctorFakeHermesAcpLease("doctor-live-profile", options, disposals),
+        hermesAcpClientFactory: (command, options) => {
+          const client = new DoctorFakeHermesAcpClient(command, options);
+          clients.push(client);
+          return client;
+        },
+      });
+
+      expect(checks).toContainEqual({
+        id: "hermes_acp.live_runtime",
+        status: "ok",
+        message: "Host Hermes ACP initialized and created diagnostic session doctor-acp-session-1 with disposable profile doctor-live-profile",
+      });
+      expect(checks).toContainEqual({
+        id: "hermes_acp.profile_cleanup",
+        status: "ok",
+        message: "Deleted disposable cloned host Hermes profile doctor-live-profile; source profile operator was not selected or mutated",
+      });
+      expect(clients).toHaveLength(1);
+      expect(clients[0]?.initializeCalls).toBe(1);
+      expect(clients[0]?.sessions).toEqual([{ cwd: root, mcpServers: [] }]);
+      expect(clients[0]?.closeReasons).toEqual(["hermes_acp.doctor_live_runtime"]);
+      expect(disposals).toEqual([{ profileName: "doctor-live-profile", status: "succeeded" }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("errors when Hermes dogfood would run without an explicit model", async () => {
@@ -849,6 +1054,113 @@ class DoctorFakeHermesGatewayClient extends EventEmitter implements HermesGatewa
   getLogTail(): string {
     return "";
   }
+}
+
+class DoctorFakeHermesAcpClient extends EventEmitter implements HermesAcpClient {
+  readonly sessions: Array<{ cwd: string; mcpServers: AcpMcpServerStdio[] }> = [];
+  readonly closeReasons: string[] = [];
+  readonly killReasons: string[] = [];
+  initializeCalls = 0;
+
+  constructor(
+    readonly command: HostHermesAcpProcessCommand,
+    readonly options: HermesAcpFacadeOptions,
+  ) {
+    super();
+  }
+
+  on(event: "event", listener: (event: HermesAcpFacadeEvent) => void): this;
+  on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  on(event: "event" | "exit", listener: (...args: any[]) => void): this {
+    return super.on(event, listener);
+  }
+
+  off(event: "event", listener: (event: HermesAcpFacadeEvent) => void): this;
+  off(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  off(event: "event" | "exit", listener: (...args: any[]) => void): this {
+    return super.off(event, listener);
+  }
+
+  async initialize(): Promise<Record<string, unknown>> {
+    this.initializeCalls += 1;
+    return { protocolVersion: 1 };
+  }
+
+  async newSession(input: { cwd: string; mcpServers: AcpMcpServerStdio[] }): Promise<HermesAcpSession> {
+    this.sessions.push(input);
+    return {
+      sessionId: `doctor-acp-session-${this.sessions.length}`,
+      raw: { sessionId: `doctor-acp-session-${this.sessions.length}` },
+    };
+  }
+
+  async prompt(_input: { sessionId: string; prompt: string }): Promise<HermesAcpPromptResult> {
+    return { stopReason: "end_turn", usage: null, raw: {} };
+  }
+
+  async cancel(_sessionId: string): Promise<void> {
+    return;
+  }
+
+  async close(reason?: string): Promise<void> {
+    this.closeReasons.push(reason ?? "close");
+  }
+
+  kill(reason?: string): void {
+    this.killReasons.push(reason ?? "kill");
+  }
+
+  getLogTail(): string {
+    return "";
+  }
+}
+
+function hermesAcpDoctorConfig(workflowPath: string) {
+  const root = path.dirname(workflowPath);
+  return parseServiceConfig(
+    {
+      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
+      agent: { harness: "hermes_acp" },
+      hermes_acp: {
+        binary: "/opt/hermes/bin/hermes",
+        source_profile: "operator",
+        profile_name_prefix: "dogfood",
+      },
+    },
+    workflowPath,
+    { LINEAR_API_KEY: "secret" },
+  );
+}
+
+function okHostHermesDiscovery(): HostHermesDiscoveryResult {
+  return {
+    ok: true,
+    binary: { path: "/opt/hermes/bin/hermes", source: "config", versionText: "hermes 1.2.3" },
+    sourceProfile: { name: "operator", source: "config" },
+    diagnostics: [],
+  };
+}
+
+function doctorFakeHermesAcpLease(
+  profileName: string,
+  options: HostHermesAcpProfileLeaseOptions,
+  disposals: Array<{ profileName: string; status: HostHermesAcpTerminalStatus }>,
+): HostHermesAcpProfileLease {
+  return {
+    profileName,
+    sourceProfile: options.sourceProfile ?? "operator",
+    acpCommand: {
+      file: options.binaryPath,
+      args: ["-p", profileName, "acp"],
+      cwd: options.cwd,
+      env: { PATH: process.env.PATH },
+    },
+    dispose: async (status) => {
+      disposals.push({ profileName, status });
+      return { profileName, reason: "deleted", deleted: true };
+    },
+  };
 }
 
 async function writeHermesTemplates(root: string): Promise<void> {

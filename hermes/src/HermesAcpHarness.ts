@@ -47,9 +47,12 @@ interface HermesAcpLease {
   initialized: boolean;
   acpSessionId: string | null;
   disposed: boolean;
+  transportExited: boolean;
+  transportExitListener: HermesAcpTransportExitListener | undefined;
 }
 
 type TerminalStatus = HostHermesAcpTerminalStatus;
+type HermesAcpTransportExitListener = (code: number | null, signal: NodeJS.Signals | null) => void;
 
 export class HermesAcpHarness implements AgentHarness {
   readonly id = "hermes_acp";
@@ -204,8 +207,8 @@ export class HermesAcpHarness implements AgentHarness {
       lease.client.off("exit", onExit);
       this.activeRuns.delete(runId);
       this.cancelledRuns.delete(runId);
-      if (!lease.reusable || terminalStatus !== "succeeded") {
-        await this.disposeLease(lease, terminalStatus, "run_finished");
+      if (!lease.reusable || terminalStatus !== "succeeded" || lease.transportExited) {
+        await this.disposeLease(lease, terminalStatus, lease.transportExited ? "transport_exit" : "run_finished");
       }
     }
   }
@@ -226,7 +229,7 @@ export class HermesAcpHarness implements AgentHarness {
     const reusable = shouldReuseLease(ctx);
     const key = reusable ? reusableLeaseKey(ctx) : `fresh:${runId}`;
     const existing = reusable ? this.leases.get(key) : undefined;
-    if (existing && !existing.disposed) return existing;
+    if (existing && !existing.disposed && !existing.transportExited) return existing;
 
     const binaryPath = await this.resolveBinaryPath(ctx);
     const sourceProfile = await this.resolveSourceProfile(ctx, binaryPath);
@@ -254,7 +257,19 @@ export class HermesAcpHarness implements AgentHarness {
       shutdownGraceMs: ctx.config.hermesAcp.shutdownGraceMs,
       clientInfo: { name: "symphony", title: "Symphony", version: "0.1.0" },
     });
-    const lease: HermesAcpLease = { key, reusable, profile, client, initialized: false, acpSessionId: null, disposed: false };
+    const lease: HermesAcpLease = {
+      key,
+      reusable,
+      profile,
+      client,
+      initialized: false,
+      acpSessionId: null,
+      disposed: false,
+      transportExited: false,
+      transportExitListener: undefined,
+    };
+    lease.transportExitListener = (code, signal) => this.handleLeaseTransportExit(lease, code, signal);
+    lease.client.on("exit", lease.transportExitListener);
     if (reusable) this.leases.set(key, lease);
     return lease;
   }
@@ -317,12 +332,24 @@ export class HermesAcpHarness implements AgentHarness {
     if (lease.disposed) return;
     lease.disposed = true;
     this.leases.delete(lease.key);
+    if (lease.transportExitListener) {
+      lease.client.off("exit", lease.transportExitListener);
+      lease.transportExitListener = undefined;
+    }
     await lease.client.close(`hermes_acp.${reason}`).catch(() => lease.client.kill(`hermes_acp.${reason}.close_failed`));
     await lease.profile.dispose(terminalStatus);
   }
 
+  private handleLeaseTransportExit(lease: HermesAcpLease, _code: number | null, _signal: NodeJS.Signals | null): void {
+    this.retireLeaseAfterTransportExit(lease);
+    if ([...this.activeRuns.values()].some((activeLease) => activeLease === lease)) return;
+    void this.disposeLease(lease, "failed", "transport_exit").catch(() => lease.client.kill("hermes_acp.transport_exit.dispose_failed"));
+  }
+
   private retireLeaseAfterTransportExit(lease: HermesAcpLease): void {
     if (lease.disposed) return;
+    lease.transportExited = true;
+    lease.initialized = false;
     lease.acpSessionId = null;
     this.leases.delete(lease.key);
   }

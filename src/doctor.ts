@@ -32,6 +32,18 @@ import {
   normalizeHermesAuthProvider,
   redactHermesAuthMessage,
 } from "../hermes/src/HermesAuthManager.js";
+import { discoverHostHermes, type HostHermesDiscoveryResult } from "../hermes/src/HostHermesDiscovery.js";
+import {
+  createHostHermesAcpProfileLease,
+  type HostHermesAcpProfileLease,
+  type HostHermesAcpProfileLeaseOptions,
+  type HostHermesAcpProcessCommand,
+} from "../hermes/src/HostHermesAcpProfileLease.js";
+import {
+  StdioHermesAcpClient,
+  type HermesAcpClient,
+  type HermesAcpFacadeOptions,
+} from "../hermes/src/HermesAcpFacade.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -66,8 +78,12 @@ export interface RuntimeHarnessDependencyDoctorCheckOptions {
   strict?: boolean | undefined;
   liveRuntime?: boolean | undefined;
   cliPath?: string | undefined;
+  workflowPath?: string | undefined;
   hermesGatewayFactory?: ((env: HermesGatewayEnvironment) => HermesGatewayClient) | undefined;
   hermesAuthManagerFactory?: ((options: HermesAuthManagerOptions) => Pick<HermesAuthManager, "prepare" | "validateOpenAiCodex">) | undefined;
+  hostHermesDiscovery?: typeof discoverHostHermes | undefined;
+  hostHermesAcpProfileLeaseFactory?: ((options: HostHermesAcpProfileLeaseOptions) => Promise<HostHermesAcpProfileLease>) | undefined;
+  hermesAcpClientFactory?: ((command: HostHermesAcpProcessCommand, options: HermesAcpFacadeOptions) => HermesAcpClient) | undefined;
 }
 
 export type McpToolServerCommand = "completion-report-mcp" | "review-verdict-mcp" | "review-feedback-mcp";
@@ -96,6 +112,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
         strict: options.strict ?? false,
         liveRuntime: options.liveRuntime ?? false,
         cliPath: options.cliPath,
+        workflowPath,
       })),
     );
     checks.push({
@@ -277,6 +294,7 @@ export async function runtimeHarnessDependencyDoctorChecks(
   config: ServiceConfig,
   options: RuntimeHarnessDependencyDoctorCheckOptions = {},
 ): Promise<DoctorCheck[]> {
+  if (config.agent.harness === "hermes_acp") return hermesAcpDependencyDoctorChecks(config, options);
   if (config.agent.harness !== "hermes") return [];
   const checks: DoctorCheck[] = [];
   checks.push(await hermesPathDoctorCheck("hermes.upstream_root", config.hermes.upstreamRoot, [
@@ -305,6 +323,158 @@ export async function runtimeHarnessDependencyDoctorChecks(
     );
   }
   return checks;
+}
+
+export async function hermesAcpDependencyDoctorChecks(
+  config: ServiceConfig,
+  options: RuntimeHarnessDependencyDoctorCheckOptions = {},
+): Promise<DoctorCheck[]> {
+  const checks: DoctorCheck[] = [];
+  const cwd = options.workflowPath ? path.dirname(path.resolve(options.workflowPath)) : process.cwd();
+  const discovery = await (options.hostHermesDiscovery ?? discoverHostHermes)({
+    binaryPath: config.hermesAcp.binaryPath,
+    sourceProfile: config.hermesAcp.sourceProfile,
+    cwd,
+    timeoutMs: config.hermesAcp.discoveryTimeoutMs,
+  });
+  checks.push(...hermesAcpDiscoveryDoctorChecks(discovery));
+  if (!discovery.ok || !discovery.binary || !discovery.sourceProfile) return checks;
+
+  const leaseFactory = options.hostHermesAcpProfileLeaseFactory ?? createHostHermesAcpProfileLease;
+  let lease: HostHermesAcpProfileLease | null = null;
+  let liveStatus: DoctorStatus = "ok";
+  try {
+    lease = await leaseFactory({
+      binaryPath: discovery.binary.path,
+      cwd,
+      timeoutMs: config.hermesAcp.discoveryTimeoutMs,
+      sourceProfile: discovery.sourceProfile.name,
+      keepProfiles: "never",
+      profileName: `${config.hermesAcp.profileNamePrefix}-doctor-${randomUUID().slice(0, 8)}`,
+    });
+    checks.push({
+      id: "hermes_acp.profile_clone",
+      status: "ok",
+      message:
+        `Created disposable cloned host Hermes profile ${lease.profileName} from ${lease.sourceProfile}; ` +
+        `ACP command is ${formatCommandPreview(lease.acpCommand.file, lease.acpCommand.args)}`,
+    });
+
+    if (options.liveRuntime) {
+      const liveCheck = await hermesAcpLiveRuntimeDoctorCheck(lease, config, options);
+      liveStatus = liveCheck.status;
+      checks.push(liveCheck);
+    }
+  } catch (error) {
+    liveStatus = "error";
+    checks.push({
+      id: "hermes_acp.profile_clone",
+      status: "error",
+      message: `Host Hermes ACP disposable clone check failed: ${redactHermesAuthMessage(errorMessage(error))}`,
+    });
+    if (options.liveRuntime) {
+      checks.push({
+        id: "hermes_acp.live_runtime",
+        status: "error",
+        message: "Host Hermes ACP live runtime check requires a disposable cloned profile",
+      });
+    }
+  } finally {
+    if (lease) {
+      try {
+        await lease.dispose(liveStatus === "error" ? "failed" : "succeeded");
+        checks.push({
+          id: "hermes_acp.profile_cleanup",
+          status: "ok",
+          message: `Deleted disposable cloned host Hermes profile ${lease.profileName}; source profile ${lease.sourceProfile} was not selected or mutated`,
+        });
+      } catch (error) {
+        checks.push({
+          id: "hermes_acp.profile_cleanup",
+          status: "error",
+          message: `Host Hermes ACP disposable clone cleanup failed: ${redactHermesAuthMessage(errorMessage(error))}`,
+        });
+      }
+    }
+  }
+  return checks;
+}
+
+export async function hermesAcpLiveRuntimeDoctorCheck(
+  lease: HostHermesAcpProfileLease,
+  config: ServiceConfig,
+  options: Pick<RuntimeHarnessDependencyDoctorCheckOptions, "hermesAcpClientFactory"> = {},
+): Promise<DoctorCheck> {
+  const clientFactory =
+    options.hermesAcpClientFactory ??
+    ((command: HostHermesAcpProcessCommand, clientOptions: HermesAcpFacadeOptions) => new StdioHermesAcpClient(command, clientOptions));
+  const client = clientFactory(
+    lease.acpCommand,
+    {
+      startupTimeoutMs: config.hermesAcp.startupTimeoutMs,
+      requestTimeoutMs: config.hermesAcp.requestTimeoutMs,
+      permissionTimeoutMs: config.hermesAcp.permissionTimeoutMs,
+      shutdownGraceMs: config.hermesAcp.shutdownGraceMs,
+      clientInfo: { name: "symphony-doctor", title: "Symphony Doctor", version: "0.1.0" },
+    },
+  );
+  try {
+    await client.initialize();
+    const session = await client.newSession({ cwd: lease.acpCommand.cwd, mcpServers: [] });
+    return {
+      id: "hermes_acp.live_runtime",
+      status: "ok",
+      message: `Host Hermes ACP initialized and created diagnostic session ${session.sessionId} with disposable profile ${lease.profileName}`,
+    };
+  } catch (error) {
+    return {
+      id: "hermes_acp.live_runtime",
+      status: "error",
+      message: `Host Hermes ACP live runtime check failed: ${redactHermesAuthMessage(errorMessage(error))}`,
+    };
+  } finally {
+    await client.close("hermes_acp.doctor_live_runtime").catch(() => client.kill("hermes_acp.doctor_live_runtime.close_failed"));
+  }
+}
+
+function hermesAcpDiscoveryDoctorChecks(discovery: HostHermesDiscoveryResult): DoctorCheck[] {
+  const binaryDiagnostics = discovery.diagnostics.filter((diagnostic) =>
+    diagnostic.code === "host_hermes_binary_missing" || diagnostic.code === "host_hermes_version_probe_failed",
+  );
+  const profileDiagnostics = discovery.diagnostics.filter((diagnostic) =>
+    diagnostic.code === "host_hermes_active_profile_probe_failed" || diagnostic.code === "host_hermes_active_profile_unparseable",
+  );
+  return [
+    {
+      id: "hermes_acp.host_binary",
+      status: discovery.binary && !hasErrorDiagnostic(binaryDiagnostics) ? "ok" : "error",
+      message:
+        discovery.binary && !hasErrorDiagnostic(binaryDiagnostics)
+          ? `Host Hermes binary ${discovery.binary.path} (${discovery.binary.source}) responded with ${discovery.binary.versionText ?? "no version text"}`
+          : `Host Hermes binary discovery failed: ${formatHermesAcpDiagnostics(binaryDiagnostics)}`,
+    },
+    {
+      id: "hermes_acp.source_profile",
+      status: discovery.sourceProfile && !hasErrorDiagnostic(profileDiagnostics) ? "ok" : "error",
+      message:
+        discovery.sourceProfile && !hasErrorDiagnostic(profileDiagnostics)
+          ? `Host Hermes source profile ${discovery.sourceProfile.name} (${discovery.sourceProfile.source}) selected; disposable clone check validates launch safety`
+          : `Host Hermes source profile discovery failed: ${formatHermesAcpDiagnostics(profileDiagnostics)}`,
+    },
+  ];
+}
+
+function hasErrorDiagnostic(diagnostics: HostHermesDiscoveryResult["diagnostics"]): boolean {
+  return diagnostics.some((diagnostic) => diagnostic.severity === "error");
+}
+
+function formatHermesAcpDiagnostics(diagnostics: HostHermesDiscoveryResult["diagnostics"]): string {
+  if (diagnostics.length === 0) return "no diagnostic details available";
+  return diagnostics.map((diagnostic) => redactHermesAuthMessage(diagnostic.message)).join("; ");
+}
+
+function formatCommandPreview(file: string, args: readonly string[]): string {
+  return [file, ...args].join(" ");
 }
 
 export async function hermesLiveRuntimeDoctorCheck(
