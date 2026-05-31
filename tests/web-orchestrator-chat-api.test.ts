@@ -167,6 +167,54 @@ describe("web orchestrator chat API", () => {
     }
   });
 
+  it("deduplicates concurrent POST replays for the same client message id", async () => {
+    const store = new FileOrchestratorConversationStore(path.join(root, "state"));
+    const { server, calls, commands } = createStatusServer(root, {
+      orchestratorConversationStore: store,
+      dispatchDelayMs: 50,
+    });
+    const address = await server.start();
+    try {
+      const request = {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input: "run this once", messageId: "client-message-concurrent" }),
+      };
+      const responses = await Promise.all([fetch(chatUrl(address), request), fetch(chatUrl(address), request)]);
+      const bodies = (await Promise.all(responses.map((response) => response.json()))) as Array<
+        Array<Record<string, unknown>>
+      >;
+
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 202]);
+      expect(bodies[0]).toEqual(bodies[1]);
+      expect(bodies[0]).toHaveLength(1);
+      expect(bodies[0]?.[0]).toMatchObject({
+        id: "client-message-concurrent",
+        conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+        text: "run this once",
+        status: "pending",
+        metadata: {
+          actionDispatched: true,
+          commandStatus: "accepted",
+          commandReason: "accepted",
+        },
+      });
+      expect(await store.listMessages()).toHaveLength(1);
+      expect(commands).toHaveLength(1);
+      expect(commands[0]).toMatchObject({
+        action: "orchestrator.chat.post",
+        messageId: "client-message-concurrent",
+        input: "run this once",
+      });
+      expect(calls).toEqual({ ...zeroCallCounts(), dispatchOrchestratorChatCommand: 1 });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("keeps web chat histories isolated for unsafe and previously colliding conversation ids", async () => {
     const stateDir = path.join(root, "state");
     const store = new FileOrchestratorConversationStore(stateDir);
@@ -294,6 +342,127 @@ describe("web orchestrator chat API", () => {
     }
   });
 
+  it("returns an explicit persistence error and does not dispatch when the dispatch claim update fails", async () => {
+    const backingStore = new FileOrchestratorConversationStore(path.join(root, "state"));
+    const store = new FailingNumberedUpdateOrchestratorConversationStore(backingStore, new Set([1]));
+    const { server, calls, commands } = createStatusServer(root, { orchestratorConversationStore: store });
+    const address = await server.start();
+    try {
+      const response = await fetch(chatUrl(address), {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input: "claim before dispatch", messageId: "client-message-claim-fail" }),
+      });
+      const body = (await response.json()) as {
+        error?: { code?: string; message?: string };
+        chat?: Array<Record<string, unknown>>;
+      };
+
+      expect(response.status).toBe(500);
+      expect(body.error).toEqual({
+        code: "orchestrator_chat_persistence_failed",
+        message: "Web orchestrator chat could not persist the command dispatch claim",
+      });
+      expect(body.chat).toHaveLength(1);
+      expect(body.chat?.[0]).toMatchObject({
+        id: "client-message-claim-fail",
+        status: "pending",
+        metadata: { actionDispatched: false, commandStatus: "pending" },
+      });
+      expect(await backingStore.listMessages()).toMatchObject([
+        {
+          id: "client-message-claim-fail",
+          status: "pending",
+          metadata: { actionDispatched: false, commandStatus: "pending" },
+        },
+      ]);
+      expect(commands).toEqual([]);
+      expect(calls).toEqual(zeroCallCounts());
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("repairs durable command state when result persistence fails after dispatch", async () => {
+    const backingStore = new FileOrchestratorConversationStore(path.join(root, "state"));
+    const store = new FailingNumberedUpdateOrchestratorConversationStore(backingStore, new Set([2]));
+    const { server, calls, commands } = createStatusServer(root, { orchestratorConversationStore: store });
+    const address = await server.start();
+    try {
+      const response = await fetch(chatUrl(address), {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input: "persist the outcome", messageId: "client-message-update-fail" }),
+      });
+      const body = (await response.json()) as {
+        error?: { code?: string; message?: string };
+        chat?: Array<Record<string, unknown>>;
+      };
+
+      expect(response.status).toBe(500);
+      expect(body.error).toEqual({
+        code: "orchestrator_chat_persistence_failed",
+        message: "Web orchestrator chat could not persist the command state update",
+      });
+      expect(body.chat).toHaveLength(1);
+      expect(body.chat?.[0]).toMatchObject({
+        id: "client-message-update-fail",
+        status: "failed",
+        metadata: {
+          actionDispatched: true,
+          commandStatus: "failed",
+          commandReason: "orchestrator_chat_command_state_persistence_failed",
+        },
+      });
+      expect(commands).toHaveLength(1);
+      expect(calls).toEqual({ ...zeroCallCounts(), dispatchOrchestratorChatCommand: 1 });
+
+      const stored = await backingStore.listMessages();
+      expect(stored).toHaveLength(1);
+      expect(stored[0]).toMatchObject({
+        id: "client-message-update-fail",
+        status: "failed",
+        metadata: {
+          actionDispatched: true,
+          commandStatus: "failed",
+          commandReason: "orchestrator_chat_command_state_persistence_failed",
+        },
+      });
+      expect(stored[0]?.metadata).not.toMatchObject({ actionDispatched: false, commandStatus: "pending" });
+
+      const replay = await fetch(chatUrl(address), {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input: "persist the outcome", messageId: "client-message-update-fail" }),
+      });
+      const replayed = (await replay.json()) as Array<Record<string, unknown>>;
+      expect(replay.status).toBe(200);
+      expect(replayed).toHaveLength(1);
+      expect(replayed[0]).toMatchObject({
+        id: "client-message-update-fail",
+        status: "failed",
+        metadata: {
+          actionDispatched: true,
+          commandStatus: "failed",
+          commandReason: "orchestrator_chat_command_state_persistence_failed",
+        },
+      });
+      expect(commands).toHaveLength(1);
+      expect(await backingStore.listMessages()).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("returns an explicit persistence error and does not dispatch when durable append fails", async () => {
     const store = new FailingOrchestratorConversationStore();
     const { server, calls, commands } = createStatusServer(root, { orchestratorConversationStore: store });
@@ -397,10 +566,11 @@ function createStatusServer(
   options: {
     orchestratorConversationStore?: OrchestratorConversationStore;
     dispatchResult?: OrchestratorChatCommandResult;
+    dispatchDelayMs?: number;
   } = {},
 ): { server: StatusServer; calls: OrchestratorCallCounts; commands: OrchestratorChatCommand[] } {
   const config = testConfig(path.join(root, "workspaces"));
-  const { orchestrator, calls, commands } = instrumentedOrchestrator(options.dispatchResult);
+  const { orchestrator, calls, commands } = instrumentedOrchestrator(options.dispatchResult, options.dispatchDelayMs ?? 0);
   const server = new StatusServer({
     orchestrator,
     workspaceManager: new WorkspaceManager({
@@ -423,6 +593,7 @@ function createStatusServer(
 
 function instrumentedOrchestrator(
   dispatchResult: OrchestratorChatCommandResult = { status: "accepted", reason: "accepted", acceptedAt: "2026-01-01T00:00:00.000Z" },
+  dispatchDelayMs = 0,
 ): { orchestrator: Orchestrator; calls: OrchestratorCallCounts; commands: OrchestratorChatCommand[] } {
   const calls = zeroCallCounts();
   const commands: OrchestratorChatCommand[] = [];
@@ -465,10 +636,52 @@ function instrumentedOrchestrator(
       async dispatchOrchestratorChatCommand(command: OrchestratorChatCommand) {
         calls.dispatchOrchestratorChatCommand += 1;
         commands.push(command);
+        if (dispatchDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, dispatchDelayMs));
         return dispatchResult;
       },
     } as unknown as Orchestrator,
   };
+}
+
+class FailingNumberedUpdateOrchestratorConversationStore implements OrchestratorConversationStore {
+  private updateCount = 0;
+
+  constructor(
+    private readonly delegate: OrchestratorConversationStore,
+    private readonly failingUpdates: ReadonlySet<number>,
+  ) {}
+
+  projectionRevision(): number {
+    return this.delegate.projectionRevision();
+  }
+
+  onProjectionChanged(listener: Parameters<OrchestratorConversationStore["onProjectionChanged"]>[0]) {
+    return this.delegate.onProjectionChanged(listener);
+  }
+
+  createConversation(input?: Parameters<OrchestratorConversationStore["createConversation"]>[0]) {
+    return this.delegate.createConversation(input);
+  }
+
+  getConversation(input?: Parameters<OrchestratorConversationStore["getConversation"]>[0]) {
+    return this.delegate.getConversation(input);
+  }
+
+  appendMessage(input: Parameters<OrchestratorConversationStore["appendMessage"]>[0]) {
+    return this.delegate.appendMessage(input);
+  }
+
+  updateMessage(input: Parameters<OrchestratorConversationStore["updateMessage"]>[0]) {
+    this.updateCount += 1;
+    if (this.failingUpdates.has(this.updateCount)) {
+      throw new Error(`forced update failure ${this.updateCount}`);
+    }
+    return this.delegate.updateMessage(input);
+  }
+
+  listMessages(input?: Parameters<OrchestratorConversationStore["listMessages"]>[0]) {
+    return this.delegate.listMessages(input);
+  }
 }
 
 class FailingOrchestratorConversationStore implements OrchestratorConversationStore {
