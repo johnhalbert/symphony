@@ -109,8 +109,8 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
   if (isRequestEvent(eventType, payloadKind)) return projectRequestMessage(event, payload);
   if (isUserEvent(eventType, payloadKind)) return projectUserMessage(event, payload);
   if (isSystemEvent(eventType, payloadKind)) return projectSystemMessage(event, payload);
-  if (isStatusEvent(eventType, payloadKind)) return projectStatusMessage(event, payload, eventType);
-  if (isAssistantEvent(event, eventType, payloadKind)) {
+  if (isStatusEvent(eventType, payloadKind, payload)) return projectStatusMessage(event, payload, eventType);
+  if (isAssistantEvent(event, eventType, payloadKind, payload)) {
     return { kind: "assistant", ts: event.at, text: eventText(event, payload) };
   }
   return projectStatusMessage(event, payload, eventType);
@@ -294,16 +294,40 @@ function isSystemEvent(eventType: string, payloadKind: string | null): boolean {
   return eventType === "system" || eventType === "session_info" || eventType === "hermes_profile" || payloadKind === "system";
 }
 
-function isStatusEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType === "status" || eventType === "status_update" || payloadKind === "status";
+function isStatusEvent(eventType: string, payloadKind: string | null, payload: Record<string, unknown>): boolean {
+  if (isAssistantDeltaLikePayload(payloadKind, payload)) return false;
+  return (
+    eventType === "status" ||
+    eventType === "status_update" ||
+    eventType === "runtime_diagnostic" ||
+    eventType === "diagnostic" ||
+    eventType === "token_usage_reported" ||
+    eventType === "token_budget_warning" ||
+    eventType === "token_budget_exceeded" ||
+    eventType === "rate_limit_updated" ||
+    eventType === "provider_limit_updated" ||
+    eventType === "run_cancelled" ||
+    eventType === "run_canceled" ||
+    eventType === "run_failed" ||
+    eventType === "run_completed" ||
+    eventType === "run_status" ||
+    (eventType === "progress" && isStatusLikePayload(payloadKind, payload)) ||
+    isStatusLikePayload(payloadKind, payload)
+  );
 }
 
 function isLegacyAcpProtocolEvent(eventType: string): boolean {
   return eventType === "acp_session_update" || eventType === "acp_permission_denied" || eventType === "acp_diagnostic" || eventType === "hermes_acp_profile";
 }
 
-function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind: string | null): boolean {
+function isAssistantEvent(
+  event: TranscriptEvent,
+  eventType: string,
+  payloadKind: string | null,
+  payload: Record<string, unknown>,
+): boolean {
   if (eventType === "assistant" || payloadKind === "assistant") return true;
+  if (isAssistantDeltaLikePayload(payloadKind, payload)) return true;
   if (
     eventType === "message_delta" ||
     eventType === "message_complete" ||
@@ -316,12 +340,20 @@ function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind
   ) {
     return true;
   }
-  return event.source === "harness" && (eventType === "progress" || eventType === "completed");
+  return event.source === "harness" && !isStatusLikePayload(payloadKind, payload) && (eventType === "progress" || eventType === "completed");
 }
 
 function isAssistantDeltaEvent(event: TranscriptEvent): boolean {
   const eventType = normalizeToken(event.eventType);
-  return eventType === "message_delta" || eventType === "assistant_delta" || eventType === "assistant_message_delta" || eventType === "response_delta";
+  const payload = sanitizedPayloadRecord(event);
+  const payloadKind = normalizedPayloadKind(payload);
+  return (
+    eventType === "message_delta" ||
+    eventType === "assistant_delta" ||
+    eventType === "assistant_message_delta" ||
+    eventType === "response_delta" ||
+    isAssistantDeltaLikePayload(payloadKind, payload)
+  );
 }
 
 function isAssistantCompleteEvent(event: TranscriptEvent): boolean {
@@ -340,6 +372,49 @@ function combineAssistantDeltaText(existing: string, next: string): string {
   if (next.length === 0) return existing;
   if (/\s$/.test(existing) || /^\s/.test(next)) return existing + next;
   return `${existing} ${next}`;
+}
+
+function isAssistantDeltaLikePayload(payloadKind: string | null, payload: Record<string, unknown>): boolean {
+  const actor = normalizedOptionalToken(payload.actor);
+  const channel = normalizedOptionalToken(payload.channel);
+  const activitySource = normalizedOptionalToken(payload.activitySource);
+  const progressKind = normalizedOptionalToken(payload.progressKind);
+  const assistantChannel = channel === "message" || channel === "chat" || channel === "assistant";
+  return (
+    payloadKind === "assistant_delta" ||
+    payloadKind === "assistant_message_delta" ||
+    payloadKind === "response_delta" ||
+    (payloadKind === "progress" && actor === "assistant" && assistantChannel && payload.delta === true) ||
+    (payloadKind === "progress" && (activitySource === "delta" || progressKind === "assistant_delta"))
+  );
+}
+
+function isStatusLikePayload(payloadKind: string | null, payload: Record<string, unknown>): boolean {
+  const actor = normalizedOptionalToken(payload.actor);
+  const channel = normalizedOptionalToken(payload.channel);
+  return (
+    payloadKind === "status" ||
+    payloadKind === "progress" ||
+    payloadKind === "usage" ||
+    payloadKind === "diagnostic" ||
+    payloadKind === "terminal" ||
+    payloadKindIncludes(payloadKind, "token") ||
+    payloadKindIncludes(payloadKind, "rate_limit") ||
+    payloadKindIncludes(payloadKind, "provider_limit") ||
+    payloadKindIncludes(payloadKind, "runtime") ||
+    payloadKindIncludes(payloadKind, "diagnostic") ||
+    payloadKindIncludes(payloadKind, "run_") ||
+    actor === "runtime" ||
+    channel === "status" ||
+    channel === "token" ||
+    channel === "runtime" ||
+    channel === "terminal"
+  );
+}
+
+function normalizedOptionalToken(value: unknown): string | null {
+  const text = firstCleanString(value);
+  return text ? normalizeToken(text) : null;
 }
 
 function sanitizedPayloadRecord(event: TranscriptEvent): Record<string, unknown> {

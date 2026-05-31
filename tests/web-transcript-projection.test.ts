@@ -345,6 +345,55 @@ describe("projectWebTranscript", () => {
     expect(JSON.stringify(messages)).not.toContain("SECRET_FAILURE_TOKEN");
   });
 
+  it("routes progress-shaped token and rate-limit telemetry to status while coalescing assistant progress deltas", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "assistant delta one",
+        payload: { kind: "progress", actor: "assistant", channel: "message", textPreview: "Hello", delta: true },
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "assistant delta two",
+        payload: { kind: "progress", actor: "assistant", channel: "message", textPreview: "again", delta: true },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 2,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Token usage reported",
+        payload: { kind: "token_usage_reported", actor: "runtime", channel: "token", messagePreview: "8 total tokens" },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 3,
+      }),
+      event({
+        eventType: "progress",
+        source: "runtime",
+        message: "Provider rate limit updated",
+        payload: { kind: "provider_rate_limit", actor: "runtime", channel: "status", messagePreview: "rate limit backoff" },
+        at: "2026-01-01T00:00:03.000Z",
+        sequence: 4,
+      }),
+      event({
+        eventType: "completed",
+        source: "harness",
+        message: "legacy harness assistant completion",
+        at: "2026-01-01T00:00:04.000Z",
+        sequence: 5,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello again" },
+      { kind: "status", state: "token_usage_reported", ts: "2026-01-01T00:00:02.000Z", text: "8 total tokens" },
+      { kind: "status", state: "provider_rate_limit", ts: "2026-01-01T00:00:03.000Z", text: "rate limit backoff" },
+      { kind: "assistant", ts: "2026-01-01T00:00:04.000Z", text: "legacy harness assistant completion" },
+    ]);
+  });
+
   it("keeps unresolved request actions exact empty arrays and maps unknown payloads without leaking runtime fields", () => {
     const messages = projectWebTranscript([
       event({
