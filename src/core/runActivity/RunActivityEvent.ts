@@ -156,6 +156,36 @@ export interface RunActivityPayload extends Readonly<Record<string, unknown>> {
   redacted?: boolean;
 }
 
+export const RUN_ACTIVITY_PROTOCOLS = ["json_rpc", "acp", "symphony", "unknown"] as const;
+
+export type RunActivityProtocol = (typeof RUN_ACTIVITY_PROTOCOLS)[number];
+
+export const RUN_ACTIVITY_SEQUENCE_SOURCES = ["harness", "symphony"] as const;
+
+export type RunActivitySequenceSource = (typeof RUN_ACTIVITY_SEQUENCE_SOURCES)[number];
+
+export interface RunActivityAdapterOrderingProfile {
+  readonly protocol: Extract<RunActivityProtocol, "json_rpc" | "acp">;
+  readonly sequenceRule: "preserve_positive_integer_or_assign_next";
+  readonly externalEventIdRule: "preserve_when_available_optional_otherwise";
+  readonly terminalRule: "first_terminal_wins_backfill_before_terminal_allowed";
+}
+
+export const RUN_ACTIVITY_ADAPTER_ORDERING_PROFILES = {
+  json_rpc: {
+    protocol: "json_rpc",
+    sequenceRule: "preserve_positive_integer_or_assign_next",
+    externalEventIdRule: "preserve_when_available_optional_otherwise",
+    terminalRule: "first_terminal_wins_backfill_before_terminal_allowed",
+  },
+  acp: {
+    protocol: "acp",
+    sequenceRule: "preserve_positive_integer_or_assign_next",
+    externalEventIdRule: "preserve_when_available_optional_otherwise",
+    terminalRule: "first_terminal_wins_backfill_before_terminal_allowed",
+  },
+} as const satisfies Record<Extract<RunActivityProtocol, "json_rpc" | "acp">, RunActivityAdapterOrderingProfile>;
+
 export interface RunActivityLifecyclePayload extends RunActivityPayload {
   role?: AgentRunRole | null;
   runPhase?: AgentRunPhase | null;
@@ -236,13 +266,31 @@ export interface RunActivityEventBase<
   runId: string;
   /** Runtime session/thread id when one exists; null before or outside runtime session creation. */
   sessionId: string | null;
+  /**
+   * Opaque ordering and idempotency scope for this run/session.
+   *
+   * Adapters must use a value that is unique to the Symphony run attempt even
+   * when a runtime session/thread is reused across issue turns. Persistence and
+   * realtime replay code key ordering state by this field, not by raw sessionId.
+   */
+  runSessionId: string;
   /** ISO-8601 timestamp for when this normalized activity was observed. */
   at: string;
   /**
-   * Monotonic sequence within the run/session when known. Consumers should use
-   * id for idempotency and sequence+at for stable ordering when sequence is present.
+   * Positive, 1-based sequence within runSessionId after normalization.
+   *
+   * Harness-provided positive integers are preserved; otherwise Symphony assigns
+   * the next sequence above the accepted high-water mark for this runSessionId.
+   * Consumers may order by runSessionId + sequence and use at/id only as stable
+   * tie-breakers for corrupted legacy data.
    */
-  sequence?: number | null;
+  sequence: number;
+  /** Whether sequence came from the harness/protocol or was assigned by Symphony. */
+  sequenceSource: RunActivitySequenceSource;
+  /** Optional opaque upstream event id for reconnect/replay idempotency. */
+  externalEventId?: string | null;
+  /** Runtime protocol/adapter family that produced the source event. */
+  protocol: RunActivityProtocol;
   /** Neutral runtime adapter id; intentionally opaque to frontend taxonomy reducers. */
   harnessId: string;
   actor: TActor;
@@ -314,6 +362,142 @@ export type RunActivityEvent =
 
 export type RunActivityEventForChannel<TChannel extends RunActivityChannel> = Extract<RunActivityEvent, { channel: TChannel }>;
 
+type DistributiveOmit<T, TKeys extends keyof any> = T extends unknown ? Omit<T, TKeys> : never;
+
+export type RunActivityEventInput = DistributiveOmit<RunActivityEvent, "runSessionId" | "sequence" | "sequenceSource" | "protocol"> & {
+  /** Explicit scope from the adapter; defaults to a Symphony-derived run/session scope when omitted. */
+  runSessionId?: string | null;
+  /** Positive harness/protocol sequence. Missing, null, or non-positive values are assigned by Symphony. */
+  sequence?: number | null;
+  sequenceSource?: RunActivitySequenceSource | null;
+  protocol?: RunActivityProtocol | null;
+};
+
+export interface RunActivityOrderingState {
+  /** Scope that owns every accepted idempotency key in this state. */
+  readonly runSessionId: string;
+  /** Highest accepted sequence in the scope, including out-of-order arrivals. */
+  readonly highWatermark: number;
+  /** First accepted terminal sequence, or null while the run/session remains open. */
+  readonly terminalSequence: number | null;
+  /** Accepted stable event ids. Kept serializable so persistence code can snapshot/rebuild state. */
+  readonly eventIds: readonly string[];
+  /** Accepted upstream ids, scoped by runSessionId. Empty/null upstream ids are ignored. */
+  readonly externalEventIds: readonly string[];
+  /** Accepted sequence numbers, scoped by runSessionId. */
+  readonly sequences: readonly number[];
+}
+
+export type RunActivityDuplicateReason = "event_id" | "external_event_id" | "sequence";
+
+export type RunActivityRejectReason = "run_session_scope_mismatch" | "terminal_already_accepted";
+
+export type RunActivityOrderingResult =
+  | {
+      readonly status: "accepted";
+      readonly event: RunActivityEvent;
+      readonly state: RunActivityOrderingState;
+    }
+  | {
+      readonly status: "duplicate";
+      readonly reason: RunActivityDuplicateReason;
+      readonly state: RunActivityOrderingState;
+    }
+  | {
+      readonly status: "rejected";
+      readonly reason: RunActivityRejectReason;
+      readonly state: RunActivityOrderingState;
+    };
+
+export function createRunActivityOrderingState(runSessionId: string): RunActivityOrderingState {
+  return {
+    runSessionId,
+    highWatermark: 0,
+    terminalSequence: null,
+    eventIds: [],
+    externalEventIds: [],
+    sequences: [],
+  };
+}
+
+export function deriveRunActivityRunSessionId(input: Pick<RunActivityEventInput, "runId" | "sessionId" | "runSessionId">): string {
+  const explicit = normalizeOptionalString(input.runSessionId);
+  if (explicit) return explicit;
+  const sessionId = normalizeOptionalString(input.sessionId);
+  return sessionId ? `${input.runId}:${sessionId}` : input.runId;
+}
+
+export function runActivityIdempotencyKeys(
+  input: Pick<RunActivityEvent, "id" | "runSessionId" | "sequence" | "externalEventId">,
+): readonly string[] {
+  return [
+    `event_id:${input.id}`,
+    `run_sequence:${input.runSessionId}:${input.sequence}`,
+    ...(normalizeOptionalString(input.externalEventId) ? [`external_event_id:${input.runSessionId}:${normalizeOptionalString(input.externalEventId)}`] : []),
+  ];
+}
+
+/**
+ * Applies the RunActivityEvent ordering and idempotency contract.
+ *
+ * Rules:
+ * - runSessionId scopes ordering and idempotency, not raw sessionId.
+ * - Positive harness/protocol sequences are preserved, including out-of-order
+ *   backfill. Missing, null, or non-positive sequences are assigned to the next
+ *   high-watermark value in the runSessionId scope.
+ * - Duplicate event id, runSessionId+sequence, or runSessionId+externalEventId
+ *   inputs are no-op duplicates and must not be re-emitted to realtime clients.
+ * - The first terminal event wins. Replayed duplicates remain no-ops; explicit
+ *   pre-terminal backfill may still be accepted, but missing-sequence or
+ *   post-terminal events are rejected after a terminal sequence exists.
+ */
+export function applyRunActivityOrdering(input: RunActivityEventInput, state?: RunActivityOrderingState): RunActivityOrderingResult {
+  const runSessionId = deriveRunActivityRunSessionId(input);
+  const current = state ?? createRunActivityOrderingState(runSessionId);
+  if (current.runSessionId !== runSessionId) return { status: "rejected", reason: "run_session_scope_mismatch", state: current };
+
+  const providedSequence = positiveIntegerOrNull(input.sequence);
+  const sequence = providedSequence ?? current.highWatermark + 1;
+  const externalEventId = normalizeOptionalString(input.externalEventId);
+
+  if (current.eventIds.includes(input.id)) return { status: "duplicate", reason: "event_id", state: current };
+  if (externalEventId && current.externalEventIds.includes(externalEventId)) {
+    return { status: "duplicate", reason: "external_event_id", state: current };
+  }
+  if (current.sequences.includes(sequence)) return { status: "duplicate", reason: "sequence", state: current };
+
+  if (current.terminalSequence !== null) {
+    const canBackfillBeforeTerminal = providedSequence !== null && sequence < current.terminalSequence && input.channel !== "terminal";
+    if (!canBackfillBeforeTerminal) return { status: "rejected", reason: "terminal_already_accepted", state: current };
+  }
+
+  const event = {
+    ...input,
+    runSessionId,
+    sequence,
+    sequenceSource: providedSequence === null ? "symphony" : (input.sequenceSource ?? "harness"),
+    externalEventId,
+    protocol: input.protocol ?? "unknown",
+  } as RunActivityEvent;
+  const nextState: RunActivityOrderingState = {
+    runSessionId,
+    highWatermark: Math.max(current.highWatermark, sequence),
+    terminalSequence: event.channel === "terminal" ? sequence : current.terminalSequence,
+    eventIds: [...current.eventIds, event.id],
+    externalEventIds: externalEventId ? [...current.externalEventIds, externalEventId] : current.externalEventIds,
+    sequences: [...current.sequences, sequence],
+  };
+  return { status: "accepted", event, state: nextState };
+}
+
+export function compareRunActivityEvents(left: RunActivityEvent, right: RunActivityEvent): number {
+  if (left.runSessionId !== right.runSessionId) return left.runSessionId.localeCompare(right.runSessionId);
+  if (left.sequence !== right.sequence) return left.sequence - right.sequence;
+  const atComparison = left.at.localeCompare(right.at);
+  if (atComparison !== 0) return atComparison;
+  return left.id.localeCompare(right.id);
+}
+
 export function isRunActivityActor(value: unknown): value is RunActivityActor {
   return typeof value === "string" && (RUN_ACTIVITY_ACTORS as readonly string[]).includes(value);
 }
@@ -341,4 +525,14 @@ export function isRunActivityKindForChannel<TChannel extends RunActivityChannel>
   kind: unknown,
 ): kind is RunActivityKindForChannel<TChannel> {
   return typeof kind === "string" && (RUN_ACTIVITY_KIND_BY_CHANNEL[channel] as readonly string[]).includes(kind);
+}
+
+function normalizeOptionalString(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function positiveIntegerOrNull(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
