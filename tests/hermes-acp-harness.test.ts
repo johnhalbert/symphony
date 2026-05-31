@@ -23,6 +23,7 @@ import type {
 } from "../hermes/src/HostHermesAcpProfileLease.js";
 import { parseServiceConfig, type HermesWorkerSessionLifecycle, type ServiceConfig } from "../src/core/config/Config.js";
 import type { AgentEvent, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import type { RunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type { Issue } from "../src/core/types.js";
 
 interface RecordedRequest {
@@ -150,6 +151,36 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
 }
 
 describe("HermesAcpHarness", () => {
+  it("constructs with default dependencies, prepares handoff context, and disposes before acquiring leases", async () => {
+    const defaultHarness = new HermesAcpHarness();
+    expect(defaultHarness.id).toBe("hermes_acp");
+    expect(defaultHarness.capabilities).toEqual({
+      continuation: true,
+      mcpHandoff: true,
+      runStatus: false,
+      liveDiagnostics: true,
+    });
+    expect(defaultHarness.supportsContinuation).toBe(true);
+    await defaultHarness.dispose();
+    await defaultHarness.dispose();
+
+    const { acpClientFactory, ctx, harness, leaseFactory, leases } = await fixture();
+
+    await harness.prepare(ctx);
+    await harness.dispose();
+    await harness.dispose();
+
+    const initialContext = JSON.parse(
+      await readFile(path.join(ctx.config.workspace.stateDir, "completion-report-mcp", "issue-1-1.json"), "utf8"),
+    ) as { activeRunId: string | null; sessionId: string | null; workspacePath: string | null };
+    expect(initialContext.activeRunId).toBeNull();
+    expect(initialContext.sessionId).toBeNull();
+    expect(initialContext.workspacePath).toBe(ctx.workspace.path);
+    expect(leaseFactory).not.toHaveBeenCalled();
+    expect(acpClientFactory).not.toHaveBeenCalled();
+    expect(leases).toEqual([]);
+  });
+
   it("starts a fresh ACP session, wires MCP handoff, sends text prompts, and cleans up on success", async () => {
     const { client, ctx, harness, leases } = await fixture();
 
@@ -182,7 +213,7 @@ describe("HermesAcpHarness", () => {
       expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } })]),
     );
     expect(leases[0]?.disposeStatuses).toEqual(["succeeded"]);
-    expect(client.kills).toEqual(expect.arrayContaining([expect.stringContaining("run_finished")]))
+    expect(client.kills).toEqual(expect.arrayContaining([expect.stringContaining("run_finished")]));
 
     const activeContext = JSON.parse(
       await readFile(path.join(ctx.config.workspace.stateDir, "completion-report-mcp", "issue-1-1.json"), "utf8"),
@@ -190,6 +221,64 @@ describe("HermesAcpHarness", () => {
     expect(activeContext.activeRunId).toMatch(/^hermes-acp-/);
     expect(activeContext.sessionId).toContain("acp-session-1");
     expect(activeContext.workspacePath).toBe(ctx.workspace.path);
+  });
+
+  it("passes the profile lease command into the ACP facade and records run-start profile metadata", async () => {
+    const transcriptEvents: Array<Parameters<RunTranscriptStore["appendEvent"]>[0]> = [];
+    const appendEvent = vi.fn(async (event: Parameters<RunTranscriptStore["appendEvent"]>[0]) => {
+      transcriptEvents.push(event);
+      return { ...event, sequence: transcriptEvents.length };
+    }) as unknown as RunTranscriptStore["appendEvent"];
+    const runStore = { appendEvent } as unknown as RunTranscriptStore;
+    const { acpClientFactory, ctx, harness, leaseFactory, leases } = await fixture({ runStore });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+
+    expect(leaseFactory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        binaryPath: "/host/bin/hermes",
+        cwd: ctx.workspace.path,
+        timeoutMs: 1_000,
+        sourceProfile: "host-source",
+        keepProfiles: "never",
+        nameInput: expect.objectContaining({
+          workspaceKey: "ENG-139",
+          issueIdentifier: "ENG-139",
+          role: "worker",
+          phase: "implementation",
+          attempt: 1,
+          prefix: "symphony",
+        }),
+      }),
+    );
+    expect(acpClientFactory).toHaveBeenCalledWith(leases[0]?.lease.acpCommand, { requestTimeoutMs: 1_000 });
+    const sessionStarted = events.find((event) => event.type === "session_started");
+    const profileEvent = transcriptEvents.find((event) => event.eventType === "hermes_acp_profile");
+    expect(profileEvent).toMatchObject({
+      runId: sessionStarted?.runId,
+      source: "runtime",
+      eventType: "hermes_acp_profile",
+      message: "Host Hermes ACP profile profile-1",
+      payload: {
+        harnessId: "hermes_acp",
+        profileName: "profile-1",
+        sourceProfile: "host-source",
+        acpSessionId: "acp-session-1",
+        reusable: false,
+      },
+    });
+  });
+
+  it("creates fresh leases for fresh_per_run worker turns and only disposes each lease once", async () => {
+    const { ctx, harness, leaseFactory, leases } = await fixture({ lifecycle: "fresh_per_run" });
+
+    await collectEvents(harness.run(ctx, "First"));
+    await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
+    await harness.dispose();
+    await harness.dispose();
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(leases.map((lease) => lease.disposeStatuses)).toEqual([["succeeded"], ["succeeded"]]);
   });
 
   it("rejects unattended setup-only authentication before creating sessions", async () => {
@@ -282,6 +371,7 @@ describe("HermesAcpHarness", () => {
     client.sessionId = "acp-session-2";
     await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
     await harness.dispose();
+    await harness.dispose();
 
     expect(leaseFactory).toHaveBeenCalledTimes(1);
     expect(client.requests.map((request) => request.method)).toEqual([
@@ -320,7 +410,7 @@ describe("HermesAcpHarness", () => {
   });
 });
 
-async function fixture(input: { client?: FakeAcpClient; lifecycle?: HermesWorkerSessionLifecycle } = {}) {
+async function fixture(input: { client?: FakeAcpClient; lifecycle?: HermesWorkerSessionLifecycle; runStore?: RunTranscriptStore } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-"));
   const config = serviceConfig(root, input.lifecycle ?? "fresh_per_run");
   const ctx = runContext(config, root);
@@ -351,6 +441,7 @@ async function fixture(input: { client?: FakeAcpClient; lifecycle?: HermesWorker
   );
   const harness = new HermesAcpHarness({
     cliPath: path.join(root, "src", "cli.ts"),
+    ...(input.runStore === undefined ? {} : { runStore: input.runStore }),
     profileLeaseFactory: leaseFactory,
     acpClientFactory,
   });
