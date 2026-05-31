@@ -88,7 +88,7 @@ export interface HostHermesAcpProfileLeaseOptions {
   acpSessionId?: string | null;
   runner?: HostHermesAcpCommandRunner;
   onDisposed?: (
-    lease: HostHermesAcpProfileLease,
+    lease: HostHermesAcpManagedProfileLease,
     result: HostHermesAcpProfileLeaseDisposeResult,
     hook: HostHermesAcpLeaseLifecycleHook,
   ) => void;
@@ -104,8 +104,12 @@ export interface HostHermesAcpProcessCommand {
 export interface HostHermesAcpProfileLease {
   profileName: string;
   sourceProfile: string;
-  reusable: boolean;
   acpCommand: HostHermesAcpProcessCommand;
+  dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
+}
+
+export interface HostHermesAcpManagedProfileLease extends HostHermesAcpProfileLease {
+  reusable: boolean;
   processHandle: HostHermesAcpLeaseProcessHandle | null;
   acpSessionId: string | null;
   disposed: boolean;
@@ -115,7 +119,6 @@ export interface HostHermesAcpProfileLease {
   afterProcessExit(terminalStatus?: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
   afterHarnessDispose(terminalStatus?: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
   afterStartupFailure(terminalStatus?: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
-  dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
 }
 
 export interface HostHermesAcpProfileLeaseDisposeResult {
@@ -143,7 +146,7 @@ type HostHermesAcpProfileLeaseProfileDisposition = "created" | "reused";
 
 export async function createHostHermesAcpProfileLease(
   options: HostHermesAcpProfileLeaseOptions,
-): Promise<HostHermesAcpProfileLease> {
+): Promise<HostHermesAcpManagedProfileLease> {
   const binaryPath = requireNonEmpty(options.binaryPath, "Host Hermes binary path");
   const cwd = requireNonEmpty(options.cwd, "Host Hermes ACP working directory");
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -173,7 +176,7 @@ export async function createHostHermesAcpProfileLease(
   let processHandle = options.processHandle ?? null;
   let acpSessionId = normalizeOptionalString(options.acpSessionId);
   let backedFailedRun = false;
-  let lease: HostHermesAcpProfileLease;
+  let lease: HostHermesAcpManagedProfileLease;
 
   function recordTerminalStatus(terminalStatus: HostHermesAcpTerminalStatus): void {
     if (terminalStatus === "failed") backedFailedRun = true;
@@ -283,11 +286,11 @@ export async function createHostHermesAcpProfileLease(
 }
 
 export class HostHermesAcpLeaseManager {
-  private readonly leases = new Map<string, HostHermesAcpProfileLease>();
+  private readonly leases = new Map<string, HostHermesAcpManagedProfileLease>();
 
   constructor(private readonly options: HostHermesAcpLeaseManagerOptions) {}
 
-  async acquire(input: HostHermesAcpRunLeaseInput): Promise<HostHermesAcpProfileLease> {
+  async acquire(input: HostHermesAcpRunLeaseInput): Promise<HostHermesAcpManagedProfileLease> {
     const phase = resolveHostHermesAcpRunPhase(input);
     const workerSessionLifecycle = input.workerSessionLifecycle ?? this.options.workerSessionLifecycle ?? "reuse_by_issue";
     const reusable = shouldReuseHostHermesAcpLease({ role: input.role, phase, workerSessionLifecycle });

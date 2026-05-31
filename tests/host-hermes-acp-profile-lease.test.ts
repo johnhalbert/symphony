@@ -13,6 +13,7 @@ import {
   shouldReuseHostHermesAcpLease,
   type HostHermesAcpCommandOptions,
   type HostHermesAcpCommandResult,
+  type HostHermesAcpProfileLease,
 } from "../hermes/src/HostHermesAcpProfileLease.js";
 
 interface RecordedCommand {
@@ -77,6 +78,25 @@ describe("HostHermesAcpProfileLease", () => {
     ]);
     expect(buildHostHermesAcpLaunchArgs("run-profile")).toEqual(["-p", "run-profile", "acp"]);
     expect(buildHostHermesAcpDeleteProfileArgs("run-profile")).toEqual(["profile", "delete", "run-profile", "--yes"]);
+  });
+
+  it("keeps the runtime lease contract compatible with harness fakes", async () => {
+    const lease: HostHermesAcpProfileLease = {
+      profileName: "profile-1",
+      sourceProfile: "host-source",
+      acpCommand: { file: "/usr/local/bin/hermes", args: ["-p", "profile-1", "acp"], cwd: "/workspace", env: {} },
+      dispose: async (terminalStatus) => ({
+        profileName: `profile-1-${terminalStatus ?? "none"}`,
+        reason: "deleted",
+        deleted: true,
+      }),
+    };
+
+    await expect(lease.dispose(null)).resolves.toEqual({
+      profileName: "profile-1-none",
+      reason: "deleted",
+      deleted: true,
+    });
   });
 
   it("removes vendored Hermes env vars while preserving unrelated host env", () => {
