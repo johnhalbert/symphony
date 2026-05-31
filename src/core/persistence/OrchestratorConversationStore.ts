@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
@@ -100,7 +101,7 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
 
   async createConversation(input: CreateOrchestratorConversationInput = {}): Promise<OrchestratorConversationRecord> {
     const conversationId = normalizeConversationId(input.conversationId);
-    return this.withConversationLock(conversationId, async () => {
+    return this.withConversationLock(this.conversationPath(conversationId), async () => {
       const existing = await this.readConversation(conversationId);
       const now = input.at ?? new Date().toISOString();
       const record: OrchestratorConversationRecord = existing
@@ -130,7 +131,7 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
 
   async appendMessage(input: AppendOrchestratorConversationMessageInput): Promise<OrchestratorConversationMessage> {
     const conversationId = normalizeConversationId(input.conversationId);
-    return this.withConversationLock(conversationId, async () => {
+    return this.withConversationLock(this.conversationPath(conversationId), async () => {
       const now = input.at ?? new Date().toISOString();
       const existing = await this.readConversation(conversationId);
       const record = existing ?? {
@@ -171,7 +172,7 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
 
   async updateMessage(input: UpdateOrchestratorConversationMessageInput): Promise<OrchestratorConversationMessage> {
     const conversationId = normalizeConversationId(input.conversationId);
-    return this.withConversationLock(conversationId, async () => {
+    return this.withConversationLock(this.conversationPath(conversationId), async () => {
       const existing = await this.readConversation(conversationId);
       if (!existing) throw new Error(`Orchestrator conversation not found: ${conversationId}`);
       const messageIndex = existing.messages.findIndex((message) => message.id === input.messageId);
@@ -210,28 +211,31 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
     return conversation?.messages ?? [];
   }
 
-  private async withConversationLock<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.updateLocks.get(conversationId) ?? Promise.resolve();
+  private async withConversationLock<T>(lockKey: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.updateLocks.get(lockKey) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(operation);
-    this.updateLocks.set(conversationId, next);
+    this.updateLocks.set(lockKey, next);
     try {
       return await next;
     } finally {
-      if (this.updateLocks.get(conversationId) === next) this.updateLocks.delete(conversationId);
+      if (this.updateLocks.get(lockKey) === next) this.updateLocks.delete(lockKey);
     }
   }
 
   private conversationPath(conversationId: string): string {
-    return path.join(this.stateDir, "orchestrator-conversations", `${safeFileName(conversationId)}.json`);
+    return path.join(this.stateDir, "orchestrator-conversations", conversationFileName(conversationId));
   }
 
   private async readConversation(conversationId: string): Promise<OrchestratorConversationRecord | null> {
-    const record = await readJsonIfExists<OrchestratorConversationRecord>(this.conversationPath(conversationId));
-    return record ? normalizeConversationRecord(record, conversationId) : null;
+    const filePath = this.conversationPath(conversationId);
+    const record = await readJsonIfExists<OrchestratorConversationRecord>(filePath);
+    return record ? normalizeConversationRecordForConversation(record, conversationId, filePath) : null;
   }
 
   private async writeConversation(record: OrchestratorConversationRecord): Promise<void> {
-    await writeJson(this.conversationPath(record.conversationId), normalizeConversationRecord(record, record.conversationId));
+    const conversationId = normalizeConversationId(record.conversationId);
+    const filePath = this.conversationPath(conversationId);
+    await writeJson(filePath, normalizeConversationRecordForConversation(record, conversationId, filePath));
   }
 
   private notifyProjectionChanged(): void {
@@ -295,6 +299,34 @@ function normalizeConversationRecord(
     metadata: sanitizeMetadata(record.metadata),
     messages,
   };
+}
+
+function normalizeConversationRecordForConversation(
+  record: OrchestratorConversationRecord,
+  expectedConversationId: string,
+  filePath: string,
+): OrchestratorConversationRecord {
+  const storeFile = path.basename(filePath);
+  const storedConversationId = normalizeString(record.conversationId);
+  if (storedConversationId === null) {
+    throw new Error(`Durable orchestrator conversation record ${storeFile} is missing a conversationId`);
+  }
+  if (normalizeConversationId(storedConversationId) !== expectedConversationId) {
+    throw new Error(
+      `Durable orchestrator conversation record ${storeFile} has conversationId ${JSON.stringify(
+        storedConversationId,
+      )}, expected ${JSON.stringify(expectedConversationId)}`,
+    );
+  }
+  const normalized = normalizeConversationRecord(record, expectedConversationId);
+  if (normalized.conversationId !== expectedConversationId) {
+    throw new Error(
+      `Durable orchestrator conversation record ${storeFile} normalized to conversationId ${JSON.stringify(
+        normalized.conversationId,
+      )}, expected ${JSON.stringify(expectedConversationId)}`,
+    );
+  }
+  return normalized;
 }
 
 function normalizeMessage(
@@ -363,8 +395,12 @@ function redactConversationBody(value: string): string {
   return redactTranscriptText(value).text;
 }
 
-function safeFileName(value: string): string {
-  return value.replace(/[^A-Za-z0-9._-]/g, "_") || "conversation";
+function conversationFileName(conversationId: string): string {
+  // The web API accepts arbitrary non-empty conversation ids. A full SHA-256
+  // content address keeps filesystem paths fixed-length and avoids lossy
+  // sanitizer collisions, including case-only collisions on Windows.
+  const digest = createHash("sha256").update(conversationId, "utf8").digest("hex");
+  return `conversation-${digest}.json`;
 }
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {

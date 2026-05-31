@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -140,6 +140,56 @@ describe("web orchestrator chat API", () => {
       ]);
       expect(await (await fetch(alphaUrl)).json()).toEqual(alphaPosted);
       expect(await (await fetch(chatUrl(address))).json()).toEqual(posted);
+      expect(calls).toEqual(zeroCallCounts());
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps web chat histories isolated for unsafe and previously colliding conversation ids", async () => {
+    const stateDir = path.join(root, "state");
+    const store = new FileOrchestratorConversationStore(stateDir);
+    const { server, calls } = createStatusServer(root, { orchestratorConversationStore: store });
+    const address = await server.start();
+    const scopedUrl = (conversationId: string) => chatUrl(address) + "?conversationId=" + encodeURIComponent(conversationId);
+    const postMessage = async (conversationId: string, input: string) => {
+      const response = await fetch(scopedUrl(conversationId), {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input }),
+      });
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expect(response.status).toBe(200);
+      return body;
+    };
+    const readMessages = async (conversationId: string) => {
+      const response = await fetch(scopedUrl(conversationId));
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expect(response.status).toBe(200);
+      return body;
+    };
+
+    try {
+      await postMessage("a/b", "slash scoped");
+      await postMessage("a_b", "underscore scoped");
+      await postMessage("CaseOnly", "upper case scoped");
+      await postMessage("caseonly", "lower case scoped");
+
+      expect(await readMessages("a/b")).toMatchObject([{ conversationId: "a/b", text: "slash scoped" }]);
+      expect(await readMessages("a_b")).toMatchObject([{ conversationId: "a_b", text: "underscore scoped" }]);
+      expect(await readMessages("CaseOnly")).toMatchObject([{ conversationId: "CaseOnly", text: "upper case scoped" }]);
+      expect(await readMessages("caseonly")).toMatchObject([{ conversationId: "caseonly", text: "lower case scoped" }]);
+      expect(await (await fetch(chatUrl(address))).json()).toEqual([]);
+      expect((await store.listMessages("a/b")).map((message) => message.body)).toEqual(["slash scoped"]);
+      expect((await store.listMessages("a_b")).map((message) => message.body)).toEqual(["underscore scoped"]);
+
+      const files = await readdir(path.join(stateDir, "orchestrator-conversations"));
+      expect(files).toHaveLength(4);
+      expect(new Set(files.map((file) => file.toLowerCase())).size).toBe(4);
+      expect(files).not.toContain("a_b.json");
       expect(calls).toEqual(zeroCallCounts());
     } finally {
       await server.stop();

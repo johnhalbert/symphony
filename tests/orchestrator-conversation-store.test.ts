@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -152,14 +152,69 @@ describe("FileOrchestratorConversationStore", () => {
     ]);
   });
 
-  it("keeps independent durable histories per conversation id", async () => {
+  it("keeps independent durable histories per conversation id, including ids that would collide in lossy filenames", async () => {
     const store = new FileOrchestratorConversationStore(root);
+    const conversations: Array<{ conversationId: string; body: string }> = [
+      { conversationId: "alpha", body: "alpha one" },
+      { conversationId: "beta", body: "beta one" },
+      { conversationId: "a/b", body: "slash scoped" },
+      { conversationId: "a_b", body: "underscore scoped" },
+      { conversationId: "CaseOnly", body: "upper case scoped" },
+      { conversationId: "caseonly", body: "lower case scoped" },
+    ];
 
-    await store.appendMessage({ conversationId: "alpha", role: "user", body: "alpha one" });
-    await store.appendMessage({ conversationId: "beta", role: "user", body: "beta one" });
+    for (const conversation of conversations) {
+      await store.appendMessage({
+        conversationId: conversation.conversationId,
+        role: "user",
+        body: conversation.body,
+      });
+    }
 
-    expect((await store.listMessages("alpha")).map((message) => message.body)).toEqual(["alpha one"]);
-    expect((await store.listMessages("beta")).map((message) => message.body)).toEqual(["beta one"]);
+    for (const conversation of conversations) {
+      expect((await store.listMessages(conversation.conversationId)).map((message) => message.body)).toEqual([
+        conversation.body,
+      ]);
+    }
     expect(await store.listMessages()).toEqual([]);
+
+    const files = await readdir(path.join(root, "orchestrator-conversations"));
+    expect(files).toHaveLength(conversations.length);
+    expect(new Set(files).size).toBe(conversations.length);
+    expect(new Set(files.map((file) => file.toLowerCase())).size).toBe(conversations.length);
+    expect(files).not.toContain("a_b.json");
+
+    const reloaded = new FileOrchestratorConversationStore(root);
+    expect((await reloaded.listMessages("a/b")).map((message) => message.body)).toEqual(["slash scoped"]);
+    expect((await reloaded.listMessages("a_b")).map((message) => message.body)).toEqual(["underscore scoped"]);
+    expect((await reloaded.listMessages("CaseOnly")).map((message) => message.body)).toEqual(["upper case scoped"]);
+    expect((await reloaded.listMessages("caseonly")).map((message) => message.body)).toEqual(["lower case scoped"]);
+  });
+
+  it("rejects a durable record whose stored conversation id does not match the requested id", async () => {
+    const store = new FileOrchestratorConversationStore(root);
+    await store.appendMessage({ conversationId: "requested", role: "user", body: "request scoped" });
+    const conversationsDir = path.join(root, "orchestrator-conversations");
+    const [fileName] = await readdir(conversationsDir);
+    if (!fileName) throw new Error("expected a persisted orchestrator conversation file");
+
+    await writeFile(
+      path.join(conversationsDir, fileName),
+      `${JSON.stringify(
+        {
+          conversationId: "different",
+          status: "completed",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          metadata: {},
+          messages: [],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await expect(store.getConversation("requested")).rejects.toThrow(/conversationId.*different.*expected.*requested/);
   });
 });
