@@ -81,6 +81,7 @@ import {
   type WebProjectionRevisionUnsubscribe,
   type WebProjectionSourceRevision,
 } from "./WebProjectionContext.js";
+import { RealtimeProjectionEventBus } from "./RealtimeProjectionEvents.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -163,6 +164,7 @@ export class StatusServer {
   private readonly webAssetsRoot: string | null;
   private readonly webProjectionRevisionProviders: readonly WebProjectionRevisionProvider[];
   private readonly webProjectionRevisionUnsubscribes: WebProjectionRevisionUnsubscribe[] = [];
+  private readonly realtimeEvents = new RealtimeProjectionEventBus();
   private webProjectionDirtyGeneration = 0;
 
   constructor(private readonly options: StatusServerOptions) {
@@ -191,6 +193,7 @@ export class StatusServer {
   }
 
   async stop(): Promise<void> {
+    this.realtimeEvents.closeAllStreams();
     if (!this.server) {
       this.unsubscribeWebProjectionRevisionListeners();
       return;
@@ -206,12 +209,17 @@ export class StatusServer {
     }
   }
 
+  activeRealtimeSubscriberCount(): number {
+    return this.realtimeEvents.subscriberCount();
+  }
+
   private registerWebProjectionRevisionListeners(): void {
     if (this.webProjectionRevisionUnsubscribes.length > 0) return;
     for (const provider of this.webProjectionRevisionProviders) {
       if (!provider.subscribe) continue;
       const unsubscribe = provider.subscribe((revision) => {
         this.markCompletedWebProjectionContextDirty(revision);
+        this.realtimeEvents.publishProjectionRevision(revision);
       });
       this.webProjectionRevisionUnsubscribes.push(unsubscribe);
     }
@@ -231,6 +239,17 @@ export class StatusServer {
   private markCompletedWebProjectionContextDirty(_revision: WebProjectionSourceRevision): void {
     this.webProjectionDirtyGeneration += 1;
     this.completedWebProjectionContext = null;
+  }
+
+  private handleRealtime(request: IncomingMessage, response: ServerResponse, url: URL): void {
+    const stream = this.realtimeEvents.openSseStream({
+      response,
+      lastEventId: realtimeLastEventId(request, url),
+    });
+    const close = (): void => stream.close();
+    request.on("aborted", close);
+    response.on("close", close);
+    response.on("error", close);
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -265,6 +284,10 @@ export class StatusServer {
           ),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/realtime") {
+        this.handleRealtime(request, response, url);
         return;
       }
       const webIssueMatch = /^\/api\/v1\/web\/issues\/([^/]+)$/.exec(url.pathname);
@@ -431,7 +454,9 @@ export class StatusServer {
             throw error;
           }
 
-          sendJson(response, 200, projectWebOrchestratorChatPost(input));
+          const chat = projectWebOrchestratorChatPost(input);
+          this.realtimeEvents.publishOrchestratorMessage({ inputLength: input.length, messageCount: chat.length });
+          sendJson(response, 200, chat);
           return;
         }
       }
@@ -1413,6 +1438,15 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
 function sendHtml(response: ServerResponse, body: string): void {
   response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   response.end(body);
+}
+
+function realtimeLastEventId(request: IncomingMessage, url: URL): string | null {
+  const header = request.headers["last-event-id"];
+  const headerValue = Array.isArray(header) ? header[0] : header;
+  const queryValue = url.searchParams.get("lastEventId") ?? url.searchParams.get("last-event-id");
+  const value = headerValue ?? queryValue;
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : null;
 }
 
 const WEB_MOUNT_PATH = "/web";
