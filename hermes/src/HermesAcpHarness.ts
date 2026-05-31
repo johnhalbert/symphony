@@ -23,6 +23,7 @@ import {
   type HostHermesAcpProfileLeaseOptions,
   type HostHermesAcpTerminalStatus,
 } from "./HostHermesAcpProfileLease.js";
+import { normalizeHermesAuthProvider } from "./HermesAuthManager.js";
 import {
   HostHermesAcpStdioJsonRpcFacade,
   type HostHermesAcpDiagnostic,
@@ -94,6 +95,17 @@ type HermesAcpRuntimeEvent =
 
 const TERMINAL_SETUP_AUTH_METHOD_ID = "hermes-setup";
 const DEFAULT_PROFILE_PREFIX = "symphony";
+
+interface SelectedAuthMethod {
+  id: string;
+  label: string;
+  diagnostics: string;
+}
+
+interface AuthMethodSelectionContext {
+  expectedProvider: string | null;
+  sourceProfile: string | null;
+}
 
 export class HermesAcpHarness implements AgentHarness {
   readonly id = "hermes_acp";
@@ -414,12 +426,24 @@ export class HermesAcpHarness implements AgentHarness {
       },
       { timeoutMs: ctx.config.hermes.startupTimeoutMs },
     );
-    const method = selectNonTerminalAuthMethod(initializeResult);
-    const authenticateResult = await lease.client.request<unknown>(
-      "authenticate",
-      { methodId: method.id },
-      { timeoutMs: ctx.config.hermes.startupTimeoutMs },
-    );
+    const method = selectNonTerminalAuthMethod(initializeResult, {
+      expectedProvider: ctx.config.hermes.provider,
+      sourceProfile: lease.profile.sourceProfile,
+    });
+    let authenticateResult: unknown;
+    try {
+      authenticateResult = await lease.client.request<unknown>(
+        "authenticate",
+        { methodId: method.id },
+        { timeoutMs: ctx.config.hermes.startupTimeoutMs },
+      );
+    } catch (error) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `Host Hermes ACP authenticate failed for auth method ${method.label} (${method.id}): ${redactLogLine(errorMessage(error))}. ${method.diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
+        error,
+      );
+    }
     validateAcpAuthenticateResult(authenticateResult, method);
     lease.initialized = true;
   }
@@ -582,36 +606,64 @@ function formatHostHermesDiagnostic(diagnostic: HostHermesDiscoveryDiagnostic): 
   return `${diagnostic.code}: ${diagnostic.message}`;
 }
 
-function selectNonTerminalAuthMethod(initializeResult: Record<string, unknown>): { id: string; label: string } {
+function selectNonTerminalAuthMethod(
+  initializeResult: Record<string, unknown>,
+  context: AuthMethodSelectionContext,
+): SelectedAuthMethod {
   const authMethods = authMethodsFromInitializeResult(initializeResult);
-  const selected = authMethods.find((method) => {
-    const id = authMethodId(method);
-    return id !== null && !isTerminalAuthMethod(method);
-  });
-  if (!selected) {
+  const diagnostics = advertisedAuthMethodsDiagnostic(authMethods, context);
+  const nonTerminalMethods = authMethods.filter((method) => authMethodId(method) !== null && !isTerminalAuthMethod(method));
+  const expectedProviders = expectedAuthProviderKeys(context);
+
+  if (nonTerminalMethods.length === 0) {
     throw new SymphonyError(
       "config_validation_error",
-      "Host Hermes ACP initialize did not advertise a non-terminal provider auth method. Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.",
+      `Host Hermes ACP initialize did not advertise a non-terminal provider auth method. ${diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
     );
   }
-  const id = authMethodId(selected);
-  if (!id) {
-    throw new SymphonyError("agent_error", "Host Hermes ACP selected auth method did not include an id.");
+
+  if (expectedProviders.length > 0) {
+    const matchingMethods = nonTerminalMethods.filter((method) => authMethodMatchesExpectedProvider(method, expectedProviders));
+    if (matchingMethods.length === 1) return selectedAuthMethod(matchingMethods[0]!, diagnostics);
+    if (matchingMethods.length > 1) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `Host Hermes ACP initialize advertised multiple non-terminal auth methods matching expected provider(s) ${expectedProviders.join(", ")}. ${diagnostics} Refusing unattended hermes_acp run until the provider auth method is unambiguous.`,
+      );
+    }
   }
-  return { id, label: authMethodLabel(selected) ?? id };
+
+  if (nonTerminalMethods.length === 1) return selectedAuthMethod(nonTerminalMethods[0]!, diagnostics);
+
+  const expected = expectedProviders.length > 0 ? ` for expected provider(s) ${expectedProviders.join(", ")}` : "";
+  throw new SymphonyError(
+    "config_validation_error",
+    `Host Hermes ACP initialize advertised multiple non-terminal provider auth methods but none matched unambiguously${expected}. ${diagnostics} Refusing unattended hermes_acp run until the provider auth method is explicit.`,
+  );
 }
 
-function validateAcpAuthenticateResult(result: unknown, method: { id: string; label: string }): void {
+function selectedAuthMethod(
+  method: Record<string, unknown>,
+  diagnostics: string,
+): SelectedAuthMethod {
+  const id = authMethodId(method);
+  if (!id) {
+    throw new SymphonyError("agent_error", `Host Hermes ACP selected auth method did not include an id. ${diagnostics}`);
+  }
+  return { id, label: authMethodLabel(method) ?? id, diagnostics };
+}
+
+function validateAcpAuthenticateResult(result: unknown, method: SelectedAuthMethod): void {
   if (result === null || result === undefined || result === false) {
     throw new SymphonyError(
       "config_validation_error",
-      `Host Hermes ACP authenticate rejected auth method ${method.label} (${method.id}). Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
+      `Host Hermes ACP authenticate rejected auth method ${method.label} (${method.id}). ${method.diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
     );
   }
   if (!isRecord(result)) {
     throw new SymphonyError(
       "agent_error",
-      `Host Hermes ACP authenticate returned an invalid response for auth method ${method.label} (${method.id}).`,
+      `Host Hermes ACP authenticate returned an invalid response for auth method ${method.label} (${method.id}). ${method.diagnostics}`,
     );
   }
 }
@@ -625,17 +677,88 @@ function authMethodsFromInitializeResult(initializeResult: Record<string, unknow
   return value.filter(isRecord);
 }
 
+function expectedAuthProviderKeys(context: AuthMethodSelectionContext): string[] {
+  const configuredProvider = normalizedAuthProviderKey(context.expectedProvider);
+  if (configuredProvider.length > 0) return [configuredProvider];
+  return uniqueNonEmptyStrings([context.sourceProfile].map(normalizedAuthProviderKey));
+}
+
+function authMethodMatchesExpectedProvider(method: Record<string, unknown>, expectedProviders: string[]): boolean {
+  return authMethodProviderKeys(method).some((provider) => expectedProviders.includes(provider));
+}
+
+function authMethodProviderKeys(method: Record<string, unknown>): string[] {
+  return uniqueNonEmptyStrings(
+    [
+      method.provider,
+      method.providerId,
+      method.provider_id,
+      method.providerName,
+      method.provider_name,
+      authMethodId(method),
+    ].map(normalizedAuthProviderKey),
+  );
+}
+
+function normalizedAuthProviderKey(value: unknown): string {
+  const provider = nonEmptyString(value);
+  return provider ? normalizeHermesAuthProvider(provider) : "";
+}
+
+function uniqueNonEmptyStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
+}
+
+function advertisedAuthMethodsDiagnostic(authMethods: Record<string, unknown>[], context: AuthMethodSelectionContext): string {
+  const expectedProviders = expectedAuthProviderKeys(context);
+  const expected = expectedProviders.length > 0 ? ` expectedProviders=${JSON.stringify(expectedProviders)};` : "";
+  return `advertised authMethods=${JSON.stringify(authMethods.map(sanitizedAuthMethodForDiagnostics))};${expected}`;
+}
+
+function sanitizedAuthMethodForDiagnostics(method: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: sanitizedAuthMethodField(authMethodId(method)),
+    type: sanitizedAuthMethodField(authMethodType(method)),
+    label: sanitizedAuthMethodField(authMethodLabel(method)),
+    provider: sanitizedAuthMethodField(authMethodProviderForDiagnostics(method)),
+    terminal: isTerminalAuthMethod(method),
+  };
+}
+
+function sanitizedAuthMethodField(value: string | null): string | null {
+  if (!value) return null;
+  const sanitized = preview(value, 160);
+  return sanitized.length > 0 ? sanitized : null;
+}
+
+function authMethodProviderForDiagnostics(method: Record<string, unknown>): string | null {
+  const explicitProvider =
+    nonEmptyString(method.provider) ??
+    nonEmptyString(method.providerId) ??
+    nonEmptyString(method.provider_id) ??
+    nonEmptyString(method.providerName) ??
+    nonEmptyString(method.provider_name);
+  if (explicitProvider) return normalizeHermesAuthProvider(explicitProvider);
+  if (isTerminalAuthMethod(method)) return null;
+  const id = authMethodId(method);
+  return id ? normalizeHermesAuthProvider(id) : null;
+}
+
 function authMethodId(method: Record<string, unknown>): string | null {
   return nonEmptyString(method.id) ?? nonEmptyString(method.methodId) ?? nonEmptyString(method.method_id);
 }
 
+function authMethodType(method: Record<string, unknown>): string | null {
+  return nonEmptyString(method.type) ?? nonEmptyString(method.kind);
+}
+
 function authMethodLabel(method: Record<string, unknown>): string | null {
-  return nonEmptyString(method.name) ?? nonEmptyString(method.title) ?? nonEmptyString(method.description);
+  return nonEmptyString(method.label) ?? nonEmptyString(method.name) ?? nonEmptyString(method.title) ?? nonEmptyString(method.description);
 }
 
 function isTerminalAuthMethod(method: Record<string, unknown>): boolean {
   const id = authMethodId(method);
-  const type = nonEmptyString(method.type)?.toLowerCase() ?? "";
+  const type = authMethodType(method)?.toLowerCase() ?? "";
   return id === TERMINAL_SETUP_AUTH_METHOD_ID || type === "terminal" || type === "terminalauthmethod";
 }
 
