@@ -165,7 +165,7 @@ export function DetailColumn({
                 </div>
               ))
             ) : (
-              <div className="view-empty">No issue activity in the mock data.</div>
+              <div className="view-empty">No issue activity available.</div>
             )}
           </div>
         </div>

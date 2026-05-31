@@ -20,9 +20,18 @@ export function SidebarViews({
   variant: SidebarVariant;
 }) {
   const chatMessages = orchestratorChat ?? sidebar.chat;
+  const sidebarChatSubtitle = sidebar.runningAgents[0]
+    ? `${sidebar.runningAgents[0].id} · ${sidebar.runningAgents[0].issue}`
+    : undefined;
   const child =
     variant === "chat" ? (
-      <SidebarChat messages={chatMessages} loading={orchestratorChatLoading} error={orchestratorChatError} readOnly={orchestratorChatReadOnly} />
+      <SidebarChat
+        messages={chatMessages}
+        loading={orchestratorChatLoading}
+        error={orchestratorChatError}
+        readOnly={orchestratorChatReadOnly}
+        subtitle={sidebarChatSubtitle}
+      />
     ) : variant === "history" ? (
       <SidebarHistory sessions={sidebar.sessions} />
     ) : (
