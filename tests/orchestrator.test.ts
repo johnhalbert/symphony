@@ -5231,7 +5231,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => harness.runs.length === 1, "head-advanced repair dispatch");
     await orchestrator.stop();
 
     expect(pullRequestClient.branches[0]).toBe("symphony/TEST-1");
@@ -5898,7 +5898,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => harness.runs.length === 2, "continuation dispatch below event threshold", 5_000);
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(2);
@@ -5980,7 +5980,7 @@ describe("Orchestrator", () => {
     const storedLifecycle = await lifecycleStore.get(candidate.identifier);
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => harness.runs.length === 2, "continuation dispatch above event threshold", 5_000);
     await orchestrator.stop();
 
     expect(createdSummary.summaryReference.id).toContain("continuation-summary:issue-1:");
