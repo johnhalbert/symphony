@@ -2,7 +2,7 @@
 import path from "node:path";
 import { Command } from "commander";
 import { StatusServer } from "./app/http.js";
-import type { ServiceConfig } from "./core/config/Config.js";
+import { parseDatabaseConfig, type DatabaseConfig, type ServiceConfig } from "./core/config/Config.js";
 import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
 import { Orchestrator } from "./core/orchestrator/Orchestrator.js";
@@ -11,7 +11,12 @@ import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureD
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore } from "./core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
-import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
+import {
+  loadWorkflowEnvironment,
+  parseWorkflowFile,
+  readWorkflowFile,
+  WorkflowLoader,
+} from "./core/workflow/WorkflowLoader.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
@@ -27,6 +32,12 @@ import {
   resolveStatusMutationToken,
   resolveTrackerStateLists,
 } from "./app/RuntimeDependencies.js";
+import {
+  applyConfiguredPostgresMigrations,
+  validateConfiguredPostgresMigrations,
+  type PostgresMigrationApplyResult,
+  type PostgresMigrationValidationResult,
+} from "./core/database/PostgresMigrations.js";
 
 const program = new Command();
 
@@ -54,6 +65,28 @@ program
       console.log(formatDoctorResult(result));
     }
     if (!result.ok) process.exitCode = 2;
+  });
+
+program
+  .command("migrations:validate")
+  .description("Validate Postgres migration discovery and ordering without connecting to Postgres")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .option("--json", "print JSON output")
+  .action(async (workflow: string, options: { json?: boolean }) => {
+    const database = await loadDatabaseConfigForCli(workflow);
+    const result = await validateConfiguredPostgresMigrations({ database });
+    printMigrationValidationResult(result, options.json ?? false);
+  });
+
+program
+  .command("migrations:apply")
+  .description("Apply configured Postgres migrations to the configured database")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .option("--json", "print JSON output")
+  .action(async (workflow: string, options: { json?: boolean }) => {
+    const database = await loadDatabaseConfigForCli(workflow);
+    const result = await applyConfiguredPostgresMigrations({ database });
+    printMigrationApplyResult(result, options.json ?? false);
   });
 
 program
@@ -248,6 +281,37 @@ program.parseAsync().catch((error) => {
 
 function currentCliPath(): string {
   return path.resolve(process.argv[1] ?? "dist/cli.js");
+}
+
+async function loadDatabaseConfigForCli(workflow: string): Promise<DatabaseConfig> {
+  const workflowPath = path.resolve(process.cwd(), workflow);
+  const definition = parseWorkflowFile(await readWorkflowFile(workflowPath), workflowPath);
+  const env = await loadWorkflowEnvironment(workflowPath);
+  return parseDatabaseConfig(definition.config, workflowPath, env);
+}
+
+function printMigrationValidationResult(result: PostgresMigrationValidationResult, asJson: boolean): void {
+  if (asJson) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(
+    `Validated ${result.count} Postgres migration(s) in ${result.migrationsDir}: ${formatMigrationIds(result)}`,
+  );
+}
+
+function printMigrationApplyResult(result: PostgresMigrationApplyResult, asJson: boolean): void {
+  if (asJson) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(
+    `Applied ${result.applied.length} Postgres migration(s), skipped ${result.skipped.length} already-applied migration(s) in ${result.migrationsDir}: ${formatMigrationIds(result)}`,
+  );
+}
+
+function formatMigrationIds(result: PostgresMigrationValidationResult): string {
+  return result.migrations.length === 0 ? "none" : result.migrations.map((migration) => migration.id).join(", ");
 }
 
 function statusDashboardConfig(config: ServiceConfig) {

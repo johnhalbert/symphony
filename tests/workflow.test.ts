@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import YAML from "yaml";
-import { parseServiceConfig } from "../src/core/config/Config.js";
+import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
 import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
@@ -76,6 +76,14 @@ Work on {{ issue.identifier }}.`,
       searchEnabled: false,
       summarizationEnabled: false,
     });
+    expect(config.database).toEqual({
+      postgres: {
+        connectionString: null,
+        migrationsDir: path.resolve("/repo/migrations/postgres"),
+        migrationsTable: "symphony_schema_migrations",
+        ssl: false,
+      },
+    });
     expect(config.server).toEqual({
       port: null,
       host: "127.0.0.1",
@@ -120,6 +128,72 @@ Work on {{ issue.identifier }}.`,
       canceled: ["Cancelled", "Canceled", "Duplicate"],
     });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
+  });
+
+  it("parses database-only config for migration commands without requiring tracker credentials", () => {
+    const database = parseDatabaseConfig(
+      {
+        database: { postgres: { migrations_dir: "db/migrations" } },
+      },
+      "/repo/WORKFLOW.md",
+      {},
+    );
+
+    expect(database).toEqual({
+      postgres: {
+        connectionString: null,
+        migrationsDir: path.resolve("/repo/db/migrations"),
+        migrationsTable: "symphony_schema_migrations",
+        ssl: false,
+      },
+    });
+  });
+
+  it("parses optional Postgres database config without requiring a connection string", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        database: {
+          postgres: {
+            url: "$TEST_POSTGRES_URL",
+            migrations_dir: "db/migrations",
+            migrations_table: "symphony_migrations_test",
+            ssl: true,
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret", TEST_POSTGRES_URL: "postgres-url-from-env" },
+    );
+
+    expect(config.database.postgres).toEqual({
+      connectionString: "postgres-url-from-env",
+      migrationsDir: path.resolve("/repo/db/migrations"),
+      migrationsTable: "symphony_migrations_test",
+      ssl: true,
+    });
+
+    const absent = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+    expect(absent.database.postgres.connectionString).toBeNull();
+  });
+
+  it("rejects unsafe Postgres migration metadata table names", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          database: { postgres: { migrations_table: "symphony.schema_migrations" } },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("database.postgres.migrations_table must be a single PostgreSQL identifier");
   });
 
   it("loads workflow-local .env values for runtime config resolution", async () => {
