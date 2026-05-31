@@ -1,9 +1,47 @@
-import type { DashboardModel, DashboardTotals } from "../../types/symphony";
+import type {
+  DashboardBurnupMetrics,
+  DashboardMetrics,
+  DashboardModel,
+  DashboardTotals,
+} from "../../types/symphony";
+
+function textOr(value: string | null | undefined, fallback: string) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : fallback;
+}
+
+function textOrNull(value: string | null | undefined) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeSeries(series: number[] | null | undefined) {
+  return (series ?? []).filter((value) => Number.isFinite(value)).map((value) => Math.max(value, 0));
+}
+
+function hasChartSeries(burnup: DashboardBurnupMetrics | null | undefined) {
+  return normalizeSeries(burnup?.completedSeries).length >= 2 && normalizeSeries(burnup?.targetSeries).length >= 2;
+}
+
+function InlineUnavailable({ children }: { children: string }) {
+  return <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-3)", fontFamily: "var(--font-mono)" }}>{children}</div>;
+}
+
+function PanelUnavailable({ children }: { children: string }) {
+  return <div className="view-empty" style={{ minHeight: 132, display: "grid", placeItems: "center" }}>{children}</div>;
+}
 
 export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
   const totals = dashboard.totals;
   const runningCount = dashboard.runningAgents.length;
   const agentSlotCount = Math.max(dashboard.concurrencyCap, runningCount, 0);
+  const cycleMetrics = dashboard.metrics?.cycle;
+  const velocityMetrics = dashboard.metrics?.velocity;
+  const velocityValue = textOrNull(velocityMetrics?.valueLabel);
+  const velocityUnit = textOrNull(velocityMetrics?.unitLabel);
+  const velocityEta = textOrNull(velocityMetrics?.etaLabel);
+  const velocitySparkline = normalizeSeries(velocityMetrics?.sparkline);
+  const completenessDelta = textOrNull(cycleMetrics?.completenessDeltaLabel);
 
   return (
     <div className="stats">
@@ -16,7 +54,7 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
         <div className="completeness-bar">
           <div style={{ width: `${totals.completeness}%` }} />
         </div>
-        <div className="stat__delta stat__delta--up">▲ 12% this cycle</div>
+        <div className={completenessDelta ? "stat__delta stat__delta--up" : "stat__delta"}>{completenessDelta ?? "Trend unavailable"}</div>
       </div>
       <div className="stat">
         <div className="stat__label">Running agents</div>
@@ -57,18 +95,23 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
       <div className="stat">
         <div className="stat__label">Velocity / ETA</div>
         <div className="stat__value">
-          3.2<span className="suffix">PR/day</span>
+          {velocityValue ?? "—"}
+          {velocityUnit ? <span className="suffix">{velocityUnit}</span> : null}
         </div>
-        <div style={{ marginTop: 8 }}>
-          <Sparkline tiny />
-        </div>
-        <div className="stat__delta stat__delta--warn">ETA: cycle ends ~3 days early</div>
+        {velocitySparkline.length >= 2 ? (
+          <div style={{ marginTop: 8 }}>
+            <Sparkline tiny points={velocitySparkline} />
+          </div>
+        ) : (
+          <InlineUnavailable>Velocity trend unavailable</InlineUnavailable>
+        )}
+        <div className={velocityEta ? "stat__delta stat__delta--warn" : "stat__delta"}>{velocityEta ?? "ETA unavailable"}</div>
       </div>
     </div>
   );
 }
 
-export function StatsGridDense({ totals }: { totals: DashboardTotals }) {
+export function StatsGridDense({ totals, metrics }: { totals: DashboardTotals; metrics?: DashboardMetrics | null }) {
   return (
     <div className="stats" style={{ gridTemplateColumns: "repeat(6, 1fr)" }}>
       <DenseStat label="Done" value={totals.done} sub="this cycle" color="var(--st-done)" />
@@ -76,7 +119,7 @@ export function StatsGridDense({ totals }: { totals: DashboardTotals }) {
       <DenseStat label="In Progress" value={totals.progress} sub="running" color="var(--st-progress)" />
       <DenseStat label="Todo" value={totals.todo} sub="dispatchable" color="var(--st-todo)" />
       <DenseStat label="Backlog" value={totals.backlog} sub="" color="var(--st-backlog)" />
-      <DenseStat label="Completeness" value={`${totals.completeness}%`} sub="cycle 14" color="var(--accent)" emphasis />
+      <DenseStat label="Completeness" value={`${totals.completeness}%`} sub={textOr(metrics?.cycle?.label, "cycle unavailable")} color="var(--accent)" emphasis />
     </div>
   );
 }
@@ -108,17 +151,26 @@ function DenseStat({
   );
 }
 
-export function BurndownPanel({ totals, useModelBurnupTotals = true }: { totals: DashboardTotals; useModelBurnupTotals?: boolean }) {
+export function BurndownPanel({
+  totals,
+  metrics,
+}: {
+  totals: DashboardTotals;
+  metrics?: DashboardMetrics | null;
+  useModelBurnupTotals?: boolean;
+}) {
+  const burnup = metrics?.burnup;
+  const hasBurnup = hasChartSeries(burnup);
   return (
     <div className="panel" style={{ marginBottom: 0 }}>
       <div className="panel__head">
-        <span>Burn-up · Cycle 14</span>
+        <span>{textOr(burnup?.title, "Burn-up unavailable")}</span>
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>
-          {totals.done}/{totals.all} done · 7 days left
+          {totals.done}/{totals.all} done · {textOr(burnup?.remainingLabel, "schedule unavailable")}
         </span>
       </div>
       <div style={{ padding: "14px 18px 18px" }}>
-        <BurnupChart totals={useModelBurnupTotals ? totals : null} />
+        {hasBurnup && burnup ? <BurnupChart burnup={burnup} /> : <PanelUnavailable>Burn-up trend unavailable until the API provides cycle history.</PanelUnavailable>}
       </div>
     </div>
   );
@@ -126,6 +178,18 @@ export function BurndownPanel({ totals, useModelBurnupTotals = true }: { totals:
 
 export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel }) {
   const totals = dashboard.totals;
+  const cycle = dashboard.metrics?.cycle;
+  const velocity = dashboard.metrics?.velocity;
+  const health = dashboard.metrics?.health;
+  const cycleLabel = textOr(cycle?.label, "cycle unavailable");
+  const dateRange = textOr(cycle?.dateRange, "schedule unavailable");
+  const remainingLabel = textOr(cycle?.remainingLabel, "remaining unavailable");
+  const projectedCompletion = textOr(cycle?.projectedCompletionLabel, "unavailable");
+  const velocityLabel = velocityValueLabel(velocity?.valueLabel, velocity?.unitLabel);
+  const velocityTrend = textOr(velocity?.trendLabel, "backend metric unavailable");
+  const reviewQueue = textOr(health?.reviewQueueLabel, `${totals.review} issues in review · queue age unavailable`);
+  const healthState = textOr(health?.stateLabel, "status unavailable");
+  const errorSummary = textOr(health?.errorSummaryLabel, "errors unavailable");
 
   return (
     <div className="panel" style={{ borderRadius: 6, background: "#0a0a0c" }}>
@@ -133,51 +197,55 @@ export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase" }}>
           ./symphony status --branch {dashboard.branch || "--"}
         </span>
-        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--accent)" }}>● live</span>
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: health?.stateLabel ? "var(--accent)" : "var(--text-3)" }}>● {healthState}</span>
       </div>
       <div style={{ padding: "12px 16px 14px", fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.65 }}>
         <div>
-          <span style={{ color: "var(--text-3)" }}>cycle      </span> 14 · May 15 - May 29 · <span style={{ color: "var(--text)" }}>7 days remaining</span>
+          <span style={{ color: "var(--text-3)" }}>cycle      </span> {cycleLabel} · {dateRange} · <span style={{ color: "var(--text)" }}>{remainingLabel}</span>
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>completion </span> <span style={{ color: "var(--st-done)" }}>{totals.completeness}%</span> ({totals.done}/{totals.all}) · projected <span style={{ color: "var(--st-done)" }}>96%</span>
+          <span style={{ color: "var(--text-3)" }}>completion </span> <span style={{ color: "var(--st-done)" }}>{totals.completeness}%</span> ({totals.done}/{totals.all}) · projection <span style={{ color: cycle?.projectedCompletionLabel ? "var(--st-done)" : "var(--text-3)" }}>{projectedCompletion}</span>
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>velocity   </span> <span style={{ color: "var(--accent)" }}>3.2 PR/day</span> · 7d avg · 14d trend ↑
+          <span style={{ color: "var(--text-3)" }}>velocity   </span> <span style={{ color: velocity?.valueLabel ? "var(--accent)" : "var(--text-3)" }}>{velocityLabel}</span> · {velocityTrend}
         </div>
         <div>
           <span style={{ color: "var(--text-3)" }}>agents     </span> <span style={{ color: "var(--accent)" }}>{dashboard.agentUsageLabel}</span> · {dashboard.runningAgents.length} running / {dashboard.concurrencyCap} cap
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>review     </span> 3 issues in In Review agent queue · oldest 24m
+          <span style={{ color: "var(--text-3)" }}>review     </span> {reviewQueue}
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>health     </span> <span style={{ color: "var(--st-done)" }}>nominal</span> · {dashboard.pollLabel || "poll unavailable"} · 0 errors in 24h
+          <span style={{ color: "var(--text-3)" }}>health     </span> <span style={{ color: health?.stateLabel ? "var(--st-done)" : "var(--text-3)" }}>{healthState}</span> · {dashboard.pollLabel || "poll unavailable"} · {errorSummary}
         </div>
       </div>
     </div>
   );
 }
 
-const mockBurnupCompleted = [0, 2, 3, 5, 6, 8, 11, 13];
-const mockBurnupTarget = [0, 2.4, 4.8, 7.2, 9.6, 12, 14.4, 16.8];
-const mockBurnupCompletedEnd = 13;
-const mockBurnupTargetEnd = 17;
+function velocityValueLabel(value: string | null | undefined, unit: string | null | undefined) {
+  const valueLabel = textOrNull(value);
+  if (!valueLabel) return "unavailable";
+  const unitLabel = textOrNull(unit);
+  return unitLabel ? `${valueLabel} ${unitLabel}` : valueLabel;
+}
 
-function BurnupChart({ totals }: { totals: DashboardTotals | null }) {
+function BurnupChart({ burnup }: { burnup: DashboardBurnupMetrics }) {
   const width = 700;
   const height = 160;
-  const completedEnd = totals ? chartValue(totals.done) : mockBurnupCompletedEnd;
-  const targetEnd = totals ? chartValue(totals.all) : mockBurnupTargetEnd;
-  const max = Math.max(completedEnd, targetEnd, 1);
-  const completed = totals ? scaleSeries(mockBurnupCompleted, completedEnd) : mockBurnupCompleted;
-  const target = totals ? scaleSeries(mockBurnupTarget, targetEnd) : mockBurnupTarget;
-  const gridLines = totals ? [0, max / 3, (max / 3) * 2, max] : [0, 5, 10, 15];
-  const dx = (width - 30) / 13;
+  const completed = normalizeSeries(burnup.completedSeries);
+  const target = normalizeSeries(burnup.targetSeries);
+  const totalPoints = Math.max(Math.trunc(burnup.totalPoints ?? Math.max(completed.length, target.length, 2)), 2);
+  const currentIndex = clamp(Math.trunc(burnup.currentIndex ?? completed.length - 1), 0, totalPoints - 1);
+  const completedEnd = chartValue(burnup.completedEnd ?? completed[completed.length - 1] ?? 0);
+  const targetEnd = chartValue(burnup.targetEnd ?? target[target.length - 1] ?? completedEnd);
+  const max = Math.max(...completed, ...target, completedEnd, targetEnd, 1);
+  const gridLines = [0, max / 3, (max / 3) * 2, max];
+  const dx = (width - 30) / (totalPoints - 1);
   const sy = (y: number) => height - 18 - (y / max) * (height - 36);
   const sx = (i: number) => 18 + i * dx;
-  const pathCompleted = completed.map((y, index) => `${index ? "L" : "M"}${sx(index)},${sy(y)}`).join(" ");
-  const pathTarget = target.map((y, index) => `${index ? "L" : "M"}${sx(index)},${sy(y)}`).join(" ");
+  const pathCompleted = chartPath(completed, sx, sy);
+  const pathTarget = chartPath(target, sx, sy);
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height }}>
@@ -186,23 +254,24 @@ function BurnupChart({ totals }: { totals: DashboardTotals | null }) {
       ))}
       <path d={pathTarget} fill="none" stroke="var(--text-3)" strokeWidth="1.3" strokeDasharray="3 3" opacity="0.7" />
       <path d={pathCompleted} fill="none" stroke="var(--accent)" strokeWidth="2" />
-      <path d={`${pathCompleted} L${sx(7)},${sy(0)} L${sx(0)},${sy(0)} Z`} fill="var(--accent-soft)" />
+      <path d={`${pathCompleted} L${sx(currentIndex)},${sy(0)} L${sx(0)},${sy(0)} Z`} fill="var(--accent-soft)" />
       {completed.map((y, index) => (
         <circle key={index} cx={sx(index)} cy={sy(y)} r="2.5" fill="var(--accent)" />
       ))}
-      <path d={`M${sx(7)},${sy(completedEnd)} L${sx(13)},${sy(targetEnd)}`} stroke="var(--accent)" strokeWidth="1.5" strokeDasharray="2 3" opacity="0.55" />
-      <circle cx={sx(13)} cy={sy(targetEnd)} r="3" fill="none" stroke="var(--accent)" strokeWidth="1.5" />
-      <line x1={sx(7)} x2={sx(7)} y1="6" y2={height - 12} stroke="var(--border-strong)" strokeWidth="1" strokeDasharray="2 3" />
-      <text x={sx(7) + 4} y="16" fill="var(--text-3)" fontSize="10" fontFamily="var(--font-mono)">
+      <path d={`M${sx(currentIndex)},${sy(completedEnd)} L${sx(totalPoints - 1)},${sy(targetEnd)}`} stroke="var(--accent)" strokeWidth="1.5" strokeDasharray="2 3" opacity="0.55" />
+      <circle cx={sx(totalPoints - 1)} cy={sy(targetEnd)} r="3" fill="none" stroke="var(--accent)" strokeWidth="1.5" />
+      <line x1={sx(currentIndex)} x2={sx(currentIndex)} y1="6" y2={height - 12} stroke="var(--border-strong)" strokeWidth="1" strokeDasharray="2 3" />
+      <text x={sx(currentIndex) + 4} y="16" fill="var(--text-3)" fontSize="10" fontFamily="var(--font-mono)">
         today
       </text>
-      {["Day 1", "", "", "", "", "", "", "Day 7", "", "", "", "", "", "Day 14"].map((label, index) =>
-        label ? (
+      {Array.from({ length: totalPoints }).map((_, index) => {
+        const label = dayLabel(index, currentIndex, totalPoints);
+        return label ? (
           <text key={index} x={sx(index)} y={height - 2} textAnchor="middle" fill="var(--text-4)" fontSize="9.5" fontFamily="var(--font-mono)">
             {label}
           </text>
-        ) : null,
-      )}
+        ) : null;
+      })}
       <text x={width - 14} y={sy(targetEnd) + 3} textAnchor="end" fill="var(--text-3)" fontSize="9.5" fontFamily="var(--font-mono)">
         target {formatChartValue(targetEnd)}
       </text>
@@ -213,27 +282,37 @@ function BurnupChart({ totals }: { totals: DashboardTotals | null }) {
   );
 }
 
+function chartPath(points: number[], sx: (index: number) => number, sy: (value: number) => number) {
+  return points.map((y, index) => `${index ? "L" : "M"}${sx(index)},${sy(y)}`).join(" ");
+}
+
+function dayLabel(index: number, currentIndex: number, totalPoints: number) {
+  if (index === 0) return "Day 1";
+  if (index === currentIndex && index !== totalPoints - 1) return `Day ${index + 1}`;
+  if (index === totalPoints - 1) return `Day ${totalPoints}`;
+  return "";
+}
+
 function chartValue(value: number) {
   return Number.isFinite(value) ? Math.max(value, 0) : 0;
 }
 
-function scaleSeries(shape: number[], endValue: number) {
-  const shapeEnd = shape[shape.length - 1] ?? 1;
-  if (shapeEnd === 0) return shape.map(() => 0);
-  return shape.map((value) => (value / shapeEnd) * endValue);
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
 }
 
 function formatChartValue(value: number) {
   return Number.isInteger(value) ? `${value}` : value.toFixed(1);
 }
 
-export function Sparkline({ tiny }: { tiny?: boolean }) {
-  const points = [1, 3, 2, 4, 3, 5, 4, 6, 5, 7, 6, 3, 8, 5];
+export function Sparkline({ tiny, points = [] }: { tiny?: boolean; points?: number[] | null }) {
+  const safePoints = normalizeSeries(points);
+  if (safePoints.length < 2) return null;
   const width = tiny ? 120 : 240;
   const height = tiny ? 22 : 36;
-  const max = Math.max(...points);
-  const dx = width / (points.length - 1);
-  const path = points.map((y, index) => `${index ? "L" : "M"}${index * dx},${height - (y / max) * (height - 3) - 1}`).join(" ");
+  const max = Math.max(...safePoints, 1);
+  const dx = width / (safePoints.length - 1);
+  const path = safePoints.map((y, index) => `${index ? "L" : "M"}${index * dx},${height - (y / max) * (height - 3) - 1}`).join(" ");
   return (
     <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height }}>
       <path d={`${path} L${width},${height} L0,${height} Z`} fill="var(--accent-soft)" />

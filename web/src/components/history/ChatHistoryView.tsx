@@ -8,9 +8,11 @@ import { TranscriptPane } from "./TranscriptPane";
 export function ChatHistoryView({
   history,
   variant = "list",
+  refreshToken,
 }: {
   history: HistoryModel;
   variant?: HistoryVariant;
+  refreshToken?: unknown;
 }) {
   const [selectedSessionId, setSelectedSessionId] = useState(history.defaultSessionId);
   const selectedSession = history.sessions.find((candidate) => candidate.id === selectedSessionId);
@@ -28,13 +30,21 @@ export function ChatHistoryView({
   return (
     <div className="history">
       {variant !== "focused" ? <SessionsList sessions={history.sessions} selectedId={session.id} onSelect={setSelectedSessionId} /> : null}
-      <SelectedTranscript history={history} session={session} />
+      <SelectedTranscript history={history} session={session} refreshToken={refreshToken} />
     </div>
   );
 }
 
-function SelectedTranscript({ history, session }: { history: HistoryModel; session: HistoryModel["sessions"][number] }) {
-  const transcript = useTranscript(session.id);
+function SelectedTranscript({
+  history,
+  session,
+  refreshToken,
+}: {
+  history: HistoryModel;
+  session: HistoryModel["sessions"][number];
+  refreshToken?: unknown;
+}) {
+  const transcript = useTranscript(session.id, refreshToken);
   const embeddedMessages = history.transcriptBySession?.[session.id] ?? [];
   const messages = transcript.error ? [] : (transcript.data ?? embeddedMessages);
 
