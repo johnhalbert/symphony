@@ -693,8 +693,77 @@ async function seedLegacyProjectionSourceFreshness(containerName: string): Promi
         'upgrade-test',
         'legacy-source-freshness',
         1,
-        '[{"source":"linear","revision":"10","observedAt":"2026-01-02T03:03:05.000Z"}]'::jsonb,
-        '{"sourceFreshness":[{"source":"linear","status":"stale","checkedAt":"2026-01-02T03:04:05.000Z","revision":"10","lastSuccessAt":"2026-01-02T03:03:05.000Z","lastErrorAt":null,"staleMs":60000,"detail":"legacy cursor freshness"}]}'::jsonb,
+        jsonb_build_array(
+          jsonb_build_object('source', 'github', 'revision', 'gh-55', 'observedAt', '2026-01-02T03:04:05.000Z'),
+          jsonb_build_object('source', 'harness', 'revision', 'harness-run-7', 'observedAt', '2026-01-02T03:04:05.000Z'),
+          jsonb_build_object('source', 'linear', 'revision', 'lin-42', 'observedAt', '2026-01-02T03:04:05.000Z'),
+          jsonb_build_object('source', 'local', 'revision', 'local-snapshot-0', 'observedAt', null)
+        ),
+        jsonb_build_object(
+          'sourceFreshness',
+          jsonb_build_array(
+            jsonb_build_object(
+              'source', 'github',
+              'status', 'stale',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', 'gh-55',
+              'lastSuccessAt', '2026-01-02T03:00:05.000Z',
+              'lastErrorAt', null,
+              'staleMs', 240000,
+              'detail', 'legacy GitHub cursor is behind'
+            ),
+            jsonb_build_object(
+              'source', 'harness',
+              'status', 'error',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', 'harness-run-7',
+              'lastSuccessAt', null,
+              'lastErrorAt', '2026-01-02T03:04:05.000Z',
+              'staleMs', null,
+              'detail', 'legacy harness transcript ingest failed'
+            ),
+            jsonb_build_object(
+              'source', 'linear',
+              'status', 'fresh',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', 'lin-42',
+              'lastSuccessAt', '2026-01-02T03:04:05.000Z',
+              'lastErrorAt', null,
+              'staleMs', null,
+              'detail', 'legacy Linear import is current'
+            ),
+            jsonb_build_object(
+              'source', 'local',
+              'status', 'never_synced',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', null,
+              'lastSuccessAt', null,
+              'lastErrorAt', null,
+              'staleMs', null,
+              'detail', 'legacy local snapshot has not run'
+            ),
+            jsonb_build_object(
+              'source', 'runs',
+              'status', 'loading',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', null,
+              'lastSuccessAt', null,
+              'lastErrorAt', null,
+              'staleMs', null,
+              'detail', 'legacy run projection is loading'
+            ),
+            jsonb_build_object(
+              'source', 'workspaces',
+              'status', 'empty',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', 0,
+              'lastSuccessAt', '2026-01-02T03:04:05.000Z',
+              'lastErrorAt', null,
+              'staleMs', null,
+              'detail', 'legacy workspace source is empty'
+            )
+          )
+        ),
         'legacy-source-freshness-sha',
         '2026-01-02T03:04:05.000Z'
       );
@@ -785,14 +854,64 @@ async function expectLegacyProjectionSourceFreshnessMigrated(containerName: stri
   );
   expect(JSON.parse(sourceFreshness.trim())).toEqual([
     {
-      source: "linear",
+      source: "github",
       status: "stale",
       checkedAt: "2026-01-02T03:04:05.000Z",
-      revision: "10",
-      lastSuccessAt: "2026-01-02T03:03:05.000Z",
+      revision: "gh-55",
+      lastSuccessAt: "2026-01-02T03:00:05.000Z",
       lastErrorAt: null,
-      staleMs: 60_000,
-      detail: "legacy cursor freshness",
+      staleMs: 240_000,
+      detail: "legacy GitHub cursor is behind",
+    },
+    {
+      source: "harness",
+      status: "error",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: "harness-run-7",
+      lastSuccessAt: null,
+      lastErrorAt: "2026-01-02T03:04:05.000Z",
+      staleMs: null,
+      detail: "legacy harness transcript ingest failed",
+    },
+    {
+      source: "linear",
+      status: "fresh",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: "lin-42",
+      lastSuccessAt: "2026-01-02T03:04:05.000Z",
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "legacy Linear import is current",
+    },
+    {
+      source: "local",
+      status: "never_synced",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: null,
+      lastSuccessAt: null,
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "legacy local snapshot has not run",
+    },
+    {
+      source: "runs",
+      status: "loading",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: null,
+      lastSuccessAt: null,
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "legacy run projection is loading",
+    },
+    {
+      source: "workspaces",
+      status: "empty",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: 0,
+      lastSuccessAt: "2026-01-02T03:04:05.000Z",
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "legacy workspace source is empty",
     },
   ]);
 }

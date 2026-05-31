@@ -124,6 +124,182 @@ describe("ProjectionTransactionService", () => {
     unsubscribe();
   });
 
+  it("normalizes, persists, and publishes freshness statuses for independent projection sources", async () => {
+    const store = new InMemoryProjectionTransactionStore();
+    const service = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });
+    const publications: unknown[] = [];
+    service.onProjectionChanged((event) => publications.push(event));
+
+    const expectedSourceFreshness = [
+      {
+        source: "github",
+        status: "stale",
+        checkedAt: fixedTime,
+        revision: "gh-55",
+        lastSuccessAt: "2026-01-02T03:00:05.000Z",
+        lastErrorAt: null,
+        staleMs: 240_000,
+        detail: "GitHub webhook cursor is behind",
+      },
+      {
+        source: "harness",
+        status: "error",
+        checkedAt: fixedTime,
+        revision: "harness-run-7",
+        lastSuccessAt: null,
+        lastErrorAt: fixedTime,
+        staleMs: null,
+        detail: "Harness transcript ingest failed",
+      },
+      {
+        source: "linear",
+        status: "fresh",
+        checkedAt: fixedTime,
+        revision: "lin-42",
+        lastSuccessAt: fixedTime,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "Linear import is current",
+      },
+      {
+        source: "local",
+        status: "never_synced",
+        checkedAt: fixedTime,
+        revision: null,
+        lastSuccessAt: null,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "Local workspace snapshot has not run",
+      },
+      {
+        source: "runs",
+        status: "loading",
+        checkedAt: fixedTime,
+        revision: null,
+        lastSuccessAt: null,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "Run projection is still loading",
+      },
+      {
+        source: "workspaces",
+        status: "empty",
+        checkedAt: fixedTime,
+        revision: 0,
+        lastSuccessAt: fixedTime,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "No workspace rows are available yet",
+      },
+    ];
+
+    const first = await service.writeProjection({
+      projectionName: "dashboard_projection",
+      payload: { agents: [] },
+      sourceRevisions: [
+        { source: "linear", revision: "lin-42", observedAt: fixedTime },
+        { source: "github", revision: "gh-55", observedAt: fixedTime },
+        { source: "harness", revision: "harness-run-7", observedAt: fixedTime },
+        { source: "local", revision: "local-snapshot-0", observedAt: null },
+      ],
+      sourceFreshness: [
+        {
+          source: "linear",
+          status: "fresh",
+          revision: "lin-42",
+          detail: "Linear import is current",
+        },
+        {
+          source: "github",
+          status: "stale",
+          revision: "gh-55",
+          lastSuccessAt: "2026-01-02T03:00:05.000Z",
+          detail: "GitHub webhook cursor is behind",
+        },
+        {
+          source: "harness",
+          status: "failed",
+          revision: "harness-run-7",
+          detail: "Harness transcript ingest failed",
+        },
+        {
+          source: "local",
+          status: "never-synced",
+          detail: "Local workspace snapshot has not run",
+        },
+        {
+          source: "runs",
+          status: "pending",
+          detail: "Run projection is still loading",
+        },
+        {
+          source: "workspaces",
+          status: "empty",
+          revision: 0,
+          detail: "No workspace rows are available yet",
+        },
+      ],
+    });
+    const repeated = await service.writeProjection({
+      projectionName: "dashboard_projection",
+      payload: { agents: [] },
+      sourceRevisions: [
+        { source: "github", revision: "gh-55", observedAt: fixedTime },
+        { source: "harness", revision: "harness-run-7", observedAt: fixedTime },
+        { source: "linear", revision: "lin-42", observedAt: fixedTime },
+        { source: "local", revision: "local-snapshot-0", observedAt: null },
+      ],
+      sourceFreshness: [
+        {
+          source: "github",
+          status: "stale",
+          revision: "gh-55",
+          lastSuccessAt: "2026-01-02T03:00:05.000Z",
+          detail: "GitHub webhook cursor is behind",
+        },
+        {
+          source: "harness",
+          status: "error",
+          revision: "harness-run-7",
+          detail: "Harness transcript ingest failed",
+        },
+        {
+          source: "linear",
+          status: "fresh",
+          revision: "lin-42",
+          detail: "Linear import is current",
+        },
+        {
+          source: "local",
+          status: "never_synced",
+          detail: "Local workspace snapshot has not run",
+        },
+        {
+          source: "runs",
+          status: "loading",
+          detail: "Run projection is still loading",
+        },
+        {
+          source: "workspaces",
+          status: "empty",
+          revision: 0,
+          detail: "No workspace rows are available yet",
+        },
+      ],
+    });
+    const current = await service.readCurrentRevision({ projectionName: "dashboard_projection" });
+
+    expect(first.status).toBe("written");
+    expect(repeated.status).toBe("unchanged");
+    expect(repeated.revision.projectionRevisionId).toBe(first.revision.projectionRevisionId);
+    expect(store.revisions()).toHaveLength(1);
+    expect(first.revision.sourceFreshness).toEqual(expectedSourceFreshness);
+    expect(first.revision.sourceCursors.sourceFreshness).toEqual(expectedSourceFreshness);
+    expect(current?.sourceFreshness).toEqual(expectedSourceFreshness);
+    expect(publications).toHaveLength(1);
+    expect((publications[0] as { sourceFreshness?: unknown }).sourceFreshness).toEqual(expectedSourceFreshness);
+  });
+
   it("keeps revisions monotonic across service instances and concurrent updates", async () => {
     const store = new InMemoryProjectionTransactionStore();
     const firstProcess = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });

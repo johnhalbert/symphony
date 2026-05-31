@@ -80,7 +80,7 @@ export function projectionSourceFreshnessFromRevisions(
     return {
       source: revision.source,
       status,
-      checkedAt: options.defaultCheckedAt,
+      checkedAt: observedAt ?? options.defaultCheckedAt,
       revision: revision.revision,
       lastSuccessAt: observedAt,
       detail: freshnessDetailForRevision(revision.source, status, revisionText),

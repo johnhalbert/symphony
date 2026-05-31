@@ -986,7 +986,7 @@ function normalizeGitHubAppConfig(
 
   const hasExplicitConfig = rawApp !== undefined;
   const hasEnvironmentConfig = Boolean(
-    appId || clientId || installationId || privateKey.value || privateKey.envVar || privateKeyPath,
+    appId || installationId || privateKey.value || privateKey.envVar || privateKeyPath,
   );
   if (!hasExplicitConfig && !hasEnvironmentConfig) return null;
 

@@ -14,6 +14,7 @@ import {
   projectWebOrchestratorChatPost,
   projectWebReferenceData,
   projectWebSidebar,
+  type ChatMessage,
   type DashboardRuntimeConfig,
 } from "./webProjection.js";
 import {
@@ -49,6 +50,7 @@ import {
   compareRunChronology,
   type RunRecord,
   type RunTranscriptStore,
+  type TranscriptPage,
   type TranscriptEvent,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
@@ -95,6 +97,12 @@ import {
   type WebProjectionRevisionUnsubscribe,
   type WebProjectionSourceRevision,
 } from "./WebProjectionContext.js";
+import { RealtimeProjectionEventBus } from "./RealtimeProjectionEvents.js";
+import type {
+  ProjectionPayloadWriteInput,
+  ProjectionSourceRevision,
+  ProjectionWriteResult,
+} from "../core/persistence/ProjectionTransactionService.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -119,6 +127,10 @@ type StatusServerWritebackOutbox = Pick<FileWritebackOutboxStore, "list"> &
 interface StatusServerProjectionRevisionStore {
   projectionRevision(): number;
   onProjectionChanged(listener: (event: { source: string; revision: number }) => void): () => void;
+}
+
+export interface StatusServerProjectionWriter {
+  writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult>;
 }
 
 export interface StatusServerWebProjectionContextBuildInput {
@@ -173,6 +185,7 @@ export interface StatusServerOptions {
   webProjectionContextClock?: WebProjectionClock;
   webProjectionContextBuilder?: StatusServerWebProjectionContextBuilder;
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
+  projectionWriter?: StatusServerProjectionWriter;
 }
 
 export class StatusServer {
@@ -183,8 +196,11 @@ export class StatusServer {
   private readonly webAssetsRoot: string | null;
   private readonly webProjectionRevisionProviders: readonly WebProjectionRevisionProvider[];
   private readonly webProjectionRevisionUnsubscribes: WebProjectionRevisionUnsubscribe[] = [];
+  private readonly realtimeEvents = new RealtimeProjectionEventBus();
   private readonly webProjectionEventClients = new Map<number, WebProjectionEventClient>();
   private readonly pendingWebOrchestratorChatMessagePosts = new Map<string, Promise<unknown>>();
+  private lastPublishedTrackerSourceStatusKey: string | null = null;
+  private trackerSourceStatusRevision = 0;
   private nextWebProjectionEventClientId = 1;
   private webProjectionDirtyGeneration = 0;
 
@@ -214,6 +230,7 @@ export class StatusServer {
   }
 
   async stop(): Promise<void> {
+    this.realtimeEvents.closeAllStreams();
     if (!this.server) {
       this.unsubscribeWebProjectionRevisionListeners();
       return;
@@ -230,12 +247,17 @@ export class StatusServer {
     }
   }
 
+  activeRealtimeSubscriberCount(): number {
+    return this.realtimeEvents.subscriberCount();
+  }
+
   private registerWebProjectionRevisionListeners(): void {
     if (this.webProjectionRevisionUnsubscribes.length > 0) return;
     for (const provider of this.webProjectionRevisionProviders) {
       if (!provider.subscribe) continue;
       const unsubscribe = provider.subscribe((revision) => {
         this.markCompletedWebProjectionContextDirty(revision);
+        this.realtimeEvents.publishProjectionRevision(revision);
       });
       this.webProjectionRevisionUnsubscribes.push(unsubscribe);
     }
@@ -312,6 +334,44 @@ export class StatusServer {
     }
   }
 
+  private publishTrackerSourceStatusIfChanged(sourceIndex: BuiltWebProjectionSourceIndex): void {
+    const trackerIssues = sourceIndex.trackerIssues;
+    const statusKey = trackerSourceStatusKey(trackerIssues);
+    if (statusKey === this.lastPublishedTrackerSourceStatusKey) return;
+    this.lastPublishedTrackerSourceStatusKey = statusKey;
+    this.trackerSourceStatusRevision += 1;
+    this.realtimeEvents.publish({
+      type: "source.status",
+      source: {
+        source: "trackerIssues",
+        revision: this.trackerSourceStatusRevision,
+        observedAt: trackerIssues.fetchedAt,
+      },
+      detail: {
+        source: "trackerIssues",
+        status: trackerIssues.status,
+        fetchedStates: trackerIssues.fetchedStates,
+        fetchedAt: trackerIssues.fetchedAt,
+        cached: trackerIssues.cached,
+        error: trackerIssues.error
+          ? { code: trackerIssues.error.code, message: trackerIssues.error.message }
+          : null,
+        issueCount: trackerIssues.issues.length,
+      },
+    });
+  }
+
+  private handleRealtime(request: IncomingMessage, response: ServerResponse, url: URL): void {
+    const stream = this.realtimeEvents.openSseStream({
+      response,
+      lastEventId: realtimeLastEventId(request, url),
+    });
+    const close = (): void => stream.close();
+    request.on("aborted", close);
+    response.on("close", close);
+    response.on("error", close);
+  }
+
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
@@ -348,6 +408,10 @@ export class StatusServer {
           ),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/realtime") {
+        this.handleRealtime(request, response, url);
         return;
       }
       const webIssueMatch = /^\/api\/v1\/web\/issues\/([^/]+)$/.exec(url.pathname);
@@ -423,15 +487,23 @@ export class StatusServer {
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/issues") {
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
+        const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
         let board: IssueBoardResponse | null = null;
-        try {
-          board = await this.fetchIssueBoard(forceRefresh);
-        } catch (error) {
-          if (!(error instanceof SymphonyError) || (error.code !== "tracker_error" && error.code !== "tracker_unavailable")) {
-            throw error;
+        if (projection) {
+          try {
+            board = await this.buildIssueBoardFromSourceIndex(projection.sourceIndex, projection.issueBoardColumns);
+          } catch (error) {
+            if (!(error instanceof SymphonyError) || (error.code !== "tracker_error" && error.code !== "tracker_unavailable")) {
+              throw error;
+            }
           }
         }
-        sendJson(response, 200, projectWebIssueBoard(board));
+        const issues = projectWebIssueBoard(board);
+        await this.persistWebIssueBoardProjection(issues, {
+          sourceIndex: projection?.sourceIndex ?? null,
+          issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
+        });
+        sendJson(response, 200, issues);
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/issue-board") {
@@ -476,13 +548,18 @@ export class StatusServer {
           sendJson(response, 200, []);
           return;
         }
-        sendJson(response, 200, projectWebTranscript(await readBoundedWebTranscript(this.options.runStore, run.runId, url), { run }));
+        const transcriptPage = await readBoundedWebTranscriptPage(this.options.runStore, run.runId, url);
+        const transcript = projectWebTranscript(transcriptPage.events, { run });
+        await this.persistWebTranscriptProjection(run, transcriptPage, transcript);
+        sendJson(response, 200, transcript);
         return;
       }
       if (url.pathname === "/api/v1/web/orchestrator-chat") {
         const conversationId = parseWebOrchestratorChatConversationId(url.searchParams.get("conversationId"));
         if (request.method === "GET") {
-          sendJson(response, 200, projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages(conversationId)));
+          const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages(conversationId));
+          await this.persistWebOrchestratorChatProjection(chat, conversationId);
+          sendJson(response, 200, chat);
           return;
         }
         if (request.method === "POST") {
@@ -521,6 +598,18 @@ export class StatusServer {
             ...(postConversationId === undefined ? {} : { conversationId: postConversationId }),
             ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
           });
+          const chat = webOrchestratorChatProjectionFromResponseBody(result.body);
+          if (chat) {
+            await this.persistWebOrchestratorChatProjection(chat, postConversationId);
+            if (chat.length > 0 && result.status !== 200) {
+              this.realtimeEvents.publishOrchestratorMessage({
+                inputLength: input.input.length,
+                messageCount: chat.length,
+                conversationId: postConversationId ?? DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+                status: result.status,
+              });
+            }
+          }
           sendJson(response, result.status, result.body);
           return;
         }
@@ -1049,12 +1138,18 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: 20 },
       includeTranscriptEvents: false,
     });
-    return projectWebDashboard({
+    const dashboard = projectWebDashboard({
       runtime: snapshot,
       board,
       activity,
       config: this.options.dashboard ?? null,
     });
+    await this.persistWebDashboardProjection(dashboard, {
+      sourceIndex,
+      activityCount: activity.activity.length,
+      issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
+    });
+    return dashboard;
   }
 
   private async fetchWebOrchestratorChatMessages(
@@ -1311,17 +1406,22 @@ export class StatusServer {
       includeTranscriptEvents: false,
     });
     const dashboardActivity = previewActivityFeed(historyActivity, 20);
-    return projectWebSidebar(
-      projectWebDashboard({
-        runtime: snapshot,
-        board,
-        activity: dashboardActivity,
-        config: this.options.dashboard ?? null,
-      }),
-      projectWebIssueBoard(board),
-      projectWebHistory(activitySources.runs, historyActivity.activity),
-      projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages()),
-    );
+    const dashboard = projectWebDashboard({
+      runtime: snapshot,
+      board,
+      activity: dashboardActivity,
+      config: this.options.dashboard ?? null,
+    });
+    const issues = projectWebIssueBoard(board);
+    const history = projectWebHistory(activitySources.runs, historyActivity.activity);
+    const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
+    const sidebar = projectWebSidebar(dashboard, issues, history, chat);
+    await this.persistWebSidebarProjection(sidebar, {
+      sourceIndex,
+      activityCount: historyActivity.activity.length,
+      issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
+    });
+    return sidebar;
   }
 
   private async fetchWebHistory(forceRefresh: boolean, url: URL) {
@@ -1345,7 +1445,181 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: limits.timelineLimit },
       includeTranscriptEvents: false,
     });
-    return projectWebHistory(runs, activityFeed.activity);
+    const history = projectWebHistory(runs, activityFeed.activity);
+    await this.persistWebHistoryProjection(history, {
+      sourceIndex,
+      limits,
+      activityCount: activityFeed.activity.length,
+    });
+    return history;
+  }
+
+  private async persistWebDashboardProjection(
+    dashboard: ReturnType<typeof projectWebDashboard>,
+    input: {
+      sourceIndex: BuiltWebProjectionSourceIndex | null;
+      activityCount: number;
+      issueBoardColumns: IssueBoardColumnMapping;
+    },
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "dashboard_projection",
+      scopeKind: "global",
+      scopeKey: "global",
+      payload: dashboard,
+      sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceCursors: {
+        generatedAt: input.sourceIndex?.generatedAt ?? null,
+        issueCount: dashboard.totals.all,
+        openIssueCount: dashboard.totals.open,
+        runningAgentCount: dashboard.runningAgents.length,
+        providerGateCount: dashboard.providerGates.length,
+        activityCount: input.activityCount,
+        issueBoardColumns: input.issueBoardColumns,
+      },
+      fields: { messageCount: dashboard.activity.length },
+    });
+  }
+
+  private async persistWebIssueBoardProjection(
+    issues: ReturnType<typeof projectWebIssueBoard>,
+    input: { sourceIndex: BuiltWebProjectionSourceIndex | null; issueBoardColumns: IssueBoardColumnMapping },
+  ): Promise<void> {
+    const fetchedStates = webProjectionIssueBoardFetchStates(input.issueBoardColumns);
+    await this.persistProjection({
+      projectionName: "issue_board_projection",
+      scopeKind: "board",
+      scopeKey: "default-board",
+      payload: issues,
+      sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceCursors: {
+        generatedAt: input.sourceIndex?.generatedAt ?? null,
+        issueCount: issues.issues.length,
+        laneCounts: Object.fromEntries(Object.entries(issues.lanes).map(([lane, cards]) => [lane, cards.length])),
+        fetchedStates,
+        issueBoardColumns: input.issueBoardColumns,
+      },
+      fields: {
+        fetchedStates,
+        messageCount: issues.issues.length,
+      },
+    });
+  }
+
+  private async persistWebSidebarProjection(
+    sidebar: ReturnType<typeof projectWebSidebar>,
+    input: {
+      sourceIndex: BuiltWebProjectionSourceIndex | null;
+      activityCount: number;
+      issueBoardColumns: IssueBoardColumnMapping;
+    },
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "sidebar_projection",
+      scopeKind: "global",
+      scopeKey: "global",
+      payload: sidebar,
+      sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceCursors: {
+        generatedAt: input.sourceIndex?.generatedAt ?? null,
+        runningAgentCount: sidebar.runningAgents.length,
+        reviewIssueCount: sidebar.reviewIssues.length,
+        sessionCount: sidebar.sessions.length,
+        chatMessageCount: sidebar.chat.length,
+        activityCount: input.activityCount,
+        issueBoardColumns: input.issueBoardColumns,
+      },
+      fields: { messageCount: sidebar.activity.length },
+    });
+  }
+
+  private async persistWebHistoryProjection(
+    history: ReturnType<typeof projectWebHistory>,
+    input: {
+      sourceIndex: BuiltWebProjectionSourceIndex | null;
+      limits: { sessionLimit: number; timelineLimit: number };
+      activityCount: number;
+    },
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "history_projection",
+      scopeKind: "global_collection",
+      scopeKey: historyProjectionScopeKey(input.limits),
+      payload: history,
+      sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceCursors: {
+        sessionLimit: input.limits.sessionLimit,
+        timelineLimit: input.limits.timelineLimit,
+        sessionCount: history.sessions.length,
+        timelineCount: history.timeline.length,
+        activityCount: input.activityCount,
+        defaultSessionId: history.defaultSessionId,
+        runIds: history.sessions.map((session) => session.runSession.runId),
+      },
+      fields: {
+        messageCount: history.sessions.length,
+      },
+    });
+  }
+
+  private async persistWebTranscriptProjection(
+    run: RunRecord,
+    page: TranscriptPage,
+    transcript: ReturnType<typeof projectWebTranscript>,
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "transcript_projection",
+      scopeKind: "run_page",
+      scopeKey: transcriptProjectionScopeKey(run, page),
+      payload: transcript,
+      sourceRevisions: statusServerTranscriptProjectionSourceRevisions(this.options.runStore, run, page),
+      sourceCursors: transcriptProjectionSourceCursors(run, page),
+      fields: {
+        issueKey: run.issueIdentifier || run.issueId,
+        runId: run.runId,
+        sessionId: run.sessionId,
+        offsetStart: page.offset,
+        offsetLimit: page.limit,
+        nextOffset: page.nextOffset,
+        messageCount: transcript.length,
+      },
+    });
+  }
+
+  private async persistWebOrchestratorChatProjection(
+    chat: readonly ChatMessage[],
+    conversationId?: string | null,
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "orchestrator_chat_projection",
+      scopeKind: "conversation",
+      scopeKey: orchestratorChatProjectionScopeKey(conversationId),
+      payload: chat,
+      sourceRevisions: statusServerOrchestratorChatProjectionSourceRevisions(
+        this.options.orchestratorConversationStore,
+        chat,
+        conversationId,
+      ),
+      sourceCursors: orchestratorChatProjectionSourceCursors(chat, conversationId),
+      fields: {
+        conversationKey: orchestratorChatProjectionScopeKey(conversationId),
+        issueKey: firstChatMetadataString(chat, "issueKey", "issueIdentifier"),
+        runId: firstChatMetadataString(chat, "runId"),
+        messageCount: chat.length,
+      },
+    });
+  }
+
+  private async persistProjection(input: ProjectionPayloadWriteInput): Promise<void> {
+    const writer = this.options.projectionWriter;
+    if (!writer) return;
+    try {
+      await writer.writeProjection(input);
+    } catch {
+      // Durable projection rows are cache/read-model side effects. The status API
+      // response is derived from canonical stores during this transition phase,
+      // so projection persistence failures must not make the UI unavailable.
+    }
   }
 
   private async fetchOptionalWebProjectionSourceIndex(forceRefresh: boolean): Promise<{
@@ -1445,10 +1719,12 @@ export class StatusServer {
     issueBoardColumns: IssueBoardColumnMapping;
   }> {
     const acquired = await this.acquireWebProjectionContextEntry(forceRefresh);
+    const sourceIndex = acquired.reusedCompleted
+      ? webProjectionSourceIndexWithTrackerCacheHit(acquired.context.sourceIndex)
+      : acquired.context.sourceIndex;
+    this.publishTrackerSourceStatusIfChanged(sourceIndex);
     return {
-      sourceIndex: acquired.reusedCompleted
-        ? webProjectionSourceIndexWithTrackerCacheHit(acquired.context.sourceIndex)
-        : acquired.context.sourceIndex,
+      sourceIndex,
       issueBoardColumns: this.resolveWebProjectionIssueBoardColumns(),
     };
   }
@@ -1657,6 +1933,134 @@ function isStatusServerProjectionRevisionStore(store: unknown): store is StatusS
   );
 }
 
+function statusServerProjectionSourceRevisions(
+  sourceIndex: BuiltWebProjectionSourceIndex | null,
+  options: Pick<StatusServerOptions, "runStore" | "lifecycleStore" | "writebackOutbox">,
+): ProjectionSourceRevision[] {
+  if (sourceIndex) return sourceIndex.durableSourceRevisions.map(toProjectionSourceRevision);
+  return [
+    statusServerStoreProjectionSourceRevision("runs", options.runStore),
+    statusServerStoreProjectionSourceRevision("lifecycles", options.lifecycleStore),
+    statusServerStoreProjectionSourceRevision("writebacks", options.writebackOutbox),
+  ].filter((revision): revision is ProjectionSourceRevision => revision !== null);
+}
+
+function statusServerTranscriptProjectionSourceRevisions(
+  runStore: RunTranscriptStore | undefined,
+  run: RunRecord,
+  page: TranscriptPage,
+): ProjectionSourceRevision[] {
+  const runStoreRevision = statusServerStoreProjectionSourceRevision("runs", runStore) ?? {
+    source: "runs",
+    revision: [run.status, run.updatedAt, run.transcriptEventCount ?? "unknown"].join(":"),
+    observedAt: run.updatedAt,
+  };
+  const lastEvent = page.events.at(-1) ?? null;
+  const totalEventCount = Math.max(run.transcriptEventCount ?? 0, page.nextOffset ?? page.offset + page.events.length);
+  return [
+    runStoreRevision,
+    {
+      source: `transcript:${run.runId}`,
+      revision: [totalEventCount, lastEvent?.sequence ?? "none", lastEvent?.at ?? run.updatedAt].join(":"),
+      observedAt: lastEvent?.at ?? run.updatedAt,
+    },
+  ];
+}
+
+function statusServerOrchestratorChatProjectionSourceRevisions(
+  store: OrchestratorConversationStore | undefined,
+  chat: readonly ChatMessage[],
+  conversationId?: string | null,
+): ProjectionSourceRevision[] {
+  const storeRevision = statusServerStoreProjectionSourceRevision("orchestrator_conversations", store);
+  const lastMessage = chat.at(-1) ?? null;
+  const conversationKey = orchestratorChatProjectionScopeKey(conversationId);
+  const chatRevision: ProjectionSourceRevision = {
+    source: `orchestrator_chat:${conversationKey}`,
+    revision: [chat.length, lastMessage?.id ?? "none", lastMessage?.updatedAt ?? lastMessage?.createdAt ?? "unknown"].join(":"),
+    observedAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null,
+  };
+  return storeRevision ? [storeRevision, chatRevision] : [chatRevision];
+}
+
+function statusServerStoreProjectionSourceRevision(source: string, store: unknown): ProjectionSourceRevision | null {
+  if (!isStatusServerProjectionRevisionStore(store)) return null;
+  return { source, revision: store.projectionRevision(), observedAt: null };
+}
+
+function toProjectionSourceRevision(revision: WebProjectionSourceRevision): ProjectionSourceRevision {
+  return { source: revision.source, revision: revision.revision, observedAt: revision.observedAt };
+}
+
+function historyProjectionScopeKey(limits: { sessionLimit: number; timelineLimit: number }): string {
+  return `global:session:${limits.sessionLimit}:timeline:${limits.timelineLimit}`;
+}
+
+function transcriptProjectionScopeKey(run: RunRecord, page: TranscriptPage): string {
+  return `${run.runId}:offset:${page.offset}:limit:${page.limit}`;
+}
+
+function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage): Record<string, unknown> {
+  const firstEvent = page.events[0] ?? null;
+  const lastEvent = page.events.at(-1) ?? null;
+  return {
+    runId: run.runId,
+    sessionId: run.sessionId,
+    issueKey: run.issueIdentifier || run.issueId,
+    offset: page.offset,
+    limit: page.limit,
+    nextOffset: page.nextOffset,
+    eventCount: page.events.length,
+    firstSequence: firstEvent?.sequence ?? null,
+    lastSequence: lastEvent?.sequence ?? null,
+    lastEventAt: lastEvent?.at ?? null,
+  };
+}
+
+function orchestratorChatProjectionScopeKey(conversationId?: string | null): string {
+  const trimmed = conversationId?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_ORCHESTRATOR_CONVERSATION_ID;
+}
+
+function orchestratorChatProjectionSourceCursors(
+  chat: readonly ChatMessage[],
+  conversationId?: string | null,
+): Record<string, unknown> {
+  const lastMessage = chat.at(-1) ?? null;
+  return {
+    conversationKey: orchestratorChatProjectionScopeKey(conversationId),
+    messageCount: chat.length,
+    lastMessageId: lastMessage?.id ?? null,
+    lastMessageStatus: lastMessage?.status ?? null,
+    lastMessageAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null,
+  };
+}
+
+function webOrchestratorChatProjectionFromResponseBody(body: unknown): ChatMessage[] | null {
+  if (isWebOrchestratorChatProjection(body)) return body;
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const chat = (body as { chat?: unknown }).chat;
+    if (isWebOrchestratorChatProjection(chat)) return chat;
+  }
+  return null;
+}
+
+function isWebOrchestratorChatProjection(value: unknown): value is ChatMessage[] {
+  return Array.isArray(value) && value.every((item) => item && typeof item === "object" && typeof (item as ChatMessage).text === "string");
+}
+
+function firstChatMetadataString(chat: readonly ChatMessage[], ...keys: readonly string[]): string | null {
+  for (const message of chat) {
+    const metadata = message.metadata;
+    if (!metadata) continue;
+    for (const key of keys) {
+      const value = metadata[key];
+      if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    }
+  }
+  return null;
+}
+
 const STATUS_SERVER_WEB_PROJECTION_COLUMN_IDS: readonly IssueBoardColumnId[] = [
   "backlog",
   "todo",
@@ -1727,6 +2131,28 @@ function webProjectionSourceIndexWithTrackerCacheHit(
   };
 }
 
+function trackerSourceStatusKey(trackerIssues: BuiltWebProjectionSourceIndex["trackerIssues"]): string {
+  return JSON.stringify({
+    status: trackerIssues.status,
+    fetchedStateKey: trackerIssues.fetchedStateKey,
+    fetchedAt: trackerIssues.fetchedAt,
+    cached: trackerIssues.cached,
+    error: trackerIssues.error ? { code: trackerIssues.error.code, message: trackerIssues.error.message } : null,
+    issueCount: trackerIssues.issues.length,
+    latestIssueRevision: latestTrackerIssueRevision(trackerIssues.issues),
+  });
+}
+
+function latestTrackerIssueRevision(issues: readonly Issue[]): string | null {
+  let latest: string | null = null;
+  for (const issue of issues) {
+    const revision = issue.updatedAt ?? issue.createdAt ?? issue.id;
+    if (!revision) continue;
+    if (latest === null || revision > latest) latest = revision;
+  }
+  return latest;
+}
+
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(`${JSON.stringify(body, null, 2)}\n`);
@@ -1741,6 +2167,15 @@ function writeWebProjectionSseEvent(response: ServerResponse, event: string, bod
 function sendHtml(response: ServerResponse, body: string): void {
   response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   response.end(body);
+}
+
+function realtimeLastEventId(request: IncomingMessage, url: URL): string | null {
+  const header = request.headers["last-event-id"];
+  const headerValue = Array.isArray(header) ? header[0] : header;
+  const queryValue = url.searchParams.get("lastEventId") ?? url.searchParams.get("last-event-id");
+  const value = headerValue ?? queryValue;
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : null;
 }
 
 const WEB_MOUNT_PATH = "/web";
@@ -3772,10 +4207,14 @@ async function resolveWebTranscriptRun(runStore: RunTranscriptStore, sessionIdOr
 }
 
 async function readBoundedWebTranscript(runStore: RunTranscriptStore, runId: string, url?: URL): Promise<TranscriptEvent[]> {
-  const requestedPage = parseWebTranscriptPagination(url);
-  if (requestedPage) return (await runStore.readTranscript(runId, requestedPage)).events;
+  return (await readBoundedWebTranscriptPage(runStore, runId, url)).events;
+}
 
-  return (await runStore.readTranscriptTail(runId, { limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT })).events;
+async function readBoundedWebTranscriptPage(runStore: RunTranscriptStore, runId: string, url?: URL): Promise<TranscriptPage> {
+  const requestedPage = parseWebTranscriptPagination(url);
+  if (requestedPage) return runStore.readTranscript(runId, requestedPage);
+
+  return runStore.readTranscriptTail(runId, { limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT });
 }
 
 function parseWebTranscriptPagination(url: URL | undefined): { offset: number; limit: number } | null {
