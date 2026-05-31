@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path";
+import { createRequire } from "node:module";
 import { Command } from "commander";
 import { StatusServer } from "./app/http.js";
 import { parseDatabaseConfig, type DatabaseConfig, type ServiceConfig } from "./core/config/Config.js";
@@ -9,6 +10,11 @@ import { Orchestrator } from "./core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureDiagnosticsStore.js";
 import { FileOrchestratorConversationStore } from "./core/persistence/OrchestratorConversationStore.js";
+import {
+  PostgresProjectionTransactionStore,
+  ProjectionTransactionService,
+  type ProjectionSqlPool,
+} from "./core/persistence/ProjectionTransactionService.js";
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore } from "./core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
@@ -196,6 +202,7 @@ program
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const projectionPersistence = config.server.port === null ? null : await createRuntimeProjectionPersistence(config);
     const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
     const operatorApproval = new OperatorApprovalService({ config, store: operatorApprovalStore, runStore });
     const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger);
@@ -255,6 +262,7 @@ program
             staleThresholdMs: config.polling.intervalMs,
             dashboard: statusDashboardConfig(config),
             webAssetsRoot: config.server.webAssetsRoot,
+            ...(projectionPersistence ? { projectionWriter: projectionPersistence.writer } : {}),
           });
 
     if (statusServer) {
@@ -269,6 +277,7 @@ program
       logger.info("symphony shutting down");
       await orchestrator.stop();
       await statusServer?.stop();
+      await projectionPersistence?.close();
       await loader.close();
       await harness.dispose?.();
       process.exit(0);
@@ -284,6 +293,25 @@ program.parseAsync().catch((error) => {
 
 function currentCliPath(): string {
   return path.resolve(process.argv[1] ?? "dist/cli.js");
+}
+
+interface RuntimeProjectionPersistence {
+  writer: ProjectionTransactionService;
+  close(): Promise<void>;
+}
+
+async function createRuntimeProjectionPersistence(config: ServiceConfig): Promise<RuntimeProjectionPersistence | null> {
+  const connectionString = config.database.postgres.connectionString;
+  if (connectionString === null) return null;
+  const require = createRequire(import.meta.url);
+  const { Pool } = require("pg") as {
+    Pool: new (options: { connectionString: string; ssl: boolean }) => ProjectionSqlPool & { end(): Promise<void> };
+  };
+  const pool = new Pool({ connectionString, ssl: config.database.postgres.ssl });
+  return {
+    writer: new ProjectionTransactionService(new PostgresProjectionTransactionStore(pool)),
+    close: () => pool.end(),
+  };
 }
 
 async function loadDatabaseConfigForCli(workflow: string): Promise<DatabaseConfig> {
