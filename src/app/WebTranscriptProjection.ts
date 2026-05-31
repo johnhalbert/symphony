@@ -54,6 +54,7 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
 
   for (const event of events) {
     const projected = projectWebTranscriptEvent(event);
+    if (projected === null) continue;
     if (projected.kind === "tool_call") {
       const existingIndex = toolMessageIndexByCallId.get(projected.call_id);
       if (existingIndex !== undefined) {
@@ -71,7 +72,10 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
       if (pendingAssistantDeltaIndex !== null) {
         const existing = messages[pendingAssistantDeltaIndex];
         if (existing?.kind === "assistant") {
-          messages[pendingAssistantDeltaIndex] = { ...existing, text: combineAssistantDeltaText(existing.text, projected.text) };
+          messages[pendingAssistantDeltaIndex] = {
+            ...existing,
+            text: combineAssistantDeltaText(existing.text, projected.text, shouldConcatenateAssistantDeltaExactly(event)),
+          };
           continue;
         }
       }
@@ -96,10 +100,15 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
   return messages;
 }
 
-function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
+function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage | null {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
   const payloadKind = normalizedPayloadKind(payload);
+  const activitySource = normalizedActivitySource(payload);
+  if (isHiddenMetadataEvent(eventType, activitySource)) return null;
+  if (isDiagnosticEvent(eventType)) return projectDiagnosticStatusMessage(event, payload, eventType);
+  if (isProviderLimitEvent(eventType)) return projectProviderLimitStatusMessage(event, payload, eventType);
+  if (isTerminalStatusEvent(eventType)) return projectTerminalStatusMessage(event, payload, eventType);
   if (isToolEvent(eventType, payloadKind)) return projectToolCallMessage(event, payload, eventType);
   if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
   if (isTaskEvent(eventType, payloadKind)) return projectTaskMessage(event, payload);
@@ -220,6 +229,46 @@ function projectStatusMessage(
   };
 }
 
+function projectDiagnosticStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  return {
+    kind: "status",
+    state: firstCleanString(payload.code, payload.state, payload.status) ?? eventType,
+    ts: event.at,
+    text: firstCleanString(payload.message, payload.messagePreview, payload.textPreview, event.message) ?? eventText(event, payload),
+  };
+}
+
+function projectProviderLimitStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const signal = isRecord(payload.signal) ? payload.signal : {};
+  return {
+    kind: "status",
+    state: firstCleanString(signal.kind, payload.state, payload.status) ?? eventType,
+    ts: event.at,
+    text: firstCleanString(signal.message, payload.message, event.message) ?? "Provider limit reached",
+  };
+}
+
+function projectTerminalStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  return {
+    kind: "status",
+    state: eventType,
+    ts: event.at,
+    text: firstCleanString(payload.message, payload.error, payload.reason, event.message) ?? terminalStatusText(eventType),
+  };
+}
+
 function projectRunPreludeMessages(run: RunRecord, existingMessages: readonly TranscriptMessage[]): TranscriptMessage[] {
   const messages: TranscriptMessage[] = [];
   if (!existingMessages.some((message) => message.kind === "system")) messages.push(projectRunSystemMessage(run));
@@ -295,6 +344,28 @@ function isStatusEvent(eventType: string, payloadKind: string | null): boolean {
   return eventType === "status" || eventType === "status_update" || payloadKind === "status";
 }
 
+function isHiddenMetadataEvent(eventType: string, activitySource: string | null): boolean {
+  return (
+    eventType === "session_started" ||
+    eventType === "tokens" ||
+    eventType === "rate_limits" ||
+    eventType === "run_status" ||
+    (eventType === "progress" && activitySource === "tool")
+  );
+}
+
+function isDiagnosticEvent(eventType: string): boolean {
+  return eventType === "run_diagnostic";
+}
+
+function isProviderLimitEvent(eventType: string): boolean {
+  return eventType === "provider_limit";
+}
+
+function isTerminalStatusEvent(eventType: string): boolean {
+  return eventType === "completed" || eventType === "failed" || eventType === "cancelled";
+}
+
 function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind: string | null): boolean {
   if (eventType === "assistant" || payloadKind === "assistant") return true;
   if (
@@ -307,11 +378,12 @@ function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind
   ) {
     return true;
   }
-  return event.source === "harness" && (eventType === "progress" || eventType === "completed");
+  return event.source === "harness" && eventType === "progress";
 }
 
 function isAssistantDeltaEvent(event: TranscriptEvent): boolean {
   const eventType = normalizeToken(event.eventType);
+  if (eventType === "progress") return normalizedActivitySource(sanitizedPayloadRecord(event)) === "delta";
   return eventType === "message_delta" || eventType === "assistant_delta" || eventType === "response_delta";
 }
 
@@ -320,9 +392,14 @@ function isAssistantCompleteEvent(event: TranscriptEvent): boolean {
   return eventType === "message_complete" || eventType === "assistant_complete" || eventType === "response_complete" || eventType === "completed";
 }
 
-function combineAssistantDeltaText(existing: string, next: string): string {
+function shouldConcatenateAssistantDeltaExactly(event: TranscriptEvent): boolean {
+  return normalizeToken(event.eventType) === "progress" && normalizedActivitySource(sanitizedPayloadRecord(event)) === "delta";
+}
+
+function combineAssistantDeltaText(existing: string, next: string, exact = false): string {
   if (existing.length === 0) return next;
   if (next.length === 0) return existing;
+  if (exact) return existing + next;
   if (/\s$/.test(existing) || /^\s/.test(next)) return existing + next;
   return `${existing} ${next}`;
 }
@@ -337,6 +414,19 @@ function eventText(event: TranscriptEvent, payload: Record<string, unknown>): st
     firstCleanString(payload.textPreview, payload.summary, payload.messagePreview, payload.text, payload.message, event.message) ??
     event.eventType
   );
+}
+
+function terminalStatusText(eventType: string): string {
+  switch (eventType) {
+    case "completed":
+      return "Run completed";
+    case "failed":
+      return "Run failed";
+    case "cancelled":
+      return "Run cancelled";
+    default:
+      return eventType;
+  }
 }
 
 function actionLabels(value: unknown): string[] {
@@ -364,6 +454,11 @@ function stringLabels(value: unknown): string[] {
 function normalizedPayloadKind(payload: Record<string, unknown>): string | null {
   const kind = firstCleanString(payload.kind, payload.type);
   return kind ? normalizeToken(kind) : null;
+}
+
+function normalizedActivitySource(payload: Record<string, unknown>): string | null {
+  const source = firstCleanString(payload.activitySource);
+  return source ? normalizeToken(source) : null;
 }
 
 function payloadKindIncludes(payloadKind: string | null, token: string): boolean {
