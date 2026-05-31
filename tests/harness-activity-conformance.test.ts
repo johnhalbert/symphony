@@ -129,7 +129,6 @@ async function runHermesAcpFixture(fixture: HarnessActivityConformanceFixture): 
   const client = new FixtureAcpClient(protocol.notifications, protocol.promptResult, protocol.diagnostics ?? []);
   const harness = new HermesAcpHarness({
     cliPath: path.join(root, "src", "cli.ts"),
-    runStore: runStore as unknown as RunTranscriptStore,
     profileLeaseFactory: async (options) => acpLease(options),
     acpClientFactory: (_command: HostHermesAcpProcessCommand, _options: HermesAcpRuntimeClientOptions) => client,
   });
