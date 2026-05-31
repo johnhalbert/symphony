@@ -155,6 +155,10 @@ export interface TranscriptEvent {
   eventType: string;
   message?: string;
   payload?: unknown;
+  payloadSchema?: string;
+  payloadTruncated?: boolean;
+  payloadByteLength?: number;
+  rawPayloadRefId?: number | string | null;
 }
 
 export interface TranscriptPage {

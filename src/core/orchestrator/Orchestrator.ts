@@ -60,6 +60,7 @@ import {
   type ProviderLimitSignal,
   type RuntimeProviderGate,
 } from "../provider/ProviderLimits.js";
+import { mapAgentEventToRunActivityEvent } from "../transcript/RunActivityEventMapper.js";
 import { sanitizeAgentEventForPublicOutput } from "../transcript/TranscriptProjection.js";
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
@@ -1433,6 +1434,7 @@ export class Orchestrator {
             sdkRunStatusSource: event.source,
           },
         });
+        await this.persistHarnessEvent(entry, rawEvent);
         continue;
       }
       entry.lastEvent = event.type;
@@ -1517,7 +1519,7 @@ export class Orchestrator {
         }
         throw new SymphonyError("agent_error", signal.message);
       }
-      await this.persistHarnessEvent(entry, event);
+      await this.persistHarnessEvent(entry, rawEvent);
       if (event.type === "completed") {
         if (entry.runPhase === "issue_breakdown") {
           const accepted = await this.reconcileIssueBreakdownPlanHandoff(entry);
@@ -2180,17 +2182,13 @@ export class Orchestrator {
   }
 
   private async persistHarnessEvent(entry: RunningEntry, event: AgentEvent): Promise<void> {
-    const runId = entry.activeRunId ?? entry.runId;
+    const runId = event.type === "run_status" ? event.runId : entry.activeRunId ?? entry.runId;
     if (!runId) return;
-    const message =
-      event.type === "progress" || event.type === "completed" || event.type === "run_diagnostic" ? event.message : undefined;
     await this.options.runStore?.appendEvent({
       runId,
       at: new Date(event.at ?? Date.now()).toISOString(),
       source: "harness",
-      eventType: event.type,
-      ...(message === undefined ? {} : { message }),
-      payload: event,
+      ...mapAgentEventToRunActivityEvent(event),
     });
     if (event.type === "tokens") {
       await this.options.runStore?.updateRun(runId, { tokens: entry.activeRunTokens });
