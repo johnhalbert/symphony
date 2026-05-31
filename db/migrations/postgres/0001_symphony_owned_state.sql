@@ -212,8 +212,11 @@ CREATE TABLE IF NOT EXISTS symphony.run_activity_event (
   event_id text NOT NULL,
   run_id text NOT NULL REFERENCES symphony.run_session(run_id) ON DELETE CASCADE,
   session_id text,
+  run_session_id text NOT NULL,
   sequence integer NOT NULL CHECK (sequence > 0),
+  sequence_source text NOT NULL CHECK (sequence_source IN ('harness', 'symphony')),
   event_at timestamptz NOT NULL,
+  protocol text NOT NULL CHECK (protocol IN ('json_rpc', 'acp', 'symphony', 'unknown')),
   harness_id text NOT NULL,
   external_event_id text,
   actor text NOT NULL CHECK (
@@ -231,30 +234,38 @@ CREATE TABLE IF NOT EXISTS symphony.run_activity_event (
   metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (event_id),
-  UNIQUE (run_id, sequence),
+  UNIQUE (run_session_id, sequence),
   CHECK (jsonb_typeof(payload) = 'object'),
   CHECK (jsonb_typeof(metadata) = 'object')
 );
 
 COMMENT ON TABLE symphony.run_activity_event IS
-  'Normalized ordered run activity events keyed by stable event_id plus per-run sequence. Large raw harness payloads are referenced through raw_payload_ref_id instead of embedded.';
+  'Normalized ordered run activity events keyed by stable event_id plus run-session sequence. Large raw harness payloads are referenced through raw_payload_ref_id instead of embedded.';
+COMMENT ON COLUMN symphony.run_activity_event.run_session_id IS
+  'Durable ordering and idempotency scope for the Symphony run attempt; raw session_id is correlation metadata only.';
+COMMENT ON COLUMN symphony.run_activity_event.sequence_source IS
+  'Whether sequence was preserved from the harness/protocol or assigned by Symphony during transactional append.';
 COMMENT ON COLUMN symphony.run_activity_event.external_event_id IS
-  'Optional upstream harness/runtime event id used with run_id for idempotent duplicate detection during replay/import.';
+  'Optional upstream harness/runtime event id used with run_session_id for idempotent duplicate detection during replay/import.';
+COMMENT ON COLUMN symphony.run_activity_event.run_activity_event_id IS
+  'Monotonic append revision returned to reducers and realtime publishers after transactional persistence.';
 COMMENT ON COLUMN symphony.run_activity_event.payload IS
   'Normalized, redacted, size-capped structured event payload suitable for projections and status APIs.';
 COMMENT ON COLUMN symphony.run_activity_event.raw_payload_ref_id IS
   'Reference to oversized raw harness payload bytes when payload is truncated or unsuitable for inline projection JSON.';
 
 CREATE INDEX IF NOT EXISTS run_activity_event_ordering_idx
-  ON symphony.run_activity_event (run_id, sequence);
+  ON symphony.run_activity_event (run_session_id, sequence);
+CREATE INDEX IF NOT EXISTS run_activity_event_run_ordering_idx
+  ON symphony.run_activity_event (run_id, run_session_id, sequence);
 CREATE INDEX IF NOT EXISTS run_activity_event_time_ordering_idx
-  ON symphony.run_activity_event (run_id, event_at, sequence);
+  ON symphony.run_activity_event (run_session_id, event_at, sequence);
 CREATE INDEX IF NOT EXISTS run_activity_event_kind_time_idx
   ON symphony.run_activity_event (kind, event_at DESC);
 CREATE INDEX IF NOT EXISTS run_activity_event_channel_kind_time_idx
   ON symphony.run_activity_event (channel, kind, event_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS run_activity_event_external_event_unique_idx
-  ON symphony.run_activity_event (run_id, external_event_id)
+  ON symphony.run_activity_event (run_session_id, external_event_id)
   WHERE external_event_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS symphony.chat_message (

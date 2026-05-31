@@ -36,6 +36,7 @@ const requiredLookupIndexes = [
   "run_session_issue_status_idx",
   "issue_status_lookup_idx",
   "run_activity_event_ordering_idx",
+  "run_activity_event_run_ordering_idx",
   "run_activity_event_kind_time_idx",
   "run_activity_event_channel_kind_time_idx",
   "chat_message_ordering_idx",
@@ -75,11 +76,12 @@ describe("Postgres Symphony-owned state migration", () => {
       expect(normalized, `missing ${indexName}`).toContain(`create index if not exists ${indexName}`);
     }
 
-    expect(normalized).toContain("on symphony.run_activity_event (run_id, sequence)");
+    expect(normalized).toContain("on symphony.run_activity_event (run_session_id, sequence)");
+    expect(normalized).toContain("on symphony.run_activity_event (run_id, run_session_id, sequence)");
     expect(normalized).toContain("on symphony.run_activity_event (kind, event_at desc)");
     expect(normalized).toContain("on symphony.run_activity_event (channel, kind, event_at desc)");
     expect(normalized).toContain("create unique index if not exists run_activity_event_external_event_unique_idx");
-    expect(normalized).toContain("on symphony.run_activity_event (run_id, external_event_id)");
+    expect(normalized).toContain("on symphony.run_activity_event (run_session_id, external_event_id)");
     expect(normalized).toContain("where external_event_id is not null");
     expect(normalized).toContain("on symphony.chat_message (thread_key, message_index)");
     expect(normalized).toContain("on symphony.chat_message (run_id, event_sequence_start, event_sequence_end)");
@@ -93,6 +95,9 @@ describe("Postgres Symphony-owned state migration", () => {
 
     for (const fragment of [
       "event_id text not null",
+      "run_session_id text not null",
+      "sequence_source text not null check",
+      "protocol text not null check",
       "external_event_id text",
       "actor text not null check",
       "channel text not null check",
@@ -103,7 +108,7 @@ describe("Postgres Symphony-owned state migration", () => {
       "payload_byte_length bigint check",
       "raw_payload_ref_id bigint references symphony.raw_payload_reference(raw_payload_ref_id)",
       "unique (event_id)",
-      "unique (run_id, sequence)",
+      "unique (run_session_id, sequence)",
     ]) {
       expect(normalized, `missing run_activity_event fragment: ${fragment}`).toContain(fragment);
     }
@@ -330,8 +335,11 @@ async function expectOperationalAndProjectionInsertQueryPaths(containerName: str
           event_id,
           run_id,
           session_id,
+          run_session_id,
           sequence,
+          sequence_source,
           event_at,
+          protocol,
           harness_id,
           external_event_id,
           actor,
@@ -345,8 +353,11 @@ async function expectOperationalAndProjectionInsertQueryPaths(containerName: str
           'activity:eng-187:1',
           'run:eng-187:1',
           'session:eng-187:1',
+          'run:eng-187:1:session:eng-187:1',
           1,
+          'harness',
           now(),
+          'symphony',
           'hermes',
           'hermes:event:eng-187:1',
           'harness',
@@ -619,8 +630,11 @@ async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(contain
         event_id,
         run_id,
         session_id,
+        run_session_id,
         sequence,
+        sequence_source,
         event_at,
+        protocol,
         harness_id,
         external_event_id,
         actor,
@@ -638,8 +652,11 @@ async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(contain
         'activity:eng-187:large',
         'run:eng-187:1',
         'session:eng-187:1',
+        'run:eng-187:1:session:eng-187:1',
         2,
+        'harness',
         now(),
+        'json_rpc',
         'hermes',
         'hermes:event:eng-187:large',
         'assistant',
@@ -765,8 +782,11 @@ async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(contain
           event_id,
           run_id,
           session_id,
+          run_session_id,
           sequence,
+          sequence_source,
           event_at,
+          protocol,
           harness_id,
           external_event_id,
           actor,
@@ -777,8 +797,11 @@ async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(contain
           'activity:eng-187:duplicate-sequence',
           'run:eng-187:1',
           'session:eng-187:1',
+          'run:eng-187:1:session:eng-187:1',
           2,
+          'harness',
           now(),
+          'json_rpc',
           'hermes',
           'hermes:event:eng-187:duplicate-sequence',
           'runtime',
@@ -798,8 +821,11 @@ async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(contain
           event_id,
           run_id,
           session_id,
+          run_session_id,
           sequence,
+          sequence_source,
           event_at,
+          protocol,
           harness_id,
           external_event_id,
           actor,
@@ -810,8 +836,11 @@ async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(contain
           'activity:eng-187:duplicate-external',
           'run:eng-187:1',
           'session:eng-187:1',
+          'run:eng-187:1:session:eng-187:1',
           3,
+          'harness',
           now(),
+          'json_rpc',
           'hermes',
           'hermes:event:eng-187:large',
           'runtime',

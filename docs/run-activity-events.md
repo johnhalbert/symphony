@@ -27,6 +27,13 @@ An incoming event is a duplicate no-op when any accepted event in the same durab
 
 Duplicate no-ops must not increment sequence state, mutate terminal state, or be re-emitted over SSE/realtime streams.
 
+## Transactional append metadata
+
+- Append stores must apply this ordering/idempotency contract inside the persistence transaction before accepted events are emitted to reducers or realtime clients.
+- Accepted append results return the final `runSessionId`, `sequence`, `sequenceSource`, and a durable append revision. In Postgres, the append revision is `run_activity_event_id`.
+- Duplicate append results return the existing event metadata and must not allocate a new sequence or append revision.
+- Rejected append results do not persist rows and must not be published as activity updates.
+
 ## Terminal events and replay
 
 - The first accepted `channel: "terminal"` event wins and records `terminalSequence`.

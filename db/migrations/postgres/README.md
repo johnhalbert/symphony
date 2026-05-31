@@ -26,7 +26,7 @@ Owned operational tables:
 - `workspace`
 - `issue`
 - `run_session`
-- `run_activity_event` (stable `event_id`, per-run `sequence`, actor/channel/kind taxonomy fields, optional `external_event_id`, structured payload, text, and oversized raw payload reference hooks)
+- `run_activity_event` (stable `event_id`, explicit `run_session_id` ordering/idempotency scope, preserved-or-assigned `sequence` with `sequence_source`, append revision identity, actor/channel/kind taxonomy fields, optional `external_event_id`, structured payload, text, and oversized raw payload reference hooks)
 - `chat_message` (thread/message ordering, role/status/body fields, event sequence range pointers for reconstruction, metadata, and oversized raw payload reference hooks)
 - `writeback_operation`
 - `approval_request`
@@ -57,7 +57,7 @@ When raw tool output, harness payloads, or diagnostic payloads exceed the inline
 
 ## Validation
 
-The static Vitest coverage in `tests/postgres-schema.test.ts` asserts required tables, indexes, source-boundary notes, transition policy, run activity/chat reconstruction fields, duplicate-event/message constraints, and oversized-payload policy. The same test file includes an opt-in Docker-backed validation that applies the migration to an empty `postgres:16-alpine` database, exercises basic insert/query paths for each operational and projection table, verifies ordered run-activity replay, duplicate event sequence/external id rejection, chat message reconstruction from event ranges, invalid chat event ranges, large payload reference fields, and duplicate workspace keys plus duplicate non-null external issue ids are rejected:
+The static Vitest coverage in `tests/postgres-schema.test.ts` asserts required tables, indexes, source-boundary notes, transition policy, run activity/chat reconstruction fields, run-session scoped duplicate-event/message constraints, and oversized-payload policy. The same test file includes an opt-in Docker-backed validation that applies the migration to an empty `postgres:16-alpine` database, exercises basic insert/query paths for each operational and projection table, verifies ordered run-activity replay, duplicate event sequence/external id rejection, chat message reconstruction from event ranges, invalid chat event ranges, large payload reference fields, and duplicate workspace keys plus duplicate non-null external issue ids are rejected:
 
 ```bash
 SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1 npx vitest run tests/postgres-schema.test.ts --no-file-parallelism
