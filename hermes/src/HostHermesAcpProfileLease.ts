@@ -172,7 +172,18 @@ export async function createHostHermesAcpProfileLease(
   let disposed = false;
   let processHandle = options.processHandle ?? null;
   let acpSessionId = normalizeOptionalString(options.acpSessionId);
+  let backedFailedRun = false;
   let lease: HostHermesAcpProfileLease;
+
+  function recordTerminalStatus(terminalStatus: HostHermesAcpTerminalStatus): void {
+    if (terminalStatus === "failed") backedFailedRun = true;
+  }
+
+  function retentionTerminalStatus(terminalStatus: HostHermesAcpTerminalStatus): HostHermesAcpTerminalStatus {
+    // A reusable profile may outlive a failed run. Once it has backed a failed run,
+    // later harness/default disposal must continue to apply failed-run retention.
+    return backedFailedRun ? "failed" : terminalStatus;
+  }
 
   async function cleanupLease(
     hook: HostHermesAcpLeaseLifecycleHook,
@@ -180,6 +191,8 @@ export async function createHostHermesAcpProfileLease(
     input: { terminateProcess: boolean } = { terminateProcess: true },
   ): Promise<HostHermesAcpProfileLeaseDisposeResult> {
     if (disposed) return { profileName, reason: "already_disposed", deleted: false };
+    recordTerminalStatus(terminalStatus);
+    const cleanupTerminalStatus = retentionTerminalStatus(terminalStatus);
 
     let processCleanupError: unknown = null;
     if (input.terminateProcess) {
@@ -197,7 +210,7 @@ export async function createHostHermesAcpProfileLease(
     if (profileDisposition === "reused") {
       disposed = true;
       result = { profileName, reason: "retained", deleted: false };
-    } else if (!shouldDeleteHostHermesAcpProfile({ keepProfiles, terminalStatus })) {
+    } else if (!shouldDeleteHostHermesAcpProfile({ keepProfiles, terminalStatus: cleanupTerminalStatus })) {
       disposed = true;
       result = { profileName, reason: "retained", deleted: false };
     } else {
@@ -245,7 +258,10 @@ export async function createHostHermesAcpProfileLease(
     },
     async afterRunFinished(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult> {
       if (disposed) return { profileName, reason: "already_disposed", deleted: false };
-      if (reusable) return { profileName, reason: "retained", deleted: false };
+      if (reusable) {
+        recordTerminalStatus(terminalStatus);
+        return { profileName, reason: "retained", deleted: false };
+      }
       return cleanupLease("run_finished", terminalStatus);
     },
     async afterProcessExit(terminalStatus: HostHermesAcpTerminalStatus = "failed"): Promise<HostHermesAcpProfileLeaseDisposeResult> {
