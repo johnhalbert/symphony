@@ -209,54 +209,101 @@ CREATE INDEX IF NOT EXISTS run_session_workspace_idx
 
 CREATE TABLE IF NOT EXISTS symphony.run_activity_event (
   run_activity_event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  event_id text NOT NULL,
   run_id text NOT NULL REFERENCES symphony.run_session(run_id) ON DELETE CASCADE,
+  session_id text,
+  run_session_id text NOT NULL,
   sequence integer NOT NULL CHECK (sequence > 0),
+  sequence_source text NOT NULL CHECK (sequence_source IN ('harness', 'symphony')),
   event_at timestamptz NOT NULL,
-  source text NOT NULL CHECK (source IN ('harness', 'runtime', 'cursor', 'orchestrator')),
-  event_type text NOT NULL,
-  message_preview text,
-  payload jsonb,
+  protocol text NOT NULL CHECK (protocol IN ('json_rpc', 'acp', 'symphony', 'unknown')),
+  harness_id text NOT NULL,
+  external_event_id text,
+  actor text NOT NULL CHECK (
+    actor IN ('orchestrator', 'harness', 'runtime', 'assistant', 'user', 'tool', 'operator', 'provider', 'system')
+  ),
+  channel text NOT NULL CHECK (channel IN ('lifecycle', 'message', 'tool', 'status', 'token', 'rate_limit', 'terminal')),
+  kind text NOT NULL,
+  text text,
+  text_char_count integer NOT NULL DEFAULT 0 CHECK (text_char_count >= 0),
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
   payload_schema text,
   payload_truncated boolean NOT NULL DEFAULT false,
   payload_byte_length bigint CHECK (payload_byte_length IS NULL OR payload_byte_length >= 0),
   raw_payload_ref_id bigint REFERENCES symphony.raw_payload_reference(raw_payload_ref_id),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (run_id, sequence),
-  CHECK (payload IS NULL OR jsonb_typeof(payload) IN ('object', 'array', 'string', 'number', 'boolean', 'null'))
+  UNIQUE (event_id),
+  UNIQUE (run_session_id, sequence),
+  CHECK (jsonb_typeof(payload) = 'object'),
+  CHECK (jsonb_typeof(metadata) = 'object')
 );
 
 COMMENT ON TABLE symphony.run_activity_event IS
-  'Normalized ordered run transcript/activity events. Large raw harness payloads are referenced through raw_payload_ref_id instead of embedded.';
+  'Normalized ordered run activity events keyed by stable event_id plus run-session sequence. Large raw harness payloads are referenced through raw_payload_ref_id instead of embedded.';
+COMMENT ON COLUMN symphony.run_activity_event.run_session_id IS
+  'Durable ordering and idempotency scope for the Symphony run attempt; raw session_id is correlation metadata only.';
+COMMENT ON COLUMN symphony.run_activity_event.sequence_source IS
+  'Whether sequence was preserved from the harness/protocol or assigned by Symphony during transactional append.';
+COMMENT ON COLUMN symphony.run_activity_event.external_event_id IS
+  'Optional upstream harness/runtime event id used with run_session_id for idempotent duplicate detection during replay/import.';
+COMMENT ON COLUMN symphony.run_activity_event.run_activity_event_id IS
+  'Monotonic append revision returned to reducers and realtime publishers after transactional persistence.';
 COMMENT ON COLUMN symphony.run_activity_event.payload IS
-  'Normalized, redacted, size-capped event payload suitable for projections and status APIs.';
+  'Normalized, redacted, size-capped structured event payload suitable for projections and status APIs.';
+COMMENT ON COLUMN symphony.run_activity_event.raw_payload_ref_id IS
+  'Reference to oversized raw harness payload bytes when payload is truncated or unsuitable for inline projection JSON.';
 
 CREATE INDEX IF NOT EXISTS run_activity_event_ordering_idx
-  ON symphony.run_activity_event (run_id, sequence);
+  ON symphony.run_activity_event (run_session_id, sequence);
+CREATE INDEX IF NOT EXISTS run_activity_event_run_ordering_idx
+  ON symphony.run_activity_event (run_id, run_session_id, sequence);
 CREATE INDEX IF NOT EXISTS run_activity_event_time_ordering_idx
-  ON symphony.run_activity_event (run_id, event_at, sequence);
-CREATE INDEX IF NOT EXISTS run_activity_event_type_idx
-  ON symphony.run_activity_event (event_type, event_at DESC);
+  ON symphony.run_activity_event (run_session_id, event_at, sequence);
+CREATE INDEX IF NOT EXISTS run_activity_event_kind_time_idx
+  ON symphony.run_activity_event (kind, event_at DESC);
+CREATE INDEX IF NOT EXISTS run_activity_event_channel_kind_time_idx
+  ON symphony.run_activity_event (channel, kind, event_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS run_activity_event_external_event_unique_idx
+  ON symphony.run_activity_event (run_session_id, external_event_id)
+  WHERE external_event_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS symphony.chat_message (
   chat_message_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  message_id text NOT NULL,
   thread_key text NOT NULL,
   issue_key text,
   issue_identifier text,
   run_id text REFERENCES symphony.run_session(run_id) ON DELETE SET NULL,
   session_id text,
   message_index integer NOT NULL CHECK (message_index >= 0),
-  speaker text NOT NULL CHECK (speaker IN ('system', 'user', 'assistant', 'agent', 'orchestrator', 'tool')),
+  role text NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'agent', 'orchestrator', 'tool')),
   message_kind text NOT NULL DEFAULT 'message',
+  status text NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')),
+  body text NOT NULL DEFAULT '',
   body_preview text NOT NULL DEFAULT '',
   body_char_count integer NOT NULL DEFAULT 0 CHECK (body_char_count >= 0),
+  body_truncated boolean NOT NULL DEFAULT false,
+  event_sequence_start integer CHECK (event_sequence_start IS NULL OR event_sequence_start > 0),
+  event_sequence_end integer CHECK (event_sequence_end IS NULL OR event_sequence_end > 0),
   payload jsonb NOT NULL DEFAULT '{}'::jsonb,
   raw_payload_ref_id bigint REFERENCES symphony.raw_payload_reference(raw_payload_ref_id),
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL,
-  UNIQUE (thread_key, message_index)
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (message_id),
+  UNIQUE (thread_key, message_index),
+  CHECK (event_sequence_end IS NULL OR event_sequence_start IS NOT NULL),
+  CHECK (event_sequence_start IS NULL OR event_sequence_end IS NULL OR event_sequence_end >= event_sequence_start),
+  CHECK (jsonb_typeof(payload) = 'object'),
+  CHECK (jsonb_typeof(metadata) = 'object'),
+  CHECK (updated_at >= created_at)
 );
 
 COMMENT ON TABLE symphony.chat_message IS
-  'Symphony-owned normalized chat/orchestrator message stream used to build frontend chat projections.';
+  'Symphony-owned normalized chat/orchestrator message stream used to reconstruct user-visible messages from ordered run activity event ranges.';
+COMMENT ON COLUMN symphony.chat_message.raw_payload_ref_id IS
+  'Reference to oversized raw message body/payload bytes when the inline body or payload is truncated.';
 
 CREATE INDEX IF NOT EXISTS chat_message_ordering_idx
   ON symphony.chat_message (thread_key, message_index);
@@ -264,6 +311,9 @@ CREATE INDEX IF NOT EXISTS chat_message_issue_ordering_idx
   ON symphony.chat_message (issue_key, created_at, message_index);
 CREATE INDEX IF NOT EXISTS chat_message_run_ordering_idx
   ON symphony.chat_message (run_id, message_index)
+  WHERE run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS chat_message_event_range_idx
+  ON symphony.chat_message (run_id, event_sequence_start, event_sequence_end)
   WHERE run_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS symphony.writeback_operation (

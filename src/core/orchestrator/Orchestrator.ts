@@ -60,6 +60,7 @@ import {
   type ProviderLimitSignal,
   type RuntimeProviderGate,
 } from "../provider/ProviderLimits.js";
+import { mapAgentEventToRunActivityEvent } from "../transcript/RunActivityEventMapper.js";
 import { sanitizeAgentEventForPublicOutput } from "../transcript/TranscriptProjection.js";
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
@@ -105,6 +106,10 @@ import {
   type OperatorApprovalRecord,
   type OperatorApprovalService,
 } from "../approval/OperatorApprovalService.js";
+import type {
+  OrchestratorChatCommand,
+  OrchestratorChatCommandResult,
+} from "./OrchestratorChatCommand.js";
 
 export interface OrchestratorOptions {
   config: ServiceConfig;
@@ -215,6 +220,10 @@ export interface RetryEntry {
 
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
 type TerminalUpdateResult = { updated: true; record: RunRecord | null } | { updated: false; record: RunRecord | null };
+type AcceptedHandoffKind = "completion_report" | "pull_request_handoff" | "issue_breakdown_plan" | "merge_conflict_resolution";
+
+const PLANNING_NO_PLAN_ERROR = "Planning run completed without submit_issue_breakdown_plan";
+const PLANNING_FAILURE_DIAGNOSTIC_CODE = "planning_run_failed";
 
 export interface RuntimeSnapshot {
   generatedAt: string;
@@ -415,6 +424,7 @@ export class Orchestrator {
   private stopped = false;
   private endedRuntimeSeconds = 0;
   private readonly running = new Map<string, RunningEntry>();
+  private readonly activeWorkers = new Set<Promise<void>>();
   private readonly claimed = new Set<string>();
   private readonly completed = new Set<string>();
   private readonly pausedIssues = new Set<string>();
@@ -454,7 +464,8 @@ export class Orchestrator {
       running.abortController.abort();
       if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
     }
-    await Promise.allSettled([...this.running.values()].map((entry) => entry.worker));
+    const workers = new Set([...this.activeWorkers, ...[...this.running.values()].map((entry) => entry.worker)]);
+    await Promise.allSettled([...workers]);
   }
 
   updateConfig(config: ServiceConfig, promptTemplate: string): void {
@@ -464,6 +475,19 @@ export class Orchestrator {
 
   async refreshNow(): Promise<void> {
     await this.tick();
+  }
+
+  async dispatchOrchestratorChatCommand(command: OrchestratorChatCommand): Promise<OrchestratorChatCommandResult> {
+    if (this.stopped) {
+      return { status: "disabled", reason: "orchestrator_stopped" };
+    }
+    this.options.logger.info("orchestrator chat command accepted", {
+      action: command.action,
+      conversation_id: command.conversationId,
+      message_id: command.messageId,
+      source: command.source,
+    });
+    return { status: "accepted", reason: "accepted", acceptedAt: new Date().toISOString() };
   }
 
   pauseIssue(issueId: string): void {
@@ -1230,7 +1254,13 @@ export class Orchestrator {
     this.claimed.add(issue.id);
     this.clearRetry(issue.id);
     const run = role === "reviewer" ? this.runReviewer(entry) : this.runWorker(entry, attempt);
-    entry.worker = this.monitorRunExit(entry, run);
+    const worker = this.monitorRunExit(entry, run);
+    entry.worker = worker;
+    this.activeWorkers.add(worker);
+    void worker.then(
+      () => this.activeWorkers.delete(worker),
+      () => this.activeWorkers.delete(worker),
+    );
   }
 
   private async monitorRunExit(entry: RunningEntry, run: Promise<void>): Promise<void> {
@@ -1433,6 +1463,7 @@ export class Orchestrator {
             sdkRunStatusSource: event.source,
           },
         });
+        await this.persistHarnessEvent(entry, rawEvent);
         continue;
       }
       entry.lastEvent = event.type;
@@ -1504,7 +1535,6 @@ export class Orchestrator {
       if (event.type === "rate_limits") this.rateLimits = event.payload;
       if (event.type === "provider_limit") {
         const signal = await this.recordProviderLimitEvent(entry, event.signal, eventAt);
-        await this.persistHarnessEvent(entry, { ...event, signal });
         const runId = entry.activeRunId ?? entry.runId ?? "";
         if (runId.length > 0) {
           await this.updateRunTerminalStateIfRunning(runId, {
@@ -1515,19 +1545,31 @@ export class Orchestrator {
             metadata: terminalRunMetadata(entry, "failed"),
           });
         }
+        await this.persistHarnessEvent(entry, { ...event, signal });
         throw new SymphonyError("agent_error", signal.message);
       }
-      await this.persistHarnessEvent(entry, event);
+      const terminalHarnessEvent = event.type === "completed" || event.type === "failed" || event.type === "cancelled";
+      if (!terminalHarnessEvent) await this.persistHarnessEvent(entry, rawEvent);
+
       if (event.type === "completed") {
         if (entry.runPhase === "issue_breakdown") {
           const accepted = await this.reconcileIssueBreakdownPlanHandoff(entry);
+          if (accepted) {
+            const terminal = await this.terminalizeAcceptedHandoff(entry, "issue_breakdown_plan");
+            await this.persistHarnessEvent(entry, event);
+            if (!terminal.updated) return;
+            continue;
+          }
+          const completedAt = new Date().toISOString();
+          this.applyPlanningFailureDiagnostic(entry, PLANNING_NO_PLAN_ERROR, new Date(completedAt));
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
-            status: accepted ? "succeeded" : "failed",
-            completedAt: new Date().toISOString(),
-            ...(accepted ? {} : { error: "Planning run completed without submit_issue_breakdown_plan" }),
+            status: "failed",
+            completedAt,
+            error: PLANNING_NO_PLAN_ERROR,
             tokens: entry.activeRunTokens,
-            metadata: terminalRunMetadata(entry, accepted ? "succeeded" : "failed"),
+            metadata: terminalRunMetadata(entry, "failed"),
           });
+          await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           continue;
         }
@@ -1537,6 +1579,7 @@ export class Orchestrator {
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
+        await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         await this.discoverPullRequestForEntry(entry, context.workspace);
         if (
@@ -1563,19 +1606,13 @@ export class Orchestrator {
           entry.runPhase === "issue_breakdown" &&
           (await this.terminalizeAcceptedIssueBreakdownPlan(entry))
         ) {
+          await this.persistHarnessEvent(entry, event);
           return;
         }
-        if (
-          entry.role === "worker" &&
-          ((entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) ||
-            (entry.runPhase === "merge_conflict_resolution" && (await this.reconcileMergeConflictResolutionHandoff(entry))))
-        ) {
-          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
-            status: "succeeded",
-            completedAt: new Date().toISOString(),
-            tokens: entry.activeRunTokens,
-            metadata: terminalRunMetadata(entry, "succeeded"),
-          });
+        const acceptedFailedHandoffKind = await this.acceptedTerminalHandoffKind(entry);
+        if (acceptedFailedHandoffKind) {
+          const terminal = await this.terminalizeAcceptedHandoff(entry, acceptedFailedHandoffKind);
+          await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           return;
         }
@@ -1586,6 +1623,7 @@ export class Orchestrator {
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
         });
+        await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         throw new SymphonyError("agent_error", event.error);
       }
@@ -1595,19 +1633,13 @@ export class Orchestrator {
           entry.runPhase === "issue_breakdown" &&
           (await this.terminalizeAcceptedIssueBreakdownPlan(entry))
         ) {
+          await this.persistHarnessEvent(entry, event);
           return;
         }
-        if (
-          entry.role === "worker" &&
-          ((entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) ||
-            (entry.runPhase === "merge_conflict_resolution" && (await this.reconcileMergeConflictResolutionHandoff(entry))))
-        ) {
-          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
-            status: "succeeded",
-            completedAt: new Date().toISOString(),
-            tokens: entry.activeRunTokens,
-            metadata: terminalRunMetadata(entry, "succeeded"),
-          });
+        const acceptedCancelledHandoffKind = await this.acceptedTerminalHandoffKind(entry);
+        if (acceptedCancelledHandoffKind) {
+          const terminal = await this.terminalizeAcceptedHandoff(entry, acceptedCancelledHandoffKind);
+          await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           return;
         }
@@ -1617,6 +1649,7 @@ export class Orchestrator {
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
         });
+        await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         throw new SymphonyError("agent_error", "Run was cancelled");
       }
@@ -1681,19 +1714,69 @@ export class Orchestrator {
     return normalized;
   }
 
+  private applyPlanningFailureDiagnostic(entry: RunningEntry, message: string, at: Date): void {
+    entry.failureKind = entry.failureKind ?? PLANNING_FAILURE_DIAGNOSTIC_CODE;
+    entry.failureDiagnosticCode = entry.failureDiagnosticCode ?? PLANNING_FAILURE_DIAGNOSTIC_CODE;
+    entry.failureDiagnosticMessage = entry.failureDiagnosticMessage ?? message;
+    entry.failureDiagnosticAt = entry.failureDiagnosticAt ?? at;
+    entry.lastMessage = message;
+  }
+
   private async terminalizeAcceptedIssueBreakdownPlan(entry: RunningEntry): Promise<boolean> {
     const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
     if (!accepted) return false;
+    await this.terminalizeAcceptedHandoff(entry, "issue_breakdown_plan");
+    return true;
+  }
+
+  private async acceptedTerminalHandoffKind(entry: RunningEntry): Promise<AcceptedHandoffKind | null> {
+    if (entry.role !== "worker") return null;
+    if (entry.runPhase === "issue_breakdown") {
+      return entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry))
+        ? "issue_breakdown_plan"
+        : null;
+    }
+    if (entry.runPhase === "merge_conflict_resolution") {
+      return entry.mergeConflictResolutionAccepted || (await this.reconcileMergeConflictResolutionHandoff(entry))
+        ? "merge_conflict_resolution"
+        : null;
+    }
+    return (await this.reconcileCompletionReportHandoff(entry)) || entry.completionReportAccepted || entry.pullRequestHandoffAccepted
+      ? this.acceptedImplementationHandoffKind(entry)
+      : null;
+  }
+
+  private acceptedImplementationHandoffKind(_entry: RunningEntry): AcceptedHandoffKind {
+    return this.config.github.prHandoff.enabled ? "pull_request_handoff" : "completion_report";
+  }
+
+  private async terminalizeAcceptedHandoff(entry: RunningEntry, kind: AcceptedHandoffKind): Promise<TerminalUpdateResult> {
     const runId = entry.activeRunId ?? entry.runId ?? "";
-    if (runId.length > 0) {
-      await this.updateRunTerminalStateIfRunning(runId, {
-        status: "succeeded",
-        completedAt: new Date().toISOString(),
-        tokens: entry.activeRunTokens,
-        metadata: terminalRunMetadata(entry, "succeeded"),
+    if (runId.length === 0) return { updated: true, record: null };
+    const completedAt = new Date().toISOString();
+    const metadata = terminalRunMetadata(entry, "succeeded");
+    const terminal = await this.updateRunTerminalStateIfRunning(runId, {
+      status: "succeeded",
+      completedAt,
+      tokens: entry.activeRunTokens,
+      metadata,
+    });
+    if (terminal.updated) {
+      await this.options.runStore?.appendEvent({
+        runId,
+        at: completedAt,
+        source: "orchestrator",
+        eventType: "handoff_terminal",
+        message: `Accepted ${formatAcceptedHandoffKind(kind)} handoff terminalized run as succeeded`,
+        payload: {
+          kind,
+          status: "succeeded",
+          tokens: entry.activeRunTokens,
+          ...metadata,
+        },
       });
     }
-    return true;
+    return terminal;
   }
 
   private async onWorkerExit(issueId: string, kind: "normal" | "abnormal", error: string | null): Promise<void> {
@@ -1740,12 +1823,10 @@ export class Orchestrator {
           ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted))))
     ) {
       if (entry.runId) {
-        const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
-          status: "succeeded",
-          completedAt: new Date().toISOString(),
-          tokens: entry.activeRunTokens,
-          metadata: terminalRunMetadata(entry, "succeeded"),
-        });
+        const terminal = await this.terminalizeAcceptedHandoff(
+          entry,
+          entry.runPhase === "merge_conflict_resolution" ? "merge_conflict_resolution" : this.acceptedImplementationHandoffKind(entry),
+        );
         if (!terminal.updated) {
           if (entry.runPhase !== "merge_conflict_resolution") {
             this.claimed.delete(issueId);
@@ -1923,6 +2004,15 @@ export class Orchestrator {
 
     const now = new Date().toISOString();
     const runId = entry.activeRunId ?? entry.runId ?? issueId;
+    const failureMessage = error ?? "Planning run failed";
+    this.applyPlanningFailureDiagnostic(entry, failureMessage, new Date(now));
+    await this.updateRunTerminalStateIfRunning(runId, {
+      status: "failed",
+      completedAt: now,
+      error: failureMessage,
+      tokens: entry.activeRunTokens,
+      metadata: terminalRunMetadata(entry, "failed"),
+    });
     const current = (await store.get(issueId)) ?? entry.lifecycle;
     const nextCount = (current?.planningFailureCount ?? 0) + 1;
     const lifecycle = await store.updateIssue(entry.issue, {
@@ -1936,9 +2026,15 @@ export class Orchestrator {
       runId,
       at: now,
       source: "orchestrator",
-      eventType: "planning_run_failed",
-      message: error ?? "Planning run failed",
-      payload: { planningFailureCount: nextCount },
+      eventType: PLANNING_FAILURE_DIAGNOSTIC_CODE,
+      message: failureMessage,
+      payload: {
+        status: "failed",
+        error: failureMessage,
+        tokens: entry.activeRunTokens,
+        planningFailureCount: nextCount,
+        ...terminalRunMetadata(entry, "failed"),
+      },
     });
 
     const maxFailures = this.config.issueBreakdown.maxPlanningFailures;
@@ -2180,17 +2276,13 @@ export class Orchestrator {
   }
 
   private async persistHarnessEvent(entry: RunningEntry, event: AgentEvent): Promise<void> {
-    const runId = entry.activeRunId ?? entry.runId;
+    const runId = event.type === "run_status" ? event.runId : (entry.activeRunId ?? entry.runId);
     if (!runId) return;
-    const message =
-      event.type === "progress" || event.type === "completed" || event.type === "run_diagnostic" ? event.message : undefined;
     await this.options.runStore?.appendEvent({
       runId,
       at: new Date(event.at ?? Date.now()).toISOString(),
       source: "harness",
-      eventType: event.type,
-      ...(message === undefined ? {} : { message }),
-      payload: event,
+      ...mapAgentEventToRunActivityEvent(event),
     });
     if (event.type === "tokens") {
       await this.options.runStore?.updateRun(runId, { tokens: entry.activeRunTokens });
@@ -3217,11 +3309,13 @@ function effectiveRuntimeModeForEntry(entry: RunningEntry, config: ServiceConfig
 
 function runtimeProviderForHarness(harnessId: string, config: ServiceConfig): string | null {
   if (harnessId === "hermes") return config.hermes.provider;
+  if (harnessId === "hermes_acp") return config.hermes.provider ?? "host_hermes";
   return harnessId;
 }
 
 function runtimeModelForHarness(harnessId: string, config: ServiceConfig): string | null {
   if (harnessId === "hermes") return config.hermes.model;
+  if (harnessId === "hermes_acp") return config.hermes.model;
   if (harnessId === "cursor") return config.cursor.model;
   return null;
 }
@@ -3265,6 +3359,20 @@ function runtimeMetadataForEntry(
       runtimeModelParams: [],
       runtimeSettingSources: [
         `template:${hermesTemplateForEntry(entry, config)}`,
+        ...(config.hermes.provider === null ? [] : [`provider:${config.hermes.provider}`]),
+      ],
+      runtimeMode: effectiveRuntimeModeForEntry(entry, config),
+      runtimeAgentLifecycle: config.hermes.workerSessionLifecycle,
+    };
+  }
+  if (harnessId === "hermes_acp") {
+    return {
+      runtimeModel: config.hermes.model,
+      runtimeModelParams: [],
+      runtimeSettingSources: [
+        `host_hermes:${config.hermes.acpBinaryPath ?? "PATH:hermes"}`,
+        `source_profile:${config.hermes.acpSourceProfile ?? "active"}`,
+        `profile_prefix:${config.hermes.acpProfilePrefix ?? "symphony"}`,
         ...(config.hermes.provider === null ? [] : [`provider:${config.hermes.provider}`]),
       ],
       runtimeMode: effectiveRuntimeModeForEntry(entry, config),
@@ -3471,6 +3579,19 @@ function terminalActivitySnapshot(entry: RunningEntry): RunActivitySnapshot {
     lastDeltaOrToolActivityAt: activity.lastDeltaOrToolActivityAt,
     lastToolActivityAt: activity.lastToolActivityAt,
   };
+}
+
+function formatAcceptedHandoffKind(kind: AcceptedHandoffKind): string {
+  switch (kind) {
+    case "completion_report":
+      return "completion report";
+    case "pull_request_handoff":
+      return "pull request";
+    case "issue_breakdown_plan":
+      return "issue breakdown plan";
+    case "merge_conflict_resolution":
+      return "merge conflict resolution";
+  }
 }
 
 function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | "failed" | "cancelled"): RunMetadata {

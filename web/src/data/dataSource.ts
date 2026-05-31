@@ -9,6 +9,17 @@ import type {
   TranscriptMessage,
 } from "../types/symphony";
 
+export interface ProjectionChangeEvent {
+  type: string;
+  generation?: number;
+  source?: string;
+  revision?: number;
+  observedAt?: string;
+}
+
+export type ProjectionChangeListener = (event: ProjectionChangeEvent) => void;
+export type ProjectionChangeUnsubscribe = () => void;
+
 export interface SymphonyDataSource {
   getReferenceData(signal?: AbortSignal): Promise<ReferenceData>;
   getDashboard(signal?: AbortSignal): Promise<DashboardModel>;
@@ -20,4 +31,6 @@ export interface SymphonyDataSource {
   getSidebar(signal?: AbortSignal): Promise<SidebarModel>;
   getOrchestratorChat(signal?: AbortSignal): Promise<ChatMessage[]>;
   sendOrchestratorMessage(input: string): Promise<ChatMessage[]>;
+  invalidateCachedReads?(): void;
+  subscribeToProjectionChanges?(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe;
 }
