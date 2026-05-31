@@ -382,6 +382,7 @@ CREATE TABLE IF NOT EXISTS symphony.projection_revision (
   expires_at timestamptz,
   superseded_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (projection_name, scope_kind, scope_key, revision),
   CHECK (jsonb_typeof(source_revisions) = 'array'),
   CHECK (jsonb_typeof(source_cursors) = 'object')
@@ -391,7 +392,7 @@ COMMENT ON TABLE symphony.projection_revision IS
   'Durable monotonic projection revision metadata for frontend read models. Rows capture the Symphony and external-source revisions used to derive each projection payload.';
 
 CREATE INDEX IF NOT EXISTS projection_revision_reads_idx
-  ON symphony.projection_revision (projection_name, scope_kind, scope_key, revision DESC, generated_at DESC);
+  ON symphony.projection_revision (projection_name, scope_kind, scope_key, revision DESC, updated_at DESC, generated_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS projection_revision_current_unique_idx
   ON symphony.projection_revision (projection_name, scope_kind, scope_key)
   WHERE superseded_at IS NULL;
@@ -405,6 +406,7 @@ CREATE TABLE IF NOT EXISTS symphony.dashboard_projection (
   raw_payload_refs jsonb NOT NULL DEFAULT '[]'::jsonb,
   generated_at timestamptz NOT NULL,
   expires_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (jsonb_typeof(raw_payload_refs) = 'array')
 );
 
@@ -414,7 +416,7 @@ COMMENT ON TABLE symphony.dashboard_projection IS
 CREATE UNIQUE INDEX IF NOT EXISTS dashboard_projection_scope_revision_idx
   ON symphony.dashboard_projection (scope_key, revision);
 CREATE INDEX IF NOT EXISTS dashboard_projection_revision_reads_idx
-  ON symphony.dashboard_projection (scope_key, revision DESC, generated_at DESC);
+  ON symphony.dashboard_projection (scope_key, revision DESC, updated_at DESC, generated_at DESC);
 
 CREATE TABLE IF NOT EXISTS symphony.issue_board_projection (
   projection_revision_id bigint PRIMARY KEY REFERENCES symphony.projection_revision(projection_revision_id) ON DELETE CASCADE,
@@ -426,6 +428,7 @@ CREATE TABLE IF NOT EXISTS symphony.issue_board_projection (
   raw_payload_refs jsonb NOT NULL DEFAULT '[]'::jsonb,
   generated_at timestamptz NOT NULL,
   expires_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (jsonb_typeof(fetched_states) = 'array'),
   CHECK (jsonb_typeof(raw_payload_refs) = 'array')
 );
@@ -436,7 +439,7 @@ COMMENT ON TABLE symphony.issue_board_projection IS
 CREATE UNIQUE INDEX IF NOT EXISTS issue_board_projection_scope_revision_idx
   ON symphony.issue_board_projection (scope_key, revision);
 CREATE INDEX IF NOT EXISTS issue_board_projection_revision_reads_idx
-  ON symphony.issue_board_projection (scope_key, revision DESC, generated_at DESC);
+  ON symphony.issue_board_projection (scope_key, revision DESC, updated_at DESC, generated_at DESC);
 
 CREATE TABLE IF NOT EXISTS symphony.sidebar_projection (
   projection_revision_id bigint PRIMARY KEY REFERENCES symphony.projection_revision(projection_revision_id) ON DELETE CASCADE,
@@ -447,6 +450,7 @@ CREATE TABLE IF NOT EXISTS symphony.sidebar_projection (
   raw_payload_refs jsonb NOT NULL DEFAULT '[]'::jsonb,
   generated_at timestamptz NOT NULL,
   expires_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (jsonb_typeof(raw_payload_refs) = 'array')
 );
 
@@ -456,7 +460,7 @@ COMMENT ON TABLE symphony.sidebar_projection IS
 CREATE UNIQUE INDEX IF NOT EXISTS sidebar_projection_scope_revision_idx
   ON symphony.sidebar_projection (scope_key, revision);
 CREATE INDEX IF NOT EXISTS sidebar_projection_revision_reads_idx
-  ON symphony.sidebar_projection (scope_key, revision DESC, generated_at DESC);
+  ON symphony.sidebar_projection (scope_key, revision DESC, updated_at DESC, generated_at DESC);
 
 CREATE TABLE IF NOT EXISTS symphony.history_projection (
   projection_revision_id bigint PRIMARY KEY REFERENCES symphony.projection_revision(projection_revision_id) ON DELETE CASCADE,
@@ -470,6 +474,7 @@ CREATE TABLE IF NOT EXISTS symphony.history_projection (
   raw_payload_refs jsonb NOT NULL DEFAULT '[]'::jsonb,
   generated_at timestamptz NOT NULL,
   expires_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (jsonb_typeof(raw_payload_refs) = 'array')
 );
 
@@ -479,9 +484,9 @@ COMMENT ON TABLE symphony.history_projection IS
 CREATE UNIQUE INDEX IF NOT EXISTS history_projection_scope_revision_idx
   ON symphony.history_projection (scope_key, revision);
 CREATE INDEX IF NOT EXISTS history_projection_revision_reads_idx
-  ON symphony.history_projection (scope_key, revision DESC, generated_at DESC);
+  ON symphony.history_projection (scope_key, revision DESC, updated_at DESC, generated_at DESC);
 CREATE INDEX IF NOT EXISTS history_projection_run_lookup_idx
-  ON symphony.history_projection (run_id, session_id, revision DESC)
+  ON symphony.history_projection (run_id, session_id, revision DESC, updated_at DESC)
   WHERE run_id IS NOT NULL OR session_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS symphony.transcript_projection (
@@ -499,6 +504,7 @@ CREATE TABLE IF NOT EXISTS symphony.transcript_projection (
   raw_payload_refs jsonb NOT NULL DEFAULT '[]'::jsonb,
   generated_at timestamptz NOT NULL,
   expires_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (jsonb_typeof(raw_payload_refs) = 'array')
 );
 
@@ -508,9 +514,9 @@ COMMENT ON TABLE symphony.transcript_projection IS
 CREATE UNIQUE INDEX IF NOT EXISTS transcript_projection_scope_revision_idx
   ON symphony.transcript_projection (scope_key, revision);
 CREATE INDEX IF NOT EXISTS transcript_projection_revision_reads_idx
-  ON symphony.transcript_projection (run_id, revision DESC, generated_at DESC);
+  ON symphony.transcript_projection (run_id, revision DESC, updated_at DESC, generated_at DESC);
 CREATE INDEX IF NOT EXISTS transcript_projection_session_reads_idx
-  ON symphony.transcript_projection (session_id, revision DESC)
+  ON symphony.transcript_projection (session_id, revision DESC, updated_at DESC)
   WHERE session_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS symphony.orchestrator_chat_projection (
@@ -525,6 +531,7 @@ CREATE TABLE IF NOT EXISTS symphony.orchestrator_chat_projection (
   raw_payload_refs jsonb NOT NULL DEFAULT '[]'::jsonb,
   generated_at timestamptz NOT NULL,
   expires_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (jsonb_typeof(raw_payload_refs) = 'array')
 );
 
@@ -534,9 +541,9 @@ COMMENT ON TABLE symphony.orchestrator_chat_projection IS
 CREATE UNIQUE INDEX IF NOT EXISTS orchestrator_chat_projection_scope_revision_idx
   ON symphony.orchestrator_chat_projection (scope_key, conversation_key, revision);
 CREATE INDEX IF NOT EXISTS orchestrator_chat_projection_revision_reads_idx
-  ON symphony.orchestrator_chat_projection (scope_key, conversation_key, revision DESC, generated_at DESC);
+  ON symphony.orchestrator_chat_projection (scope_key, conversation_key, revision DESC, updated_at DESC, generated_at DESC);
 CREATE INDEX IF NOT EXISTS orchestrator_chat_projection_issue_idx
-  ON symphony.orchestrator_chat_projection (issue_key, revision DESC)
+  ON symphony.orchestrator_chat_projection (issue_key, revision DESC, updated_at DESC)
   WHERE issue_key IS NOT NULL;
 
 COMMIT;
