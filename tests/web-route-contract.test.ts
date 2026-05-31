@@ -145,16 +145,21 @@ describe("/api/v1/web route contracts", () => {
     }
   });
 
-  it("keeps the orchestrator chat POST contract side-effect-free and validates malformed input", async () => {
+  it("keeps the orchestrator chat POST contract bounded when storage is absent and validates malformed input", async () => {
     const { server, calls } = createStatusServer(root);
     const address = await server.start();
     const url = `${baseUrlFor(address)}/api/v1/web/orchestrator-chat`;
     try {
-      const accepted = await postJson(url, { input: "summarize ENG-113" });
-      expect(accepted.response.status).toBe(200);
-      expect(accepted.body).toEqual([]);
-      expect(accepted.text.trim()).toBe("[]");
-      expect(accepted.text).not.toContain("summarize ENG-113");
+      const unavailable = await postJson(url, { input: "summarize ENG-113" });
+      expect(unavailable.response.status).toBe(503);
+      expect(unavailable.body).toEqual({
+        error: {
+          code: "orchestrator_chat_unavailable",
+          message: "Web orchestrator chat is unavailable because durable conversation storage is not configured",
+        },
+        chat: [],
+      });
+      expect(unavailable.text).not.toContain("summarize ENG-113");
 
       const malformed = await fetch(url, {
         method: "POST",

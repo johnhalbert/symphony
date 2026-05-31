@@ -62,8 +62,16 @@ import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import type {
   OrchestratorConversationMessage,
+  OrchestratorConversationStatus,
   OrchestratorConversationStore,
 } from "../core/persistence/OrchestratorConversationStore.js";
+import {
+  ORCHESTRATOR_CHAT_POST_ACTION,
+  type OrchestratorChatCommandDispatcher,
+  type OrchestratorChatCommandResult,
+  type OrchestratorChatCommandResultStatus,
+} from "../core/orchestrator/OrchestratorChatCommand.js";
+
 import { projectWebHistory } from "./WebHistoryProjection.js";
 import { projectWebTranscript } from "./WebTranscriptProjection.js";
 import {
@@ -504,18 +512,13 @@ export class StatusServer {
             throw error;
           }
 
-          if (!this.options.orchestratorConversationStore) {
-            sendJson(response, 200, projectWebOrchestratorChatPost(input.input));
-            return;
-          }
-
           const postConversationId = input.conversationId ?? conversationId;
-          const persisted = await this.persistWebOrchestratorChatPost({
+          const result = await this.acceptWebOrchestratorChatPost({
             input: input.input,
             ...(postConversationId === undefined ? {} : { conversationId: postConversationId }),
             ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
           });
-          sendJson(response, 200, projectWebOrchestratorChatPost(input.input, persisted));
+          sendJson(response, result.status, result.body);
           return;
         }
       }
@@ -1057,25 +1060,143 @@ export class StatusServer {
     return (await this.options.orchestratorConversationStore?.listMessages(conversationId)) ?? [];
   }
 
-  private async persistWebOrchestratorChatPost(input: {
+  private async acceptWebOrchestratorChatPost(input: {
     conversationId?: string | null;
     messageId?: string;
     input: string;
-  }): Promise<OrchestratorConversationMessage[]> {
+  }): Promise<{ status: number; body: unknown }> {
     const store = this.options.orchestratorConversationStore;
-    if (!store) return [];
-    await store.appendMessage({
-      role: "user",
-      body: input.input,
-      status: "completed",
-      ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
-      ...(input.messageId === undefined ? {} : { id: input.messageId }),
-      metadata: {
-        source: "web_orchestrator_chat",
+    if (!store) {
+      return webOrchestratorChatErrorResponse(
+        503,
+        "orchestrator_chat_unavailable",
+        "Web orchestrator chat is unavailable because durable conversation storage is not configured",
+        [],
+      );
+    }
+
+    let existingMessages: OrchestratorConversationMessage[] = [];
+    try {
+      existingMessages = input.messageId === undefined ? [] : await store.listMessages(input.conversationId);
+    } catch {
+      return webOrchestratorChatErrorResponse(
+        500,
+        "orchestrator_chat_persistence_failed",
+        "Web orchestrator chat could not inspect existing messages",
+        [],
+      );
+    }
+    const existingMessage =
+      input.messageId === undefined ? undefined : existingMessages.find((message) => message.id === input.messageId);
+    if (existingMessage) {
+      return { status: 200, body: projectWebOrchestratorChatPost(input.input, existingMessages) };
+    }
+
+    const requestedAt = new Date().toISOString();
+    let message: OrchestratorConversationMessage;
+    try {
+      message = await store.appendMessage({
+        role: "user",
+        body: input.input,
+        status: "pending",
+        at: requestedAt,
+        ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+        ...(input.messageId === undefined ? {} : { id: input.messageId }),
+        metadata: {
+          source: "web_orchestrator_chat",
+          action: ORCHESTRATOR_CHAT_POST_ACTION,
+          actionDispatched: false,
+          commandStatus: "pending",
+          commandRequestedAt: requestedAt,
+        },
+      });
+    } catch {
+      return webOrchestratorChatErrorResponse(
+        500,
+        "orchestrator_chat_persistence_failed",
+        "Web orchestrator chat could not persist the user message",
+        [],
+      );
+    }
+
+    const dispatcher = orchestratorChatCommandDispatcher(this.options.orchestrator);
+    if (!dispatcher) {
+      return this.finalizeWebOrchestratorChatCommand({
+        store,
+        input,
+        message,
         actionDispatched: false,
-      },
+        result: { status: "unavailable", reason: "orchestrator_chat_command_dispatcher_unavailable" },
+      });
+    }
+
+    let result: OrchestratorChatCommandResult;
+    try {
+      result = await dispatcher.dispatchOrchestratorChatCommand({
+        action: ORCHESTRATOR_CHAT_POST_ACTION,
+        source: "web",
+        conversationId: message.conversationId,
+        messageId: message.id,
+        input: message.body,
+        requestedAt,
+      });
+    } catch {
+      result = { status: "failed", reason: "orchestrator_chat_command_dispatch_failed" };
+    }
+
+    return this.finalizeWebOrchestratorChatCommand({
+      store,
+      input,
+      message,
+      actionDispatched: true,
+      result,
     });
-    return store.listMessages(input.conversationId);
+  }
+
+  private async finalizeWebOrchestratorChatCommand(input: {
+    store: OrchestratorConversationStore;
+    conversationId?: string | null;
+    message?: OrchestratorConversationMessage;
+    input: { conversationId?: string | null; input: string };
+    actionDispatched: boolean;
+    result: OrchestratorChatCommandResult;
+  }): Promise<{ status: number; body: unknown }> {
+    const message = input.message;
+    if (!message) {
+      return webOrchestratorChatErrorResponse(
+        500,
+        "orchestrator_chat_persistence_failed",
+        "Web orchestrator chat could not persist the user message",
+        [],
+      );
+    }
+    let messages: OrchestratorConversationMessage[];
+    try {
+      await input.store.updateMessage({
+        conversationId: message.conversationId,
+        messageId: message.id,
+        status: webOrchestratorChatMessageStatusFromCommandResult(input.result.status),
+        metadata: webOrchestratorChatCommandMetadata(input.result, input.actionDispatched),
+      });
+      messages = await input.store.listMessages(message.conversationId);
+    } catch {
+      return webOrchestratorChatErrorResponse(
+        500,
+        "orchestrator_chat_persistence_failed",
+        "Web orchestrator chat could not persist the command state update",
+        projectWebOrchestratorChatPost(input.input.input, [message]),
+      );
+    }
+
+    if (input.result.status === "accepted") {
+      return { status: 202, body: projectWebOrchestratorChatPost(input.input.input, messages) };
+    }
+    return webOrchestratorChatErrorResponse(
+      webOrchestratorChatHttpStatusFromCommandResult(input.result.status),
+      webOrchestratorChatErrorCodeFromCommandResult(input.result.status),
+      webOrchestratorChatErrorMessageFromCommandResult(input.result.status),
+      projectWebOrchestratorChatPost(input.input.input, messages),
+    );
   }
 
   private async fetchWebSidebar(forceRefresh: boolean) {
@@ -1854,6 +1975,95 @@ function parseOptionalWebOrchestratorChatString(body: unknown, key: "conversatio
     throw new SymphonyError("invalid_request", `Web orchestrator chat request body ${key} must be a non-empty string`);
   }
   return value.trim();
+}
+
+function orchestratorChatCommandDispatcher(value: unknown): OrchestratorChatCommandDispatcher | null {
+  if (typeof value !== "object" || value === null) return null;
+  const candidate = value as Partial<OrchestratorChatCommandDispatcher>;
+  return typeof candidate.dispatchOrchestratorChatCommand === "function"
+    ? (value as OrchestratorChatCommandDispatcher)
+    : null;
+}
+
+function webOrchestratorChatMessageStatusFromCommandResult(
+  status: OrchestratorChatCommandResultStatus,
+): OrchestratorConversationStatus {
+  switch (status) {
+    case "accepted":
+      return "pending";
+    case "disabled":
+      return "disabled";
+    case "unavailable":
+      return "unavailable";
+    case "failed":
+      return "failed";
+  }
+}
+
+function webOrchestratorChatHttpStatusFromCommandResult(status: OrchestratorChatCommandResultStatus): number {
+  switch (status) {
+    case "accepted":
+      return 202;
+    case "disabled":
+    case "unavailable":
+      return 503;
+    case "failed":
+      return 500;
+  }
+}
+
+function webOrchestratorChatErrorCodeFromCommandResult(status: OrchestratorChatCommandResultStatus): string {
+  switch (status) {
+    case "accepted":
+      return "orchestrator_chat_accepted";
+    case "disabled":
+      return "orchestrator_chat_disabled";
+    case "unavailable":
+      return "orchestrator_chat_unavailable";
+    case "failed":
+      return "orchestrator_chat_dispatch_failed";
+  }
+}
+
+function webOrchestratorChatErrorMessageFromCommandResult(status: OrchestratorChatCommandResultStatus): string {
+  switch (status) {
+    case "accepted":
+      return "Web orchestrator chat command was accepted";
+    case "disabled":
+      return "Web orchestrator chat command dispatch is disabled";
+    case "unavailable":
+      return "Web orchestrator chat command dispatch is unavailable";
+    case "failed":
+      return "Web orchestrator chat command dispatch failed";
+  }
+}
+
+function webOrchestratorChatCommandMetadata(
+  result: OrchestratorChatCommandResult,
+  actionDispatched: boolean,
+): Record<string, unknown> {
+  return {
+    actionDispatched,
+    commandStatus: result.status,
+    commandReason: sanitizedPreviewValue(result.reason, 200).preview ?? "",
+    ...(result.acceptedAt ? { commandAcceptedAt: result.acceptedAt } : {}),
+    ...(result.metadata ? { commandMetadata: sanitizePublicJson(result.metadata) } : {}),
+  };
+}
+
+function webOrchestratorChatErrorResponse(
+  status: number,
+  code: string,
+  message: string,
+  chat: unknown,
+): { status: number; body: unknown } {
+  return {
+    status,
+    body: {
+      error: { code, message },
+      chat,
+    },
+  };
 }
 
 function parseIssueBreakdownApplyRequest(body: unknown): { dryRun: boolean } {
