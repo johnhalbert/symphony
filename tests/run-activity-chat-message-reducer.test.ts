@@ -55,6 +55,48 @@ function statusActivity(overrides: Record<string, unknown> = {}): RunActivityEve
   } as RunActivityEvent;
 }
 
+function toolActivity(overrides: Record<string, unknown> = {}): RunActivityEvent {
+  return {
+    id: "activity-tool-1",
+    runId: "run-chat",
+    sessionId: "session-chat",
+    runSessionId: "run-chat:session-chat",
+    at: "2026-05-31T00:00:01.000Z",
+    sequence: 2,
+    sequenceSource: "harness",
+    externalEventId: null,
+    protocol: "json_rpc",
+    harnessId: "hermes",
+    actor: "assistant",
+    channel: "tool",
+    kind: "tool_call_requested",
+    text: "Run shell command",
+    payload: { toolCallId: "tool-call-1", toolName: "shell.run" },
+    ...overrides,
+  } as RunActivityEvent;
+}
+
+function terminalActivity(overrides: Record<string, unknown> = {}): RunActivityEvent {
+  return {
+    id: "activity-terminal-1",
+    runId: "run-chat",
+    sessionId: "session-chat",
+    runSessionId: "run-chat:session-chat",
+    at: "2026-05-31T00:00:04.000Z",
+    sequence: 4,
+    sequenceSource: "harness",
+    externalEventId: null,
+    protocol: "json_rpc",
+    harnessId: "hermes",
+    actor: "runtime",
+    channel: "terminal",
+    kind: "run_failed",
+    text: "run failed",
+    payload: { reason: "run_failed" },
+    ...overrides,
+  } as RunActivityEvent;
+}
+
 function stored(event: RunActivityEvent, overrides: Partial<RunActivityStoredEvent["storage"]> = {}): RunActivityStoredEvent {
   return {
     event,
@@ -146,6 +188,115 @@ describe("RunActivityChatMessageReducer", () => {
     expect(JSON.stringify(messages)).not.toContain("SECRET_USER_TOKEN");
     expect(JSON.stringify(messages)).not.toContain("SECRET_ASSISTANT_TOKEN");
     expect(JSON.stringify(messages)).not.toContain("sk-user-secret");
+  });
+
+  it("reduces tool call and permission activity into coherent tool chat_message rows", () => {
+    const messages = reduceRunActivityEventsToChatMessages([
+      stored(
+        toolActivity({
+          id: "activity-tool-requested",
+          sequence: 1,
+          text: "shell.run requested with token=SECRET_TOOL_TOKEN",
+          payload: { toolCallId: "tool-call-1", toolName: "shell.run", inputPreview: "token=SECRET_TOOL_TOKEN" },
+        }),
+      ),
+      stored(
+        toolActivity({
+          id: "activity-tool-started",
+          sequence: 2,
+          kind: "tool_call_started",
+          text: "shell.run started",
+          payload: { toolCallId: "tool-call-1", toolName: "shell.run", status: "running" },
+        }),
+      ),
+      stored(
+        toolActivity({
+          id: "activity-tool-progress",
+          sequence: 3,
+          kind: "tool_call_progress",
+          text: "downloaded ",
+          payload: { toolCallId: "tool-call-1", toolName: "shell.run", status: "running" },
+        }),
+      ),
+      stored(
+        toolActivity({
+          id: "activity-tool-completed",
+          sequence: 4,
+          kind: "tool_call_completed",
+          text: "done token=SECRET_TOOL_TOKEN",
+          payload: { toolCallId: "tool-call-1", toolName: "shell.run", status: "succeeded" },
+        }),
+      ),
+      stored(
+        toolActivity({
+          id: "activity-permission-requested",
+          sequence: 5,
+          kind: "tool_permission_requested",
+          text: "permission requested",
+          payload: { toolCallId: "permission-1", toolName: "shell.run", status: "requested" },
+        }),
+      ),
+      stored(
+        toolActivity({
+          id: "activity-permission-resolved",
+          sequence: 6,
+          kind: "tool_permission_resolved",
+          text: "permission denied token=SECRET_PERMISSION_TOKEN",
+          payload: { toolCallId: "permission-1", toolName: "shell.run", status: "denied" },
+        }),
+      ),
+    ]);
+
+    expect(messages).toHaveLength(2);
+    expect(messages.map((message) => [message.role, message.messageKind, message.status, message.eventSequenceStart, message.eventSequenceEnd])).toEqual([
+      ["tool", "tool_call", "completed", 1, 4],
+      ["tool", "tool_permission", "failed", 5, 6],
+    ]);
+    expect(messages[0]).toMatchObject({
+      messageId: "run_activity:run-chat:session-chat:tool_call:tool-call-1",
+      body: "done token=[redacted]",
+      metadata: { sourceEventIds: ["activity-tool-requested", "activity-tool-started", "activity-tool-progress", "activity-tool-completed"], bodyRedacted: true },
+    });
+    expect(messages[1]).toMatchObject({
+      messageId: "run_activity:run-chat:session-chat:tool_permission:permission-1",
+      body: "permission denied token=[redacted]",
+      metadata: { sourceEventIds: ["activity-permission-requested", "activity-permission-resolved"], bodyRedacted: true },
+    });
+    expect(JSON.stringify(messages)).not.toContain("SECRET_TOOL_TOKEN");
+    expect(JSON.stringify(messages)).not.toContain("SECRET_PERMISSION_TOKEN");
+  });
+
+  it("marks active assistant and tool messages failed when terminal failure activity ends the run", () => {
+    const messages = reduceRunActivityEventsToChatMessages([
+      stored(messageActivity({ id: "activity-assistant-delta", sequence: 1, kind: "assistant_message_delta", text: "partial" })),
+      stored(toolActivity({ id: "activity-tool-requested", sequence: 2, text: "shell.run requested", payload: { toolCallId: "tool-call-1", toolName: "shell.run" } })),
+      stored(terminalActivity({ id: "activity-run-failed", sequence: 3, kind: "run_failed", text: "runtime failed" })),
+    ]);
+
+    expect(messages.map((message) => [message.role, message.messageKind, message.status, message.body, message.eventSequenceStart, message.eventSequenceEnd])).toEqual([
+      ["assistant", "assistant_response", "failed", "partial", 1, 3],
+      ["tool", "tool_call", "failed", "shell.run requested", 2, 3],
+    ]);
+    expect(messages[0]?.metadata).toMatchObject({ sourceEventIds: ["activity-assistant-delta", "activity-run-failed"], sourceEventSequences: [1, 3] });
+    expect(messages[1]?.metadata).toMatchObject({ sourceEventIds: ["activity-tool-requested", "activity-run-failed"], sourceEventSequences: [2, 3] });
+  });
+
+  it("marks active assistant messages cancelled for terminal cancellation while missing completion remains streaming", () => {
+    const missingCompletion = reduceRunActivityEventsToChatMessages([
+      stored(messageActivity({ id: "activity-missing-completion", sequence: 1, kind: "assistant_message_delta", text: "partial" })),
+      stored(statusActivity({ id: "activity-status", sequence: 2 })),
+    ]);
+    expect(missingCompletion).toHaveLength(1);
+    expect(missingCompletion[0]).toMatchObject({ status: "streaming", body: "partial", eventSequenceStart: 1, eventSequenceEnd: 1 });
+
+    const cancelled = reduceRunActivityEventsToChatMessages([
+      stored(messageActivity({ id: "activity-assistant-delta", sequence: 1, kind: "assistant_message_delta", text: "partial" })),
+      stored(terminalActivity({ id: "activity-run-cancelled", sequence: 2, kind: "run_cancelled", text: "operator cancelled" })),
+    ]);
+
+    expect(cancelled).toHaveLength(1);
+    expect(cancelled[0]).toMatchObject({ status: "cancelled", body: "partial", eventSequenceStart: 1, eventSequenceEnd: 2 });
+    expect(cancelled[0]?.metadata).toMatchObject({ sourceEventIds: ["activity-assistant-delta", "activity-run-cancelled"], sourceEventSequences: [1, 2] });
   });
 
   it("coalesces implicit assistant delta streams, reasoning, and source truncation metadata", () => {
@@ -305,6 +456,69 @@ describe("RunActivityChatMessageReducer", () => {
       client.normalizedStatements.findIndex((statement) => statement.startsWith("INSERT INTO symphony.run_activity_event")),
     ).toBeLessThan(client.normalizedStatements.findIndex((statement) => statement.startsWith("INSERT INTO symphony.chat_message")));
   });
+
+  it("reduces accepted tool appends into chat_message rows in the same Postgres append transaction", async () => {
+    const client = new FakeAppendAndChatReducerPostgresClient();
+    const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+
+    const result = await store.appendEvents([
+      toolAppendInput({ id: "activity:append:tool-request", kind: "tool_call_requested", text: "shell requested", payload: { toolCallId: "append-tool", toolName: "shell.run" } }),
+      toolAppendInput({ id: "activity:append:tool-complete", kind: "tool_call_completed", text: "shell completed", payload: { toolCallId: "append-tool", toolName: "shell.run", status: "succeeded" } }),
+    ]);
+
+    expect(result.accepted).toHaveLength(2);
+    expect(client.activityRows).toHaveLength(2);
+    expect(client.chatInsertValues).toHaveLength(1);
+    expect(client.chatInsertValues[0]?.slice(0, 16)).toEqual([
+      "run_activity:run-chat:session-chat:tool_call:append-tool",
+      "run-chat:session-chat",
+      "issue:eng-198",
+      "ENG-198",
+      "run-chat",
+      "session-chat",
+      0,
+      "tool",
+      "tool_call",
+      "completed",
+      "shell completed",
+      "shell completed",
+      15,
+      false,
+      1,
+      2,
+    ]);
+  });
+
+  it("re-runs reduction for accepted terminal failure appends but not duplicate appends", async () => {
+    const client = new FakeAppendAndChatReducerPostgresClient();
+    const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+
+    const first = await store.appendEvents([
+      messageAppendInput({ id: "activity:append:assistant-delta", kind: "assistant_message_delta", text: "partial", payload: { delta: true } }),
+      terminalAppendInput({ id: "activity:append:run-failed", kind: "run_failed", text: "runtime failed" }),
+    ]);
+    expect(first.accepted).toHaveLength(2);
+    expect(client.chatInsertValues).toHaveLength(1);
+    expect(client.chatInsertValues[0]?.slice(7, 16)).toEqual([
+      "assistant",
+      "assistant_response",
+      "failed",
+      "partial",
+      "partial",
+      7,
+      false,
+      1,
+      2,
+    ]);
+    const metadata = JSON.parse(String(client.chatInsertValues[0]?.[18]));
+    expect(metadata).toMatchObject({ sourceEventIds: ["activity:append:assistant-delta", "activity:append:run-failed"], sourceEventSequences: [1, 2] });
+
+    const duplicate = await store.appendEvent(
+      messageAppendInput({ id: "activity:append:assistant-delta", kind: "assistant_message_delta", text: "partial", payload: { delta: true } }),
+    );
+    expect(duplicate.status).toBe("duplicate");
+    expect(client.chatInsertValues).toHaveLength(1);
+  });
 });
 
 class FakeChatReducerPostgresClient implements PostgresRunActivityChatMessageReducerClient {
@@ -438,6 +652,42 @@ function messageAppendInput(overrides: Record<string, unknown> = {}): RunActivit
     kind: "assistant_message_completed",
     text: "append message",
     payload: {},
+    protocol: "json_rpc",
+    sequence: null,
+    ...overrides,
+  } as RunActivityAppendInput;
+}
+
+function toolAppendInput(overrides: Record<string, unknown> = {}): RunActivityAppendInput {
+  return {
+    id: "activity:append:tool",
+    runId: "run-chat",
+    sessionId: "session-chat",
+    at: "2026-05-31T00:00:01.000Z",
+    harnessId: "hermes",
+    actor: "assistant",
+    channel: "tool",
+    kind: "tool_call_requested",
+    text: "tool append",
+    payload: { toolCallId: "append-tool", toolName: "shell.run" },
+    protocol: "json_rpc",
+    sequence: null,
+    ...overrides,
+  } as RunActivityAppendInput;
+}
+
+function terminalAppendInput(overrides: Record<string, unknown> = {}): RunActivityAppendInput {
+  return {
+    id: "activity:append:terminal",
+    runId: "run-chat",
+    sessionId: "session-chat",
+    at: "2026-05-31T00:00:02.000Z",
+    harnessId: "hermes",
+    actor: "runtime",
+    channel: "terminal",
+    kind: "run_failed",
+    text: "terminal append",
+    payload: { reason: "run_failed" },
     protocol: "json_rpc",
     sequence: null,
     ...overrides,

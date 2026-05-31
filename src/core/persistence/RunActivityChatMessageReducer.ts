@@ -2,10 +2,15 @@ import type { QueryResultRow } from "pg";
 import type { PostgresQueryClient } from "../database/PostgresMigrations.js";
 import { SymphonyError } from "../errors.js";
 import {
+  RUN_ACTIVITY_TERMINAL_CANCEL_KINDS,
+  RUN_ACTIVITY_TERMINAL_FAILURE_KINDS,
   compareRunActivityEvents,
   type RunActivityEvent,
   type RunActivityMessageKind,
+  type RunActivityToolKind,
   type RunMessageActivityEvent,
+  type RunTerminalActivityEvent,
+  type RunToolActivityEvent,
 } from "../runActivity/RunActivityEvent.js";
 import { redactTranscriptText, sanitizePublicJson, sanitizedPreviewValue } from "../transcript/TranscriptProjection.js";
 import type { RunActivityStoredEvent } from "./RunActivityAppendStore.js";
@@ -100,6 +105,7 @@ interface ChatMessageReducerState {
   readonly byMessageId: Map<string, MutableChatMessage>;
   openAssistantResponse: MutableChatMessage | null;
   openAssistantReasoning: MutableChatMessage | null;
+  readonly openToolMessages: Map<string, MutableChatMessage>;
 }
 
 export interface PostgresRunActivityChatMessageReducerClient extends PostgresQueryClient {
@@ -216,11 +222,11 @@ export function reduceRunActivityEventsToChatMessages(
     byMessageId: new Map<string, MutableChatMessage>(),
     openAssistantResponse: null,
     openAssistantReasoning: null,
+    openToolMessages: new Map<string, MutableChatMessage>(),
   };
 
   for (const envelope of envelopes) {
-    if (!isMessageActivityEvent(envelope.event)) continue;
-    reduceMessageEvent(envelope, state, threadKey, context);
+    reduceChatActivityEvent(envelope, state, threadKey, context);
   }
 
   return state.messages.map((message, index) => finalizeChatMessage(message, index));
@@ -302,6 +308,25 @@ export async function reduceRunActivityChatMessagesWithPostgresClient(
   };
 }
 
+function reduceChatActivityEvent(
+  envelope: RunActivityChatEventEnvelope,
+  state: ChatMessageReducerState,
+  threadKey: string,
+  context: RunActivityChatMessageContext,
+): void {
+  if (isMessageActivityEvent(envelope.event)) {
+    reduceMessageEvent(envelope, state, threadKey, context);
+    return;
+  }
+  if (isToolActivityEvent(envelope.event)) {
+    reduceToolEvent(envelope, state, threadKey, context);
+    return;
+  }
+  if (isTerminalActivityEvent(envelope.event)) {
+    reduceTerminalEvent(envelope, state);
+  }
+}
+
 function reduceMessageEvent(
   envelope: RunActivityChatEventEnvelope,
   state: ChatMessageReducerState,
@@ -329,6 +354,55 @@ function reduceMessageEvent(
   } else if (messageKind === "assistant_reasoning") {
     state.openAssistantReasoning = message.status === "completed" ? null : message;
   }
+}
+
+function reduceToolEvent(
+  envelope: RunActivityChatEventEnvelope,
+  state: ChatMessageReducerState,
+  threadKey: string,
+  context: RunActivityChatMessageContext,
+): void {
+  const event = envelope.event;
+  if (!isToolActivityEvent(event)) return;
+  const messageKind = chatMessageKindForRunActivityToolKind(event.kind);
+  const upstreamMessageId = normalizeOptionalString(event.payload.toolCallId);
+  const status = statusForToolEvent(event);
+  const text = textForToolEvent(event);
+  const message = resolveMutableMessage({
+    envelope,
+    state,
+    threadKey,
+    context,
+    role: "tool",
+    messageKind,
+    upstreamMessageId,
+    status,
+  });
+
+  applyEnvelopeToMutableMessage(message, envelope, text, status);
+
+  if (isActiveChatMessage(message)) {
+    state.openToolMessages.set(message.messageId, message);
+  } else {
+    state.openToolMessages.delete(message.messageId);
+  }
+}
+
+function reduceTerminalEvent(envelope: RunActivityChatEventEnvelope, state: ChatMessageReducerState): void {
+  const event = envelope.event;
+  if (!isTerminalActivityEvent(event)) return;
+  const status = statusForTerminalEvent(event);
+  if (status === null) return;
+
+  const activeMessages = state.messages.filter(isActiveChatMessage);
+
+  for (const message of activeMessages) {
+    applyEnvelopeToMutableMessage(message, envelope, "", status);
+  }
+
+  state.openAssistantResponse = null;
+  state.openAssistantReasoning = null;
+  state.openToolMessages.clear();
 }
 
 function resolveMutableMessage(input: {
@@ -399,8 +473,16 @@ function applyEnvelopeToMutableMessage(
   status: ChatMessageStatus,
 ): void {
   const event = envelope.event;
-  const shouldReplaceBody = event.kind === "assistant_message_completed" || event.kind === "assistant_reasoning_available";
-  const shouldAppendBody = event.kind === "assistant_message_delta" || event.kind === "assistant_reasoning_delta";
+  const shouldReplaceBody =
+    event.kind === "assistant_message_completed" ||
+    event.kind === "assistant_reasoning_available" ||
+    event.kind === "tool_call_completed" ||
+    event.kind === "tool_call_failed" ||
+    event.kind === "tool_permission_resolved";
+  const shouldAppendBody =
+    event.kind === "assistant_message_delta" ||
+    event.kind === "assistant_reasoning_delta" ||
+    event.kind === "tool_call_progress";
 
   if (text.length > 0) {
     if (shouldReplaceBody && event.payload.delta !== true) {
@@ -568,6 +650,14 @@ function isMessageActivityEvent(event: RunActivityEvent): event is RunMessageAct
   return event.channel === "message";
 }
 
+function isToolActivityEvent(event: RunActivityEvent): event is RunToolActivityEvent {
+  return event.channel === "tool";
+}
+
+function isTerminalActivityEvent(event: RunActivityEvent): event is RunTerminalActivityEvent {
+  return event.channel === "terminal";
+}
+
 function assertSingleRunSession(envelopes: readonly RunActivityChatEventEnvelope[]): void {
   const runSessionIds = new Set(envelopes.map((envelope) => envelope.event.runSessionId));
   if (runSessionIds.size > 1) {
@@ -616,6 +706,20 @@ function chatMessageKindForRunActivityMessageKind(kind: RunActivityMessageKind):
   }
 }
 
+function chatMessageKindForRunActivityToolKind(kind: RunActivityToolKind): string {
+  switch (kind) {
+    case "tool_call_requested":
+    case "tool_call_started":
+    case "tool_call_progress":
+    case "tool_call_completed":
+    case "tool_call_failed":
+      return "tool_call";
+    case "tool_permission_requested":
+    case "tool_permission_resolved":
+      return "tool_permission";
+  }
+}
+
 function statusForMessageEvent(event: RunMessageActivityEvent): ChatMessageStatus {
   if (event.payload.final === true) return "completed";
   switch (event.kind) {
@@ -632,11 +736,104 @@ function statusForMessageEvent(event: RunMessageActivityEvent): ChatMessageStatu
   }
 }
 
+function statusForToolEvent(event: RunToolActivityEvent): ChatMessageStatus {
+  switch (event.kind) {
+    case "tool_call_requested":
+    case "tool_permission_requested":
+      return statusFromToolPayload(event.payload.status, "pending");
+    case "tool_call_started":
+    case "tool_call_progress":
+      return statusFromToolPayload(event.payload.status, "streaming");
+    case "tool_call_completed":
+      return "completed";
+    case "tool_call_failed":
+      return "failed";
+    case "tool_permission_resolved":
+      return statusFromToolPayload(event.payload.status, "completed");
+  }
+}
+
+function statusForTerminalEvent(event: RunTerminalActivityEvent): ChatMessageStatus | null {
+  if (RUN_ACTIVITY_TERMINAL_FAILURE_KINDS.includes(event.kind as (typeof RUN_ACTIVITY_TERMINAL_FAILURE_KINDS)[number])) {
+    return "failed";
+  }
+  if (RUN_ACTIVITY_TERMINAL_CANCEL_KINDS.includes(event.kind as (typeof RUN_ACTIVITY_TERMINAL_CANCEL_KINDS)[number])) {
+    return "cancelled";
+  }
+  return null;
+}
+
+function statusFromToolPayload(value: unknown, fallback: ChatMessageStatus): ChatMessageStatus {
+  const status = normalizeOptionalString(value)?.toLowerCase();
+  if (status === "failed" || status === "error" || status === "errored" || status === "denied" || status === "rejected") {
+    return "failed";
+  }
+  if (status === "cancelled" || status === "canceled" || status === "aborted" || status === "interrupted") {
+    return "cancelled";
+  }
+  if (status === "completed" || status === "complete" || status === "succeeded" || status === "success" || status === "approved" || status === "granted" || status === "resolved") {
+    return "completed";
+  }
+  if (status === "running" || status === "streaming" || status === "in_progress") return "streaming";
+  if (status === "pending" || status === "requested" || status === "queued") return "pending";
+  return fallback;
+}
+
 function terminalStatus(current: ChatMessageStatus, next: ChatMessageStatus): ChatMessageStatus {
   if (current === "failed" || current === "cancelled" || current === "completed") return current;
   if (next === "failed" || next === "cancelled" || next === "completed") return next;
   if (current === "streaming" || next === "streaming") return "streaming";
   return next;
+}
+
+function isActiveChatMessage(message: MutableChatMessage): boolean {
+  return message.status === "pending" || message.status === "streaming";
+}
+
+function textForToolEvent(event: RunToolActivityEvent): string {
+  const directText = normalizeEventText(event.text);
+  if (directText.length > 0) return directText;
+
+  const preview = previewForToolEvent(event);
+  const toolName = normalizeOptionalString(event.payload.toolName) ?? "tool";
+  if (preview !== null) return `${toolName}: ${preview}`;
+  return `${toolName} ${toolStatusLabelForKind(event.kind)}`;
+}
+
+function previewForToolEvent(event: RunToolActivityEvent): string | null {
+  switch (event.kind) {
+    case "tool_call_failed":
+      return normalizeOptionalString(event.payload.errorPreview) ?? normalizeOptionalString(event.payload.outputPreview);
+    case "tool_call_completed":
+    case "tool_call_progress":
+      return normalizeOptionalString(event.payload.outputPreview) ?? normalizeOptionalString(event.payload.inputPreview);
+    case "tool_call_requested":
+    case "tool_call_started":
+    case "tool_permission_requested":
+    case "tool_permission_resolved":
+      return normalizeOptionalString(event.payload.inputPreview)
+        ?? normalizeOptionalString(event.payload.outputPreview)
+        ?? normalizeOptionalString(event.payload.errorPreview);
+  }
+}
+
+function toolStatusLabelForKind(kind: RunActivityToolKind): string {
+  switch (kind) {
+    case "tool_call_requested":
+      return "requested";
+    case "tool_call_started":
+      return "started";
+    case "tool_call_progress":
+      return "progress";
+    case "tool_call_completed":
+      return "completed";
+    case "tool_call_failed":
+      return "failed";
+    case "tool_permission_requested":
+      return "permission requested";
+    case "tool_permission_resolved":
+      return "permission resolved";
+  }
 }
 
 function implicitOpenMessage(state: ChatMessageReducerState, messageKind: string): MutableChatMessage | null {
