@@ -220,6 +220,7 @@ export interface RetryEntry {
 
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
 type TerminalUpdateResult = { updated: true; record: RunRecord | null } | { updated: false; record: RunRecord | null };
+type AcceptedHandoffKind = "completion_report" | "pull_request_handoff" | "issue_breakdown_plan" | "merge_conflict_resolution";
 
 export interface RuntimeSnapshot {
   generatedAt: string;
@@ -1597,17 +1598,9 @@ export class Orchestrator {
           await this.persistHarnessEvent(entry, event);
           return;
         }
-        if (
-          entry.role === "worker" &&
-          ((entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) ||
-            (entry.runPhase === "merge_conflict_resolution" && (await this.reconcileMergeConflictResolutionHandoff(entry))))
-        ) {
-          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
-            status: "succeeded",
-            completedAt: new Date().toISOString(),
-            tokens: entry.activeRunTokens,
-            metadata: terminalRunMetadata(entry, "succeeded"),
-          });
+        const acceptedFailedHandoffKind = await this.acceptedTerminalHandoffKind(entry);
+        if (acceptedFailedHandoffKind) {
+          const terminal = await this.terminalizeAcceptedHandoff(entry, acceptedFailedHandoffKind);
           await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           return;
@@ -1632,17 +1625,9 @@ export class Orchestrator {
           await this.persistHarnessEvent(entry, event);
           return;
         }
-        if (
-          entry.role === "worker" &&
-          ((entry.runPhase === "implementation" && ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted)) ||
-            (entry.runPhase === "merge_conflict_resolution" && (await this.reconcileMergeConflictResolutionHandoff(entry))))
-        ) {
-          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
-            status: "succeeded",
-            completedAt: new Date().toISOString(),
-            tokens: entry.activeRunTokens,
-            metadata: terminalRunMetadata(entry, "succeeded"),
-          });
+        const acceptedCancelledHandoffKind = await this.acceptedTerminalHandoffKind(entry);
+        if (acceptedCancelledHandoffKind) {
+          const terminal = await this.terminalizeAcceptedHandoff(entry, acceptedCancelledHandoffKind);
           await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           return;
@@ -1721,16 +1706,58 @@ export class Orchestrator {
   private async terminalizeAcceptedIssueBreakdownPlan(entry: RunningEntry): Promise<boolean> {
     const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
     if (!accepted) return false;
+    await this.terminalizeAcceptedHandoff(entry, "issue_breakdown_plan");
+    return true;
+  }
+
+  private async acceptedTerminalHandoffKind(entry: RunningEntry): Promise<AcceptedHandoffKind | null> {
+    if (entry.role !== "worker") return null;
+    if (entry.runPhase === "issue_breakdown") {
+      return entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry))
+        ? "issue_breakdown_plan"
+        : null;
+    }
+    if (entry.runPhase === "merge_conflict_resolution") {
+      return entry.mergeConflictResolutionAccepted || (await this.reconcileMergeConflictResolutionHandoff(entry))
+        ? "merge_conflict_resolution"
+        : null;
+    }
+    return (await this.reconcileCompletionReportHandoff(entry)) || entry.completionReportAccepted || entry.pullRequestHandoffAccepted
+      ? this.acceptedImplementationHandoffKind(entry)
+      : null;
+  }
+
+  private acceptedImplementationHandoffKind(_entry: RunningEntry): AcceptedHandoffKind {
+    return this.config.github.prHandoff.enabled ? "pull_request_handoff" : "completion_report";
+  }
+
+  private async terminalizeAcceptedHandoff(entry: RunningEntry, kind: AcceptedHandoffKind): Promise<TerminalUpdateResult> {
     const runId = entry.activeRunId ?? entry.runId ?? "";
-    if (runId.length > 0) {
-      await this.updateRunTerminalStateIfRunning(runId, {
-        status: "succeeded",
-        completedAt: new Date().toISOString(),
-        tokens: entry.activeRunTokens,
-        metadata: terminalRunMetadata(entry, "succeeded"),
+    if (runId.length === 0) return { updated: true, record: null };
+    const completedAt = new Date().toISOString();
+    const metadata = terminalRunMetadata(entry, "succeeded");
+    const terminal = await this.updateRunTerminalStateIfRunning(runId, {
+      status: "succeeded",
+      completedAt,
+      tokens: entry.activeRunTokens,
+      metadata,
+    });
+    if (terminal.updated) {
+      await this.options.runStore?.appendEvent({
+        runId,
+        at: completedAt,
+        source: "orchestrator",
+        eventType: "handoff_terminal",
+        message: `Accepted ${formatAcceptedHandoffKind(kind)} handoff terminalized run as succeeded`,
+        payload: {
+          kind,
+          status: "succeeded",
+          tokens: entry.activeRunTokens,
+          ...metadata,
+        },
       });
     }
-    return true;
+    return terminal;
   }
 
   private async onWorkerExit(issueId: string, kind: "normal" | "abnormal", error: string | null): Promise<void> {
@@ -1777,12 +1804,10 @@ export class Orchestrator {
           ((await this.reconcileCompletionReportHandoff(entry)) || entry.pullRequestHandoffAccepted))))
     ) {
       if (entry.runId) {
-        const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
-          status: "succeeded",
-          completedAt: new Date().toISOString(),
-          tokens: entry.activeRunTokens,
-          metadata: terminalRunMetadata(entry, "succeeded"),
-        });
+        const terminal = await this.terminalizeAcceptedHandoff(
+          entry,
+          entry.runPhase === "merge_conflict_resolution" ? "merge_conflict_resolution" : this.acceptedImplementationHandoffKind(entry),
+        );
         if (!terminal.updated) {
           if (entry.runPhase !== "merge_conflict_resolution") {
             this.claimed.delete(issueId);
@@ -3520,6 +3545,19 @@ function terminalActivitySnapshot(entry: RunningEntry): RunActivitySnapshot {
     lastDeltaOrToolActivityAt: activity.lastDeltaOrToolActivityAt,
     lastToolActivityAt: activity.lastToolActivityAt,
   };
+}
+
+function formatAcceptedHandoffKind(kind: AcceptedHandoffKind): string {
+  switch (kind) {
+    case "completion_report":
+      return "completion report";
+    case "pull_request_handoff":
+      return "pull request";
+    case "issue_breakdown_plan":
+      return "issue breakdown plan";
+    case "merge_conflict_resolution":
+      return "merge conflict resolution";
+  }
 }
 
 function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | "failed" | "cancelled"): RunMetadata {

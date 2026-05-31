@@ -724,30 +724,60 @@ describe("Orchestrator", () => {
       type: "failed",
       error: "post-plan harness failure",
     });
-    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "issue_breakdown_plan",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("failed");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
   });
 
   it("[event-guard:cancelled] treats accepted issue breakdown plans as succeeded when the harness is cancelled after submitting", async () => {
     const result = await runAcceptedIssueBreakdownHandoffScenario(root, { type: "cancelled" });
-    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "issue_breakdown_plan",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
   });
 
   it("[exit-guard:throw] terminalizes accepted planning runs when the harness throws after submitting without a terminal event", async () => {
     const result = await runAcceptedIssueBreakdownHandoffScenario(root, "throw");
-    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "issue_breakdown_plan",
+      status: "succeeded",
+    });
     expect(eventTypes).not.toContain("failed");
     expect(eventTypes).not.toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
   });
 
   it("blocks repeated issue breakdown failures without incrementing implementation incomplete turns", async () => {
@@ -2768,8 +2798,20 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript("report-run-1");
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "pull_request_handoff",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("failed");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(stateDir, "report-run-1", {
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -2874,8 +2916,20 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript("report-run-1");
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "pull_request_handoff",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(stateDir, "report-run-1", {
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -2978,9 +3032,21 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript("report-run-1");
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "pull_request_handoff",
+      status: "succeeded",
+    });
     expect(eventTypes).not.toContain("failed");
     expect(eventTypes).not.toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(stateDir, "report-run-1", {
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -6147,12 +6213,31 @@ async function settleOrchestratorExit(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 25));
 }
 
+async function expectReplaySucceededFromHandoff(
+  stateDir: string,
+  runId: string,
+  expected: Record<string, unknown> = {},
+): Promise<void> {
+  const rebuilt = await new FileRunTranscriptStore(stateDir).rebuildRunFromTranscript(runId);
+  expect(rebuilt).toMatchObject({
+    status: "succeeded",
+    completedAt: expect.any(String),
+    error: null,
+    ...expected,
+  });
+  expect(rebuilt?.failureKind ?? null).toBeNull();
+  expect(rebuilt?.failureDiagnosticCode ?? null).toBeNull();
+  expect(rebuilt?.failureDiagnosticMessage ?? null).toBeNull();
+  expect(rebuilt?.failureDiagnosticAt ?? null).toBeNull();
+}
+
 async function runAcceptedIssueBreakdownHandoffScenario(
   root: string,
   terminal: IssueBreakdownHandoffTerminal,
 ): Promise<{
   runStore: FileRunTranscriptStore;
   planRunId: string;
+  stateDir: string;
 }> {
   const config = testConfig(root);
   config.issueBreakdown.enabled = true;
@@ -6219,7 +6304,7 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   await orchestrator.stop();
   expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
 
-  return { runStore, planRunId };
+  return { runStore, planRunId, stateDir: config.workspace.stateDir };
 }
 
 class BlockingHarness implements AgentHarness {

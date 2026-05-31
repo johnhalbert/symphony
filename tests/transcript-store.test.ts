@@ -572,6 +572,80 @@ describe("FileRunTranscriptStore", () => {
         ...(scenario.status === "cancelled" ? { cancellationOutcome: "cancelled" } : {}),
       });
     }
+
+    for (const scenario of [
+      {
+        runId: "run-replay-handoff-completion-failed",
+        kind: "completion_report",
+        handoffAt: "2026-01-01T00:00:03.100Z",
+        laterEventType: "failed",
+      },
+      {
+        runId: "run-replay-handoff-pr-cancelled",
+        kind: "pull_request_handoff",
+        handoffAt: "2026-01-01T00:00:04.100Z",
+        laterEventType: "cancelled",
+      },
+      {
+        runId: "run-replay-handoff-issue-breakdown-throw",
+        kind: "issue_breakdown_plan",
+        handoffAt: "2026-01-01T00:00:05.100Z",
+        laterEventType: null,
+      },
+      {
+        runId: "run-replay-handoff-merge-conflict-failed",
+        kind: "merge_conflict_resolution",
+        handoffAt: "2026-01-01T00:00:06.100Z",
+        laterEventType: "failed",
+      },
+    ] as const) {
+      await startBasicRun(store, scenario.runId);
+      await store.appendEvent({
+        runId: scenario.runId,
+        at: scenario.handoffAt.replace(".100Z", ".000Z"),
+        source: "harness",
+        eventType: "session_started",
+        payload: { type: "session_started", sessionId: `${scenario.runId}-session`, runId: scenario.runId },
+      });
+      await store.appendEvent({
+        runId: scenario.runId,
+        at: scenario.handoffAt,
+        source: "orchestrator",
+        eventType: "handoff_terminal",
+        payload: {
+          kind: scenario.kind,
+          status: "succeeded",
+          tokens: { inputTokens: 13, outputTokens: 17, totalTokens: 30 },
+          failureKind: null,
+          failureDiagnosticCode: null,
+          failureDiagnosticMessage: null,
+          failureDiagnosticAt: null,
+        },
+      });
+      if (scenario.laterEventType) {
+        await store.appendEvent({
+          runId: scenario.runId,
+          at: scenario.handoffAt.replace(".100Z", ".200Z"),
+          source: "harness",
+          eventType: scenario.laterEventType,
+          payload:
+            scenario.laterEventType === "failed"
+              ? { type: "failed", error: "post-handoff harness failure" }
+              : { type: "cancelled" },
+        });
+      }
+      await expect(reloaded.rebuildRunFromTranscript(scenario.runId)).resolves.toMatchObject({
+        status: "succeeded",
+        completedAt: scenario.handoffAt,
+        error: null,
+        tokens: { inputTokens: 13, outputTokens: 17, totalTokens: 30 },
+        transcriptEventCount: scenario.laterEventType ? 3 : 2,
+        failureKind: null,
+        failureDiagnosticCode: null,
+        failureDiagnosticMessage: null,
+        failureDiagnosticAt: null,
+      });
+    }
   });
 
 

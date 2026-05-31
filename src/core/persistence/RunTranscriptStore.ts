@@ -711,6 +711,9 @@ function reduceRunActivityEvent(
     case "approval_resolved":
       next = reduceApprovalResolved(next, payload);
       break;
+    case "handoff_terminal":
+      next = reduceHandoffTerminalEvent(next, event, payload, options);
+      break;
     case "completed":
       next = reduceTerminalEvent(next, event, "succeeded", null, options);
       break;
@@ -792,7 +795,9 @@ function reduceSessionStarted(record: RunRecord, event: TranscriptEvent, payload
 function reduceRunStatus(record: RunRecord, event: TranscriptEvent, payload: UnknownRecord | null): RunRecord {
   const sdkRunStatus = persistedSdkRunStatus(stringField(payload, "sdkStatus"));
   if (!sdkRunStatus) return record;
-  const sdkRunStatusSource = persistedSdkRunStatusSource(stringField(payload, "source"));
+  const sdkRunStatusSource = persistedSdkRunStatusSource(
+    stringField(payload, "sdkStatusSource") ?? stringField(payload, "source"),
+  );
   return {
     ...record,
     sdkRunStatus,
@@ -826,6 +831,7 @@ function reduceProviderLimit(
   payload: UnknownRecord | null,
   options: RunActivityReductionOptions,
 ): RunRecord {
+  if (options.terminalEvents && record.status !== "running") return record;
   const signal = providerLimitSignal(payload);
   const message = signal?.message ?? event.message ?? "Provider limit reached";
   const observedAt = signal?.observedAt ?? event.at;
@@ -855,12 +861,26 @@ function reduceApprovalResolved(record: RunRecord, payload: UnknownRecord | null
   return { ...record, pendingApprovalRequestId: null, pendingApprovalRequestedAt: null };
 }
 
+function reduceHandoffTerminalEvent(
+  record: RunRecord,
+  event: TranscriptEvent,
+  payload: UnknownRecord | null,
+  options: RunActivityReductionOptions,
+): RunRecord {
+  const status = terminalStatusField(stringField(payload, "status")) ?? "succeeded";
+  const tokens = recordPayload(payload?.tokens);
+  const withTokens = tokens ? { ...record, tokens: reduceTokenCounts(record.tokens, tokens) } : record;
+  const error = status === "failed" ? stringField(payload, "error") ?? event.message ?? "Agent run failed" : null;
+  return reduceTerminalEvent(withTokens, event, status, error, options);
+}
+
 function reduceFailedEvent(
   record: RunRecord,
   event: TranscriptEvent,
   payload: UnknownRecord | null,
   options: RunActivityReductionOptions,
 ): RunRecord {
+  if (options.terminalEvents && record.status !== "running") return record;
   const error = stringField(payload, "error") ?? event.message ?? "Agent run failed";
   const withDiagnostic = record.failureKind
     ? record
@@ -953,6 +973,10 @@ function failureKindForDiagnosticCode(code: string): string {
 
 function isTerminalRunStatus(status: RunStatus): boolean {
   return status === "succeeded" || status === "failed" || status === "cancelled";
+}
+
+function terminalStatusField(value: string | undefined): Exclude<RunStatus, "running"> | null {
+  return value === "succeeded" || value === "failed" || value === "cancelled" ? value : null;
 }
 
 function stringField(record: UnknownRecord | null | undefined, key: string): string | undefined {
