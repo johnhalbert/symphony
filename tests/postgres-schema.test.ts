@@ -58,6 +58,25 @@ const requiredLookupIndexes = [
   "projection_revision_reads_idx",
 ] as const;
 
+const requiredProjectionLookupIndexes = [
+  "projection_revision_current_unique_idx",
+  "dashboard_projection_scope_revision_idx",
+  "dashboard_projection_revision_reads_idx",
+  "issue_board_projection_scope_revision_idx",
+  "issue_board_projection_revision_reads_idx",
+  "sidebar_projection_scope_revision_idx",
+  "sidebar_projection_revision_reads_idx",
+  "history_projection_scope_revision_idx",
+  "history_projection_revision_reads_idx",
+  "history_projection_run_lookup_idx",
+  "transcript_projection_scope_revision_idx",
+  "transcript_projection_revision_reads_idx",
+  "transcript_projection_session_reads_idx",
+  "orchestrator_chat_projection_scope_revision_idx",
+  "orchestrator_chat_projection_revision_reads_idx",
+  "orchestrator_chat_projection_issue_idx",
+] as const;
+
 async function migrationSql(): Promise<string> {
   return readFile(migrationUrl, "utf8");
 }
@@ -98,8 +117,8 @@ describe("Postgres Symphony-owned state migration", () => {
   it("declares lookup indexes for high-volume runtime and projection reads", async () => {
     const normalized = normalizedSql(await migrationSql());
 
-    for (const indexName of requiredLookupIndexes) {
-      expect(normalized, `missing ${indexName}`).toContain(`create index if not exists ${indexName}`);
+    for (const indexName of [...requiredLookupIndexes, ...requiredProjectionLookupIndexes]) {
+      expect(normalized, `missing ${indexName}`).toContain(`index if not exists ${indexName}`);
     }
 
     expect(normalized).toContain("on symphony.run_activity_event (run_session_id, sequence)");
@@ -113,7 +132,10 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("on symphony.chat_message (run_id, event_sequence_start, event_sequence_end)");
     expect(normalized).toContain("on symphony.writeback_operation (status, next_attempt_at, created_at)");
     expect(normalized).toContain("on symphony.approval_request (status, expires_at, requested_at)");
-    expect(normalized).toContain("on symphony.projection_revision (projection_name, scope_kind, scope_key, revision desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.projection_revision (projection_name, scope_kind, scope_key, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.dashboard_projection (scope_key, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.transcript_projection (run_id, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.orchestrator_chat_projection (scope_key, conversation_key, revision desc, updated_at desc, generated_at desc)");
   });
 
   it("declares run activity and chat message fields for replay, reconstruction, and idempotency", async () => {
@@ -176,11 +198,26 @@ describe("Postgres Symphony-owned state migration", () => {
   it("keeps projection payloads tied to durable revision metadata", async () => {
     const normalized = normalizedSql(await migrationSql());
 
+    expect(normalized).toContain("create table if not exists symphony.projection_revision");
+    expect(normalized).toContain("projection_name text not null check");
+    expect(normalized).toContain("unique (projection_name, scope_kind, scope_key, revision)");
+    expect(normalized).toContain("updated_at timestamptz not null default now()");
+
     for (const table of projectionTables.filter((table) => table !== "projection_revision")) {
       expect(normalized, `missing revision FK for ${table}`).toContain(
         `create table if not exists symphony.${table} ( projection_revision_id bigint primary key references symphony.projection_revision(projection_revision_id) on delete cascade`,
       );
       expect(normalized, `missing read index for ${table}`).toContain(`${table}_revision_reads_idx`);
+    }
+
+    for (const table of projectionTables) {
+      const tableStart = normalized.indexOf(`create table if not exists symphony.${table}`);
+      expect(tableStart, `missing ${table}`).toBeGreaterThanOrEqual(0);
+      const tableEnd = normalized.indexOf(");", tableStart);
+      expect(tableEnd, `unterminated table definition for ${table}`).toBeGreaterThan(tableStart);
+      const definition = normalized.slice(tableStart, tableEnd);
+      expect(definition, `missing revision column for ${table}`).toContain("revision bigint not null check (revision > 0)");
+      expect(definition, `missing updated_at for ${table}`).toContain("updated_at timestamptz not null default now()");
     }
   });
 
@@ -220,7 +257,7 @@ describe("Postgres Symphony-owned state migration", () => {
         expect(Number(tableCount.trim())).toBe([...operationalTables, ...projectionTables, "raw_payload_reference"].length);
 
         const indexes = await psql(containerName, "select indexname from pg_indexes where schemaname = 'symphony' order by indexname;");
-        for (const indexName of requiredLookupIndexes) {
+        for (const indexName of [...requiredLookupIndexes, ...requiredProjectionLookupIndexes]) {
           expect(indexes).toContain(indexName);
         }
 
