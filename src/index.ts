@@ -16,6 +16,7 @@ export * from "./core/persistence/IssueLifecycleStore.js";
 export * from "./core/review/PullRequestReviewEvidenceService.js";
 export * from "./core/review/PullRequestReviewFeedbackService.js";
 export * from "./core/ReviewVerdictService.js";
+export * from "./core/runActivity/RunActivityEvent.js";
 export * from "./core/summarization/ContinuationContextRoadmap.js";
 export * from "./core/summarization/ContinuationSummarizer.js";
 export * from "./core/tracker/TrackerClient.js";
