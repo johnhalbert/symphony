@@ -15,6 +15,7 @@ export * from "./core/orchestrator/Orchestrator.js";
 export * from "./core/persistence/IssueLifecycleStore.js";
 export * from "./core/persistence/OrchestratorConversationStore.js";
 export * from "./core/persistence/RunActivityAppendStore.js";
+export * from "./core/persistence/RunActivityChatMessageReducer.js";
 export * from "./core/review/PullRequestReviewEvidenceService.js";
 export * from "./core/review/PullRequestReviewFeedbackService.js";
 export * from "./core/ReviewVerdictService.js";
