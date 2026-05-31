@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -25,6 +26,24 @@ describe("Postgres migration foundation", () => {
       expect(migrations.map((migration) => migration.id)).toEqual(["0001_first", "0002_second"]);
       expect(migrations.map((migration) => migration.filename)).toEqual(["0001_first.sql", "0002_second.sql"]);
       expect(migrations.every((migration) => /^[a-f0-9]{64}$/.test(migration.checksumSha256))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes migration line endings before checksum calculation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-postgres-migrations-line-endings-"));
+    try {
+      const crlfSql = "SELECT 1;\r\nSELECT 2;\r\n";
+      const normalizedSql = "SELECT 1;\nSELECT 2;\n";
+      await writeFile(path.join(root, "0001_line_endings.sql"), crlfSql, "utf8");
+
+      const migrations = await discoverPostgresMigrations(root);
+
+      expect(migrations).toHaveLength(1);
+      expect(migrations[0]?.sql).toBe(normalizedSql);
+      expect(migrations[0]?.checksumSha256).toBe(sha256Hex(normalizedSql));
+      expect(migrations[0]?.checksumSha256).not.toBe(sha256Hex(crlfSql));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -124,6 +143,10 @@ function checksum(input: string): string {
     hash = (hash * 31 + input.charCodeAt(index)) >>> 0;
   }
   return hash.toString(16).padStart(64, "0");
+}
+
+function sha256Hex(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
 }
 
 class FakePostgresClient implements PostgresQueryClient {

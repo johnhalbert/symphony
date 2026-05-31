@@ -4,6 +4,8 @@ This directory is the configured Symphony Postgres migration path. `database.pos
 
 Migration files use the `NNNN_description.sql` naming convention. The migration runner stores applied checksums in `symphony_schema_migrations` inside the target database and wraps each migration file in its own transaction, so migration SQL files should not include explicit `BEGIN` / `COMMIT` statements.
 
+See [State Ownership and Migration Compatibility](../../docs/state-ownership-and-migration.md) for the canonical/snapshot/projection ownership map, external authority boundaries, startup recovery scenarios, and file-backed migration constraints that apply to this configured migration surface.
+
 Current migrations:
 
 - `0001_migration_foundation.sql` establishes the runner baseline.

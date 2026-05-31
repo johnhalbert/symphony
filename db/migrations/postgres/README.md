@@ -1,6 +1,6 @@
 # Symphony Postgres owned-state schema
 
-`0001_symphony_owned_state.sql` is the original migration-ready Postgres schema for Symphony-owned operational state and durable frontend projection/read models.
+`0001_symphony_owned_state.sql` is the original migration-ready Postgres schema for Symphony-owned operational state and durable frontend projection/read models. See [`docs/state-ownership-and-migration.md`](../../../docs/state-ownership-and-migration.md) for the ownership map, external authority boundaries, startup compatibility matrix, and file-backed migration constraints that now apply to the configured runner path.
 
 > The service-configured migration runner path is `migrations/postgres`. The runner-owned copy of this schema lives at `migrations/postgres/0002_symphony_owned_state.sql` so `migrations:apply` creates the tables used by `PostgresRunActivityAppendStore`.
 

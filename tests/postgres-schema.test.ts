@@ -27,6 +27,7 @@ const projectionFreshnessMigrationUrl = new URL(
   import.meta.url,
 );
 const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
+const stateOwnershipUrl = new URL("../docs/state-ownership-and-migration.md", import.meta.url);
 const publishedOwnedStateChecksumSha256 = "8e10c03c6cfa34e9672e350c59ff4998459989529a82c98cbd9f714469799298";
 
 const operationalTables = [
@@ -116,6 +117,10 @@ function sha256(input: string): string {
 
 async function migrationReadme(): Promise<string> {
   return readFile(readmeUrl, "utf8");
+}
+
+async function stateOwnershipDoc(): Promise<string> {
+  return readFile(stateOwnershipUrl, "utf8");
 }
 
 function normalizedSql(sql: string): string {
@@ -247,7 +252,8 @@ describe("Postgres Symphony-owned state migration", () => {
   it("documents external authorities, file-backed transition, and oversized raw payload references", async () => {
     const sql = (await configuredMigrationSql()).toLowerCase();
     const readme = (await migrationReadme()).toLowerCase();
-    const combined = `${sql}\n${readme}`;
+    const ownership = (await stateOwnershipDoc()).toLowerCase();
+    const combined = `${sql}\n${readme}\n${ownership}`;
 
     for (const authority of ["linear", "github", "git worktrees", "runtime harnesses", "external agent sessions"]) {
       expect(combined).toContain(authority);
@@ -258,6 +264,75 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(combined).toContain("raw_payload_reference");
     expect(combined).toContain("raw harness payloads must not be blindly embedded into projection json");
     expect(sql).toContain("raw_payload_refs jsonb not null default '[]'::jsonb");
+    expect(readme).toContain("docs/state-ownership-and-migration.md");
+  });
+
+  it("links the ownership guide to the configured migration surface", async () => {
+    const ownership = (await stateOwnershipDoc()).toLowerCase();
+    const readme = (await migrationReadme()).toLowerCase();
+
+    for (const fragment of [
+      "configured postgres migration path",
+      "migrations/postgres/0002_symphony_owned_state.sql",
+      "migrations/postgres/0003_projection_freshness_indexes.sql",
+      "checksum-stable",
+      "projection `updated_at` freshness columns",
+    ]) {
+      expect(ownership, `missing ownership guide fragment: ${fragment}`).toContain(fragment);
+    }
+
+    expect(readme).toContain("state ownership and migration compatibility");
+    expect(readme).toContain("docs/state-ownership-and-migration.md");
+  });
+
+  it("classifies current Postgres tables by canonical, snapshot, and projection ownership", async () => {
+    const ownership = (await stateOwnershipDoc()).toLowerCase();
+
+    for (const table of [...operationalTables, ...projectionTables, "raw_payload_reference"]) {
+      expect(ownership, `missing ownership guidance for ${table}`).toContain(`symphony.${table}`);
+    }
+
+    for (const term of ["canonical symphony state", "external snapshots", "projection/read-model state", "external authority boundaries"]) {
+      expect(ownership).toContain(term);
+    }
+
+    for (const currentShape of [
+      "run_session_id",
+      "sequence_source",
+      "external_event_id",
+      "run_activity_event_id",
+      "event_sequence_start",
+      "event_sequence_end",
+      "updated_at",
+    ]) {
+      expect(ownership, `missing current schema shape ${currentShape}`).toContain(currentShape);
+    }
+  });
+
+  it("documents startup compatibility for absent, empty, stale, and replayed Postgres states", async () => {
+    const ownership = (await stateOwnershipDoc()).toLowerCase();
+
+    for (const scenario of [
+      "postgres absent",
+      "postgres present but empty",
+      "postgres present with stale projections",
+      "projection rows exist without matching canonical rows",
+      "existing file-backed state is newer than postgres",
+      "interrupted import or dual-write replay",
+      "external authority is unavailable at startup",
+      "large raw artifact encountered during migration",
+    ]) {
+      expect(ownership).toContain(scenario);
+    }
+
+    for (const fileStore of ["fileruntranscriptstore", "fileissuelifecyclestore", "filewritebackoutboxstore", "fileoperatorapprovalstore"]) {
+      expect(ownership).toContain(fileStore);
+    }
+
+    expect(ownership).toContain("missing postgres must not make the current file-backed workflow unavailable");
+    expect(ownership).toContain("stale projections may affect ui freshness only");
+    expect(ownership).toContain("importers must be side-effect free");
+    expect(ownership).toContain("replays must not duplicate transcript events");
   });
 
   it("keeps projection payloads tied to durable revision metadata", async () => {

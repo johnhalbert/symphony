@@ -70,7 +70,7 @@ export async function discoverPostgresMigrations(migrationsDir: string): Promise
       );
     }
     const filePath = path.join(resolvedDir, entry.name);
-    const sql = await fs.readFile(filePath, "utf8");
+    const sql = normalizePostgresMigrationSql(await fs.readFile(filePath, "utf8"));
     migrations.push({
       id: path.basename(entry.name, ".sql"),
       version: match[1],
@@ -85,6 +85,10 @@ export async function discoverPostgresMigrations(migrationsDir: string): Promise
   migrations.sort((left, right) => left.version.localeCompare(right.version) || left.id.localeCompare(right.id));
   validatePostgresMigrationOrdering(migrations);
   return migrations;
+}
+
+function normalizePostgresMigrationSql(sql: string): string {
+  return sql.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
 export function validatePostgresMigrationOrdering(migrations: readonly PostgresMigration[]): void {
