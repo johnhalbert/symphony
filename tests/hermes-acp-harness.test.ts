@@ -5,6 +5,8 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   HermesAcpHarness,
+  type HermesAcpHarnessOptions,
+  type HermesAcpPermissionResolver,
   type HermesAcpRuntimeClient,
   type HermesAcpRuntimeClientOptions,
 } from "../hermes/src/HermesAcpHarness.js";
@@ -23,6 +25,7 @@ import type {
 } from "../hermes/src/HostHermesAcpProfileLease.js";
 import { parseServiceConfig, type HermesWorkerSessionLifecycle, type ServiceConfig } from "../src/core/config/Config.js";
 import type { AgentEvent, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import type { TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
 import type { Issue } from "../src/core/types.js";
 
 interface RecordedRequest {
@@ -295,32 +298,230 @@ describe("HermesAcpHarness", () => {
     expect(leases[0]?.disposeStatuses).toEqual([null]);
   });
 
-  it("denies ACP permission requests until Symphony has an approval bridge", async () => {
+  it("fails ACP permission requests closed when no approval bridge is configured", async () => {
     const client = new FakeAcpClient();
     client.promptDeferred = deferred<Record<string, unknown> | null>();
     client.promptStarted = deferred<void>();
     client.promptNotificationParams = null;
-    const { ctx, harness } = await fixture({ client });
-    const started = deferred<string>();
+    const transcript = recordingRunStore();
+    const { ctx, harness } = await fixture({ client, runStore: transcript.runStore });
+    const { runPromise } = await startPendingRun({ client, ctx, harness });
 
-    const runPromise = collectEvents(harness.run(ctx, "Do work"), (event) => {
-      if (event.type === "session_started" && event.runId) started.resolve(event.runId);
-    });
-    await started.promise;
-    await client.promptStarted.promise;
-    const responses = await client.invokeClientRequest("session/request_permission", {
-      sessionId: "acp-session-1",
-      toolCall: { name: "dangerous" },
-    });
+    const responses = await client.invokeClientRequest("session/request_permission", terminalPermissionRequest());
     client.promptDeferred.resolve({ stopReason: "end_turn" });
     const events = await runPromise;
 
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
-    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ code: "hermes_acp_permission_denied" })]));
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "run_diagnostic",
+          code: "hermes_acp_permission_denied",
+          message: "Host Hermes ACP permission request denied: permission_bridge_not_configured",
+        }),
+      ]),
+    );
+    expect(transcript.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "acp_permission_denied",
+          message: "Host Hermes ACP permission denied: permission_bridge_not_configured",
+        }),
+      ]),
+    );
+  });
+
+  it("returns the explicit bridge permission selection only when the resolver chooses an offered option", async () => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    const transcript = recordingRunStore();
+    const permissionResolver = vi.fn((input: Parameters<HermesAcpPermissionResolver>[0]) => {
+      expect(input.acpSessionId).toBe("acp-session-1");
+      expect(input.symphonySessionId).toContain("acp-session-1");
+      expect(input.request).toMatchObject({
+        sessionId: "acp-session-1",
+        toolCallId: "perm-tool-1",
+        requestKind: "terminal_execute",
+      });
+      return { optionId: "allow_once" };
+    });
+    const { ctx, harness } = await fixture({ client, permissionResolver, runStore: transcript.runStore });
+    const { runPromise } = await startPendingRun({ client, ctx, harness });
+
+    const responses = await client.invokeClientRequest("session/request_permission", terminalPermissionRequest());
+    client.promptDeferred.resolve({ stopReason: "end_turn" });
+    const events = await runPromise;
+
+    expect(permissionResolver).toHaveBeenCalledTimes(1);
+    expect(responses).toEqual([{ outcome: { outcome: "selected", optionId: "allow_once" } }]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "progress",
+          activitySource: "tool",
+          message: "Host Hermes ACP permission allow_once for terminal_execute",
+        }),
+      ]),
+    );
+    expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ code: "hermes_acp_permission_denied" })]));
+    expect(transcript.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "acp_permission_selected",
+          message: "Host Hermes ACP permission selected: allow_once",
+          payload: expect.objectContaining({ selectedOptionId: "allow_once", requestKind: "terminal_execute" }),
+        }),
+      ]),
+    );
+  });
+
+  it("rejects malformed permission requests before consulting the bridge", async () => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    const permissionResolver = vi.fn(() => "allow_once");
+    const { ctx, harness } = await fixture({ client, permissionResolver });
+    const { runPromise } = await startPendingRun({ client, ctx, harness });
+
+    const responses = await client.invokeClientRequest("session/request_permission", {
+      sessionId: "acp-session-1",
+      toolCall: { toolCallId: "perm-tool-1", kind: "execute" },
+    });
+    client.promptDeferred.resolve({ stopReason: "end_turn" });
+    const events = await runPromise;
+
+    expect(permissionResolver).not.toHaveBeenCalled();
+    expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "run_diagnostic",
+          code: "hermes_acp_permission_denied",
+          message: "Host Hermes ACP permission request denied: missing_permission_options",
+        }),
+      ]),
+    );
+  });
+
+  it.each([
+    {
+      name: "unoffered option",
+      resolver: () => "allow_always",
+      params: () => editPermissionRequest(),
+      reason: "permission_option_not_offered",
+    },
+    {
+      name: "resolver exception",
+      resolver: () => {
+        throw new Error("operator approval service unavailable");
+      },
+      params: () => terminalPermissionRequest(),
+      reason: "permission_bridge_error",
+    },
+    {
+      name: "resolver timeout",
+      resolver: () => new Promise<string>(() => undefined),
+      params: () => terminalPermissionRequest(),
+      reason: "permission_bridge_error",
+      timeoutMs: 5,
+    },
+  ])("fails ACP permission requests closed on $name", async ({ resolver, params, reason, timeoutMs }) => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    const permissionResolver = vi.fn(resolver);
+    const { ctx, harness } = await fixture({
+      client,
+      permissionResolver,
+      ...(timeoutMs === undefined ? {} : { permissionRequestTimeoutMs: timeoutMs }),
+    });
+    const { runPromise } = await startPendingRun({ client, ctx, harness });
+
+    const responses = await client.invokeClientRequest("session/request_permission", params());
+    client.promptDeferred.resolve({ stopReason: "end_turn" });
+    const events = await runPromise;
+
+    expect(permissionResolver).toHaveBeenCalledTimes(1);
+    expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "run_diagnostic",
+          code: "hermes_acp_permission_denied",
+          message: `Host Hermes ACP permission request denied: ${reason}`,
+        }),
+      ]),
+    );
   });
 });
 
-async function fixture(input: { client?: FakeAcpClient; lifecycle?: HermesWorkerSessionLifecycle } = {}) {
+async function startPendingRun(input: {
+  client: FakeAcpClient;
+  ctx: AgentRunContext;
+  harness: HermesAcpHarness;
+}): Promise<{ runId: string; runPromise: Promise<AgentEvent[]> }> {
+  const started = deferred<string>();
+  const runPromise = collectEvents(input.harness.run(input.ctx, "Do work"), (event) => {
+    if (event.type === "session_started" && event.runId) started.resolve(event.runId);
+  });
+  const runId = await started.promise;
+  if (!input.client.promptStarted) throw new Error("startPendingRun requires client.promptStarted to be configured");
+  await input.client.promptStarted.promise;
+  return { runId, runPromise };
+}
+
+function terminalPermissionRequest(): Record<string, unknown> {
+  return {
+    sessionId: "acp-session-1",
+    toolCall: {
+      toolCallId: "perm-tool-1",
+      kind: "execute",
+      title: "dangerous command",
+      rawInput: { command: "rm -rf /" },
+    },
+    options: terminalPermissionOptions(),
+  };
+}
+
+function terminalPermissionOptions(): Array<Record<string, unknown>> {
+  return [
+    { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
+    { optionId: "allow_session", kind: "allow_always", name: "Allow for session" },
+    { optionId: "allow_always", kind: "allow_always", name: "Allow always" },
+    { optionId: "deny", kind: "reject_once", name: "Deny" },
+    { optionId: "deny_always", kind: "reject_always", name: "Deny always" },
+  ];
+}
+
+function editPermissionRequest(): Record<string, unknown> {
+  return {
+    session_id: "acp-session-1",
+    tool_call: {
+      tool_call_id: "edit-tool-1",
+      kind: "edit",
+      title: "edit file",
+      rawInput: { path: "README.md" },
+    },
+    permission_options: [
+      { option_id: "allow_once", kind: "allow_once", name: "Allow edit" },
+      { option_id: "deny", kind: "reject_once", name: "Deny" },
+    ],
+  };
+}
+
+async function fixture(
+  input: {
+    client?: FakeAcpClient;
+    lifecycle?: HermesWorkerSessionLifecycle;
+    permissionResolver?: HermesAcpPermissionResolver;
+    permissionRequestTimeoutMs?: number;
+    runStore?: HermesAcpHarnessOptions["runStore"];
+  } = {},
+) {
   const root = await mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-"));
   const config = serviceConfig(root, input.lifecycle ?? "fresh_per_run");
   const ctx = runContext(config, root);
@@ -349,11 +550,15 @@ async function fixture(input: { client?: FakeAcpClient; lifecycle?: HermesWorker
   const acpClientFactory = vi.fn(
     (_command: HostHermesAcpProcessCommand, _options: HermesAcpRuntimeClientOptions): HermesAcpRuntimeClient => client,
   );
-  const harness = new HermesAcpHarness({
+  const harnessOptions = {
     cliPath: path.join(root, "src", "cli.ts"),
     profileLeaseFactory: leaseFactory,
     acpClientFactory,
-  });
+    ...(input.runStore === undefined ? {} : { runStore: input.runStore }),
+    ...(input.permissionResolver === undefined ? {} : { permissionResolver: input.permissionResolver }),
+    ...(input.permissionRequestTimeoutMs === undefined ? {} : { permissionRequestTimeoutMs: input.permissionRequestTimeoutMs }),
+  } satisfies HermesAcpHarnessOptions;
+  const harness = new HermesAcpHarness(harnessOptions);
   return { root, config, ctx, client, harness, leaseFactory, acpClientFactory, leases };
 }
 
@@ -456,4 +661,16 @@ function deferred<T>(): Deferred<T> {
     reject = innerReject;
   });
   return { promise, resolve, reject };
+}
+
+function recordingRunStore(): { events: TranscriptEvent[]; runStore: NonNullable<HermesAcpHarnessOptions["runStore"]> } {
+  const events: TranscriptEvent[] = [];
+  const runStore = {
+    appendEvent: vi.fn(async (input: Omit<TranscriptEvent, "sequence"> & { sequence?: number }) => {
+      const event: TranscriptEvent = { ...input, sequence: input.sequence ?? events.length + 1 };
+      events.push(event);
+      return event;
+    }),
+  } as unknown as NonNullable<HermesAcpHarnessOptions["runStore"]>;
+  return { events, runStore };
 }

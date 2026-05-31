@@ -31,6 +31,14 @@ import {
   type HostHermesAcpProcessExit,
   type HostHermesAcpRequestOptions,
 } from "./HostHermesAcpFacade.js";
+import {
+  denyHermesAcpPermission,
+  parseHermesAcpPermissionRequest,
+  resolveHermesAcpPermissionDecision,
+  type HermesAcpPermissionDecision,
+  type HermesAcpPermissionRequest,
+  type HermesAcpPermissionResolution,
+} from "./HermesAcpPermissions.js";
 
 export interface AcpEnvVariable {
   name: string;
@@ -44,12 +52,27 @@ export interface AcpMcpServerStdio {
   env: AcpEnvVariable[];
 }
 
+export interface HermesAcpPermissionResolverInput {
+  ctx: AgentRunContext;
+  runId: string;
+  request: HermesAcpPermissionRequest;
+  jsonRpcRequest: HostHermesAcpJsonRpcRequest;
+  acpSessionId: string | null;
+  symphonySessionId: string | null;
+}
+
+export type HermesAcpPermissionResolver = (
+  input: HermesAcpPermissionResolverInput,
+) => HermesAcpPermissionDecision | Promise<HermesAcpPermissionDecision>;
+
 export interface HermesAcpHarnessOptions {
   runStore?: RunTranscriptStore;
   cliPath?: string;
   discoverHostHermes?: (options: Parameters<typeof discoverHostHermes>[0]) => Promise<HostHermesDiscoveryResult>;
   profileLeaseFactory?: (options: HostHermesAcpProfileLeaseOptions) => Promise<HostHermesAcpProfileLease>;
   acpClientFactory?: (command: HostHermesAcpProcessCommand, options: HermesAcpRuntimeClientOptions) => HermesAcpRuntimeClient;
+  permissionResolver?: HermesAcpPermissionResolver;
+  permissionRequestTimeoutMs?: number;
 }
 
 export interface HermesAcpRuntimeClientOptions {
@@ -90,7 +113,7 @@ type TerminalStatus = HostHermesAcpTerminalStatus;
 type HermesAcpRuntimeEvent =
   | { type: "session.update"; sessionId: string | null; update: Record<string, unknown>; raw: Record<string, unknown> }
   | { type: "diagnostic"; diagnostic: HostHermesAcpDiagnostic }
-  | { type: "permission.denied"; sessionId: string | null; reason: string; params: unknown };
+  | { type: "permission.resolved"; resolution: HermesAcpPermissionResolution };
 
 const TERMINAL_SETUP_AUTH_METHOD_ID = "hermes-setup";
 const DEFAULT_PROFILE_PREFIX = "symphony";
@@ -164,19 +187,38 @@ export class HermesAcpHarness implements AgentHarness {
         enqueue(mapped);
       }
     };
-    const permissionDeniedReason = "ACP permission requests are denied by Symphony unless an explicit approval bridge is implemented.";
-    const onPermissionRequest = (params: unknown): Record<string, unknown> => {
-      const sessionId = acpSessionIdFromParams(params);
-      const event: HermesAcpRuntimeEvent = { type: "permission.denied", sessionId, reason: permissionDeniedReason, params };
+    const onPermissionRequest = async (
+      params: unknown,
+      request: HostHermesAcpJsonRpcRequest,
+    ): Promise<Record<string, unknown>> => {
+      const parsedRequest = parseHermesAcpPermissionRequest(params);
+      const resolution = await this.resolvePermissionRequest(ctx, runId, activeRun, parsedRequest, request);
+      const event: HermesAcpRuntimeEvent = { type: "permission.resolved", resolution };
       if (sessionStarted) persistRuntimeEvent(event);
-      enqueue({
-        type: "run_diagnostic",
-        code: "hermes_acp_permission_denied",
-        message: permissionDeniedReason,
-        payload: { sessionId, paramsPreview: preview(params, 500), redacted: true },
-      });
-      return { outcome: { outcome: "cancelled" } };
+      if (resolution.outcome === "cancelled") {
+        enqueue({
+          type: "run_diagnostic",
+          code: "hermes_acp_permission_denied",
+          message: `Host Hermes ACP permission request denied: ${resolution.reason}`,
+          payload: {
+            sessionId: resolution.request.sessionId,
+            requestKind: resolution.request.requestKind,
+            toolCallId: resolution.request.toolCallId,
+            reason: resolution.reason,
+            paramsPreview: preview(params, 500),
+            redacted: true,
+          },
+        });
+      } else {
+        enqueue({
+          type: "progress",
+          activitySource: "tool",
+          message: `Host Hermes ACP permission ${resolution.selectedOptionId ?? "selected"} for ${resolution.request.requestKind}`,
+        });
+      }
+      return resolution.response;
     };
+
     const onDiagnostic = (diagnostic: HostHermesAcpDiagnostic): void => {
       const event: HermesAcpRuntimeEvent = { type: "diagnostic", diagnostic };
       if (sessionStarted) persistRuntimeEvent(event);
@@ -187,6 +229,7 @@ export class HermesAcpHarness implements AgentHarness {
         ...(diagnostic.details === undefined ? {} : { payload: diagnostic.details }),
       });
     };
+
     const failRun = (message: string, payload?: unknown): void => {
       if (terminalStatus !== null) return;
       terminalStatus = ctx.abortSignal.aborted || this.cancelledRuns.has(runId) ? "cancelled" : "failed";
@@ -318,6 +361,46 @@ export class HermesAcpHarness implements AgentHarness {
       if (shouldDisposeLeaseAfterRun(lease, terminalStatus)) {
         await this.disposeLease(lease, terminalStatus, lease.transportExited ? "transport_exit" : "run_finished");
       }
+    }
+  }
+
+  private async resolvePermissionRequest(
+    ctx: AgentRunContext,
+    runId: string,
+    activeRun: ActiveHermesAcpRun,
+    request: HermesAcpPermissionRequest,
+    jsonRpcRequest: HostHermesAcpJsonRpcRequest,
+  ): Promise<HermesAcpPermissionResolution> {
+    if (request.malformedReason) return denyHermesAcpPermission(request, request.malformedReason);
+    if (ctx.abortSignal.aborted || this.cancelledRuns.has(runId)) return denyHermesAcpPermission(request, "run_cancelled");
+
+    const resolver = this.options.permissionResolver;
+    if (!resolver) return denyHermesAcpPermission(request, "permission_bridge_not_configured");
+
+    try {
+      const decision = await withTimeout(
+        Promise.resolve(
+          resolver({
+            ctx,
+            runId,
+            request,
+            jsonRpcRequest,
+            acpSessionId: activeRun.acpSessionId,
+            symphonySessionId: activeRun.symphonySessionId,
+          }),
+        ),
+        this.options.permissionRequestTimeoutMs ?? ctx.config.hermes.requestTimeoutMs,
+        "ACP permission resolver timed out",
+      );
+      return resolveHermesAcpPermissionDecision(request, decision);
+    } catch (error) {
+      ctx.logger.warn("hermes_acp permission resolver failed closed", {
+        run_id: runId,
+        issue_id: ctx.issue.id,
+        issue_identifier: ctx.issue.identifier,
+        error: errorMessage(error),
+      });
+      return denyHermesAcpPermission(request, "permission_bridge_error");
     }
   }
 
@@ -769,12 +852,26 @@ function hermesAcpTranscriptEvent(
           redacted: true,
         },
       };
-    case "permission.denied":
+    case "permission.resolved": {
+      const resolution = event.resolution;
       return {
-        eventType: "acp_permission_denied",
-        message: event.reason,
-        payload: { harnessId, sessionId: event.sessionId, paramsPreview: preview(event.params, 500), redacted: true },
+        eventType: resolution.outcome === "selected" ? "acp_permission_selected" : "acp_permission_denied",
+        message:
+          resolution.outcome === "selected"
+            ? `Host Hermes ACP permission selected: ${resolution.selectedOptionId ?? "unknown"}`
+            : `Host Hermes ACP permission denied: ${resolution.reason}`,
+        payload: {
+          harnessId,
+          sessionId: resolution.request.sessionId,
+          requestKind: resolution.request.requestKind,
+          toolCallId: resolution.request.toolCallId,
+          selectedOptionId: resolution.selectedOptionId,
+          reason: resolution.reason,
+          paramsPreview: preview(resolution.request.params, 500),
+          redacted: true,
+        },
       };
+    }
     case "diagnostic":
       return {
         eventType: "acp_diagnostic",
@@ -807,6 +904,21 @@ function hostHermesAcpExitDescription(exit: HostHermesAcpProcessExit): string {
   if (exit.signal) return `signal ${exit.signal}`;
   if (exit.code === null) return "exit code unknown";
   return `exit code ${exit.code}`;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise;
+  let timeout: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${message} after ${timeoutMs}ms.`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 function preview(value: unknown, maxLength: number): string {
