@@ -43,6 +43,7 @@ export type {
 export interface HostHermesAcpProcessExit {
   code: number | null;
   signal: NodeJS.Signals | null;
+  error?: string;
 }
 
 export interface HostHermesAcpSpawnOptions extends SpawnOptionsWithoutStdio {
@@ -59,6 +60,7 @@ export interface HostHermesAcpChildProcess {
   pid?: number | undefined;
   kill(signal?: NodeJS.Signals | number): boolean;
   on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  on(event: "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
   on(event: "error", listener: (error: Error) => void): this;
 }
 
@@ -122,6 +124,10 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
   readonly #stdoutDecoder = new HostHermesAcpJsonRpcStreamDecoder({ ignoreEmptyLines: true });
   #stderrTail = "";
   #exited = false;
+  #exitEmitted = false;
+  #pendingExit: HostHermesAcpProcessExit | null = null;
+  #killRequested = false;
+  #processError: string | null = null;
 
   constructor(command: HostHermesAcpProcessCommand, options: HostHermesAcpSubprocessTransportOptions = {}) {
     super();
@@ -137,13 +143,26 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
     this.#child.stdout?.on("end", () => this.#flushStdoutRemainder());
     this.#child.stderr?.on("data", (chunk: string | Buffer) => this.#acceptStderrChunk(chunk));
     this.#child.on("error", (error) => {
+      const processError = errorMessage(error);
+      this.#processError = processError;
       this.#emitDiagnostic({
         code: "host_hermes_acp_process_error",
-        message: `Host Hermes ACP process error: ${error.message}`,
+        message: `Host Hermes ACP process error: ${processError}`,
       });
-      this.#markExited({ code: null, signal: null });
+      this.#recordExited({ code: null, signal: null, error: processError });
     });
-    this.#child.on("exit", (code, signal) => this.#markExited({ code, signal }));
+    this.#child.on("exit", (code, signal) => {
+      const exit: HostHermesAcpProcessExit = { code, signal };
+      if (this.#processError) exit.error = this.#processError;
+      this.#recordExited(exit);
+    });
+    this.#child.on("close", (code, signal) => {
+      // ChildProcess "exit" can fire before stdio has drained; "close" is the
+      // stream-drained lifecycle signal used for final rejection diagnostics.
+      const exit = this.#pendingExit ?? { code, signal };
+      if (this.#processError && !exit.error) exit.error = this.#processError;
+      this.#markExited(exit);
+    });
   }
 
   on(event: "message", listener: (message: HostHermesAcpJsonRpcMessage, kind: HostHermesAcpJsonRpcMessageKind) => void): this;
@@ -170,7 +189,8 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
   }
 
   kill(reason?: string): void {
-    if (this.#exited) return;
+    if (this.#exited || this.#killRequested) return;
+    this.#killRequested = true;
     if (reason) {
       this.#emitDiagnostic({
         code: "host_hermes_acp_process_kill",
@@ -215,9 +235,16 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
     this.emit("diagnostic", diagnostic);
   }
 
-  #markExited(exit: HostHermesAcpProcessExit): void {
+  #recordExited(exit: HostHermesAcpProcessExit): void {
     if (this.#exited) return;
     this.#exited = true;
+    this.#pendingExit = exit;
+  }
+
+  #markExited(exit: HostHermesAcpProcessExit): void {
+    this.#recordExited(exit);
+    if (this.#exitEmitted) return;
+    this.#exitEmitted = true;
     this.#flushStdoutRemainder();
     this.emit("exit", exit);
   }
@@ -506,7 +533,6 @@ function logTailLines(tail: string, limit?: number): string {
 }
 
 function hostHermesAcpExitDescription(exit: HostHermesAcpProcessExit): string {
-  if (exit.signal) return `signal ${exit.signal}`;
-  if (exit.code === null) return "exit code unknown";
-  return `exit code ${exit.code}`;
+  const base = exit.signal ? `signal ${exit.signal}` : exit.code === null ? "exit code unknown" : `exit code ${exit.code}`;
+  return exit.error ? `${base}; process error: ${exit.error}` : base;
 }

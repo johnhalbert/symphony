@@ -1016,9 +1016,8 @@ function redactLogLine(line: string): string {
 }
 
 function hostHermesAcpExitDescription(exit: HostHermesAcpProcessExit): string {
-  if (exit.signal) return `signal ${exit.signal}`;
-  if (exit.code === null) return "exit code unknown";
-  return `exit code ${exit.code}`;
+  const base = exit.signal ? `signal ${exit.signal}` : exit.code === null ? "exit code unknown" : `exit code ${exit.code}`;
+  return exit.error ? `${base}; process error: ${exit.error}` : base;
 }
 
 function preview(value: unknown, maxLength: number): string {

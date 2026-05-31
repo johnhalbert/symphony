@@ -517,7 +517,7 @@ describe("HermesAcpHarness", () => {
     client.promptDeferred = deferred<Record<string, unknown> | null>();
     client.promptStarted = deferred<void>();
     client.promptNotificationParams = null;
-    client.logTail = "stderr with SECRET_TOKEN=should-not-leak";
+    client.logTail = "stderr with api_key=should-not-leak";
     const { ctx, harness, leases } = await fixture({ client });
     const started = deferred<void>();
 
@@ -535,6 +535,11 @@ describe("HermesAcpHarness", () => {
         expect.objectContaining({ type: "failed" }),
       ]),
     );
+    const diagnostic = events.find((event) => event.type === "run_diagnostic" && event.code === "hermes_acp_run_error");
+    expect(diagnostic).toMatchObject({
+      payload: { acpLogTail: { lines: ["stderr with api_key=[redacted]"], lineCount: 1 } },
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("should-not-leak");
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
   });
 
