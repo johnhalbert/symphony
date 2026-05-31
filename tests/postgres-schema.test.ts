@@ -9,6 +9,7 @@ const execFileAsync = promisify(execFile);
 
 const migrationUrl = new URL("../db/migrations/postgres/0001_symphony_owned_state.sql", import.meta.url);
 const readmeUrl = new URL("../db/migrations/postgres/README.md", import.meta.url);
+const stateOwnershipUrl = new URL("../docs/state-ownership-and-migration.md", import.meta.url);
 
 const operationalTables = [
   "workspace",
@@ -50,6 +51,10 @@ async function migrationReadme(): Promise<string> {
   return readFile(readmeUrl, "utf8");
 }
 
+async function stateOwnershipDoc(): Promise<string> {
+  return readFile(stateOwnershipUrl, "utf8");
+}
+
 function normalizedSql(sql: string): string {
   return sql.replace(/\s+/g, " ").toLowerCase();
 }
@@ -82,7 +87,8 @@ describe("Postgres Symphony-owned state migration", () => {
   it("documents external authorities, file-backed transition, and oversized raw payload references", async () => {
     const sql = (await migrationSql()).toLowerCase();
     const readme = (await migrationReadme()).toLowerCase();
-    const combined = `${sql}\n${readme}`;
+    const ownership = (await stateOwnershipDoc()).toLowerCase();
+    const combined = `${sql}\n${readme}\n${ownership}`;
 
     for (const authority of ["linear", "github", "git worktrees", "runtime harnesses", "external agent sessions"]) {
       expect(combined).toContain(authority);
@@ -93,6 +99,35 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(combined).toContain("raw_payload_reference");
     expect(combined).toContain("raw harness payloads must not be blindly embedded into projection json");
     expect(sql).toContain("raw_payload_refs jsonb not null default '[]'::jsonb");
+    expect(readme).toContain("docs/state-ownership-and-migration.md");
+  });
+
+  it("classifies Postgres tables by canonical, snapshot, and projection ownership", async () => {
+    const ownership = (await stateOwnershipDoc()).toLowerCase();
+
+    for (const table of [...operationalTables, ...projectionTables, "raw_payload_reference"]) {
+      expect(ownership, `missing ownership guidance for ${table}`).toContain(`symphony.${table}`);
+    }
+
+    for (const term of ["canonical symphony state", "external snapshots", "projection/read-model state", "external authority boundaries"]) {
+      expect(ownership).toContain(term);
+    }
+  });
+
+  it("documents startup compatibility for absent, empty, and stale Postgres states", async () => {
+    const ownership = (await stateOwnershipDoc()).toLowerCase();
+
+    for (const scenario of ["postgres absent", "postgres present but empty", "postgres present with stale projections"]) {
+      expect(ownership).toContain(scenario);
+    }
+
+    for (const fileStore of ["fileruntranscriptstore", "fileissuelifecyclestore", "filewritebackoutboxstore", "fileoperatorapprovalstore"]) {
+      expect(ownership).toContain(fileStore);
+    }
+
+    expect(ownership).toContain("missing postgres must not make the current file-backed workflow unavailable");
+    expect(ownership).toContain("stale projections may affect ui freshness only");
+    expect(ownership).toContain("importers must be side-effect free");
   });
 
   it("keeps projection payloads tied to durable revision metadata", async () => {

@@ -1,6 +1,6 @@
 # Symphony Postgres owned-state schema
 
-`0001_symphony_owned_state.sql` is the first migration-ready Postgres schema for Symphony-owned operational state and durable frontend projection/read models.
+`0001_symphony_owned_state.sql` is the first migration-ready Postgres schema for Symphony-owned operational state and durable frontend projection/read models. See [`docs/state-ownership-and-migration.md`](../../../docs/state-ownership-and-migration.md) for the ownership map, external authority boundaries, startup compatibility matrix, and file-backed migration constraints.
 
 ## Source-of-truth boundaries
 
