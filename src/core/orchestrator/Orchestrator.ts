@@ -106,6 +106,10 @@ import {
   type OperatorApprovalRecord,
   type OperatorApprovalService,
 } from "../approval/OperatorApprovalService.js";
+import type {
+  OrchestratorChatCommand,
+  OrchestratorChatCommandResult,
+} from "./OrchestratorChatCommand.js";
 
 export interface OrchestratorOptions {
   config: ServiceConfig;
@@ -465,6 +469,19 @@ export class Orchestrator {
 
   async refreshNow(): Promise<void> {
     await this.tick();
+  }
+
+  async dispatchOrchestratorChatCommand(command: OrchestratorChatCommand): Promise<OrchestratorChatCommandResult> {
+    if (this.stopped) {
+      return { status: "disabled", reason: "orchestrator_stopped" };
+    }
+    this.options.logger.info("orchestrator chat command accepted", {
+      action: command.action,
+      conversation_id: command.conversationId,
+      message_id: command.messageId,
+      source: command.source,
+    });
+    return { status: "accepted", reason: "accepted", acceptedAt: new Date().toISOString() };
   }
 
   pauseIssue(issueId: string): void {
