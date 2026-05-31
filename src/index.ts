@@ -13,6 +13,7 @@ export * from "./core/MergeConflictResolutionService.js";
 export * from "./core/merge/MergePolicyService.js";
 export * from "./core/orchestrator/Orchestrator.js";
 export * from "./core/persistence/IssueLifecycleStore.js";
+export * from "./core/persistence/ProjectionTransactionService.js";
 export * from "./core/review/PullRequestReviewEvidenceService.js";
 export * from "./core/review/PullRequestReviewFeedbackService.js";
 export * from "./core/ReviewVerdictService.js";
