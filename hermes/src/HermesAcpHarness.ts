@@ -415,7 +415,12 @@ export class HermesAcpHarness implements AgentHarness {
       { timeoutMs: ctx.config.hermes.startupTimeoutMs },
     );
     const method = selectNonTerminalAuthMethod(initializeResult);
-    await lease.client.request("authenticate", { methodId: method.id }, { timeoutMs: ctx.config.hermes.startupTimeoutMs });
+    const authenticateResult = await lease.client.request<unknown>(
+      "authenticate",
+      { methodId: method.id },
+      { timeoutMs: ctx.config.hermes.startupTimeoutMs },
+    );
+    validateAcpAuthenticateResult(authenticateResult, method);
     lease.initialized = true;
   }
 
@@ -594,6 +599,21 @@ function selectNonTerminalAuthMethod(initializeResult: Record<string, unknown>):
     throw new SymphonyError("agent_error", "Host Hermes ACP selected auth method did not include an id.");
   }
   return { id, label: authMethodLabel(selected) ?? id };
+}
+
+function validateAcpAuthenticateResult(result: unknown, method: { id: string; label: string }): void {
+  if (result === null || result === undefined || result === false) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `Host Hermes ACP authenticate rejected auth method ${method.label} (${method.id}). Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
+    );
+  }
+  if (!isRecord(result)) {
+    throw new SymphonyError(
+      "agent_error",
+      `Host Hermes ACP authenticate returned an invalid response for auth method ${method.label} (${method.id}).`,
+    );
+  }
 }
 
 function authMethodsFromInitializeResult(initializeResult: Record<string, unknown>): Record<string, unknown>[] {

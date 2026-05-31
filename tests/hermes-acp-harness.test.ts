@@ -52,6 +52,7 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
   initializeResult: Record<string, unknown> = {
     authMethods: [{ id: "openai-codex", name: "OpenAI Codex", type: "provider" }],
   };
+  authenticateResult: unknown = {};
   sessionId = "acp-session-1";
   promptResult: Record<string, unknown> | null = { stopReason: "end_turn", usage: { input: 1, output: 2, total: 3 } };
   promptNotificationParams: unknown = {
@@ -70,7 +71,7 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
       case "initialize":
         return this.initializeResult as T;
       case "authenticate":
-        return {} as T;
+        return this.authenticateResult as T;
       case "session/new":
         return { sessionId: this.sessionId } as T;
       case "session/prompt":
@@ -204,6 +205,23 @@ describe("HermesAcpHarness", () => {
       expect.arrayContaining([
         expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_run_error" }),
         expect.objectContaining({ type: "failed" }),
+      ]),
+    );
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("fails before creating sessions when provider authentication is rejected", async () => {
+    const client = new FakeAcpClient();
+    client.authenticateResult = null;
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize", "authenticate"]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_run_error" }),
+        expect.objectContaining({ type: "failed", error: expect.stringContaining("authenticate rejected auth method") }),
       ]),
     );
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
