@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StatusServer } from "../src/app/http.js";
+import { projectWebTranscript } from "../src/app/WebTranscriptProjection.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import {
   CompletionReportService,
@@ -22,6 +23,7 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import type { RunActivityEvent } from "../src/core/runActivity/RunActivityEvent.js";
 import {
   planIssueBreakdownApplicationWritebacks,
   planIssueBreakdownFinalizationWritebacks,
@@ -194,6 +196,203 @@ describe("Orchestrator", () => {
       runtimeMode: null,
       runtimeAgentLifecycle: "fresh_per_run",
     });
+  });
+
+  it("persists harness-provided ACP RunActivityEvent metadata through the shared orchestrator transcript path", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    let active = true;
+    let refreshes = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return active ? [candidate] : [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        refreshes += 1;
+        if (refreshes === 1) return [candidate];
+        active = false;
+        return [{ ...candidate, state: "Done" }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const runId = `fake-${candidate.id}-1`;
+    const harness = new RunActivityHarness([
+      {
+        type: "progress",
+        activitySource: "delta",
+        message: "hello",
+        runActivity: acpActivity(runId, 2, {
+          actor: "assistant",
+          channel: "chat",
+          kind: "assistant_message_delta",
+          text: "hello",
+          payload: { delta: true, messagePreview: "hello", redacted: true },
+        }),
+      },
+      {
+        type: "progress",
+        activitySource: "stream",
+        message: "Hermes ACP thought update",
+        runActivity: acpActivity(runId, 3, {
+          actor: "assistant",
+          channel: "chat",
+          kind: "assistant_reasoning_delta",
+          text: "Hermes ACP thought update",
+          payload: { reasoning: true, messagePreview: "thought preview", redacted: true },
+        }),
+      },
+      {
+        type: "progress",
+        activitySource: "tool",
+        message: "Hermes ACP tool started: terminal",
+        runActivity: acpActivity(runId, 4, {
+          actor: "tool",
+          channel: "tool",
+          kind: "tool_call_started",
+          text: "Hermes ACP tool started: terminal",
+          payload: { toolCallId: "call-1", toolName: "terminal", status: "running", outputPreview: "started", redacted: true },
+        }),
+      },
+      {
+        type: "progress",
+        activitySource: "tool",
+        message: "Hermes ACP tool completed: terminal",
+        runActivity: acpActivity(runId, 5, {
+          actor: "tool",
+          channel: "tool",
+          kind: "tool_call_completed",
+          text: "Hermes ACP tool completed: terminal",
+          payload: { toolCallId: "call-1", toolName: "terminal", status: "succeeded", outputPreview: "tests passed", redacted: true },
+        }),
+      },
+      {
+        type: "tokens",
+        tokens: { inputTokens: 3, outputTokens: 5, totalTokens: 8 },
+        runActivity: acpActivity(runId, 6, {
+          actor: "runtime",
+          channel: "token",
+          kind: "token_usage_reported",
+          text: "Token usage reported",
+          payload: { inputTokens: 3, outputTokens: 5, totalTokens: 8, usageSource: "stream" },
+        }),
+      },
+      {
+        type: "run_diagnostic",
+        code: "hermes_acp_permission_denied",
+        message: "ACP permission denied",
+        payload: { paramsPreview: "safe" },
+        runActivity: acpActivity(runId, 7, {
+          actor: "runtime",
+          channel: "diagnostic",
+          kind: "runtime_diagnostic",
+          text: "ACP permission denied",
+          payload: { code: "hermes_acp_permission_denied", severity: "info", messagePreview: "permission denied", redacted: true },
+        }),
+      },
+      {
+        type: "completed",
+        message: "Run completed",
+        runActivity: acpActivity(runId, 8, {
+          actor: "runtime",
+          channel: "terminal",
+          kind: "run_succeeded",
+          text: "Run completed",
+          payload: { reason: "run_succeeded" },
+        }),
+      },
+    ]);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "run-activity harness dispatched");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "run-activity harness exited");
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    const run = await runStore.latestRunForIssue(candidate.id);
+    expect(run).toMatchObject({ runId, status: "succeeded", tokens: { inputTokens: 3, outputTokens: 5, totalTokens: 8 } });
+    const transcript = await runStore.readTranscript(runId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
+    expect(eventTypes).toEqual(
+      expect.arrayContaining([
+        "session_started",
+        "assistant_message_delta",
+        "assistant_reasoning_delta",
+        "tool_call_started",
+        "tool_call_completed",
+        "token_usage_reported",
+        "runtime_diagnostic",
+        "run_succeeded",
+      ]),
+    );
+    expect(eventTypes).not.toContain("agent_message_chunk");
+    expect(eventTypes).not.toContain("session/update");
+    expect(transcript.events.find((event) => event.eventType === "assistant_message_delta")).toMatchObject({
+      source: "harness",
+      message: "hello",
+      payload: {
+        kind: "assistant_message_delta",
+        actor: "assistant",
+        channel: "chat",
+        protocol: "acp",
+        activitySequence: 2,
+        sequenceSource: "harness",
+      },
+    });
+    expect(transcript.events.find((event) => event.eventType === "runtime_diagnostic")).toMatchObject({
+      payload: { kind: "runtime_diagnostic", code: "hermes_acp_permission_denied", messagePreview: "permission denied" },
+    });
+    const projected = projectWebTranscript(transcript.events, { includeRunPrelude: false });
+    expect(projected).toEqual(
+      expect.arrayContaining([
+        { kind: "assistant", ts: expect.any(String), text: "hello" },
+        { kind: "thinking", ts: expect.any(String), text: "Hermes ACP thought update" },
+        expect.objectContaining({ kind: "tool_call", call_id: "call-1", name: "terminal", status: "succeeded", result: "tests passed" }),
+        { kind: "status", state: "token_usage_reported", ts: expect.any(String), text: "Token usage reported" },
+        { kind: "status", state: "runtime_diagnostic", ts: expect.any(String), text: "ACP permission denied" },
+        { kind: "status", state: "run_succeeded", ts: expect.any(String), text: "Run completed" },
+      ]),
+    );
+  });
+
+  it("persists harness-provided ACP terminal failure and cancellation metadata through the shared orchestrator transcript path", async () => {
+    const failed = await runTerminalRunActivityScenario(root, "failed");
+    expect(failed.run).toMatchObject({ status: "failed", error: "Run failed token=[redacted]" });
+    expect(failed.eventTypes).toContain("run_failed");
+    expect(failed.eventTypes).not.toContain("failed");
+    expect(failed.transcript.events.find((event) => event.eventType === "run_failed")).toMatchObject({
+      message: "Run failed token=[redacted]",
+      payload: { kind: "run_failed", actor: "runtime", channel: "terminal", protocol: "acp", reason: "provider_error" },
+    });
+    expect(failed.projected).toEqual(
+      expect.arrayContaining([{ kind: "status", state: "run_failed", ts: expect.any(String), text: "Run failed token=[redacted]" }]),
+    );
+    expect(JSON.stringify(failed.transcript)).not.toContain("SECRET_TERMINAL_TOKEN");
+
+    const cancelled = await runTerminalRunActivityScenario(root, "cancelled");
+    expect(cancelled.run).toMatchObject({ status: "cancelled" });
+    expect(cancelled.eventTypes).toContain("run_cancelled");
+    expect(cancelled.eventTypes).not.toContain("cancelled");
+    expect(cancelled.transcript.events.find((event) => event.eventType === "run_cancelled")).toMatchObject({
+      message: "Run cancelled",
+      payload: { kind: "run_cancelled", actor: "runtime", channel: "terminal", protocol: "acp", reason: "operator_cancelled" },
+    });
+    expect(cancelled.projected).toEqual(
+      expect.arrayContaining([{ kind: "status", state: "run_cancelled", ts: expect.any(String), text: "Run cancelled" }]),
+    );
   });
 
   it("records provider-limit gates without normal retry and resumes after the window closes", async () => {
@@ -6301,6 +6500,110 @@ function createdIssueRefForOperation(operation: IssueCreateWriteback): IssueBrea
     id: `child-${childNumber}`,
     identifier: `TEST-${childNumber + 1}`,
     url: `https://linear.test/TEST-${childNumber + 1}`,
+  };
+}
+
+class RunActivityHarness implements AgentHarness {
+  readonly id = "fake";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(private readonly events: AgentEvent[]) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    yield { type: "session_started", sessionId: `fake-${ctx.issue.id}-${ctx.turnNumber}` };
+    for (const event of this.events) yield event;
+  }
+}
+
+function acpActivity(runId: string, sequence: number, overrides: Partial<RunActivityEvent>): RunActivityEvent {
+  const payload =
+    overrides.payload && typeof overrides.payload === "object" && !Array.isArray(overrides.payload) ? overrides.payload : {};
+  return {
+    eventId: `${runId}:activity:${sequence}`,
+    runSessionId: `profile:acp-session-1:${runId}`,
+    occurredAt: `2026-05-31T00:00:0${Math.min(sequence, 9)}.000Z`,
+    sequence,
+    sequenceSource: "harness",
+    externalEventId: `upstream-${sequence}`,
+    protocol: "acp",
+    harness: "hermes-acp",
+    ...overrides,
+    payload: { runtimeSessionId: "acp-session-1", ...payload },
+  } as RunActivityEvent;
+}
+
+async function runTerminalRunActivityScenario(root: string, terminal: "failed" | "cancelled") {
+  const config = testConfig(root);
+  const candidate = issue({ id: `issue-${terminal}`, identifier: `TEST-${terminal.toUpperCase()}`, state: "Todo" });
+  let active = true;
+  let refreshes = 0;
+  const tracker: TrackerClient = {
+    async fetchCandidateIssues() {
+      return active ? [candidate] : [];
+    },
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssueStatesByIds() {
+      refreshes += 1;
+      if (refreshes === 1) return [candidate];
+      active = false;
+      return [{ ...candidate, state: "Done" }];
+    },
+  };
+  const logger = new StructuredLogger(() => undefined);
+  const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+  const runId = `fake-${candidate.id}-1`;
+  const terminalEvent: AgentEvent =
+    terminal === "failed"
+      ? {
+          type: "failed",
+          error: "Run failed token=SECRET_TERMINAL_TOKEN",
+          runActivity: acpActivity(runId, 2, {
+            actor: "runtime",
+            channel: "terminal",
+            kind: "run_failed",
+            text: "Run failed token=SECRET_TERMINAL_TOKEN",
+            payload: { reason: "provider_error", errorPreview: "Run failed token=SECRET_TERMINAL_TOKEN", redacted: true },
+          }),
+        }
+      : {
+          type: "cancelled",
+          runActivity: acpActivity(runId, 2, {
+            actor: "runtime",
+            channel: "terminal",
+            kind: "run_cancelled",
+            text: "Run cancelled",
+            payload: { reason: "operator_cancelled" },
+          }),
+        };
+  const harness = new RunActivityHarness([terminalEvent]);
+  const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+  const orchestrator = new Orchestrator({
+    config,
+    tracker,
+    workspaceManager,
+    harness,
+    logger,
+    promptTemplate: "Work on {{ issue.identifier }}",
+    runStore,
+  });
+
+  await orchestrator.refreshNow();
+  await waitFor(() => harness.runs.length === 1, `${terminal} run-activity harness dispatched`);
+  await waitFor(() => orchestrator.snapshot().counts.running === 0, `${terminal} run-activity harness exited`);
+  await settleOrchestratorExit();
+  await orchestrator.stop();
+
+  const run = await runStore.latestRunForIssue(candidate.id);
+  const transcript = await runStore.readTranscript(runId);
+  return {
+    run,
+    transcript,
+    eventTypes: transcript.events.map((event) => event.eventType),
+    projected: projectWebTranscript(transcript.events, { includeRunPrelude: false }),
   };
 }
 

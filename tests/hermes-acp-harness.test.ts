@@ -24,10 +24,16 @@ import type {
   HostHermesAcpProfileLeaseOptions,
   HostHermesAcpTerminalStatus,
 } from "../hermes/src/HostHermesAcpProfileLease.js";
+import { projectWebTranscript } from "../src/app/WebTranscriptProjection.js";
 import { parseServiceConfig, type HermesWorkerSessionLifecycle, type ServiceConfig } from "../src/core/config/Config.js";
 import type { AgentEvent, AgentRunContext } from "../src/core/harness/AgentHarness.js";
-import type { RunTranscriptStore, TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { FileRunTranscriptStore, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue } from "../src/core/types.js";
+import { mapAgentEventToRunActivityEvent } from "../src/core/transcript/RunActivityEventMapper.js";
+import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 
 interface RecordedRequest {
   method: string;
@@ -258,39 +264,104 @@ describe("HermesAcpHarness", () => {
     ]);
   });
 
-  it("streams and persists only active ACP session updates as Symphony run events", async () => {
+  it("attaches normalized ACP run activity metadata to streamed harness events", async () => {
     const client = new FakeAcpClient();
-    const transcriptEvents: TranscriptEvent[] = [];
-    const runStore = {
-      appendEvent: vi.fn(async (event: Omit<TranscriptEvent, "sequence"> & { sequence?: number }): Promise<TranscriptEvent> => {
-        const recorded = { ...event, sequence: transcriptEvents.length + 1 };
-        transcriptEvents.push(recorded);
-        return recorded;
-      }),
-    } as unknown as RunTranscriptStore;
+    client.promptNotificationParams = [
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
+      { sessionId: "acp-session-1", update: { session_update: "agent_thought_chunk", content: { type: "text", text: "private" } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "tool_call", toolCall: { title: "terminal", status: "pending" } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "tool_call_update", toolCall: { title: "terminal" }, status: "completed" } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "usage_update", final: true, usage: { input: 4, output: 5, total: 9 } } },
+    ];
+    client.promptResult = { stopReason: "end_turn" };
+    const { ctx, harness } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const activities = events.map((event) => event.runActivity);
+
+    expect(events.map((event) => event.type)).toEqual(["session_started", "progress", "progress", "progress", "progress", "progress", "tokens", "completed"]);
+    expect(activities.every(Boolean)).toBe(true);
+    expect(activities.map((activity) => activity?.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(activities[0]).toMatchObject({
+      protocol: "acp",
+      harness: "hermes_acp",
+      eventId: expect.stringMatching(/^hermes-acp-.*:activity:1$/),
+      runSessionId: expect.stringContaining("acp-session-1"),
+      sequenceSource: "harness",
+      channel: "lifecycle",
+      kind: "session_started",
+      payload: expect.objectContaining({ runtimeSessionId: "acp-session-1" }),
+    });
+    expect(activities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "runtime", channel: "diagnostic", kind: "runtime_ready" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "assistant", channel: "chat", kind: "assistant_message_delta", text: "hello" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "assistant", channel: "chat", kind: "assistant_reasoning_delta" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_started" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_completed" }),
+        expect.objectContaining({
+          protocol: "acp",
+          harness: "hermes_acp",
+          actor: "runtime",
+          channel: "token",
+          kind: "token_usage_reported",
+          payload: expect.objectContaining({ inputTokens: 4, outputTokens: 5, totalTokens: 9 }),
+        }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "runtime", channel: "terminal", kind: "run_succeeded", text: "hello" }),
+      ]),
+    );
+    expect(activities.map((activity) => activity?.kind)).not.toEqual(expect.arrayContaining(["agent_message_chunk", "agent_thought_chunk", "tool_call", "usage_update"]));
+  });
+
+  it("streams active ACP session updates with projection-compatible normalized run activity", async () => {
+    const client = new FakeAcpClient();
     client.sessionNewNotificationParams = {
       sessionId: "acp-session-1",
       update: { sessionUpdate: "agent_message_chunk", content: "before active session" },
     };
     client.promptNotificationParams = [
       { sessionId: "other-session", update: { sessionUpdate: "agent_message_chunk", content: "wrong session" } },
-      { sessionId: "acp-session-1", update: { sessionUpdate: "tool_call", toolCall: { title: "terminal", status: "started" } } },
-      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
-      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " " } } },
+      {
+        sessionId: "acp-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCall: { id: "call-1", name: "terminal", status: "started", input: { command: "npm test", apiKey: "not-a-real-token-placeholder" } },
+        },
+      },
+      {
+        sessionId: "acp-session-1",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCall: { id: "call-1", name: "terminal", output: "tests passed", result: { exitCode: 0 } },
+          status: "completed",
+        },
+      },
+      {
+        sessionId: "acp-session-1",
+        update: { sessionUpdate: "tool_call", toolCall: { id: "call-2", name: "terminal", status: "started", input: { command: "rm -rf /tmp" } } },
+      },
+      {
+        sessionId: "acp-session-1",
+        update: { sessionUpdate: "tool_call_update", toolCall: { id: "call-2", name: "terminal", error: "permission denied" }, status: "failed" },
+      },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello " } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "usage_update", used: 9, size: 100 } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "available_commands_update", availableCommands: [{ name: "/help" }] } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "future_update", details: "still visible as diagnostic" } },
     ];
     client.promptResult = { stopReason: "end_turn", usage: { input: 1, output: 2, total: 3 } };
-    const { ctx, harness } = await fixture({ client, runStore });
+    const { ctx, harness } = await fixture({ client });
 
     const events = await collectEvents(harness.run(ctx, "Do work"));
+    const transcriptEvents = transcriptEventsFromAgentEvents(events);
 
     expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "session_started", threadId: "acp-session-1" })]));
     expect(events).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: "progress", activitySource: "tool", message: "Hermes ACP tool started: terminal (started)" }),
+        expect.objectContaining({ type: "progress", activitySource: "tool", message: "Hermes ACP tool completed: terminal (completed)" }),
+        expect.objectContaining({ type: "progress", activitySource: "tool", message: "Hermes ACP tool failed: terminal (failed)" }),
         expect.objectContaining({ type: "progress", activitySource: "stream", message: "Hermes ACP usage update: 9/100 context tokens" }),
         expect.objectContaining({ type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } }),
         expect.objectContaining({ type: "progress", activitySource: "stream", message: "Hermes ACP commands available: /help" }),
@@ -299,25 +370,66 @@ describe("HermesAcpHarness", () => {
       ]),
     );
     expect(events.flatMap((event) => event.type === "progress" && event.activitySource === "delta" ? [event.message] : [])).toEqual([
-      "hello",
-      " ",
+      "hello ",
       "world",
     ]);
     expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { totalTokens: 9 } })]));
     expect(events.map((event) => "message" in event ? event.message : "").join("\n")).not.toContain("before active session");
     expect(events.map((event) => "message" in event ? event.message : "").join("\n")).not.toContain("wrong session");
-    expect(transcriptEvents.map((event) => event.eventType)).toEqual([
-      "hermes_acp_profile",
-      "acp_session_update",
-      "acp_session_update",
-      "acp_session_update",
-      "acp_session_update",
-      "acp_session_update",
-      "acp_session_update",
-      "acp_session_update",
+
+    const transcriptEventTypes = transcriptEvents.map((event) => event.eventType);
+    expect(transcriptEventTypes).toEqual([
+      "session_started",
+      "runtime_ready",
+      "tool_call_started",
+      "tool_call_completed",
+      "tool_call_started",
+      "tool_call_failed",
+      "assistant_message_delta",
+      "assistant_message_delta",
+      "runtime_status_update",
+      "available_commands_update",
+      "runtime_diagnostic",
+      "token_usage_reported",
+      "run_succeeded",
     ]);
-    expect(JSON.stringify(transcriptEvents.map((event) => event.payload))).not.toContain("before active session");
-    expect(JSON.stringify(transcriptEvents.map((event) => event.payload))).not.toContain("wrong session");
+    expect(transcriptEventTypes).not.toEqual(
+      expect.arrayContaining(["hermes_acp_profile", "acp_session_update", "acp_permission_denied", "acp_diagnostic", "session_update"]),
+    );
+    const call1Events = transcriptEvents.filter((event) => (event.payload as Record<string, unknown> | undefined)?.toolCallId === "call-1");
+    expect(call1Events.map((event) => event.eventType)).toEqual(["tool_call_started", "tool_call_completed"]);
+    expect(call1Events.map((event) => event.payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ toolCallId: "call-1", toolName: "terminal", status: "running", inputPreview: expect.stringContaining("npm test") }),
+        expect.objectContaining({ toolCallId: "call-1", toolName: "terminal", status: "succeeded", outputPreview: "tests passed", resultPreview: expect.stringContaining("exitCode") }),
+      ]),
+    );
+    const call2Failure = transcriptEvents.find((event) => (event.payload as Record<string, unknown> | undefined)?.toolCallId === "call-2" && event.eventType === "tool_call_failed");
+    expect(call2Failure?.payload).toEqual(expect.objectContaining({ toolCallId: "call-2", toolName: "terminal", status: "failed", errorPreview: "permission denied" }));
+    const transcriptPayloadJson = JSON.stringify(transcriptEvents.map((event) => event.payload));
+    expect(transcriptPayloadJson).not.toContain("before active session");
+    expect(transcriptPayloadJson).not.toContain("wrong session");
+    expect(transcriptPayloadJson).not.toContain("not-a-real-token-placeholder");
+    expect(transcriptPayloadJson).toContain("[redacted]");
+
+    const projected = projectWebTranscript(transcriptEvents);
+    expect(projected.flatMap((message) => message.kind === "assistant" ? [message.text] : [])).toEqual(["hello world"]);
+    const projectedToolMessages = projected.filter((message) => message.kind === "tool_call");
+    expect(projectedToolMessages).toEqual([
+      expect.objectContaining({
+        kind: "tool_call",
+        call_id: "call-1",
+        name: "terminal",
+        status: "succeeded",
+        args: { preview: expect.stringContaining("npm test") },
+        result: expect.stringContaining("exitCode"),
+        output: "tests passed",
+      }),
+      expect.objectContaining({ kind: "tool_call", call_id: "call-2", name: "terminal", status: "failed", error: "permission denied" }),
+    ]);
+    expect(projected.flatMap((message) => message.kind === "status" ? [message.state] : [])).not.toEqual(
+      expect.arrayContaining(["hermes_acp_profile", "acp_session_update", "acp_permission_denied", "acp_diagnostic", "session_update", "tool_call", "tool_call_update"]),
+    );
   });
 
   it("uses final ACP usage updates as token fallback only when prompt usage is absent", async () => {
@@ -567,18 +679,153 @@ describe("HermesAcpHarness", () => {
     expect(leases[0]?.disposeStatuses).toEqual([null]);
   });
 
-  it("fails ACP permission requests closed when no approval bridge is configured", async () => {
+  it("persists actual ACP harness updates exactly once through the orchestrator shared runStore", async () => {
+    const client = new FakeAcpClient();
+    client.sessionNewNotificationParams = {
+      sessionId: "acp-session-1",
+      update: { sessionUpdate: "agent_message_chunk", content: "before active session" },
+    };
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = [
+      { sessionId: "other-session", update: { sessionUpdate: "agent_message_chunk", content: "wrong session" } },
+      { sessionId: "acp-session-1", update: { session_update: "agent_thought_chunk", content: { type: "text", text: "thinking" } } },
+      {
+        sessionId: "acp-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCall: { id: "call-1", name: "terminal", status: "started", input: { command: "npm test", apiKey: "not-a-real-token-placeholder" } },
+        },
+      },
+      {
+        sessionId: "acp-session-1",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCall: { id: "call-1", name: "terminal", output: "tests passed", result: { exitCode: 0 } },
+          status: "completed",
+        },
+      },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "tool_call", toolCall: { id: "call-2", name: "terminal", status: "started" } } },
+      {
+        sessionId: "acp-session-1",
+        update: { sessionUpdate: "tool_call_update", toolCall: { id: "call-2", name: "terminal", error: "permission denied" }, status: "failed" },
+      },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello " } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "usage_update", used: 9, size: 100 } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "available_commands_update", availableCommands: [{ name: "/help" }] } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "future_update", details: "still visible as diagnostic" } },
+    ];
+    const { config, harness } = await fixture({ client });
+    const candidate: Issue = { ...issue(), id: "issue-acp-orchestrated", identifier: "ENG-194", state: "Todo", branchName: "symphony/ENG-194" };
+    let active = true;
+    let refreshes = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return active ? [candidate] : [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        refreshes += 1;
+        if (refreshes === 1) return [candidate];
+        active = false;
+        return [{ ...candidate, state: "Done" }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    const refreshPromise = orchestrator.refreshNow();
+    await client.promptStarted.promise;
+    client.emitDiagnostic({ code: "host_hermes_notice", message: "runtime notice", details: { apiKey: "not-a-real-token-placeholder" } });
+    const permissionResponses = await client.invokeClientRequest("session/request_permission", {
+      sessionId: "acp-session-1",
+      toolCall: { name: "dangerous" },
+    });
+    client.promptDeferred.resolve({ stopReason: "end_turn", usage: { input: 1, output: 2, total: 3 } });
+    await refreshPromise;
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "orchestrated ACP run to finish");
+    await orchestrator.stop();
+
+    expect(permissionResponses).toEqual([{ outcome: { outcome: "cancelled" } }]);
+    const run = await runStore.latestRunForIssue(candidate.id);
+    expect(run).toMatchObject({ status: "succeeded", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } });
+    expect(run?.runId).toMatch(/^hermes-acp-/);
+    const transcript = await runStore.readTranscript(run?.runId ?? "missing-run");
+    const counts = eventTypeCounts(transcript.events);
+    expect(counts).toEqual({
+      session_started: 1,
+      runtime_ready: 1,
+      assistant_reasoning_delta: 1,
+      tool_call_started: 2,
+      tool_call_completed: 1,
+      tool_call_failed: 1,
+      assistant_message_delta: 2,
+      runtime_status_update: 1,
+      available_commands_update: 1,
+      runtime_diagnostic: 3,
+      token_usage_reported: 1,
+      run_succeeded: 1,
+    });
+    expect(transcript.events.every((event) => event.source === "harness")).toBe(true);
+    expect(transcript.events.map((event) => event.eventType)).not.toEqual(
+      expect.arrayContaining(["hermes_acp_profile", "acp_session_update", "acp_permission_denied", "acp_diagnostic", "session/update", "tool_call", "tool_call_update"]),
+    );
+    const payloadJson = JSON.stringify(transcript.events.map((event) => event.payload));
+    expect(payloadJson).not.toContain("before active session");
+    expect(payloadJson).not.toContain("wrong session");
+    expect(payloadJson).not.toContain("not-a-real-token-placeholder");
+    expect(payloadJson).toContain("[redacted]");
+
+    const call1Events = transcript.events.filter((event) => (event.payload as Record<string, unknown> | undefined)?.toolCallId === "call-1");
+    expect(call1Events.map((event) => event.eventType)).toEqual(["tool_call_started", "tool_call_completed"]);
+    const call2Events = transcript.events.filter((event) => (event.payload as Record<string, unknown> | undefined)?.toolCallId === "call-2");
+    expect(call2Events.map((event) => event.eventType)).toEqual(["tool_call_started", "tool_call_failed"]);
+    expect(transcript.events.filter((event) => event.eventType === "runtime_diagnostic").map((event) => event.payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "hermes_acp_session_update_unmapped" }),
+        expect.objectContaining({ code: "host_hermes_notice", severity: "info" }),
+        expect.objectContaining({ code: "hermes_acp_permission_denied", severity: "warning" }),
+      ]),
+    );
+
+    const projected = projectWebTranscript(transcript.events, { includeRunPrelude: false });
+    expect(projected.flatMap((message) => message.kind === "assistant" ? [message.text] : [])).toEqual(["hello world"]);
+    const projectedToolMessages = projected.filter((message) => message.kind === "tool_call");
+    expect(projectedToolMessages).toEqual([
+      expect.objectContaining({ kind: "tool_call", call_id: "call-1", name: "terminal", status: "succeeded", output: "tests passed", result: expect.stringContaining("exitCode") }),
+      expect.objectContaining({ kind: "tool_call", call_id: "call-2", name: "terminal", status: "failed", error: "permission denied" }),
+    ]);
+    expect(projected.flatMap((message) => message.kind === "status" ? [message.state] : [])).not.toEqual(
+      expect.arrayContaining(["acp_session_update", "acp_permission_denied", "acp_diagnostic", "session/update", "tool_call", "tool_call_update"]),
+    );
+  });
+
+  it("fails ACP permission requests closed when no approval bridge is configured and maps normalized diagnostics", async () => {
     const client = new FakeAcpClient();
     client.promptDeferred = deferred<Record<string, unknown> | null>();
     client.promptStarted = deferred<void>();
     client.promptNotificationParams = null;
-    const transcript = recordingRunStore();
-    const { ctx, harness } = await fixture({ client, runStore: transcript.runStore });
+    const { ctx, harness } = await fixture({ client });
     const { runPromise } = await startPendingRun({ client, ctx, harness });
 
+    client.emitDiagnostic({ code: "host_hermes_notice", message: "runtime notice", details: { apiKey: "not-a-real-token-placeholder" } });
     const responses = await client.invokeClientRequest("session/request_permission", terminalPermissionRequest());
     client.promptDeferred.resolve({ stopReason: "end_turn" });
     const events = await runPromise;
+    const transcriptEvents = transcriptEventsFromAgentEvents(events);
 
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
     expect(events).toEqual(
@@ -590,14 +837,19 @@ describe("HermesAcpHarness", () => {
         }),
       ]),
     );
-    expect(transcript.events).toEqual(
+    expect(transcriptEvents.map((event) => event.eventType)).toEqual(
+      expect.arrayContaining(["runtime_ready", "runtime_diagnostic", "runtime_diagnostic"]),
+    );
+    expect(transcriptEvents.map((event) => event.eventType)).not.toEqual(expect.arrayContaining(["acp_permission_denied", "acp_diagnostic"]));
+    expect(transcriptEvents.map((event) => event.payload)).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
-          eventType: "acp_permission_denied",
-          message: "Host Hermes ACP permission denied: permission_bridge_not_configured",
-        }),
+        expect.objectContaining({ kind: "runtime_diagnostic", code: "host_hermes_notice", severity: "info" }),
+        expect.objectContaining({ kind: "runtime_diagnostic", code: "hermes_acp_permission_denied", severity: "warning" }),
       ]),
     );
+    const projectedStates = projectWebTranscript(transcriptEvents).flatMap((message) => message.kind === "status" ? [message.state] : []);
+    expect(projectedStates).not.toEqual(expect.arrayContaining(["acp_permission_denied", "acp_diagnostic"]));
+    expect(JSON.stringify(transcriptEvents.map((event) => event.payload))).not.toContain("not-a-real-token-placeholder");
   });
 
   it("returns the explicit bridge permission selection only when the resolver chooses an offered option", async () => {
@@ -605,7 +857,6 @@ describe("HermesAcpHarness", () => {
     client.promptDeferred = deferred<Record<string, unknown> | null>();
     client.promptStarted = deferred<void>();
     client.promptNotificationParams = null;
-    const transcript = recordingRunStore();
     const permissionResolver = vi.fn((input: Parameters<HermesAcpPermissionResolver>[0]) => {
       expect(input.acpSessionId).toBe("acp-session-1");
       expect(input.symphonySessionId).toContain("acp-session-1");
@@ -616,12 +867,13 @@ describe("HermesAcpHarness", () => {
       });
       return { optionId: "allow_once" };
     });
-    const { ctx, harness } = await fixture({ client, permissionResolver, runStore: transcript.runStore });
+    const { ctx, harness } = await fixture({ client, permissionResolver });
     const { runPromise } = await startPendingRun({ client, ctx, harness });
 
     const responses = await client.invokeClientRequest("session/request_permission", terminalPermissionRequest());
     client.promptDeferred.resolve({ stopReason: "end_turn" });
     const events = await runPromise;
+    const transcriptEvents = transcriptEventsFromAgentEvents(events);
 
     expect(permissionResolver).toHaveBeenCalledTimes(1);
     expect(responses).toEqual([{ outcome: { outcome: "selected", optionId: "allow_once" } }]);
@@ -635,14 +887,22 @@ describe("HermesAcpHarness", () => {
       ]),
     );
     expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ code: "hermes_acp_permission_denied" })]));
-    expect(transcript.events).toEqual(
+    expect(transcriptEvents).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          eventType: "acp_permission_selected",
-          message: "Host Hermes ACP permission selected: allow_once",
-          payload: expect.objectContaining({ selectedOptionId: "allow_once", requestKind: "terminal_execute" }),
+          eventType: "runtime_status_update",
+          message: "Host Hermes ACP permission allow_once for terminal_execute",
+          payload: expect.objectContaining({
+            kind: "runtime_status_update",
+            status: "permission_selected",
+            selectedOptionId: "allow_once",
+            requestKind: "terminal_execute",
+          }),
         }),
       ]),
+    );
+    expect(transcriptEvents.map((event) => event.eventType)).not.toEqual(
+      expect.arrayContaining(["acp_permission_selected", "acp_permission_denied"]),
     );
   });
 
@@ -661,17 +921,17 @@ describe("HermesAcpHarness", () => {
       client.promptDeferred = deferred<Record<string, unknown> | null>();
       client.promptStarted = deferred<void>();
       client.promptNotificationParams = null;
-      const transcript = recordingRunStore();
       const permissionResolver = vi.fn((input: Parameters<HermesAcpPermissionResolver>[0]) => {
         expect(input.request.requestKind).toBe(requestKind);
         return { optionId };
       });
-      const { ctx, harness } = await fixture({ client, permissionResolver, runStore: transcript.runStore });
+      const { ctx, harness } = await fixture({ client, permissionResolver });
       const { runPromise } = await startPendingRun({ client, ctx, harness });
 
       const responses = await client.invokeClientRequest("session/request_permission", params());
       client.promptDeferred.resolve({ stopReason: "end_turn" });
       const events = await runPromise;
+      const transcriptEvents = transcriptEventsFromAgentEvents(events);
 
       expect(permissionResolver).toHaveBeenCalledTimes(1);
       expect(responses).toEqual([{ outcome: { outcome: "selected", optionId } }]);
@@ -684,14 +944,22 @@ describe("HermesAcpHarness", () => {
           }),
         ]),
       );
-      expect(transcript.events).toEqual(
+      expect(transcriptEvents).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            eventType: "acp_permission_selected",
-            message: `Host Hermes ACP permission selected: ${optionId}`,
-            payload: expect.objectContaining({ selectedOptionId: optionId, requestKind }),
+            eventType: "runtime_status_update",
+            message: `Host Hermes ACP permission ${optionId} for ${requestKind}`,
+            payload: expect.objectContaining({
+              kind: "runtime_status_update",
+              status: "permission_selected",
+              selectedOptionId: optionId,
+              requestKind,
+            }),
           }),
         ]),
+      );
+      expect(transcriptEvents.map((event) => event.eventType)).not.toEqual(
+        expect.arrayContaining(["acp_permission_selected", "acp_permission_denied"]),
       );
     },
   );
@@ -912,14 +1180,13 @@ describe("HermesAcpHarness", () => {
     client.promptDeferred = deferred<Record<string, unknown> | null>();
     client.promptStarted = deferred<void>();
     client.promptNotificationParams = null;
-    const transcript = recordingRunStore();
     const resolverStarted = deferred<void>();
     const permissionDecision = deferred<string>();
     const permissionResolver = vi.fn(() => {
       resolverStarted.resolve();
       return permissionDecision.promise;
     });
-    const { ctx, harness } = await fixture({ client, permissionResolver, runStore: transcript.runStore });
+    const { ctx, harness } = await fixture({ client, permissionResolver });
     const { runId, runPromise } = await startPendingRun({ client, ctx, harness });
 
     const responsePromise = client.invokeClientRequest("session/request_permission", terminalPermissionRequest());
@@ -928,22 +1195,32 @@ describe("HermesAcpHarness", () => {
     permissionDecision.resolve("allow_always");
     const responses = await responsePromise;
     const events = await runPromise;
+    const transcriptEvents = transcriptEventsFromAgentEvents(events);
 
     expect(permissionResolver).toHaveBeenCalledTimes(1);
     expect(client.cancelledParams).toEqual([{ sessionId: "acp-session-1" }]);
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
     expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "cancelled" })]));
-    expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "progress" })]));
-    expect(transcript.events).toEqual(
+    expect(events).not.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          eventType: "acp_permission_denied",
-          message: "Host Hermes ACP permission denied: run_cancelled",
-          payload: expect.objectContaining({ reason: "run_cancelled" }),
+          type: "progress",
+          activitySource: "tool",
+          message: expect.stringContaining("Host Hermes ACP permission"),
         }),
       ]),
     );
-    expect(transcript.events).not.toEqual(expect.arrayContaining([expect.objectContaining({ eventType: "acp_permission_selected" })]));
+    expect(transcriptEvents).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "runtime_status_update",
+          payload: expect.objectContaining({ status: "permission_selected" }),
+        }),
+      ]),
+    );
+    expect(transcriptEvents.map((event) => event.eventType)).not.toEqual(
+      expect.arrayContaining(["acp_permission_selected", "acp_permission_denied"]),
+    );
   });
 });
 
@@ -1011,7 +1288,6 @@ async function fixture(
     lifecycle?: HermesWorkerSessionLifecycle;
     permissionResolver?: HermesAcpPermissionResolver;
     permissionRequestTimeoutMs?: number;
-    runStore?: HermesAcpHarnessOptions["runStore"];
   } = {},
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-"));
@@ -1046,7 +1322,6 @@ async function fixture(
     cliPath: path.join(root, "src", "cli.ts"),
     profileLeaseFactory: leaseFactory,
     acpClientFactory,
-    ...(input.runStore === undefined ? {} : { runStore: input.runStore }),
     ...(input.permissionResolver === undefined ? {} : { permissionResolver: input.permissionResolver }),
     ...(input.permissionRequestTimeoutMs === undefined ? {} : { permissionRequestTimeoutMs: input.permissionRequestTimeoutMs }),
   } satisfies HermesAcpHarnessOptions;
@@ -1145,6 +1420,32 @@ async function collectEvents(
   return events;
 }
 
+function transcriptEventsFromAgentEvents(events: AgentEvent[]): TranscriptEvent[] {
+  const started = events.find((event): event is Extract<AgentEvent, { type: "session_started" }> => event.type === "session_started");
+  const runId = started?.runId ?? started?.sessionId ?? "hermes-acp-test-run";
+  return events.map((event, index) => ({
+    runId,
+    sequence: index + 1,
+    at: event.at ?? new Date(index).toISOString(),
+    source: "harness",
+    ...mapAgentEventToRunActivityEvent(event),
+  }));
+}
+
+function eventTypeCounts(events: TranscriptEvent[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const event of events) counts[event.eventType] = (counts[event.eventType] ?? 0) + 1;
+  return counts;
+}
+
+async function waitFor(condition: () => boolean | Promise<boolean>, label: string, timeoutMs = 2_000): Promise<void> {
+  const started = Date.now();
+  while (!(await condition())) {
+    if (Date.now() - started > timeoutMs) throw new Error(`Timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -1153,16 +1454,4 @@ function deferred<T>(): Deferred<T> {
     reject = innerReject;
   });
   return { promise, resolve, reject };
-}
-
-function recordingRunStore(): { events: TranscriptEvent[]; runStore: NonNullable<HermesAcpHarnessOptions["runStore"]> } {
-  const events: TranscriptEvent[] = [];
-  const runStore = {
-    appendEvent: vi.fn(async (input: Omit<TranscriptEvent, "sequence"> & { sequence?: number }) => {
-      const event: TranscriptEvent = { ...input, sequence: input.sequence ?? events.length + 1 };
-      events.push(event);
-      return event;
-    }),
-  } as unknown as NonNullable<HermesAcpHarnessOptions["runStore"]>;
-  return { events, runStore };
 }
