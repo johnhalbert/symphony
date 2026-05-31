@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentEvent } from "../src/core/harness/AgentHarness.js";
+import type { RunActivityEvent } from "../src/core/runActivity/RunActivityEvent.js";
 import { mapAgentEventToRunActivityEvent, RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX } from "../src/core/transcript/RunActivityEventMapper.js";
 
 const providerLimitSignal = {
@@ -88,6 +89,64 @@ describe("mapAgentEventToRunActivityEvent", () => {
     expect(tool.payload).toMatchObject({ kind: "tool", activitySource: "tool", progressKind: "tool" });
   });
 
+  it("prefers valid harness-provided RunActivityEvent metadata for the shared persisted taxonomy", () => {
+    const mapped = mapAgentEventToRunActivityEvent({
+      type: "progress",
+      activitySource: "delta",
+      message: "legacy assistant chunk token=SECRET_LEGACY_TOKEN",
+      runActivity: acpRunActivity({
+        text: "assistant chunk token=SECRET_TEXT_TOKEN",
+        payload: {
+          delta: true,
+          messagePreview: "assistant chunk token=SECRET_PAYLOAD_TOKEN",
+          rawPayload: { token: "SECRET_RAW_TOKEN" },
+          redacted: true,
+        },
+      }),
+    });
+
+    expect(mapped.eventType).toBe("assistant_message_delta");
+    expect(mapped.payloadSchema).toBe(`${RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX}.assistant_message_delta.v1`);
+    expect(mapped.message).toBe("assistant chunk token=[redacted]");
+    expect(mapped.payload).toMatchObject({
+      kind: "assistant_message_delta",
+      actor: "assistant",
+      channel: "message",
+      protocol: "acp",
+      harnessId: "hermes-acp",
+      activityId: "run-1:activity:2",
+      activityRunId: "run-1",
+      activitySessionId: "acp-session-1",
+      runSessionId: "profile:acp-session-1:run-1",
+      activitySequence: 2,
+      sequenceSource: "harness",
+      externalEventId: "upstream-2",
+      delta: true,
+      messagePreview: "assistant chunk token=[redacted]",
+      textPreview: "assistant chunk token=[redacted]",
+      redacted: true,
+    });
+    const serialized = JSON.stringify(mapped);
+    expect(serialized).not.toContain("SECRET_");
+    expect(serialized).not.toContain("rawPayload");
+    expect(serialized).not.toContain("SECRET_RAW_TOKEN");
+    expect(serialized).not.toContain("legacy assistant chunk");
+  });
+
+  it("falls back to legacy AgentEvent mapping when harness-provided activity metadata is malformed", () => {
+    const malformedActivity = { ...acpRunActivity(), channel: "chat" } as unknown as RunActivityEvent;
+
+    const mapped = mapAgentEventToRunActivityEvent({
+      type: "progress",
+      activitySource: "delta",
+      message: "legacy assistant chunk",
+      runActivity: malformedActivity,
+    });
+
+    expect(mapped.eventType).toBe("progress");
+    expect(mapped.payload).toMatchObject({ kind: "assistant_delta", activitySource: "delta", progressKind: "assistant_delta" });
+  });
+
   it("redacts secrets, marks truncated previews, and omits raw protocol fields from frontend payloads", () => {
     const longSecret = `${"x".repeat(560)} SECRET_LONG_TOKEN`;
     const diagnostic = mapAgentEventToRunActivityEvent({
@@ -114,3 +173,24 @@ describe("mapAgentEventToRunActivityEvent", () => {
     expect(serialized).not.toContain("json-rpc body");
   });
 });
+
+function acpRunActivity(overrides: Partial<RunActivityEvent> = {}): RunActivityEvent {
+  return {
+    id: "run-1:activity:2",
+    runId: "run-1",
+    sessionId: "acp-session-1",
+    runSessionId: "profile:acp-session-1:run-1",
+    at: "2026-05-31T00:00:02.000Z",
+    sequence: 2,
+    sequenceSource: "harness",
+    externalEventId: "upstream-2",
+    protocol: "acp",
+    harnessId: "hermes-acp",
+    actor: "assistant",
+    channel: "message",
+    kind: "assistant_message_delta",
+    text: "assistant chunk",
+    payload: { delta: true, messagePreview: "assistant chunk", redacted: true },
+    ...overrides,
+  } as RunActivityEvent;
+}

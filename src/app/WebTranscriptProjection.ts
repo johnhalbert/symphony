@@ -114,14 +114,14 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
 }
 
 function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, unknown>, eventType: string): TranscriptMessage {
-  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.args, payload.arguments, payload.input);
+  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.inputPreview, payload.args, payload.arguments, payload.input);
   const resultPreview = firstPublicPreview(payload.resultPreview, payload.result, payload.summary);
   const outputPreview = firstPublicPreview(payload.outputPreview, payload.output);
   const errorPreview = firstPublicPreview(payload.errorPreview, payload.error);
   return {
     kind: "tool_call",
     ts: event.at,
-    call_id: firstCleanString(payload.call_id, payload.callId, payload.id, payload.toolId, payload.tool_id) ?? `${event.runId}:${event.sequence}`,
+    call_id: firstCleanString(payload.call_id, payload.callId, payload.toolCallId, payload.id, payload.toolId, payload.tool_id) ?? `${event.runId}:${event.sequence}`,
     name: firstCleanString(payload.name, payload.tool, payload.toolName) ?? event.eventType,
     status: inferredToolStatus(eventType, payload, errorPreview !== null),
     args: argsPreview ? { preview: argsPreview.preview } : {},
@@ -302,6 +302,8 @@ function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind
     eventType === "message_complete" ||
     eventType === "assistant_delta" ||
     eventType === "assistant_complete" ||
+    eventType === "assistant_message_delta" ||
+    eventType === "assistant_message_completed" ||
     eventType === "response_delta" ||
     eventType === "response_complete"
   ) {
@@ -312,12 +314,18 @@ function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind
 
 function isAssistantDeltaEvent(event: TranscriptEvent): boolean {
   const eventType = normalizeToken(event.eventType);
-  return eventType === "message_delta" || eventType === "assistant_delta" || eventType === "response_delta";
+  return eventType === "message_delta" || eventType === "assistant_delta" || eventType === "assistant_message_delta" || eventType === "response_delta";
 }
 
 function isAssistantCompleteEvent(event: TranscriptEvent): boolean {
   const eventType = normalizeToken(event.eventType);
-  return eventType === "message_complete" || eventType === "assistant_complete" || eventType === "response_complete" || eventType === "completed";
+  return (
+    eventType === "message_complete" ||
+    eventType === "assistant_complete" ||
+    eventType === "assistant_message_completed" ||
+    eventType === "response_complete" ||
+    eventType === "completed"
+  );
 }
 
 function combineAssistantDeltaText(existing: string, next: string): string {
