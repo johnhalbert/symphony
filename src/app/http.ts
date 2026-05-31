@@ -97,6 +97,7 @@ import {
   type WebProjectionRevisionUnsubscribe,
   type WebProjectionSourceRevision,
 } from "./WebProjectionContext.js";
+import { RealtimeProjectionEventBus } from "./RealtimeProjectionEvents.js";
 import type {
   ProjectionPayloadWriteInput,
   ProjectionSourceRevision,
@@ -195,8 +196,11 @@ export class StatusServer {
   private readonly webAssetsRoot: string | null;
   private readonly webProjectionRevisionProviders: readonly WebProjectionRevisionProvider[];
   private readonly webProjectionRevisionUnsubscribes: WebProjectionRevisionUnsubscribe[] = [];
+  private readonly realtimeEvents = new RealtimeProjectionEventBus();
   private readonly webProjectionEventClients = new Map<number, WebProjectionEventClient>();
   private readonly pendingWebOrchestratorChatMessagePosts = new Map<string, Promise<unknown>>();
+  private lastPublishedTrackerSourceStatusKey: string | null = null;
+  private trackerSourceStatusRevision = 0;
   private nextWebProjectionEventClientId = 1;
   private webProjectionDirtyGeneration = 0;
 
@@ -226,6 +230,7 @@ export class StatusServer {
   }
 
   async stop(): Promise<void> {
+    this.realtimeEvents.closeAllStreams();
     if (!this.server) {
       this.unsubscribeWebProjectionRevisionListeners();
       return;
@@ -242,12 +247,17 @@ export class StatusServer {
     }
   }
 
+  activeRealtimeSubscriberCount(): number {
+    return this.realtimeEvents.subscriberCount();
+  }
+
   private registerWebProjectionRevisionListeners(): void {
     if (this.webProjectionRevisionUnsubscribes.length > 0) return;
     for (const provider of this.webProjectionRevisionProviders) {
       if (!provider.subscribe) continue;
       const unsubscribe = provider.subscribe((revision) => {
         this.markCompletedWebProjectionContextDirty(revision);
+        this.realtimeEvents.publishProjectionRevision(revision);
       });
       this.webProjectionRevisionUnsubscribes.push(unsubscribe);
     }
@@ -324,6 +334,44 @@ export class StatusServer {
     }
   }
 
+  private publishTrackerSourceStatusIfChanged(sourceIndex: BuiltWebProjectionSourceIndex): void {
+    const trackerIssues = sourceIndex.trackerIssues;
+    const statusKey = trackerSourceStatusKey(trackerIssues);
+    if (statusKey === this.lastPublishedTrackerSourceStatusKey) return;
+    this.lastPublishedTrackerSourceStatusKey = statusKey;
+    this.trackerSourceStatusRevision += 1;
+    this.realtimeEvents.publish({
+      type: "source.status",
+      source: {
+        source: "trackerIssues",
+        revision: this.trackerSourceStatusRevision,
+        observedAt: trackerIssues.fetchedAt,
+      },
+      detail: {
+        source: "trackerIssues",
+        status: trackerIssues.status,
+        fetchedStates: trackerIssues.fetchedStates,
+        fetchedAt: trackerIssues.fetchedAt,
+        cached: trackerIssues.cached,
+        error: trackerIssues.error
+          ? { code: trackerIssues.error.code, message: trackerIssues.error.message }
+          : null,
+        issueCount: trackerIssues.issues.length,
+      },
+    });
+  }
+
+  private handleRealtime(request: IncomingMessage, response: ServerResponse, url: URL): void {
+    const stream = this.realtimeEvents.openSseStream({
+      response,
+      lastEventId: realtimeLastEventId(request, url),
+    });
+    const close = (): void => stream.close();
+    request.on("aborted", close);
+    response.on("close", close);
+    response.on("error", close);
+  }
+
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
@@ -360,6 +408,10 @@ export class StatusServer {
           ),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/realtime") {
+        this.handleRealtime(request, response, url);
         return;
       }
       const webIssueMatch = /^\/api\/v1\/web\/issues\/([^/]+)$/.exec(url.pathname);
@@ -547,7 +599,17 @@ export class StatusServer {
             ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
           });
           const chat = webOrchestratorChatProjectionFromResponseBody(result.body);
-          if (chat) await this.persistWebOrchestratorChatProjection(chat, postConversationId);
+          if (chat) {
+            await this.persistWebOrchestratorChatProjection(chat, postConversationId);
+            if (chat.length > 0 && result.status !== 200) {
+              this.realtimeEvents.publishOrchestratorMessage({
+                inputLength: input.input.length,
+                messageCount: chat.length,
+                conversationId: postConversationId ?? DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+                status: result.status,
+              });
+            }
+          }
           sendJson(response, result.status, result.body);
           return;
         }
@@ -1657,10 +1719,12 @@ export class StatusServer {
     issueBoardColumns: IssueBoardColumnMapping;
   }> {
     const acquired = await this.acquireWebProjectionContextEntry(forceRefresh);
+    const sourceIndex = acquired.reusedCompleted
+      ? webProjectionSourceIndexWithTrackerCacheHit(acquired.context.sourceIndex)
+      : acquired.context.sourceIndex;
+    this.publishTrackerSourceStatusIfChanged(sourceIndex);
     return {
-      sourceIndex: acquired.reusedCompleted
-        ? webProjectionSourceIndexWithTrackerCacheHit(acquired.context.sourceIndex)
-        : acquired.context.sourceIndex,
+      sourceIndex,
       issueBoardColumns: this.resolveWebProjectionIssueBoardColumns(),
     };
   }
@@ -2067,6 +2131,28 @@ function webProjectionSourceIndexWithTrackerCacheHit(
   };
 }
 
+function trackerSourceStatusKey(trackerIssues: BuiltWebProjectionSourceIndex["trackerIssues"]): string {
+  return JSON.stringify({
+    status: trackerIssues.status,
+    fetchedStateKey: trackerIssues.fetchedStateKey,
+    fetchedAt: trackerIssues.fetchedAt,
+    cached: trackerIssues.cached,
+    error: trackerIssues.error ? { code: trackerIssues.error.code, message: trackerIssues.error.message } : null,
+    issueCount: trackerIssues.issues.length,
+    latestIssueRevision: latestTrackerIssueRevision(trackerIssues.issues),
+  });
+}
+
+function latestTrackerIssueRevision(issues: readonly Issue[]): string | null {
+  let latest: string | null = null;
+  for (const issue of issues) {
+    const revision = issue.updatedAt ?? issue.createdAt ?? issue.id;
+    if (!revision) continue;
+    if (latest === null || revision > latest) latest = revision;
+  }
+  return latest;
+}
+
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(`${JSON.stringify(body, null, 2)}\n`);
@@ -2081,6 +2167,15 @@ function writeWebProjectionSseEvent(response: ServerResponse, event: string, bod
 function sendHtml(response: ServerResponse, body: string): void {
   response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   response.end(body);
+}
+
+function realtimeLastEventId(request: IncomingMessage, url: URL): string | null {
+  const header = request.headers["last-event-id"];
+  const headerValue = Array.isArray(header) ? header[0] : header;
+  const queryValue = url.searchParams.get("lastEventId") ?? url.searchParams.get("last-event-id");
+  const value = headerValue ?? queryValue;
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : null;
 }
 
 const WEB_MOUNT_PATH = "/web";
