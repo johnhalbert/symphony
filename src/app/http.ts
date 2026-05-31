@@ -60,6 +60,10 @@ import {
 } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
+import type {
+  OrchestratorConversationMessage,
+  OrchestratorConversationStore,
+} from "../core/persistence/OrchestratorConversationStore.js";
 import { projectWebHistory } from "./WebHistoryProjection.js";
 import { projectWebTranscript } from "./WebTranscriptProjection.js";
 import {
@@ -135,6 +139,7 @@ export interface StatusServerOptions {
   workspaceManager: WorkspaceManager;
   workspaceOpener: WorkspaceOpener;
   runStore?: RunTranscriptStore;
+  orchestratorConversationStore?: OrchestratorConversationStore;
   lifecycleStore?: IssueLifecycleStore;
   mcpExposureDiagnosticsStore?: FileMcpExposureDiagnosticsStore;
   writebackOutbox?: StatusServerWritebackOutbox;
@@ -464,8 +469,9 @@ export class StatusServer {
         return;
       }
       if (url.pathname === "/api/v1/web/orchestrator-chat") {
+        const conversationId = parseWebOrchestratorChatConversationId(url.searchParams.get("conversationId"));
         if (request.method === "GET") {
-          sendJson(response, 200, projectWebOrchestratorChat());
+          sendJson(response, 200, projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages(conversationId)));
           return;
         }
         if (request.method === "POST") {
@@ -482,7 +488,7 @@ export class StatusServer {
             return;
           }
 
-          let input: string;
+          let input: WebOrchestratorChatPostRequest;
           try {
             input = parseWebOrchestratorChatPostRequest(body);
           } catch (error) {
@@ -498,7 +504,18 @@ export class StatusServer {
             throw error;
           }
 
-          sendJson(response, 200, projectWebOrchestratorChatPost(input));
+          if (!this.options.orchestratorConversationStore) {
+            sendJson(response, 200, projectWebOrchestratorChatPost(input.input));
+            return;
+          }
+
+          const postConversationId = input.conversationId ?? conversationId;
+          const persisted = await this.persistWebOrchestratorChatPost({
+            input: input.input,
+            ...(postConversationId === undefined ? {} : { conversationId: postConversationId }),
+            ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
+          });
+          sendJson(response, 200, projectWebOrchestratorChatPost(input.input, persisted));
           return;
         }
       }
@@ -1034,6 +1051,33 @@ export class StatusServer {
     });
   }
 
+  private async fetchWebOrchestratorChatMessages(
+    conversationId?: string | null,
+  ): Promise<OrchestratorConversationMessage[]> {
+    return (await this.options.orchestratorConversationStore?.listMessages(conversationId)) ?? [];
+  }
+
+  private async persistWebOrchestratorChatPost(input: {
+    conversationId?: string | null;
+    messageId?: string;
+    input: string;
+  }): Promise<OrchestratorConversationMessage[]> {
+    const store = this.options.orchestratorConversationStore;
+    if (!store) return [];
+    await store.appendMessage({
+      role: "user",
+      body: input.input,
+      status: "completed",
+      ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+      ...(input.messageId === undefined ? {} : { id: input.messageId }),
+      metadata: {
+        source: "web_orchestrator_chat",
+        actionDispatched: false,
+      },
+    });
+    return store.listMessages(input.conversationId);
+  }
+
   private async fetchWebSidebar(forceRefresh: boolean) {
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
@@ -1070,7 +1114,7 @@ export class StatusServer {
       }),
       projectWebIssueBoard(board),
       projectWebHistory(activitySources.runs, historyActivity.activity),
-      projectWebOrchestratorChat(),
+      projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages()),
     );
   }
 
@@ -1376,6 +1420,11 @@ function createStatusServerWebProjectionRevisionProviders(
   if (lifecycleStoreProvider) providers.push(lifecycleStoreProvider);
   const writebackOutboxProvider = createStatusServerStoreRevisionProvider("writebackOutbox", options.writebackOutbox);
   if (writebackOutboxProvider) providers.push(writebackOutboxProvider);
+  const orchestratorConversationProvider = createStatusServerStoreRevisionProvider(
+    "orchestrator_conversations",
+    options.orchestratorConversationStore,
+  );
+  if (orchestratorConversationProvider) providers.push(orchestratorConversationProvider);
   return providers;
 }
 
@@ -1764,7 +1813,13 @@ function parseApprovalDecision(body: unknown): "approve" | "reject" {
   return decision;
 }
 
-function parseWebOrchestratorChatPostRequest(body: unknown): string {
+interface WebOrchestratorChatPostRequest {
+  input: string;
+  conversationId?: string;
+  messageId?: string;
+}
+
+function parseWebOrchestratorChatPostRequest(body: unknown): WebOrchestratorChatPostRequest {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new SymphonyError(
       "invalid_request",
@@ -1778,7 +1833,27 @@ function parseWebOrchestratorChatPostRequest(body: unknown): string {
       "Web orchestrator chat request body must include a non-empty string input",
     );
   }
-  return input;
+  const conversationId = parseOptionalWebOrchestratorChatString(body, "conversationId");
+  const messageId = parseOptionalWebOrchestratorChatString(body, "messageId");
+  return {
+    input,
+    ...(conversationId === undefined ? {} : { conversationId }),
+    ...(messageId === undefined ? {} : { messageId }),
+  };
+}
+
+function parseWebOrchestratorChatConversationId(value: string | null): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+function parseOptionalWebOrchestratorChatString(body: unknown, key: "conversationId" | "messageId"): string | undefined {
+  const value = (body as Record<string, unknown>)[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new SymphonyError("invalid_request", `Web orchestrator chat request body ${key} must be a non-empty string`);
+  }
+  return value.trim();
 }
 
 function parseIssueBreakdownApplyRequest(body: unknown): { dryRun: boolean } {

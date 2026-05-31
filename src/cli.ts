@@ -8,6 +8,7 @@ import { StructuredLogger } from "./core/logging/StructuredLogger.js";
 import { Orchestrator } from "./core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureDiagnosticsStore.js";
+import { FileOrchestratorConversationStore } from "./core/persistence/OrchestratorConversationStore.js";
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore } from "./core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
@@ -191,6 +192,7 @@ program
 
     const tracker = createRuntimeTrackerClient(config);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const orchestratorConversationStore = new FileOrchestratorConversationStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
@@ -239,6 +241,7 @@ program
             workspaceManager,
             workspaceOpener: opener,
             runStore,
+            orchestratorConversationStore,
             lifecycleStore,
             mcpExposureDiagnosticsStore,
             writebackOutbox,
