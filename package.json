@@ -14,6 +14,7 @@
     "extension:ci": "npm ci --prefix extension",
     "extension:test": "npm run test --prefix extension",
     "extension:typecheck": "npm run typecheck --prefix extension",
+    "fixture:large-history": "tsx scripts/generate-large-history-fixture.ts",
     "smoke:active-context-governor": "tsx scripts/active-context-governor-poc.ts",
     "smoke:hermes-local": "tsx scripts/hermes-local-smoke.ts",
     "smoke:mcp-exposure": "tsx scripts/mcp-tool-exposure-probe.ts",
