@@ -57,7 +57,7 @@ When raw tool output, harness payloads, or diagnostic payloads exceed the inline
 
 ## Validation
 
-The static Vitest coverage in `tests/postgres-schema.test.ts` asserts required tables, indexes, source-boundary notes, transition policy, and oversized-payload policy. The same test file includes an opt-in Docker-backed validation that applies the migration to an empty `postgres:16-alpine` database:
+The static Vitest coverage in `tests/postgres-schema.test.ts` asserts required tables, indexes, source-boundary notes, transition policy, and oversized-payload policy. The same test file includes an opt-in Docker-backed validation that applies the migration to an empty `postgres:16-alpine` database, exercises basic insert/query paths for each operational and projection table, and verifies duplicate workspace keys plus duplicate non-null external issue ids are rejected:
 
 ```bash
 SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1 npx vitest run tests/postgres-schema.test.ts --no-file-parallelism
