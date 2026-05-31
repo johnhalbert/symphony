@@ -23,9 +23,9 @@ export function resolveAppResourceLoading(activeTab: AppTab, apiMode: boolean): 
 
   return {
     referenceData: true,
-    dashboard: activeTab === "dashboard",
+    dashboard: activeTab === "dashboard" || activeTab === "states",
     issueBoard: activeTab === "issues",
-    history: activeTab === "history",
+    history: activeTab === "history" || activeTab === "states",
     sidebar: activeTab === "sidebar",
     orchestratorChat: activeTab === "dashboard" || activeTab === "sidebar",
   };

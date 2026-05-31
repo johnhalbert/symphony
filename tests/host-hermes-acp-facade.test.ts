@@ -3,14 +3,18 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
   HostHermesAcpStdioJsonRpcFacade,
+  HostHermesAcpSubprocessTransport,
   parseHostHermesAcpJsonRpcLine,
   stringifyHostHermesAcpJsonRpcMessage,
+  HostHermesAcpJsonRpcResponseError,
   type HostHermesAcpChildProcess,
   type HostHermesAcpDiagnostic,
+  type HostHermesAcpJsonRpcId,
   type HostHermesAcpJsonRpcMessage,
   type HostHermesAcpProcessExit,
   type HostHermesAcpSpawnOptions,
 } from "../hermes/src/HostHermesAcpFacade.js";
+import { buildHostHermesAcpLaunchCommand } from "../hermes/src/HostHermesAcpProfileLease.js";
 
 class FakeChildProcess extends EventEmitter implements HostHermesAcpChildProcess {
   readonly stdin = new PassThrough();
@@ -28,6 +32,10 @@ class FakeChildProcess extends EventEmitter implements HostHermesAcpChildProcess
     this.emit("exit", code, signal);
   }
 
+  close(code: number | null = null, signal: NodeJS.Signals | null = null): void {
+    this.emit("close", code, signal);
+  }
+
   fail(error: Error): void {
     this.emit("error", error);
   }
@@ -39,7 +47,9 @@ interface SpawnCall {
   options: HostHermesAcpSpawnOptions;
 }
 
-function createSpawnedFacade(options: { requestTimeoutMs?: number; stderrTailBytes?: number } = {}) {
+function createSpawnedFacade(
+  options: { requestTimeoutMs?: number; stderrTailBytes?: number; idFactory?: () => HostHermesAcpJsonRpcId } = {},
+) {
   const child = new FakeChildProcess();
   const spawnCalls: SpawnCall[] = [];
   const writes = collectJsonRpcWrites(child.stdin);
@@ -127,6 +137,43 @@ describe("HostHermesAcpFacade JSON-RPC codec", () => {
 });
 
 describe("HostHermesAcpStdioJsonRpcFacade", () => {
+  it("spawns the lease ACP command in the workspace cwd with stripped vendored runtime env", () => {
+    const child = new FakeChildProcess();
+    const spawnCalls: SpawnCall[] = [];
+    const command = buildHostHermesAcpLaunchCommand({
+      binaryPath: "/opt/hermes/bin/hermes",
+      profileName: "symphony-eng-149",
+      cwd: "/workspace/project",
+      env: {
+        HERMES_HOME: "/vendored/home",
+        hermes_auth_home: "/vendored/auth",
+        HERMES_PYTHON_SRC_ROOT: "/vendored/src",
+        PYTHONPATH: "/vendored/python",
+        HERMES_MODEL: "vendored-model",
+        HERMES_TUI_PROVIDER: "vendored-provider",
+        PATH: "/usr/bin",
+        CUSTOM_ENV: "kept",
+      },
+    });
+
+    HostHermesAcpStdioJsonRpcFacade.spawn(command, {
+      spawn: (file: string, args: readonly string[], spawnOptions: HostHermesAcpSpawnOptions) => {
+        spawnCalls.push({ file, args: [...args], options: { ...spawnOptions, env: { ...spawnOptions.env } } });
+        return child;
+      },
+    });
+
+    expect(spawnCalls).toHaveLength(1);
+    const call = spawnCalls[0];
+    if (!call) throw new Error("Expected Host Hermes ACP spawn call.");
+    expect(call.file).toBe("/opt/hermes/bin/hermes");
+    expect(call.args).toEqual(["-p", "symphony-eng-149", "acp"]);
+    expect(call.options.cwd).toBe("/workspace/project");
+    expect(call.options.stdio).toBe("pipe");
+    expect(call.options.windowsHide).toBe(true);
+    expect(call.options.env).toEqual({ PATH: "/usr/bin", CUSTOM_ENV: "kept" });
+  });
+
   it("spawns the profile lease command, writes newline JSON-RPC, and routes responses and session/update notifications", async () => {
     const { child, facade, spawnCalls, writes } = createSpawnedFacade();
     const notifications: unknown[] = [];
@@ -181,8 +228,67 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     await expect(response).resolves.toEqual({ sessionId: "symphony-acp-session" });
   });
 
+  it("resolves concurrent in-flight requests by id even when responses arrive out of order or with JSON-RPC errors", async () => {
+    const { child, facade, writes } = createSpawnedFacade();
+
+    const first = facade.request("session/first", { order: 1 });
+    const second = facade.request("session/second", { order: 2 });
+
+    expect(writes).toEqual([
+      { jsonrpc: "2.0", id: 1, method: "session/first", params: { order: 1 } },
+      { jsonrpc: "2.0", id: 2, method: "session/second", params: { order: 2 } },
+    ]);
+
+    writeJsonRpc(child, { jsonrpc: "2.0", id: 2, result: { completed: "second" } });
+    await expect(second).resolves.toEqual({ completed: "second" });
+
+    writeJsonRpc(child, { jsonrpc: "2.0", id: 1, error: { code: -32000, message: "first failed", data: { retryable: false } } });
+    await expect(first).rejects.toBeInstanceOf(HostHermesAcpJsonRpcResponseError);
+    await expect(first).rejects.toMatchObject({ code: -32000, data: { retryable: false } });
+  });
+
+  it("rejects duplicate outgoing request ids while preserving the original pending request", async () => {
+    const { child, facade, writes } = createSpawnedFacade({ idFactory: () => 7 });
+
+    const first = facade.request("session/original", { ok: true });
+    const duplicate = facade.request("session/duplicate", { ok: false });
+
+    await expect(duplicate).rejects.toThrow("Host Hermes ACP request id collision for 7.");
+    expect(writes).toEqual([{ jsonrpc: "2.0", id: 7, method: "session/original", params: { ok: true } }]);
+
+    writeJsonRpc(child, { jsonrpc: "2.0", id: 7, result: { completed: true } });
+    await expect(first).resolves.toEqual({ completed: true });
+  });
+
+  it("surfaces unknown notifications as diagnostics without replying or blocking later known notifications", () => {
+    const { child, facade, writes } = createSpawnedFacade();
+    const diagnostics: HostHermesAcpDiagnostic[] = [];
+    const allNotifications: string[] = [];
+    const handledNotifications: unknown[] = [];
+    facade.on("diagnostic", (diagnostic) => diagnostics.push(diagnostic));
+    facade.on("notification", (notification) => allNotifications.push(notification.method));
+
+    writeJsonRpc(child, { jsonrpc: "2.0", method: "future/notification", params: { stillRunning: true } });
+
+    expect(writes).toEqual([]);
+    expect(allNotifications).toEqual(["future/notification"]);
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        code: "host_hermes_acp_unknown_notification",
+        details: { method: "future/notification" },
+      }),
+    ]);
+
+    facade.onNotification("session/update", (params) => handledNotifications.push(params));
+    writeJsonRpc(child, { jsonrpc: "2.0", method: "session/update", params: { sessionId: "s1", update: { ok: true } } });
+
+    expect(handledNotifications).toEqual([{ sessionId: "s1", update: { ok: true } }]);
+    expect(diagnostics).toHaveLength(1);
+  });
+
   it("routes Hermes client-method requests such as session/request_permission and replies to unknown methods defensively", async () => {
     const { child, facade, writes } = createSpawnedFacade();
+
     facade.onClientRequest("session/request_permission", (params) => ({ outcome: "allow_once", received: params }));
 
     writeJsonRpc(child, {
@@ -213,12 +319,43 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     });
   });
 
+  it("turns server request handler failures into a single JSON-RPC error response and diagnostic", async () => {
+    const { child, facade, writes } = createSpawnedFacade();
+    const diagnostics: HostHermesAcpDiagnostic[] = [];
+    facade.on("diagnostic", (diagnostic) => diagnostics.push(diagnostic));
+    facade.onClientRequest("session/request_permission", () => {
+      throw new Error("permission bridge unavailable");
+    });
+
+    writeJsonRpc(child, {
+      jsonrpc: "2.0",
+      id: "perm-fail-1",
+      method: "session/request_permission",
+      params: { sessionId: "s1", toolCall: { id: "tool-1" } },
+    });
+    await flushAsyncHandlers();
+
+    expect(writes).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: "perm-fail-1",
+        error: { code: -32603, message: "Handler failed: permission bridge unavailable" },
+      },
+    ]);
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        code: "host_hermes_acp_client_request_handler_error",
+        details: { id: "perm-fail-1", method: "session/request_permission" },
+      }),
+    ]);
+  });
+
   it("captures malformed stdout diagnostics and bounded stderr log tails without crashing", () => {
-    const { child, facade } = createSpawnedFacade({ stderrTailBytes: 1_024 });
+    const { child, facade } = createSpawnedFacade({ stderrTailBytes: 256 });
     const diagnostics: HostHermesAcpDiagnostic[] = [];
     facade.on("diagnostic", (diagnostic) => diagnostics.push(diagnostic));
 
-    child.stderr.write("first\nsecond\nthird\nfourth\n");
+    child.stderr.write(`discarded-prefix\n${"x".repeat(600)}\nfirst\nsecond\nthird\nfourth\n`);
     child.stdout.write("{not json\n");
     writeJsonRpc(child, { jsonrpc: "2.0", id: 999, result: { late: true } });
 
@@ -226,6 +363,8 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
       "host_hermes_acp_json_parse_error",
       "host_hermes_acp_unmatched_response",
     ]);
+    expect(facade.getLogTail().length).toBeLessThanOrEqual(256);
+    expect(facade.getLogTail()).not.toContain("discarded-prefix");
     expect(facade.getLogTail(2)).toBe("third\nfourth");
   });
 
@@ -244,6 +383,67 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     ]);
   });
 
+  it("rejects pending startup requests with stderr context when the child process fails before initialization", async () => {
+    const { child, facade } = createSpawnedFacade();
+    const diagnostics: HostHermesAcpDiagnostic[] = [];
+    const exitEvents: HostHermesAcpProcessExit[] = [];
+    facade.on("diagnostic", (diagnostic) => diagnostics.push(diagnostic));
+    facade.on("exit", (exit) => exitEvents.push(exit));
+
+    const sessionNew = facade.request("session/new", { cwd: "/workspace" }, { timeoutMs: 1_000 });
+    child.stderr.write("startup failed: missing profile\n");
+    child.fail(new Error("spawn ENOENT"));
+    child.close(null);
+
+    await expect(sessionNew).rejects.toThrow(
+      /Host Hermes ACP process exited before all requests completed \(exit code unknown; process error: spawn ENOENT\)\.\nStderr tail:\nstartup failed: missing profile/,
+    );
+    expect(diagnostics).toEqual([
+      { code: "host_hermes_acp_process_error", message: "Host Hermes ACP process error: spawn ENOENT" },
+    ]);
+    expect(exitEvents).toEqual([{ code: null, signal: null, error: "spawn ENOENT" }]);
+
+    const earlyExit = createSpawnedFacade();
+    const initialize = earlyExit.facade.request("initialize", {}, { timeoutMs: 1_000 });
+    earlyExit.child.stderr.write("early boot exit\n");
+    earlyExit.child.exit(2);
+    earlyExit.child.close(2);
+
+    await expect(initialize).rejects.toThrow(
+      /Host Hermes ACP process exited before all requests completed \(exit code 2\)\.\nStderr tail:\nearly boot exit/,
+    );
+  });
+
+  it("waits for process close before rejecting startup requests so late stderr is included", async () => {
+    const { child, facade } = createSpawnedFacade();
+    const exitEvents: HostHermesAcpProcessExit[] = [];
+    const logTailAtExit: string[] = [];
+    facade.on("exit", (exit) => {
+      exitEvents.push(exit);
+      logTailAtExit.push(facade.getLogTail());
+    });
+
+    const initialize = facade.request("initialize", {}, { timeoutMs: 1_000 });
+    let rejectedBeforeClose = false;
+    void initialize.catch(() => {
+      rejectedBeforeClose = true;
+    });
+
+    child.exit(2);
+    await flushAsyncHandlers();
+    expect(rejectedBeforeClose).toBe(false);
+    expect(exitEvents).toEqual([]);
+
+    child.stderr.write("late stderr after exit event\n");
+    child.close(2);
+
+    await expect(initialize).rejects.toThrow(
+      /Host Hermes ACP process exited before all requests completed \(exit code 2\)\.\nStderr tail:\nlate stderr after exit event/,
+    );
+    expect(exitEvents).toEqual([{ code: 2, signal: null }]);
+    expect(logTailAtExit).toEqual(["late stderr after exit event"]);
+  });
+
   it("rejects pending requests on process exit and kill while retaining stderr diagnostics", async () => {
     const first = createSpawnedFacade();
     const exitEvents: HostHermesAcpProcessExit[] = [];
@@ -251,6 +451,7 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     const prompt = first.facade.request("session/prompt", { sessionId: "s1" }, { timeoutMs: 1_000 });
     first.child.stderr.write("fatal line\n");
     first.child.exit(1);
+    first.child.close(1);
 
     await expect(prompt).rejects.toThrow(/Host Hermes ACP process exited before all requests completed \(exit code 1\)\.\nStderr tail:\nfatal line/);
     expect(exitEvents).toEqual([{ code: 1, signal: null }]);
@@ -258,8 +459,32 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     const second = createSpawnedFacade();
     const pending = second.facade.request("session/prompt", { sessionId: "s2" }, { timeoutMs: 1_000 });
     second.facade.kill("test cleanup");
+    second.facade.kill("duplicate cleanup");
 
     await expect(pending).rejects.toThrow("Host Hermes ACP process killed: test cleanup.");
     expect(second.child.killCalls).toEqual(["SIGTERM"]);
+  });
+
+  it("sends at most one termination signal when the subprocess transport is killed repeatedly", () => {
+    const child = new FakeChildProcess();
+    const diagnostics: HostHermesAcpDiagnostic[] = [];
+    const transport = new HostHermesAcpSubprocessTransport(
+      {
+        file: "hermes",
+        args: ["-p", "symphony-run", "acp"],
+        cwd: "/workspace",
+        env: { PATH: "/usr/bin" },
+      },
+      { spawn: () => child },
+    );
+    transport.on("diagnostic", (diagnostic) => diagnostics.push(diagnostic));
+
+    transport.kill("first cleanup");
+    transport.kill("second cleanup");
+
+    expect(child.killCalls).toEqual(["SIGTERM"]);
+    expect(diagnostics).toEqual([
+      { code: "host_hermes_acp_process_kill", message: "Killing Host Hermes ACP process: first cleanup" },
+    ]);
   });
 });

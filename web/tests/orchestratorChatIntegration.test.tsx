@@ -162,8 +162,11 @@ describe("dashboard orchestrator chat integration", () => {
     const markup = renderDashboardChat({ chat: [] });
 
     expect(markup).toContain("Ask about the project, or issue a command");
+    expect(markup).toContain("show stalled agents");
     expect(markup).toContain("/ commands");
-    expect(markup).toContain("codex-1");
+    expect(markup).toContain("agent unavailable");
+    expect(markup).not.toContain("codex-1");
+    expect(markup).not.toContain("pause SYM-42");
     expect(markup).toContain("type=\"submit\"");
     expect(markup).not.toContain("API mode shows durable chat history only");
   });
@@ -216,7 +219,8 @@ describe("sidebar orchestrator chat integration", () => {
 
     expect(markup).toContain("Ask or command");
     expect(markup).toContain("@ context");
-    expect(markup).toContain("codex-1 · cycle 14");
+    expect(markup).toContain("agent context unavailable");
+    expect(markup).not.toContain("codex-1 · cycle 14");
     expect(markup).not.toContain("read-only API mode");
     expect(markup).not.toContain("Sending commands from this compact chat is not supported yet");
   });
