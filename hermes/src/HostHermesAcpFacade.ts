@@ -60,6 +60,7 @@ export interface HostHermesAcpChildProcess {
   pid?: number | undefined;
   kill(signal?: NodeJS.Signals | number): boolean;
   on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  on(event: "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
   on(event: "error", listener: (error: Error) => void): this;
 }
 
@@ -123,6 +124,8 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
   readonly #stdoutDecoder = new HostHermesAcpJsonRpcStreamDecoder({ ignoreEmptyLines: true });
   #stderrTail = "";
   #exited = false;
+  #exitEmitted = false;
+  #pendingExit: HostHermesAcpProcessExit | null = null;
   #killRequested = false;
   #processError: string | null = null;
 
@@ -146,11 +149,18 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
         code: "host_hermes_acp_process_error",
         message: `Host Hermes ACP process error: ${processError}`,
       });
-      this.#markExited({ code: null, signal: null, error: processError });
+      this.#recordExited({ code: null, signal: null, error: processError });
     });
     this.#child.on("exit", (code, signal) => {
       const exit: HostHermesAcpProcessExit = { code, signal };
       if (this.#processError) exit.error = this.#processError;
+      this.#recordExited(exit);
+    });
+    this.#child.on("close", (code, signal) => {
+      // ChildProcess "exit" can fire before stdio has drained; "close" is the
+      // stream-drained lifecycle signal used for final rejection diagnostics.
+      const exit = this.#pendingExit ?? { code, signal };
+      if (this.#processError && !exit.error) exit.error = this.#processError;
       this.#markExited(exit);
     });
   }
@@ -225,9 +235,16 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
     this.emit("diagnostic", diagnostic);
   }
 
-  #markExited(exit: HostHermesAcpProcessExit): void {
+  #recordExited(exit: HostHermesAcpProcessExit): void {
     if (this.#exited) return;
     this.#exited = true;
+    this.#pendingExit = exit;
+  }
+
+  #markExited(exit: HostHermesAcpProcessExit): void {
+    this.#recordExited(exit);
+    if (this.#exitEmitted) return;
+    this.#exitEmitted = true;
     this.#flushStdoutRemainder();
     this.emit("exit", exit);
   }

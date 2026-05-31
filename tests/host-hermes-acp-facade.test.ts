@@ -29,6 +29,10 @@ class FakeChildProcess extends EventEmitter implements HostHermesAcpChildProcess
     this.emit("exit", code, signal);
   }
 
+  close(code: number | null = null, signal: NodeJS.Signals | null = null): void {
+    this.emit("close", code, signal);
+  }
+
   fail(error: Error): void {
     this.emit("error", error);
   }
@@ -273,6 +277,7 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     const sessionNew = facade.request("session/new", { cwd: "/workspace" }, { timeoutMs: 1_000 });
     child.stderr.write("startup failed: missing profile\n");
     child.fail(new Error("spawn ENOENT"));
+    child.close(null);
 
     await expect(sessionNew).rejects.toThrow(
       /Host Hermes ACP process exited before all requests completed \(exit code unknown; process error: spawn ENOENT\)\.\nStderr tail:\nstartup failed: missing profile/,
@@ -286,10 +291,41 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     const initialize = earlyExit.facade.request("initialize", {}, { timeoutMs: 1_000 });
     earlyExit.child.stderr.write("early boot exit\n");
     earlyExit.child.exit(2);
+    earlyExit.child.close(2);
 
     await expect(initialize).rejects.toThrow(
       /Host Hermes ACP process exited before all requests completed \(exit code 2\)\.\nStderr tail:\nearly boot exit/,
     );
+  });
+
+  it("waits for process close before rejecting startup requests so late stderr is included", async () => {
+    const { child, facade } = createSpawnedFacade();
+    const exitEvents: HostHermesAcpProcessExit[] = [];
+    const logTailAtExit: string[] = [];
+    facade.on("exit", (exit) => {
+      exitEvents.push(exit);
+      logTailAtExit.push(facade.getLogTail());
+    });
+
+    const initialize = facade.request("initialize", {}, { timeoutMs: 1_000 });
+    let rejectedBeforeClose = false;
+    void initialize.catch(() => {
+      rejectedBeforeClose = true;
+    });
+
+    child.exit(2);
+    await flushAsyncHandlers();
+    expect(rejectedBeforeClose).toBe(false);
+    expect(exitEvents).toEqual([]);
+
+    child.stderr.write("late stderr after exit event\n");
+    child.close(2);
+
+    await expect(initialize).rejects.toThrow(
+      /Host Hermes ACP process exited before all requests completed \(exit code 2\)\.\nStderr tail:\nlate stderr after exit event/,
+    );
+    expect(exitEvents).toEqual([{ code: 2, signal: null }]);
+    expect(logTailAtExit).toEqual(["late stderr after exit event"]);
   });
 
   it("rejects pending requests on process exit and kill while retaining stderr diagnostics", async () => {
@@ -299,6 +335,7 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     const prompt = first.facade.request("session/prompt", { sessionId: "s1" }, { timeoutMs: 1_000 });
     first.child.stderr.write("fatal line\n");
     first.child.exit(1);
+    first.child.close(1);
 
     await expect(prompt).rejects.toThrow(/Host Hermes ACP process exited before all requests completed \(exit code 1\)\.\nStderr tail:\nfatal line/);
     expect(exitEvents).toEqual([{ code: 1, signal: null }]);
