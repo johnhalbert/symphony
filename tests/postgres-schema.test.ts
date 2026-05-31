@@ -36,7 +36,10 @@ const requiredLookupIndexes = [
   "run_session_issue_status_idx",
   "issue_status_lookup_idx",
   "run_activity_event_ordering_idx",
+  "run_activity_event_kind_time_idx",
+  "run_activity_event_channel_kind_time_idx",
   "chat_message_ordering_idx",
+  "chat_message_event_range_idx",
   "writeback_operation_state_idx",
   "approval_request_state_idx",
   "projection_revision_reads_idx",
@@ -73,10 +76,54 @@ describe("Postgres Symphony-owned state migration", () => {
     }
 
     expect(normalized).toContain("on symphony.run_activity_event (run_id, sequence)");
+    expect(normalized).toContain("on symphony.run_activity_event (kind, event_at desc)");
+    expect(normalized).toContain("on symphony.run_activity_event (channel, kind, event_at desc)");
+    expect(normalized).toContain("create unique index if not exists run_activity_event_external_event_unique_idx");
+    expect(normalized).toContain("on symphony.run_activity_event (run_id, external_event_id)");
+    expect(normalized).toContain("where external_event_id is not null");
     expect(normalized).toContain("on symphony.chat_message (thread_key, message_index)");
+    expect(normalized).toContain("on symphony.chat_message (run_id, event_sequence_start, event_sequence_end)");
     expect(normalized).toContain("on symphony.writeback_operation (status, next_attempt_at, created_at)");
     expect(normalized).toContain("on symphony.approval_request (status, expires_at, requested_at)");
     expect(normalized).toContain("on symphony.projection_revision (projection_name, scope_kind, scope_key, revision desc, generated_at desc)");
+  });
+
+  it("declares run activity and chat message fields for replay, reconstruction, and idempotency", async () => {
+    const normalized = normalizedSql(await migrationSql());
+
+    for (const fragment of [
+      "event_id text not null",
+      "external_event_id text",
+      "actor text not null check",
+      "channel text not null check",
+      "kind text not null",
+      "text text",
+      "payload jsonb not null default '{}'::jsonb",
+      "payload_truncated boolean not null default false",
+      "payload_byte_length bigint check",
+      "raw_payload_ref_id bigint references symphony.raw_payload_reference(raw_payload_ref_id)",
+      "unique (event_id)",
+      "unique (run_id, sequence)",
+    ]) {
+      expect(normalized, `missing run_activity_event fragment: ${fragment}`).toContain(fragment);
+    }
+
+    for (const fragment of [
+      "message_id text not null",
+      "role text not null check",
+      "status text not null default 'completed' check",
+      "body text not null default ''",
+      "body_truncated boolean not null default false",
+      "event_sequence_start integer check",
+      "event_sequence_end integer check",
+      "metadata jsonb not null default '{}'::jsonb",
+      "unique (message_id)",
+      "unique (thread_key, message_index)",
+      "check (event_sequence_end is null or event_sequence_start is not null)",
+      "check (event_sequence_start is null or event_sequence_end is null or event_sequence_end >= event_sequence_start)",
+    ]) {
+      expect(normalized, `missing chat_message fragment: ${fragment}`).toContain(fragment);
+    }
   });
 
   it("documents external authorities, file-backed transition, and oversized raw payload references", async () => {
@@ -129,6 +176,7 @@ describe("Postgres Symphony-owned state migration", () => {
         }
 
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
+        await expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName);
         await expectDuplicateWorkspaceAndExternalIssueConstraints(containerName);
       } finally {
         await docker(["rm", "-f", containerName]).catch(() => undefined);
@@ -279,37 +327,59 @@ async function expectOperationalAndProjectionInsertQueryPaths(containerName: str
         ) returning run_id
       ), inserted_activity as (
         insert into symphony.run_activity_event (
+          event_id,
           run_id,
+          session_id,
           sequence,
           event_at,
-          source,
-          event_type,
-          message_preview,
-          payload
+          harness_id,
+          external_event_id,
+          actor,
+          channel,
+          kind,
+          text,
+          text_char_count,
+          payload,
+          metadata
         ) values (
+          'activity:eng-187:1',
           'run:eng-187:1',
+          'session:eng-187:1',
           1,
           now(),
+          'hermes',
+          'hermes:event:eng-187:1',
           'harness',
-          'completion_report_ready',
-          'worker produced completion report',
-          '{"status":"ready"}'::jsonb
+          'lifecycle',
+          'run_started',
+          'worker run started',
+          18,
+          '{"status":"running"}'::jsonb,
+          '{"scenario":"insert-query-smoke"}'::jsonb
         ) returning run_activity_event_id
       ), inserted_chat_message as (
         insert into symphony.chat_message (
+          message_id,
           thread_key,
           issue_key,
           issue_identifier,
           run_id,
           session_id,
           message_index,
-          speaker,
+          role,
           message_kind,
+          status,
+          body,
           body_preview,
           body_char_count,
+          event_sequence_start,
+          event_sequence_end,
           payload,
-          created_at
+          metadata,
+          created_at,
+          updated_at
         ) values (
+          'message:eng-187:0',
           'thread:eng-187',
           'issue:eng-187',
           'ENG-187',
@@ -318,9 +388,15 @@ async function expectOperationalAndProjectionInsertQueryPaths(containerName: str
           0,
           'user',
           'message',
+          'completed',
+          'Create owned operational state tables',
           'Create owned operational state tables',
           39,
+          1,
+          1,
           '{"safe":true}'::jsonb,
+          '{"scenario":"insert-query-smoke"}'::jsonb,
+          now(),
           now()
         ) returning chat_message_id
       ), inserted_writeback as (
@@ -489,6 +565,344 @@ async function expectOperationalAndProjectionInsertQueryPaths(containerName: str
     transcript_projection: 1,
     orchestrator_chat_projection: 1,
   });
+}
+
+async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName: string): Promise<void> {
+  await psql(
+    containerName,
+    String.raw`
+      insert into symphony.raw_payload_reference (
+        owner_table,
+        owner_key,
+        storage_uri,
+        sha256,
+        byte_length,
+        media_type,
+        compression,
+        redaction_status,
+        metadata
+      ) values (
+        'symphony.run_activity_event',
+        'activity:eng-187:large',
+        'file:///var/lib/symphony/raw/run-activity-large.json',
+        '1111111111111111111111111111111111111111111111111111111111111111',
+        8388608,
+        'application/json',
+        'gzip',
+        'redacted',
+        '{"policy":"oversized-run-activity"}'::jsonb
+      );
+
+      insert into symphony.raw_payload_reference (
+        owner_table,
+        owner_key,
+        storage_uri,
+        sha256,
+        byte_length,
+        media_type,
+        compression,
+        redaction_status,
+        metadata
+      ) values (
+        'symphony.chat_message',
+        'message:eng-187:1',
+        'file:///var/lib/symphony/raw/chat-message-large.json',
+        '2222222222222222222222222222222222222222222222222222222222222222',
+        4194304,
+        'application/json',
+        'gzip',
+        'redacted',
+        '{"policy":"oversized-chat-message"}'::jsonb
+      );
+
+      insert into symphony.run_activity_event (
+        event_id,
+        run_id,
+        session_id,
+        sequence,
+        event_at,
+        harness_id,
+        external_event_id,
+        actor,
+        channel,
+        kind,
+        text,
+        text_char_count,
+        payload,
+        payload_schema,
+        payload_truncated,
+        payload_byte_length,
+        raw_payload_ref_id,
+        metadata
+      ) values (
+        'activity:eng-187:large',
+        'run:eng-187:1',
+        'session:eng-187:1',
+        2,
+        now(),
+        'hermes',
+        'hermes:event:eng-187:large',
+        'assistant',
+        'message',
+        'assistant_message_delta',
+        'large assistant delta stored externally',
+        41,
+        '{"preview":"large assistant delta"}'::jsonb,
+        'symphony.run_activity_event.v1',
+        true,
+        8388608,
+        (select raw_payload_ref_id from symphony.raw_payload_reference where owner_key = 'activity:eng-187:large'),
+        '{"source":"range-smoke"}'::jsonb
+      );
+
+      insert into symphony.chat_message (
+        message_id,
+        thread_key,
+        issue_key,
+        issue_identifier,
+        run_id,
+        session_id,
+        message_index,
+        role,
+        message_kind,
+        status,
+        body,
+        body_preview,
+        body_char_count,
+        body_truncated,
+        event_sequence_start,
+        event_sequence_end,
+        payload,
+        raw_payload_ref_id,
+        metadata,
+        created_at,
+        updated_at
+      ) values (
+        'message:eng-187:1',
+        'thread:eng-187',
+        'issue:eng-187',
+        'ENG-187',
+        'run:eng-187:1',
+        'session:eng-187:1',
+        1,
+        'assistant',
+        'assistant_response',
+        'streaming',
+        'large response preview',
+        'large response preview',
+        1048576,
+        true,
+        1,
+        2,
+        '{"preview":"large response"}'::jsonb,
+        (select raw_payload_ref_id from symphony.raw_payload_reference where owner_key = 'message:eng-187:1'),
+        '{"source":"range-smoke"}'::jsonb,
+        now(),
+        now()
+      );
+    `,
+  );
+
+  const replay = await psql(
+    containerName,
+    String.raw`
+      select jsonb_build_object(
+        'sequences', (
+          select jsonb_agg(sequence order by sequence)
+          from symphony.run_activity_event
+          where run_id = 'run:eng-187:1'
+        ),
+        'largeActivity', (
+          select jsonb_build_object(
+            'externalEventId', event.external_event_id,
+            'payloadTruncated', event.payload_truncated,
+            'payloadByteLength', event.payload_byte_length,
+            'rawStorageUri', raw.storage_uri
+          )
+          from symphony.run_activity_event event
+          join symphony.raw_payload_reference raw on raw.raw_payload_ref_id = event.raw_payload_ref_id
+          where event.event_id = 'activity:eng-187:large'
+        ),
+        'message', (
+          select jsonb_build_object(
+            'role', role,
+            'status', status,
+            'body', body,
+            'range', jsonb_build_array(event_sequence_start, event_sequence_end),
+            'bodyTruncated', body_truncated,
+            'rawPayloadReferenced', raw_payload_ref_id is not null
+          )
+          from symphony.chat_message
+          where message_id = 'message:eng-187:1'
+        )
+      )::text;
+    `,
+  );
+
+  expect(JSON.parse(replay.trim())).toEqual({
+    sequences: [1, 2],
+    largeActivity: {
+      externalEventId: "hermes:event:eng-187:large",
+      payloadTruncated: true,
+      payloadByteLength: 8388608,
+      rawStorageUri: "file:///var/lib/symphony/raw/run-activity-large.json",
+    },
+    message: {
+      role: "assistant",
+      status: "streaming",
+      body: "large response preview",
+      range: [1, 2],
+      bodyTruncated: true,
+      rawPayloadReferenced: true,
+    },
+  });
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.run_activity_event (
+          event_id,
+          run_id,
+          session_id,
+          sequence,
+          event_at,
+          harness_id,
+          external_event_id,
+          actor,
+          channel,
+          kind,
+          payload
+        ) values (
+          'activity:eng-187:duplicate-sequence',
+          'run:eng-187:1',
+          'session:eng-187:1',
+          2,
+          now(),
+          'hermes',
+          'hermes:event:eng-187:duplicate-sequence',
+          'runtime',
+          'status',
+          'runtime_status_update',
+          '{"status":"duplicate"}'::jsonb
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.run_activity_event (
+          event_id,
+          run_id,
+          session_id,
+          sequence,
+          event_at,
+          harness_id,
+          external_event_id,
+          actor,
+          channel,
+          kind,
+          payload
+        ) values (
+          'activity:eng-187:duplicate-external',
+          'run:eng-187:1',
+          'session:eng-187:1',
+          3,
+          now(),
+          'hermes',
+          'hermes:event:eng-187:large',
+          'runtime',
+          'status',
+          'runtime_status_update',
+          '{"status":"duplicate"}'::jsonb
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.chat_message (
+          message_id,
+          thread_key,
+          run_id,
+          session_id,
+          message_index,
+          role,
+          created_at
+        ) values (
+          'message:eng-187:1',
+          'thread:eng-187:duplicate-message-id',
+          'run:eng-187:1',
+          'session:eng-187:1',
+          0,
+          'assistant',
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.chat_message (
+          message_id,
+          thread_key,
+          run_id,
+          session_id,
+          message_index,
+          role,
+          event_sequence_start,
+          event_sequence_end,
+          created_at
+        ) values (
+          'message:eng-187:invalid-range',
+          'thread:eng-187',
+          'run:eng-187:1',
+          'session:eng-187:1',
+          2,
+          'assistant',
+          2,
+          1,
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/violates check constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.chat_message (
+          message_id,
+          thread_key,
+          run_id,
+          session_id,
+          message_index,
+          role,
+          event_sequence_end,
+          created_at
+        ) values (
+          'message:eng-187:end-without-start',
+          'thread:eng-187',
+          'run:eng-187:1',
+          'session:eng-187:1',
+          3,
+          'assistant',
+          2,
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/violates check constraint/i);
 }
 
 async function expectDuplicateWorkspaceAndExternalIssueConstraints(containerName: string): Promise<void> {
