@@ -5,8 +5,10 @@ import {
   HostHermesAcpStdioJsonRpcFacade,
   parseHostHermesAcpJsonRpcLine,
   stringifyHostHermesAcpJsonRpcMessage,
+  HostHermesAcpJsonRpcResponseError,
   type HostHermesAcpChildProcess,
   type HostHermesAcpDiagnostic,
+  type HostHermesAcpJsonRpcId,
   type HostHermesAcpJsonRpcMessage,
   type HostHermesAcpProcessExit,
   type HostHermesAcpSpawnOptions,
@@ -44,7 +46,9 @@ interface SpawnCall {
   options: HostHermesAcpSpawnOptions;
 }
 
-function createSpawnedFacade(options: { requestTimeoutMs?: number; stderrTailBytes?: number } = {}) {
+function createSpawnedFacade(
+  options: { requestTimeoutMs?: number; stderrTailBytes?: number; idFactory?: () => HostHermesAcpJsonRpcId } = {},
+) {
   const child = new FakeChildProcess();
   const spawnCalls: SpawnCall[] = [];
   const writes = collectJsonRpcWrites(child.stdin);
@@ -202,8 +206,67 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     await expect(response).resolves.toEqual({ sessionId: "s1" });
   });
 
+  it("resolves concurrent in-flight requests by id even when responses arrive out of order or with JSON-RPC errors", async () => {
+    const { child, facade, writes } = createSpawnedFacade();
+
+    const first = facade.request("session/first", { order: 1 });
+    const second = facade.request("session/second", { order: 2 });
+
+    expect(writes).toEqual([
+      { jsonrpc: "2.0", id: 1, method: "session/first", params: { order: 1 } },
+      { jsonrpc: "2.0", id: 2, method: "session/second", params: { order: 2 } },
+    ]);
+
+    writeJsonRpc(child, { jsonrpc: "2.0", id: 2, result: { completed: "second" } });
+    await expect(second).resolves.toEqual({ completed: "second" });
+
+    writeJsonRpc(child, { jsonrpc: "2.0", id: 1, error: { code: -32000, message: "first failed", data: { retryable: false } } });
+    await expect(first).rejects.toBeInstanceOf(HostHermesAcpJsonRpcResponseError);
+    await expect(first).rejects.toMatchObject({ code: -32000, data: { retryable: false } });
+  });
+
+  it("rejects duplicate outgoing request ids while preserving the original pending request", async () => {
+    const { child, facade, writes } = createSpawnedFacade({ idFactory: () => 7 });
+
+    const first = facade.request("session/original", { ok: true });
+    const duplicate = facade.request("session/duplicate", { ok: false });
+
+    await expect(duplicate).rejects.toThrow("Host Hermes ACP request id collision for 7.");
+    expect(writes).toEqual([{ jsonrpc: "2.0", id: 7, method: "session/original", params: { ok: true } }]);
+
+    writeJsonRpc(child, { jsonrpc: "2.0", id: 7, result: { completed: true } });
+    await expect(first).resolves.toEqual({ completed: true });
+  });
+
+  it("surfaces unknown notifications as diagnostics without replying or blocking later known notifications", () => {
+    const { child, facade, writes } = createSpawnedFacade();
+    const diagnostics: HostHermesAcpDiagnostic[] = [];
+    const allNotifications: string[] = [];
+    const handledNotifications: unknown[] = [];
+    facade.on("diagnostic", (diagnostic) => diagnostics.push(diagnostic));
+    facade.on("notification", (notification) => allNotifications.push(notification.method));
+
+    writeJsonRpc(child, { jsonrpc: "2.0", method: "future/notification", params: { stillRunning: true } });
+
+    expect(writes).toEqual([]);
+    expect(allNotifications).toEqual(["future/notification"]);
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        code: "host_hermes_acp_unknown_notification",
+        details: { method: "future/notification" },
+      }),
+    ]);
+
+    facade.onNotification("session/update", (params) => handledNotifications.push(params));
+    writeJsonRpc(child, { jsonrpc: "2.0", method: "session/update", params: { sessionId: "s1", update: { ok: true } } });
+
+    expect(handledNotifications).toEqual([{ sessionId: "s1", update: { ok: true } }]);
+    expect(diagnostics).toHaveLength(1);
+  });
+
   it("routes Hermes client-method requests such as session/request_permission and replies to unknown methods defensively", async () => {
     const { child, facade, writes } = createSpawnedFacade();
+
     facade.onClientRequest("session/request_permission", (params) => ({ outcome: "allow_once", received: params }));
 
     writeJsonRpc(child, {
@@ -232,6 +295,37 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
       id: "future-1",
       error: { code: -32601, message: "Method not found: future/client_method" },
     });
+  });
+
+  it("turns server request handler failures into a single JSON-RPC error response and diagnostic", async () => {
+    const { child, facade, writes } = createSpawnedFacade();
+    const diagnostics: HostHermesAcpDiagnostic[] = [];
+    facade.on("diagnostic", (diagnostic) => diagnostics.push(diagnostic));
+    facade.onClientRequest("session/request_permission", () => {
+      throw new Error("permission bridge unavailable");
+    });
+
+    writeJsonRpc(child, {
+      jsonrpc: "2.0",
+      id: "perm-fail-1",
+      method: "session/request_permission",
+      params: { sessionId: "s1", toolCall: { id: "tool-1" } },
+    });
+    await flushAsyncHandlers();
+
+    expect(writes).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: "perm-fail-1",
+        error: { code: -32603, message: "Handler failed: permission bridge unavailable" },
+      },
+    ]);
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        code: "host_hermes_acp_client_request_handler_error",
+        details: { id: "perm-fail-1", method: "session/request_permission" },
+      }),
+    ]);
   });
 
   it("captures malformed stdout diagnostics and bounded stderr log tails without crashing", () => {

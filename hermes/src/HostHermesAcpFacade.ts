@@ -406,7 +406,14 @@ export class HostHermesAcpStdioJsonRpcFacade extends EventEmitter {
   #handleNotification(notification: HostHermesAcpJsonRpcNotification): void {
     this.emit("notification", notification);
     const handlers = this.#notificationHandlers.get(notification.method);
-    if (!handlers) return;
+    if (!handlers || handlers.size === 0) {
+      this.emit("diagnostic", {
+        code: "host_hermes_acp_unknown_notification",
+        message: `No Host Hermes ACP notification handler registered for ${notification.method}.`,
+        details: { method: notification.method },
+      });
+      return;
+    }
     for (const handler of handlers) {
       try {
         handler(notification.params, notification);
