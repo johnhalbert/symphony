@@ -5308,6 +5308,85 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("persists tool, diagnostic, token, and rate-limit harness events while applying side effects", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 1;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new DiagnosticActivityHarness();
+    const runStore = new FileRunTranscriptStore(root);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitForAsync(async () => (await runStore.getRun("diagnostic-run-1"))?.status === "succeeded", "diagnostic activity run");
+    await orchestrator.stop();
+
+    const run = await runStore.getRun("diagnostic-run-1");
+    const transcript = await runStore.readTranscript("diagnostic-run-1");
+    const serializedTranscript = JSON.stringify(transcript.events);
+
+    expect(run).toMatchObject({
+      tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+      transcriptEventCount: 6,
+    });
+    expect(orchestrator.snapshot().totals).toMatchObject({ inputTokens: 12, outputTokens: 8, totalTokens: 20 });
+    expect(orchestrator.snapshot().rateLimits).toEqual({
+      requests: { remaining: 2, resetAt: "2026-01-01T00:30:00.000Z" },
+      authorization: "[redacted]",
+    });
+    expect(transcript.events.map((event) => event.eventType)).toEqual([
+      "session_started",
+      "progress",
+      "run_diagnostic",
+      "tokens",
+      "rate_limits",
+      "completed",
+    ]);
+    expect(transcript.events[1]).toMatchObject({
+      message: "terminal tool completed",
+      payload: { kind: "tool", activitySource: "tool", progressKind: "tool" },
+    });
+    expect(transcript.events[2]).toMatchObject({
+      eventType: "run_diagnostic",
+      message: "Hermes gateway diagnostic token=[redacted]",
+      payload: { kind: "diagnostic", code: "hermes_gateway_protocol_error" },
+    });
+    expect(transcript.events[3]).toMatchObject({
+      eventType: "tokens",
+      payload: { kind: "usage", tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 } },
+    });
+    expect(transcript.events[4]).toMatchObject({
+      eventType: "rate_limits",
+      payload: {
+        kind: "rate_limits",
+        rateLimits: { requests: { remaining: 2, resetAt: "2026-01-01T00:30:00.000Z" }, authorization: "[redacted]" },
+      },
+    });
+    expect(serializedTranscript).not.toContain("SECRET_DIAGNOSTIC_TOKEN");
+    expect(serializedTranscript).not.toContain("SECRET_RATE_LIMIT_TOKEN");
+    expect(serializedTranscript).not.toContain("rawPayload");
+  });
+
   it("includes compact handoff for prior-run-only follow-up prompts", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -6470,6 +6549,30 @@ class TokenSequenceHarness implements AgentHarness {
     const tokens = this.tokenEvents[runNumber - 1];
     if (tokens) yield { type: "tokens", tokens };
     yield { type: "completed" };
+  }
+}
+
+class DiagnosticActivityHarness implements AgentHarness {
+  readonly id = "diagnostic-activity";
+
+  async *run(): AsyncIterable<AgentEvent> {
+    yield { type: "session_started", sessionId: "diagnostic-session-1", runId: "diagnostic-run-1" };
+    yield { type: "progress", activitySource: "tool", message: "terminal tool completed" };
+    yield {
+      type: "run_diagnostic",
+      code: "hermes_gateway_protocol_error",
+      message: "Hermes gateway diagnostic token=SECRET_DIAGNOSTIC_TOKEN",
+      payload: { preview: "malformed gateway line", rawPayload: { token: "SECRET_DIAGNOSTIC_TOKEN" } },
+    };
+    yield { type: "tokens", tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 } };
+    yield {
+      type: "rate_limits",
+      payload: {
+        requests: { remaining: 2, resetAt: "2026-01-01T00:30:00.000Z" },
+        authorization: "Bearer SECRET_RATE_LIMIT_TOKEN",
+      },
+    };
+    yield { type: "completed", message: "diagnostic run completed" };
   }
 }
 
