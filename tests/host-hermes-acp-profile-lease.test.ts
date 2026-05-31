@@ -5,12 +5,15 @@ import {
   buildHostHermesAcpLaunchArgs,
   buildHostHermesAcpProfileName,
   createHostHermesAcpProfileLease,
+  HostHermesAcpLeaseManager,
   hostHermesAcpCommandEnvironment,
   normalizeHostHermesAcpProfileName,
   parseHostHermesAcpActiveProfile,
   shouldDeleteHostHermesAcpProfile,
+  shouldReuseHostHermesAcpLease,
   type HostHermesAcpCommandOptions,
   type HostHermesAcpCommandResult,
+  type HostHermesAcpProfileLease,
 } from "../hermes/src/HostHermesAcpProfileLease.js";
 
 interface RecordedCommand {
@@ -75,6 +78,25 @@ describe("HostHermesAcpProfileLease", () => {
     ]);
     expect(buildHostHermesAcpLaunchArgs("run-profile")).toEqual(["-p", "run-profile", "acp"]);
     expect(buildHostHermesAcpDeleteProfileArgs("run-profile")).toEqual(["profile", "delete", "run-profile", "--yes"]);
+  });
+
+  it("keeps the runtime lease contract compatible with harness fakes", async () => {
+    const lease: HostHermesAcpProfileLease = {
+      profileName: "profile-1",
+      sourceProfile: "host-source",
+      acpCommand: { file: "/usr/local/bin/hermes", args: ["-p", "profile-1", "acp"], cwd: "/workspace", env: {} },
+      dispose: async (terminalStatus) => ({
+        profileName: `profile-1-${terminalStatus ?? "none"}`,
+        reason: "deleted",
+        deleted: true,
+      }),
+    };
+
+    await expect(lease.dispose(null)).resolves.toEqual({
+      profileName: "profile-1-none",
+      reason: "deleted",
+      deleted: true,
+    });
   });
 
   it("removes vendored Hermes env vars while preserving unrelated host env", () => {
@@ -346,6 +368,217 @@ describe("HostHermesAcpProfileLease", () => {
         runner,
       }),
     ).rejects.toThrow(/without an exit code.*terminated/s);
+  });
+
+  it("applies the existing reuse policy only to worker implementation leases", () => {
+    expect(shouldReuseHostHermesAcpLease({ role: "worker", phase: "implementation", workerSessionLifecycle: "reuse_by_issue" })).toBe(
+      true,
+    );
+    expect(shouldReuseHostHermesAcpLease({ role: "worker", phase: "implementation", workerSessionLifecycle: "fresh_per_run" })).toBe(
+      false,
+    );
+    expect(shouldReuseHostHermesAcpLease({ role: "reviewer", phase: "review", workerSessionLifecycle: "reuse_by_issue" })).toBe(
+      false,
+    );
+    expect(shouldReuseHostHermesAcpLease({ role: "worker", phase: "issue_breakdown", workerSessionLifecycle: "reuse_by_issue" })).toBe(
+      false,
+    );
+  });
+
+  it("keeps reusable worker leases alive after run finish and cleans them up on harness dispose", async () => {
+    const { calls, runner } = commandRecorder([
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "", exitCode: 0 },
+    ]);
+    const manager = new HostHermesAcpLeaseManager({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      sourceProfile: "operator",
+      keepProfiles: "failed",
+      runner,
+    });
+    const input = {
+      workspaceKey: "workspace-1",
+      issueIdentifier: "ENG-147",
+      role: "worker",
+      phase: "implementation",
+    };
+
+    const first = await manager.acquire(input);
+    const second = await manager.acquire(input);
+
+    expect(second).toBe(first);
+    expect(first.reusable).toBe(true);
+    expect(first.disposed).toBe(false);
+    expect(manager.activeLeaseCount).toBe(1);
+    expect(calls.map((call) => call.args)).toEqual([
+      ["profile", "create", first.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
+    ]);
+
+    await expect(first.afterRunFinished("succeeded")).resolves.toEqual({
+      profileName: first.profileName,
+      reason: "retained",
+      deleted: false,
+    });
+    expect(first.disposed).toBe(false);
+    expect(manager.activeLeaseCount).toBe(1);
+    expect(calls).toHaveLength(1);
+
+    await expect(manager.dispose("succeeded")).resolves.toEqual([
+      { profileName: first.profileName, reason: "deleted", deleted: true },
+    ]);
+    expect(first.disposed).toBe(true);
+    expect(manager.activeLeaseCount).toBe(0);
+    expect(calls.map((call) => call.args)).toEqual([
+      ["profile", "create", first.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
+      ["profile", "delete", first.profileName, "--yes"],
+    ]);
+  });
+
+  it("preserves failed reusable worker profiles when later harness dispose reports non-failed/default status", async () => {
+    const scenarios = [
+      { suffix: "dispose-succeeded", terminalStatus: "succeeded" as const },
+      { suffix: "dispose-default", terminalStatus: undefined },
+    ];
+
+    for (const scenario of scenarios) {
+      const { calls, runner } = commandRecorder([{ stdout: "", stderr: "", exitCode: 0 }]);
+      const manager = new HostHermesAcpLeaseManager({
+        binaryPath: "hermes",
+        cwd: "/workspace",
+        sourceProfile: "operator",
+        keepProfiles: "failed",
+        runner,
+      });
+      const lease = await manager.acquire({
+        workspaceKey: `workspace-${scenario.suffix}`,
+        issueIdentifier: "ENG-147",
+        role: "worker",
+        phase: "implementation",
+      });
+
+      await expect(lease.afterRunFinished("failed")).resolves.toEqual({
+        profileName: lease.profileName,
+        reason: "retained",
+        deleted: false,
+      });
+      expect(lease.disposed).toBe(false);
+      expect(manager.activeLeaseCount).toBe(1);
+
+      const disposeResult = scenario.terminalStatus === undefined
+        ? await manager.dispose()
+        : await manager.dispose(scenario.terminalStatus);
+      expect(disposeResult).toEqual([{ profileName: lease.profileName, reason: "retained", deleted: false }]);
+      expect(lease.disposed).toBe(true);
+      expect(manager.activeLeaseCount).toBe(0);
+      expect(calls.map((call) => call.args)).toEqual([
+        ["profile", "create", lease.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
+      ]);
+    }
+  });
+
+  it("uses fresh reviewer leases and deletes successful fresh profiles on run finish", async () => {
+    const freshIds = ["review-one", "review-two"];
+    const { calls, runner } = commandRecorder([
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "", exitCode: 0 },
+    ]);
+    const manager = new HostHermesAcpLeaseManager({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      sourceProfile: "operator",
+      keepProfiles: "failed",
+      freshLeaseIdFactory: () => freshIds.shift() ?? "fallback-review",
+      runner,
+    });
+
+    const first = await manager.acquire({ workspaceKey: "workspace-1", issueIdentifier: "ENG-147", role: "reviewer", phase: "review" });
+    const second = await manager.acquire({ workspaceKey: "workspace-1", issueIdentifier: "ENG-147", role: "reviewer", phase: "review" });
+
+    expect(first).not.toBe(second);
+    expect(first.reusable).toBe(false);
+    expect(second.reusable).toBe(false);
+    expect(first.profileName).not.toBe(second.profileName);
+    expect(manager.activeLeaseCount).toBe(0);
+
+    await expect(first.afterRunFinished("succeeded")).resolves.toEqual({ profileName: first.profileName, reason: "deleted", deleted: true });
+    await expect(second.afterRunFinished("succeeded")).resolves.toEqual({ profileName: second.profileName, reason: "deleted", deleted: true });
+    expect(calls.map((call) => call.args)).toEqual([
+      ["profile", "create", first.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
+      ["profile", "create", second.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
+      ["profile", "delete", first.profileName, "--yes"],
+      ["profile", "delete", second.profileName, "--yes"],
+    ]);
+  });
+
+  it("cleans up startup failures and clears process and ACP session placeholders", async () => {
+    const killReasons: string[] = [];
+    const { calls, runner } = commandRecorder([
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "", exitCode: 0 },
+    ]);
+    const manager = new HostHermesAcpLeaseManager({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      sourceProfile: "operator",
+      keepProfiles: "never",
+      runner,
+    });
+
+    const lease = await manager.acquire({
+      workspaceKey: "workspace-1",
+      issueIdentifier: "ENG-147",
+      role: "worker",
+      phase: "implementation",
+      workerSessionLifecycle: "fresh_per_run",
+      runId: "run-startup-failure",
+    });
+    lease.markProcessStarted({ kill: (reason) => {
+      killReasons.push(reason ?? "");
+    } });
+    lease.markAcpSessionStarted("session-startup-failure");
+
+    await expect(lease.afterStartupFailure()).resolves.toEqual({ profileName: lease.profileName, reason: "deleted", deleted: true });
+    expect(killReasons).toEqual(["hermes.startup_failure"]);
+    expect(lease.processHandle).toBeNull();
+    expect(lease.acpSessionId).toBeNull();
+    expect(lease.disposed).toBe(true);
+    expect(calls.map((call) => call.args)).toEqual([
+      ["profile", "create", lease.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
+      ["profile", "delete", lease.profileName, "--yes"],
+    ]);
+  });
+
+  it("retains failed fresh profiles when the process exits before completion", async () => {
+    const { calls, runner } = commandRecorder([{ stdout: "", stderr: "", exitCode: 0 }]);
+    const manager = new HostHermesAcpLeaseManager({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      sourceProfile: "operator",
+      keepProfiles: "failed",
+      runner,
+    });
+
+    const lease = await manager.acquire({
+      workspaceKey: "workspace-1",
+      issueIdentifier: "ENG-147",
+      role: "worker",
+      phase: "implementation",
+      workerSessionLifecycle: "fresh_per_run",
+      runId: "run-process-exit",
+    });
+    lease.markProcessStarted({ kill: () => Promise.reject(new Error("should not kill an exited process")) });
+    lease.markAcpSessionStarted("session-process-exit");
+
+    await expect(lease.afterProcessExit()).resolves.toEqual({ profileName: lease.profileName, reason: "retained", deleted: false });
+    expect(lease.disposed).toBe(true);
+    expect(lease.processHandle).toBeNull();
+    expect(lease.acpSessionId).toBeNull();
+    expect(calls.map((call) => call.args)).toEqual([
+      ["profile", "create", lease.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
+    ]);
   });
 
   it("parses active profile output and applies retention policy boundaries", () => {
