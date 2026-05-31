@@ -83,6 +83,7 @@ describe("harness activity contract conformance", () => {
     const transcriptEvents = transcriptEventsForRun(publicEvents, result.runtimeTranscriptEvents);
     const frontendMessages = projectWebTranscript(transcriptEvents);
 
+    if (adapterId === "hermes_acp") assertAgentEventsAreBoundedAndRedacted(result.events);
     assertAgentEventContract(publicEvents, adapterId, fixture);
     assertTranscriptContract(transcriptEvents, publicEvents);
     assertFrontendContract(frontendMessages);
@@ -555,12 +556,7 @@ function assertPublicPayloadsAreBoundedAndRedacted(
   const publicJson = JSON.stringify({ events, frontendMessages });
   for (const secret of HARNESS_ACTIVITY_SENSITIVE_NEEDLES) expect(publicJson).not.toContain(secret);
 
-  for (const event of events) {
-    if (event.type === "progress" || event.type === "completed" || event.type === "run_diagnostic") {
-      expect(event.message?.length ?? 0).toBeLessThanOrEqual(520);
-    }
-    if (event.type === "failed") expect(event.error.length).toBeLessThanOrEqual(520);
-  }
+  assertAgentEventsAreBoundedAndRedacted(events);
 
   for (const message of frontendMessages) {
     for (const value of Object.values(message)) {
@@ -569,5 +565,17 @@ function assertPublicPayloadsAreBoundedAndRedacted(
         expect(String((value as { preview: unknown }).preview).length).toBeLessThanOrEqual(520);
       }
     }
+  }
+}
+
+function assertAgentEventsAreBoundedAndRedacted(events: readonly AgentEvent[]): void {
+  const eventJson = JSON.stringify(events);
+  for (const secret of HARNESS_ACTIVITY_SENSITIVE_NEEDLES) expect(eventJson).not.toContain(secret);
+
+  for (const event of events) {
+    if (event.type === "progress" || event.type === "completed" || event.type === "run_diagnostic") {
+      expect(event.message?.length ?? 0).toBeLessThanOrEqual(520);
+    }
+    if (event.type === "failed") expect(event.error.length).toBeLessThanOrEqual(520);
   }
 }

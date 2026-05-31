@@ -10,7 +10,11 @@ import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubpro
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
-import { redactTranscriptText, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
+import {
+  redactTranscriptText,
+  sanitizeAgentEventForPublicOutput,
+  sanitizedPreviewValue,
+} from "../../src/core/transcript/TranscriptProjection.js";
 import {
   discoverHostHermes,
   type HostHermesDiscoveryResult,
@@ -144,7 +148,10 @@ export class HermesAcpHarness implements AgentHarness {
     let sessionStarted = false;
     let responseText = "";
 
-    const enqueue = (event: AgentEvent): void => queue.push({ ...event, at: event.at ?? new Date().toISOString() });
+    const publicEvent = (event: AgentEvent): AgentEvent =>
+      sanitizeAgentEventForPublicOutput({ ...event, at: event.at ?? new Date().toISOString() });
+    const enqueue = (event: AgentEvent): void => queue.push(publicEvent(event));
+
     const persistRuntimeEvent = (event: HermesAcpRuntimeEvent): void => {
       const transcriptEvent = hermesAcpTranscriptEvent(event, this.id);
       if (!transcriptEvent) return;
@@ -155,6 +162,7 @@ export class HermesAcpHarness implements AgentHarness {
         ...transcriptEvent,
       });
     };
+
     const onSessionUpdate = (params: unknown): void => {
       const event = hermesAcpSessionUpdateEvent(params);
       if (!event || !acceptAcpSessionEvent(event, activeRun.acpSessionId)) return;
@@ -164,6 +172,7 @@ export class HermesAcpHarness implements AgentHarness {
         enqueue(mapped);
       }
     };
+
     const permissionDeniedReason = "ACP permission requests are denied by Symphony unless an explicit approval bridge is implemented.";
     const onPermissionRequest = (params: unknown): Record<string, unknown> => {
       const sessionId = acpSessionIdFromParams(params);
@@ -778,7 +787,7 @@ function hermesAcpTranscriptEvent(
     case "diagnostic":
       return {
         eventType: "acp_diagnostic",
-        message: event.diagnostic.message,
+        message: preview(event.diagnostic.message, 500),
         payload: { harnessId, code: event.diagnostic.code, detailsPreview: preview(event.diagnostic.details, 500), redacted: true },
       };
   }
