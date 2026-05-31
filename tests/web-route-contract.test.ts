@@ -3,11 +3,16 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http.js";
+import { StatusServer, type StatusServerProjectionReader, type StatusServerProjectionWriter } from "../src/app/http.js";
+import type { WebProjectionRevisionProvider } from "../src/app/WebProjectionContext.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type {
+  DurableProjectionName,
+  ProjectionPayloadRecord,
   ProjectionPayloadWriteInput,
   ProjectionRevisionRecord,
+  ProjectionRevisionSelector,
+  ProjectionSourceRevision,
   ProjectionWriteResult,
 } from "../src/core/persistence/ProjectionTransactionService.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
@@ -204,6 +209,131 @@ describe("/api/v1/web route contracts", () => {
       fields: { conversationKey: "operator-room", messageCount: 0 },
       sourceCursors: { conversationKey: "operator-room", messageCount: 0 },
     });
+  });
+
+  it("serves web route payloads from durable projection read models without rebuilding or rewriting", async () => {
+    const durableIssue = issueModelFixture();
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Durable cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "ENG-179",
+    };
+    const dashboard = {
+      projectName: "Durable Symphony",
+      repoLabel: "durable/repo",
+      branch: "durable-branch",
+      workflowLabel: "durable workflow",
+      pollLabel: "durable poll",
+      agentUsageLabel: "1 agent",
+      concurrencyCap: 4,
+      providerGates: [],
+      runningAgents: [],
+      activity: [],
+      chat: [],
+      totals: { ...emptyTotals(), progress: 1, open: 1, all: 1, completeness: 0 },
+    };
+    const history = {
+      sessions: [{ id: "durable-session", title: "Durable session", subtitle: "read model", updatedAt: "2026-05-31T00:00:00.000Z", msgCount: 1, lastEvent: "done", toolCount: 0 }],
+      transcriptBySession: {},
+      timeline: [],
+      defaultSessionId: "durable-session",
+    };
+    const sidebar = {
+      providerGates: [],
+      runningAgents: [],
+      reviewIssues: [durableIssue],
+      activity: [],
+      sessions: history.sessions,
+      chat: [],
+      totals: dashboard.totals,
+    };
+    const chat = [{ id: "chat-1", who: "agent", text: "served from durable projection", createdAt: "2026-05-31T00:00:00.000Z" }];
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture({ projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" }, dashboard),
+      projectionPayloadRecordFixture({ projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" }, issueBoard),
+      projectionPayloadRecordFixture(
+        { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
+        history,
+      ),
+      projectionPayloadRecordFixture({ projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" }, sidebar),
+      projectionPayloadRecordFixture(
+        { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+        chat,
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server, calls } = createStatusServer(root, { projectionReader, projectionWriter });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      await expect(getJson(`${baseUrl}/api/v1/web/dashboard`)).resolves.toMatchObject({ body: dashboard });
+      await expect(getJson(`${baseUrl}/api/v1/web/issues`)).resolves.toMatchObject({ body: issueBoard });
+      await expect(getJson(`${baseUrl}/api/v1/web/history`)).resolves.toMatchObject({ body: history });
+      await expect(getJson(`${baseUrl}/api/v1/web/sidebar`)).resolves.toMatchObject({ body: sidebar });
+      await expect(getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=operator-room`)).resolves.toMatchObject({ body: chat });
+      const referenceData = await getJson(`${baseUrl}/api/v1/web/reference-data`);
+      expect(referenceData.body).toMatchObject({
+        labels: { durable: { name: "durable" } },
+        users: { Ada: { name: "Ada" }, worker: { name: "worker" } },
+      });
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls.snapshot).toBe(0);
+    expect(projectionWriter.writes).toEqual([]);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
+      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+      { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    ]);
+  });
+
+  it("falls back to canonical web projection sources when durable read models are stale", async () => {
+    const staleDashboard = {
+      projectName: "Stale durable dashboard",
+      repoLabel: "",
+      branch: "",
+      workflowLabel: "",
+      pollLabel: "",
+      agentUsageLabel: "stale",
+      concurrencyCap: 0,
+      providerGates: [],
+      runningAgents: [],
+      activity: [],
+      chat: [],
+      totals: emptyTotals(),
+    };
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+        staleDashboard,
+        { sourceRevisions: [{ source: "runs", revision: "old", observedAt: null }] },
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, {
+      projectionReader,
+      projectionWriter,
+      webProjectionRevisionProviders: [{ source: "runs", getRevision: () => ({ source: "runs", revision: "new", observedAt: null }) }],
+    });
+    const address = await server.start();
+    try {
+      const { response, body } = await getJson(`${baseUrlFor(address)}/api/v1/web/dashboard`);
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({ projectName: "Symphony", agentUsageLabel: "0 agents" });
+      expect(body).not.toEqual(staleDashboard);
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionWriter.writeFor("dashboard_projection").projectionName).toBe("dashboard_projection");
   });
 
   it("keeps web responses available when durable projection persistence rejects", async () => {
@@ -481,6 +611,8 @@ interface OrchestratorCallCounts {
 interface CreateStatusServerOptions {
   webAssetsRoot?: string | null;
   projectionWriter?: StatusServerProjectionWriter;
+  projectionReader?: StatusServerProjectionReader;
+  webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
 }
 
 class RecordingProjectionWriter implements StatusServerProjectionWriter {
@@ -510,6 +642,80 @@ class FailingProjectionWriter implements StatusServerProjectionWriter {
   async writeProjection(): Promise<ProjectionWriteResult> {
     throw new Error("simulated projection persistence failure");
   }
+}
+
+class RecordingProjectionReader implements StatusServerProjectionReader {
+  readonly selectors: ProjectionRevisionSelector[] = [];
+  private readonly records = new Map<string, ProjectionPayloadRecord>();
+
+  constructor(records: readonly ProjectionPayloadRecord[]) {
+    for (const record of records) {
+      this.records.set(projectionSelectorKey(record.revision), cloneJson(record));
+    }
+  }
+
+  async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    this.selectors.push({ ...selector });
+    const record = this.records.get(projectionSelectorKey(selector));
+    return record ? (cloneJson(record) as ProjectionPayloadRecord<TPayload>) : null;
+  }
+}
+
+function projectionSelectorKey(selector: ProjectionRevisionSelector): string {
+  return [selector.projectionName, selector.scopeKind ?? "global", selector.scopeKey ?? "global"].join(":");
+}
+
+function projectionPayloadRecordFixture<TPayload>(
+  selector: { projectionName: DurableProjectionName; scopeKind: string; scopeKey: string },
+  payload: TPayload,
+  options: { sourceRevisions?: ProjectionSourceRevision[]; expiresAt?: string | null; revision?: number } = {},
+): ProjectionPayloadRecord<TPayload> {
+  const generatedAt = "2026-01-01T00:00:00.000Z";
+  const revision = options.revision ?? 1;
+  return {
+    revision: {
+      projectionRevisionId: revision,
+      projectionName: selector.projectionName,
+      scopeKind: selector.scopeKind,
+      scopeKey: selector.scopeKey,
+      revision,
+      sourceRevisions: options.sourceRevisions ?? [],
+      sourceCursors: {},
+      contentSha256: "0".repeat(64),
+      generatedAt,
+      expiresAt: options.expiresAt ?? null,
+      supersededAt: null,
+      createdAt: generatedAt,
+    },
+    payload: cloneJson(payload),
+    payloadSha256: "1".repeat(64),
+    rawPayloadRefs: [],
+    generatedAt,
+    expiresAt: options.expiresAt ?? null,
+  };
+}
+
+function issueModelFixture() {
+  return {
+    id: "ENG-179",
+    title: "Serve durable web projections",
+    status: "progress" as const,
+    priority: 1 as const,
+    labels: ["durable"],
+    assignee: "Ada",
+    agent: "worker",
+    project: "Symphony",
+    cycle: "May 2026",
+    activity: [],
+    pr: null,
+    ci: null,
+    workspace: null,
+    session: null,
+  };
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function projectionRevisionRecordFixture(input: ProjectionPayloadWriteInput, revision: number): ProjectionRevisionRecord {
@@ -552,6 +758,10 @@ function createStatusServer(
       staleThresholdMs: 300_000,
       webAssetsRoot: options.webAssetsRoot,
       ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
+      ...(options.projectionReader ? { projectionReader: options.projectionReader } : {}),
+      ...(options.webProjectionRevisionProviders
+        ? { webProjectionRevisionProviders: options.webProjectionRevisionProviders }
+        : {}),
     }),
   };
 }

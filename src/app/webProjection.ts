@@ -438,7 +438,7 @@ export function emptyReferenceData(): ReferenceData {
   return { labels: {}, users: { unassigned: referenceUser("unassigned", "Unassigned") } };
 }
 
-export function projectWebReferenceData(input: WebReferenceBoardInput | IssueBoardModel | null | undefined): ReferenceData {
+export function projectWebReferenceData(input: WebReferenceBoardInput | IssueBoardModel | WebIssueBoardModel | null | undefined): ReferenceData {
   const labels = new Map<string, ReferenceLabelModel>();
   const users = new Map<string, ReferenceUserModel>();
   addReferenceUser(users, "unassigned", "Unassigned");
@@ -447,6 +447,12 @@ export function projectWebReferenceData(input: WebReferenceBoardInput | IssueBoa
     for (const issue of input.issues) {
       for (const label of issue.labels) addReferenceLabel(labels, label);
       addReferenceUser(users, issue.assignee);
+    }
+  } else if (isWebIssueBoardModel(input)) {
+    for (const issue of input.issues) {
+      for (const label of issue.labels) addReferenceLabel(labels, label);
+      addReferenceUser(users, issue.assignee);
+      addReferenceUser(users, issue.agent);
     }
   } else {
     for (const card of uniqueReferenceCards(input)) {
@@ -1036,20 +1042,17 @@ function isIssueBoardModel(input: unknown): input is IssueBoardModel {
   return Array.isArray(input.columns) && Array.isArray(input.issues) && isIssueBoardCounts(input.counts);
 }
 
-function isWebIssueBoardModel(
-  input: IssueBoardResponseProjectionInput | IssueBoardModel | WebIssueBoardModel | null | undefined,
-): input is WebIssueBoardModel {
-  return Boolean(
-    input &&
-      Array.isArray(input.issues) &&
-      Array.isArray((input as WebIssueBoardModel).backlog) &&
-      isRecord((input as WebIssueBoardModel).lanes) &&
-      Array.isArray((input as WebIssueBoardModel).lanes.todo) &&
-      Array.isArray((input as WebIssueBoardModel).lanes.progress) &&
-      Array.isArray((input as WebIssueBoardModel).lanes.review) &&
-      typeof (input as WebIssueBoardModel).cycleLabel === "string" &&
-      typeof (input as WebIssueBoardModel).cycleDateRange === "string" &&
-      typeof (input as WebIssueBoardModel).selectedIssueId === "string",
+function isWebIssueBoardModel(input: unknown): input is WebIssueBoardModel {
+  if (!isRecord(input) || !isRecord(input.lanes)) return false;
+  return (
+    Array.isArray(input.issues) &&
+    Array.isArray(input.backlog) &&
+    Array.isArray(input.lanes.todo) &&
+    Array.isArray(input.lanes.progress) &&
+    Array.isArray(input.lanes.review) &&
+    typeof input.cycleLabel === "string" &&
+    typeof input.cycleDateRange === "string" &&
+    typeof input.selectedIssueId === "string"
   );
 }
 

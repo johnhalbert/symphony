@@ -262,7 +262,9 @@ program
             staleThresholdMs: config.polling.intervalMs,
             dashboard: statusDashboardConfig(config),
             webAssetsRoot: config.server.webAssetsRoot,
-            ...(projectionPersistence ? { projectionWriter: projectionPersistence.writer } : {}),
+            ...(projectionPersistence
+              ? { projectionWriter: projectionPersistence.writer, projectionReader: projectionPersistence.writer }
+              : {}),
           });
 
     if (statusServer) {
