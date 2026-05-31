@@ -5,7 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
 import { resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
-import { FileIssueLifecycleStore, type IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileIssueLifecycleStore,
+  type IssueLifecyclePatch,
+  type IssueLifecycleRecord,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "../src/core/persistence/McpExposureDiagnosticsStore.js";
 import { FileRunTranscriptStore, type RunRecord } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
@@ -1249,6 +1253,52 @@ describe("StatusServer durable API", () => {
       await identifierFixture.orchestrator.stop();
       await identifierFixture.server.stop();
     }
+  });
+
+  it("waits for terminal planning-run persistence before stop returns", async () => {
+    const candidate = issue({ id: "issue-stop", identifier: "TEST-STOP", state: "Todo", labels: ["planning"] });
+    const config = testConfig(path.join(root, "planning-stop"));
+    config.issueBreakdown.enabled = true;
+    const logger = new StructuredLogger(() => undefined);
+    const tracker = new PlanningRunStrictIdTracker(candidate);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new BlockingPlanningFailureLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.requestIssueBreakdown(candidate.id);
+    await lifecycleStore.waitForPlanningFailureUpdate();
+    expect(orchestrator.snapshot().counts.running).toBe(0);
+
+    let stopSettled = false;
+    const stopPromise = orchestrator.stop().then(() => {
+      stopSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(stopSettled).toBe(false);
+
+    lifecycleStore.releasePlanningFailureUpdate();
+    await stopPromise;
+
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      planningFailureCount: 1,
+      lastPlanningFailureRunId: "planning-api-run",
+    });
+    await expect(runStore.getRun("planning-api-run")).resolves.toMatchObject({
+      status: "failed",
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
   });
 
   it("protects issue breakdown preview/apply with a fail-closed token", async () => {
@@ -4321,6 +4371,42 @@ class PlanningRunRecordingHarness implements AgentHarness {
     this.runs.push({ ctx, prompt });
     yield { type: "session_started", sessionId: "planning-api-session", runId: "planning-api-run" };
     yield { type: "completed" };
+  }
+}
+
+class BlockingPlanningFailureLifecycleStore extends FileIssueLifecycleStore {
+  private readonly planningFailureUpdateStarted: Promise<void>;
+  private readonly releasePlanningFailureUpdatePromise: Promise<void>;
+  private resolvePlanningFailureUpdateStarted!: () => void;
+  private resolveReleasePlanningFailureUpdate!: () => void;
+
+  constructor(stateDir: string) {
+    super(stateDir);
+    this.planningFailureUpdateStarted = new Promise((resolve) => {
+      this.resolvePlanningFailureUpdateStarted = resolve;
+    });
+    this.releasePlanningFailureUpdatePromise = new Promise((resolve) => {
+      this.resolveReleasePlanningFailureUpdate = resolve;
+    });
+  }
+
+  override async updateIssue(
+    issue: Pick<Issue, "id" | "identifier">,
+    patch: IssueLifecyclePatch,
+  ): Promise<IssueLifecycleRecord> {
+    if (patch.lastPlanningFailureRunId === "planning-api-run") {
+      this.resolvePlanningFailureUpdateStarted();
+      await this.releasePlanningFailureUpdatePromise;
+    }
+    return super.updateIssue(issue, patch);
+  }
+
+  waitForPlanningFailureUpdate(): Promise<void> {
+    return this.planningFailureUpdateStarted;
+  }
+
+  releasePlanningFailureUpdate(): void {
+    this.resolveReleasePlanningFailureUpdate();
   }
 }
 

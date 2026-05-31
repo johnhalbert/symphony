@@ -415,6 +415,7 @@ export class Orchestrator {
   private stopped = false;
   private endedRuntimeSeconds = 0;
   private readonly running = new Map<string, RunningEntry>();
+  private readonly activeWorkers = new Set<Promise<void>>();
   private readonly claimed = new Set<string>();
   private readonly completed = new Set<string>();
   private readonly pausedIssues = new Set<string>();
@@ -454,7 +455,8 @@ export class Orchestrator {
       running.abortController.abort();
       if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
     }
-    await Promise.allSettled([...this.running.values()].map((entry) => entry.worker));
+    const workers = new Set([...this.activeWorkers, ...[...this.running.values()].map((entry) => entry.worker)]);
+    await Promise.allSettled([...workers]);
   }
 
   updateConfig(config: ServiceConfig, promptTemplate: string): void {
@@ -1230,7 +1232,13 @@ export class Orchestrator {
     this.claimed.add(issue.id);
     this.clearRetry(issue.id);
     const run = role === "reviewer" ? this.runReviewer(entry) : this.runWorker(entry, attempt);
-    entry.worker = this.monitorRunExit(entry, run);
+    const worker = this.monitorRunExit(entry, run);
+    entry.worker = worker;
+    this.activeWorkers.add(worker);
+    void worker.then(
+      () => this.activeWorkers.delete(worker),
+      () => this.activeWorkers.delete(worker),
+    );
   }
 
   private async monitorRunExit(entry: RunningEntry, run: Promise<void>): Promise<void> {
