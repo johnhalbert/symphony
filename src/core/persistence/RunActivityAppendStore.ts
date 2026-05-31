@@ -6,6 +6,8 @@ import {
   applyRunActivityOrdering,
   createRunActivityOrderingState,
   deriveRunActivityRunSessionId,
+  normalizeRunActivityChannel,
+  type RunActivityChannelInput,
   type RunActivityDuplicateReason,
   type RunActivityEvent,
   type RunActivityEventInput,
@@ -107,9 +109,15 @@ interface RequiredRunActivityAppendStorageMetadata {
   readonly metadata: Record<string, unknown>;
 }
 
+interface RunActivityAppendPersistenceContext {
+  readonly runId: string;
+  readonly sessionId: string | null;
+}
+
 type PersistAcceptedRunActivityEvent = (
   event: RunActivityEvent,
   storage: RequiredRunActivityAppendStorageMetadata,
+  context: RunActivityAppendPersistenceContext,
 ) => Promise<RunActivityStoredEvent>;
 
 interface RunActivityEventRow extends QueryResultRow {
@@ -125,7 +133,7 @@ interface RunActivityEventRow extends QueryResultRow {
   harness_id: string;
   external_event_id: string | null;
   actor: RunActivityEvent["actor"];
-  channel: RunActivityEvent["channel"];
+  channel: RunActivityChannelInput;
   kind: RunActivityEvent["kind"];
   text: string | null;
   payload: unknown;
@@ -150,10 +158,12 @@ export class InMemoryRunActivityAppendStore implements RunActivityAppendStore {
 
   async appendEvents(inputs: readonly RunActivityAppendInput[]): Promise<RunActivityAppendBatchResult> {
     const state = new RunActivityAppendAccumulator(this.storedEvents);
-    const result = await appendRunActivityEventsWithState(inputs, state, async (event, storage) => {
+    const result = await appendRunActivityEventsWithState(inputs, state, async (event, storage, context) => {
       const stored = storedEventFromAcceptedEvent(event, storage, {
         appendRevision: String(this.revision + 1),
-        createdAt: event.at,
+        createdAt: event.occurredAt,
+        runId: context.runId,
+        sessionId: context.sessionId,
       });
       this.revision += 1;
       this.storedEvents.push(stored);
@@ -211,11 +221,11 @@ export async function appendRunActivityEventsWithPostgresClient(
 ): Promise<RunActivityAppendBatchResult> {
   if (inputs.length === 0) return emptyAppendBatchResult();
 
-  const runIds = sortedUnique(inputs.map((input) => input.runId));
+  const runIds = sortedUnique(inputs.map(runIdForAppendInput));
   await lockRunActivityAppendRuns(client, runIds);
 
   const runSessionIds = sortedUnique(inputs.map((input) => deriveRunActivityRunSessionId(input)));
-  const eventIds = sortedUnique(inputs.map((input) => input.id));
+  const eventIds = sortedUnique(inputs.map(eventIdForAppendInput));
   const existingRows = await client.query<RunActivityEventRow>(
     `
       SELECT
@@ -250,8 +260,8 @@ export async function appendRunActivityEventsWithPostgresClient(
   );
   const state = new RunActivityAppendAccumulator(existingRows.rows.map(storedEventFromPostgresRow));
 
-  return appendRunActivityEventsWithState(inputs, state, async (event, storage) => {
-    const row = await insertRunActivityEventRow(client, event, storage);
+  return appendRunActivityEventsWithState(inputs, state, async (event, storage, context) => {
+    const row = await insertRunActivityEventRow(client, event, storage, context);
     return storedEventFromPostgresRow(row);
   });
 }
@@ -269,7 +279,7 @@ async function reduceAcceptedRunActivityMessageEventsWithPostgresClient(
 }
 
 function isChatMessageReductionTrigger(event: RunActivityEvent): boolean {
-  if (event.channel === "message" || event.channel === "tool") return true;
+  if (event.channel === "chat" || event.channel === "tool") return true;
   if (event.channel !== "terminal") return false;
   return event.kind !== "run_succeeded";
 }
@@ -287,8 +297,9 @@ async function appendRunActivityEventsWithState(
   for (const input of inputs) {
     const eventInput = eventInputForAppend(input);
     const runSessionId = deriveRunActivityRunSessionId(eventInput);
+    const persistenceContext = persistenceContextForAppendInput(eventInput);
     const currentState = state.orderingStateFor(runSessionId);
-    const existingByEventId = state.findByEventId(eventInput.id);
+    const existingByEventId = state.findByEventId(eventIdForAppendInput(eventInput));
     if (existingByEventId !== null) {
       const duplicateResult: RunActivityDuplicateAppendResult = {
         status: "duplicate",
@@ -329,7 +340,11 @@ async function appendRunActivityEventsWithState(
       continue;
     }
 
-    const stored = await persistAcceptedEvent(ordering.event, normalizeStorageMetadata(input.storage, ordering.event));
+    const stored = await persistAcceptedEvent(
+      ordering.event,
+      normalizeStorageMetadata(input.storage, ordering.event),
+      persistenceContext,
+    );
     state.accept(stored, ordering.state);
     const acceptedResult: RunActivityAcceptedAppendResult = {
       status: "accepted",
@@ -347,6 +362,34 @@ async function appendRunActivityEventsWithState(
 function eventInputForAppend(input: RunActivityAppendInput): RunActivityEventInput {
   const { storage: _storage, ...eventInput } = input;
   return eventInput;
+}
+
+function persistenceContextForAppendInput(input: RunActivityEventInput): RunActivityAppendPersistenceContext {
+  return {
+    runId: runIdForAppendInput(input),
+    sessionId: sessionIdForAppendInput(input),
+  };
+}
+
+function eventIdForAppendInput(input: RunActivityEventInput): string {
+  return normalizeRequiredString(input.eventId ?? input.id, "run activity eventId");
+}
+
+function runIdForAppendInput(input: RunActivityEventInput): string {
+  const explicit = normalizeOptionalString(input.runId);
+  if (explicit !== null) return explicit;
+  const runSessionId = normalizeOptionalString(input.runSessionId);
+  if (runSessionId !== null) return runSessionId.split(":", 1)[0] ?? runSessionId;
+  return "unknown-run";
+}
+
+function sessionIdForAppendInput(input: RunActivityEventInput): string | null {
+  const explicit = normalizeOptionalString(input.sessionId);
+  if (explicit !== null) return explicit;
+  const runSessionId = normalizeOptionalString(input.runSessionId);
+  if (runSessionId === null) return null;
+  const separatorIndex = runSessionId.indexOf(":");
+  return separatorIndex < 0 ? null : normalizeOptionalString(runSessionId.slice(separatorIndex + 1));
 }
 
 class RunActivityAppendAccumulator {
@@ -384,7 +427,7 @@ class RunActivityAppendAccumulator {
   ): RunActivityStoredEvent {
     const runSessionId = currentState.runSessionId;
     const stored = (() => {
-      if (reason === "event_id") return this.byEventId.get(input.id);
+      if (reason === "event_id") return this.byEventId.get(eventIdForAppendInput(input));
       if (reason === "external_event_id") {
         const externalEventId = normalizeOptionalString(input.externalEventId);
         return externalEventId === null ? undefined : this.byRunSessionExternalId.get(scopedKey(runSessionId, externalEventId));
@@ -408,8 +451,8 @@ class RunActivityAppendAccumulator {
   }
 
   private index(stored: RunActivityStoredEvent): void {
-    this.byEventId.set(stored.event.id, stored);
-    this.byRunSessionSequence.set(scopedKey(stored.event.runSessionId, String(stored.event.sequence)), stored);
+    this.byEventId.set(stored.event.eventId, stored);
+    this.byRunSessionSequence.set(scopedKey(stored.event.runSessionId, String(runActivityEventSequence(stored.event))), stored);
     const externalEventId = normalizeOptionalString(stored.event.externalEventId);
     if (externalEventId !== null) {
       this.byRunSessionExternalId.set(scopedKey(stored.event.runSessionId, externalEventId), stored);
@@ -422,13 +465,15 @@ function orderingStateFromStoredEvents(
   storedEvents: readonly RunActivityStoredEvent[],
 ): RunActivityOrderingState {
   const events = [...storedEvents].sort((left, right) => compareAppendRevision(left.metadata.appendRevision, right.metadata.appendRevision));
-  const sequences = events.map((stored) => stored.event.sequence);
+  const sequences = events
+    .map((stored) => positiveIntegerOrNull(stored.event.sequence))
+    .filter((sequence): sequence is number => sequence !== null);
   const terminalEvent = events.find((stored) => stored.event.channel === "terminal");
   return {
     runSessionId,
     highWatermark: sequences.reduce((max, sequence) => Math.max(max, sequence), 0),
-    terminalSequence: terminalEvent?.event.sequence ?? null,
-    eventIds: events.map((stored) => stored.event.id),
+    terminalSequence: terminalEvent === undefined ? null : runActivityEventSequence(terminalEvent.event),
+    eventIds: events.map((stored) => stored.event.eventId),
     externalEventIds: events
       .map((stored) => normalizeOptionalString(stored.event.externalEventId))
       .filter((externalEventId): externalEventId is string => externalEventId !== null),
@@ -458,6 +503,7 @@ async function insertRunActivityEventRow(
   client: PostgresQueryClient,
   event: RunActivityEvent,
   storage: RequiredRunActivityAppendStorageMetadata,
+  context: RunActivityAppendPersistenceContext,
 ): Promise<RunActivityEventRow> {
   const payload = stringifyJsonObject(event.payload, "run activity payload");
   const metadata = stringifyJsonObject(storage.metadata, "run activity metadata");
@@ -533,15 +579,15 @@ async function insertRunActivityEventRow(
         created_at
     `,
     [
-      event.id,
-      event.runId,
-      event.sessionId,
+      event.eventId,
+      context.runId,
+      context.sessionId,
       event.runSessionId,
-      event.sequence,
+      runActivityEventSequence(event),
       event.sequenceSource,
-      event.at,
+      event.occurredAt,
       event.protocol,
-      event.harnessId,
+      event.harness,
       event.externalEventId,
       event.actor,
       event.channel,
@@ -558,7 +604,7 @@ async function insertRunActivityEventRow(
   );
   const inserted = row.rows[0];
   if (inserted === undefined) {
-    throw new SymphonyError("conflict", `Run activity event insert returned no row for event ${event.id}`);
+    throw new SymphonyError("conflict", `Run activity event insert returned no row for event ${event.eventId}`);
   }
   return inserted;
 }
@@ -566,15 +612,15 @@ async function insertRunActivityEventRow(
 function storedEventFromAcceptedEvent(
   event: RunActivityEvent,
   storage: RequiredRunActivityAppendStorageMetadata,
-  metadata: Pick<RunActivityAppendMetadata, "appendRevision" | "createdAt">,
+  metadata: Pick<RunActivityAppendMetadata, "appendRevision" | "createdAt" | "runId"> & { readonly sessionId: string | null },
 ): RunActivityStoredEvent {
   return {
     event,
     metadata: {
-      eventId: event.id,
-      runId: event.runId,
+      eventId: event.eventId,
+      runId: metadata.runId,
       runSessionId: event.runSessionId,
-      sequence: event.sequence,
+      sequence: runActivityEventSequence(event),
       sequenceSource: event.sequenceSource,
       appendRevision: metadata.appendRevision,
       createdAt: metadata.createdAt,
@@ -586,18 +632,16 @@ function storedEventFromAcceptedEvent(
 
 function storedEventFromPostgresRow(row: RunActivityEventRow): RunActivityStoredEvent {
   const event = {
-    id: row.event_id,
-    runId: row.run_id,
-    sessionId: row.session_id,
+    eventId: row.event_id,
     runSessionId: row.run_session_id,
-    at: toIsoString(row.event_at),
+    occurredAt: toIsoString(row.event_at),
     sequence: Number(row.sequence),
     sequenceSource: row.sequence_source,
     externalEventId: normalizeOptionalString(row.external_event_id),
     protocol: row.protocol,
-    harnessId: row.harness_id,
+    harness: row.harness_id,
     actor: row.actor,
-    channel: row.channel,
+    channel: normalizeRunActivityChannel(row.channel),
     kind: row.kind,
     text: row.text,
     payload: sanitizeJsonObject(row.payload, "persisted run activity payload"),
@@ -605,10 +649,10 @@ function storedEventFromPostgresRow(row: RunActivityEventRow): RunActivityStored
   return {
     event,
     metadata: {
-      eventId: event.id,
-      runId: event.runId,
+      eventId: event.eventId,
+      runId: row.run_id,
       runSessionId: event.runSessionId,
-      sequence: event.sequence,
+      sequence: runActivityEventSequence(event),
       sequenceSource: event.sequenceSource,
       appendRevision: String(row.append_revision),
       createdAt: toIsoString(row.created_at),
@@ -653,6 +697,18 @@ async function rollbackRunActivityAppendQuietly(client: PostgresQueryClient): Pr
 
 function sortedUnique(values: readonly string[]): string[] {
   return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
+function runActivityEventSequence(event: RunActivityEvent): number {
+  const sequence = positiveIntegerOrNull(event.sequence);
+  if (sequence === null) throw new SymphonyError("invalid_request", `Run activity event ${event.eventId} must have a positive sequence`);
+  return sequence;
+}
+
+function normalizeRequiredString(value: string | null | undefined, label: string): string {
+  const normalized = normalizeOptionalString(value);
+  if (normalized === null) throw new SymphonyError("invalid_request", `${label} must be non-empty`);
+  return normalized;
 }
 
 function scopedKey(scope: string, value: string): string {

@@ -13,101 +13,123 @@ import {
 } from "../src/core/persistence/RunActivityAppendStore.js";
 import type { RunActivityEvent, RunActivityMessageKind } from "../src/core/runActivity/RunActivityEvent.js";
 
-function messageActivity(overrides: Record<string, unknown> = {}): RunActivityEvent {
+function canonicalEventOverrides(overrides: Record<string, unknown>): Record<string, unknown> {
+  const eventId = typeof overrides.eventId === "string" ? overrides.eventId : typeof overrides.id === "string" ? overrides.id : undefined;
+  const occurredAt = typeof overrides.occurredAt === "string"
+    ? overrides.occurredAt
+    : typeof overrides.at === "string"
+      ? overrides.at
+      : undefined;
+  const harness = typeof overrides.harness === "string"
+    ? overrides.harness
+    : typeof overrides.harnessId === "string"
+      ? overrides.harnessId
+      : undefined;
+  const channel = overrides.channel === "message" ? "chat" : overrides.channel === "status" ? "diagnostic" : overrides.channel;
   return {
-    id: "activity-message-1",
-    runId: "run-chat",
-    sessionId: "session-chat",
+    ...overrides,
+    ...(eventId === undefined ? {} : { eventId }),
+    ...(occurredAt === undefined ? {} : { occurredAt }),
+    ...(harness === undefined ? {} : { harness }),
+    ...(channel === undefined ? {} : { channel }),
+  };
+}
+
+function messageActivity(overrides: Record<string, unknown> = {}): RunActivityEvent {
+  const normalizedOverrides = canonicalEventOverrides(overrides);
+  return {
+    eventId: "activity-message-1",
     runSessionId: "run-chat:session-chat",
-    at: "2026-05-31T00:00:00.000Z",
+    occurredAt: "2026-05-31T00:00:00.000Z",
     sequence: 1,
     sequenceSource: "harness",
     externalEventId: null,
     protocol: "json_rpc",
-    harnessId: "hermes",
+    harness: "hermes",
     actor: "assistant",
-    channel: "message",
+    channel: "chat",
     kind: "assistant_message_delta",
     text: "Hello",
     payload: {},
-    ...overrides,
+    ...normalizedOverrides,
   } as RunActivityEvent;
 }
 
 function statusActivity(overrides: Record<string, unknown> = {}): RunActivityEvent {
+  const normalizedOverrides = canonicalEventOverrides(overrides);
   return {
-    id: "activity-status-1",
-    runId: "run-chat",
-    sessionId: "session-chat",
+    eventId: "activity-status-1",
     runSessionId: "run-chat:session-chat",
-    at: "2026-05-31T00:00:03.000Z",
+    occurredAt: "2026-05-31T00:00:03.000Z",
     sequence: 4,
     sequenceSource: "harness",
     externalEventId: null,
     protocol: "json_rpc",
-    harnessId: "hermes",
+    harness: "hermes",
     actor: "runtime",
-    channel: "status",
+    channel: "diagnostic",
     kind: "runtime_log",
     text: "ignored status",
     payload: {},
-    ...overrides,
+    ...normalizedOverrides,
   } as RunActivityEvent;
 }
 
 function toolActivity(overrides: Record<string, unknown> = {}): RunActivityEvent {
+  const normalizedOverrides = canonicalEventOverrides(overrides);
   return {
-    id: "activity-tool-1",
-    runId: "run-chat",
-    sessionId: "session-chat",
+    eventId: "activity-tool-1",
     runSessionId: "run-chat:session-chat",
-    at: "2026-05-31T00:00:01.000Z",
+    occurredAt: "2026-05-31T00:00:01.000Z",
     sequence: 2,
     sequenceSource: "harness",
     externalEventId: null,
     protocol: "json_rpc",
-    harnessId: "hermes",
+    harness: "hermes",
     actor: "assistant",
     channel: "tool",
     kind: "tool_call_requested",
     text: "Run shell command",
     payload: { toolCallId: "tool-call-1", toolName: "shell.run" },
-    ...overrides,
+    ...normalizedOverrides,
   } as RunActivityEvent;
 }
 
 function terminalActivity(overrides: Record<string, unknown> = {}): RunActivityEvent {
+  const normalizedOverrides = canonicalEventOverrides(overrides);
   return {
-    id: "activity-terminal-1",
-    runId: "run-chat",
-    sessionId: "session-chat",
+    eventId: "activity-terminal-1",
     runSessionId: "run-chat:session-chat",
-    at: "2026-05-31T00:00:04.000Z",
+    occurredAt: "2026-05-31T00:00:04.000Z",
     sequence: 4,
     sequenceSource: "harness",
     externalEventId: null,
     protocol: "json_rpc",
-    harnessId: "hermes",
+    harness: "hermes",
     actor: "runtime",
     channel: "terminal",
     kind: "run_failed",
     text: "run failed",
     payload: { reason: "run_failed" },
-    ...overrides,
+    ...normalizedOverrides,
   } as RunActivityEvent;
+}
+
+function runIdFromRunSessionId(runSessionId: string): string {
+  return runSessionId.split(":", 1)[0] ?? runSessionId;
 }
 
 function stored(event: RunActivityEvent, overrides: Partial<RunActivityStoredEvent["storage"]> = {}): RunActivityStoredEvent {
   return {
     event,
     metadata: {
-      eventId: event.id,
-      runId: event.runId,
+      eventId: event.eventId,
+      runId: runIdFromRunSessionId(event.runSessionId),
       runSessionId: event.runSessionId,
-      sequence: event.sequence,
+      sequence: event.sequence ?? 0,
       sequenceSource: event.sequenceSource,
-      appendRevision: String(event.sequence),
-      createdAt: event.at,
+      appendRevision: String(event.sequence ?? 0),
+      createdAt: event.occurredAt,
       externalEventId: event.externalEventId ?? null,
     },
     storage: {
