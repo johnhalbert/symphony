@@ -171,6 +171,7 @@ export function DashboardView({
       <OrchestratorChat
         messages={chat}
         onSend={sendChat}
+        agentLabel={chatAgentLabel(dashboard)}
         subtitle={chatSubtitle(dashboard)}
         loading={orchestratorChatLoading}
         error={orchestratorChatError}
@@ -182,6 +183,10 @@ export function DashboardView({
 
 function chatSubtitle(dashboard: DashboardModel) {
   return [dashboard.agentUsageLabel, dashboard.workflowLabel, dashboard.pollLabel].filter(Boolean).join(" · ");
+}
+
+function chatAgentLabel(dashboard: DashboardModel) {
+  return dashboard.runningAgents[0]?.id ?? null;
 }
 
 function dotColorForVerb(verb: string) {

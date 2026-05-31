@@ -16,6 +16,7 @@ export function AppChrome({
   onTabChange,
   children,
   rightSlot,
+  tabBadges,
   runningCount = 0,
   repoLabel = "",
   branch = "",
@@ -29,6 +30,7 @@ export function AppChrome({
   onTabChange: (tab: AppTab) => void;
   children: ReactNode;
   rightSlot?: ReactNode;
+  tabBadges?: Partial<Record<AppTab, string | null | undefined>>;
   runningCount?: number;
   repoLabel?: string;
   branch?: string;
@@ -50,23 +52,26 @@ export function AppChrome({
           <span className="meta">{branch || "--"}</span>
         </div>
         <div className="tabs" role="tablist" aria-label="Symphony views">
-          {appTabs.map((tab) => (
-            <button
-              className="tab"
-              data-active={activeTab === tab.id}
-              key={tab.id}
-              onClick={() => onTabChange(tab.id)}
-              role="tab"
-              aria-label={tab.label}
-              aria-selected={activeTab === tab.id}
-              title={tab.label}
-              type="button"
-            >
-              {tabIcon[tab.id]()}
-              <span>{tab.label}</span>
-              {tab.badge ? <span className="badge">{tab.badge}</span> : null}
-            </button>
-          ))}
+          {appTabs.map((tab) => {
+            const badge = tabBadges?.[tab.id]?.trim();
+            return (
+              <button
+                className="tab"
+                data-active={activeTab === tab.id}
+                key={tab.id}
+                onClick={() => onTabChange(tab.id)}
+                role="tab"
+                aria-label={tab.label}
+                aria-selected={activeTab === tab.id}
+                title={tab.label}
+                type="button"
+              >
+                {tabIcon[tab.id]()}
+                <span>{tab.label}</span>
+                {badge ? <span className="badge">{badge}</span> : null}
+              </button>
+            );
+          })}
         </div>
         <div className="titlebar__right">
           {rightSlot}

@@ -430,15 +430,19 @@ Current dashboard mock-data inventory:
 - `web/src/components/dashboard/Stats.tsx`: renders real `DashboardModel` totals but treats optional velocity, ETA, burn-up, cycle, projection, review queue, health, and error metrics as unavailable until supplied by `dashboard.metrics`; it no longer embeds the legacy mock values in the component path.
 - `web/src/components/dashboard/DashboardView.tsx`: renders the dashboard variant switcher, cycle filter, and dense-grid velocity panel from optional `dashboard.metrics` fields, with neutral unavailable placeholders in API/default mode when those fields are absent.
 - `web/src/app/AppChrome.tsx`: renders connection and error status from explicit props sourced from optional dashboard health metrics; the API/default fallback is neutral (`connection unavailable`, `errors unavailable`) rather than hard-coded Linear/zero-error status.
+- `web/src/app/navigation.ts` and `web/src/app/AppChrome.tsx`: tab definitions are label-only; navigation badges are optional props derived from loaded issue/history data and are omitted while those resources are unavailable, so production chrome no longer ships fixed issue/live counts.
+- `web/src/App.tsx` `StateCardsView`: state cards render from loaded dashboard running-agent and history session models, or a neutral `Run state data unavailable.` empty state; legacy `SYM-*`/`codex-*` state-card examples remain only in explicit mock data/adapters and tests.
+- `web/src/components/sidebar/SidebarChat.tsx`: compact chat subtitle is sourced from the active sidebar running-agent model when available, or a neutral `agent context unavailable`/read-only API label; it no longer embeds a fixed agent/cycle fallback.
+- `web/src/components/dashboard/OrchestratorChat.tsx`: command input copy uses neutral examples and the agent footer is sourced from the active dashboard running-agent model or a neutral unavailable label, avoiding fixed mock issue/agent ids in runtime UI.
 - `web/src/components/issues/DetailColumn.tsx`: real issue-detail empty activity renders neutral `No issue activity available.` copy and must not mention mock data outside the explicit fixture records.
-- `web/tests/adapters.test.ts`, `web/tests/dashboardPresentation.test.tsx`, `web/tests/appApiModeRendering.test.tsx`, `web/tests/issuesComponents.test.tsx`, and `web/tests/referenceData.test.ts`: retain fixture imports or rendered fixture expectations as test/design-preview coverage, not runtime defaults, and cover API/default unavailable placeholders.
+- `web/tests/adapters.test.ts`, `web/tests/dashboardPresentation.test.tsx`, `web/tests/appApiModeRendering.test.tsx`, `web/tests/issuesComponents.test.tsx`, `web/tests/orchestratorChatIntegration.test.tsx`, and `web/tests/referenceData.test.ts`: retain fixture imports or rendered fixture expectations as test/design-preview coverage, not runtime defaults, and cover API/default unavailable placeholders.
 
 Acceptance criteria:
 
 - Switching between explicit mock/demo and API data is a composition/config change.
 - Component props and view modules do not change.
 - Mock mode remains available for deliberate design review and frontend fixture tests, but real/API-backed data is the default dashboard source.
-- Unsupported dashboard/chrome metrics in API mode render neutral unavailable placeholders until the backend supplies real `dashboard.metrics` fields, and real issue-detail empty states avoid mock-data copy.
+- Unsupported dashboard/chrome metrics, navigation counts, state-card data, chat subtitles, and command placeholders in API/default mode render from active models when available or neutral unavailable placeholders until the backend supplies real fields; real issue-detail empty states avoid mock-data copy.
 
 ## Suggested Milestones
 

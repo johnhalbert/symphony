@@ -474,9 +474,9 @@ describe("App API-mode rendering", () => {
       },
       states: {
         referenceData: true,
-        dashboard: false,
+        dashboard: true,
         issueBoard: false,
-        history: false,
+        history: true,
         sidebar: false,
         orchestratorChat: false,
       },
@@ -515,6 +515,8 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
     expect(markup).toContain("Full-app suggestion");
+    expect(markup).not.toContain('class="badge"');
+    expect(markup).not.toContain("4 live");
 
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
@@ -528,6 +530,29 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("PR/day");
     expect(markup).not.toContain("linear · connected");
     expect(markup).not.toContain("0 errors");
+  });
+
+  it("renders state cards from API run/session data or neutral empty copy without demo cards", async () => {
+    const { StateCardsView } = await import("../src/App");
+
+    const markup = renderToStaticMarkup(<StateCardsView runningAgents={apiDashboard.runningAgents} sessions={apiHistory.sessions} />);
+
+    expect(markup).toContain("API-1");
+    expect(markup).toContain("Implement API dashboard");
+    expect(markup).toContain("Rendering dashboard model");
+    expect(markup).toContain("API-HISTORY");
+    expect(markup).toContain("API selected transcript session");
+
+    expect(markup).not.toContain("SYM-42");
+    expect(markup).not.toContain("SYM-12");
+    expect(markup).not.toContain("codex-04");
+    expect(markup).not.toContain("Add exponential backoff to retry queue with jitter");
+    expect(markup).not.toContain("Agent review queue · PR #1248");
+
+    const emptyMarkup = renderToStaticMarkup(<StateCardsView />);
+    expect(emptyMarkup).toContain("Run state data unavailable.");
+    expect(emptyMarkup).not.toContain("SYM-42");
+    expect(emptyMarkup).not.toContain("codex-04");
   });
 
   it("keeps mock-mode app-shell resources eager once reference data is loaded", async () => {

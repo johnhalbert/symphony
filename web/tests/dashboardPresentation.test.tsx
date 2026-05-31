@@ -221,6 +221,7 @@ describe("dashboard API presentation", () => {
         pollLabel={apiDashboard.pollLabel}
         agentUsageLabel={apiDashboard.agentUsageLabel}
         dataSourceLabel="api source · api"
+        tabBadges={{ issues: String(apiDashboard.totals.all), history: "2 live" }}
       >
         <div>Dashboard body</div>
       </AppChrome>,
@@ -231,11 +232,15 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("api/repo@api-branch");
     expect(markup).toContain("poll 5s");
     expect(markup).toContain("api source · api");
+    expect(markup).toContain('<span class="badge">32</span>');
+    expect(markup).toContain('<span class="badge">2 live</span>');
     expect(markup).toContain("connection unavailable");
     expect(markup).toContain("errors unavailable");
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("api source · mock");
+    expect(markup).not.toContain('badge">11</span>');
+    expect(markup).not.toContain('badge">4 live</span>');
     expect(markup).not.toContain("linear · connected");
     expect(markup).not.toContain("0 errors · 24h");
   });

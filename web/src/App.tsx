@@ -20,10 +20,14 @@ import {
 import type {
   AppTab,
   DashboardVariant,
+  HistoryModel,
   HistoryVariant,
+  IssueBoardModel,
   IssuesVariant,
   ReferenceData,
+  RunningAgentModel,
   RunState,
+  SessionModel,
   SidebarVariant,
 } from "./types/symphony";
 
@@ -94,6 +98,7 @@ function AppShell({
   const orchestratorChat = useOrchestratorChat({ enabled: resourceLoading.orchestratorChat });
   const dashboardChrome = dashboard.data;
   const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
+  const tabBadges = resolveTabBadges(issueBoard.data, history.data);
 
   return (
     <ReferenceDataProvider value={referenceData}>
@@ -101,6 +106,7 @@ function AppShell({
         <AppChrome
           activeTab={activeTab}
           onTabChange={setActiveTab}
+          tabBadges={tabBadges}
           runningCount={runningCount}
           repoLabel={dashboardChrome?.repoLabel ?? ""}
           branch={dashboardChrome?.branch ?? ""}
@@ -155,7 +161,14 @@ function AppShell({
                 />
               ))
             : null}
-          {activeTab === "states" ? <StateCardsView /> : null}
+          {activeTab === "states" ? (
+            <StateCardsView
+              runningAgents={dashboard.data?.runningAgents ?? []}
+              sessions={history.data?.sessions ?? []}
+              loading={dashboard.loading || history.loading}
+              error={dashboard.error ?? history.error}
+            />
+          ) : null}
         </AppChrome>
       </ThemeFrame>
     </ReferenceDataProvider>
@@ -239,22 +252,87 @@ function ViewControls({
   return null;
 }
 
-function StateCardsView() {
-  const cards: Array<{ state: RunState; issue: string; title: string; agent: string | null; step: string; duration: string }> = [
-    { state: "creating", issue: "SYM-42", title: "Stream agent app-server updates to orchestrator", agent: "codex-08", step: "Acquiring workspace lock", duration: "3s" },
-    { state: "running", issue: "SYM-12", title: "Add exponential backoff to retry queue with jitter", agent: "codex-04", step: "Running mix test", duration: "4m 41s" },
-    { state: "queued", issue: "SYM-50", title: "Document trust & safety posture", agent: null, step: "Waiting for concurrency slot", duration: "--" },
-    { state: "review", issue: "SYM-15", title: "Workspace cleanup hook for terminal-state issues", agent: "codex-02", step: "Agent review queue · PR #1248", duration: "24m" },
-    { state: "finished", issue: "SYM-52", title: "Linear GraphQL query isolation + tests", agent: "codex-06", step: "Merged · #1190", duration: "1h 14m" },
-    { state: "error", issue: "SYM-09", title: "Initial Linear tracker integration", agent: "codex-11", step: "rate-limit cascade - 429", duration: "18s" },
-    { state: "cancelled", issue: "SYM-07", title: "WORKFLOW.md loader", agent: "codex-10", step: "Cancelled by operator", duration: "9s" },
-    { state: "expired", issue: "SYM-03", title: "Workspace prune (terminal)", agent: "codex--", step: "Idle 30m - released", duration: "30m" },
-  ];
+function resolveTabBadges(issueBoard: IssueBoardModel | null, history: HistoryModel | null): Partial<Record<AppTab, string>> {
+  const liveSessions = history?.sessions.filter((session) => session.state === "running").length ?? null;
+  return {
+    issues: issueBoard ? String(issueBoard.issues.length) : undefined,
+    history: history ? (liveSessions ? `${liveSessions} live` : String(history.sessions.length)) : undefined,
+  };
+}
+
+interface StateCardData {
+  state: RunState;
+  issue: string;
+  title: string;
+  agent: string | null;
+  step: string;
+  duration: string;
+}
+
+function textOrUnavailable(value: string | null | undefined, fallback: string) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : fallback;
+}
+
+function sessionStateToRunState(state: SessionModel["state"]): RunState {
+  if (state === "finished" || state === "error" || state === "cancelled" || state === "queued" || state === "running") {
+    return state;
+  }
+  return "running";
+}
+
+function createStateCards(runningAgents: RunningAgentModel[], sessions: SessionModel[]): StateCardData[] {
+  const cards: StateCardData[] = runningAgents.map((agent) => ({
+    state: agent.state,
+    issue: textOrUnavailable(agent.issue, "Issue unavailable"),
+    title: textOrUnavailable(agent.title, "Run title unavailable"),
+    agent: textOrUnavailable(agent.id, "").trim() || null,
+    step: textOrUnavailable(agent.step, "Step unavailable"),
+    duration: textOrUnavailable(agent.duration, "duration unavailable"),
+  }));
+
+  const seenRunKeys = new Set(cards.map((card) => `${card.issue}:${card.agent ?? ""}`));
+  for (const session of sessions) {
+    if (cards.length >= 8) break;
+    const agent = session.runSession?.agentId ?? null;
+    const issue = textOrUnavailable(session.issue, "Issue unavailable");
+    const runKey = `${issue}:${agent ?? ""}`;
+    if (seenRunKeys.has(runKey)) continue;
+    seenRunKeys.add(runKey);
+    cards.push({
+      state: sessionStateToRunState(session.state),
+      issue,
+      title: textOrUnavailable(session.title, "Run title unavailable"),
+      agent,
+      step: textOrUnavailable(session.lastEvent, "Status unavailable"),
+      duration: textOrUnavailable(session.updatedAt, "updated time unavailable"),
+    });
+  }
+
+  return cards.slice(0, 8);
+}
+
+export function StateCardsView({
+  runningAgents = [],
+  sessions = [],
+  loading = false,
+  error = null,
+}: {
+  runningAgents?: RunningAgentModel[];
+  sessions?: SessionModel[];
+  loading?: boolean;
+  error?: string | null;
+}) {
+  const cards = createStateCards(runningAgents, sessions);
+
+  if (loading && cards.length === 0) return <div className="view-loading">Loading run state data...</div>;
+  if (error && cards.length === 0) return <div className="view-error">Run state data unavailable: {error}</div>;
+  if (cards.length === 0) return <div className="view-empty">Run state data unavailable.</div>;
 
   return (
     <div className="state-card-grid">
       {cards.map((card) => (
-        <div className="state-card-cell" key={card.state}>
+        <div className="state-card-cell" key={`${card.state}-${card.issue}-${card.agent ?? card.title}`}>
           <AgentStateCard {...card} />
         </div>
       ))}
