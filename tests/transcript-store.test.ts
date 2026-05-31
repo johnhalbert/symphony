@@ -5,8 +5,13 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 
-async function startBasicRun(store: FileRunTranscriptStore, runId: string): Promise<void> {
+async function startBasicRun(
+  store: FileRunTranscriptStore,
+  runId: string,
+  overrides: Partial<Parameters<FileRunTranscriptStore["startRun"]>[0]> = {},
+): Promise<void> {
   await store.startRun({
+    ...overrides,
     runId,
     role: "worker",
     issueId: "issue-1",
@@ -646,6 +651,93 @@ describe("FileRunTranscriptStore", () => {
         failureDiagnosticAt: null,
       });
     }
+  });
+
+  it("rebuilds issue-breakdown planning failures that complete or exit without an accepted plan", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const reloaded = new FileRunTranscriptStore(root);
+
+    await startBasicRun(store, "plan-completed-no-plan", { runPhase: "issue_breakdown", runKind: "planning" });
+    await store.appendEvent({
+      runId: "plan-completed-no-plan",
+      at: "2026-01-01T00:01:00.000Z",
+      source: "harness",
+      eventType: "session_started",
+      payload: { type: "session_started", sessionId: "plan-completed-session", runId: "plan-completed-no-plan" },
+    });
+    await store.appendEvent({
+      runId: "plan-completed-no-plan",
+      at: "2026-01-01T00:01:00.050Z",
+      source: "harness",
+      eventType: "tokens",
+      payload: { type: "tokens", tokens: { inputTokens: 5, outputTokens: 8, totalTokens: 13 } },
+    });
+    await store.appendEvent({
+      runId: "plan-completed-no-plan",
+      at: "2026-01-01T00:01:00.100Z",
+      source: "harness",
+      eventType: "completed",
+      payload: { type: "completed" },
+    });
+    await store.appendEvent({
+      runId: "plan-completed-no-plan",
+      at: "2026-01-01T00:01:00.200Z",
+      source: "orchestrator",
+      eventType: "planning_run_failed",
+      message: "Planning run completed without submit_issue_breakdown_plan",
+      payload: {
+        status: "failed",
+        error: "Planning run completed without submit_issue_breakdown_plan",
+        tokens: { inputTokens: 5, outputTokens: 8, totalTokens: 13 },
+        planningFailureCount: 1,
+      },
+    });
+
+    await expect(reloaded.rebuildRunFromTranscript("plan-completed-no-plan")).resolves.toMatchObject({
+      status: "failed",
+      completedAt: "2026-01-01T00:01:00.100Z",
+      error: "Planning run completed without submit_issue_breakdown_plan",
+      tokens: { inputTokens: 5, outputTokens: 8, totalTokens: 13 },
+      transcriptEventCount: 4,
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+      failureKind: "planning_run_failed",
+      failureDiagnosticCode: "planning_run_failed",
+      failureDiagnosticMessage: "Planning run completed without submit_issue_breakdown_plan",
+    });
+
+    await startBasicRun(store, "plan-throw-no-plan", { runPhase: "issue_breakdown", runKind: "planning" });
+    await store.appendEvent({
+      runId: "plan-throw-no-plan",
+      at: "2026-01-01T00:02:00.000Z",
+      source: "harness",
+      eventType: "session_started",
+      payload: { type: "session_started", sessionId: "plan-throw-session", runId: "plan-throw-no-plan" },
+    });
+    await store.appendEvent({
+      runId: "plan-throw-no-plan",
+      at: "2026-01-01T00:02:00.100Z",
+      source: "orchestrator",
+      eventType: "planning_run_failed",
+      message: "planning harness threw before submitting a plan",
+      payload: {
+        status: "failed",
+        error: "planning harness threw before submitting a plan",
+        planningFailureCount: 1,
+      },
+    });
+
+    await expect(reloaded.rebuildRunFromTranscript("plan-throw-no-plan")).resolves.toMatchObject({
+      status: "failed",
+      completedAt: "2026-01-01T00:02:00.100Z",
+      error: "planning harness threw before submitting a plan",
+      transcriptEventCount: 2,
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+      failureKind: "planning_run_failed",
+      failureDiagnosticCode: "planning_run_failed",
+      failureDiagnosticMessage: "planning harness threw before submitting a plan",
+    });
   });
 
 

@@ -14,6 +14,9 @@ export type PersistedCancellationOutcome = "none" | "requested" | "cancelled" | 
 export type PersistedSdkRunStatus = "running" | "finished" | "error" | "cancelled";
 export type PersistedSdkRunStatusSource = "initial" | "onDidChangeStatus" | "wait";
 
+const PLANNING_NO_PLAN_ERROR = "Planning run completed without submit_issue_breakdown_plan";
+const PLANNING_FAILURE_DIAGNOSTIC_CODE = "planning_run_failed";
+
 export interface RunActivitySnapshot {
   lastHarnessActivityAt: string | null;
   lastStreamActivityAt: string | null;
@@ -714,8 +717,11 @@ function reduceRunActivityEvent(
     case "handoff_terminal":
       next = reduceHandoffTerminalEvent(next, event, payload, options);
       break;
+    case "planning_run_failed":
+      next = reducePlanningRunFailedEvent(next, event, payload, options, "Planning run failed");
+      break;
     case "completed":
-      next = reduceTerminalEvent(next, event, "succeeded", null, options);
+      next = reduceCompletedEvent(next, event, payload, options);
       break;
     case "failed":
       next = reduceFailedEvent(next, event, payload, options);
@@ -872,6 +878,43 @@ function reduceHandoffTerminalEvent(
   const withTokens = tokens ? { ...record, tokens: reduceTokenCounts(record.tokens, tokens) } : record;
   const error = status === "failed" ? stringField(payload, "error") ?? event.message ?? "Agent run failed" : null;
   return reduceTerminalEvent(withTokens, event, status, error, options);
+}
+
+function reduceCompletedEvent(
+  record: RunRecord,
+  event: TranscriptEvent,
+  payload: UnknownRecord | null,
+  options: RunActivityReductionOptions,
+): RunRecord {
+  if (record.runPhase === "issue_breakdown") {
+    return reducePlanningRunFailedEvent(record, event, payload, options, PLANNING_NO_PLAN_ERROR, true);
+  }
+  return reduceTerminalEvent(record, event, "succeeded", null, options);
+}
+
+function reducePlanningRunFailedEvent(
+  record: RunRecord,
+  event: TranscriptEvent,
+  payload: UnknownRecord | null,
+  options: RunActivityReductionOptions,
+  fallbackError: string,
+  preferFallbackError = false,
+): RunRecord {
+  const tokens = recordPayload(payload?.tokens);
+  const withTokens = tokens ? { ...record, tokens: reduceTokenCounts(record.tokens, tokens) } : record;
+  const payloadError = stringField(payload, "error");
+  const error = payloadError ?? (preferFallbackError ? fallbackError : event.message ?? fallbackError);
+  const withDiagnostic = withTokens.failureKind
+    ? withTokens
+    : {
+        ...withTokens,
+        failureKind: PLANNING_FAILURE_DIAGNOSTIC_CODE,
+        failureDiagnosticCode: PLANNING_FAILURE_DIAGNOSTIC_CODE,
+        failureDiagnosticMessage: error,
+        failureDiagnosticAt: event.at,
+      };
+  if (withDiagnostic.status !== "running") return withDiagnostic.status === "failed" ? withDiagnostic : record;
+  return reduceTerminalEvent(withDiagnostic, event, "failed", error, options);
 }
 
 function reduceFailedEvent(

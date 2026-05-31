@@ -222,6 +222,9 @@ type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" 
 type TerminalUpdateResult = { updated: true; record: RunRecord | null } | { updated: false; record: RunRecord | null };
 type AcceptedHandoffKind = "completion_report" | "pull_request_handoff" | "issue_breakdown_plan" | "merge_conflict_resolution";
 
+const PLANNING_NO_PLAN_ERROR = "Planning run completed without submit_issue_breakdown_plan";
+const PLANNING_FAILURE_DIAGNOSTIC_CODE = "planning_run_failed";
+
 export interface RuntimeSnapshot {
   generatedAt: string;
   counts: {
@@ -1551,12 +1554,20 @@ export class Orchestrator {
       if (event.type === "completed") {
         if (entry.runPhase === "issue_breakdown") {
           const accepted = await this.reconcileIssueBreakdownPlanHandoff(entry);
+          if (accepted) {
+            const terminal = await this.terminalizeAcceptedHandoff(entry, "issue_breakdown_plan");
+            await this.persistHarnessEvent(entry, event);
+            if (!terminal.updated) return;
+            continue;
+          }
+          const completedAt = new Date().toISOString();
+          this.applyPlanningFailureDiagnostic(entry, PLANNING_NO_PLAN_ERROR, new Date(completedAt));
           const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
-            status: accepted ? "succeeded" : "failed",
-            completedAt: new Date().toISOString(),
-            ...(accepted ? {} : { error: "Planning run completed without submit_issue_breakdown_plan" }),
+            status: "failed",
+            completedAt,
+            error: PLANNING_NO_PLAN_ERROR,
             tokens: entry.activeRunTokens,
-            metadata: terminalRunMetadata(entry, accepted ? "succeeded" : "failed"),
+            metadata: terminalRunMetadata(entry, "failed"),
           });
           await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
@@ -1701,6 +1712,14 @@ export class Orchestrator {
       resume_at: gate.window?.resumeAt ?? null,
     });
     return normalized;
+  }
+
+  private applyPlanningFailureDiagnostic(entry: RunningEntry, message: string, at: Date): void {
+    entry.failureKind = entry.failureKind ?? PLANNING_FAILURE_DIAGNOSTIC_CODE;
+    entry.failureDiagnosticCode = entry.failureDiagnosticCode ?? PLANNING_FAILURE_DIAGNOSTIC_CODE;
+    entry.failureDiagnosticMessage = entry.failureDiagnosticMessage ?? message;
+    entry.failureDiagnosticAt = entry.failureDiagnosticAt ?? at;
+    entry.lastMessage = message;
   }
 
   private async terminalizeAcceptedIssueBreakdownPlan(entry: RunningEntry): Promise<boolean> {
@@ -1985,6 +2004,15 @@ export class Orchestrator {
 
     const now = new Date().toISOString();
     const runId = entry.activeRunId ?? entry.runId ?? issueId;
+    const failureMessage = error ?? "Planning run failed";
+    this.applyPlanningFailureDiagnostic(entry, failureMessage, new Date(now));
+    await this.updateRunTerminalStateIfRunning(runId, {
+      status: "failed",
+      completedAt: now,
+      error: failureMessage,
+      tokens: entry.activeRunTokens,
+      metadata: terminalRunMetadata(entry, "failed"),
+    });
     const current = (await store.get(issueId)) ?? entry.lifecycle;
     const nextCount = (current?.planningFailureCount ?? 0) + 1;
     const lifecycle = await store.updateIssue(entry.issue, {
@@ -1998,9 +2026,15 @@ export class Orchestrator {
       runId,
       at: now,
       source: "orchestrator",
-      eventType: "planning_run_failed",
-      message: error ?? "Planning run failed",
-      payload: { planningFailureCount: nextCount },
+      eventType: PLANNING_FAILURE_DIAGNOSTIC_CODE,
+      message: failureMessage,
+      payload: {
+        status: "failed",
+        error: failureMessage,
+        tokens: entry.activeRunTokens,
+        planningFailureCount: nextCount,
+        ...terminalRunMetadata(entry, "failed"),
+      },
     });
 
     const maxFailures = this.config.issueBreakdown.maxPlanningFailures;
