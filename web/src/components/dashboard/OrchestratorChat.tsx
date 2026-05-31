@@ -8,6 +8,7 @@ export function OrchestratorChat({
   loading = false,
   messages,
   onSend,
+  agentLabel,
   readOnly = false,
   subtitle,
 }: {
@@ -15,6 +16,7 @@ export function OrchestratorChat({
   loading?: boolean;
   messages: ChatMessage[];
   onSend: (input: string) => Promise<void>;
+  agentLabel?: string | null;
   readOnly?: boolean;
   subtitle?: string;
 }) {
@@ -23,6 +25,7 @@ export function OrchestratorChat({
   const hasNoMessages = messages.length === 0;
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this web chat is not supported yet; no orchestrator action will be dispatched.";
+  const agentContextLabel = agentLabel?.trim() || "agent unavailable";
 
   async function submit(input = draft) {
     const trimmed = input.trim();
@@ -91,7 +94,7 @@ export function OrchestratorChat({
         >
           <div className="box">
             <textarea
-              placeholder="Ask about the project, or issue a command (e.g. 'pause SYM-42', 'show stalled agents')..."
+              placeholder="Ask about the project, or issue a command (e.g. 'show stalled agents')..."
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
             />
@@ -103,7 +106,7 @@ export function OrchestratorChat({
                 / commands
               </button>
               <div className="grow" />
-              <span style={{ color: "var(--text-4)", fontFamily: "var(--font-mono)", fontSize: 10.5 }}>codex-1</span>
+              <span style={{ color: "var(--text-4)", fontFamily: "var(--font-mono)", fontSize: 10.5 }}>{agentContextLabel}</span>
               <button className="btn btn--primary" type="submit" style={{ padding: "3px 9px" }} disabled={sending || !draft.trim()}>
                 {Icon.send()}
                 {sending ? "Sending" : "Send"}
