@@ -1,6 +1,8 @@
 # Symphony Postgres owned-state schema
 
-`0001_symphony_owned_state.sql` is the first migration-ready Postgres schema for Symphony-owned operational state and durable frontend projection/read models.
+`0001_symphony_owned_state.sql` is the original migration-ready Postgres schema for Symphony-owned operational state and durable frontend projection/read models.
+
+> The service-configured migration runner path is `migrations/postgres`. The runner-owned copy of this schema lives at `migrations/postgres/0002_symphony_owned_state.sql` so `migrations:apply` creates the tables used by `PostgresRunActivityAppendStore`.
 
 ## Source-of-truth boundaries
 
@@ -57,7 +59,7 @@ When raw tool output, harness payloads, or diagnostic payloads exceed the inline
 
 ## Validation
 
-The static Vitest coverage in `tests/postgres-schema.test.ts` asserts required tables, indexes, source-boundary notes, transition policy, run activity/chat reconstruction fields, run-session scoped duplicate-event/message constraints, and oversized-payload policy. The same test file includes an opt-in Docker-backed validation that applies the migration to an empty `postgres:16-alpine` database, exercises basic insert/query paths for each operational and projection table, verifies ordered run-activity replay, duplicate event sequence/external id rejection, chat message reconstruction from event ranges, invalid chat event ranges, large payload reference fields, and duplicate workspace keys plus duplicate non-null external issue ids are rejected:
+The static Vitest coverage in `tests/postgres-schema.test.ts` now reads the configured migration path (`migrations/postgres/0002_symphony_owned_state.sql`) and asserts required tables, indexes, source-boundary notes, transition policy, run activity/chat reconstruction fields, run-session scoped duplicate-event/message constraints, and oversized-payload policy. The same test file includes an opt-in Docker-backed validation that applies the configured migrations to an empty `postgres:16-alpine` database, exercises basic insert/query paths for each operational and projection table, verifies ordered run-activity replay, duplicate event sequence/external id rejection, chat message reconstruction from event ranges, invalid chat event ranges, large payload reference fields, duplicate workspace keys plus duplicate non-null external issue ids, and a real `PostgresRunActivityAppendStore` append plus duplicate/no-op replay path:
 
 ```bash
 SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1 npx vitest run tests/postgres-schema.test.ts --no-file-parallelism

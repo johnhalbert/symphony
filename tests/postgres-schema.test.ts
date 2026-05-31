@@ -4,11 +4,23 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
+import { Pool } from "pg";
+import {
+  applyConfiguredPostgresMigrations,
+  discoverPostgresMigrations,
+} from "../src/core/database/PostgresMigrations.js";
+import {
+  PostgresRunActivityAppendStore,
+  type PostgresRunActivityAppendClient,
+  type RunActivityAppendInput,
+} from "../src/core/persistence/RunActivityAppendStore.js";
 
 const execFileAsync = promisify(execFile);
 
-const migrationUrl = new URL("../db/migrations/postgres/0001_symphony_owned_state.sql", import.meta.url);
-const readmeUrl = new URL("../db/migrations/postgres/README.md", import.meta.url);
+const configuredMigrationsDirUrl = new URL("../migrations/postgres/", import.meta.url);
+const configuredMigrationsDir = fileURLToPath(configuredMigrationsDirUrl);
+const migrationUrl = new URL("../migrations/postgres/0002_symphony_owned_state.sql", import.meta.url);
+const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
 
 const operationalTables = [
   "workspace",
@@ -59,6 +71,20 @@ function normalizedSql(sql: string): string {
 }
 
 describe("Postgres Symphony-owned state migration", () => {
+  it("keeps the owned-state schema on the configured migration path after the runner baseline", async () => {
+    const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
+
+    expect(migrations.map((migration) => migration.id)).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
+    const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
+    expect(ownedState?.filePath).toBe(fileURLToPath(migrationUrl));
+    expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_session");
+    expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_activity_event");
+    expect(ownedState?.sql).toContain("run_activity_event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY");
+    expect(ownedState?.sql).toContain("UNIQUE (run_session_id, sequence)");
+    expect(ownedState?.sql).toContain("run_activity_event_external_event_unique_idx");
+    expect(ownedState?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+  });
+
   it("declares all required operational and projection tables", async () => {
     const normalized = normalizedSql(await migrationSql());
 
@@ -161,13 +187,31 @@ describe("Postgres Symphony-owned state migration", () => {
   const liveIt = process.env.SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER === "1" ? it : it.skip;
 
   liveIt(
-    "applies cleanly and supports basic insert/query paths via Docker",
+    "applies configured migrations and supports append-store paths via Docker",
     async () => {
       const containerName = `symphony-postgres-schema-${process.pid}-${Date.now()}`;
       try {
-        await docker(["run", "--rm", "--name", containerName, "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-d", "postgres:16-alpine"], 60_000);
+        await docker(
+          [
+            "run",
+            "--rm",
+            "--name",
+            containerName,
+            "-e",
+            "POSTGRES_HOST_AUTH_METHOD=trust",
+            "-p",
+            "127.0.0.1::5432",
+            "-d",
+            "postgres:16-alpine",
+          ],
+          60_000,
+        );
         await waitForPostgres(containerName);
-        await applyMigration(containerName);
+        const connectionString = await postgresConnectionString(containerName);
+        await applyConfiguredMigrations(connectionString);
+
+        const appliedMigrations = await psql(containerName, "select id from symphony_schema_migrations order by id;");
+        expect(appliedMigrations.trim().split(/\s+/)).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
 
         const tableCount = await psql(
           containerName,
@@ -183,6 +227,7 @@ describe("Postgres Symphony-owned state migration", () => {
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
         await expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName);
         await expectDuplicateWorkspaceAndExternalIssueConstraints(containerName);
+        await expectPostgresRunActivityAppendStoreAppendAndDuplicatePath(connectionString);
       } finally {
         await docker(["rm", "-f", containerName]).catch(() => undefined);
       }
@@ -191,21 +236,17 @@ describe("Postgres Symphony-owned state migration", () => {
   );
 });
 
-async function applyMigration(containerName: string): Promise<void> {
-  await docker(["cp", fileURLToPath(migrationUrl), `${containerName}:/tmp/0001_symphony_owned_state.sql`]);
-  await docker([
-    "exec",
-    containerName,
-    "psql",
-    "-U",
-    "postgres",
-    "-d",
-    "postgres",
-    "-v",
-    "ON_ERROR_STOP=1",
-    "-f",
-    "/tmp/0001_symphony_owned_state.sql",
-  ]);
+async function applyConfiguredMigrations(connectionString: string): Promise<void> {
+  await applyConfiguredPostgresMigrations({
+    database: {
+      postgres: {
+        connectionString,
+        migrationsDir: configuredMigrationsDir,
+        migrationsTable: "symphony_schema_migrations",
+        ssl: false,
+      },
+    },
+  });
 }
 
 async function expectOperationalAndProjectionInsertQueryPaths(containerName: string): Promise<void> {
@@ -970,6 +1011,122 @@ async function expectDuplicateWorkspaceAndExternalIssueConstraints(containerName
     `,
   );
   expect(Number(nullableExternalIds.trim())).toBe(2);
+}
+
+async function expectPostgresRunActivityAppendStoreAppendAndDuplicatePath(connectionString: string): Promise<void> {
+  const pool = new Pool({ connectionString });
+  const runId = "run:configured-append";
+  const sessionId = "session:configured-append";
+  const runSessionId = `${runId}:${sessionId}`;
+  try {
+    await pool.query(
+      `
+        INSERT INTO symphony.run_session (
+          run_id,
+          session_id,
+          agent_id,
+          role,
+          issue_key,
+          issue_identifier,
+          workspace_key,
+          workspace_path,
+          turn_number,
+          harness_id,
+          status,
+          started_at,
+          updated_at
+        ) VALUES (
+          $1,
+          $2,
+          'agent:configured-append',
+          'worker',
+          'issue:configured-append',
+          'APPEND-1',
+          'workspace:configured-append',
+          '/tmp/symphony/APPEND-1',
+          1,
+          'hermes',
+          'running',
+          now(),
+          now()
+        )
+      `,
+      [runId, sessionId],
+    );
+
+    const store = new PostgresRunActivityAppendStore({
+      connect: async () => (await pool.connect()) as PostgresRunActivityAppendClient,
+    });
+    const first = await store.appendEvent(
+      runActivityAppendInput({
+        id: "activity:configured-append:1",
+        runId,
+        sessionId,
+        sequence: null,
+        externalEventId: "external:configured-append:1",
+      }),
+    );
+    expect(first).toMatchObject({
+      status: "accepted",
+      event: { runSessionId, sequence: 1, sequenceSource: "symphony" },
+    });
+    if (first.status !== "accepted") throw new Error("expected first append to be accepted");
+
+    const duplicate = await store.appendEvent(
+      runActivityAppendInput({
+        id: "activity:configured-append:duplicate-external",
+        runId,
+        sessionId,
+        sequence: null,
+        externalEventId: "external:configured-append:1",
+      }),
+    );
+    expect(duplicate).toMatchObject({
+      status: "duplicate",
+      reason: "external_event_id",
+      metadata: { appendRevision: first.metadata.appendRevision, sequence: 1 },
+    });
+
+    const persisted = await pool.query<{ count: string; max_sequence: number }>(
+      `
+        SELECT count(*)::text AS count, max(sequence)::int AS max_sequence
+        FROM symphony.run_activity_event
+        WHERE run_session_id = $1
+      `,
+      [runSessionId],
+    );
+    expect(persisted.rows[0]).toMatchObject({ count: "1", max_sequence: 1 });
+  } finally {
+    await pool.end();
+  }
+}
+
+function runActivityAppendInput(overrides: Record<string, unknown> = {}): RunActivityAppendInput {
+  return {
+    id: "activity:configured-append",
+    runId: "run:configured-append",
+    sessionId: "session:configured-append",
+    at: "2026-05-31T00:00:00.000Z",
+    harnessId: "hermes",
+    actor: "runtime",
+    channel: "status",
+    kind: "runtime_log",
+    text: "configured migration append",
+    payload: { source: "configured-migration-test" },
+    protocol: "json_rpc",
+    ...overrides,
+  } as RunActivityAppendInput;
+}
+
+async function postgresConnectionString(containerName: string): Promise<string> {
+  const { stdout } = await docker(["port", containerName, "5432/tcp"]);
+  const endpoint = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0 && /:\d+$/.test(line));
+  const port = endpoint?.match(/:(\d+)$/)?.[1];
+  if (port === undefined) throw new Error(`Could not resolve mapped Postgres port for ${containerName}: ${stdout}`);
+  return `postgres://postgres@127.0.0.1:${port}/postgres`;
 }
 
 async function waitForPostgres(containerName: string): Promise<void> {
