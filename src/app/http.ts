@@ -49,6 +49,7 @@ import {
   compareRunChronology,
   type RunRecord,
   type RunTranscriptStore,
+  type TranscriptPage,
   type TranscriptEvent,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
@@ -96,6 +97,11 @@ import {
   type WebProjectionSourceRevision,
 } from "./WebProjectionContext.js";
 import type {
+  ProjectionPayloadWriteInput,
+  ProjectionSourceRevision,
+  ProjectionWriteResult,
+} from "../core/persistence/ProjectionTransactionService.js";
+import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
   IssueLatestRunSummary,
@@ -119,6 +125,10 @@ type StatusServerWritebackOutbox = Pick<FileWritebackOutboxStore, "list"> &
 interface StatusServerProjectionRevisionStore {
   projectionRevision(): number;
   onProjectionChanged(listener: (event: { source: string; revision: number }) => void): () => void;
+}
+
+export interface StatusServerProjectionWriter {
+  writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult>;
 }
 
 export interface StatusServerWebProjectionContextBuildInput {
@@ -173,6 +183,7 @@ export interface StatusServerOptions {
   webProjectionContextClock?: WebProjectionClock;
   webProjectionContextBuilder?: StatusServerWebProjectionContextBuilder;
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
+  projectionWriter?: StatusServerProjectionWriter;
 }
 
 export class StatusServer {
@@ -476,7 +487,10 @@ export class StatusServer {
           sendJson(response, 200, []);
           return;
         }
-        sendJson(response, 200, projectWebTranscript(await readBoundedWebTranscript(this.options.runStore, run.runId, url), { run }));
+        const transcriptPage = await readBoundedWebTranscriptPage(this.options.runStore, run.runId, url);
+        const transcript = projectWebTranscript(transcriptPage.events, { run });
+        await this.persistWebTranscriptProjection(run, transcriptPage, transcript);
+        sendJson(response, 200, transcript);
         return;
       }
       if (url.pathname === "/api/v1/web/orchestrator-chat") {
@@ -1345,7 +1359,78 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: limits.timelineLimit },
       includeTranscriptEvents: false,
     });
-    return projectWebHistory(runs, activityFeed.activity);
+    const history = projectWebHistory(runs, activityFeed.activity);
+    await this.persistWebHistoryProjection(history, {
+      sourceIndex,
+      limits,
+      activityCount: activityFeed.activity.length,
+    });
+    return history;
+  }
+
+  private async persistWebHistoryProjection(
+    history: ReturnType<typeof projectWebHistory>,
+    input: {
+      sourceIndex: BuiltWebProjectionSourceIndex | null;
+      limits: { sessionLimit: number; timelineLimit: number };
+      activityCount: number;
+    },
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "history_projection",
+      scopeKind: "global_collection",
+      scopeKey: historyProjectionScopeKey(input.limits),
+      payload: history,
+      sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceCursors: {
+        sessionLimit: input.limits.sessionLimit,
+        timelineLimit: input.limits.timelineLimit,
+        sessionCount: history.sessions.length,
+        timelineCount: history.timeline.length,
+        activityCount: input.activityCount,
+        defaultSessionId: history.defaultSessionId,
+        runIds: history.sessions.map((session) => session.runSession.runId),
+      },
+      fields: {
+        messageCount: history.sessions.length,
+      },
+    });
+  }
+
+  private async persistWebTranscriptProjection(
+    run: RunRecord,
+    page: TranscriptPage,
+    transcript: ReturnType<typeof projectWebTranscript>,
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "transcript_projection",
+      scopeKind: "run_page",
+      scopeKey: transcriptProjectionScopeKey(run, page),
+      payload: transcript,
+      sourceRevisions: statusServerTranscriptProjectionSourceRevisions(this.options.runStore, run, page),
+      sourceCursors: transcriptProjectionSourceCursors(run, page),
+      fields: {
+        issueKey: run.issueIdentifier || run.issueId,
+        runId: run.runId,
+        sessionId: run.sessionId,
+        offsetStart: page.offset,
+        offsetLimit: page.limit,
+        nextOffset: page.nextOffset,
+        messageCount: transcript.length,
+      },
+    });
+  }
+
+  private async persistProjection(input: ProjectionPayloadWriteInput): Promise<void> {
+    const writer = this.options.projectionWriter;
+    if (!writer) return;
+    try {
+      await writer.writeProjection(input);
+    } catch {
+      // Durable projection rows are cache/read-model side effects. The status API
+      // response is derived from canonical file-backed stores in this transition
+      // phase, so projection persistence failures must not make the UI unavailable.
+    }
   }
 
   private async fetchOptionalWebProjectionSourceIndex(forceRefresh: boolean): Promise<{
@@ -1655,6 +1740,74 @@ function isStatusServerProjectionRevisionStore(store: unknown): store is StatusS
       typeof (store as Partial<StatusServerProjectionRevisionStore>).projectionRevision === "function" &&
       typeof (store as Partial<StatusServerProjectionRevisionStore>).onProjectionChanged === "function",
   );
+}
+
+function statusServerProjectionSourceRevisions(
+  sourceIndex: BuiltWebProjectionSourceIndex | null,
+  options: Pick<StatusServerOptions, "runStore" | "lifecycleStore" | "writebackOutbox">,
+): ProjectionSourceRevision[] {
+  if (sourceIndex) return sourceIndex.durableSourceRevisions.map(toProjectionSourceRevision);
+  return [
+    statusServerStoreProjectionSourceRevision("runs", options.runStore),
+    statusServerStoreProjectionSourceRevision("lifecycles", options.lifecycleStore),
+    statusServerStoreProjectionSourceRevision("writebacks", options.writebackOutbox),
+  ].filter((revision): revision is ProjectionSourceRevision => revision !== null);
+}
+
+function statusServerTranscriptProjectionSourceRevisions(
+  runStore: RunTranscriptStore | undefined,
+  run: RunRecord,
+  page: TranscriptPage,
+): ProjectionSourceRevision[] {
+  const runStoreRevision = statusServerStoreProjectionSourceRevision("runs", runStore) ?? {
+    source: "runs",
+    revision: [run.status, run.updatedAt, run.transcriptEventCount ?? "unknown"].join(":"),
+    observedAt: run.updatedAt,
+  };
+  const lastEvent = page.events.at(-1) ?? null;
+  const totalEventCount = Math.max(run.transcriptEventCount ?? 0, page.nextOffset ?? page.offset + page.events.length);
+  return [
+    runStoreRevision,
+    {
+      source: `transcript:${run.runId}`,
+      revision: [totalEventCount, lastEvent?.sequence ?? "none", lastEvent?.at ?? run.updatedAt].join(":"),
+      observedAt: lastEvent?.at ?? run.updatedAt,
+    },
+  ];
+}
+
+function statusServerStoreProjectionSourceRevision(source: string, store: unknown): ProjectionSourceRevision | null {
+  if (!isStatusServerProjectionRevisionStore(store)) return null;
+  return { source, revision: store.projectionRevision(), observedAt: null };
+}
+
+function toProjectionSourceRevision(revision: WebProjectionSourceRevision): ProjectionSourceRevision {
+  return { source: revision.source, revision: revision.revision, observedAt: revision.observedAt };
+}
+
+function historyProjectionScopeKey(limits: { sessionLimit: number; timelineLimit: number }): string {
+  return `global:session:${limits.sessionLimit}:timeline:${limits.timelineLimit}`;
+}
+
+function transcriptProjectionScopeKey(run: RunRecord, page: TranscriptPage): string {
+  return `${run.runId}:offset:${page.offset}:limit:${page.limit}`;
+}
+
+function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage): Record<string, unknown> {
+  const firstEvent = page.events[0] ?? null;
+  const lastEvent = page.events.at(-1) ?? null;
+  return {
+    runId: run.runId,
+    sessionId: run.sessionId,
+    issueKey: run.issueIdentifier || run.issueId,
+    offset: page.offset,
+    limit: page.limit,
+    nextOffset: page.nextOffset,
+    eventCount: page.events.length,
+    firstSequence: firstEvent?.sequence ?? null,
+    lastSequence: lastEvent?.sequence ?? null,
+    lastEventAt: lastEvent?.at ?? null,
+  };
 }
 
 const STATUS_SERVER_WEB_PROJECTION_COLUMN_IDS: readonly IssueBoardColumnId[] = [
@@ -3772,10 +3925,14 @@ async function resolveWebTranscriptRun(runStore: RunTranscriptStore, sessionIdOr
 }
 
 async function readBoundedWebTranscript(runStore: RunTranscriptStore, runId: string, url?: URL): Promise<TranscriptEvent[]> {
-  const requestedPage = parseWebTranscriptPagination(url);
-  if (requestedPage) return (await runStore.readTranscript(runId, requestedPage)).events;
+  return (await readBoundedWebTranscriptPage(runStore, runId, url)).events;
+}
 
-  return (await runStore.readTranscriptTail(runId, { limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT })).events;
+async function readBoundedWebTranscriptPage(runStore: RunTranscriptStore, runId: string, url?: URL): Promise<TranscriptPage> {
+  const requestedPage = parseWebTranscriptPagination(url);
+  if (requestedPage) return runStore.readTranscript(runId, requestedPage);
+
+  return runStore.readTranscriptTail(runId, { limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT });
 }
 
 function parseWebTranscriptPagination(url: URL | undefined): { offset: number; limit: number } | null {
