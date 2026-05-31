@@ -41,6 +41,17 @@ describe("ProjectionTransactionService", () => {
         { source: "linear", revision: "10", observedAt: fixedTime },
       ],
       sourceCursors: { z: "cursor", a: 1 },
+      sourceFreshness: [
+        {
+          source: "linear",
+          status: "stale",
+          checkedAt: fixedTime,
+          revision: "10",
+          lastSuccessAt: "2026-01-02T03:03:05.000Z",
+          staleMs: 60_000,
+          detail: "Linear import is outside the freshness SLA",
+        },
+      ],
       fields: { fetchedStates: [{ id: "started" }] },
     });
     const repeated = await service.writeProjection({
@@ -51,6 +62,17 @@ describe("ProjectionTransactionService", () => {
         { source: "runs", revision: 2 },
       ],
       sourceCursors: { a: 1, z: "cursor" },
+      sourceFreshness: [
+        {
+          source: "linear",
+          status: "stale",
+          checkedAt: fixedTime,
+          revision: "10",
+          lastSuccessAt: "2026-01-02T03:03:05.000Z",
+          staleMs: 60_000,
+          detail: "Linear import is outside the freshness SLA",
+        },
+      ],
       fields: { fetchedStates: [{ id: "started" }] },
     });
 
@@ -62,6 +84,29 @@ describe("ProjectionTransactionService", () => {
     expect(repeated.revision.contentSha256).toBe(first.revision.contentSha256);
     expect(store.revisions()).toHaveLength(1);
     expect(store.payloadWrites()).toHaveLength(1);
+    expect(first.revision.sourceFreshness).toEqual([
+      {
+        source: "linear",
+        status: "stale",
+        checkedAt: fixedTime,
+        revision: "10",
+        lastSuccessAt: "2026-01-02T03:03:05.000Z",
+        lastErrorAt: null,
+        staleMs: 60_000,
+        detail: "Linear import is outside the freshness SLA",
+      },
+      {
+        source: "runs",
+        status: "fresh",
+        checkedAt: fixedTime,
+        revision: 2,
+        lastSuccessAt: fixedTime,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "runs source revision 2 observed",
+      },
+    ]);
+    expect(first.revision.sourceCursors.sourceFreshness).toEqual(first.revision.sourceFreshness);
 
     expect(publications).toEqual([
       {
@@ -292,6 +337,7 @@ class InMemoryProjectionTransaction implements ProjectionTransactionRevisionPort
       revision: input.revision,
       sourceRevisions: input.sourceRevisions.map((revision) => ({ ...revision })),
       sourceCursors: cloneJson(input.sourceCursors),
+      sourceFreshness: input.sourceFreshness.map((freshness) => ({ ...freshness })),
       contentSha256: input.contentSha256,
       generatedAt: input.generatedAt,
       expiresAt: input.expiresAt,
@@ -341,11 +387,12 @@ class RecordingProjectionSqlRunner implements ProjectionSqlQueryRunner {
         revision: values[3],
         source_revisions: JSON.parse(String(values[4])) as unknown,
         source_cursors: JSON.parse(String(values[5])) as unknown,
-        content_sha256: values[6],
-        generated_at: values[7],
-        expires_at: values[8] ?? null,
+        source_freshness: JSON.parse(String(values[6])) as unknown,
+        content_sha256: values[7],
+        generated_at: values[8],
+        expires_at: values[9] ?? null,
         superseded_at: null,
-        created_at: values[7],
+        created_at: values[8],
       };
       this.nextProjectionRevisionId += 1;
       return { rows: [row as TRow] };
@@ -407,6 +454,7 @@ function cloneRevisionRecord(record: ProjectionRevisionRecord): ProjectionRevisi
     ...record,
     sourceRevisions: record.sourceRevisions.map((revision) => ({ ...revision })),
     sourceCursors: cloneJson(record.sourceCursors),
+    sourceFreshness: record.sourceFreshness.map((freshness) => ({ ...freshness })),
   };
 }
 
