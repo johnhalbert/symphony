@@ -132,6 +132,70 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.running).toBe(0);
   });
 
+  it("persists distinct Hermes ACP runtime metadata on started runs", async () => {
+    const config = testConfig(root);
+    config.agent.harness = "hermes_acp";
+    config.hermes.provider = "openrouter";
+    config.hermes.model = "anthropic/claude-sonnet-test";
+    config.hermes.acpBinaryPath = "/opt/hermes/bin/hermes";
+    config.hermes.acpSourceProfile = "dogfood";
+    config.hermes.acpProfilePrefix = "sym-test";
+    config.hermes.workerSessionLifecycle = "fresh_per_run";
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness: AgentHarness & { runs: Array<{ ctx: AgentRunContext; prompt: string }> } = {
+      id: "hermes_acp",
+      capabilities: { continuation: true, mcpHandoff: true },
+      runs: [],
+      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+        this.runs.push({ ctx, prompt });
+        yield { type: "session_started", sessionId: `hermes-acp-${ctx.issue.id}-${ctx.turnNumber}` };
+        yield { type: "completed", message: "hermes acp completed" };
+      },
+    };
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "Hermes ACP dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "Hermes ACP run completion");
+    await orchestrator.stop();
+
+    await expect(runStore.latestRunForIssue(candidate.id)).resolves.toMatchObject({
+      harnessId: "hermes_acp",
+      runtimeModel: "anthropic/claude-sonnet-test",
+      runtimeModelParams: [],
+      runtimeSettingSources: [
+        "host_hermes:/opt/hermes/bin/hermes",
+        "source_profile:dogfood",
+        "profile_prefix:sym-test",
+        "provider:openrouter",
+      ],
+      runtimeMode: null,
+      runtimeAgentLifecycle: "fresh_per_run",
+    });
+  });
+
   it("records provider-limit gates without normal retry and resumes after the window closes", async () => {
     const config = testConfig(root);
     config.hermes.provider = "openai-codex";

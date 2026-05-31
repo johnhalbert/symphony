@@ -3217,11 +3217,13 @@ function effectiveRuntimeModeForEntry(entry: RunningEntry, config: ServiceConfig
 
 function runtimeProviderForHarness(harnessId: string, config: ServiceConfig): string | null {
   if (harnessId === "hermes") return config.hermes.provider;
+  if (harnessId === "hermes_acp") return config.hermes.provider ?? "host_hermes";
   return harnessId;
 }
 
 function runtimeModelForHarness(harnessId: string, config: ServiceConfig): string | null {
   if (harnessId === "hermes") return config.hermes.model;
+  if (harnessId === "hermes_acp") return config.hermes.model;
   if (harnessId === "cursor") return config.cursor.model;
   return null;
 }
@@ -3265,6 +3267,20 @@ function runtimeMetadataForEntry(
       runtimeModelParams: [],
       runtimeSettingSources: [
         `template:${hermesTemplateForEntry(entry, config)}`,
+        ...(config.hermes.provider === null ? [] : [`provider:${config.hermes.provider}`]),
+      ],
+      runtimeMode: effectiveRuntimeModeForEntry(entry, config),
+      runtimeAgentLifecycle: config.hermes.workerSessionLifecycle,
+    };
+  }
+  if (harnessId === "hermes_acp") {
+    return {
+      runtimeModel: config.hermes.model,
+      runtimeModelParams: [],
+      runtimeSettingSources: [
+        `host_hermes:${config.hermes.acpBinaryPath ?? "PATH:hermes"}`,
+        `source_profile:${config.hermes.acpSourceProfile ?? "active"}`,
+        `profile_prefix:${config.hermes.acpProfilePrefix ?? "symphony"}`,
         ...(config.hermes.provider === null ? [] : [`provider:${config.hermes.provider}`]),
       ],
       runtimeMode: effectiveRuntimeModeForEntry(entry, config),
