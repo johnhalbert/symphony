@@ -9,9 +9,6 @@ import {
 } from "../../src/core/harness/HandoffMcp.js";
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
-import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
-import { mapAgentEventToRunActivityEvent } from "../../src/core/transcript/RunActivityEventMapper.js";
-
 import type { ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
 import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
 import { redactTranscriptText, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
@@ -77,7 +74,6 @@ export type HermesAcpPermissionResolver = (
 ) => HermesAcpPermissionDecision | Promise<HermesAcpPermissionDecision>;
 
 export interface HermesAcpHarnessOptions {
-  runStore?: RunTranscriptStore;
   cliPath?: string;
   discoverHostHermes?: (options: Parameters<typeof discoverHostHermes>[0]) => Promise<HostHermesDiscoveryResult>;
   profileLeaseFactory?: (options: HostHermesAcpProfileLeaseOptions) => Promise<HostHermesAcpProfileLease>;
@@ -184,11 +180,9 @@ export class HermesAcpHarness implements AgentHarness {
 
     const queue = new AsyncEventQueue<AgentEvent>();
     let terminalStatus: TerminalStatus = null;
-    let sessionStarted = false;
     let responseText = "";
     let pendingFinalUsageUpdateTokens: Partial<TokenCounts> | null = null;
     let activitySequence = 0;
-    let runtimeActivitySequence = 0;
 
     const runActivityContext = (at: string, sequence: number, idScope?: string): HermesAcpRunActivityContext => ({
       runId,
@@ -204,23 +198,9 @@ export class HermesAcpHarness implements AgentHarness {
       return attachHermesAcpRunActivity({ ...event, at }, runActivityContext(at, ++activitySequence), metadata);
     };
     const enqueue = (event: AgentEvent, metadata?: HermesAcpRunActivityMetadata): void => queue.push(withRunActivity(event, metadata));
-    const persistRuntimeAgentEvent = (event: AgentEvent, metadata?: HermesAcpRunActivityMetadata): void => {
-      const at = event.at ?? new Date().toISOString();
-      const activityEvent = attachHermesAcpRunActivity(
-        { ...event, at },
-        runActivityContext(at, ++runtimeActivitySequence, "runtime-activity"),
-        metadata,
-      );
-      void this.options.runStore?.appendEvent({
-        runId,
-        at,
-        source: "runtime",
-        ...mapAgentEventToRunActivityEvent(activityEvent),
-      });
-    };
-    const persistRuntimeEvent = (event: HermesAcpRuntimeEvent, mappedEvents?: HermesAcpMappedAgentEvent[]): void => {
+    const enqueueRuntimeEvent = (event: HermesAcpRuntimeEvent, mappedEvents?: HermesAcpMappedAgentEvent[]): void => {
       for (const mapped of runtimeAgentEventsForHermesAcpRuntimeEvent(event, mappedEvents)) {
-        persistRuntimeAgentEvent(mapped.event, mapped.runActivityMetadata);
+        enqueue(mapped.event, mapped.runActivityMetadata);
       }
     };
     const onSessionUpdate = (params: unknown): void => {
@@ -229,7 +209,6 @@ export class HermesAcpHarness implements AgentHarness {
       const mappedEvents = mapHermesAcpSessionUpdateWithMetadata(event.update).map((mapped) =>
         withAcpSessionUpdateMetadata(mapped, event.sessionId, event.update),
       );
-      if (sessionStarted) persistRuntimeEvent(event, mappedEvents);
       responseText += hermesAcpAgentMessageDelta(event.update);
       for (const mapped of mappedEvents) {
         if (mapped.event.type === "tokens" && acpSessionUpdateKind(event.update) === "usage_update") {
@@ -245,41 +224,13 @@ export class HermesAcpHarness implements AgentHarness {
     ): Promise<Record<string, unknown>> => {
       const parsedRequest = parseHermesAcpPermissionRequest(params);
       const resolution = await this.resolvePermissionRequest(ctx, runId, activeRun, parsedRequest, request);
-      const event: HermesAcpRuntimeEvent = { type: "permission.resolved", resolution };
-      if (sessionStarted) persistRuntimeEvent(event);
-      if (resolution.outcome === "cancelled") {
-        enqueue({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          message: `Host Hermes ACP permission request denied: ${resolution.reason}`,
-          payload: {
-            sessionId: resolution.request.sessionId,
-            requestKind: resolution.request.requestKind,
-            toolCallId: resolution.request.toolCallId,
-            reason: resolution.reason,
-            paramsPreview: preview(params, 500),
-            redacted: true,
-          },
-        });
-      } else {
-        enqueue({
-          type: "progress",
-          activitySource: "tool",
-          message: `Host Hermes ACP permission ${resolution.selectedOptionId ?? "selected"} for ${resolution.request.requestKind}`,
-        });
-      }
+      enqueueRuntimeEvent({ type: "permission.resolved", resolution });
       return resolution.response;
     };
 
     const onDiagnostic = (diagnostic: HostHermesAcpDiagnostic): void => {
       const event: HermesAcpRuntimeEvent = { type: "diagnostic", diagnostic };
-      if (sessionStarted) persistRuntimeEvent(event);
-      enqueue({
-        type: "run_diagnostic",
-        code: diagnostic.code,
-        message: diagnostic.message,
-        ...(diagnostic.details === undefined ? {} : { payload: diagnostic.details }),
-      });
+      enqueueRuntimeEvent(event);
     };
 
     const failRun = (message: string, payload?: unknown): void => {
@@ -334,8 +285,7 @@ export class HermesAcpHarness implements AgentHarness {
       activeRun.symphonySessionId = `${lease.profile.profileName}:${acpSessionId}:${runId}`;
       await writeActiveHandoffMcpContexts(ctx, { activeRunId: runId, sessionId: activeRun.symphonySessionId });
       yield withRunActivity({ type: "session_started", sessionId: activeRun.symphonySessionId, threadId: acpSessionId, runId });
-      sessionStarted = true;
-      persistRuntimeAgentEvent(
+      enqueue(
         { type: "progress", activitySource: "stream", message: `Host Hermes ACP profile ${lease.profile.profileName}` },
         {
           actor: "runtime",
