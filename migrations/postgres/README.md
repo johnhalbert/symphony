@@ -7,7 +7,8 @@ Migration files use the `NNNN_description.sql` naming convention. The migration 
 Current migrations:
 
 - `0001_migration_foundation.sql` establishes the runner baseline.
-- `0002_symphony_owned_state.sql` creates Symphony-owned operational state and durable frontend projection tables, including the `symphony.run_session` and `symphony.run_activity_event` tables used by `PostgresRunActivityAppendStore`.
+- `0002_symphony_owned_state.sql` creates Symphony-owned operational state and durable frontend projection tables, including the `symphony.run_session` and `symphony.run_activity_event` tables used by `PostgresRunActivityAppendStore`. This migration is published and checksum-stable; do not edit it after release.
+- `0003_projection_freshness_indexes.sql` adds projection `updated_at` freshness columns and replaces projection read indexes so databases that already applied `0002` can upgrade without migration-checksum conflicts.
 
 Common development commands:
 
@@ -72,7 +73,7 @@ When raw tool output, harness payloads, or diagnostic payloads exceed the inline
 
 Static Vitest coverage in `tests/postgres-schema.test.ts` asserts that the configured migration path contains the owned-state schema and that it declares the required tables, indexes, source-boundary notes, transition policy, run activity/chat reconstruction fields, run-session scoped duplicate constraints, and oversized-payload policy.
 
-The opt-in Docker-backed validation applies the configured migrations to an empty `postgres:16-alpine` database, verifies the migration ledger, exercises basic operational/projection insert and query paths, and runs a real `PostgresRunActivityAppendStore` append plus duplicate/no-op replay path against the migrated schema:
+The opt-in Docker-backed validation applies the configured migrations to an empty `postgres:16-alpine` database, verifies the migration ledger, exercises basic operational/projection insert and query paths, checks projection `updated_at` columns and read-index definitions, and runs a real `PostgresRunActivityAppendStore` append plus duplicate/no-op replay path against the migrated schema. It also validates the upgrade path from a database that already recorded the published `0002_symphony_owned_state.sql` checksum before applying the follow-up projection freshness migration:
 
 ```bash
 SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1 npx vitest run tests/postgres-schema.test.ts --no-file-parallelism

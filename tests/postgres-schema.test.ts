@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -7,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { Pool } from "pg";
 import {
   applyConfiguredPostgresMigrations,
+  applyPostgresMigrationsWithClient,
   discoverPostgresMigrations,
 } from "../src/core/database/PostgresMigrations.js";
 import {
@@ -19,8 +21,13 @@ const execFileAsync = promisify(execFile);
 
 const configuredMigrationsDirUrl = new URL("../migrations/postgres/", import.meta.url);
 const configuredMigrationsDir = fileURLToPath(configuredMigrationsDirUrl);
-const migrationUrl = new URL("../migrations/postgres/0002_symphony_owned_state.sql", import.meta.url);
+const ownedStateMigrationUrl = new URL("../migrations/postgres/0002_symphony_owned_state.sql", import.meta.url);
+const projectionFreshnessMigrationUrl = new URL(
+  "../migrations/postgres/0003_projection_freshness_indexes.sql",
+  import.meta.url,
+);
 const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
+const publishedOwnedStateChecksumSha256 = "8e10c03c6cfa34e9672e350c59ff4998459989529a82c98cbd9f714469799298";
 
 const operationalTables = [
   "workspace",
@@ -58,8 +65,53 @@ const requiredLookupIndexes = [
   "projection_revision_reads_idx",
 ] as const;
 
-async function migrationSql(): Promise<string> {
-  return readFile(migrationUrl, "utf8");
+const requiredProjectionLookupIndexes = [
+  "projection_revision_current_unique_idx",
+  "dashboard_projection_scope_revision_idx",
+  "dashboard_projection_revision_reads_idx",
+  "issue_board_projection_scope_revision_idx",
+  "issue_board_projection_revision_reads_idx",
+  "sidebar_projection_scope_revision_idx",
+  "sidebar_projection_revision_reads_idx",
+  "history_projection_scope_revision_idx",
+  "history_projection_revision_reads_idx",
+  "history_projection_run_lookup_idx",
+  "transcript_projection_scope_revision_idx",
+  "transcript_projection_revision_reads_idx",
+  "transcript_projection_session_reads_idx",
+  "orchestrator_chat_projection_scope_revision_idx",
+  "orchestrator_chat_projection_revision_reads_idx",
+  "orchestrator_chat_projection_issue_idx",
+] as const;
+
+const projectionFreshnessIndexes = [
+  "projection_revision_reads_idx",
+  "dashboard_projection_revision_reads_idx",
+  "issue_board_projection_revision_reads_idx",
+  "sidebar_projection_revision_reads_idx",
+  "history_projection_revision_reads_idx",
+  "history_projection_run_lookup_idx",
+  "transcript_projection_revision_reads_idx",
+  "transcript_projection_session_reads_idx",
+  "orchestrator_chat_projection_revision_reads_idx",
+  "orchestrator_chat_projection_issue_idx",
+] as const;
+
+async function ownedStateMigrationSql(): Promise<string> {
+  return readFile(ownedStateMigrationUrl, "utf8");
+}
+
+async function projectionFreshnessMigrationSql(): Promise<string> {
+  return readFile(projectionFreshnessMigrationUrl, "utf8");
+}
+
+async function configuredMigrationSql(): Promise<string> {
+  const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
+  return migrations.map((migration) => migration.sql).join("\n");
+}
+
+function sha256(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
 }
 
 async function migrationReadme(): Promise<string> {
@@ -74,19 +126,51 @@ describe("Postgres Symphony-owned state migration", () => {
   it("keeps the owned-state schema on the configured migration path after the runner baseline", async () => {
     const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
 
-    expect(migrations.map((migration) => migration.id)).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
+    expect(migrations.map((migration) => migration.id)).toEqual([
+      "0001_migration_foundation",
+      "0002_symphony_owned_state",
+      "0003_projection_freshness_indexes",
+    ]);
     const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
-    expect(ownedState?.filePath).toBe(fileURLToPath(migrationUrl));
+    const projectionFreshness = migrations.find((migration) => migration.id === "0003_projection_freshness_indexes");
+    expect(ownedState?.filePath).toBe(fileURLToPath(ownedStateMigrationUrl));
+    expect(projectionFreshness?.filePath).toBe(fileURLToPath(projectionFreshnessMigrationUrl));
+    expect(sha256(ownedState?.sql ?? "")).toBe(publishedOwnedStateChecksumSha256);
+    expect(ownedState?.checksumSha256).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_session");
     expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_activity_event");
     expect(ownedState?.sql).toContain("run_activity_event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY");
     expect(ownedState?.sql).toContain("UNIQUE (run_session_id, sequence)");
     expect(ownedState?.sql).toContain("run_activity_event_external_event_unique_idx");
+    expect(projectionFreshness?.sql).toContain("ALTER TABLE symphony.projection_revision");
     expect(ownedState?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+    expect(projectionFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+  });
+
+  it("delivers projection updated_at columns and freshness indexes through the follow-up migration", async () => {
+    const normalized = normalizedSql(await projectionFreshnessMigrationSql());
+
+    for (const table of projectionTables) {
+      expect(normalized, `missing updated_at upgrade for ${table}`).toContain(
+        `alter table symphony.${table} add column if not exists updated_at timestamptz not null default now()`,
+      );
+    }
+
+    for (const indexName of projectionFreshnessIndexes) {
+      expect(normalized, `missing drop for ${indexName}`).toContain(`drop index if exists symphony.${indexName}`);
+      expect(normalized, `missing recreated ${indexName}`).toContain(`index if not exists ${indexName}`);
+    }
+
+    expect(normalized).toContain(
+      "on symphony.projection_revision (projection_name, scope_kind, scope_key, revision desc, updated_at desc, generated_at desc)",
+    );
+    expect(normalized).toContain(
+      "on symphony.orchestrator_chat_projection (issue_key, revision desc, updated_at desc)",
+    );
   });
 
   it("declares all required operational and projection tables", async () => {
-    const normalized = normalizedSql(await migrationSql());
+    const normalized = normalizedSql(await configuredMigrationSql());
 
     for (const table of [...operationalTables, ...projectionTables]) {
       expect(normalized, `missing symphony.${table}`).toContain(`create table if not exists symphony.${table}`);
@@ -96,10 +180,10 @@ describe("Postgres Symphony-owned state migration", () => {
   });
 
   it("declares lookup indexes for high-volume runtime and projection reads", async () => {
-    const normalized = normalizedSql(await migrationSql());
+    const normalized = normalizedSql(await configuredMigrationSql());
 
-    for (const indexName of requiredLookupIndexes) {
-      expect(normalized, `missing ${indexName}`).toContain(`create index if not exists ${indexName}`);
+    for (const indexName of [...requiredLookupIndexes, ...requiredProjectionLookupIndexes]) {
+      expect(normalized, `missing ${indexName}`).toContain(`index if not exists ${indexName}`);
     }
 
     expect(normalized).toContain("on symphony.run_activity_event (run_session_id, sequence)");
@@ -113,11 +197,14 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("on symphony.chat_message (run_id, event_sequence_start, event_sequence_end)");
     expect(normalized).toContain("on symphony.writeback_operation (status, next_attempt_at, created_at)");
     expect(normalized).toContain("on symphony.approval_request (status, expires_at, requested_at)");
-    expect(normalized).toContain("on symphony.projection_revision (projection_name, scope_kind, scope_key, revision desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.projection_revision (projection_name, scope_kind, scope_key, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.dashboard_projection (scope_key, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.transcript_projection (run_id, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.orchestrator_chat_projection (scope_key, conversation_key, revision desc, updated_at desc, generated_at desc)");
   });
 
   it("declares run activity and chat message fields for replay, reconstruction, and idempotency", async () => {
-    const normalized = normalizedSql(await migrationSql());
+    const normalized = normalizedSql(await configuredMigrationSql());
 
     for (const fragment of [
       "event_id text not null",
@@ -158,7 +245,7 @@ describe("Postgres Symphony-owned state migration", () => {
   });
 
   it("documents external authorities, file-backed transition, and oversized raw payload references", async () => {
-    const sql = (await migrationSql()).toLowerCase();
+    const sql = (await configuredMigrationSql()).toLowerCase();
     const readme = (await migrationReadme()).toLowerCase();
     const combined = `${sql}\n${readme}`;
 
@@ -174,13 +261,32 @@ describe("Postgres Symphony-owned state migration", () => {
   });
 
   it("keeps projection payloads tied to durable revision metadata", async () => {
-    const normalized = normalizedSql(await migrationSql());
+    const normalized = normalizedSql(await configuredMigrationSql());
+
+    expect(normalized).toContain("create table if not exists symphony.projection_revision");
+    expect(normalized).toContain("projection_name text not null check");
+    expect(normalized).toContain("unique (projection_name, scope_kind, scope_key, revision)");
+    expect(normalized).toContain(
+      "alter table symphony.projection_revision add column if not exists updated_at timestamptz not null default now()",
+    );
 
     for (const table of projectionTables.filter((table) => table !== "projection_revision")) {
       expect(normalized, `missing revision FK for ${table}`).toContain(
         `create table if not exists symphony.${table} ( projection_revision_id bigint primary key references symphony.projection_revision(projection_revision_id) on delete cascade`,
       );
       expect(normalized, `missing read index for ${table}`).toContain(`${table}_revision_reads_idx`);
+    }
+
+    for (const table of projectionTables) {
+      const tableStart = normalized.indexOf(`create table if not exists symphony.${table}`);
+      expect(tableStart, `missing ${table}`).toBeGreaterThanOrEqual(0);
+      const tableEnd = normalized.indexOf(");", tableStart);
+      expect(tableEnd, `unterminated table definition for ${table}`).toBeGreaterThan(tableStart);
+      const definition = normalized.slice(tableStart, tableEnd);
+      expect(definition, `missing revision column for ${table}`).toContain("revision bigint not null check (revision > 0)");
+      expect(normalized, `missing updated_at upgrade for ${table}`).toContain(
+        `alter table symphony.${table} add column if not exists updated_at timestamptz not null default now()`,
+      );
     }
   });
 
@@ -211,7 +317,11 @@ describe("Postgres Symphony-owned state migration", () => {
         await applyConfiguredMigrations(connectionString);
 
         const appliedMigrations = await psql(containerName, "select id from symphony_schema_migrations order by id;");
-        expect(appliedMigrations.trim().split(/\s+/)).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
+        expect(appliedMigrations.trim().split(/\s+/)).toEqual([
+          "0001_migration_foundation",
+          "0002_symphony_owned_state",
+          "0003_projection_freshness_indexes",
+        ]);
 
         const tableCount = await psql(
           containerName,
@@ -220,9 +330,10 @@ describe("Postgres Symphony-owned state migration", () => {
         expect(Number(tableCount.trim())).toBe([...operationalTables, ...projectionTables, "raw_payload_reference"].length);
 
         const indexes = await psql(containerName, "select indexname from pg_indexes where schemaname = 'symphony' order by indexname;");
-        for (const indexName of requiredLookupIndexes) {
+        for (const indexName of [...requiredLookupIndexes, ...requiredProjectionLookupIndexes]) {
           expect(indexes).toContain(indexName);
         }
+        await expectProjectionFreshnessCatalog(containerName);
 
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
         await expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName);
@@ -234,10 +345,59 @@ describe("Postgres Symphony-owned state migration", () => {
     },
     120_000,
   );
+
+  liveIt(
+    "upgrades a database that already applied the published 0002 migration without checksum conflicts",
+    async () => {
+      const containerName = `symphony-postgres-schema-upgrade-${process.pid}-${Date.now()}`;
+      try {
+        await docker(
+          [
+            "run",
+            "--rm",
+            "--name",
+            containerName,
+            "-e",
+            "POSTGRES_HOST_AUTH_METHOD=trust",
+            "-p",
+            "127.0.0.1::5432",
+            "-d",
+            "postgres:16-alpine",
+          ],
+          60_000,
+        );
+        await waitForPostgres(containerName);
+        const connectionString = await postgresConnectionString(containerName);
+
+        await applyPublishedOwnedStateBaselineMigrations(connectionString);
+        expect(await appliedMigrationIds(containerName)).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
+        expect(await appliedMigrationChecksum(containerName, "0002_symphony_owned_state")).toBe(
+          publishedOwnedStateChecksumSha256,
+        );
+
+        const result = await applyConfiguredMigrations(connectionString);
+        expect(result.skipped).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
+        expect(result.applied).toEqual(["0003_projection_freshness_indexes"]);
+        expect(await appliedMigrationIds(containerName)).toEqual([
+          "0001_migration_foundation",
+          "0002_symphony_owned_state",
+          "0003_projection_freshness_indexes",
+        ]);
+        expect(await appliedMigrationChecksum(containerName, "0002_symphony_owned_state")).toBe(
+          publishedOwnedStateChecksumSha256,
+        );
+        await expectProjectionFreshnessCatalog(containerName);
+        await expectOperationalAndProjectionInsertQueryPaths(containerName);
+      } finally {
+        await docker(["rm", "-f", containerName]).catch(() => undefined);
+      }
+    },
+    120_000,
+  );
 });
 
-async function applyConfiguredMigrations(connectionString: string): Promise<void> {
-  await applyConfiguredPostgresMigrations({
+async function applyConfiguredMigrations(connectionString: string) {
+  return applyConfiguredPostgresMigrations({
     database: {
       postgres: {
         connectionString,
@@ -247,6 +407,89 @@ async function applyConfiguredMigrations(connectionString: string): Promise<void
       },
     },
   });
+}
+
+async function applyPublishedOwnedStateBaselineMigrations(connectionString: string): Promise<void> {
+  const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
+  const baselineMigrations = migrations.filter((migration) =>
+    ["0001_migration_foundation", "0002_symphony_owned_state"].includes(migration.id),
+  );
+  expect(baselineMigrations.map((migration) => migration.id)).toEqual([
+    "0001_migration_foundation",
+    "0002_symphony_owned_state",
+  ]);
+
+  const pool = new Pool({ connectionString });
+  const client = await pool.connect();
+  try {
+    await applyPostgresMigrationsWithClient(client, baselineMigrations, {
+      migrationsDir: configuredMigrationsDir,
+      migrationsTable: "symphony_schema_migrations",
+    });
+  } finally {
+    client.release();
+    await pool.end();
+  }
+}
+
+async function appliedMigrationIds(containerName: string): Promise<string[]> {
+  const appliedMigrations = await psql(containerName, "select id from symphony_schema_migrations order by id;");
+  return appliedMigrations.trim().split(/\s+/).filter(Boolean);
+}
+
+async function appliedMigrationChecksum(containerName: string, migrationId: string): Promise<string> {
+  const checksum = await psql(
+    containerName,
+    `select checksum_sha256 from symphony_schema_migrations where id = '${migrationId}';`,
+  );
+  return checksum.trim();
+}
+
+async function expectProjectionFreshnessCatalog(containerName: string): Promise<void> {
+  const columnMetadata = await psql(
+    containerName,
+    String.raw`
+      select coalesce(
+        jsonb_object_agg(
+          table_name,
+          jsonb_build_object('nullable', is_nullable, 'default', column_default)
+          order by table_name
+        ),
+        '{}'::jsonb
+      )::text
+      from information_schema.columns
+      where table_schema = 'symphony'
+        and column_name = 'updated_at'
+        and table_name in (${sqlStringList(projectionTables)});
+    `,
+  );
+  const columns = JSON.parse(columnMetadata.trim()) as Record<string, { nullable: string; default: string | null }>;
+  expect(Object.keys(columns).sort()).toEqual([...projectionTables].sort());
+  for (const table of projectionTables) {
+    expect(columns[table], `missing updated_at metadata for ${table}`).toMatchObject({ nullable: "NO" });
+    expect(columns[table]?.default, `missing updated_at default for ${table}`).toContain("now()");
+  }
+
+  const indexMetadata = await psql(
+    containerName,
+    String.raw`
+      select coalesce(jsonb_object_agg(indexname, indexdef order by indexname), '{}'::jsonb)::text
+      from pg_indexes
+      where schemaname = 'symphony'
+        and indexname in (${sqlStringList(projectionFreshnessIndexes)});
+    `,
+  );
+  const indexes = JSON.parse(indexMetadata.trim()) as Record<string, string>;
+  expect(Object.keys(indexes).sort()).toEqual([...projectionFreshnessIndexes].sort());
+  for (const indexName of projectionFreshnessIndexes) {
+    expect(indexes[indexName]?.toLowerCase(), `missing updated_at ordering for ${indexName}`).toContain(
+      "updated_at desc",
+    );
+  }
+}
+
+function sqlStringList(values: readonly string[]): string {
+  return values.map((value) => `'${value.replace(/'/g, "''")}'`).join(", ");
 }
 
 async function expectOperationalAndProjectionInsertQueryPaths(containerName: string): Promise<void> {
