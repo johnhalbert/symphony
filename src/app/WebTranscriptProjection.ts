@@ -100,6 +100,9 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
   const payloadKind = normalizedPayloadKind(payload);
+  if (isLegacyAcpProtocolEvent(eventType)) {
+    return { ...projectStatusMessage(event, payload, "runtime_diagnostic"), state: "runtime_diagnostic" };
+  }
   if (isToolEvent(eventType, payloadKind)) return projectToolCallMessage(event, payload, eventType);
   if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
   if (isTaskEvent(eventType, payloadKind)) return projectTaskMessage(event, payload);
@@ -211,7 +214,7 @@ function projectStatusMessage(
   event: TranscriptEvent,
   payload: Record<string, unknown>,
   eventType: string,
-): TranscriptMessage {
+): Extract<TranscriptMessage, { kind: "status" }> {
   return {
     kind: "status",
     state: firstCleanString(payload.state, payload.status, payload.subtype, payload.kind) ?? eventType,
@@ -293,6 +296,10 @@ function isSystemEvent(eventType: string, payloadKind: string | null): boolean {
 
 function isStatusEvent(eventType: string, payloadKind: string | null): boolean {
   return eventType === "status" || eventType === "status_update" || payloadKind === "status";
+}
+
+function isLegacyAcpProtocolEvent(eventType: string): boolean {
+  return eventType === "acp_session_update" || eventType === "acp_permission_denied" || eventType === "acp_diagnostic" || eventType === "hermes_acp_profile";
 }
 
 function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind: string | null): boolean {

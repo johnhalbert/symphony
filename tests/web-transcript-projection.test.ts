@@ -395,6 +395,40 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("toolArgs");
   });
 
+  it("downgrades legacy ACP protocol event names to neutral public status states", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "acp_session_update",
+        source: "runtime",
+        message: "Legacy ACP session update",
+        payload: { kind: "session_update", status: "tool_call_update", messagePreview: "legacy update" },
+      }),
+      event({
+        eventType: "acp_permission_denied",
+        source: "runtime",
+        message: "Legacy permission denied",
+        payload: { state: "acp_permission_denied", messagePreview: "permission denied" },
+        sequence: 2,
+      }),
+      event({
+        eventType: "hermes_acp_profile",
+        source: "runtime",
+        message: "Legacy profile detail",
+        payload: { kind: "hermes_acp_profile", messagePreview: "profile ready" },
+        sequence: 3,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      { kind: "status", state: "runtime_diagnostic", ts: "2026-01-01T00:00:00.000Z", text: "legacy update" },
+      { kind: "status", state: "runtime_diagnostic", ts: "2026-01-01T00:00:00.000Z", text: "permission denied" },
+      { kind: "status", state: "runtime_diagnostic", ts: "2026-01-01T00:00:00.000Z", text: "profile ready" },
+    ]);
+    expect(messages.flatMap((message) => message.kind === "status" ? [message.state] : [])).not.toEqual(
+      expect.arrayContaining(["acp_session_update", "acp_permission_denied", "hermes_acp_profile", "session_update", "tool_call_update"]),
+    );
+  });
+
 });
 
 function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
