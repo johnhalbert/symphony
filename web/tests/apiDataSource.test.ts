@@ -342,6 +342,39 @@ describe("API data source", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("fences in-flight cacheable GETs when realtime projection invalidation arrives", async () => {
+    const staleDashboard = { ...dashboardModel, pollLabel: "poll stale in-flight" };
+    const refreshedDashboard = { ...dashboardModel, pollLabel: "poll post-invalidation" };
+    const staleGate = deferred<Response>();
+    const freshGate = deferred<Response>();
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockReturnValueOnce(staleGate.promise)
+      .mockReturnValueOnce(freshGate.promise);
+    const dataSource = createApiDataSource("/status-server/");
+
+    const staleRequest = dataSource.getDashboard();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    dataSource.invalidateCachedReads?.();
+    const postInvalidationRequest = dataSource.getDashboard();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    staleGate.resolve(jsonResponse(staleDashboard));
+    await expect(staleRequest).resolves.toEqual(staleDashboard);
+
+    const sharedPostInvalidationRequest = dataSource.getDashboard();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    freshGate.resolve(jsonResponse(refreshedDashboard));
+    await expect(Promise.all([postInvalidationRequest, sharedPostInvalidationRequest])).resolves.toEqual([
+      refreshedDashboard,
+      refreshedDashboard,
+    ]);
+    await expect(dataSource.getDashboard()).resolves.toEqual(refreshedDashboard);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("subscribes to projection revision events through EventSource and ignores malformed payload shape safely", () => {
     FakeEventSource.instances = [];
     globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;

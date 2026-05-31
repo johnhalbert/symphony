@@ -18,6 +18,12 @@ interface CachedGetResponse {
   expiresAt: number;
 }
 
+interface InFlightGetResponse {
+  generation: number;
+  promise: Promise<unknown>;
+  token: symbol;
+}
+
 interface FetchJsonOptions {
   signal?: AbortSignal;
   cacheable?: boolean;
@@ -29,8 +35,9 @@ interface GetJsonFetcher {
 }
 
 function createGetJsonFetcher(): GetJsonFetcher {
-  const inFlight = new Map<string, Promise<unknown>>();
+  const inFlight = new Map<string, InFlightGetResponse>();
   const successCache = new Map<string, CachedGetResponse>();
+  let invalidationGeneration = 0;
 
   async function fetchJson<T>(baseUrl: string, path: string, options: FetchJsonOptions = {}): Promise<T> {
     const url = `${baseUrl}${path}`;
@@ -41,24 +48,31 @@ function createGetJsonFetcher(): GetJsonFetcher {
     if (cached && cached.expiresAt > Date.now()) return resolveCachedGet(cached.data as T, signal);
 
     const pending = inFlight.get(url);
-    if (pending) return resolveSharedGet(pending as Promise<T>, signal);
+    if (pending && pending.generation === invalidationGeneration) return resolveSharedGet(pending.promise as Promise<T>, signal);
 
+    const requestGeneration = invalidationGeneration;
+    const requestToken = Symbol(url);
     const promise = fetchJsonOnce<T>(url).then((data) => {
-      successCache.set(url, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS });
+      const current = inFlight.get(url);
+      if (current?.token === requestToken && requestGeneration === invalidationGeneration) {
+        successCache.set(url, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS });
+      }
       return data;
     });
-    inFlight.set(url, promise);
-    void promise.then(
-      () => inFlight.delete(url),
-      () => inFlight.delete(url),
-    );
+    inFlight.set(url, { generation: requestGeneration, promise, token: requestToken });
+    const clearIfCurrent = () => {
+      if (inFlight.get(url)?.token === requestToken) inFlight.delete(url);
+    };
+    void promise.then(clearIfCurrent, clearIfCurrent);
     return resolveSharedGet(promise, signal);
   }
 
   return {
     fetchJson,
     invalidateCache() {
+      invalidationGeneration += 1;
       successCache.clear();
+      inFlight.clear();
     },
   };
 }
