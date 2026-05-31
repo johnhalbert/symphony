@@ -1531,7 +1531,6 @@ export class Orchestrator {
       if (event.type === "rate_limits") this.rateLimits = event.payload;
       if (event.type === "provider_limit") {
         const signal = await this.recordProviderLimitEvent(entry, event.signal, eventAt);
-        await this.persistHarnessEvent(entry, { ...event, signal });
         const runId = entry.activeRunId ?? entry.runId ?? "";
         if (runId.length > 0) {
           await this.updateRunTerminalStateIfRunning(runId, {
@@ -1542,9 +1541,12 @@ export class Orchestrator {
             metadata: terminalRunMetadata(entry, "failed"),
           });
         }
+        await this.persistHarnessEvent(entry, { ...event, signal });
         throw new SymphonyError("agent_error", signal.message);
       }
-      await this.persistHarnessEvent(entry, rawEvent);
+      const terminalHarnessEvent = event.type === "completed" || event.type === "failed" || event.type === "cancelled";
+      if (!terminalHarnessEvent) await this.persistHarnessEvent(entry, rawEvent);
+
       if (event.type === "completed") {
         if (entry.runPhase === "issue_breakdown") {
           const accepted = await this.reconcileIssueBreakdownPlanHandoff(entry);
@@ -1555,6 +1557,7 @@ export class Orchestrator {
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, accepted ? "succeeded" : "failed"),
           });
+          await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           continue;
         }
@@ -1564,6 +1567,7 @@ export class Orchestrator {
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
+        await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         await this.discoverPullRequestForEntry(entry, context.workspace);
         if (
@@ -1590,6 +1594,7 @@ export class Orchestrator {
           entry.runPhase === "issue_breakdown" &&
           (await this.terminalizeAcceptedIssueBreakdownPlan(entry))
         ) {
+          await this.persistHarnessEvent(entry, event);
           return;
         }
         if (
@@ -1603,6 +1608,7 @@ export class Orchestrator {
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "succeeded"),
           });
+          await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           return;
         }
@@ -1613,6 +1619,7 @@ export class Orchestrator {
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
         });
+        await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         throw new SymphonyError("agent_error", event.error);
       }
@@ -1622,6 +1629,7 @@ export class Orchestrator {
           entry.runPhase === "issue_breakdown" &&
           (await this.terminalizeAcceptedIssueBreakdownPlan(entry))
         ) {
+          await this.persistHarnessEvent(entry, event);
           return;
         }
         if (
@@ -1635,6 +1643,7 @@ export class Orchestrator {
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "succeeded"),
           });
+          await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           return;
         }
@@ -1644,6 +1653,7 @@ export class Orchestrator {
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
         });
+        await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         throw new SymphonyError("agent_error", "Run was cancelled");
       }
@@ -2207,7 +2217,7 @@ export class Orchestrator {
   }
 
   private async persistHarnessEvent(entry: RunningEntry, event: AgentEvent): Promise<void> {
-    const runId = event.type === "run_status" ? event.runId : entry.activeRunId ?? entry.runId;
+    const runId = event.type === "run_status" ? event.runId : (entry.activeRunId ?? entry.runId);
     if (!runId) return;
     await this.options.runStore?.appendEvent({
       runId,

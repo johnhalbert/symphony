@@ -5,6 +5,26 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 
+async function startBasicRun(store: FileRunTranscriptStore, runId: string): Promise<void> {
+  await store.startRun({
+    runId,
+    role: "worker",
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    attempt: null,
+    turnNumber: 1,
+    prompt: "work",
+    harnessId: "codex",
+    runtimeModel: "gpt-5.5",
+    runtimeMode: "agent",
+    workspaceKey: "TEST-1",
+    workspacePath: "/tmp/workspace",
+    gitBranchName: "symphony/TEST-1",
+    repoPath: "/repo",
+    baseRef: "main",
+  });
+}
+
 describe("FileRunTranscriptStore", () => {
   let root: string;
 
@@ -286,6 +306,272 @@ describe("FileRunTranscriptStore", () => {
     expect(page.events[0]?.message).toContain("inputTokens: 7");
     expect(page.events[0]?.message).toContain("totalTokens: 9");
     expect(page.events[0]?.message).toContain("tokenConfigured: true");
+  });
+
+  it("reduces activity, status, token, provider-limit, and metadata events into run state", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await startBasicRun(store, "run-reduce");
+
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "session_started",
+      payload: { type: "session_started", sessionId: "session-reduce", threadId: "thread-reduce", runId: "run-reduce" },
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.100Z",
+      source: "harness",
+      eventType: "run_status",
+      payload: { type: "run_status", runId: "run-reduce", sdkStatus: "running", source: "initial" },
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.200Z",
+      source: "harness",
+      eventType: "progress",
+      message: "stream activity",
+      payload: { type: "progress", message: "stream activity", activitySource: "stream" },
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.300Z",
+      source: "harness",
+      eventType: "progress",
+      message: "tool activity",
+      payload: { type: "progress", message: "tool activity", activitySource: "tool" },
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.400Z",
+      source: "harness",
+      eventType: "tokens",
+      payload: { type: "tokens", tokens: { inputTokens: 7, totalTokens: 9 } },
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.500Z",
+      source: "harness",
+      eventType: "tokens",
+      payload: { type: "tokens", tokens: { outputTokens: 4, totalTokens: 11 } },
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.600Z",
+      source: "harness",
+      eventType: "run_diagnostic",
+      message: "stream reported 500",
+      payload: { type: "run_diagnostic", code: "cursor_stream_status_500", message: "stream reported 500", payload: { status: 500 } },
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.700Z",
+      source: "harness",
+      eventType: "provider_limit",
+      payload: {
+        type: "provider_limit",
+        signal: {
+          scope: { harnessId: "codex", providerId: "openai", model: "gpt-5.5" },
+          kind: "windowed_bucket_exhausted",
+          message: "provider window exhausted",
+          observedAt: "2026-01-01T00:00:00.700Z",
+        },
+      },
+    });
+    await store.recordPullRequestEvent({
+      runId: "run-reduce",
+      action: "updated",
+      at: "2026-01-01T00:00:00.750Z",
+      prUrl: "https://github.com/acme/repo/pull/7",
+      prNumber: 7,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastPushedAt: "2026-01-01T00:00:00.740Z",
+    });
+    await store.recordCiStatusEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.800Z",
+      ciStatus: "pending",
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.850Z",
+      source: "orchestrator",
+      eventType: "approval_request",
+      payload: { requestId: "approval-1", requestedAt: "2026-01-01T00:00:00.850Z" },
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.875Z",
+      source: "orchestrator",
+      eventType: "approval_resolved",
+      payload: { requestId: "approval-1", status: "approved" },
+    });
+    await store.appendEvent({
+      runId: "run-reduce",
+      at: "2026-01-01T00:00:00.900Z",
+      source: "harness",
+      eventType: "completed",
+      payload: { type: "completed" },
+    });
+
+    const run = await store.getRun("run-reduce");
+
+    expect(run).toMatchObject({
+      sessionId: "session-reduce",
+      agentId: "thread-reduce",
+      status: "failed",
+      completedAt: "2026-01-01T00:00:00.700Z",
+      error: "provider window exhausted",
+      tokens: { inputTokens: 7, outputTokens: 4, totalTokens: 11 },
+      transcriptEventCount: 13,
+      sdkRunStatus: "running",
+      sdkRunStatusObservedAt: "2026-01-01T00:00:00.100Z",
+      sdkRunStatusSource: "initial",
+      activitySnapshot: {
+        lastHarnessActivityAt: "2026-01-01T00:00:00.900Z",
+        lastStreamActivityAt: "2026-01-01T00:00:00.200Z",
+        lastDeltaOrToolActivityAt: "2026-01-01T00:00:00.300Z",
+        lastToolActivityAt: "2026-01-01T00:00:00.300Z",
+      },
+      failureKind: "provider_limit",
+      failureDiagnosticCode: "provider_limit",
+      failureDiagnosticMessage: "provider window exhausted",
+      failureDiagnosticAt: "2026-01-01T00:00:00.700Z",
+      providerLimit: {
+        message: "provider window exhausted",
+        scope: { harnessId: "codex", providerId: "openai", model: "gpt-5.5" },
+      },
+      prUrl: "https://github.com/acme/repo/pull/7",
+      prNumber: 7,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastPushedAt: "2026-01-01T00:00:00.740Z",
+      ciStatus: "pending",
+      pendingApprovalRequestId: null,
+      pendingApprovalRequestedAt: null,
+    });
+  });
+
+  it("rebuilds run state from persisted events after restart with deterministic terminal transitions", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await startBasicRun(store, "run-replay");
+    await store.appendEvent({
+      runId: "run-replay",
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "session_started",
+      payload: { type: "session_started", sessionId: "session-replay", threadId: "thread-replay", runId: "run-replay" },
+    });
+    await store.appendEvent({
+      runId: "run-replay",
+      at: "2026-01-01T00:00:00.050Z",
+      source: "harness",
+      eventType: "run_status",
+      payload: { type: "run_status", runId: "run-replay", sdkStatus: "running", source: "initial" },
+    });
+    await store.appendEvent({
+      runId: "run-replay",
+      at: "2026-01-01T00:00:00.100Z",
+      source: "harness",
+      eventType: "progress",
+      message: "used a tool",
+      payload: { type: "progress", message: "used a tool", activitySource: "tool" },
+    });
+    await store.appendEvent({
+      runId: "run-replay",
+      at: "2026-01-01T00:00:00.200Z",
+      source: "harness",
+      eventType: "tokens",
+      payload: { type: "tokens", tokens: { inputTokens: 3, outputTokens: 5, totalTokens: 8 } },
+    });
+    await store.recordPullRequestEvent({
+      runId: "run-replay",
+      action: "opened",
+      at: "2026-01-01T00:00:00.300Z",
+      prUrl: "https://github.com/acme/repo/pull/8",
+      prNumber: 8,
+      prBranch: "symphony/TEST-1",
+    });
+    await store.recordCiStatusEvent({ runId: "run-replay", at: "2026-01-01T00:00:00.400Z", ciStatus: "success" });
+    await store.appendEvent({
+      runId: "run-replay",
+      at: "2026-01-01T00:00:00.500Z",
+      source: "harness",
+      eventType: "run_diagnostic",
+      message: "wait threw",
+      payload: { type: "run_diagnostic", code: "cursor_run_wait_threw", message: "wait threw" },
+    });
+    await store.appendEvent({
+      runId: "run-replay",
+      at: "2026-01-01T00:00:00.600Z",
+      source: "harness",
+      eventType: "failed",
+      payload: { type: "failed", error: "boom" },
+    });
+    await store.appendEvent({
+      runId: "run-replay",
+      at: "2026-01-01T00:00:00.700Z",
+      source: "harness",
+      eventType: "completed",
+      payload: { type: "completed" },
+    });
+
+    const reloaded = new FileRunTranscriptStore(root);
+    const rebuilt = await reloaded.rebuildRunFromTranscript("run-replay");
+
+    expect(rebuilt).toMatchObject({
+      status: "failed",
+      completedAt: "2026-01-01T00:00:00.600Z",
+      error: "boom",
+      tokens: { inputTokens: 3, outputTokens: 5, totalTokens: 8 },
+      transcriptEventCount: 9,
+      sdkRunStatus: "running",
+      sdkRunStatusObservedAt: "2026-01-01T00:00:00.050Z",
+      failureKind: "cursor_sdk_wait_error",
+      failureDiagnosticCode: "cursor_run_wait_threw",
+      failureDiagnosticMessage: "wait threw",
+      activitySnapshot: {
+        lastHarnessActivityAt: "2026-01-01T00:00:00.700Z",
+        lastDeltaOrToolActivityAt: "2026-01-01T00:00:00.100Z",
+        lastToolActivityAt: "2026-01-01T00:00:00.100Z",
+      },
+      prUrl: "https://github.com/acme/repo/pull/8",
+      prNumber: 8,
+      prBranch: "symphony/TEST-1",
+      ciStatus: "success",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+
+    for (const scenario of [
+      { runId: "run-replay-completed", eventType: "completed", status: "succeeded", completedAt: "2026-01-01T00:00:01.100Z" },
+      { runId: "run-replay-cancelled", eventType: "cancelled", status: "cancelled", completedAt: "2026-01-01T00:00:02.100Z" },
+    ] as const) {
+      await startBasicRun(store, scenario.runId);
+      await store.appendEvent({
+        runId: scenario.runId,
+        at: scenario.completedAt.replace(".100Z", ".000Z"),
+        source: "harness",
+        eventType: "session_started",
+        payload: { type: "session_started", sessionId: `${scenario.runId}-session`, runId: scenario.runId },
+      });
+      await store.appendEvent({
+        runId: scenario.runId,
+        at: scenario.completedAt,
+        source: "harness",
+        eventType: scenario.eventType,
+        payload: { type: scenario.eventType },
+      });
+      await expect(reloaded.rebuildRunFromTranscript(scenario.runId)).resolves.toMatchObject({
+        status: scenario.status,
+        completedAt: scenario.completedAt,
+        transcriptEventCount: 2,
+        ...(scenario.status === "cancelled" ? { cancellationOutcome: "cancelled" } : {}),
+      });
+    }
   });
 
 

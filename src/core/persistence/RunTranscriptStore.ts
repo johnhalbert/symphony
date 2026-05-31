@@ -389,11 +389,35 @@ export class FileRunTranscriptStore {
       };
       await fs.appendFile(this.eventsPath(input.runId), `${JSON.stringify(event)}\n`, "utf8");
       const record = await this.getRun(input.runId);
-      if (record) {
-        await this.writeRun({ ...record, transcriptEventCount: count + 1, updatedAt: new Date().toISOString() });
+      const reduced = reduceRunActivityEvent(record, event, count + 1, { terminalEvents: true });
+      if (reduced) {
+        await this.writeRun(reduced);
       }
       this.notifyProjectionChanged("runs");
       return event;
+    });
+  }
+
+  async rebuildRunFromTranscript(runId: string): Promise<RunRecord | null> {
+    return this.withRunUpdateLock(runId, async () => {
+      const existing = await this.getRun(runId);
+      let reduced: RunRecord | null = existing === null ? null : resetReplayableRunState(existing);
+      let count = 0;
+      try {
+        const stream = createReadStream(this.eventsPath(runId), { encoding: "utf8" });
+        const lines = createInterface({ input: stream, crlfDelay: Infinity });
+        for await (const line of lines) {
+          if (line.length === 0) continue;
+          count += 1;
+          reduced = reduceRunActivityEvent(reduced, JSON.parse(line) as TranscriptEvent, count, { terminalEvents: true });
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (!reduced) return null;
+      await this.writeRun(reduced);
+      this.notifyProjectionChanged("runs");
+      return reduced;
     });
   }
 
@@ -637,6 +661,311 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
 
 function metadataPayload(metadata: RunMetadata): RunMetadata {
   return metadataPatch(metadata);
+}
+
+interface RunActivityReductionOptions {
+  terminalEvents: boolean;
+}
+
+type UnknownRecord = Record<string, unknown>;
+
+function reduceRunActivityEvent(
+  record: RunRecord | null,
+  event: TranscriptEvent,
+  transcriptEventCount: number,
+  options: RunActivityReductionOptions,
+): RunRecord | null {
+  if (!record) return null;
+  const payload = recordPayload(event.payload);
+  const activitySnapshot = reduceActivitySnapshot(record.activitySnapshot, event);
+  let next: RunRecord = {
+    ...record,
+    transcriptEventCount,
+    ...(activitySnapshot === undefined ? {} : { activitySnapshot }),
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (payload) {
+    next = applyRunMetadataPayload(next, payload);
+  }
+
+  switch (event.eventType) {
+    case "session_started":
+      next = reduceSessionStarted(next, event, payload);
+      break;
+    case "run_status":
+      next = reduceRunStatus(next, event, payload);
+      break;
+    case "tokens":
+      next = reduceTokenEvent(next, payload);
+      break;
+    case "run_diagnostic":
+      next = reduceRunDiagnostic(next, event, payload);
+      break;
+    case "provider_limit":
+      next = reduceProviderLimit(next, event, payload, options);
+      break;
+    case "approval_request":
+      next = reduceApprovalRequest(next, event, payload);
+      break;
+    case "approval_resolved":
+      next = reduceApprovalResolved(next, payload);
+      break;
+    case "completed":
+      next = reduceTerminalEvent(next, event, "succeeded", null, options);
+      break;
+    case "failed":
+      next = reduceFailedEvent(next, event, payload, options);
+      break;
+    case "cancelled":
+      next = reduceTerminalEvent(next, event, "cancelled", null, options);
+      break;
+    default:
+      break;
+  }
+
+  return normalizeRunRecord(next);
+}
+
+function resetReplayableRunState(record: RunRecord): RunRecord {
+  return normalizeRunRecord({
+    ...record,
+    status: "running",
+    completedAt: null,
+    error: null,
+    tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    transcriptEventCount: 0,
+    prUrl: null,
+    prNumber: null,
+    prHeadSha: null,
+    prBranch: null,
+    ciStatus: null,
+    lastPushedAt: null,
+    lastEvidenceCursor: null,
+    cancellationRequestedAt: null,
+    cancellationSource: null,
+    cancellationReason: null,
+    harnessStopRequestedAt: null,
+    harnessStopFailedAt: null,
+    harnessStopFailedReason: null,
+    cancellationOutcome: "none",
+    cancelFailed: false,
+    cancelFailedAt: null,
+    cancelFailedReason: null,
+    cancelFailedSource: null,
+    activitySnapshot: emptyActivitySnapshot(),
+    sdkRunStatus: null,
+    sdkRunStatusObservedAt: null,
+    sdkRunStatusSource: null,
+    failureKind: null,
+    failureDiagnosticCode: null,
+    failureDiagnosticMessage: null,
+    failureDiagnosticAt: null,
+    failureDiagnosticPayload: null,
+    pendingApprovalRequestId: null,
+    pendingApprovalRequestedAt: null,
+    providerLimit: null,
+    updatedAt: record.startedAt,
+  });
+}
+
+function applyRunMetadataPayload(record: RunRecord, payload: UnknownRecord): RunRecord {
+  const patch = metadataPatch(payload as RunMetadata);
+  return Object.keys(patch).length === 0 ? record : { ...record, ...patch };
+}
+
+function reduceSessionStarted(record: RunRecord, event: TranscriptEvent, payload: UnknownRecord | null): RunRecord {
+  const sessionId = stringField(payload, "sessionId");
+  const agentId = stringField(payload, "threadId");
+  const runningPatch: Partial<RunRecord> = isTerminalRunStatus(record.status)
+    ? {}
+    : { status: "running", completedAt: null, error: null };
+  return {
+    ...record,
+    ...runningPatch,
+    startedAt: event.at,
+    ...(sessionId === undefined ? {} : { sessionId }),
+    ...(agentId === undefined ? {} : { agentId }),
+  };
+}
+
+function reduceRunStatus(record: RunRecord, event: TranscriptEvent, payload: UnknownRecord | null): RunRecord {
+  const sdkRunStatus = persistedSdkRunStatus(stringField(payload, "sdkStatus"));
+  if (!sdkRunStatus) return record;
+  const sdkRunStatusSource = persistedSdkRunStatusSource(stringField(payload, "source"));
+  return {
+    ...record,
+    sdkRunStatus,
+    sdkRunStatusObservedAt: event.at,
+    ...(sdkRunStatusSource === null ? {} : { sdkRunStatusSource }),
+  };
+}
+
+function reduceTokenEvent(record: RunRecord, payload: UnknownRecord | null): RunRecord {
+  const tokens = recordPayload(payload?.tokens);
+  if (!tokens) return record;
+  return { ...record, tokens: reduceTokenCounts(record.tokens, tokens) };
+}
+
+function reduceRunDiagnostic(record: RunRecord, event: TranscriptEvent, payload: UnknownRecord | null): RunRecord {
+  const code = stringField(payload, "code");
+  const message = event.message ?? stringField(payload, "message");
+  if (code === undefined && message === undefined) return record;
+  const next: RunRecord = {
+    ...record,
+    ...(code === undefined ? {} : { failureKind: failureKindForDiagnosticCode(code), failureDiagnosticCode: code }),
+    ...(message === undefined ? {} : { failureDiagnosticMessage: message }),
+    failureDiagnosticAt: event.at,
+  };
+  return payload && Object.hasOwn(payload, "payload") ? { ...next, failureDiagnosticPayload: payload.payload } : next;
+}
+
+function reduceProviderLimit(
+  record: RunRecord,
+  event: TranscriptEvent,
+  payload: UnknownRecord | null,
+  options: RunActivityReductionOptions,
+): RunRecord {
+  const signal = providerLimitSignal(payload);
+  const message = signal?.message ?? event.message ?? "Provider limit reached";
+  const observedAt = signal?.observedAt ?? event.at;
+  const next: RunRecord = {
+    ...record,
+    ...(signal === null ? {} : { providerLimit: signal }),
+    failureKind: "provider_limit",
+    failureDiagnosticCode: "provider_limit",
+    failureDiagnosticMessage: message,
+    failureDiagnosticAt: observedAt,
+  };
+  return reduceTerminalEvent(next, event, "failed", message, options);
+}
+
+function reduceApprovalRequest(record: RunRecord, event: TranscriptEvent, payload: UnknownRecord | null): RunRecord {
+  const requestId = stringField(payload, "requestId");
+  return {
+    ...record,
+    ...(requestId === undefined ? {} : { pendingApprovalRequestId: requestId }),
+    pendingApprovalRequestedAt: stringField(payload, "requestedAt") ?? event.at,
+  };
+}
+
+function reduceApprovalResolved(record: RunRecord, payload: UnknownRecord | null): RunRecord {
+  const requestId = stringField(payload, "requestId");
+  if (requestId !== undefined && record.pendingApprovalRequestId != null && record.pendingApprovalRequestId !== requestId) return record;
+  return { ...record, pendingApprovalRequestId: null, pendingApprovalRequestedAt: null };
+}
+
+function reduceFailedEvent(
+  record: RunRecord,
+  event: TranscriptEvent,
+  payload: UnknownRecord | null,
+  options: RunActivityReductionOptions,
+): RunRecord {
+  const error = stringField(payload, "error") ?? event.message ?? "Agent run failed";
+  const withDiagnostic = record.failureKind
+    ? record
+    : {
+        ...record,
+        failureKind: "agent_error",
+        failureDiagnosticMessage: error,
+        failureDiagnosticAt: event.at,
+      };
+  return reduceTerminalEvent(withDiagnostic, event, "failed", error, options);
+}
+
+function reduceTerminalEvent(
+  record: RunRecord,
+  event: TranscriptEvent,
+  status: Exclude<RunStatus, "running">,
+  error: string | null,
+  options: RunActivityReductionOptions,
+): RunRecord {
+  if (!options.terminalEvents || record.status !== "running") return record;
+  const cancellationOutcome = record.cancellationOutcome ?? "none";
+  return {
+    ...record,
+    status,
+    completedAt: event.at,
+    error,
+    ...(status === "cancelled" && (cancellationOutcome === "none" || cancellationOutcome === "requested")
+      ? { cancellationOutcome: "cancelled" as const }
+      : {}),
+  };
+}
+
+function reduceActivitySnapshot(existing: RunActivitySnapshot | undefined, event: TranscriptEvent): RunActivitySnapshot | undefined {
+  const isHarnessActivity = event.source === "harness" || event.source === "runtime" || event.source === "cursor";
+  if (!existing && !isHarnessActivity) return undefined;
+  const next = existing ? { ...emptyActivitySnapshot(), ...existing } : emptyActivitySnapshot();
+  if (isHarnessActivity) next.lastHarnessActivityAt = event.at;
+
+  if (event.eventType === "progress") {
+    const source = activitySourceForEvent(event);
+    if (source === "stream") next.lastStreamActivityAt = event.at;
+    if (source === "delta" || source === "tool") next.lastDeltaOrToolActivityAt = event.at;
+    if (source === "tool") next.lastToolActivityAt = event.at;
+  }
+  return next;
+}
+
+function activitySourceForEvent(event: TranscriptEvent): "stream" | "delta" | "tool" {
+  const source = stringField(recordPayload(event.payload), "activitySource");
+  return source === "delta" || source === "tool" || source === "stream" ? source : "stream";
+}
+
+function emptyActivitySnapshot(): RunActivitySnapshot {
+  return {
+    lastHarnessActivityAt: null,
+    lastStreamActivityAt: null,
+    lastDeltaOrToolActivityAt: null,
+    lastToolActivityAt: null,
+  };
+}
+
+function reduceTokenCounts(current: TokenCounts, tokens: UnknownRecord): TokenCounts {
+  return {
+    inputTokens: finiteNumber(tokens.inputTokens) ?? current.inputTokens,
+    outputTokens: finiteNumber(tokens.outputTokens) ?? current.outputTokens,
+    totalTokens: finiteNumber(tokens.totalTokens) ?? current.totalTokens,
+  };
+}
+
+function providerLimitSignal(payload: UnknownRecord | null): ProviderLimitSignal | null {
+  const signal = recordPayload(payload?.signal);
+  if (!signal || typeof signal.message !== "string" || typeof signal.kind !== "string" || !recordPayload(signal.scope)) return null;
+  return signal as unknown as ProviderLimitSignal;
+}
+
+function persistedSdkRunStatus(value: string | undefined): PersistedSdkRunStatus | null {
+  return value === "running" || value === "finished" || value === "error" || value === "cancelled" ? value : null;
+}
+
+function persistedSdkRunStatusSource(value: string | undefined): PersistedSdkRunStatusSource | null {
+  return value === "initial" || value === "onDidChangeStatus" || value === "wait" ? value : null;
+}
+
+function failureKindForDiagnosticCode(code: string): string {
+  if (code === "cursor_run_wait_terminal_error") return "cursor_sdk_terminal_error";
+  if (code === "cursor_run_wait_threw") return "cursor_sdk_wait_error";
+  if (code === "cursor_stream_error" || code.startsWith("cursor_stream_status_")) return "cursor_stream_error";
+  return "harness_diagnostic";
+}
+
+function isTerminalRunStatus(status: RunStatus): boolean {
+  return status === "succeeded" || status === "failed" || status === "cancelled";
+}
+
+function stringField(record: UnknownRecord | null | undefined, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function recordPayload(value: unknown): UnknownRecord | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as UnknownRecord) : null;
 }
 
 function formatPullRequestMessage(input: PullRequestTranscriptInput): string {
