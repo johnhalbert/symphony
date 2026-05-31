@@ -136,7 +136,7 @@ const RUN_CANCELLED = Symbol("hermes_acp_run_cancelled");
 
 interface SelectedAuthMethod {
   id: string;
-  label: string;
+  display: string;
   diagnostics: string;
 }
 
@@ -587,7 +587,7 @@ export class HermesAcpHarness implements AgentHarness {
     } catch (error) {
       throw new SymphonyError(
         "config_validation_error",
-        `Host Hermes ACP authenticate failed for auth method ${method.label} (${method.id}): ${redactLogLine(errorMessage(error))}. ${method.diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
+        `Host Hermes ACP authenticate failed for auth method ${method.display}: ${redactLogLine(errorMessage(error))}. ${method.diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
         error,
       );
     }
@@ -1028,20 +1028,26 @@ function selectedAuthMethod(
   if (!id) {
     throw new SymphonyError("agent_error", `Host Hermes ACP selected auth method did not include an id. ${diagnostics}`);
   }
-  return { id, label: authMethodLabel(method) ?? id, diagnostics };
+  return { id, display: selectedAuthMethodDisplay(method, id), diagnostics };
+}
+
+function selectedAuthMethodDisplay(method: Record<string, unknown>, id: string): string {
+  const displayLabel = sanitizedAuthMethodField(authMethodLabel(method) ?? id) ?? "[redacted]";
+  const displayId = sanitizedAuthMethodField(id) ?? "[redacted]";
+  return `${displayLabel} (${displayId})`;
 }
 
 function validateAcpAuthenticateResult(result: unknown, method: SelectedAuthMethod): void {
   if (result === null || result === undefined || result === false) {
     throw new SymphonyError(
       "config_validation_error",
-      `Host Hermes ACP authenticate rejected auth method ${method.label} (${method.id}). ${method.diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
+      `Host Hermes ACP authenticate rejected auth method ${method.display}. ${method.diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
     );
   }
   if (!isRecord(result)) {
     throw new SymphonyError(
       "agent_error",
-      `Host Hermes ACP authenticate returned an invalid response for auth method ${method.label} (${method.id}). ${method.diagnostics}`,
+      `Host Hermes ACP authenticate returned an invalid response for auth method ${method.display}. ${method.diagnostics}`,
     );
   }
 }

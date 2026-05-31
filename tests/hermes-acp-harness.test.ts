@@ -437,6 +437,82 @@ describe("HermesAcpHarness", () => {
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
   });
 
+  it.each([
+    {
+      name: "throws with a secret-bearing selected label",
+      displayField: "label",
+      authenticate: "throw",
+      expectedText: "authenticate failed for auth method",
+    },
+    {
+      name: "returns null with a secret-bearing selected name",
+      displayField: "name",
+      authenticate: "null",
+      expectedText: "authenticate rejected auth method",
+    },
+    {
+      name: "returns false with a secret-bearing selected label",
+      displayField: "label",
+      authenticate: "false",
+      expectedText: "authenticate rejected auth method",
+    },
+    {
+      name: "returns an invalid primitive with a secret-bearing selected name",
+      displayField: "name",
+      authenticate: "invalidPrimitive",
+      expectedText: "authenticate returned an invalid response",
+    },
+  ] as const)("redacts selected auth method display values when authenticate $name", async ({
+    displayField,
+    authenticate,
+    expectedText,
+  }) => {
+    const client = new FakeAcpClient();
+    const secret = `sk-${"z".repeat(32)}`;
+    const methodId = `openai-codex-${secret}`;
+    const selectedMethod: Record<string, unknown> = {
+      id: methodId,
+      provider: "openai-codex",
+      type: "agent",
+    };
+    selectedMethod[displayField] = `OpenAI Codex ${secret}`;
+    client.initializeResult = { authMethods: [selectedMethod] };
+    switch (authenticate) {
+      case "throw":
+        client.authenticateError = new Error(`upstream auth failed access_token=${secret}`);
+        break;
+      case "null":
+        client.authenticateResult = null;
+        break;
+      case "false":
+        client.authenticateResult = false;
+        break;
+      case "invalidPrimitive":
+        client.authenticateResult = "unexpected authenticate response";
+        break;
+    }
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const text = eventText(events);
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize", "authenticate"]);
+    expect(text).toContain(expectedText);
+    expect(text).toContain("advertised authMethods");
+    expect(text).toContain("openai-codex");
+    expect(text).toContain("[redacted]");
+    expect(text).not.toContain(secret);
+    expect(JSON.stringify(events)).not.toContain(secret);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_run_error" }),
+        expect.objectContaining({ type: "failed" }),
+      ]),
+    );
+    expect(client.requests.some((request) => request.method === "session/new")).toBe(false);
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
   it("passes the profile lease command into the ACP facade and records run-start profile metadata", async () => {
     const { acpClientFactory, ctx, harness, leaseFactory, leases } = await fixture();
 
