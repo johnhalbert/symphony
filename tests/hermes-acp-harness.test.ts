@@ -207,12 +207,19 @@ describe("HermesAcpHarness", () => {
     expect(mapHermesAcpSessionUpdate({ sessionUpdate: "agentMessageChunk", content: { type: "text", text: "hello" } })).toEqual([
       { type: "progress", activitySource: "delta", message: "hello" },
     ]);
+    expect(mapHermesAcpSessionUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: " " } })).toEqual([
+      { type: "progress", activitySource: "delta", message: " " },
+    ]);
+    expect(mapHermesAcpSessionUpdate({ sessionUpdate: "agent_message_chunk", content: "" })).toEqual([]);
     expect(mapHermesAcpSessionUpdate({ session_update: "agent_thought_chunk", content: { type: "text", text: "private" } })).toEqual([
       { type: "progress", activitySource: "stream", message: "Hermes ACP thought update" },
     ]);
     expect(mapHermesAcpSessionUpdate({ sessionUpdate: "user_message_chunk", content: "do not echo user replay" })).toEqual([]);
     expect(mapHermesAcpSessionUpdate({ sessionUpdate: "usage_update", used: 42, size: 200 })).toEqual([
-      { type: "tokens", tokens: { totalTokens: 42 } },
+      { type: "progress", activitySource: "stream", message: "Hermes ACP usage update: 42/200 context tokens" },
+    ]);
+    expect(mapHermesAcpSessionUpdate({ sessionUpdate: "usage_update", final: true, usage: { input: 4, output: 5, total: 9 } })).toEqual([
+      { type: "tokens", tokens: { inputTokens: 4, outputTokens: 5, totalTokens: 9 } },
     ]);
     expect(mapHermesAcpSessionUpdate({ sessionUpdate: "tool_call", toolCall: { title: "terminal", status: "pending" } })).toEqual([
       { type: "progress", activitySource: "tool", message: "Hermes ACP tool started: terminal (pending)" },
@@ -266,12 +273,14 @@ describe("HermesAcpHarness", () => {
     client.promptNotificationParams = [
       { sessionId: "other-session", update: { sessionUpdate: "agent_message_chunk", content: "wrong session" } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "tool_call", toolCall: { title: "terminal", status: "started" } } },
-      { update: { sessionUpdate: "agent_message_chunk", content: [{ type: "text", text: "hello " }, { type: "text", text: "world" }] } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " " } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "usage_update", used: 9, size: 100 } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "available_commands_update", availableCommands: [{ name: "/help" }] } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "future_update", details: "still visible as diagnostic" } },
     ];
-    client.promptResult = { stopReason: "end_turn" };
+    client.promptResult = { stopReason: "end_turn", usage: { input: 1, output: 2, total: 3 } };
     const { ctx, harness } = await fixture({ client, runStore });
 
     const events = await collectEvents(harness.run(ctx, "Do work"));
@@ -280,13 +289,19 @@ describe("HermesAcpHarness", () => {
     expect(events).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: "progress", activitySource: "tool", message: "Hermes ACP tool started: terminal (started)" }),
-        expect.objectContaining({ type: "progress", activitySource: "delta", message: "hello world" }),
-        expect.objectContaining({ type: "tokens", tokens: { totalTokens: 9 } }),
+        expect.objectContaining({ type: "progress", activitySource: "stream", message: "Hermes ACP usage update: 9/100 context tokens" }),
+        expect.objectContaining({ type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } }),
         expect.objectContaining({ type: "progress", activitySource: "stream", message: "Hermes ACP commands available: /help" }),
         expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_session_update_unmapped" }),
         expect.objectContaining({ type: "completed", message: "hello world" }),
       ]),
     );
+    expect(events.flatMap((event) => event.type === "progress" && event.activitySource === "delta" ? [event.message] : [])).toEqual([
+      "hello",
+      " ",
+      "world",
+    ]);
+    expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { totalTokens: 9 } })]));
     expect(events.map((event) => "message" in event ? event.message : "").join("\n")).not.toContain("before active session");
     expect(events.map((event) => "message" in event ? event.message : "").join("\n")).not.toContain("wrong session");
     expect(transcriptEvents.map((event) => event.eventType)).toEqual([
@@ -296,9 +311,41 @@ describe("HermesAcpHarness", () => {
       "acp_session_update",
       "acp_session_update",
       "acp_session_update",
+      "acp_session_update",
+      "acp_session_update",
     ]);
     expect(JSON.stringify(transcriptEvents.map((event) => event.payload))).not.toContain("before active session");
     expect(JSON.stringify(transcriptEvents.map((event) => event.payload))).not.toContain("wrong session");
+  });
+
+  it("uses final ACP usage updates as token fallback only when prompt usage is absent", async () => {
+    const client = new FakeAcpClient();
+    client.promptNotificationParams = {
+      sessionId: "acp-session-1",
+      update: { sessionUpdate: "usage_update", final: true, usage: { input: 8, output: 13, total: 21 } },
+    };
+    client.promptResult = { stopReason: "end_turn" };
+    const { ctx, harness } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+
+    const tokenEvents = events.flatMap((event) => event.type === "tokens" ? [event.tokens] : []);
+    expect(tokenEvents).toEqual([{ inputTokens: 8, outputTokens: 13, totalTokens: 21 }]);
+  });
+
+  it("prefers final prompt usage over final ACP usage update fallback", async () => {
+    const client = new FakeAcpClient();
+    client.promptNotificationParams = {
+      sessionId: "acp-session-1",
+      update: { sessionUpdate: "usage_update", final: true, usage: { input: 80, output: 130, total: 210 } },
+    };
+    client.promptResult = { stopReason: "end_turn", usage: { input: 1, output: 2, total: 3 } };
+    const { ctx, harness } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+
+    const tokenEvents = events.flatMap((event) => event.type === "tokens" ? [event.tokens] : []);
+    expect(tokenEvents).toEqual([{ inputTokens: 1, outputTokens: 2, totalTokens: 3 }]);
   });
 
   it("rejects unattended setup-only authentication before creating sessions", async () => {
@@ -333,6 +380,115 @@ describe("HermesAcpHarness", () => {
       ]),
     );
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("emits provider-limit events for credible ACP prompt response payloads scoped to the selected provider", async () => {
+    const client = new FakeAcpClient();
+    client.promptNotificationParams = null;
+    client.promptResult = {
+      stopReason: "error",
+      provider_limit: {
+        kind: "usage_limit_reached",
+        message: "Usage limit reached for the selected provider.",
+        retry_after_ms: 60_000,
+      },
+    };
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "provider_limit",
+          signal: expect.objectContaining({
+            kind: "windowed_bucket_exhausted",
+            message: "Usage limit reached for the selected provider.",
+            scope: { harnessId: "hermes_acp", providerId: "openai-codex", model: "gpt-5.5", accountScopeKey: null },
+          }),
+        }),
+        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_provider_limit" }),
+        expect.objectContaining({ type: "failed", error: "Usage limit reached for the selected provider." }),
+      ]),
+    );
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("emits provider-limit events for credible ACP provider-limit text", async () => {
+    const client = new FakeAcpClient();
+    client.promptNotificationParams = null;
+    client.promptResult = { status: "error", text: "429 rate limit from provider", retry_after: 1 };
+    const { ctx, harness } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "provider_limit",
+          signal: expect.objectContaining({
+            kind: "transient_rate_limit",
+            message: "429 rate limit from provider",
+            scope: { harnessId: "hermes_acp", providerId: "openai-codex", model: "gpt-5.5", accountScopeKey: null },
+          }),
+        }),
+        expect.objectContaining({ type: "failed", error: "429 rate limit from provider" }),
+      ]),
+    );
+  });
+
+  it("emits provider-limit events for credible ACP prompt errors", async () => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    const { ctx, harness } = await fixture({ client });
+    const runPromise = collectEvents(harness.run(ctx, "Do work"));
+    await client.promptStarted.promise;
+    const error = Object.assign(new Error("Provider returned a rate limit"), {
+      code: "provider.limit",
+      data: {
+        provider_limit: {
+          kind: "rate_limit",
+          message: "Provider returned a rate limit",
+          retry_after: 2,
+        },
+      },
+    });
+    client.promptDeferred.reject(error);
+
+    const events = await runPromise;
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "provider_limit",
+          signal: expect.objectContaining({
+            kind: "transient_rate_limit",
+            message: "Provider returned a rate limit",
+            scope: { harnessId: "hermes_acp", providerId: "openai-codex", model: "gpt-5.5", accountScopeKey: null },
+          }),
+        }),
+        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_run_error" }),
+        expect.objectContaining({ type: "failed", error: "Host Hermes ACP run failed: Provider returned a rate limit" }),
+      ]),
+    );
+  });
+
+  it("does not emit provider-limit events for non-terminal assistant text about limits", async () => {
+    const client = new FakeAcpClient();
+    client.promptNotificationParams = {
+      sessionId: "acp-session-1",
+      update: { sessionUpdate: "agent_message_chunk", content: "Here are docs about provider rate limits." },
+    };
+    client.promptResult = { stopReason: "end_turn", text: "429 rate limit from provider" };
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+
+    expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "provider_limit" })]));
+    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "completed", message: "Here are docs about provider rate limits." })]));
+    expect(leases[0]?.disposeStatuses).toEqual(["succeeded"]);
   });
 
   it("implements stop(runId) by cancelling the active ACP session", async () => {
