@@ -189,6 +189,12 @@ const rawConfigSchema = z
         python: z.string().optional(),
         templates_dir: z.string().optional(),
         state_dir: z.string().optional(),
+        acp_binary_path: z.string().optional(),
+        binary_path: z.string().optional(),
+        acp_source_profile: z.string().optional(),
+        source_profile: z.string().optional(),
+        acp_profile_prefix: z.string().optional(),
+        profile_name_prefix: z.string().optional(),
         auth: z
           .object({
             mode: z.enum(["managed_root"]).optional(),
@@ -389,6 +395,9 @@ export interface HermesConfig {
   python: string | null;
   templatesDir: string;
   stateDir: string;
+  acpBinaryPath: string | null;
+  acpSourceProfile: string | null;
+  acpProfilePrefix: string | null;
   auth: HermesAuthConfig;
   runtimeCredentialEnv: string;
   model: string | null;
@@ -690,6 +699,15 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     raw.hermes?.state_dir === undefined
       ? path.join(workspaceStateDir, "hermes")
       : resolvePathValue(raw.hermes.state_dir, workflowDir, env);
+  const hermesAcpBinaryPath = normalizeOptionalConfigString(
+    resolveConfigString(raw.hermes?.acp_binary_path ?? raw.hermes?.binary_path, env),
+  );
+  const hermesAcpSourceProfile = normalizeOptionalConfigString(
+    resolveConfigString(raw.hermes?.acp_source_profile ?? raw.hermes?.source_profile, env),
+  );
+  const hermesAcpProfilePrefix = normalizeOptionalConfigString(
+    resolveConfigString(raw.hermes?.acp_profile_prefix ?? raw.hermes?.profile_name_prefix, env),
+  );
   const hermesAuthManagedRoot =
     raw.hermes?.auth?.managed_root === undefined
       ? path.join(hermesStateDir, "auth")
@@ -808,6 +826,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       python: hermesPython,
       templatesDir: hermesTemplatesDir,
       stateDir: hermesStateDir,
+      acpBinaryPath: hermesAcpBinaryPath,
+      acpSourceProfile: hermesAcpSourceProfile,
+      acpProfilePrefix: hermesAcpProfilePrefix,
       auth: {
         mode: raw.hermes?.auth?.mode ?? "managed_root",
         managedRoot: hermesAuthManagedRoot,
