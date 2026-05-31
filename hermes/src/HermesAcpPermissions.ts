@@ -39,6 +39,8 @@ export interface HermesAcpPermissionResolution {
 
 const TERMINAL_PERMISSION_OPTION_IDS = new Set<string>(["allow_once", "allow_session", "allow_always", "deny", "deny_always"]);
 const EDIT_PERMISSION_OPTION_IDS = new Set<string>(["allow_once", "deny"]);
+const TERMINAL_TOOL_CALL_KINDS = new Set<string>(["execute", "terminal", "shell"]);
+const EDIT_TOOL_CALL_KINDS = new Set<string>(["edit", "file_edit", "file-edit"]);
 
 const REQUIRED_TERMINAL_PERMISSION_OPTION_IDS = ["allow_once", "allow_session", "deny"];
 const REQUIRED_EDIT_PERMISSION_OPTION_IDS = ["allow_once", "deny"];
@@ -51,7 +53,7 @@ export function parseHermesAcpPermissionRequest(params: unknown): HermesAcpPermi
   const sessionId = paramsRecord ? nonEmptyString(unknownField(paramsRecord, "sessionId", "session_id")) : null;
   const toolCallId = toolCall ? nonEmptyString(unknownField(toolCall, "toolCallId", "tool_call_id", "id")) : null;
   const toolKind = toolCall ? nonEmptyString(unknownField(toolCall, "kind", "toolKind", "tool_kind"))?.toLowerCase() ?? null : null;
-  const requestKind = classifyPermissionRequest(toolKind, options);
+  const requestKind = classifyPermissionRequest(toolKind);
 
   return {
     sessionId,
@@ -61,7 +63,16 @@ export function parseHermesAcpPermissionRequest(params: unknown): HermesAcpPermi
     toolCall,
     options,
     params,
-    malformedReason: permissionRequestMalformedReason({ paramsRecord, rawOptions, options, sessionId, requestKind }),
+    malformedReason: permissionRequestMalformedReason({
+      paramsRecord,
+      rawOptions,
+      options,
+      sessionId,
+      toolCall,
+      toolCallId,
+      toolKind,
+      requestKind,
+    }),
   };
 }
 
@@ -130,28 +141,66 @@ function permissionRequestMalformedReason(input: {
   rawOptions: unknown;
   options: HermesAcpPermissionOption[];
   sessionId: string | null;
+  toolCall: Record<string, unknown> | null;
+  toolCallId: string | null;
+  toolKind: string | null;
   requestKind: HermesAcpPermissionRequestKind;
 }): string | null {
   if (!input.paramsRecord) return "malformed_permission_request";
   if (!input.sessionId) return "missing_permission_session_id";
+  if (!input.toolCall) return "missing_permission_tool_call";
+  if (!input.toolKind) return "missing_permission_tool_call_kind";
+  if (input.requestKind === "unknown") return "unsupported_permission_tool_call";
+  if (!input.toolCallId) return "missing_permission_tool_call_id";
   if (!Array.isArray(input.rawOptions)) return "missing_permission_options";
   if (input.options.length !== input.rawOptions.length) return "malformed_permission_options";
   if (input.options.length === 0) return "missing_permission_options";
   if (hasDuplicateOptionIds(input.options)) return "duplicate_permission_options";
   if (!isSupportedPermissionOptionSet(input.requestKind, input.options)) return "unsupported_permission_options";
+  if (!hasSupportedToolCallContent(input.requestKind, input.toolCall)) return "missing_permission_tool_call_content";
   return null;
 }
 
-function classifyPermissionRequest(
-  toolKind: string | null,
-  options: readonly HermesAcpPermissionOption[],
-): HermesAcpPermissionRequestKind {
-  const optionIds = new Set(options.map((option) => option.optionId));
-  if (toolKind === "edit" || toolKind === "file_edit" || toolKind === "file-edit") return "file_edit";
-  if (toolKind === "execute" || toolKind === "terminal" || toolKind === "shell") return "terminal_execute";
-  if (optionIds.has("allow_session") || optionIds.has("allow_always") || optionIds.has("deny_always")) return "terminal_execute";
-  if (options.length > 0 && options.every((option) => EDIT_PERMISSION_OPTION_IDS.has(option.optionId))) return "file_edit";
+function classifyPermissionRequest(toolKind: string | null): HermesAcpPermissionRequestKind {
+  if (toolKind && EDIT_TOOL_CALL_KINDS.has(toolKind)) return "file_edit";
+  if (toolKind && TERMINAL_TOOL_CALL_KINDS.has(toolKind)) return "terminal_execute";
   return "unknown";
+}
+
+function hasSupportedToolCallContent(
+  requestKind: HermesAcpPermissionRequestKind,
+  toolCall: Record<string, unknown>,
+): boolean {
+  if (requestKind === "terminal_execute") return hasTerminalToolCallContent(toolCall);
+  if (requestKind === "file_edit") return hasEditToolCallContent(toolCall);
+  return false;
+}
+
+function hasTerminalToolCallContent(toolCall: Record<string, unknown>): boolean {
+  const rawInput = recordField(toolCall, "rawInput", "raw_input");
+  if (rawInput && nonEmptyString(unknownField(rawInput, "command", "cmd", "script"))) return true;
+  return hasNonEmptyStructuredContent(unknownField(toolCall, "content"));
+}
+
+function hasEditToolCallContent(toolCall: Record<string, unknown>): boolean {
+  const rawInput = recordField(toolCall, "rawInput", "raw_input");
+  if (rawInput) {
+    if (nonEmptyString(unknownField(rawInput, "path", "file", "filePath", "file_path"))) return true;
+    const args = recordField(rawInput, "arguments", "args");
+    if (args && nonEmptyString(unknownField(args, "path", "file", "filePath", "file_path"))) return true;
+    if (nonEmptyString(unknownField(rawInput, "tool", "toolName", "tool_name")) && args) return true;
+  }
+  return hasNonEmptyStructuredContent(unknownField(toolCall, "content"));
+}
+
+function hasNonEmptyStructuredContent(value: unknown): boolean {
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.some(hasNonEmptyStructuredContent);
+  if (!isRecord(value)) return false;
+  return (
+    nonEmptyString(unknownField(value, "text", "path", "oldText", "old_text", "newText", "new_text")) !== null ||
+    hasNonEmptyStructuredContent(unknownField(value, "content", "diff"))
+  );
 }
 
 function isSupportedPermissionOptionSet(
