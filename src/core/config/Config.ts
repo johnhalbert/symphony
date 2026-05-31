@@ -86,6 +86,20 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    database: z
+      .object({
+        postgres: z
+          .object({
+            url: z.string().optional(),
+            migrations_dir: z.string().optional(),
+            migrations_table: z.string().optional(),
+            ssl: z.boolean().optional(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
     issue_breakdown: z
       .object({
         enabled: z.boolean().optional(),
@@ -471,6 +485,17 @@ export interface ContinuationContextConfig {
   summarizationEnabled: boolean;
 }
 
+export interface PostgresDatabaseConfig {
+  connectionString: string | null;
+  migrationsDir: string;
+  migrationsTable: string;
+  ssl: boolean;
+}
+
+export interface DatabaseConfig {
+  postgres: PostgresDatabaseConfig;
+}
+
 export interface IssueBreakdownConfig {
   enabled: boolean;
   cursorMode: CursorConversationMode;
@@ -511,6 +536,7 @@ export interface ServiceConfig {
   mergePolicy: MergePolicyConfig;
   issueBoard: IssueBoardConfig;
   continuationContext: ContinuationContextConfig;
+  database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
   raw: RawWorkflowConfig;
 }
@@ -540,6 +566,15 @@ const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
   "Each proposed issue must include title, description, acceptanceCriteria[], dependencies[], and labels[].",
   "Symphony persists these proposals locally; do not create or modify Linear issues.",
 ].join("\n");
+
+export function parseDatabaseConfig(rawInput: unknown, workflowPath: string, env = process.env): DatabaseConfig {
+  const parsed = rawConfigSchema.safeParse(rawInput ?? {});
+  if (!parsed.success) {
+    throw new SymphonyError("config_validation_error", "Workflow config is invalid", parsed.error.flatten());
+  }
+  const workflowDir = path.dirname(path.resolve(workflowPath));
+  return normalizeDatabaseConfig(parsed.data, workflowDir, env);
+}
 
 export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
@@ -673,6 +708,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const cursorRuntimeApiKey = normalizeOptionalConfigString(resolveConfigString("$CURSOR_API_KEY", env));
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
+  const database = normalizeDatabaseConfig(raw, workflowDir, env);
   const credentialProfiles = createCredentialProfileRegistry({
     raw: raw.credential_profiles,
     env,
@@ -838,6 +874,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       searchEnabled: raw.continuation_context?.search_enabled ?? false,
       summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
     },
+    database,
     issueBreakdown: {
       enabled: raw.issue_breakdown?.enabled ?? false,
       cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
@@ -879,6 +916,36 @@ function resolveOptionalPathValue(value: string | null | undefined, baseDir: str
   const resolved = normalizeOptionalConfigString(resolveConfigString(value, env));
   if (resolved === null) return null;
   return resolvePathValue(resolved, baseDir, env);
+}
+
+function normalizeDatabaseConfig(raw: RawWorkflowConfig, workflowDir: string, env: NodeJS.ProcessEnv): DatabaseConfig {
+  const rawPostgres = raw.database?.postgres;
+  const connectionString = normalizeOptionalConfigString(
+    resolveConfigString(rawPostgres?.url ?? "$SYMPHONY_POSTGRES_URL", env),
+  );
+  const migrationsDir = resolvePathValue(rawPostgres?.migrations_dir ?? "migrations/postgres", workflowDir, env);
+  const migrationsTable = normalizePostgresIdentifier(
+    rawPostgres?.migrations_table ?? "symphony_schema_migrations",
+    "database.postgres.migrations_table",
+  );
+
+  return {
+    postgres: {
+      connectionString,
+      migrationsDir,
+      migrationsTable,
+      ssl: rawPostgres?.ssl ?? false,
+    },
+  };
+}
+
+function normalizePostgresIdentifier(value: string, configPath: string): string {
+  const trimmed = value.trim();
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) return trimmed;
+  throw new SymphonyError(
+    "config_validation_error",
+    `${configPath} must be a single PostgreSQL identifier using letters, numbers, and underscores`,
+  );
 }
 
 function normalizeGitHubAppConfig(
