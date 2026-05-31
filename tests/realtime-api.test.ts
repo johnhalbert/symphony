@@ -11,6 +11,7 @@ import {
   type RealtimeProjectionEventType,
 } from "../src/app/RealtimeProjectionEvents.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { FileOrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue, TrackerStateLists } from "../src/core/types.js";
@@ -186,19 +187,27 @@ describe("StatusServer realtime SSE API", () => {
   });
 
   it("recovers unknown high Last-Event-ID values without replaying an exact current ID", async () => {
-    const server = createRealtimeServer();
+    const runStore = new FileRunTranscriptStore(root);
+    const server = createRealtimeServer({ runStore });
     const address = await server.start();
     const baseUrl = `http://${address.host}:${address.port}`;
 
     try {
-      const chatResponse = await fetch(`${baseUrl}/api/v1/web/orchestrator-chat`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ input: "seed history" }),
+      await runStore.startRun({
+        runId: "run-realtime-current-id",
+        sessionId: "session-realtime-current-id",
+        agentId: "agent-1",
+        role: "worker",
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "work",
+        workspaceKey: "TEST-1",
+        workspacePath: "/tmp/workspace",
       });
-      expect(chatResponse.status).toBe(200);
 
-      const currentClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": "2" });
+      const currentClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": "4" });
       try {
         await expect(currentClient.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
       } finally {
@@ -226,7 +235,8 @@ describe("StatusServer realtime SSE API", () => {
   });
 
   it("emits missed-event recovery hints and orchestrator chat message events", async () => {
-    const server = createRealtimeServer();
+    const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state"));
+    const server = createRealtimeServer({ orchestratorConversationStore });
     const address = await server.start();
     const baseUrl = `http://${address.host}:${address.port}`;
 
@@ -254,14 +264,19 @@ describe("StatusServer realtime SSE API", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ input: "hello from the operator" }),
         });
-        expect(chatResponse.status).toBe(200);
-        await expect(chatResponse.json()).resolves.toEqual([]);
+        expect(chatResponse.status).toBe(202);
+        await expect(chatResponse.json()).resolves.toMatchObject([{ text: "hello from the operator" }]);
 
         const chat = await chatClient.nextEventOfType("orchestrator.message");
         expect(chat.data).toMatchObject({
           type: "orchestrator.message",
           source: { source: "orchestrator-chat" },
-          detail: { inputLength: "hello from the operator".length, messageCount: 0 },
+          detail: {
+            inputLength: "hello from the operator".length,
+            messageCount: 1,
+            conversationId: "orchestrator-default",
+            status: 202,
+          },
           recovery: { strategy: "refetch", reason: "event" },
         });
         expect((chat.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/orchestrator-chat");
@@ -288,13 +303,22 @@ interface SseTestClient {
   close(): Promise<void>;
 }
 
-function createRealtimeServer(options: { runStore?: FileRunTranscriptStore; tracker?: TrackerClient } = {}): StatusServer {
+function createRealtimeServer(
+  options: {
+    runStore?: FileRunTranscriptStore;
+    tracker?: TrackerClient;
+    orchestratorConversationStore?: FileOrchestratorConversationStore;
+  } = {},
+): StatusServer {
   return new StatusServer({
     orchestrator: fakeOrchestrator(),
     workspaceManager: {} as StatusServerOptions["workspaceManager"],
     workspaceOpener: {} as StatusServerOptions["workspaceOpener"],
     ...(options.runStore ? { runStore: options.runStore } : {}),
     ...(options.tracker ? { tracker: options.tracker } : {}),
+    ...(options.orchestratorConversationStore
+      ? { orchestratorConversationStore: options.orchestratorConversationStore }
+      : {}),
     host: "127.0.0.1",
     port: 0,
     openWorkspaceToken: null,
@@ -347,6 +371,9 @@ function fakeOrchestrator(): Orchestrator {
         },
         lifecycle: { summaryReferences: [] },
       };
+    },
+    async dispatchOrchestratorChatCommand() {
+      return { status: "accepted", reason: "accepted", acceptedAt: "2026-01-01T00:00:00.000Z" };
     },
   } as unknown as Orchestrator;
 }
