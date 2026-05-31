@@ -195,10 +195,6 @@ export class RealtimeProjectionEventBus {
     const knownIndex = this.history.findIndex((event) => event.id === normalizedLastEventId);
     if (knownIndex >= 0) return this.history.slice(knownIndex + 1);
 
-    const numericLastEventId = Number.parseInt(normalizedLastEventId, 10);
-    const newestEvent = this.history[this.history.length - 1];
-    if (newestEvent && Number.isFinite(numericLastEventId) && numericLastEventId >= newestEvent.revision) return [];
-
     return [this.createMissedEventsRecovery(normalizedLastEventId)];
   }
 

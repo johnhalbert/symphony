@@ -12,7 +12,8 @@ import {
 } from "../src/app/RealtimeProjectionEvents.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
-import type { TrackerStateLists } from "../src/core/types.js";
+import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
+import type { Issue, TrackerStateLists } from "../src/core/types.js";
 
 describe("StatusServer realtime SSE API", () => {
   let root: string;
@@ -123,6 +124,107 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
+  it("publishes tracker source freshness changes from reference-data, issues, and dashboard refresh paths", async () => {
+    let currentIssue = testIssue();
+    const tracker = mutableTracker(() => [currentIssue]);
+    const server = createRealtimeServer({ tracker });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      const referenceResponse = await fetch(`${baseUrl}/api/v1/web/reference-data?refresh=1`);
+      expect(referenceResponse.status).toBe(200);
+      const fresh = await client.nextEventOfType("source.status");
+      expect(fresh.data).toMatchObject({
+        type: "source.status",
+        source: { source: "trackerIssues", revision: 1 },
+        detail: {
+          source: "trackerIssues",
+          status: "ok",
+          cached: false,
+          error: null,
+          issueCount: 1,
+        },
+        recovery: { strategy: "refetch", reason: "event" },
+      });
+      expect((fresh.data as RealtimeProjectionEvent).recovery.endpoints).toEqual(
+        expect.arrayContaining([
+          "/api/v1/web/reference-data?refresh=1",
+          "/api/v1/web/issues?refresh=1",
+          "/api/v1/web/dashboard?refresh=1",
+        ]),
+      );
+
+      const issuesResponse = await fetch(`${baseUrl}/api/v1/web/issues`);
+      expect(issuesResponse.status).toBe(200);
+      const cached = await client.nextEventOfType("source.status");
+      expect(cached.data).toMatchObject({
+        type: "source.status",
+        source: { source: "trackerIssues", revision: 2 },
+        detail: { status: "ok", cached: true, error: null, issueCount: 1 },
+      });
+
+      currentIssue = testIssue({ updatedAt: "2026-01-01T00:00:01.000Z" });
+      const dashboardResponse = await fetch(`${baseUrl}/api/v1/web/dashboard?refresh=1`);
+      expect(dashboardResponse.status).toBe(200);
+      const refreshed = await client.nextEventOfType("source.status");
+      expect(refreshed.data).toMatchObject({
+        type: "source.status",
+        source: { source: "trackerIssues", revision: 3 },
+        detail: { status: "ok", cached: false, error: null, issueCount: 1 },
+      });
+      expect((refreshed.data as RealtimeProjectionEvent).resources).toEqual(
+        expect.arrayContaining([{ kind: "dashboard", href: "/api/v1/web/dashboard?refresh=1", relation: "refetch" }]),
+      );
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("recovers unknown high Last-Event-ID values without replaying an exact current ID", async () => {
+    const server = createRealtimeServer();
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+
+    try {
+      const chatResponse = await fetch(`${baseUrl}/api/v1/web/orchestrator-chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ input: "seed history" }),
+      });
+      expect(chatResponse.status).toBe(200);
+
+      const currentClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": "2" });
+      try {
+        await expect(currentClient.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+      } finally {
+        await currentClient.close();
+      }
+
+      const recoveryClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": "200" });
+      try {
+        const recovery = await recoveryClient.nextEvent();
+        expect(recovery.event).toBe("projection.updated");
+        expect(recovery.data).toMatchObject({
+          type: "projection.updated",
+          missedEvents: true,
+          recovery: { strategy: "refetch", reason: "missed-events", lastEventId: "200" },
+        });
+        expect((recovery.data as RealtimeProjectionEvent).recovery.endpoints).toEqual(
+          expect.arrayContaining(["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/history"]),
+        );
+      } finally {
+        await recoveryClient.close();
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("emits missed-event recovery hints and orchestrator chat message events", async () => {
     const server = createRealtimeServer();
     const address = await server.start();
@@ -181,17 +283,18 @@ interface ParsedSseEvent {
 
 interface SseTestClient {
   response: Response;
-  nextEvent(): Promise<ParsedSseEvent>;
-  nextEventOfType(type: RealtimeProjectionEventType): Promise<ParsedSseEvent>;
+  nextEvent(timeoutMs?: number): Promise<ParsedSseEvent>;
+  nextEventOfType(type: RealtimeProjectionEventType, timeoutMs?: number): Promise<ParsedSseEvent>;
   close(): Promise<void>;
 }
 
-function createRealtimeServer(options: { runStore?: FileRunTranscriptStore } = {}): StatusServer {
+function createRealtimeServer(options: { runStore?: FileRunTranscriptStore; tracker?: TrackerClient } = {}): StatusServer {
   return new StatusServer({
     orchestrator: fakeOrchestrator(),
     workspaceManager: {} as StatusServerOptions["workspaceManager"],
     workspaceOpener: {} as StatusServerOptions["workspaceOpener"],
     ...(options.runStore ? { runStore: options.runStore } : {}),
+    ...(options.tracker ? { tracker: options.tracker } : {}),
     host: "127.0.0.1",
     port: 0,
     openWorkspaceToken: null,
@@ -258,6 +361,46 @@ function testTrackerStateLists(): TrackerStateLists {
   };
 }
 
+function mutableTracker(getIssues: () => readonly Issue[]): TrackerClient {
+  const matchingIssues = (states: readonly string[]) => {
+    const wanted = new Set(states.map((state) => state.toLowerCase()));
+    return getIssues().filter((issue) => wanted.has(issue.state.toLowerCase()));
+  };
+  return {
+    async fetchCandidateIssues() {
+      return [...getIssues()];
+    },
+    async fetchIssuesByStates(states) {
+      return matchingIssues(states);
+    },
+    async fetchIssueStatesByIds(issueIds) {
+      const wanted = new Set(issueIds);
+      return getIssues().filter((issue) => wanted.has(issue.id));
+    },
+  };
+}
+
+function testIssue(overrides: Partial<Issue> = {}): Issue {
+  return {
+    id: "issue-realtime-1",
+    identifier: "TEST-1",
+    title: "Realtime issue",
+    description: null,
+    priority: null,
+    state: "Todo",
+    branchName: null,
+    url: null,
+    assigneeId: null,
+    delegateId: null,
+    assignedToWorker: false,
+    labels: ["dogfood-ready"],
+    blockedBy: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
 async function openSseClient(url: string, headers: Record<string, string> = {}): Promise<SseTestClient> {
   const controller = new AbortController();
   const response = await fetch(url, { headers, signal: controller.signal });
@@ -267,9 +410,9 @@ async function openSseClient(url: string, headers: Record<string, string> = {}):
   const decoder = new TextDecoder();
   let buffer = "";
 
-  const nextEvent = async (): Promise<ParsedSseEvent> => {
+  const nextEvent = async (timeoutMs = 2_000): Promise<ParsedSseEvent> => {
     const startedAt = Date.now();
-    while (Date.now() - startedAt < 2_000) {
+    while (Date.now() - startedAt < timeoutMs) {
       const delimiter = buffer.indexOf("\n\n");
       if (delimiter >= 0) {
         const raw = buffer.slice(0, delimiter);
@@ -278,7 +421,7 @@ async function openSseClient(url: string, headers: Record<string, string> = {}):
         if (event) return event;
         continue;
       }
-      const chunk = await withTimeout(reader.read(), 2_000 - (Date.now() - startedAt), "SSE event");
+      const chunk = await withTimeout(reader.read(), timeoutMs - (Date.now() - startedAt), "SSE event");
       if (chunk.done) throw new Error("SSE stream closed before an event was available");
       buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
     }
@@ -288,10 +431,10 @@ async function openSseClient(url: string, headers: Record<string, string> = {}):
   return {
     response,
     nextEvent,
-    async nextEventOfType(type: RealtimeProjectionEventType): Promise<ParsedSseEvent> {
+    async nextEventOfType(type: RealtimeProjectionEventType, timeoutMs = 2_000): Promise<ParsedSseEvent> {
       const startedAt = Date.now();
-      while (Date.now() - startedAt < 2_000) {
-        const event = await nextEvent();
+      while (Date.now() - startedAt < timeoutMs) {
+        const event = await nextEvent(timeoutMs - (Date.now() - startedAt));
         if (event.event === type) return event;
       }
       throw new Error(`Timed out waiting for SSE event type ${type}`);

@@ -165,6 +165,8 @@ export class StatusServer {
   private readonly webProjectionRevisionProviders: readonly WebProjectionRevisionProvider[];
   private readonly webProjectionRevisionUnsubscribes: WebProjectionRevisionUnsubscribe[] = [];
   private readonly realtimeEvents = new RealtimeProjectionEventBus();
+  private lastPublishedTrackerSourceStatusKey: string | null = null;
+  private trackerSourceStatusRevision = 0;
   private webProjectionDirtyGeneration = 0;
 
   constructor(private readonly options: StatusServerOptions) {
@@ -239,6 +241,33 @@ export class StatusServer {
   private markCompletedWebProjectionContextDirty(_revision: WebProjectionSourceRevision): void {
     this.webProjectionDirtyGeneration += 1;
     this.completedWebProjectionContext = null;
+  }
+
+  private publishTrackerSourceStatusIfChanged(sourceIndex: BuiltWebProjectionSourceIndex): void {
+    const trackerIssues = sourceIndex.trackerIssues;
+    const statusKey = trackerSourceStatusKey(trackerIssues);
+    if (statusKey === this.lastPublishedTrackerSourceStatusKey) return;
+    this.lastPublishedTrackerSourceStatusKey = statusKey;
+    this.trackerSourceStatusRevision += 1;
+    this.realtimeEvents.publish({
+      type: "source.status",
+      source: {
+        source: "trackerIssues",
+        revision: this.trackerSourceStatusRevision,
+        observedAt: trackerIssues.fetchedAt,
+      },
+      detail: {
+        source: "trackerIssues",
+        status: trackerIssues.status,
+        fetchedStates: trackerIssues.fetchedStates,
+        fetchedAt: trackerIssues.fetchedAt,
+        cached: trackerIssues.cached,
+        error: trackerIssues.error
+          ? { code: trackerIssues.error.code, message: trackerIssues.error.message }
+          : null,
+        issueCount: trackerIssues.issues.length,
+      },
+    });
   }
 
   private handleRealtime(request: IncomingMessage, response: ServerResponse, url: URL): void {
@@ -1153,10 +1182,12 @@ export class StatusServer {
     issueBoardColumns: IssueBoardColumnMapping;
   }> {
     const acquired = await this.acquireWebProjectionContextEntry(forceRefresh);
+    const sourceIndex = acquired.reusedCompleted
+      ? webProjectionSourceIndexWithTrackerCacheHit(acquired.context.sourceIndex)
+      : acquired.context.sourceIndex;
+    this.publishTrackerSourceStatusIfChanged(sourceIndex);
     return {
-      sourceIndex: acquired.reusedCompleted
-        ? webProjectionSourceIndexWithTrackerCacheHit(acquired.context.sourceIndex)
-        : acquired.context.sourceIndex,
+      sourceIndex,
       issueBoardColumns: this.resolveWebProjectionIssueBoardColumns(),
     };
   }
@@ -1428,6 +1459,28 @@ function webProjectionSourceIndexWithTrackerCacheHit(
       cached: true,
     },
   };
+}
+
+function trackerSourceStatusKey(trackerIssues: BuiltWebProjectionSourceIndex["trackerIssues"]): string {
+  return JSON.stringify({
+    status: trackerIssues.status,
+    fetchedStateKey: trackerIssues.fetchedStateKey,
+    fetchedAt: trackerIssues.fetchedAt,
+    cached: trackerIssues.cached,
+    error: trackerIssues.error ? { code: trackerIssues.error.code, message: trackerIssues.error.message } : null,
+    issueCount: trackerIssues.issues.length,
+    latestIssueRevision: latestTrackerIssueRevision(trackerIssues.issues),
+  });
+}
+
+function latestTrackerIssueRevision(issues: readonly Issue[]): string | null {
+  let latest: string | null = null;
+  for (const issue of issues) {
+    const revision = issue.updatedAt ?? issue.createdAt ?? issue.id;
+    if (!revision) continue;
+    if (latest === null || revision > latest) latest = revision;
+  }
+  return latest;
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
