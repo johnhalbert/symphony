@@ -3,59 +3,47 @@ import { EventEmitter } from "node:events";
 import type { ChildProcess, SpawnOptionsWithoutStdio } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { errorMessage } from "../../src/core/errors.js";
+import {
+  HostHermesAcpJsonRpcStreamDecoder,
+  encodeHostHermesAcpJsonRpcLine,
+  type HostHermesAcpDiagnostic,
+  type HostHermesAcpJsonRpcDecodeResult,
+  type HostHermesAcpJsonRpcErrorPayload,
+  type HostHermesAcpJsonRpcId,
+  type HostHermesAcpJsonRpcMessage,
+  type HostHermesAcpJsonRpcMessageKind,
+  type HostHermesAcpJsonRpcNotification,
+  type HostHermesAcpJsonRpcRequest,
+  type HostHermesAcpJsonRpcResponse,
+} from "./HostHermesAcpJsonRpcCodec.js";
 import type { HostHermesAcpProcessCommand } from "./HostHermesAcpProfileLease.js";
 
-export type HostHermesAcpJsonRpcId = string | number | null;
-
-export interface HostHermesAcpJsonRpcErrorPayload {
-  code: number;
-  message: string;
-  data?: unknown;
-  [key: string]: unknown;
-}
-
-export interface HostHermesAcpJsonRpcBaseMessage {
-  jsonrpc: "2.0";
-  [key: string]: unknown;
-}
-
-export interface HostHermesAcpJsonRpcRequest extends HostHermesAcpJsonRpcBaseMessage {
-  id: HostHermesAcpJsonRpcId;
-  method: string;
-  params?: unknown;
-}
-
-export interface HostHermesAcpJsonRpcNotification extends HostHermesAcpJsonRpcBaseMessage {
-  method: string;
-  params?: unknown;
-}
-
-export interface HostHermesAcpJsonRpcResponse extends HostHermesAcpJsonRpcBaseMessage {
-  id: HostHermesAcpJsonRpcId;
-  result?: unknown;
-  error?: HostHermesAcpJsonRpcErrorPayload;
-}
-
-export type HostHermesAcpJsonRpcMessage =
-  | HostHermesAcpJsonRpcRequest
-  | HostHermesAcpJsonRpcNotification
-  | HostHermesAcpJsonRpcResponse;
-
-export type HostHermesAcpJsonRpcMessageKind = "request" | "notification" | "response";
-
-export interface HostHermesAcpDiagnostic {
-  code: string;
-  message: string;
-  details?: Record<string, unknown>;
-}
-
-export type HostHermesAcpJsonRpcParseResult =
-  | { ok: true; message: HostHermesAcpJsonRpcMessage; kind: HostHermesAcpJsonRpcMessageKind }
-  | { ok: false; diagnostic: HostHermesAcpDiagnostic };
+export {
+  HostHermesAcpJsonRpcStreamDecoder,
+  encodeHostHermesAcpJsonRpcLine,
+  parseHostHermesAcpJsonRpcLine,
+  parseHostHermesAcpJsonRpcValue,
+  stringifyHostHermesAcpJsonRpcMessage,
+} from "./HostHermesAcpJsonRpcCodec.js";
+export type {
+  HostHermesAcpDiagnostic,
+  HostHermesAcpJsonRpcBaseMessage,
+  HostHermesAcpJsonRpcDecodeResult,
+  HostHermesAcpJsonRpcErrorPayload,
+  HostHermesAcpJsonRpcId,
+  HostHermesAcpJsonRpcMessage,
+  HostHermesAcpJsonRpcMessageKind,
+  HostHermesAcpJsonRpcNotification,
+  HostHermesAcpJsonRpcParseResult,
+  HostHermesAcpJsonRpcRequest,
+  HostHermesAcpJsonRpcResponse,
+  HostHermesAcpJsonRpcStreamDecoderOptions,
+} from "./HostHermesAcpJsonRpcCodec.js";
 
 export interface HostHermesAcpProcessExit {
   code: number | null;
   signal: NodeJS.Signals | null;
+  error?: string;
 }
 
 export interface HostHermesAcpSpawnOptions extends SpawnOptionsWithoutStdio {
@@ -72,6 +60,7 @@ export interface HostHermesAcpChildProcess {
   pid?: number | undefined;
   kill(signal?: NodeJS.Signals | number): boolean;
   on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  on(event: "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
   on(event: "error", listener: (error: Error) => void): this;
 }
 
@@ -132,9 +121,13 @@ export class HostHermesAcpJsonRpcResponseError extends Error {
 export class HostHermesAcpSubprocessTransport extends EventEmitter implements HostHermesAcpJsonRpcTransport {
   readonly #child: HostHermesAcpChildProcess;
   readonly #stderrTailBytes: number;
-  #stdoutBuffer = "";
+  readonly #stdoutDecoder = new HostHermesAcpJsonRpcStreamDecoder({ ignoreEmptyLines: true });
   #stderrTail = "";
   #exited = false;
+  #exitEmitted = false;
+  #pendingExit: HostHermesAcpProcessExit | null = null;
+  #killRequested = false;
+  #processError: string | null = null;
 
   constructor(command: HostHermesAcpProcessCommand, options: HostHermesAcpSubprocessTransportOptions = {}) {
     super();
@@ -150,13 +143,26 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
     this.#child.stdout?.on("end", () => this.#flushStdoutRemainder());
     this.#child.stderr?.on("data", (chunk: string | Buffer) => this.#acceptStderrChunk(chunk));
     this.#child.on("error", (error) => {
+      const processError = errorMessage(error);
+      this.#processError = processError;
       this.#emitDiagnostic({
         code: "host_hermes_acp_process_error",
-        message: `Host Hermes ACP process error: ${error.message}`,
+        message: `Host Hermes ACP process error: ${processError}`,
       });
-      this.#markExited({ code: null, signal: null });
+      this.#recordExited({ code: null, signal: null, error: processError });
     });
-    this.#child.on("exit", (code, signal) => this.#markExited({ code, signal }));
+    this.#child.on("exit", (code, signal) => {
+      const exit: HostHermesAcpProcessExit = { code, signal };
+      if (this.#processError) exit.error = this.#processError;
+      this.#recordExited(exit);
+    });
+    this.#child.on("close", (code, signal) => {
+      // ChildProcess "exit" can fire before stdio has drained; "close" is the
+      // stream-drained lifecycle signal used for final rejection diagnostics.
+      const exit = this.#pendingExit ?? { code, signal };
+      if (this.#processError && !exit.error) exit.error = this.#processError;
+      this.#markExited(exit);
+    });
   }
 
   on(event: "message", listener: (message: HostHermesAcpJsonRpcMessage, kind: HostHermesAcpJsonRpcMessageKind) => void): this;
@@ -179,11 +185,12 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
     if (!stdin || stdin.destroyed || stdin.writableEnded) {
       throw new Error("Host Hermes ACP stdin is not writable.");
     }
-    stdin.write(`${stringifyHostHermesAcpJsonRpcMessage(message)}\n`, "utf8");
+    stdin.write(encodeHostHermesAcpJsonRpcLine(message), "utf8");
   }
 
   kill(reason?: string): void {
-    if (this.#exited) return;
+    if (this.#exited || this.#killRequested) return;
+    this.#killRequested = true;
     if (reason) {
       this.#emitDiagnostic({
         code: "host_hermes_acp_process_kill",
@@ -198,30 +205,23 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
   }
 
   #acceptStdoutChunk(chunk: string | Buffer): void {
-    this.#stdoutBuffer += chunkToString(chunk);
-    for (;;) {
-      const newlineIndex = this.#stdoutBuffer.indexOf("\n");
-      if (newlineIndex < 0) return;
-      const rawLine = this.#stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-      this.#stdoutBuffer = this.#stdoutBuffer.slice(newlineIndex + 1);
-      this.#acceptStdoutLine(rawLine);
+    for (const result of this.#stdoutDecoder.acceptChunk(chunk)) {
+      this.#acceptDecodedStdout(result);
     }
   }
 
   #flushStdoutRemainder(): void {
-    const line = this.#stdoutBuffer.replace(/\r$/, "");
-    this.#stdoutBuffer = "";
-    if (line.trim().length > 0) this.#acceptStdoutLine(line);
+    for (const result of this.#stdoutDecoder.flush()) {
+      this.#acceptDecodedStdout(result);
+    }
   }
 
-  #acceptStdoutLine(line: string): void {
-    if (line.trim().length === 0) return;
-    const parsed = parseHostHermesAcpJsonRpcLine(line);
-    if (!parsed.ok) {
-      this.#emitDiagnostic(parsed.diagnostic);
+  #acceptDecodedStdout(result: HostHermesAcpJsonRpcDecodeResult): void {
+    if (!result.ok) {
+      this.#emitDiagnostic(result.diagnostic);
       return;
     }
-    this.emit("message", parsed.message, parsed.kind);
+    this.emit("message", result.message, result.kind);
   }
 
   #acceptStderrChunk(chunk: string | Buffer): void {
@@ -235,10 +235,17 @@ export class HostHermesAcpSubprocessTransport extends EventEmitter implements Ho
     this.emit("diagnostic", diagnostic);
   }
 
-  #markExited(exit: HostHermesAcpProcessExit): void {
+  #recordExited(exit: HostHermesAcpProcessExit): void {
     if (this.#exited) return;
     this.#exited = true;
-    if (this.#stdoutBuffer.trim().length > 0) this.#flushStdoutRemainder();
+    this.#pendingExit = exit;
+  }
+
+  #markExited(exit: HostHermesAcpProcessExit): void {
+    this.#recordExited(exit);
+    if (this.#exitEmitted) return;
+    this.#exitEmitted = true;
+    this.#flushStdoutRemainder();
     this.emit("exit", exit);
   }
 }
@@ -480,78 +487,6 @@ export class HostHermesAcpStdioJsonRpcFacade extends EventEmitter {
   }
 }
 
-export function parseHostHermesAcpJsonRpcLine(line: string): HostHermesAcpJsonRpcParseResult {
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return jsonRpcParseFailure("host_hermes_acp_empty_message", "Host Hermes ACP stdout contained an empty JSON-RPC line.");
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed) as unknown;
-  } catch (error) {
-    return jsonRpcParseFailure("host_hermes_acp_json_parse_error", `Could not parse Host Hermes ACP JSON-RPC line: ${errorMessage(error)}`, {
-      line: previewLine(trimmed),
-    });
-  }
-  return parseHostHermesAcpJsonRpcValue(parsed);
-}
-
-export function parseHostHermesAcpJsonRpcValue(value: unknown): HostHermesAcpJsonRpcParseResult {
-  if (!isRecord(value)) {
-    return jsonRpcParseFailure("host_hermes_acp_message_not_object", "Host Hermes ACP JSON-RPC message was not an object.");
-  }
-  if (value.jsonrpc !== "2.0") {
-    return jsonRpcParseFailure("host_hermes_acp_invalid_version", "Host Hermes ACP JSON-RPC message did not include jsonrpc=2.0.", {
-      jsonrpc: value.jsonrpc,
-    });
-  }
-
-  const hasMethod = typeof value.method === "string" && value.method.trim().length > 0;
-  const hasId = hasOwn(value, "id");
-  const hasResult = hasOwn(value, "result");
-  const hasError = hasOwn(value, "error");
-
-  if (hasMethod) {
-    if (hasId && !isJsonRpcId(value.id)) {
-      return jsonRpcParseFailure("host_hermes_acp_invalid_request_id", "Host Hermes ACP JSON-RPC request id was not a string, number, or null.", {
-        id: value.id,
-      });
-    }
-    const message = value as unknown as HostHermesAcpJsonRpcRequest | HostHermesAcpJsonRpcNotification;
-    return hasId ? { ok: true, message, kind: "request" } : { ok: true, message, kind: "notification" };
-  }
-
-  if (hasId) {
-    if (!isJsonRpcId(value.id)) {
-      return jsonRpcParseFailure("host_hermes_acp_invalid_response_id", "Host Hermes ACP JSON-RPC response id was not a string, number, or null.", {
-        id: value.id,
-      });
-    }
-    if (hasResult && hasError) {
-      return jsonRpcParseFailure("host_hermes_acp_ambiguous_response", "Host Hermes ACP JSON-RPC response included both result and error.", {
-        id: value.id,
-      });
-    }
-    if (!hasResult && !hasError) {
-      return jsonRpcParseFailure("host_hermes_acp_empty_response", "Host Hermes ACP JSON-RPC response included neither result nor error.", {
-        id: value.id,
-      });
-    }
-    if (hasError && !isJsonRpcErrorPayload(value.error)) {
-      return jsonRpcParseFailure("host_hermes_acp_invalid_error", "Host Hermes ACP JSON-RPC response error had an invalid shape.", {
-        id: value.id,
-      });
-    }
-    return { ok: true, message: value as unknown as HostHermesAcpJsonRpcResponse, kind: "response" };
-  }
-
-  return jsonRpcParseFailure("host_hermes_acp_unknown_message", "Host Hermes ACP JSON-RPC message was not a request, notification, or response.");
-}
-
-export function stringifyHostHermesAcpJsonRpcMessage(message: HostHermesAcpJsonRpcMessage): string {
-  return JSON.stringify(message);
-}
-
 function defaultHostHermesAcpProcessSpawner(
   file: string,
   args: readonly string[],
@@ -583,40 +518,8 @@ function jsonRpcError(code: number, message: string, data?: unknown): HostHermes
   return error;
 }
 
-function isJsonRpcId(value: unknown): value is HostHermesAcpJsonRpcId {
-  if (value === null) return true;
-  if (typeof value === "string") return true;
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function isJsonRpcErrorPayload(value: unknown): value is HostHermesAcpJsonRpcErrorPayload {
-  return isRecord(value) && typeof value.code === "number" && Number.isFinite(value.code) && typeof value.message === "string";
-}
-
-function jsonRpcParseFailure(
-  code: string,
-  message: string,
-  details?: Record<string, unknown>,
-): HostHermesAcpJsonRpcParseResult {
-  const diagnostic: HostHermesAcpDiagnostic = { code, message };
-  if (details) diagnostic.details = details;
-  return { ok: false, diagnostic };
-}
-
-function hasOwn(value: Record<string, unknown>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function chunkToString(chunk: string | Buffer): string {
   return typeof chunk === "string" ? chunk : chunk.toString("utf8");
-}
-
-function previewLine(line: string): string {
-  return line.length <= 500 ? line : `${line.slice(0, 500)}…`;
 }
 
 function logTailLines(tail: string, limit?: number): string {
@@ -630,7 +533,6 @@ function logTailLines(tail: string, limit?: number): string {
 }
 
 function hostHermesAcpExitDescription(exit: HostHermesAcpProcessExit): string {
-  if (exit.signal) return `signal ${exit.signal}`;
-  if (exit.code === null) return "exit code unknown";
-  return `exit code ${exit.code}`;
+  const base = exit.signal ? `signal ${exit.signal}` : exit.code === null ? "exit code unknown" : `exit code ${exit.code}`;
+  return exit.error ? `${base}; process error: ${exit.error}` : base;
 }

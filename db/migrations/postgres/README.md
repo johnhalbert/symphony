@@ -1,6 +1,8 @@
 # Symphony Postgres owned-state schema
 
-`0001_symphony_owned_state.sql` is the first migration-ready Postgres schema for Symphony-owned operational state and durable frontend projection/read models. See [`docs/state-ownership-and-migration.md`](../../../docs/state-ownership-and-migration.md) for the ownership map, external authority boundaries, startup compatibility matrix, and file-backed migration constraints.
+`0001_symphony_owned_state.sql` is the original migration-ready Postgres schema for Symphony-owned operational state and durable frontend projection/read models. See [`docs/state-ownership-and-migration.md`](../../../docs/state-ownership-and-migration.md) for the ownership map, external authority boundaries, startup compatibility matrix, and file-backed migration constraints that now apply to the configured runner path.
+
+> The service-configured migration runner path is `migrations/postgres`. The runner-owned copy of this schema lives at `migrations/postgres/0002_symphony_owned_state.sql` so `migrations:apply` creates the tables used by `PostgresRunActivityAppendStore`.
 
 ## Source-of-truth boundaries
 
@@ -26,8 +28,8 @@ Owned operational tables:
 - `workspace`
 - `issue`
 - `run_session`
-- `run_activity_event`
-- `chat_message`
+- `run_activity_event` (stable `event_id`, explicit `run_session_id` ordering/idempotency scope, preserved-or-assigned `sequence` with `sequence_source`, append revision identity, actor/channel/kind taxonomy fields, optional `external_event_id`, structured payload, text, and oversized raw payload reference hooks)
+- `chat_message` (thread/message ordering, role/status/body fields, event sequence range pointers for reconstruction, metadata, and oversized raw payload reference hooks)
 - `writeback_operation`
 - `approval_request`
 - `external_sync_cursor`
@@ -57,7 +59,7 @@ When raw tool output, harness payloads, or diagnostic payloads exceed the inline
 
 ## Validation
 
-The static Vitest coverage in `tests/postgres-schema.test.ts` asserts required tables, indexes, source-boundary notes, transition policy, and oversized-payload policy. The same test file includes an opt-in Docker-backed validation that applies the migration to an empty `postgres:16-alpine` database:
+The static Vitest coverage in `tests/postgres-schema.test.ts` now reads the configured migration path (`migrations/postgres/0002_symphony_owned_state.sql`) and asserts required tables, indexes, source-boundary notes, transition policy, run activity/chat reconstruction fields, run-session scoped duplicate-event/message constraints, and oversized-payload policy. The same test file includes an opt-in Docker-backed validation that applies the configured migrations to an empty `postgres:16-alpine` database, exercises basic insert/query paths for each operational and projection table, verifies ordered run-activity replay, duplicate event sequence/external id rejection, chat message reconstruction from event ranges, invalid chat event ranges, large payload reference fields, duplicate workspace keys plus duplicate non-null external issue ids, and a real `PostgresRunActivityAppendStore` append plus duplicate/no-op replay path:
 
 ```bash
 SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1 npx vitest run tests/postgres-schema.test.ts --no-file-parallelism

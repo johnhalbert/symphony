@@ -117,9 +117,11 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("concurrency cap 9");
     expect(markup).toContain('<div class="stat__value">73<span class="suffix">%</span></div>');
     expect(markup).toContain('<div class="stat__value">11</div>');
-    expect(markup).toContain("8/32 done");
-    expect(markup).toMatch(/target\s+32/);
-    expect(markup).toMatch(/completed\s+8/);
+    expect(markup).toContain("8/32 done · schedule unavailable");
+    expect(markup).toContain("Burn-up unavailable");
+    expect(markup).toContain("Trend unavailable");
+    expect(markup).toContain("Velocity trend unavailable");
+    expect(markup).toContain("ETA unavailable");
     expect(markup).toMatch(/API-1/);
     expect(markup).toContain("Implement API dashboard");
     expect(markup).toContain("Rendering dashboard model");
@@ -133,8 +135,15 @@ describe("dashboard API presentation", () => {
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("4/6 agents");
     expect(markup).not.toContain("Restart SYM-42");
-    expect(markup).not.toMatch(/target\s+17/);
-    expect(markup).not.toMatch(/completed\s+13/);
+    expect(markup).not.toMatch(/target\s+\d/);
+    expect(markup).not.toMatch(/completed\s+\d/);
+    expect(markup).not.toContain("Cycle 14");
+    expect(markup).not.toContain("3.2");
+    expect(markup).not.toContain("PR/day");
+    expect(markup).not.toContain("7 days left");
+    expect(markup).not.toContain("projected 96%");
+    expect(markup).not.toContain("nominal");
+    expect(markup).not.toContain("0 errors");
   });
 
   it("uses an empty API dashboard chat array as empty initial chat instead of mock suggestions", () => {
@@ -147,14 +156,19 @@ describe("dashboard API presentation", () => {
     expect(markup).not.toContain("Show SYM-42 transcript");
   });
 
-  it("uses API totals in the grid burn-up chart without mock chart labels", () => {
+  it("renders unavailable API grid velocity and burn-up placeholders without mock chart labels", () => {
     const markup = renderDashboard(apiDashboard, "grid");
 
-    expect(markup).toContain("8/32 done");
-    expect(markup).toMatch(/target\s+32/);
-    expect(markup).toMatch(/completed\s+8/);
-    expect(markup).not.toMatch(/target\s+17/);
-    expect(markup).not.toMatch(/completed\s+13/);
+    expect(markup).toContain("8/32 done · schedule unavailable");
+    expect(markup).toContain("Burn-up unavailable");
+    expect(markup).toContain("cycle unavailable");
+    expect(markup).toContain("Velocity · metric unavailable");
+    expect(markup).toContain("Velocity metric unavailable.");
+    expect(markup).not.toMatch(/target\s+\d/);
+    expect(markup).not.toMatch(/completed\s+\d/);
+    expect(markup).not.toContain("Cycle 14");
+    expect(markup).not.toContain("Velocity · last 14 days");
+    expect(markup).not.toContain("+24");
   });
 
   it("wires command-center agent and poll text to the API dashboard fields", () => {
@@ -164,8 +178,18 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("2/9 agents");
     expect(markup).toContain("2 running / 9 cap");
     expect(markup).toContain("poll 5s");
+    expect(markup).toContain("cycle unavailable · schedule unavailable ·");
+    expect(markup).toContain("projection <span style=\"color:var(--text-3)\">unavailable</span>");
+    expect(markup).toContain("backend metric unavailable");
+    expect(markup).toContain("5 issues in review · queue age unavailable");
+    expect(markup).toContain("status unavailable");
+    expect(markup).toContain("errors unavailable");
     expect(markup).not.toContain("4 running");
     expect(markup).not.toContain("last poll 8s ago");
+    expect(markup).not.toContain("3.2 PR/day");
+    expect(markup).not.toContain("oldest 24m");
+    expect(markup).not.toContain("nominal");
+    expect(markup).not.toContain("0 errors");
   });
 
   it("preserves mock dashboard data when rendering the mock model", () => {
@@ -178,6 +202,10 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("poll 22s");
     expect(markup).toContain("4/6 agents");
     expect(markup).toContain("Restart SYM-42");
+    expect(markup).toContain("Cycle 14");
+    expect(markup).toContain("3.2");
+    expect(markup).toContain("PR/day");
+    expect(markup).toContain("ETA: cycle ends ~3 days early");
     expect(markup).toMatch(/target\s+17/);
     expect(markup).toMatch(/completed\s+13/);
   });
@@ -193,6 +221,7 @@ describe("dashboard API presentation", () => {
         pollLabel={apiDashboard.pollLabel}
         agentUsageLabel={apiDashboard.agentUsageLabel}
         dataSourceLabel="api source · api"
+        tabBadges={{ issues: String(apiDashboard.totals.all), history: "2 live" }}
       >
         <div>Dashboard body</div>
       </AppChrome>,
@@ -203,8 +232,16 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("api/repo@api-branch");
     expect(markup).toContain("poll 5s");
     expect(markup).toContain("api source · api");
+    expect(markup).toContain('<span class="badge">32</span>');
+    expect(markup).toContain('<span class="badge">2 live</span>');
+    expect(markup).toContain("connection unavailable");
+    expect(markup).toContain("errors unavailable");
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("api source · mock");
+    expect(markup).not.toContain('badge">11</span>');
+    expect(markup).not.toContain('badge">4 live</span>');
+    expect(markup).not.toContain("linear · connected");
+    expect(markup).not.toContain("0 errors · 24h");
   });
 });
