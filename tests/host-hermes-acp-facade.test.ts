@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
   HostHermesAcpStdioJsonRpcFacade,
+  HostHermesAcpSubprocessTransport,
   parseHostHermesAcpJsonRpcLine,
   stringifyHostHermesAcpJsonRpcMessage,
   HostHermesAcpJsonRpcResponseError,
@@ -441,5 +442,28 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
 
     await expect(pending).rejects.toThrow("Host Hermes ACP process killed: test cleanup.");
     expect(second.child.killCalls).toEqual(["SIGTERM"]);
+  });
+
+  it("sends at most one termination signal when the subprocess transport is killed repeatedly", () => {
+    const child = new FakeChildProcess();
+    const diagnostics: HostHermesAcpDiagnostic[] = [];
+    const transport = new HostHermesAcpSubprocessTransport(
+      {
+        file: "hermes",
+        args: ["-p", "symphony-run", "acp"],
+        cwd: "/workspace",
+        env: { PATH: "/usr/bin" },
+      },
+      { spawn: () => child },
+    );
+    transport.on("diagnostic", (diagnostic) => diagnostics.push(diagnostic));
+
+    transport.kill("first cleanup");
+    transport.kill("second cleanup");
+
+    expect(child.killCalls).toEqual(["SIGTERM"]);
+    expect(diagnostics).toEqual([
+      { code: "host_hermes_acp_process_kill", message: "Killing Host Hermes ACP process: first cleanup" },
+    ]);
   });
 });

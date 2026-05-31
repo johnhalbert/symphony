@@ -100,6 +100,9 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
   const payloadKind = normalizedPayloadKind(payload);
+  if (isLegacyAcpProtocolEvent(eventType)) {
+    return { ...projectStatusMessage(event, payload, "runtime_diagnostic"), state: "runtime_diagnostic" };
+  }
   if (isToolEvent(eventType, payloadKind)) return projectToolCallMessage(event, payload, eventType);
   if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
   if (isTaskEvent(eventType, payloadKind)) return projectTaskMessage(event, payload);
@@ -114,14 +117,14 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
 }
 
 function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, unknown>, eventType: string): TranscriptMessage {
-  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.args, payload.arguments, payload.input);
+  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.inputPreview, payload.args, payload.arguments, payload.input);
   const resultPreview = firstPublicPreview(payload.resultPreview, payload.result, payload.summary);
   const outputPreview = firstPublicPreview(payload.outputPreview, payload.output);
   const errorPreview = firstPublicPreview(payload.errorPreview, payload.error);
   return {
     kind: "tool_call",
     ts: event.at,
-    call_id: firstCleanString(payload.call_id, payload.callId, payload.id, payload.toolId, payload.tool_id) ?? `${event.runId}:${event.sequence}`,
+    call_id: firstCleanString(payload.call_id, payload.callId, payload.toolCallId, payload.id, payload.toolId, payload.tool_id) ?? `${event.runId}:${event.sequence}`,
     name: firstCleanString(payload.name, payload.tool, payload.toolName) ?? event.eventType,
     status: inferredToolStatus(eventType, payload, errorPreview !== null),
     args: argsPreview ? { preview: argsPreview.preview } : {},
@@ -211,7 +214,7 @@ function projectStatusMessage(
   event: TranscriptEvent,
   payload: Record<string, unknown>,
   eventType: string,
-): TranscriptMessage {
+): Extract<TranscriptMessage, { kind: "status" }> {
   return {
     kind: "status",
     state: firstCleanString(payload.state, payload.status, payload.subtype, payload.kind) ?? eventType,
@@ -295,6 +298,10 @@ function isStatusEvent(eventType: string, payloadKind: string | null): boolean {
   return eventType === "status" || eventType === "status_update" || payloadKind === "status";
 }
 
+function isLegacyAcpProtocolEvent(eventType: string): boolean {
+  return eventType === "acp_session_update" || eventType === "acp_permission_denied" || eventType === "acp_diagnostic" || eventType === "hermes_acp_profile";
+}
+
 function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind: string | null): boolean {
   if (eventType === "assistant" || payloadKind === "assistant") return true;
   if (
@@ -302,6 +309,8 @@ function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind
     eventType === "message_complete" ||
     eventType === "assistant_delta" ||
     eventType === "assistant_complete" ||
+    eventType === "assistant_message_delta" ||
+    eventType === "assistant_message_completed" ||
     eventType === "response_delta" ||
     eventType === "response_complete"
   ) {
@@ -312,12 +321,18 @@ function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind
 
 function isAssistantDeltaEvent(event: TranscriptEvent): boolean {
   const eventType = normalizeToken(event.eventType);
-  return eventType === "message_delta" || eventType === "assistant_delta" || eventType === "response_delta";
+  return eventType === "message_delta" || eventType === "assistant_delta" || eventType === "assistant_message_delta" || eventType === "response_delta";
 }
 
 function isAssistantCompleteEvent(event: TranscriptEvent): boolean {
   const eventType = normalizeToken(event.eventType);
-  return eventType === "message_complete" || eventType === "assistant_complete" || eventType === "response_complete" || eventType === "completed";
+  return (
+    eventType === "message_complete" ||
+    eventType === "assistant_complete" ||
+    eventType === "assistant_message_completed" ||
+    eventType === "response_complete" ||
+    eventType === "completed"
+  );
 }
 
 function combineAssistantDeltaText(existing: string, next: string): string {

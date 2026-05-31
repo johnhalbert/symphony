@@ -14,6 +14,7 @@ import {
   projectWebOrchestratorChatPost,
   projectWebReferenceData,
   projectWebSidebar,
+  type ChatMessage,
   type DashboardRuntimeConfig,
 } from "./webProjection.js";
 import {
@@ -434,15 +435,23 @@ export class StatusServer {
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/issues") {
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
+        const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
         let board: IssueBoardResponse | null = null;
-        try {
-          board = await this.fetchIssueBoard(forceRefresh);
-        } catch (error) {
-          if (!(error instanceof SymphonyError) || (error.code !== "tracker_error" && error.code !== "tracker_unavailable")) {
-            throw error;
+        if (projection) {
+          try {
+            board = await this.buildIssueBoardFromSourceIndex(projection.sourceIndex, projection.issueBoardColumns);
+          } catch (error) {
+            if (!(error instanceof SymphonyError) || (error.code !== "tracker_error" && error.code !== "tracker_unavailable")) {
+              throw error;
+            }
           }
         }
-        sendJson(response, 200, projectWebIssueBoard(board));
+        const issues = projectWebIssueBoard(board);
+        await this.persistWebIssueBoardProjection(issues, {
+          sourceIndex: projection?.sourceIndex ?? null,
+          issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
+        });
+        sendJson(response, 200, issues);
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/issue-board") {
@@ -496,7 +505,9 @@ export class StatusServer {
       if (url.pathname === "/api/v1/web/orchestrator-chat") {
         const conversationId = parseWebOrchestratorChatConversationId(url.searchParams.get("conversationId"));
         if (request.method === "GET") {
-          sendJson(response, 200, projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages(conversationId)));
+          const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages(conversationId));
+          await this.persistWebOrchestratorChatProjection(chat, conversationId);
+          sendJson(response, 200, chat);
           return;
         }
         if (request.method === "POST") {
@@ -535,6 +546,8 @@ export class StatusServer {
             ...(postConversationId === undefined ? {} : { conversationId: postConversationId }),
             ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
           });
+          const chat = webOrchestratorChatProjectionFromResponseBody(result.body);
+          if (chat) await this.persistWebOrchestratorChatProjection(chat, postConversationId);
           sendJson(response, result.status, result.body);
           return;
         }
@@ -1063,12 +1076,18 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: 20 },
       includeTranscriptEvents: false,
     });
-    return projectWebDashboard({
+    const dashboard = projectWebDashboard({
       runtime: snapshot,
       board,
       activity,
       config: this.options.dashboard ?? null,
     });
+    await this.persistWebDashboardProjection(dashboard, {
+      sourceIndex,
+      activityCount: activity.activity.length,
+      issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
+    });
+    return dashboard;
   }
 
   private async fetchWebOrchestratorChatMessages(
@@ -1325,17 +1344,22 @@ export class StatusServer {
       includeTranscriptEvents: false,
     });
     const dashboardActivity = previewActivityFeed(historyActivity, 20);
-    return projectWebSidebar(
-      projectWebDashboard({
-        runtime: snapshot,
-        board,
-        activity: dashboardActivity,
-        config: this.options.dashboard ?? null,
-      }),
-      projectWebIssueBoard(board),
-      projectWebHistory(activitySources.runs, historyActivity.activity),
-      projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages()),
-    );
+    const dashboard = projectWebDashboard({
+      runtime: snapshot,
+      board,
+      activity: dashboardActivity,
+      config: this.options.dashboard ?? null,
+    });
+    const issues = projectWebIssueBoard(board);
+    const history = projectWebHistory(activitySources.runs, historyActivity.activity);
+    const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
+    const sidebar = projectWebSidebar(dashboard, issues, history, chat);
+    await this.persistWebSidebarProjection(sidebar, {
+      sourceIndex,
+      activityCount: historyActivity.activity.length,
+      issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
+    });
+    return sidebar;
   }
 
   private async fetchWebHistory(forceRefresh: boolean, url: URL) {
@@ -1366,6 +1390,85 @@ export class StatusServer {
       activityCount: activityFeed.activity.length,
     });
     return history;
+  }
+
+  private async persistWebDashboardProjection(
+    dashboard: ReturnType<typeof projectWebDashboard>,
+    input: {
+      sourceIndex: BuiltWebProjectionSourceIndex | null;
+      activityCount: number;
+      issueBoardColumns: IssueBoardColumnMapping;
+    },
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "dashboard_projection",
+      scopeKind: "global",
+      scopeKey: "global",
+      payload: dashboard,
+      sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceCursors: {
+        generatedAt: input.sourceIndex?.generatedAt ?? null,
+        issueCount: dashboard.totals.all,
+        openIssueCount: dashboard.totals.open,
+        runningAgentCount: dashboard.runningAgents.length,
+        providerGateCount: dashboard.providerGates.length,
+        activityCount: input.activityCount,
+        issueBoardColumns: input.issueBoardColumns,
+      },
+      fields: { messageCount: dashboard.activity.length },
+    });
+  }
+
+  private async persistWebIssueBoardProjection(
+    issues: ReturnType<typeof projectWebIssueBoard>,
+    input: { sourceIndex: BuiltWebProjectionSourceIndex | null; issueBoardColumns: IssueBoardColumnMapping },
+  ): Promise<void> {
+    const fetchedStates = webProjectionIssueBoardFetchStates(input.issueBoardColumns);
+    await this.persistProjection({
+      projectionName: "issue_board_projection",
+      scopeKind: "board",
+      scopeKey: "default-board",
+      payload: issues,
+      sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceCursors: {
+        generatedAt: input.sourceIndex?.generatedAt ?? null,
+        issueCount: issues.issues.length,
+        laneCounts: Object.fromEntries(Object.entries(issues.lanes).map(([lane, cards]) => [lane, cards.length])),
+        fetchedStates,
+        issueBoardColumns: input.issueBoardColumns,
+      },
+      fields: {
+        fetchedStates,
+        messageCount: issues.issues.length,
+      },
+    });
+  }
+
+  private async persistWebSidebarProjection(
+    sidebar: ReturnType<typeof projectWebSidebar>,
+    input: {
+      sourceIndex: BuiltWebProjectionSourceIndex | null;
+      activityCount: number;
+      issueBoardColumns: IssueBoardColumnMapping;
+    },
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "sidebar_projection",
+      scopeKind: "global",
+      scopeKey: "global",
+      payload: sidebar,
+      sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceCursors: {
+        generatedAt: input.sourceIndex?.generatedAt ?? null,
+        runningAgentCount: sidebar.runningAgents.length,
+        reviewIssueCount: sidebar.reviewIssues.length,
+        sessionCount: sidebar.sessions.length,
+        chatMessageCount: sidebar.chat.length,
+        activityCount: input.activityCount,
+        issueBoardColumns: input.issueBoardColumns,
+      },
+      fields: { messageCount: sidebar.activity.length },
+    });
   }
 
   private async persistWebHistoryProjection(
@@ -1421,6 +1524,30 @@ export class StatusServer {
     });
   }
 
+  private async persistWebOrchestratorChatProjection(
+    chat: readonly ChatMessage[],
+    conversationId?: string | null,
+  ): Promise<void> {
+    await this.persistProjection({
+      projectionName: "orchestrator_chat_projection",
+      scopeKind: "conversation",
+      scopeKey: orchestratorChatProjectionScopeKey(conversationId),
+      payload: chat,
+      sourceRevisions: statusServerOrchestratorChatProjectionSourceRevisions(
+        this.options.orchestratorConversationStore,
+        chat,
+        conversationId,
+      ),
+      sourceCursors: orchestratorChatProjectionSourceCursors(chat, conversationId),
+      fields: {
+        conversationKey: orchestratorChatProjectionScopeKey(conversationId),
+        issueKey: firstChatMetadataString(chat, "issueKey", "issueIdentifier"),
+        runId: firstChatMetadataString(chat, "runId"),
+        messageCount: chat.length,
+      },
+    });
+  }
+
   private async persistProjection(input: ProjectionPayloadWriteInput): Promise<void> {
     const writer = this.options.projectionWriter;
     if (!writer) return;
@@ -1428,8 +1555,8 @@ export class StatusServer {
       await writer.writeProjection(input);
     } catch {
       // Durable projection rows are cache/read-model side effects. The status API
-      // response is derived from canonical file-backed stores in this transition
-      // phase, so projection persistence failures must not make the UI unavailable.
+      // response is derived from canonical stores during this transition phase,
+      // so projection persistence failures must not make the UI unavailable.
     }
   }
 
@@ -1776,6 +1903,22 @@ function statusServerTranscriptProjectionSourceRevisions(
   ];
 }
 
+function statusServerOrchestratorChatProjectionSourceRevisions(
+  store: OrchestratorConversationStore | undefined,
+  chat: readonly ChatMessage[],
+  conversationId?: string | null,
+): ProjectionSourceRevision[] {
+  const storeRevision = statusServerStoreProjectionSourceRevision("orchestrator_conversations", store);
+  const lastMessage = chat.at(-1) ?? null;
+  const conversationKey = orchestratorChatProjectionScopeKey(conversationId);
+  const chatRevision: ProjectionSourceRevision = {
+    source: `orchestrator_chat:${conversationKey}`,
+    revision: [chat.length, lastMessage?.id ?? "none", lastMessage?.updatedAt ?? lastMessage?.createdAt ?? "unknown"].join(":"),
+    observedAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null,
+  };
+  return storeRevision ? [storeRevision, chatRevision] : [chatRevision];
+}
+
 function statusServerStoreProjectionSourceRevision(source: string, store: unknown): ProjectionSourceRevision | null {
   if (!isStatusServerProjectionRevisionStore(store)) return null;
   return { source, revision: store.projectionRevision(), observedAt: null };
@@ -1808,6 +1951,50 @@ function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage)
     lastSequence: lastEvent?.sequence ?? null,
     lastEventAt: lastEvent?.at ?? null,
   };
+}
+
+function orchestratorChatProjectionScopeKey(conversationId?: string | null): string {
+  const trimmed = conversationId?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_ORCHESTRATOR_CONVERSATION_ID;
+}
+
+function orchestratorChatProjectionSourceCursors(
+  chat: readonly ChatMessage[],
+  conversationId?: string | null,
+): Record<string, unknown> {
+  const lastMessage = chat.at(-1) ?? null;
+  return {
+    conversationKey: orchestratorChatProjectionScopeKey(conversationId),
+    messageCount: chat.length,
+    lastMessageId: lastMessage?.id ?? null,
+    lastMessageStatus: lastMessage?.status ?? null,
+    lastMessageAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null,
+  };
+}
+
+function webOrchestratorChatProjectionFromResponseBody(body: unknown): ChatMessage[] | null {
+  if (isWebOrchestratorChatProjection(body)) return body;
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const chat = (body as { chat?: unknown }).chat;
+    if (isWebOrchestratorChatProjection(chat)) return chat;
+  }
+  return null;
+}
+
+function isWebOrchestratorChatProjection(value: unknown): value is ChatMessage[] {
+  return Array.isArray(value) && value.every((item) => item && typeof item === "object" && typeof (item as ChatMessage).text === "string");
+}
+
+function firstChatMetadataString(chat: readonly ChatMessage[], ...keys: readonly string[]): string | null {
+  for (const message of chat) {
+    const metadata = message.metadata;
+    if (!metadata) continue;
+    for (const key of keys) {
+      const value = metadata[key];
+      if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    }
+  }
+  return null;
 }
 
 const STATUS_SERVER_WEB_PROJECTION_COLUMN_IDS: readonly IssueBoardColumnId[] = [

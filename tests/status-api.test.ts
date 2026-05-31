@@ -3096,11 +3096,20 @@ describe("StatusServer durable API", () => {
     try {
       const response = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
       const acceptedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board`);
+      const webIssuesResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues`);
       const referenceResponse = await fetch("http://" + address.host + ":" + address.port + "/api/v1/web/reference-data");
       const dashboardResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/dashboard`);
       const sidebarResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sidebar`);
       const body = (await response.json()) as { error: { code: string; message: string } };
       const acceptedBody = (await acceptedResponse.json()) as { error: { code: string; message: string } };
+      const webIssuesBody = (await webIssuesResponse.json()) as {
+        issues: unknown[];
+        backlog: unknown[];
+        lanes: { todo: unknown[]; progress: unknown[]; review: unknown[] };
+        cycleLabel: string;
+        cycleDateRange: string;
+        selectedIssueId: string;
+      };
       const referenceBody = (await referenceResponse.json()) as {
         labels: Record<string, { name: string; color: string | null }>;
         users: Record<string, { name: string; color: string | null }>;
@@ -3129,6 +3138,15 @@ describe("StatusServer durable API", () => {
       });
       expect(acceptedResponse.status).toBe(503);
       expect(acceptedBody.error).toMatchObject(body.error);
+      expect(webIssuesResponse.status).toBe(200);
+      expect(webIssuesBody).toEqual({
+        issues: [],
+        backlog: [],
+        lanes: { todo: [], progress: [], review: [] },
+        cycleLabel: "",
+        cycleDateRange: "",
+        selectedIssueId: "",
+      });
       expect(referenceResponse.status).toBe(200);
       expect(referenceBody.labels).toEqual({});
       expect(referenceBody.users.unassigned).toMatchObject({ name: "Unassigned" });

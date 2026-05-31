@@ -54,3 +54,9 @@ JSON-RPC and ACP adapters can both satisfy this contract by:
 - leaving sequence unset when the upstream stream has no reliable sequence so Symphony assigns it,
 - carrying an opaque `externalEventId` whenever the protocol provides one for reconnect/replay idempotency, and
 - using `runSessionId` rather than raw runtime session/thread ids for durable idempotency.
+
+## Harness payload boundaries
+
+Harnesses are responsible for translating provider/protocol updates into the normalized `RunActivityEvent` taxonomy before persistence or public projection. Protocol method names and adapter-only update names (for example ACP `session/update`, `tool_call`, `tool_call_update`, or permission-request internals) must not become top-level transcript `eventType` values or public status states. Keep those details only in bounded/redacted payload fields such as `updateKind`, `updatePreview`, `toolCallId`, `toolName`, `inputPreview`, `outputPreview`, `resultPreview`, or `errorPreview`.
+
+When ACP tool metadata is available, the harness should preserve the stable call id, display name/title, arguments/input preview, result/output preview, and error preview in the tool-channel payload so `tool_call_started`, `tool_call_progress`, `tool_call_completed`, and `tool_call_failed` rows can correlate into the same public tool invocation. Raw protocol envelopes, credentials, and unbounded tool arguments/results remain harness-private and must be redacted or summarized before persistence.
