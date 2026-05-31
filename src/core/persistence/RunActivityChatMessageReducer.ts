@@ -5,6 +5,8 @@ import {
   RUN_ACTIVITY_TERMINAL_CANCEL_KINDS,
   RUN_ACTIVITY_TERMINAL_FAILURE_KINDS,
   compareRunActivityEvents,
+  normalizeRunActivityChannel,
+  type RunActivityChannelInput,
   type RunActivityEvent,
   type RunActivityMessageKind,
   type RunActivityToolKind,
@@ -68,6 +70,8 @@ export type RunActivityChatSourceEvent = RunActivityStoredEvent | RunActivityEve
 interface RunActivityChatEventEnvelope {
   readonly event: RunActivityEvent;
   readonly appendRevision: string | null;
+  readonly runId: string | null;
+  readonly sessionId: string | null;
   readonly storage: {
     readonly payloadSchema: string | null;
     readonly payloadTruncated: boolean;
@@ -82,7 +86,7 @@ interface MutableChatMessage {
   threadKey: string;
   issueKey: string | null;
   issueIdentifier: string | null;
-  runId: string;
+  runId: string | null;
   sessionId: string | null;
   role: ChatMessageRole;
   messageKind: string;
@@ -129,7 +133,7 @@ interface RunActivityChatReducerPostgresRow extends QueryResultRow {
   harness_id: string;
   external_event_id: string | null;
   actor: RunActivityEvent["actor"];
-  channel: RunActivityEvent["channel"];
+  channel: RunActivityChannelInput;
   kind: RunActivityEvent["kind"];
   text: string | null;
   payload: unknown;
@@ -153,7 +157,7 @@ export class InMemoryRunActivityChatMessageReducer {
     const envelopes = normalizeSourceEvents(sources);
     const messages = reduceRunActivityEventsToChatMessages(sources, context);
     const threadKey = messages[0]?.threadKey ?? resolveThreadKey(envelopes[0]?.event.runSessionId ?? null, context.threadKey);
-    const runId = messages[0]?.runId ?? envelopes[0]?.event.runId ?? null;
+    const runId = messages[0]?.runId ?? envelopes[0]?.runId ?? null;
 
     if (threadKey !== null) {
       for (const [messageId, message] of [...this.messagesById.entries()]) {
@@ -444,16 +448,16 @@ function resolveMutableMessage(input: {
     threadKey,
     issueKey: context.issueKey ?? null,
     issueIdentifier: context.issueIdentifier ?? null,
-    runId: envelope.event.runId,
-    sessionId: envelope.event.sessionId,
+    runId: envelope.runId,
+    sessionId: envelope.sessionId,
     role,
     messageKind,
     status,
     body: "",
-    eventSequenceStart: envelope.event.sequence,
-    eventSequenceEnd: envelope.event.sequence,
-    createdAt: envelope.event.at,
-    updatedAt: envelope.event.at,
+    eventSequenceStart: eventSequence(envelope.event),
+    eventSequenceEnd: eventSequence(envelope.event),
+    createdAt: envelope.event.occurredAt,
+    updatedAt: envelope.event.occurredAt,
     rawPayloadRefId: envelope.storage.rawPayloadRefId,
     upstreamMessageId,
     sourcePayloadTruncated: envelope.storage.payloadTruncated,
@@ -495,10 +499,10 @@ function applyEnvelopeToMutableMessage(
   }
 
   message.status = terminalStatus(message.status, status);
-  message.eventSequenceStart = Math.min(message.eventSequenceStart, event.sequence);
-  message.eventSequenceEnd = Math.max(message.eventSequenceEnd, event.sequence);
-  message.createdAt = minIsoTimestamp(message.createdAt, event.at);
-  message.updatedAt = maxIsoTimestamp(message.updatedAt, event.at);
+  message.eventSequenceStart = Math.min(message.eventSequenceStart, eventSequence(event));
+  message.eventSequenceEnd = Math.max(message.eventSequenceEnd, eventSequence(event));
+  message.createdAt = minIsoTimestamp(message.createdAt, event.occurredAt);
+  message.updatedAt = maxIsoTimestamp(message.updatedAt, event.occurredAt);
   message.rawPayloadRefId = message.rawPayloadRefId ?? envelope.storage.rawPayloadRefId;
   message.sourcePayloadTruncated = message.sourcePayloadTruncated || envelope.storage.payloadTruncated;
   message.sourcePayloadByteLength = maxNullableNumber(message.sourcePayloadByteLength, envelope.storage.payloadByteLength);
@@ -510,11 +514,11 @@ function finalizeChatMessage(message: MutableChatMessage, messageIndex: number):
   const body = redactAndCapBody(message.body);
   const preview = sanitizedPreviewValue(body.body, DEFAULT_PREVIEW_LENGTH).preview ?? "";
   const sourceEvents = message.sourceEvents.map((envelope) => ({
-    eventId: envelope.event.id,
+    eventId: envelope.event.eventId,
     appendRevision: envelope.appendRevision,
-    sequence: envelope.event.sequence,
+    sequence: eventSequence(envelope.event),
     kind: envelope.event.kind,
-    at: envelope.event.at,
+    at: envelope.event.occurredAt,
     payload: payloadObject(envelope.event.payload),
     payloadSchema: envelope.storage.payloadSchema,
     payloadTruncated: envelope.storage.payloadTruncated,
@@ -571,6 +575,8 @@ function normalizeSourceEvents(sources: readonly RunActivityChatSourceEvent[]): 
       return {
         event: source.event,
         appendRevision: source.metadata.appendRevision,
+        runId: source.metadata.runId,
+        sessionId: sessionIdFromRunSessionId(source.event.runSessionId),
         storage: {
           payloadSchema: source.storage.payloadSchema,
           payloadTruncated: source.storage.payloadTruncated,
@@ -583,6 +589,8 @@ function normalizeSourceEvents(sources: readonly RunActivityChatSourceEvent[]): 
     return {
       event: source,
       appendRevision: null,
+      runId: runIdFromRunSessionId(source.runSessionId),
+      sessionId: sessionIdFromRunSessionId(source.runSessionId),
       storage: {
         payloadSchema: null,
         payloadTruncated: false,
@@ -598,13 +606,13 @@ function storedEventFromEnvelope(envelope: RunActivityChatEventEnvelope): RunAct
   return {
     event: envelope.event,
     metadata: {
-      eventId: envelope.event.id,
-      runId: envelope.event.runId,
+      eventId: envelope.event.eventId,
+      runId: envelope.runId ?? runIdFromRunSessionId(envelope.event.runSessionId) ?? "unknown-run",
       runSessionId: envelope.event.runSessionId,
-      sequence: envelope.event.sequence,
+      sequence: eventSequence(envelope.event),
       sequenceSource: envelope.event.sequenceSource,
-      appendRevision: envelope.appendRevision ?? `${envelope.event.sequence}`,
-      createdAt: envelope.event.at,
+      appendRevision: envelope.appendRevision ?? `${eventSequence(envelope.event)}`,
+      createdAt: envelope.event.occurredAt,
       externalEventId: envelope.event.externalEventId ?? null,
     },
     storage: envelope.storage,
@@ -613,18 +621,16 @@ function storedEventFromEnvelope(envelope: RunActivityChatEventEnvelope): RunAct
 
 function envelopeFromPostgresRow(row: RunActivityChatReducerPostgresRow): RunActivityChatEventEnvelope {
   const event = {
-    id: row.event_id,
-    runId: row.run_id,
-    sessionId: row.session_id,
+    eventId: row.event_id,
     runSessionId: row.run_session_id,
-    at: toIsoString(row.event_at),
+    occurredAt: toIsoString(row.event_at),
     sequence: Number(row.sequence),
     sequenceSource: row.sequence_source,
     externalEventId: row.external_event_id,
     protocol: row.protocol,
-    harnessId: row.harness_id,
+    harness: row.harness_id,
     actor: row.actor,
-    channel: row.channel,
+    channel: normalizeRunActivityChannel(row.channel),
     kind: row.kind,
     text: row.text,
     payload: payloadObject(row.payload),
@@ -632,6 +638,8 @@ function envelopeFromPostgresRow(row: RunActivityChatReducerPostgresRow): RunAct
   return {
     event,
     appendRevision: String(row.append_revision),
+    runId: row.run_id,
+    sessionId: row.session_id,
     storage: {
       payloadSchema: row.payload_schema,
       payloadTruncated: row.payload_truncated,
@@ -647,7 +655,7 @@ function isStoredRunActivityEvent(source: RunActivityChatSourceEvent): source is
 }
 
 function isMessageActivityEvent(event: RunActivityEvent): event is RunMessageActivityEvent {
-  return event.channel === "message";
+  return event.channel === "chat";
 }
 
 function isToolActivityEvent(event: RunActivityEvent): event is RunToolActivityEvent {
@@ -855,6 +863,23 @@ function scopedUpstreamMessageId(event: RunActivityEvent, upstreamMessageId: str
 
 function normalizeEventText(value: string | null): string {
   return value ?? "";
+}
+
+function eventSequence(event: RunActivityEvent): number {
+  return typeof event.sequence === "number" && Number.isSafeInteger(event.sequence) && event.sequence > 0 ? event.sequence : 0;
+}
+
+function runIdFromRunSessionId(runSessionId: string): string | null {
+  const normalized = normalizeOptionalString(runSessionId);
+  if (normalized === null) return null;
+  return normalized.split(":", 1)[0] ?? normalized;
+}
+
+function sessionIdFromRunSessionId(runSessionId: string): string | null {
+  const normalized = normalizeOptionalString(runSessionId);
+  if (normalized === null) return null;
+  const separatorIndex = normalized.indexOf(":");
+  return separatorIndex < 0 ? null : normalizeOptionalString(normalized.slice(separatorIndex + 1));
 }
 
 function redactAndCapBody(value: string): { body: string; charCount: number; truncated: boolean; redacted: boolean } {

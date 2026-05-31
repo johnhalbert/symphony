@@ -53,8 +53,11 @@ describe("RunActivityAppendStore", () => {
     expect(result).toMatchObject({
       status: "accepted",
       event: {
-        id: "activity-single",
+        eventId: "activity-single",
         runSessionId: "run-append:session-append",
+        occurredAt: "2026-05-31T00:00:00.000Z",
+        harness: "runtime-adapter",
+        channel: "diagnostic",
         sequence: 1,
         sequenceSource: "symphony",
         externalEventId: "upstream-single",
@@ -143,7 +146,7 @@ describe("RunActivityAppendStore", () => {
       terminalActivityInput({ id: "activity-second-terminal", sequence: 4 }),
     ]);
 
-    expect(batch.accepted.map((result) => result.event.id)).toEqual([
+    expect(batch.accepted.map((result) => result.event.eventId)).toEqual([
       "activity-before-terminal",
       "activity-terminal",
       "activity-pre-terminal-backfill",
@@ -172,8 +175,11 @@ describe("RunActivityAppendStore", () => {
     expect(result).toMatchObject({
       status: "accepted",
       event: {
-        id: "activity-postgres",
+        eventId: "activity-postgres",
         runSessionId: "run-postgres:custom-scope",
+        occurredAt: "2026-05-31T00:00:00.000Z",
+        harness: "runtime-adapter",
+        channel: "diagnostic",
         sequence: 1,
         sequenceSource: "symphony",
         protocol: "acp",
