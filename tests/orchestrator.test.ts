@@ -719,35 +719,216 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
   });
 
+  it("[event-guard:completed] treats accepted issue breakdown plans as succeeded when the harness completes after submitting", async () => {
+    const result = await runAcceptedIssueBreakdownHandoffScenario(root, { type: "completed" });
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
+
+    expect(eventTypes).toEqual(
+      expect.arrayContaining(["session_started", "handoff_terminal", "completed"]),
+    );
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
+  });
+
   it("[event-guard:failed] treats accepted issue breakdown plans as succeeded when the harness fails after submitting", async () => {
     const result = await runAcceptedIssueBreakdownHandoffScenario(root, {
       type: "failed",
       error: "post-plan harness failure",
     });
-    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "issue_breakdown_plan",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("failed");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
   });
 
   it("[event-guard:cancelled] treats accepted issue breakdown plans as succeeded when the harness is cancelled after submitting", async () => {
     const result = await runAcceptedIssueBreakdownHandoffScenario(root, { type: "cancelled" });
-    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "issue_breakdown_plan",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
   });
 
   it("[exit-guard:throw] terminalizes accepted planning runs when the harness throws after submitting without a terminal event", async () => {
     const result = await runAcceptedIssueBreakdownHandoffScenario(root, "throw");
-    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "issue_breakdown_plan",
+      status: "succeeded",
+    });
     expect(eventTypes).not.toContain("failed");
     expect(eventTypes).not.toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
+  });
+
+  it("[replay:planning-no-plan] records durable failed state when issue breakdown completes without a submitted plan", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.maxPlanningFailures = 3;
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownRejectingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    const run = await waitForTerminalRunRecord(runStore, "rejecting-plan-run-1");
+    await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
+    await settleOrchestratorExit();
+    const transcript = await runStore.readTranscript("rejecting-plan-run-1");
+    await orchestrator.stop();
+
+    const eventTypes = transcript.events.map((event) => event.eventType);
+    const planningEventTypes = eventTypes.filter((eventType) =>
+      ["session_started", "completed", "failed", "cancelled", "planning_run_failed"].includes(eventType),
+    );
+    expect(planningEventTypes).toEqual(["session_started", "completed", "planning_run_failed"]);
+    expect(transcript.events.find((event) => event.eventType === "planning_run_failed")?.payload).toMatchObject({
+      status: "failed",
+      error: "Planning run completed without submit_issue_breakdown_plan",
+      planningFailureCount: 1,
+    });
+    expect(run).toMatchObject({
+      status: "failed",
+      error: "Planning run completed without submit_issue_breakdown_plan",
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+      failureKind: "planning_run_failed",
+      failureDiagnosticCode: "planning_run_failed",
+      failureDiagnosticMessage: "Planning run completed without submit_issue_breakdown_plan",
+    });
+    await expectReplayFailedFromPlanningFailure(
+      config.workspace.stateDir,
+      "rejecting-plan-run-1",
+      "Planning run completed without submit_issue_breakdown_plan",
+    );
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(lifecycle?.lastPlanningFailureRunId).toBe("rejecting-plan-run-1");
+    expect(lifecycle?.incompleteTurnCount).toBe(0);
+  });
+
+  it("[replay:planning-no-plan] records durable failed state when issue breakdown fails or throws before submitting a plan", async () => {
+    for (const scenario of [
+      {
+        terminal: { type: "failed", error: "planning harness reported failure" } as const,
+        expectedRunId: "no-plan-terminal-run-1",
+        expectedEvents: ["session_started", "failed", "planning_run_failed"],
+        expectedError: "planning harness reported failure",
+      },
+      {
+        terminal: "throw" as const,
+        expectedRunId: "no-plan-terminal-run-1",
+        expectedEvents: ["session_started", "planning_run_failed"],
+        expectedError: "planning harness threw before submitting a plan",
+      },
+    ]) {
+      const scenarioRoot = path.join(root, `no-plan-${typeof scenario.terminal === "string" ? scenario.terminal : scenario.terminal.type}`);
+      const config = testConfig(scenarioRoot);
+      config.issueBreakdown.enabled = true;
+      config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+      config.issueBreakdown.planningLabels = ["planning"];
+      config.issueBreakdown.maxPlanningFailures = 3;
+      const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [candidate];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [candidate];
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+      const harness = new IssueBreakdownNoPlanTerminalHarness(scenario.terminal);
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        harness,
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore,
+      });
+
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1);
+      await waitForTerminalRunRecord(runStore, scenario.expectedRunId);
+      await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
+      await settleOrchestratorExit();
+      const transcript = await runStore.readTranscript(scenario.expectedRunId);
+      await orchestrator.stop();
+
+      const scenarioEventTypes = transcript.events
+        .map((event) => event.eventType)
+        .filter((eventType) => ["session_started", "completed", "failed", "cancelled", "planning_run_failed"].includes(eventType));
+      expect(scenarioEventTypes).toEqual(scenario.expectedEvents);
+      await expectReplayFailedFromPlanningFailure(config.workspace.stateDir, scenario.expectedRunId, scenario.expectedError);
+      const lifecycle = await lifecycleStore.get(candidate.id);
+      expect(lifecycle?.lastPlanningFailureRunId).toBe(scenario.expectedRunId);
+      expect(lifecycle?.incompleteTurnCount).toBe(0);
+    }
   });
 
   it("blocks repeated issue breakdown failures without incrementing implementation incomplete turns", async () => {
@@ -2768,8 +2949,20 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript("report-run-1");
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "pull_request_handoff",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("failed");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(stateDir, "report-run-1", {
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -2874,8 +3067,20 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript("report-run-1");
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "pull_request_handoff",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(stateDir, "report-run-1", {
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -2978,9 +3183,21 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript("report-run-1");
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "pull_request_handoff",
+      status: "succeeded",
+    });
     expect(eventTypes).not.toContain("failed");
     expect(eventTypes).not.toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(stateDir, "report-run-1", {
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -6147,12 +6364,52 @@ async function settleOrchestratorExit(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 25));
 }
 
+async function expectReplaySucceededFromHandoff(
+  stateDir: string,
+  runId: string,
+  expected: Record<string, unknown> = {},
+): Promise<void> {
+  const rebuilt = await new FileRunTranscriptStore(stateDir).rebuildRunFromTranscript(runId);
+  expect(rebuilt).toMatchObject({
+    status: "succeeded",
+    completedAt: expect.any(String),
+    error: null,
+    ...expected,
+  });
+  expect(rebuilt?.failureKind ?? null).toBeNull();
+  expect(rebuilt?.failureDiagnosticCode ?? null).toBeNull();
+  expect(rebuilt?.failureDiagnosticMessage ?? null).toBeNull();
+  expect(rebuilt?.failureDiagnosticAt ?? null).toBeNull();
+}
+
+async function expectReplayFailedFromPlanningFailure(
+  stateDir: string,
+  runId: string,
+  error: string,
+  expected: Record<string, unknown> = {},
+): Promise<void> {
+  const rebuilt = await new FileRunTranscriptStore(stateDir).rebuildRunFromTranscript(runId);
+  expect(rebuilt).toMatchObject({
+    status: "failed",
+    completedAt: expect.any(String),
+    error,
+    runPhase: "issue_breakdown",
+    runKind: "planning",
+    failureKind: "planning_run_failed",
+    failureDiagnosticCode: "planning_run_failed",
+    failureDiagnosticMessage: error,
+    failureDiagnosticAt: expect.any(String),
+    ...expected,
+  });
+}
+
 async function runAcceptedIssueBreakdownHandoffScenario(
   root: string,
   terminal: IssueBreakdownHandoffTerminal,
 ): Promise<{
   runStore: FileRunTranscriptStore;
   planRunId: string;
+  stateDir: string;
 }> {
   const config = testConfig(root);
   config.issueBreakdown.enabled = true;
@@ -6219,7 +6476,7 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   await orchestrator.stop();
   expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
 
-  return { runStore, planRunId };
+  return { runStore, planRunId, stateDir: config.workspace.stateDir };
 }
 
 class BlockingHarness implements AgentHarness {
@@ -6472,7 +6729,7 @@ class IssueBreakdownAcceptingHarness implements AgentHarness {
   }
 }
 
-type IssueBreakdownHandoffTerminal = { type: "failed"; error: string } | { type: "cancelled" } | "throw";
+type IssueBreakdownHandoffTerminal = { type: "completed" } | { type: "failed"; error: string } | { type: "cancelled" } | "throw";
 
 class IssueBreakdownHandoffHarness implements AgentHarness {
   readonly id = "issue-breakdown-handoff";
@@ -6532,6 +6789,21 @@ class IssueBreakdownRejectingHarness implements AgentHarness {
     const runId = `rejecting-plan-run-${this.runs.length}`;
     yield { type: "session_started", sessionId: `${runId}-session`, runId };
     yield { type: "completed" };
+  }
+}
+
+class IssueBreakdownNoPlanTerminalHarness implements AgentHarness {
+  readonly id = "issue-breakdown-no-plan-terminal";
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(private readonly terminal: Extract<AgentEvent, { type: "failed" }> | "throw") {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    const runId = `no-plan-terminal-run-${this.runs.length}`;
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    if (this.terminal === "throw") throw new Error("planning harness threw before submitting a plan");
+    yield this.terminal;
   }
 }
 
