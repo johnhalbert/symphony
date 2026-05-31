@@ -258,6 +258,54 @@ describe("HermesAcpHarness", () => {
     ]);
   });
 
+  it("attaches normalized ACP run activity metadata to streamed harness events", async () => {
+    const client = new FakeAcpClient();
+    client.promptNotificationParams = [
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
+      { sessionId: "acp-session-1", update: { session_update: "agent_thought_chunk", content: { type: "text", text: "private" } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "tool_call", toolCall: { title: "terminal", status: "pending" } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "tool_call_update", toolCall: { title: "terminal" }, status: "completed" } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "usage_update", final: true, usage: { input: 4, output: 5, total: 9 } } },
+    ];
+    client.promptResult = { stopReason: "end_turn" };
+    const { ctx, harness } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const activities = events.map((event) => event.runActivity);
+
+    expect(events.map((event) => event.type)).toEqual(["session_started", "progress", "progress", "progress", "progress", "tokens", "completed"]);
+    expect(activities.every(Boolean)).toBe(true);
+    expect(activities.map((activity) => activity?.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(activities[0]).toMatchObject({
+      protocol: "acp",
+      harnessId: "hermes_acp",
+      runId: expect.stringMatching(/^hermes-acp-/),
+      sessionId: "acp-session-1",
+      runSessionId: expect.stringContaining("acp-session-1"),
+      sequenceSource: "harness",
+      channel: "lifecycle",
+      kind: "session_started",
+    });
+    expect(activities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "assistant", channel: "message", kind: "assistant_message_delta", text: "hello" }),
+        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "assistant", channel: "message", kind: "assistant_reasoning_delta" }),
+        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_started" }),
+        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_completed" }),
+        expect.objectContaining({
+          protocol: "acp",
+          harnessId: "hermes_acp",
+          actor: "runtime",
+          channel: "token",
+          kind: "token_usage_reported",
+          payload: expect.objectContaining({ inputTokens: 4, outputTokens: 5, totalTokens: 9 }),
+        }),
+        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "runtime", channel: "terminal", kind: "run_succeeded", text: "hello" }),
+      ]),
+    );
+    expect(activities.map((activity) => activity?.kind)).not.toEqual(expect.arrayContaining(["agent_message_chunk", "agent_thought_chunk", "tool_call", "usage_update"]));
+  });
+
   it("streams and persists only active ACP session updates as Symphony run events", async () => {
     const client = new FakeAcpClient();
     const transcriptEvents: TranscriptEvent[] = [];

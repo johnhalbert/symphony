@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
+import type { RunActivityEvent } from "../../src/core/runActivity/RunActivityEvent.js";
 import {
   symphonyRoleMcpServers,
   writeActiveHandoffMcpContexts,
@@ -9,6 +10,7 @@ import {
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
+
 import type { ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
 import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
 import { redactTranscriptText, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
@@ -184,8 +186,23 @@ export class HermesAcpHarness implements AgentHarness {
     let sessionStarted = false;
     let responseText = "";
     let pendingFinalUsageUpdateTokens: Partial<TokenCounts> | null = null;
+    let activitySequence = 0;
 
-    const enqueue = (event: AgentEvent): void => queue.push({ ...event, at: event.at ?? new Date().toISOString() });
+    const withRunActivity = (event: AgentEvent): AgentEvent => {
+      const at = event.at ?? new Date().toISOString();
+      return attachHermesAcpRunActivity(
+        { ...event, at },
+        {
+          runId,
+          sequence: ++activitySequence,
+          at,
+          runSessionId: activeRun.symphonySessionId ?? runId,
+          sessionId: activeRun.acpSessionId,
+          harnessId: this.id,
+        },
+      );
+    };
+    const enqueue = (event: AgentEvent): void => queue.push(withRunActivity(event));
     const persistRuntimeEvent = (event: HermesAcpRuntimeEvent): void => {
       const transcriptEvent = hermesAcpTranscriptEvent(event, this.id);
       if (!transcriptEvent) return;
@@ -303,7 +320,7 @@ export class HermesAcpHarness implements AgentHarness {
       activeRun.acpSessionId = acpSessionId;
       activeRun.symphonySessionId = `${lease.profile.profileName}:${acpSessionId}:${runId}`;
       await writeActiveHandoffMcpContexts(ctx, { activeRunId: runId, sessionId: activeRun.symphonySessionId });
-      yield { type: "session_started", sessionId: activeRun.symphonySessionId, threadId: acpSessionId, runId };
+      yield withRunActivity({ type: "session_started", sessionId: activeRun.symphonySessionId, threadId: acpSessionId, runId });
       sessionStarted = true;
       await this.options.runStore?.appendEvent({
         runId,
@@ -366,7 +383,7 @@ export class HermesAcpHarness implements AgentHarness {
         }
       } else if (ctx.abortSignal.aborted || this.cancelledRuns.has(runId)) {
         terminalStatus = "cancelled";
-        yield { type: "cancelled" };
+        yield withRunActivity({ type: "cancelled" });
       } else {
         terminalStatus = "failed";
         const providerLimit = providerLimitSignalFromHermesError(error, {
@@ -374,8 +391,8 @@ export class HermesAcpHarness implements AgentHarness {
           model: ctx.config.hermes.model,
           harnessId: this.id,
         });
-        if (providerLimit) yield { type: "provider_limit", signal: providerLimit };
-        yield {
+        if (providerLimit) yield withRunActivity({ type: "provider_limit", signal: providerLimit });
+        yield withRunActivity({
           type: "run_diagnostic",
           code: "hermes_acp_run_error",
           message: `Host Hermes ACP run failed: ${errorMessage(error)}`,
@@ -385,8 +402,8 @@ export class HermesAcpHarness implements AgentHarness {
             profileName: lease.profile.profileName,
             acpLogTail: acpLogTailPayload(lease),
           },
-        };
-        yield { type: "failed", error: `Host Hermes ACP run failed: ${errorMessage(error)}` };
+        });
+        yield withRunActivity({ type: "failed", error: `Host Hermes ACP run failed: ${errorMessage(error)}` });
       }
     } finally {
       ctx.abortSignal.removeEventListener("abort", abort);
@@ -677,6 +694,229 @@ class AsyncEventQueue<T> implements AsyncIterable<T> {
     if (this.closed) return { value: undefined as never, done: true };
     return new Promise((resolve) => this.waiters.push(resolve));
   }
+}
+
+interface HermesAcpRunActivityContext {
+  runId: string;
+  sequence: number;
+  at: string;
+  runSessionId: string;
+  sessionId: string | null;
+  harnessId: string;
+}
+
+interface HermesAcpRunActivityMetadata {
+  actor: string;
+  channel: string;
+  kind: string;
+  text: string | null;
+  payload: Record<string, unknown>;
+}
+
+function attachHermesAcpRunActivity<T extends AgentEvent>(event: T, context: HermesAcpRunActivityContext): T {
+  if (event.runActivity) return event;
+  const metadata = runActivityMetadataForAgentEvent(event);
+  const sessionId = context.sessionId ?? (event.type === "session_started" ? event.threadId ?? event.sessionId : null);
+  const activity = {
+    id: `${context.runId}:activity:${context.sequence}`,
+    runId: context.runId,
+    sessionId,
+    runSessionId: context.runSessionId,
+    at: context.at,
+    sequence: context.sequence,
+    sequenceSource: "harness",
+    externalEventId: null,
+    protocol: "acp",
+    harnessId: context.harnessId,
+    actor: metadata.actor,
+    channel: metadata.channel,
+    kind: metadata.kind,
+    text: metadata.text,
+    payload: metadata.payload,
+  } as RunActivityEvent;
+  return { ...event, runActivity: activity };
+}
+
+function runActivityMetadataForAgentEvent(event: AgentEvent): HermesAcpRunActivityMetadata {
+  switch (event.type) {
+    case "session_started":
+      return {
+        actor: "harness",
+        channel: "lifecycle",
+        kind: "session_started",
+        text: "ACP session started",
+        payload: { sessionId: event.sessionId, threadId: event.threadId ?? null, runId: event.runId ?? null },
+      };
+    case "progress":
+      return progressRunActivityMetadata(event);
+    case "tokens":
+      return {
+        actor: "runtime",
+        channel: "token",
+        kind: "token_usage_reported",
+        text: "Token usage reported",
+        payload: { ...normalizedTokenCounts(event.tokens), usageSource: "stream" },
+      };
+    case "rate_limits":
+      return {
+        actor: "provider",
+        channel: "rate_limit",
+        kind: "rate_limit_retry_scheduled",
+        text: "Rate limits updated",
+        payload: { rateLimitsPreview: preview(event.payload, 1_000), redacted: true },
+      };
+    case "provider_limit":
+      return {
+        actor: "provider",
+        channel: "rate_limit",
+        kind: "provider_limit_detected",
+        text: event.signal.message,
+        payload: {
+          providerId: event.signal.scope.providerId,
+          model: event.signal.scope.model,
+          limitKind: event.signal.kind,
+          resumePolicy: event.signal.resumePolicy,
+          window: event.signal.window,
+          observedAt: event.signal.observedAt,
+          redacted: true,
+        },
+      };
+    case "run_status":
+      return {
+        actor: "runtime",
+        channel: "status",
+        kind: "sdk_status_update",
+        text: `Run status: ${event.sdkStatus}`,
+        payload: { runId: event.runId, status: event.sdkStatus, source: event.source },
+      };
+    case "run_diagnostic":
+      return {
+        actor: "runtime",
+        channel: "status",
+        kind: "runtime_diagnostic",
+        text: event.message,
+        payload: {
+          code: event.code,
+          severity: "info",
+          ...(event.payload === undefined ? {} : { detailsPreview: preview(event.payload, 1_000), redacted: true }),
+        },
+      };
+    case "completed":
+      return {
+        actor: "runtime",
+        channel: "terminal",
+        kind: "run_succeeded",
+        text: event.message ?? "Run completed",
+        payload: { reason: "run_succeeded" },
+      };
+    case "failed":
+      return {
+        actor: "runtime",
+        channel: "terminal",
+        kind: "run_failed",
+        text: event.error,
+        payload: { reason: "run_failed", error: preview(event.error, 1_000), redacted: true },
+      };
+    case "cancelled":
+      return {
+        actor: "runtime",
+        channel: "terminal",
+        kind: "run_cancelled",
+        text: "Run cancelled",
+        payload: { reason: "run_cancelled" },
+      };
+  }
+}
+
+function progressRunActivityMetadata(event: Extract<AgentEvent, { type: "progress" }>): HermesAcpRunActivityMetadata {
+  const messagePreview = preview(event.message, 1_000);
+  if (event.activitySource === "tool") {
+    const status = toolStatusFromProgressMessage(event.message);
+    return {
+      actor: "tool",
+      channel: "tool",
+      kind: toolRunActivityKind(status),
+      text: event.message,
+      payload: {
+        status: status ?? "running",
+        outputPreview: messagePreview,
+        redacted: true,
+      },
+    };
+  }
+  if (event.activitySource === "delta") {
+    return {
+      actor: "assistant",
+      channel: "message",
+      kind: "assistant_message_delta",
+      text: event.message,
+      payload: { delta: true, messagePreview, redacted: true },
+    };
+  }
+  if (/\b(thought|reasoning)\b/i.test(event.message)) {
+    return {
+      actor: "assistant",
+      channel: "message",
+      kind: "assistant_reasoning_delta",
+      text: event.message,
+      payload: { delta: true, reasoning: true, messagePreview, redacted: true },
+    };
+  }
+  if (/\bplan updated\b/i.test(event.message)) {
+    return {
+      actor: "runtime",
+      channel: "message",
+      kind: "plan_update",
+      text: event.message,
+      payload: { messagePreview, redacted: true },
+    };
+  }
+  return {
+    actor: "runtime",
+    channel: "status",
+    kind: "runtime_status_update",
+    text: event.message,
+    payload: { status: "progress", activitySource: event.activitySource ?? "stream", messagePreview, redacted: true },
+  };
+}
+
+function toolStatusFromProgressMessage(message: string): string | null {
+  const lower = message.toLowerCase();
+  if (/\b(failed|error)\b/.test(lower)) return "failed";
+  if (/\b(completed|succeeded|success)\b/.test(lower)) return "succeeded";
+  if (/\b(started|running|pending)\b/.test(lower)) return "running";
+  if (/\b(cancelled|canceled)\b/.test(lower)) return "cancelled";
+  return null;
+}
+
+function toolRunActivityKind(status: string | null): string {
+  switch (status) {
+    case "failed":
+      return "tool_call_failed";
+    case "succeeded":
+      return "tool_call_completed";
+    case "cancelled":
+      return "tool_call_progress";
+    case "running":
+      return "tool_call_started";
+    default:
+      return "tool_call_progress";
+  }
+}
+
+function normalizedTokenCounts(tokens: Partial<TokenCounts>): Partial<TokenCounts> {
+  const inputTokens = finiteNumber(tokens.inputTokens);
+  const outputTokens = finiteNumber(tokens.outputTokens);
+  const totalTokens = finiteNumber(tokens.totalTokens);
+  return {
+    ...(inputTokens === null ? {} : { inputTokens }),
+    ...(outputTokens === null ? {} : { outputTokens }),
+    ...(totalTokens === null ? {} : { totalTokens }),
+  };
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 export function mcpServersToAcpStdioServers(servers: Record<string, McpSubprocessServerConfig>): AcpMcpServerStdio[] {
