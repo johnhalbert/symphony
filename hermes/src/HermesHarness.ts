@@ -497,12 +497,13 @@ function hermesRunDiagnostic(code: string, message: string, payload: Record<stri
   };
 }
 
-interface HermesLimitMappingDefaults {
+export interface HermesLimitMappingDefaults {
   providerId?: string | null;
   model?: string | null;
+  harnessId?: string | null;
 }
 
-function providerLimitSignalFromHermesPayload(
+export function providerLimitSignalFromHermesPayload(
   payload: unknown,
   defaults: HermesLimitMappingDefaults = {},
 ): ProviderLimitSignal | null {
@@ -534,7 +535,7 @@ function providerLimitSignalFromHermesPayload(
   const model = nonEmptyString(payload.model) ?? defaults.model ?? null;
   return {
     scope: {
-      harnessId: "hermes",
+      harnessId: nonEmptyString(payload.harness_id) ?? nonEmptyString(payload.harnessId) ?? nonEmptyString(defaults.harnessId) ?? "hermes",
       providerId,
       model,
       accountScopeKey: nonEmptyString(payload.account_scope_key) ?? nonEmptyString(payload.accountScopeKey) ?? null,
@@ -566,7 +567,7 @@ function providerLimitSignalFromHermesPayload(
   };
 }
 
-function credibleProviderLimitSignalFromHermesPayload(
+export function credibleProviderLimitSignalFromHermesPayload(
   payload: unknown,
   defaults: HermesLimitMappingDefaults = {},
 ): ProviderLimitSignal | null {
@@ -606,7 +607,7 @@ function hasEmptyHermesResultClassifierEvidence(signal: ProviderLimitSignal): bo
   );
 }
 
-function providerLimitSignalFromHermesError(error: unknown, defaults: HermesLimitMappingDefaults = {}): ProviderLimitSignal | null {
+export function providerLimitSignalFromHermesError(error: unknown, defaults: HermesLimitMappingDefaults = {}): ProviderLimitSignal | null {
   const errorRecord = errorRecordWithProperties(error);
   const data = isRecord(errorRecord.data) ? errorRecord.data : {};
   const directPayload =
@@ -877,7 +878,7 @@ function normalizeProviderLimitKind(kind: string | null, message: string): Provi
   return "unknown_limit";
 }
 
-function looksLikeProviderLimit(value: string): boolean {
+export function looksLikeProviderLimit(value: string): boolean {
   const text = value.toLowerCase();
   return (
     text.includes("provider.limit") ||

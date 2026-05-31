@@ -9,6 +9,7 @@ import {
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
+import type { ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
 import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
 import { redactTranscriptText, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
 import {
@@ -31,6 +32,13 @@ import {
   type HostHermesAcpProcessExit,
   type HostHermesAcpRequestOptions,
 } from "./HostHermesAcpFacade.js";
+import {
+  credibleProviderLimitSignalFromHermesPayload,
+  looksLikeProviderLimit,
+  providerLimitSignalFromHermesError,
+  providerLimitSignalFromHermesPayload,
+  type HermesLimitMappingDefaults,
+} from "./HermesHarness.js";
 
 export interface AcpEnvVariable {
   name: string;
@@ -143,6 +151,7 @@ export class HermesAcpHarness implements AgentHarness {
     let terminalStatus: TerminalStatus = null;
     let sessionStarted = false;
     let responseText = "";
+    let pendingFinalUsageUpdateTokens: Partial<TokenCounts> | null = null;
 
     const enqueue = (event: AgentEvent): void => queue.push({ ...event, at: event.at ?? new Date().toISOString() });
     const persistRuntimeEvent = (event: HermesAcpRuntimeEvent): void => {
@@ -161,9 +170,14 @@ export class HermesAcpHarness implements AgentHarness {
       if (sessionStarted) persistRuntimeEvent(event);
       responseText += hermesAcpAgentMessageDelta(event.update);
       for (const mapped of mapHermesAcpSessionUpdate(event.update)) {
+        if (mapped.type === "tokens" && acpSessionUpdateKind(event.update) === "usage_update") {
+          pendingFinalUsageUpdateTokens = mapped.tokens;
+          continue;
+        }
         enqueue(mapped);
       }
     };
+
     const permissionDeniedReason = "ACP permission requests are denied by Symphony unless an explicit approval bridge is implemented.";
     const onPermissionRequest = (params: unknown): Record<string, unknown> => {
       const sessionId = acpSessionIdFromParams(params);
@@ -177,6 +191,7 @@ export class HermesAcpHarness implements AgentHarness {
       });
       return { outcome: { outcome: "cancelled" } };
     };
+
     const onDiagnostic = (diagnostic: HostHermesAcpDiagnostic): void => {
       const event: HermesAcpRuntimeEvent = { type: "diagnostic", diagnostic };
       if (sessionStarted) persistRuntimeEvent(event);
@@ -187,6 +202,7 @@ export class HermesAcpHarness implements AgentHarness {
         ...(diagnostic.details === undefined ? {} : { payload: diagnostic.details }),
       });
     };
+
     const failRun = (message: string, payload?: unknown): void => {
       if (terminalStatus !== null) return;
       terminalStatus = ctx.abortSignal.aborted || this.cancelledRuns.has(runId) ? "cancelled" : "failed";
@@ -266,12 +282,22 @@ export class HermesAcpHarness implements AgentHarness {
           const events = mapHermesAcpPromptResult(result, {
             cancelled: ctx.abortSignal.aborted || this.cancelledRuns.has(runId),
             responseText,
+            fallbackUsageTokens: pendingFinalUsageUpdateTokens,
+            providerId: ctx.config.hermes.provider,
+            model: ctx.config.hermes.model,
+            harnessId: this.id,
           });
           terminalStatus = terminalStatusFromEvents(events);
           for (const event of events) enqueue(event);
           queue.close();
         })
         .catch((error: unknown) => {
+          const providerLimit = providerLimitSignalFromHermesError(error, {
+            providerId: ctx.config.hermes.provider,
+            model: ctx.config.hermes.model,
+            harnessId: this.id,
+          });
+          if (providerLimit) enqueue({ type: "provider_limit", signal: providerLimit });
           failRun(`Host Hermes ACP run failed: ${errorMessage(error)}`, {
             runId,
             sessionId: activeRun.symphonySessionId,
@@ -294,6 +320,12 @@ export class HermesAcpHarness implements AgentHarness {
         yield { type: "cancelled" };
       } else {
         terminalStatus = "failed";
+        const providerLimit = providerLimitSignalFromHermesError(error, {
+          providerId: ctx.config.hermes.provider,
+          model: ctx.config.hermes.model,
+          harnessId: this.id,
+        });
+        if (providerLimit) yield { type: "provider_limit", signal: providerLimit };
         yield {
           type: "run_diagnostic",
           code: "hermes_acp_run_error",
@@ -636,74 +668,202 @@ function acpSessionIdFromParams(params: unknown): string | null {
 }
 
 function acceptAcpSessionEvent(event: Extract<HermesAcpRuntimeEvent, { type: "session.update" }>, activeSessionId: string | null): boolean {
-  if (!activeSessionId || !event.sessionId) return true;
-  return event.sessionId === activeSessionId;
+  if (!activeSessionId) return false;
+  return event.sessionId === null || event.sessionId === activeSessionId;
 }
 
-function mapHermesAcpSessionUpdate(update: Record<string, unknown>): AgentEvent[] {
+export function mapHermesAcpSessionUpdate(update: Record<string, unknown>): AgentEvent[] {
   const kind = acpSessionUpdateKind(update);
-  const text = acpUpdateText(update);
-  if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
-    return [{ type: "progress", activitySource: "delta", message: text }];
+  switch (kind) {
+    case "agent_message_chunk": {
+      const text = acpAgentMessageText(update);
+      return text.length > 0 ? [{ type: "progress", activitySource: "delta", message: text }] : [];
+    }
+    case "agent_thought_chunk":
+      return [{ type: "progress", activitySource: "stream", message: "Hermes ACP thought update" }];
+    case "user_message_chunk":
+      return [];
+    case "usage_update": {
+      const finalTokens = finalUsageUpdateTokens(update);
+      return finalTokens ? [{ type: "tokens", tokens: finalTokens }] : [{ type: "progress", activitySource: "stream", message: formatUsageUpdate(update) }];
+    }
+    case "tool_call":
+      return [{ type: "progress", activitySource: "tool", message: `Hermes ACP tool started: ${formatToolUpdate(update, "started")}` }];
+    case "tool_call_update":
+      return [{ type: "progress", activitySource: "tool", message: `Hermes ACP tool ${formatToolStatus(update)}: ${formatToolUpdate(update)}` }];
+    case "plan":
+      return [{ type: "progress", activitySource: "stream", message: formatPlanUpdate(update) }];
+    case "current_mode_update":
+      return [{ type: "progress", activitySource: "stream", message: formatCurrentModeUpdate(update) }];
+    case "session_info_update":
+      return [{ type: "progress", activitySource: "stream", message: formatSessionInfoUpdate(update) }];
+    case "available_commands_update":
+      return [{ type: "progress", activitySource: "stream", message: formatAvailableCommandsUpdate(update) }];
+    default:
+      return [
+        {
+          type: "run_diagnostic",
+          code: "hermes_acp_session_update_unmapped",
+          message: `Host Hermes ACP emitted unmapped session update ${kind}.`,
+          payload: { updateKind: kind, updatePreview: preview(update, 500), redacted: true },
+        },
+      ];
   }
-  if (kind === "usage_update") {
-    const tokens = usageTokens({ total: update.used });
-    return tokens ? [{ type: "tokens", tokens }] : [];
-  }
-  if (kind === "tool_call" || kind === "tool_call_update" || kind.includes("tool")) {
-    return [{ type: "progress", activitySource: "tool", message: `Hermes ACP ${formatToolUpdate(update)}` }];
-  }
-  if (kind === "plan") return [{ type: "progress", message: "Hermes ACP plan updated" }];
-  if (kind === "current_mode_update") return [{ type: "progress", message: `Hermes ACP mode: ${preview(update, 240)}` }];
-  return [{ type: "progress", message: `Hermes ACP ${kind}: ${text}` }];
 }
 
 function hermesAcpAgentMessageDelta(update: Record<string, unknown>): string {
   if (acpSessionUpdateKind(update) !== "agent_message_chunk") return "";
-  return acpUpdateText(update);
+  return acpAgentMessageText(update);
 }
 
 function acpSessionUpdateKind(update: Record<string, unknown>): string {
-  return nonEmptyString(update.sessionUpdate) ?? nonEmptyString(update.session_update) ?? "session_update";
+  const raw = nonEmptyString(update.sessionUpdate) ?? nonEmptyString(update.session_update) ?? "session_update";
+  return toSnakeCase(raw);
 }
 
-function acpUpdateText(update: Record<string, unknown>): string {
-  return (
-    textFromContent(update.content) ??
-    nonEmptyString(update.text) ??
-    preview(isRecord(update.content) || Array.isArray(update.content) ? update.content : update, 240) ??
-    ""
+function acpAgentMessageText(update: Record<string, unknown>): string {
+  return textFromContent(update.content) ?? contentString(update.text) ?? "";
+}
+
+function textFromContent(content: unknown, depth = 0): string | null {
+  if (depth > 6) return null;
+  if (typeof content === "string") return content.length > 0 ? content : null;
+  if (Array.isArray(content)) {
+    const parts = content.map((part) => textFromContent(part, depth + 1) ?? "").filter((part) => part.length > 0);
+    return parts.length > 0 ? parts.join("") : null;
+  }
+  if (!isRecord(content)) return null;
+  const directText = contentString(content.text) ?? contentString(content.content);
+  if (directText !== null && directText.length > 0) return directText;
+  if (content.content !== undefined) {
+    const nested = textFromContent(content.content, depth + 1);
+    if (nested !== null && nested.length > 0) return nested;
+  }
+  if (content.resource !== undefined) {
+    const resource = textFromContent(content.resource, depth + 1);
+    if (resource !== null && resource.length > 0) return resource;
+  }
+  const path = nonEmptyString(content.path);
+  if (path) return path;
+  const uri = nonEmptyString(content.uri);
+  if (uri) return uri;
+  return null;
+}
+
+function finalUsageUpdateTokens(update: Record<string, unknown>): Partial<TokenCounts> | null {
+  if (!isFinalUsageUpdate(update)) return null;
+  return usageTokens(update.usage ?? { input: update.input ?? update.inputTokens ?? update.input_tokens, output: update.output ?? update.outputTokens ?? update.output_tokens, total: update.total ?? update.totalTokens ?? update.total_tokens });
+}
+
+function isFinalUsageUpdate(update: Record<string, unknown>): boolean {
+  if (update.final === true || update.isFinal === true || update.is_final === true) return true;
+  const marker = toSnakeCase(
+    nonEmptyString(update.kind) ?? nonEmptyString(update.type) ?? nonEmptyString(update.status) ?? nonEmptyString(update.phase) ?? "",
   );
+  return marker === "final" || marker === "final_usage" || marker === "prompt_usage" || marker === "usage_final";
 }
 
-function textFromContent(content: unknown): string | null {
-  if (typeof content === "string") return content;
-  if (isRecord(content)) return nonEmptyString(content.text) ?? nonEmptyString(content.content);
-  if (!Array.isArray(content)) return null;
-  const parts = content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      if (isRecord(part)) return nonEmptyString(part.text) ?? nonEmptyString(part.content) ?? "";
-      return "";
-    })
-    .filter((part) => part.length > 0);
-  return parts.length > 0 ? parts.join("") : null;
+function formatUsageUpdate(update: Record<string, unknown>): string {
+  const usage = isRecord(update.usage) ? update.usage : {};
+  const used = numberFromUnknown(update.used) ?? numberFromUnknown(usage.used);
+  const size = numberFromUnknown(update.size) ?? numberFromUnknown(update.limit) ?? numberFromUnknown(usage.size) ?? numberFromUnknown(usage.limit);
+  const total = numberFromUnknown(update.total) ?? numberFromUnknown(update.totalTokens) ?? numberFromUnknown(update.total_tokens) ?? numberFromUnknown(usage.total) ?? numberFromUnknown(usage.totalTokens) ?? numberFromUnknown(usage.total_tokens);
+  if (used !== null && size !== null) return `Hermes ACP usage update: ${used}/${size} context tokens`;
+  if (used !== null) return `Hermes ACP usage update: ${used} context tokens used`;
+  if (total !== null) return `Hermes ACP usage update: ${total} tokens reported`;
+  return "Hermes ACP usage update";
 }
 
-function formatToolUpdate(update: Record<string, unknown>): string {
+function formatToolUpdate(update: Record<string, unknown>, defaultStatus?: string): string {
   const toolCall = isRecord(update.toolCall) ? update.toolCall : isRecord(update.tool_call) ? update.tool_call : update;
-  const title = nonEmptyString(toolCall.title) ?? nonEmptyString(toolCall.name) ?? nonEmptyString(toolCall.tool) ?? "tool update";
-  const status = nonEmptyString(update.status) ?? nonEmptyString(toolCall.status);
+  const title =
+    nonEmptyString(toolCall.title) ??
+    nonEmptyString(update.title) ??
+    nonEmptyString(toolCall.name) ??
+    nonEmptyString(update.name) ??
+    nonEmptyString(toolCall.tool) ??
+    nonEmptyString(update.tool) ??
+    nonEmptyString(toolCall.kind) ??
+    nonEmptyString(update.kind) ??
+    "tool update";
+  const status = nonEmptyString(update.status) ?? nonEmptyString(toolCall.status) ?? defaultStatus;
   return status ? `${title} (${status})` : title;
+}
+
+function formatToolStatus(update: Record<string, unknown>): string {
+  const toolCall = isRecord(update.toolCall) ? update.toolCall : isRecord(update.tool_call) ? update.tool_call : update;
+  return nonEmptyString(update.status) ?? nonEmptyString(toolCall.status) ?? "updated";
+}
+
+function formatPlanUpdate(update: Record<string, unknown>): string {
+  const entries = Array.isArray(update.entries) ? update.entries.filter(isRecord) : [];
+  if (entries.length === 0) return "Hermes ACP plan updated";
+  const counts = new Map<string, number>();
+  const active: string[] = [];
+  for (const entry of entries) {
+    const status = toSnakeCase(nonEmptyString(entry.status) ?? "pending");
+    counts.set(status, (counts.get(status) ?? 0) + 1);
+    if (status === "in_progress") {
+      const content = nonEmptyString(entry.content) ?? nonEmptyString(entry.title);
+      if (content) active.push(content);
+    }
+  }
+  const summary = [...counts.entries()].map(([status, count]) => `${count} ${status}`).join(", ");
+  const activeText = active.length > 0 ? `; active: ${active.slice(0, 3).join("; ")}` : "";
+  return `Hermes ACP plan updated: ${summary}${activeText}`;
+}
+
+function formatCurrentModeUpdate(update: Record<string, unknown>): string {
+  const mode = nonEmptyString(update.currentMode) ?? nonEmptyString(update.current_mode) ?? nonEmptyString(update.modeId) ?? nonEmptyString(update.mode_id);
+  return mode ? `Hermes ACP mode: ${mode}` : `Hermes ACP mode: ${preview(update, 240)}`;
+}
+
+function formatSessionInfoUpdate(update: Record<string, unknown>): string {
+  const title = nonEmptyString(update.title);
+  return title ? `Hermes ACP session: ${title}` : "Hermes ACP session info updated";
+}
+
+function formatAvailableCommandsUpdate(update: Record<string, unknown>): string {
+  const rawCommands = Array.isArray(update.availableCommands)
+    ? update.availableCommands
+    : Array.isArray(update.available_commands)
+      ? update.available_commands
+      : [];
+  const commands = rawCommands
+    .filter(isRecord)
+    .map((command) => nonEmptyString(command.name) ?? nonEmptyString(command.title))
+    .filter((command): command is string => command !== null)
+    .slice(0, 8);
+  return commands.length > 0 ? `Hermes ACP commands available: ${commands.join(", ")}` : "Hermes ACP commands available";
+}
+
+function toSnakeCase(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[\s-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toLowerCase();
 }
 
 function mapHermesAcpPromptResult(
   result: Record<string, unknown> | null,
-  input: { cancelled: boolean; responseText: string },
+  input: { cancelled: boolean; responseText: string; fallbackUsageTokens?: Partial<TokenCounts> | null } & HermesLimitMappingDefaults,
 ): AgentEvent[] {
   const stopReason = nonEmptyString(result?.stopReason) ?? nonEmptyString(result?.stop_reason) ?? null;
-  const usage = usageTokens(result?.usage);
+  const usage = usageTokens(result?.usage) ?? input.fallbackUsageTokens ?? null;
   const events: AgentEvent[] = usage ? [{ type: "tokens", tokens: usage }] : [];
+  const providerLimit = providerLimitSignalFromHermesAcpPromptResult(result, input);
+  if (providerLimit) {
+    events.push({ type: "provider_limit", signal: providerLimit });
+    events.push({
+      type: "run_diagnostic",
+      code: "hermes_acp_provider_limit",
+      message: providerLimit.message,
+      payload: { stopReason, resultPreview: preview(result, 500), redacted: true },
+    });
+    events.push({ type: "failed", error: providerLimit.message });
+    return events;
+  }
   if (input.cancelled || stopReason === "cancelled") {
     events.push({ type: "cancelled" });
     return events;
@@ -719,7 +879,7 @@ function mapHermesAcpPromptResult(
     return events;
   }
   if (stopReason === null || stopReason === "end_turn" || stopReason === "stop" || stopReason === "max_turn_requests") {
-    const completed: AgentEvent = input.responseText.trim().length > 0 ? { type: "completed", message: input.responseText } : { type: "completed" };
+    const completed: AgentEvent = input.responseText.length > 0 ? { type: "completed", message: input.responseText } : { type: "completed" };
     events.push(completed);
     return events;
   }
@@ -731,6 +891,58 @@ function mapHermesAcpPromptResult(
   });
   events.push({ type: "failed", error: `Host Hermes ACP stopped with unsupported stop reason ${stopReason}.` });
   return events;
+}
+
+function providerLimitSignalFromHermesAcpPromptResult(
+  result: Record<string, unknown> | null,
+  defaults: HermesLimitMappingDefaults,
+): ProviderLimitSignal | null {
+  if (!isRecord(result)) return null;
+  const directPayload =
+    credibleProviderLimitSignalFromHermesPayload(result.provider_limit, defaults) ??
+    credibleProviderLimitSignalFromHermesPayload(result.providerLimit, defaults);
+  if (directPayload) return directPayload;
+
+  const error = isRecord(result.error) ? result.error : {};
+  const errorPayload =
+    credibleProviderLimitSignalFromHermesPayload(error.provider_limit, defaults) ??
+    credibleProviderLimitSignalFromHermesPayload(error.providerLimit, defaults) ??
+    credibleProviderLimitSignalFromHermesPayload(error, defaults);
+  if (errorPayload && looksLikeProviderLimit(`${errorPayload.kind} ${errorPayload.message}`)) return errorPayload;
+
+  const status = nonEmptyString(result.status) ?? nonEmptyString(result.stopReason) ?? nonEmptyString(result.stop_reason);
+  const code =
+    nonEmptyString(result.code) ??
+    nonEmptyString(result.reason) ??
+    nonEmptyString(result.type) ??
+    nonEmptyString(error.code) ??
+    nonEmptyString(error.reason) ??
+    nonEmptyString(error.type);
+  const message =
+    nonEmptyString(result.message) ??
+    nonEmptyString(result.errorMessage) ??
+    nonEmptyString(result.error_message) ??
+    nonEmptyString(result.text) ??
+    nonEmptyString(error.message) ??
+    nonEmptyString(error.errorMessage) ??
+    nonEmptyString(error.error_message);
+  const errorStatus = toSnakeCase(status ?? "") === "error" || toSnakeCase(status ?? "") === "provider_limit";
+  const candidateText = `${code ?? ""} ${status ?? ""} ${message ?? ""}`;
+  if (!errorStatus || !looksLikeProviderLimit(candidateText)) return null;
+  return providerLimitSignalFromHermesPayload(
+    {
+      provider_id: defaults.providerId,
+      model: defaults.model,
+      harness_id: defaults.harnessId,
+      kind: code ?? status,
+      message: message ?? "Provider limit reached",
+      reset_at: result.reset_at ?? result.resets_at ?? result.retry_until ?? error.reset_at ?? error.resets_at ?? error.retry_until,
+      retry_after_ms: result.retry_after_ms ?? error.retry_after_ms,
+      retry_after: result.retry_after ?? error.retry_after,
+      raw: result,
+    },
+    defaults,
+  );
 }
 
 function terminalStatusFromEvents(events: AgentEvent[]): TerminalStatus {
@@ -815,6 +1027,10 @@ function preview(value: unknown, maxLength: number): string {
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function contentString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
 }
 
 function numberFromUnknown(value: unknown): number | null {
