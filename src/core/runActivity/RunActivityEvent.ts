@@ -390,7 +390,10 @@ export interface RunActivityOrderingState {
 
 export type RunActivityDuplicateReason = "event_id" | "external_event_id" | "sequence";
 
-export type RunActivityRejectReason = "run_session_scope_mismatch" | "terminal_already_accepted";
+export type RunActivityRejectReason =
+  | "run_session_scope_mismatch"
+  | "terminal_already_accepted"
+  | "terminal_sequence_precedes_accepted_event";
 
 export type RunActivityOrderingResult =
   | {
@@ -447,7 +450,10 @@ export function runActivityIdempotencyKeys(
  *   high-watermark value in the runSessionId scope.
  * - Duplicate event id, runSessionId+sequence, or runSessionId+externalEventId
  *   inputs are no-op duplicates and must not be re-emitted to realtime clients.
- * - The first terminal event wins. Replayed duplicates remain no-ops; explicit
+ * - The first terminal event wins only when it does not sort before already
+ *   accepted events. A terminal whose sequence is below an accepted sequence is
+ *   rejected so durable and realtime projections never contain accepted
+ *   post-terminal events. Replayed duplicates remain no-ops; explicit
  *   pre-terminal backfill may still be accepted, but missing-sequence or
  *   post-terminal events are rejected after a terminal sequence exists.
  */
@@ -465,6 +471,14 @@ export function applyRunActivityOrdering(input: RunActivityEventInput, state?: R
     return { status: "duplicate", reason: "external_event_id", state: current };
   }
   if (current.sequences.includes(sequence)) return { status: "duplicate", reason: "sequence", state: current };
+
+  if (
+    current.terminalSequence === null &&
+    input.channel === "terminal" &&
+    current.sequences.some((acceptedSequence) => acceptedSequence > sequence)
+  ) {
+    return { status: "rejected", reason: "terminal_sequence_precedes_accepted_event", state: current };
+  }
 
   if (current.terminalSequence !== null) {
     const canBackfillBeforeTerminal = providedSequence !== null && sequence < current.terminalSequence && input.channel !== "terminal";

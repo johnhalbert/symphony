@@ -14,7 +14,7 @@
 - `sequence` is a positive, 1-based integer within a `runSessionId`.
 - If a harness/protocol provides a positive integer sequence, Symphony preserves it, even if it arrives out of order.
 - If `sequence` is missing, null, zero, negative, or non-integer, Symphony assigns `highWatermark + 1` for the `runSessionId` scope and records `sequenceSource: "symphony"`.
-- Out-of-order explicit sequences are valid backfill as long as their `runSessionId + sequence` has not already been accepted.
+- Out-of-order explicit sequences are valid backfill as long as their `runSessionId + sequence` has not already been accepted and they do not violate the terminal boundary rules below.
 - Persistence and realtime projections must order accepted events by `(runSessionId, sequence)`, with `at` and `id` only as deterministic tie-breakers for corrupted legacy data.
 
 ## Idempotency
@@ -30,10 +30,11 @@ Duplicate no-ops must not increment sequence state, mutate terminal state, or be
 ## Terminal events and replay
 
 - The first accepted `channel: "terminal"` event wins and records `terminalSequence`.
+- A first terminal event with an explicit sequence is rejected as `terminal_sequence_precedes_accepted_event` when any accepted event in the same `runSessionId` already has a greater sequence. For example, after accepting non-terminal sequences `1` and `4`, a terminal event with sequence `3` is rejected and does not mutate ordering state or emit over SSE. The adapter must instead replay a terminal boundary at or above the accepted high-water mark, or leave terminal sequence unset so Symphony assigns the next sequence.
 - Exact duplicate terminal replay remains a duplicate no-op.
 - After a terminal event, explicit non-terminal backfill with `sequence < terminalSequence` may still be accepted so reconnect/replay can fill gaps.
 - After a terminal event, missing-sequence events, events with `sequence > terminalSequence`, and additional terminal events are rejected as `terminal_already_accepted` unless they are duplicates.
-- SSE consumers may treat an accepted terminal event as the live stream close marker, while still allowing durable readers to observe later accepted pre-terminal backfill in sequence order.
+- SSE consumers may treat an accepted terminal event as the live stream close marker because no accepted event may sort after `terminalSequence`, while still allowing durable readers to observe later accepted pre-terminal backfill in sequence order.
 
 ## Adapter commitments
 

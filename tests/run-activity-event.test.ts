@@ -328,4 +328,39 @@ describe("RunActivityEvent taxonomy", () => {
       reason: "sequence",
     });
   });
+
+  it("rejects a first terminal event that would sort before already accepted events", () => {
+    let state: RunActivityOrderingState = createRunActivityOrderingState("run-order:session-order");
+    state = accepted(applyRunActivityOrdering(statusActivityInput({ id: "activity-before-late-terminal", sequence: 1 }), state)).state;
+    state = accepted(applyRunActivityOrdering(statusActivityInput({ id: "activity-after-late-terminal", sequence: 4 }), state)).state;
+
+    const lateTerminal = terminalActivityInput({ id: "activity-terminal-too-low", sequence: 3, externalEventId: "terminal-too-low" });
+    expect(applyRunActivityOrdering(lateTerminal, state)).toMatchObject({
+      status: "rejected",
+      reason: "terminal_sequence_precedes_accepted_event",
+      state,
+    });
+    expect(state).toMatchObject({ highWatermark: 4, terminalSequence: null, sequences: [1, 4] });
+
+    expect(applyRunActivityOrdering(lateTerminal, state)).toMatchObject({
+      status: "rejected",
+      reason: "terminal_sequence_precedes_accepted_event",
+      state,
+    });
+
+    const boundaryTerminal = accepted(applyRunActivityOrdering(terminalActivityInput({ id: "activity-terminal-boundary", sequence: null }), state));
+    state = boundaryTerminal.state;
+    expect(boundaryTerminal.event).toMatchObject({ sequence: 5, sequenceSource: "symphony" });
+    expect(state).toMatchObject({ highWatermark: 5, terminalSequence: 5, sequences: [1, 4, 5] });
+
+    const preTerminalBackfill = accepted(
+      applyRunActivityOrdering(statusActivityInput({ id: "activity-pre-terminal-backfill-after-boundary", sequence: 3 }), state),
+    );
+    expect(preTerminalBackfill.state).toMatchObject({ highWatermark: 5, terminalSequence: 5, sequences: [1, 4, 5, 3] });
+    expect(applyRunActivityOrdering(statusActivityInput({ id: "activity-post-terminal-after-boundary", sequence: 6 }), preTerminalBackfill.state)).toMatchObject({
+      status: "rejected",
+      reason: "terminal_already_accepted",
+      state: preTerminalBackfill.state,
+    });
+  });
 });
