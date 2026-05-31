@@ -59,8 +59,10 @@ describe("ProjectionTransactionService", () => {
     expect(repeated.status).toBe("unchanged");
     expect(repeated.revision.revision).toBe(1);
     expect(repeated.revision.projectionRevisionId).toBe(first.revision.projectionRevisionId);
+    expect(repeated.revision.contentSha256).toBe(first.revision.contentSha256);
     expect(store.revisions()).toHaveLength(1);
     expect(store.payloadWrites()).toHaveLength(1);
+
     expect(publications).toEqual([
       {
         source: "issue_board_projection:global:default-board",
