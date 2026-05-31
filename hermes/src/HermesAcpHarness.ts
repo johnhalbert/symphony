@@ -114,6 +114,8 @@ interface ActiveHermesAcpRun {
   lease: HermesAcpLease;
   acpSessionId: string | null;
   symphonySessionId: string | null;
+  cancelled: boolean;
+  permissionCancellationWaiters: Set<() => void>;
 }
 
 type TerminalStatus = HostHermesAcpTerminalStatus;
@@ -125,6 +127,7 @@ type HermesAcpRuntimeEvent =
 
 const TERMINAL_SETUP_AUTH_METHOD_ID = "hermes-setup";
 const DEFAULT_PROFILE_PREFIX = "symphony";
+const RUN_CANCELLED = Symbol("hermes_acp_run_cancelled");
 
 export class HermesAcpHarness implements AgentHarness {
   readonly id = "hermes_acp";
@@ -167,7 +170,13 @@ export class HermesAcpHarness implements AgentHarness {
     await writeInitialHandoffMcpContexts(ctx);
     const runId = `hermes-acp-${randomUUID()}`;
     const lease = await this.getOrCreateLease(ctx, runId);
-    const activeRun: ActiveHermesAcpRun = { lease, acpSessionId: null, symphonySessionId: null };
+    const activeRun: ActiveHermesAcpRun = {
+      lease,
+      acpSessionId: null,
+      symphonySessionId: null,
+      cancelled: false,
+      permissionCancellationWaiters: new Set(),
+    };
     this.activeRuns.set(runId, activeRun);
 
     const queue = new AsyncEventQueue<AgentEvent>();
@@ -270,7 +279,7 @@ export class HermesAcpHarness implements AgentHarness {
       });
     };
     const abort = (): void => {
-      this.cancelledRuns.add(runId);
+      this.markRunCancelling(runId, activeRun);
       void this.interruptActiveRun(activeRun, "abort_signal").catch((error) => {
         ctx.logger.warn("hermes_acp cancel after abort failed", {
           run_id: runId,
@@ -320,7 +329,7 @@ export class HermesAcpHarness implements AgentHarness {
         .then((result) => {
           if (terminalStatus !== null) return;
           const events = mapHermesAcpPromptResult(result, {
-            cancelled: ctx.abortSignal.aborted || this.cancelledRuns.has(runId),
+            cancelled: this.isRunCancelling(ctx, runId, activeRun),
             responseText,
             fallbackUsageTokens: pendingFinalUsageUpdateTokens,
             providerId: ctx.config.hermes.provider,
@@ -401,26 +410,34 @@ export class HermesAcpHarness implements AgentHarness {
     jsonRpcRequest: HostHermesAcpJsonRpcRequest,
   ): Promise<HermesAcpPermissionResolution> {
     if (request.malformedReason) return denyHermesAcpPermission(request, request.malformedReason);
-    if (ctx.abortSignal.aborted || this.cancelledRuns.has(runId)) return denyHermesAcpPermission(request, "run_cancelled");
+    if (this.isRunCancelling(ctx, runId, activeRun)) return denyHermesAcpPermission(request, "run_cancelled");
 
     const resolver = this.options.permissionResolver;
     if (!resolver) return denyHermesAcpPermission(request, "permission_bridge_not_configured");
 
     try {
-      const decision = await withTimeout(
-        Promise.resolve(
-          resolver({
-            ctx,
-            runId,
-            request,
-            jsonRpcRequest,
-            acpSessionId: activeRun.acpSessionId,
-            symphonySessionId: activeRun.symphonySessionId,
-          }),
+      const decision = await this.resolvePermissionDecisionUnlessCancelled(
+        ctx,
+        runId,
+        activeRun,
+        withTimeout(
+          Promise.resolve(
+            resolver({
+              ctx,
+              runId,
+              request,
+              jsonRpcRequest,
+              acpSessionId: activeRun.acpSessionId,
+              symphonySessionId: activeRun.symphonySessionId,
+            }),
+          ),
+          this.options.permissionRequestTimeoutMs ?? ctx.config.hermes.requestTimeoutMs,
+          "ACP permission resolver timed out",
         ),
-        this.options.permissionRequestTimeoutMs ?? ctx.config.hermes.requestTimeoutMs,
-        "ACP permission resolver timed out",
       );
+      if (decision === RUN_CANCELLED || this.isRunCancelling(ctx, runId, activeRun)) {
+        return denyHermesAcpPermission(request, "run_cancelled");
+      }
       return resolveHermesAcpPermissionDecision(request, decision);
     } catch (error) {
       ctx.logger.warn("hermes_acp permission resolver failed closed", {
@@ -436,8 +453,39 @@ export class HermesAcpHarness implements AgentHarness {
   async stop(runId: string): Promise<void> {
     const activeRun = this.activeRuns.get(runId);
     if (!activeRun) return;
-    this.cancelledRuns.add(runId);
+    this.markRunCancelling(runId, activeRun);
     await this.interruptActiveRun(activeRun, "stop");
+  }
+
+  private async resolvePermissionDecisionUnlessCancelled(
+    ctx: AgentRunContext,
+    runId: string,
+    activeRun: ActiveHermesAcpRun,
+    decisionPromise: Promise<HermesAcpPermissionDecision>,
+  ): Promise<HermesAcpPermissionDecision | typeof RUN_CANCELLED> {
+    if (this.isRunCancelling(ctx, runId, activeRun)) return RUN_CANCELLED;
+
+    let notifyCancelled: (() => void) | null = null;
+    const cancellationPromise = new Promise<typeof RUN_CANCELLED>((resolve) => {
+      notifyCancelled = () => resolve(RUN_CANCELLED);
+      activeRun.permissionCancellationWaiters.add(notifyCancelled);
+    });
+    try {
+      return await Promise.race([decisionPromise, cancellationPromise]);
+    } finally {
+      if (notifyCancelled) activeRun.permissionCancellationWaiters.delete(notifyCancelled);
+    }
+  }
+
+  private isRunCancelling(ctx: AgentRunContext, runId: string, activeRun: ActiveHermesAcpRun): boolean {
+    return ctx.abortSignal.aborted || activeRun.cancelled || this.cancelledRuns.has(runId);
+  }
+
+  private markRunCancelling(runId: string, activeRun: ActiveHermesAcpRun): void {
+    activeRun.cancelled = true;
+    this.cancelledRuns.add(runId);
+    for (const notifyCancelled of activeRun.permissionCancellationWaiters) notifyCancelled();
+    activeRun.permissionCancellationWaiters.clear();
   }
 
   async dispose(): Promise<void> {

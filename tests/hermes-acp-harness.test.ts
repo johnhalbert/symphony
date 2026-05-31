@@ -646,6 +646,56 @@ describe("HermesAcpHarness", () => {
     );
   });
 
+  it.each([
+    { optionId: "allow_once", params: () => terminalPermissionRequest(), requestKind: "terminal_execute" },
+    { optionId: "allow_session", params: () => terminalPermissionRequest(), requestKind: "terminal_execute" },
+    { optionId: "allow_always", params: () => terminalPermissionRequest(), requestKind: "terminal_execute" },
+    { optionId: "deny", params: () => terminalPermissionRequest(), requestKind: "terminal_execute" },
+    { optionId: "deny_always", params: () => terminalPermissionRequest(), requestKind: "terminal_execute" },
+    { optionId: "allow_once", params: () => editPermissionRequest(), requestKind: "file_edit" },
+    { optionId: "deny", params: () => editPermissionRequest(), requestKind: "file_edit" },
+  ])(
+    "preserves offered ACP permission option $optionId for $requestKind bridge decisions",
+    async ({ optionId, params, requestKind }) => {
+      const client = new FakeAcpClient();
+      client.promptDeferred = deferred<Record<string, unknown> | null>();
+      client.promptStarted = deferred<void>();
+      client.promptNotificationParams = null;
+      const transcript = recordingRunStore();
+      const permissionResolver = vi.fn((input: Parameters<HermesAcpPermissionResolver>[0]) => {
+        expect(input.request.requestKind).toBe(requestKind);
+        return { optionId };
+      });
+      const { ctx, harness } = await fixture({ client, permissionResolver, runStore: transcript.runStore });
+      const { runPromise } = await startPendingRun({ client, ctx, harness });
+
+      const responses = await client.invokeClientRequest("session/request_permission", params());
+      client.promptDeferred.resolve({ stopReason: "end_turn" });
+      const events = await runPromise;
+
+      expect(permissionResolver).toHaveBeenCalledTimes(1);
+      expect(responses).toEqual([{ outcome: { outcome: "selected", optionId } }]);
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "progress",
+            activitySource: "tool",
+            message: `Host Hermes ACP permission ${optionId} for ${requestKind}`,
+          }),
+        ]),
+      );
+      expect(transcript.events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "acp_permission_selected",
+            message: `Host Hermes ACP permission selected: ${optionId}`,
+            payload: expect.objectContaining({ selectedOptionId: optionId, requestKind }),
+          }),
+        ]),
+      );
+    },
+  );
+
   it("rejects malformed permission requests before consulting the bridge", async () => {
     const client = new FakeAcpClient();
     client.promptDeferred = deferred<Record<string, unknown> | null>();
@@ -670,6 +720,35 @@ describe("HermesAcpHarness", () => {
           type: "run_diagnostic",
           code: "hermes_acp_permission_denied",
           message: "Host Hermes ACP permission request denied: missing_permission_options",
+        }),
+      ]),
+    );
+  });
+
+  it("rejects unknown permission option shapes before consulting the bridge", async () => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    const permissionResolver = vi.fn(() => "allow_once");
+    const { ctx, harness } = await fixture({ client, permissionResolver });
+    const { runPromise } = await startPendingRun({ client, ctx, harness });
+
+    const responses = await client.invokeClientRequest("session/request_permission", {
+      ...terminalPermissionRequest(),
+      options: [...terminalPermissionOptions(), { optionId: "unknown", kind: "unknown", name: "Unknown" }],
+    });
+    client.promptDeferred.resolve({ stopReason: "end_turn" });
+    const events = await runPromise;
+
+    expect(permissionResolver).not.toHaveBeenCalled();
+    expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "run_diagnostic",
+          code: "hermes_acp_permission_denied",
+          message: "Host Hermes ACP permission request denied: unsupported_permission_options",
         }),
       ]),
     );
@@ -725,6 +804,45 @@ describe("HermesAcpHarness", () => {
         }),
       ]),
     );
+  });
+
+  it("fails closed when a run is cancelled while the permission resolver is pending", async () => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    const transcript = recordingRunStore();
+    const resolverStarted = deferred<void>();
+    const permissionDecision = deferred<string>();
+    const permissionResolver = vi.fn(() => {
+      resolverStarted.resolve();
+      return permissionDecision.promise;
+    });
+    const { ctx, harness } = await fixture({ client, permissionResolver, runStore: transcript.runStore });
+    const { runId, runPromise } = await startPendingRun({ client, ctx, harness });
+
+    const responsePromise = client.invokeClientRequest("session/request_permission", terminalPermissionRequest());
+    await resolverStarted.promise;
+    await harness.stop(runId);
+    permissionDecision.resolve("allow_always");
+    const responses = await responsePromise;
+    const events = await runPromise;
+
+    expect(permissionResolver).toHaveBeenCalledTimes(1);
+    expect(client.cancelledParams).toEqual([{ sessionId: "acp-session-1" }]);
+    expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
+    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "cancelled" })]));
+    expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "progress" })]));
+    expect(transcript.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "acp_permission_denied",
+          message: "Host Hermes ACP permission denied: run_cancelled",
+          payload: expect.objectContaining({ reason: "run_cancelled" }),
+        }),
+      ]),
+    );
+    expect(transcript.events).not.toEqual(expect.arrayContaining([expect.objectContaining({ eventType: "acp_permission_selected" })]));
   });
 });
 
