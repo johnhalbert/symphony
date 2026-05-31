@@ -1,6 +1,7 @@
 import type { QueryResultRow } from "pg";
 import type { PostgresQueryClient } from "../database/PostgresMigrations.js";
 import { SymphonyError } from "../errors.js";
+import { reduceRunActivityChatMessagesWithPostgresClient } from "./RunActivityChatMessageReducer.js";
 import {
   applyRunActivityOrdering,
   createRunActivityOrderingState,
@@ -88,6 +89,16 @@ export interface PostgresRunActivityAppendConnectionProvider {
   connect(): Promise<PostgresRunActivityAppendClient>;
 }
 
+export interface PostgresRunActivityAppendStoreOptions {
+  /**
+   * When enabled (default), accepted chat-relevant activity is reduced into
+   * symphony.chat_message rows inside the same Postgres transaction. This covers
+   * message events, tool-facing events, and terminal failure/cancel events that
+   * can finalize active streaming chat rows.
+   */
+  readonly reduceChatMessages?: boolean;
+}
+
 interface RequiredRunActivityAppendStorageMetadata {
   readonly payloadSchema: string | null;
   readonly payloadTruncated: boolean;
@@ -159,7 +170,10 @@ export class InMemoryRunActivityAppendStore implements RunActivityAppendStore {
 }
 
 export class PostgresRunActivityAppendStore implements RunActivityAppendStore {
-  constructor(private readonly connections: PostgresRunActivityAppendConnectionProvider) {}
+  constructor(
+    private readonly connections: PostgresRunActivityAppendConnectionProvider,
+    private readonly options: PostgresRunActivityAppendStoreOptions = {},
+  ) {}
 
   async appendEvent(input: RunActivityAppendInput): Promise<RunActivityAppendResult> {
     const batch = await this.appendEvents([input]);
@@ -176,6 +190,9 @@ export class PostgresRunActivityAppendStore implements RunActivityAppendStore {
       await client.query("BEGIN");
       try {
         const result = await appendRunActivityEventsWithPostgresClient(client, inputs);
+        if (this.options.reduceChatMessages !== false) {
+          await reduceAcceptedRunActivityMessageEventsWithPostgresClient(client, result.accepted);
+        }
         await client.query("COMMIT");
         return result;
       } catch (error) {
@@ -237,6 +254,24 @@ export async function appendRunActivityEventsWithPostgresClient(
     const row = await insertRunActivityEventRow(client, event, storage);
     return storedEventFromPostgresRow(row);
   });
+}
+
+async function reduceAcceptedRunActivityMessageEventsWithPostgresClient(
+  client: PostgresQueryClient,
+  accepted: readonly RunActivityAcceptedAppendResult[],
+): Promise<void> {
+  const runSessionIds = sortedUnique(
+    accepted.filter((result) => isChatMessageReductionTrigger(result.event)).map((result) => result.event.runSessionId),
+  );
+  for (const runSessionId of runSessionIds) {
+    await reduceRunActivityChatMessagesWithPostgresClient(client, runSessionId);
+  }
+}
+
+function isChatMessageReductionTrigger(event: RunActivityEvent): boolean {
+  if (event.channel === "message" || event.channel === "tool") return true;
+  if (event.channel !== "terminal") return false;
+  return event.kind !== "run_succeeded";
 }
 
 async function appendRunActivityEventsWithState(
