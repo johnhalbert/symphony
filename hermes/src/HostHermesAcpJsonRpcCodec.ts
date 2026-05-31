@@ -1,3 +1,4 @@
+import { StringDecoder } from "node:string_decoder";
 import { errorMessage } from "../../src/core/errors.js";
 
 export type HostHermesAcpJsonRpcId = string | number | null;
@@ -61,6 +62,7 @@ export interface HostHermesAcpJsonRpcStreamDecoderOptions {
  */
 export class HostHermesAcpJsonRpcStreamDecoder {
   readonly #ignoreEmptyLines: boolean;
+  readonly #utf8Decoder = new StringDecoder("utf8");
   #buffer = "";
 
   constructor(options: HostHermesAcpJsonRpcStreamDecoderOptions = {}) {
@@ -72,7 +74,7 @@ export class HostHermesAcpJsonRpcStreamDecoder {
   }
 
   acceptChunk(chunk: string | Buffer): HostHermesAcpJsonRpcDecodeResult[] {
-    this.#buffer += chunkToString(chunk);
+    this.#buffer += this.#decodeChunk(chunk);
     const results: HostHermesAcpJsonRpcDecodeResult[] = [];
     for (;;) {
       const newlineIndex = this.#buffer.indexOf("\n");
@@ -85,6 +87,7 @@ export class HostHermesAcpJsonRpcStreamDecoder {
   }
 
   flush(): HostHermesAcpJsonRpcDecodeResult[] {
+    this.#buffer += this.#utf8Decoder.end();
     if (this.#buffer.length === 0) return [];
     const rawLine = this.#buffer.replace(/\r$/, "");
     this.#buffer = "";
@@ -94,6 +97,14 @@ export class HostHermesAcpJsonRpcStreamDecoder {
 
   reset(): void {
     this.#buffer = "";
+    this.#utf8Decoder.end();
+  }
+
+  #decodeChunk(chunk: string | Buffer): string {
+    if (typeof chunk === "string") {
+      return this.#utf8Decoder.end() + chunk;
+    }
+    return this.#utf8Decoder.write(chunk);
   }
 
   #parseLine(line: string): HostHermesAcpJsonRpcDecodeResult | null {
@@ -204,10 +215,6 @@ function hasOwn(value: Record<string, unknown>, key: string): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function chunkToString(chunk: string | Buffer): string {
-  return typeof chunk === "string" ? chunk : chunk.toString("utf8");
 }
 
 function previewLine(line: string): string {

@@ -83,6 +83,24 @@ describe("HostHermesAcpJsonRpcCodec", () => {
     ]);
   });
 
+  it("preserves multibyte UTF-8 characters split across Buffer chunks", () => {
+    const decoder = new HostHermesAcpJsonRpcStreamDecoder();
+    const notification: HostHermesAcpJsonRpcMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { text: "\u00e9" },
+    };
+    const messageBytes = Buffer.from(encodeHostHermesAcpJsonRpcLine(notification), "utf8");
+    const splitIndex = messageBytes.indexOf(0xc3);
+
+    expect(splitIndex).toBeGreaterThanOrEqual(0);
+    expect(messageBytes[splitIndex + 1]).toBe(0xa9);
+    expect(decoder.acceptChunk(messageBytes.subarray(0, splitIndex + 1))).toEqual([]);
+
+    const decoded = okResults(decoder.acceptChunk(messageBytes.subarray(splitIndex + 1)));
+    expect(decoded).toEqual([{ kind: "notification", message: notification }]);
+  });
+
   it("flushes a final unterminated message and can ignore empty process-level lines", () => {
     const decoder = new HostHermesAcpJsonRpcStreamDecoder({ ignoreEmptyLines: true });
 
