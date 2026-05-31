@@ -636,26 +636,46 @@ function acpSessionIdFromParams(params: unknown): string | null {
 }
 
 function acceptAcpSessionEvent(event: Extract<HermesAcpRuntimeEvent, { type: "session.update" }>, activeSessionId: string | null): boolean {
-  if (!activeSessionId || !event.sessionId) return true;
-  return event.sessionId === activeSessionId;
+  if (!activeSessionId) return false;
+  return event.sessionId === null || event.sessionId === activeSessionId;
 }
 
-function mapHermesAcpSessionUpdate(update: Record<string, unknown>): AgentEvent[] {
+export function mapHermesAcpSessionUpdate(update: Record<string, unknown>): AgentEvent[] {
   const kind = acpSessionUpdateKind(update);
   const text = acpUpdateText(update);
-  if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
-    return [{ type: "progress", activitySource: "delta", message: text }];
+  switch (kind) {
+    case "agent_message_chunk":
+      return text ? [{ type: "progress", activitySource: "delta", message: text }] : [];
+    case "agent_thought_chunk":
+      return [{ type: "progress", activitySource: "stream", message: "Hermes ACP thought update" }];
+    case "user_message_chunk":
+      return [];
+    case "usage_update": {
+      const tokens = usageTokens(update.usage ?? { total: update.used ?? update.total ?? update.totalTokens ?? update.total_tokens });
+      return tokens ? [{ type: "tokens", tokens }] : [];
+    }
+    case "tool_call":
+      return [{ type: "progress", activitySource: "tool", message: `Hermes ACP tool started: ${formatToolUpdate(update, "started")}` }];
+    case "tool_call_update":
+      return [{ type: "progress", activitySource: "tool", message: `Hermes ACP tool ${formatToolStatus(update)}: ${formatToolUpdate(update)}` }];
+    case "plan":
+      return [{ type: "progress", activitySource: "stream", message: formatPlanUpdate(update) }];
+    case "current_mode_update":
+      return [{ type: "progress", activitySource: "stream", message: formatCurrentModeUpdate(update) }];
+    case "session_info_update":
+      return [{ type: "progress", activitySource: "stream", message: formatSessionInfoUpdate(update) }];
+    case "available_commands_update":
+      return [{ type: "progress", activitySource: "stream", message: formatAvailableCommandsUpdate(update) }];
+    default:
+      return [
+        {
+          type: "run_diagnostic",
+          code: "hermes_acp_session_update_unmapped",
+          message: `Host Hermes ACP emitted unmapped session update ${kind}.`,
+          payload: { updateKind: kind, updatePreview: preview(update, 500), redacted: true },
+        },
+      ];
   }
-  if (kind === "usage_update") {
-    const tokens = usageTokens({ total: update.used });
-    return tokens ? [{ type: "tokens", tokens }] : [];
-  }
-  if (kind === "tool_call" || kind === "tool_call_update" || kind.includes("tool")) {
-    return [{ type: "progress", activitySource: "tool", message: `Hermes ACP ${formatToolUpdate(update)}` }];
-  }
-  if (kind === "plan") return [{ type: "progress", message: "Hermes ACP plan updated" }];
-  if (kind === "current_mode_update") return [{ type: "progress", message: `Hermes ACP mode: ${preview(update, 240)}` }];
-  return [{ type: "progress", message: `Hermes ACP ${kind}: ${text}` }];
 }
 
 function hermesAcpAgentMessageDelta(update: Record<string, unknown>): string {
@@ -664,37 +684,108 @@ function hermesAcpAgentMessageDelta(update: Record<string, unknown>): string {
 }
 
 function acpSessionUpdateKind(update: Record<string, unknown>): string {
-  return nonEmptyString(update.sessionUpdate) ?? nonEmptyString(update.session_update) ?? "session_update";
+  const raw = nonEmptyString(update.sessionUpdate) ?? nonEmptyString(update.session_update) ?? "session_update";
+  return toSnakeCase(raw);
 }
 
 function acpUpdateText(update: Record<string, unknown>): string {
-  return (
-    textFromContent(update.content) ??
-    nonEmptyString(update.text) ??
-    preview(isRecord(update.content) || Array.isArray(update.content) ? update.content : update, 240) ??
-    ""
-  );
+  return textFromContent(update.content) ?? nonEmptyString(update.text) ?? nonEmptyString(update.title) ?? preview(update, 240) ?? "";
 }
 
-function textFromContent(content: unknown): string | null {
-  if (typeof content === "string") return content;
-  if (isRecord(content)) return nonEmptyString(content.text) ?? nonEmptyString(content.content);
-  if (!Array.isArray(content)) return null;
-  const parts = content
-    .map((part) => {
-      if (typeof part === "string") return part;
-      if (isRecord(part)) return nonEmptyString(part.text) ?? nonEmptyString(part.content) ?? "";
-      return "";
-    })
-    .filter((part) => part.length > 0);
-  return parts.length > 0 ? parts.join("") : null;
+function textFromContent(content: unknown, depth = 0): string | null {
+  if (depth > 6) return null;
+  if (typeof content === "string") return content.trim().length > 0 ? content : null;
+  if (Array.isArray(content)) {
+    const parts = content.map((part) => textFromContent(part, depth + 1) ?? "").filter((part) => part.length > 0);
+    return parts.length > 0 ? parts.join("") : null;
+  }
+  if (!isRecord(content)) return null;
+  const directText = contentString(content.text) ?? contentString(content.content);
+  if (directText) return directText;
+  if (content.content !== undefined) {
+    const nested = textFromContent(content.content, depth + 1);
+    if (nested) return nested;
+  }
+  if (content.resource !== undefined) {
+    const resource = textFromContent(content.resource, depth + 1);
+    if (resource) return resource;
+  }
+  const path = nonEmptyString(content.path);
+  if (path) return path;
+  const uri = nonEmptyString(content.uri);
+  if (uri) return uri;
+  return null;
 }
 
-function formatToolUpdate(update: Record<string, unknown>): string {
+function formatToolUpdate(update: Record<string, unknown>, defaultStatus?: string): string {
   const toolCall = isRecord(update.toolCall) ? update.toolCall : isRecord(update.tool_call) ? update.tool_call : update;
-  const title = nonEmptyString(toolCall.title) ?? nonEmptyString(toolCall.name) ?? nonEmptyString(toolCall.tool) ?? "tool update";
-  const status = nonEmptyString(update.status) ?? nonEmptyString(toolCall.status);
+  const title =
+    nonEmptyString(toolCall.title) ??
+    nonEmptyString(update.title) ??
+    nonEmptyString(toolCall.name) ??
+    nonEmptyString(update.name) ??
+    nonEmptyString(toolCall.tool) ??
+    nonEmptyString(update.tool) ??
+    nonEmptyString(toolCall.kind) ??
+    nonEmptyString(update.kind) ??
+    "tool update";
+  const status = nonEmptyString(update.status) ?? nonEmptyString(toolCall.status) ?? defaultStatus;
   return status ? `${title} (${status})` : title;
+}
+
+function formatToolStatus(update: Record<string, unknown>): string {
+  const toolCall = isRecord(update.toolCall) ? update.toolCall : isRecord(update.tool_call) ? update.tool_call : update;
+  return nonEmptyString(update.status) ?? nonEmptyString(toolCall.status) ?? "updated";
+}
+
+function formatPlanUpdate(update: Record<string, unknown>): string {
+  const entries = Array.isArray(update.entries) ? update.entries.filter(isRecord) : [];
+  if (entries.length === 0) return "Hermes ACP plan updated";
+  const counts = new Map<string, number>();
+  const active: string[] = [];
+  for (const entry of entries) {
+    const status = toSnakeCase(nonEmptyString(entry.status) ?? "pending");
+    counts.set(status, (counts.get(status) ?? 0) + 1);
+    if (status === "in_progress") {
+      const content = nonEmptyString(entry.content) ?? nonEmptyString(entry.title);
+      if (content) active.push(content);
+    }
+  }
+  const summary = [...counts.entries()].map(([status, count]) => `${count} ${status}`).join(", ");
+  const activeText = active.length > 0 ? `; active: ${active.slice(0, 3).join("; ")}` : "";
+  return `Hermes ACP plan updated: ${summary}${activeText}`;
+}
+
+function formatCurrentModeUpdate(update: Record<string, unknown>): string {
+  const mode = nonEmptyString(update.currentMode) ?? nonEmptyString(update.current_mode) ?? nonEmptyString(update.modeId) ?? nonEmptyString(update.mode_id);
+  return mode ? `Hermes ACP mode: ${mode}` : `Hermes ACP mode: ${preview(update, 240)}`;
+}
+
+function formatSessionInfoUpdate(update: Record<string, unknown>): string {
+  const title = nonEmptyString(update.title);
+  return title ? `Hermes ACP session: ${title}` : "Hermes ACP session info updated";
+}
+
+function formatAvailableCommandsUpdate(update: Record<string, unknown>): string {
+  const rawCommands = Array.isArray(update.availableCommands)
+    ? update.availableCommands
+    : Array.isArray(update.available_commands)
+      ? update.available_commands
+      : [];
+  const commands = rawCommands
+    .filter(isRecord)
+    .map((command) => nonEmptyString(command.name) ?? nonEmptyString(command.title))
+    .filter((command): command is string => command !== null)
+    .slice(0, 8);
+  return commands.length > 0 ? `Hermes ACP commands available: ${commands.join(", ")}` : "Hermes ACP commands available";
+}
+
+function toSnakeCase(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[\s-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toLowerCase();
 }
 
 function mapHermesAcpPromptResult(
@@ -815,6 +906,10 @@ function preview(value: unknown, maxLength: number): string {
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function contentString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 function numberFromUnknown(value: unknown): number | null {
