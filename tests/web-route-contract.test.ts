@@ -16,6 +16,7 @@ import type {
   ProjectionWriteResult,
 } from "../src/core/persistence/ProjectionTransactionService.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import type { RunRecord, RunTranscriptStore, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { testConfig } from "./helpers.js";
@@ -269,8 +270,15 @@ describe("/api/v1/web route contracts", () => {
     const address = await server.start();
     const baseUrl = baseUrlFor(address);
     try {
-      await expect(getJson(`${baseUrl}/api/v1/web/dashboard`)).resolves.toMatchObject({ body: dashboard });
+      const durableDashboard = await getJson(`${baseUrl}/api/v1/web/dashboard`);
+      expect(durableDashboard.body).toEqual(dashboard);
+      expect(durableDashboard.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(durableDashboard.response.headers.get("x-symphony-projection-revision")).toBe("1");
+      expect(JSON.parse(decodeURIComponent(durableDashboard.response.headers.get("x-symphony-projection-source-revisions") ?? "[]"))).toEqual([]);
       await expect(getJson(`${baseUrl}/api/v1/web/issues`)).resolves.toMatchObject({ body: issueBoard });
+      await expect(getJson(`${baseUrl}/api/v1/web/issues/ENG-179`)).resolves.toMatchObject({
+        body: { issue: durableIssue, activity: durableIssue.activity, runs: [], transcript: [] },
+      });
       await expect(getJson(`${baseUrl}/api/v1/web/history`)).resolves.toMatchObject({ body: history });
       await expect(getJson(`${baseUrl}/api/v1/web/sidebar`)).resolves.toMatchObject({ body: sidebar });
       await expect(getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=operator-room`)).resolves.toMatchObject({ body: chat });
@@ -288,10 +296,89 @@ describe("/api/v1/web route contracts", () => {
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
       { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
       { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
       { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
       { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    ]);
+  });
+
+  it("serves issue detail and transcript payloads from durable projections with route-specific freshness checks", async () => {
+    const durableIssue = issueModelFixture();
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Durable cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "ENG-179",
+    };
+    const run = runRecordFixture({ runId: "run-1", sessionId: "session-1", transcriptEventCount: 1 });
+    const durableTranscript = [{ kind: "assistant" as const, ts: "2026-05-31T00:00:00.000Z", text: "served from durable transcript" }];
+    const runStore = new RecordingRunStore([run]);
+    const transcriptSourceRevisions = [
+      { source: "runs", revision: runStore.projectionRevision(), observedAt: null },
+      { source: "transcript:run-1", revision: "1:1:2026-05-31T00:00:00.000Z", observedAt: "2026-05-31T00:00:00.000Z" },
+    ];
+    const runtimeProviders: WebProjectionRevisionProvider[] = [
+      { source: "lifecycleStore", getRevision: () => ({ source: "lifecycleStore", revision: "lifecycle-current", observedAt: null }) },
+      { source: "writebackOutbox", getRevision: () => ({ source: "writebackOutbox", revision: "writeback-current", observedAt: null }) },
+      {
+        source: "orchestrator_conversations",
+        getRevision: () => ({ source: "orchestrator_conversations", revision: "chat-current", observedAt: null }),
+      },
+    ];
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+            { source: "lifecycleStore", revision: "lifecycle-current", observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
+        durableTranscript,
+        { sourceRevisions: transcriptSourceRevisions },
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      projectionWriter,
+      runStore: runStore.asRunTranscriptStore(),
+      webProjectionRevisionProviders: runtimeProviders,
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/ENG-179`);
+      expect(detail.body).toEqual({ issue: durableIssue, activity: durableIssue.activity, runs: [], transcript: [] });
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+
+      const transcript = await getJson(`${baseUrl}/api/v1/web/sessions/session-1/transcript`);
+      expect(transcript.body).toEqual(durableTranscript);
+      expect(transcript.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(transcript.response.headers.get("x-symphony-projection-cache")).toBe("hit");
+      expect(JSON.parse(decodeURIComponent(transcript.response.headers.get("x-symphony-projection-source-revisions") ?? "[]"))).toEqual(
+        transcriptSourceRevisions,
+      );
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(0);
+    expect(projectionWriter.writes).toEqual([]);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
     ]);
   });
 
@@ -329,11 +416,104 @@ describe("/api/v1/web route contracts", () => {
       expect(response.status).toBe(200);
       expect(body).toMatchObject({ projectName: "Symphony", agentUsageLabel: "0 agents" });
       expect(body).not.toEqual(staleDashboard);
+      expect(response.headers.get("x-symphony-projection-status")).toBe("stale");
+      expect(response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(response.headers.get("x-symphony-projection-revision")).toBe("1");
     } finally {
       await server.stop();
     }
 
     expect(projectionWriter.writeFor("dashboard_projection").projectionName).toBe("dashboard_projection");
+  });
+
+  it("annotates durable projection fallback states for unavailable readers, missing records, refresh bypass, read errors, and missing detail items", async () => {
+    const unavailableServer = createStatusServer(root).server;
+    const unavailableAddress = await unavailableServer.start();
+    try {
+      const unavailable = await getJson(`${baseUrlFor(unavailableAddress)}/api/v1/web/dashboard`);
+      expect(unavailable.body).toMatchObject({ projectName: "Symphony" });
+      expect(unavailable.response.headers.get("x-symphony-projection-status")).toBe("unavailable");
+      expect(unavailable.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(unavailable.response.headers.get("x-symphony-projection-name")).toBe("dashboard_projection");
+    } finally {
+      await unavailableServer.stop();
+    }
+
+    const missingReader = new RecordingProjectionReader([]);
+    const missingServer = createStatusServer(root, { projectionReader: missingReader }).server;
+    const missingAddress = await missingServer.start();
+    try {
+      const missing = await getJson(`${baseUrlFor(missingAddress)}/api/v1/web/dashboard`);
+      expect(missing.body).toMatchObject({ projectName: "Symphony" });
+      expect(missing.response.headers.get("x-symphony-projection-status")).toBe("missing");
+      expect(missing.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(missing.response.headers.get("x-symphony-projection-name")).toBe("dashboard_projection");
+    } finally {
+      await missingServer.stop();
+    }
+
+    const durableDashboard = {
+      projectName: "Do not serve on refresh",
+      repoLabel: "",
+      branch: "",
+      workflowLabel: "",
+      pollLabel: "",
+      agentUsageLabel: "stale",
+      concurrencyCap: 0,
+      providerGates: [],
+      runningAgents: [],
+      activity: [],
+      chat: [],
+      totals: emptyTotals(),
+    };
+    const refreshReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture({ projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" }, durableDashboard),
+    ]);
+    const refreshServer = createStatusServer(root, { projectionReader: refreshReader }).server;
+    const refreshAddress = await refreshServer.start();
+    try {
+      const refresh = await getJson(`${baseUrlFor(refreshAddress)}/api/v1/web/dashboard?refresh=true`);
+      expect(refresh.body).not.toEqual(durableDashboard);
+      expect(refresh.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(refresh.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(refreshReader.selectors).toEqual([]);
+    } finally {
+      await refreshServer.stop();
+    }
+
+    const failingReader = new FailingProjectionReader();
+    const errorServer = createStatusServer(root, { projectionReader: failingReader }).server;
+    const errorAddress = await errorServer.start();
+    try {
+      const failed = await getJson(`${baseUrlFor(errorAddress)}/api/v1/web/dashboard`);
+      expect(failed.body).toMatchObject({ projectName: "Symphony" });
+      expect(failed.response.headers.get("x-symphony-projection-status")).toBe("error");
+      expect(failed.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(failingReader.selectors.map(({ projectionName }) => projectionName)).toEqual(["dashboard_projection"]);
+    } finally {
+      await errorServer.stop();
+    }
+
+    const issue = issueModelFixture();
+    const detailReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        { issues: [issue], backlog: [], lanes: { todo: [], progress: [issue], review: [] }, cycleLabel: "", cycleDateRange: "", selectedIssueId: issue.id },
+      ),
+    ]);
+    const detailServer = createStatusServer(root, { projectionReader: detailReader }).server;
+    const detailAddress = await detailServer.start();
+    try {
+      const missingDetail = await getJson(`${baseUrlFor(detailAddress)}/api/v1/web/issues/ENG-404`);
+      expect(missingDetail.body).toBeNull();
+      expect(missingDetail.response.headers.get("x-symphony-projection-status")).toBe("missing_item");
+      expect(decodeURIComponent(missingDetail.response.headers.get("x-symphony-projection-reason") ?? "")).toBe(
+        "issue_detail_not_found_in_current_issue_board_projection",
+      );
+      expect(missingDetail.response.headers.get("x-symphony-projection-revision")).toBe("1");
+    } finally {
+      await detailServer.stop();
+    }
   });
 
   it("keeps web responses available when durable projection persistence rejects", async () => {
@@ -613,6 +793,7 @@ interface CreateStatusServerOptions {
   projectionWriter?: StatusServerProjectionWriter;
   projectionReader?: StatusServerProjectionReader;
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
+  runStore?: RunTranscriptStore;
 }
 
 class RecordingProjectionWriter implements StatusServerProjectionWriter {
@@ -658,6 +839,56 @@ class RecordingProjectionReader implements StatusServerProjectionReader {
     this.selectors.push({ ...selector });
     const record = this.records.get(projectionSelectorKey(selector));
     return record ? (cloneJson(record) as ProjectionPayloadRecord<TPayload>) : null;
+  }
+}
+
+class FailingProjectionReader implements StatusServerProjectionReader {
+  readonly selectors: ProjectionRevisionSelector[] = [];
+
+  async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    this.selectors.push({ ...selector });
+    throw new Error("simulated projection read failure");
+  }
+}
+
+class RecordingRunStore {
+  transcriptReadCount = 0;
+
+  private readonly runsById = new Map<string, RunRecord>();
+
+  constructor(runs: readonly RunRecord[]) {
+    for (const run of runs) this.runsById.set(run.runId, cloneJson(run));
+  }
+
+  projectionRevision(): number {
+    return 7;
+  }
+
+  onProjectionChanged(): () => void {
+    return () => undefined;
+  }
+
+  async getRun(runId: string): Promise<RunRecord | null> {
+    const run = this.runsById.get(runId);
+    return run ? cloneJson(run) : null;
+  }
+
+  async listRuns(): Promise<RunRecord[]> {
+    return [...this.runsById.values()].map((run) => cloneJson(run));
+  }
+
+  async readTranscript(runId: string, page: { offset: number; limit: number }): Promise<TranscriptPage> {
+    this.transcriptReadCount += 1;
+    return { runId, offset: page.offset, limit: page.limit, nextOffset: null, events: [] };
+  }
+
+  async readTranscriptTail(runId: string, page: { limit: number }): Promise<TranscriptPage> {
+    this.transcriptReadCount += 1;
+    return { runId, offset: 0, limit: page.limit, nextOffset: null, events: [] };
+  }
+
+  asRunTranscriptStore(): RunTranscriptStore {
+    return this as unknown as RunTranscriptStore;
   }
 }
 
@@ -714,6 +945,32 @@ function issueModelFixture() {
   };
 }
 
+function runRecordFixture(overrides: Partial<RunRecord> = {}): RunRecord {
+  return {
+    runId: "run-1",
+    sessionId: "session-1",
+    agentId: "agent-1",
+    role: "worker",
+    runPhase: "implementation",
+    runKind: "implementation",
+    issueId: "issue-id",
+    issueIdentifier: "ENG-179",
+    attempt: 1,
+    turnNumber: 1,
+    prompt: "serve durable web projections",
+    workspaceKey: "ENG-179",
+    workspacePath: path.join("workspaces", "ENG-179"),
+    status: "succeeded",
+    startedAt: "2026-05-31T00:00:00.000Z",
+    updatedAt: "2026-05-31T00:00:00.000Z",
+    completedAt: "2026-05-31T00:01:00.000Z",
+    error: null,
+    tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    transcriptEventCount: 0,
+    ...overrides,
+  };
+}
+
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
@@ -757,6 +1014,7 @@ function createStatusServer(
       trackerStateLists: testTrackerStateLists(),
       staleThresholdMs: 300_000,
       webAssetsRoot: options.webAssetsRoot,
+      ...(options.runStore ? { runStore: options.runStore } : {}),
       ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
       ...(options.projectionReader ? { projectionReader: options.projectionReader } : {}),
       ...(options.webProjectionRevisionProviders
