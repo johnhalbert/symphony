@@ -111,11 +111,10 @@ describe("mapAgentEventToRunActivityEvent", () => {
     expect(mapped.payload).toMatchObject({
       kind: "assistant_message_delta",
       actor: "assistant",
-      channel: "message",
+      channel: "chat",
       protocol: "acp",
       harnessId: "hermes-acp",
       activityId: "run-1:activity:2",
-      activityRunId: "run-1",
       activitySessionId: "acp-session-1",
       runSessionId: "profile:acp-session-1:run-1",
       activitySequence: 2,
@@ -134,7 +133,7 @@ describe("mapAgentEventToRunActivityEvent", () => {
   });
 
   it("falls back to legacy AgentEvent mapping when harness-provided activity metadata is malformed", () => {
-    const malformedActivity = { ...acpRunActivity(), channel: "chat" } as unknown as RunActivityEvent;
+    const malformedActivity = { ...acpRunActivity(), channel: "message" } as unknown as RunActivityEvent;
 
     const mapped = mapAgentEventToRunActivityEvent({
       type: "progress",
@@ -175,22 +174,22 @@ describe("mapAgentEventToRunActivityEvent", () => {
 });
 
 function acpRunActivity(overrides: Partial<RunActivityEvent> = {}): RunActivityEvent {
+  const payload =
+    overrides.payload && typeof overrides.payload === "object" && !Array.isArray(overrides.payload) ? overrides.payload : {};
   return {
-    id: "run-1:activity:2",
-    runId: "run-1",
-    sessionId: "acp-session-1",
+    eventId: "run-1:activity:2",
     runSessionId: "profile:acp-session-1:run-1",
-    at: "2026-05-31T00:00:02.000Z",
+    occurredAt: "2026-05-31T00:00:02.000Z",
     sequence: 2,
     sequenceSource: "harness",
     externalEventId: "upstream-2",
     protocol: "acp",
-    harnessId: "hermes-acp",
+    harness: "hermes-acp",
     actor: "assistant",
-    channel: "message",
+    channel: "chat",
     kind: "assistant_message_delta",
     text: "assistant chunk",
-    payload: { delta: true, messagePreview: "assistant chunk", redacted: true },
     ...overrides,
+    payload: { runtimeSessionId: "acp-session-1", delta: true, messagePreview: "assistant chunk", redacted: true, ...payload },
   } as RunActivityEvent;
 }

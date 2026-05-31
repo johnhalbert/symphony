@@ -284,30 +284,30 @@ describe("HermesAcpHarness", () => {
     expect(activities.map((activity) => activity?.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(activities[0]).toMatchObject({
       protocol: "acp",
-      harnessId: "hermes_acp",
-      runId: expect.stringMatching(/^hermes-acp-/),
-      sessionId: "acp-session-1",
+      harness: "hermes_acp",
+      eventId: expect.stringMatching(/^hermes-acp-.*:activity:1$/),
       runSessionId: expect.stringContaining("acp-session-1"),
       sequenceSource: "harness",
       channel: "lifecycle",
       kind: "session_started",
+      payload: expect.objectContaining({ runtimeSessionId: "acp-session-1" }),
     });
     expect(activities).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "runtime", channel: "status", kind: "runtime_ready" }),
-        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "assistant", channel: "message", kind: "assistant_message_delta", text: "hello" }),
-        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "assistant", channel: "message", kind: "assistant_reasoning_delta" }),
-        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_started" }),
-        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_completed" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "runtime", channel: "diagnostic", kind: "runtime_ready" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "assistant", channel: "chat", kind: "assistant_message_delta", text: "hello" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "assistant", channel: "chat", kind: "assistant_reasoning_delta" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_started" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_completed" }),
         expect.objectContaining({
           protocol: "acp",
-          harnessId: "hermes_acp",
+          harness: "hermes_acp",
           actor: "runtime",
           channel: "token",
           kind: "token_usage_reported",
           payload: expect.objectContaining({ inputTokens: 4, outputTokens: 5, totalTokens: 9 }),
         }),
-        expect.objectContaining({ protocol: "acp", harnessId: "hermes_acp", actor: "runtime", channel: "terminal", kind: "run_succeeded", text: "hello" }),
+        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "runtime", channel: "terminal", kind: "run_succeeded", text: "hello" }),
       ]),
     );
     expect(activities.map((activity) => activity?.kind)).not.toEqual(expect.arrayContaining(["agent_message_chunk", "agent_thought_chunk", "tool_call", "usage_update"]));

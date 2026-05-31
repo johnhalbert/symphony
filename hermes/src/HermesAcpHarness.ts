@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
-import type { RunActivityEvent } from "../../src/core/runActivity/RunActivityEvent.js";
+import type {
+  RunActivityActor,
+  RunActivityChannel,
+  RunActivityEvent,
+  RunActivityKind,
+} from "../../src/core/runActivity/RunActivityEvent.js";
 import {
   symphonyRoleMcpServers,
   writeActiveHandoffMcpContexts,
@@ -289,7 +294,7 @@ export class HermesAcpHarness implements AgentHarness {
         { type: "progress", activitySource: "stream", message: `Host Hermes ACP profile ${lease.profile.profileName}` },
         {
           actor: "runtime",
-          channel: "status",
+          channel: "diagnostic",
           kind: "runtime_ready",
           text: `Host Hermes runtime profile ${lease.profile.profileName}`,
           payload: {
@@ -672,9 +677,9 @@ interface HermesAcpRunActivityContext {
 }
 
 interface HermesAcpRunActivityMetadata {
-  actor: string;
-  channel: string;
-  kind: string;
+  actor: RunActivityActor;
+  channel: RunActivityChannel;
+  kind: RunActivityKind;
   text: string | null;
   payload: Record<string, unknown>;
 }
@@ -693,21 +698,19 @@ function attachHermesAcpRunActivity<T extends AgentEvent>(
   const metadata = runActivityMetadata ?? runActivityMetadataForAgentEvent(event);
   const sessionId = context.sessionId ?? (event.type === "session_started" ? event.threadId ?? event.sessionId : null);
   const activity = {
-    id: `${context.runId}:${context.idScope ?? "activity"}:${context.sequence}`,
-    runId: context.runId,
-    sessionId,
+    eventId: `${context.runId}:${context.idScope ?? "activity"}:${context.sequence}`,
     runSessionId: context.runSessionId,
-    at: context.at,
+    occurredAt: context.at,
     sequence: context.sequence,
     sequenceSource: "harness",
     externalEventId: null,
     protocol: "acp",
-    harnessId: context.harnessId,
+    harness: context.harnessId,
     actor: metadata.actor,
     channel: metadata.channel,
     kind: metadata.kind,
     text: metadata.text,
-    payload: metadata.payload,
+    payload: { ...metadata.payload, runtimeSessionId: sessionId },
   } as RunActivityEvent;
   return { ...event, runActivity: activity };
 }
@@ -759,7 +762,7 @@ function runActivityMetadataForAgentEvent(event: AgentEvent): HermesAcpRunActivi
     case "run_status":
       return {
         actor: "runtime",
-        channel: "status",
+        channel: "diagnostic",
         kind: "sdk_status_update",
         text: `Run status: ${event.sdkStatus}`,
         payload: { runId: event.runId, status: event.sdkStatus, source: event.source },
@@ -767,7 +770,7 @@ function runActivityMetadataForAgentEvent(event: AgentEvent): HermesAcpRunActivi
     case "run_diagnostic":
       return {
         actor: "runtime",
-        channel: "status",
+        channel: "diagnostic",
         kind: "runtime_diagnostic",
         text: event.message,
         payload: {
@@ -822,7 +825,7 @@ function progressRunActivityMetadata(event: Extract<AgentEvent, { type: "progres
   if (event.activitySource === "delta") {
     return {
       actor: "assistant",
-      channel: "message",
+      channel: "chat",
       kind: "assistant_message_delta",
       text: event.message,
       payload: { delta: true, messagePreview, redacted: true },
@@ -831,7 +834,7 @@ function progressRunActivityMetadata(event: Extract<AgentEvent, { type: "progres
   if (/\b(thought|reasoning)\b/i.test(event.message)) {
     return {
       actor: "assistant",
-      channel: "message",
+      channel: "chat",
       kind: "assistant_reasoning_delta",
       text: event.message,
       payload: { delta: true, reasoning: true, messagePreview, redacted: true },
@@ -840,7 +843,7 @@ function progressRunActivityMetadata(event: Extract<AgentEvent, { type: "progres
   if (/\bplan updated\b/i.test(event.message)) {
     return {
       actor: "runtime",
-      channel: "message",
+      channel: "chat",
       kind: "plan_update",
       text: event.message,
       payload: { messagePreview, redacted: true },
@@ -848,7 +851,7 @@ function progressRunActivityMetadata(event: Extract<AgentEvent, { type: "progres
   }
   return {
     actor: "runtime",
-    channel: "status",
+    channel: "diagnostic",
     kind: "runtime_status_update",
     text: event.message,
     payload: { status: "progress", activitySource: event.activitySource ?? "stream", messagePreview, redacted: true },
@@ -864,7 +867,7 @@ function toolStatusFromProgressMessage(message: string): string | null {
   return null;
 }
 
-function toolRunActivityKind(status: string | null): string {
+function toolRunActivityKind(status: string | null): RunActivityKind {
   switch (status) {
     case "failed":
       return "tool_call_failed";
@@ -1030,7 +1033,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
               { type: "progress", activitySource: "delta", message: text },
               {
                 actor: "assistant",
-                channel: "message",
+                channel: "chat",
                 kind: "assistant_message_delta",
                 text,
                 payload: {
@@ -1050,7 +1053,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
           { type: "progress", activitySource: "stream", message },
           {
             actor: "assistant",
-            channel: "message",
+            channel: "chat",
             kind: "assistant_reasoning_delta",
             text: message,
             payload: {
@@ -1088,7 +1091,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
           { type: "progress", activitySource: "stream", message },
           {
             actor: "runtime",
-            channel: "status",
+            channel: "diagnostic",
             kind: "runtime_status_update",
             text: message,
             payload: { status: "usage_update", usagePreview: preview(update.usage ?? update, 1_000), ...acpSessionUpdatePreviewPayload(update) },
@@ -1111,7 +1114,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
           { type: "progress", activitySource: "stream", message },
           {
             actor: "runtime",
-            channel: "message",
+            channel: "chat",
             kind: "plan_update",
             text: message,
             payload: { entriesPreview: preview(update.entries ?? update, 1_000), ...acpSessionUpdatePreviewPayload(update) },
@@ -1126,7 +1129,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
           { type: "progress", activitySource: "stream", message },
           {
             actor: "runtime",
-            channel: "status",
+            channel: "diagnostic",
             kind: "mode_update",
             text: message,
             payload: {
@@ -1145,7 +1148,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
           { type: "progress", activitySource: "stream", message },
           {
             actor: "runtime",
-            channel: "status",
+            channel: "diagnostic",
             kind: "runtime_status_update",
             text: message,
             payload: { status: "session_info_update", title: nonEmptyString(update.title), ...acpSessionUpdatePreviewPayload(update) },
@@ -1160,7 +1163,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
           { type: "progress", activitySource: "stream", message },
           {
             actor: "runtime",
-            channel: "status",
+            channel: "diagnostic",
             kind: "available_commands_update",
             text: message,
             payload: { commands: availableCommandNames(update), ...acpSessionUpdatePreviewPayload(update) },
@@ -1180,7 +1183,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
           },
           {
             actor: "runtime",
-            channel: "status",
+            channel: "diagnostic",
             kind: "runtime_diagnostic",
             text: message,
             payload: {
@@ -1664,14 +1667,14 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
           selected
             ? {
                 actor: "runtime",
-                channel: "status",
+                channel: "diagnostic",
                 kind: "runtime_status_update",
                 text: message,
                 payload: { ...payload, status: "permission_selected" },
               }
             : {
                 actor: "runtime",
-                channel: "status",
+                channel: "diagnostic",
                 kind: "runtime_diagnostic",
                 text: message,
                 payload: { ...payload, code: "hermes_acp_permission_denied", severity: "warning" },
@@ -1690,7 +1693,7 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
           },
           {
             actor: "runtime",
-            channel: "status",
+            channel: "diagnostic",
             kind: "runtime_diagnostic",
             text: event.diagnostic.message,
             payload: {

@@ -26,6 +26,10 @@ const projectionFreshnessMigrationUrl = new URL(
   "../migrations/postgres/0003_projection_freshness_indexes.sql",
   import.meta.url,
 );
+const canonicalChannelMigrationUrl = new URL(
+  "../migrations/postgres/0004_run_activity_canonical_channels.sql",
+  import.meta.url,
+);
 const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
 const stateOwnershipUrl = new URL("../docs/state-ownership-and-migration.md", import.meta.url);
 const publishedOwnedStateChecksumSha256 = "8e10c03c6cfa34e9672e350c59ff4998459989529a82c98cbd9f714469799298";
@@ -106,6 +110,10 @@ async function projectionFreshnessMigrationSql(): Promise<string> {
   return readFile(projectionFreshnessMigrationUrl, "utf8");
 }
 
+async function canonicalChannelMigrationSql(): Promise<string> {
+  return readFile(canonicalChannelMigrationUrl, "utf8");
+}
+
 async function configuredMigrationSql(): Promise<string> {
   const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
   return migrations.map((migration) => migration.sql).join("\n");
@@ -135,11 +143,14 @@ describe("Postgres Symphony-owned state migration", () => {
       "0001_migration_foundation",
       "0002_symphony_owned_state",
       "0003_projection_freshness_indexes",
+      "0004_run_activity_canonical_channels",
     ]);
     const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
     const projectionFreshness = migrations.find((migration) => migration.id === "0003_projection_freshness_indexes");
+    const canonicalChannels = migrations.find((migration) => migration.id === "0004_run_activity_canonical_channels");
     expect(ownedState?.filePath).toBe(fileURLToPath(ownedStateMigrationUrl));
     expect(projectionFreshness?.filePath).toBe(fileURLToPath(projectionFreshnessMigrationUrl));
+    expect(canonicalChannels?.filePath).toBe(fileURLToPath(canonicalChannelMigrationUrl));
     expect(sha256(ownedState?.sql ?? "")).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.checksumSha256).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_session");
@@ -150,6 +161,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(projectionFreshness?.sql).toContain("ALTER TABLE symphony.projection_revision");
     expect(ownedState?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+    expect(canonicalChannels?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
   });
 
   it("delivers projection updated_at columns and freshness indexes through the follow-up migration", async () => {
@@ -171,6 +183,18 @@ describe("Postgres Symphony-owned state migration", () => {
     );
     expect(normalized).toContain(
       "on symphony.orchestrator_chat_projection (issue_key, revision desc, updated_at desc)",
+    );
+  });
+
+  it("delivers canonical run activity channels through a checksum-safe follow-up migration", async () => {
+    const normalized = normalizedSql(await canonicalChannelMigrationSql());
+
+    expect(normalized).toContain("alter table symphony.run_activity_event drop constraint if exists run_activity_event_channel_check");
+    expect(normalized).toContain("when 'message' then 'chat'");
+    expect(normalized).toContain("when 'status' then 'diagnostic'");
+    expect(normalized).toContain("where channel in ('message', 'status')");
+    expect(normalized).toContain(
+      "add constraint run_activity_event_channel_check check (channel in ('lifecycle', 'chat', 'tool', 'diagnostic', 'token', 'rate_limit', 'terminal'))",
     );
   });
 
@@ -275,8 +299,10 @@ describe("Postgres Symphony-owned state migration", () => {
       "configured postgres migration path",
       "migrations/postgres/0002_symphony_owned_state.sql",
       "migrations/postgres/0003_projection_freshness_indexes.sql",
+      "migrations/postgres/0004_run_activity_canonical_channels.sql",
       "checksum-stable",
       "projection `updated_at` freshness columns",
+      "canonical run activity channel names",
     ]) {
       expect(ownership, `missing ownership guide fragment: ${fragment}`).toContain(fragment);
     }
@@ -396,6 +422,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0001_migration_foundation",
           "0002_symphony_owned_state",
           "0003_projection_freshness_indexes",
+          "0004_run_activity_canonical_channels",
         ]);
 
         const tableCount = await psql(
@@ -449,19 +476,22 @@ describe("Postgres Symphony-owned state migration", () => {
         expect(await appliedMigrationChecksum(containerName, "0002_symphony_owned_state")).toBe(
           publishedOwnedStateChecksumSha256,
         );
+        await seedLegacyRunActivityChannelAliases(containerName);
 
         const result = await applyConfiguredMigrations(connectionString);
         expect(result.skipped).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
-        expect(result.applied).toEqual(["0003_projection_freshness_indexes"]);
+        expect(result.applied).toEqual(["0003_projection_freshness_indexes", "0004_run_activity_canonical_channels"]);
         expect(await appliedMigrationIds(containerName)).toEqual([
           "0001_migration_foundation",
           "0002_symphony_owned_state",
           "0003_projection_freshness_indexes",
+          "0004_run_activity_canonical_channels",
         ]);
         expect(await appliedMigrationChecksum(containerName, "0002_symphony_owned_state")).toBe(
           publishedOwnedStateChecksumSha256,
         );
         await expectProjectionFreshnessCatalog(containerName);
+        await expectLegacyRunActivityChannelsMigrated(containerName);
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
       } finally {
         await docker(["rm", "-f", containerName]).catch(() => undefined);
@@ -518,6 +548,168 @@ async function appliedMigrationChecksum(containerName: string, migrationId: stri
     `select checksum_sha256 from symphony_schema_migrations where id = '${migrationId}';`,
   );
   return checksum.trim();
+}
+
+async function seedLegacyRunActivityChannelAliases(containerName: string): Promise<void> {
+  await psql(
+    containerName,
+    String.raw`
+      insert into symphony.run_session (
+        run_id,
+        session_id,
+        agent_id,
+        role,
+        issue_key,
+        issue_identifier,
+        workspace_key,
+        workspace_path,
+        turn_number,
+        harness_id,
+        status,
+        started_at,
+        updated_at
+      ) values (
+        'run:canonical-channel-upgrade',
+        'session:canonical-channel-upgrade',
+        'agent:canonical-channel-upgrade',
+        'worker',
+        'issue:canonical-channel-upgrade',
+        'CANONICAL-CHANNEL-UPGRADE',
+        'workspace:canonical-channel-upgrade',
+        '/tmp/symphony/CANONICAL-CHANNEL-UPGRADE',
+        1,
+        'hermes',
+        'running',
+        now(),
+        now()
+      );
+
+      insert into symphony.run_activity_event (
+        event_id,
+        run_id,
+        session_id,
+        run_session_id,
+        sequence,
+        sequence_source,
+        event_at,
+        protocol,
+        harness_id,
+        external_event_id,
+        actor,
+        channel,
+        kind,
+        text,
+        text_char_count,
+        payload
+      ) values
+      (
+        'activity:canonical-channel-upgrade:message',
+        'run:canonical-channel-upgrade',
+        'session:canonical-channel-upgrade',
+        'run:canonical-channel-upgrade:session:canonical-channel-upgrade',
+        1,
+        'harness',
+        now(),
+        'json_rpc',
+        'hermes',
+        'external:canonical-channel-upgrade:message',
+        'assistant',
+        'message',
+        'assistant_message_delta',
+        'legacy message alias',
+        20,
+        '{"legacyChannel":"message"}'::jsonb
+      ),
+      (
+        'activity:canonical-channel-upgrade:status',
+        'run:canonical-channel-upgrade',
+        'session:canonical-channel-upgrade',
+        'run:canonical-channel-upgrade:session:canonical-channel-upgrade',
+        2,
+        'harness',
+        now(),
+        'json_rpc',
+        'hermes',
+        'external:canonical-channel-upgrade:status',
+        'runtime',
+        'status',
+        'runtime_status_update',
+        'legacy status alias',
+        19,
+        '{"legacyChannel":"status"}'::jsonb
+      );
+    `,
+  );
+}
+
+async function expectLegacyRunActivityChannelsMigrated(containerName: string): Promise<void> {
+  const channelCounts = await psql(
+    containerName,
+    String.raw`
+      select coalesce(jsonb_object_agg(channel, event_count order by channel), '{}'::jsonb)::text
+      from (
+        select channel, count(*)::int as event_count
+        from symphony.run_activity_event
+        where run_id = 'run:canonical-channel-upgrade'
+        group by channel
+      ) counts;
+    `,
+  );
+  expect(JSON.parse(channelCounts.trim())).toEqual({ chat: 1, diagnostic: 1 });
+
+  const constraintDefinition = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.run_activity_event'::regclass
+        and conname = 'run_activity_event_channel_check';
+    `,
+  );
+  const normalizedConstraint = normalizedSql(constraintDefinition);
+  expect(normalizedConstraint).toContain("'chat'::text");
+  expect(normalizedConstraint).toContain("'diagnostic'::text");
+  expect(normalizedConstraint).not.toContain("'message'::text");
+  expect(normalizedConstraint).not.toContain("'status'::text");
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.run_activity_event (
+          event_id,
+          run_id,
+          session_id,
+          run_session_id,
+          sequence,
+          sequence_source,
+          event_at,
+          protocol,
+          harness_id,
+          external_event_id,
+          actor,
+          channel,
+          kind,
+          payload
+        ) values (
+          'activity:canonical-channel-upgrade:rejected-status',
+          'run:canonical-channel-upgrade',
+          'session:canonical-channel-upgrade',
+          'run:canonical-channel-upgrade:session:canonical-channel-upgrade',
+          3,
+          'harness',
+          now(),
+          'json_rpc',
+          'hermes',
+          'external:canonical-channel-upgrade:rejected-status',
+          'runtime',
+          'status',
+          'runtime_status_update',
+          '{"legacyChannel":"status"}'::jsonb
+        );
+      `,
+    ),
+  ).rejects.toThrow(/run_activity_event_channel_check|violates check constraint/i);
 }
 
 async function expectProjectionFreshnessCatalog(containerName: string): Promise<void> {
@@ -1019,7 +1211,7 @@ async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(contain
         'hermes',
         'hermes:event:eng-187:large',
         'assistant',
-        'message',
+        'chat',
         'assistant_message_delta',
         'large assistant delta stored externally',
         41,
@@ -1164,7 +1356,7 @@ async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(contain
           'hermes',
           'hermes:event:eng-187:duplicate-sequence',
           'runtime',
-          'status',
+          'diagnostic',
           'runtime_status_update',
           '{"status":"duplicate"}'::jsonb
         );
@@ -1203,7 +1395,7 @@ async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(contain
           'hermes',
           'hermes:event:eng-187:large',
           'runtime',
-          'status',
+          'diagnostic',
           'runtime_status_update',
           '{"status":"duplicate"}'::jsonb
         );

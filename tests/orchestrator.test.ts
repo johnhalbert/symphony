@@ -227,7 +227,7 @@ describe("Orchestrator", () => {
         message: "hello",
         runActivity: acpActivity(runId, 2, {
           actor: "assistant",
-          channel: "message",
+          channel: "chat",
           kind: "assistant_message_delta",
           text: "hello",
           payload: { delta: true, messagePreview: "hello", redacted: true },
@@ -239,7 +239,7 @@ describe("Orchestrator", () => {
         message: "Hermes ACP thought update",
         runActivity: acpActivity(runId, 3, {
           actor: "assistant",
-          channel: "message",
+          channel: "chat",
           kind: "assistant_reasoning_delta",
           text: "Hermes ACP thought update",
           payload: { reasoning: true, messagePreview: "thought preview", redacted: true },
@@ -287,7 +287,7 @@ describe("Orchestrator", () => {
         payload: { paramsPreview: "safe" },
         runActivity: acpActivity(runId, 7, {
           actor: "runtime",
-          channel: "status",
+          channel: "diagnostic",
           kind: "runtime_diagnostic",
           text: "ACP permission denied",
           payload: { code: "hermes_acp_permission_denied", severity: "info", messagePreview: "permission denied", redacted: true },
@@ -346,7 +346,7 @@ describe("Orchestrator", () => {
       payload: {
         kind: "assistant_message_delta",
         actor: "assistant",
-        channel: "message",
+        channel: "chat",
         protocol: "acp",
         activitySequence: 2,
         sequenceSource: "harness",
@@ -6517,19 +6517,20 @@ class RunActivityHarness implements AgentHarness {
   }
 }
 
-function acpActivity(runId: string, sequence: number, overrides: Record<string, unknown>): RunActivityEvent {
+function acpActivity(runId: string, sequence: number, overrides: Partial<RunActivityEvent>): RunActivityEvent {
+  const payload =
+    overrides.payload && typeof overrides.payload === "object" && !Array.isArray(overrides.payload) ? overrides.payload : {};
   return {
-    id: `${runId}:activity:${sequence}`,
-    runId,
-    sessionId: "acp-session-1",
+    eventId: `${runId}:activity:${sequence}`,
     runSessionId: `profile:acp-session-1:${runId}`,
-    at: `2026-05-31T00:00:0${Math.min(sequence, 9)}.000Z`,
+    occurredAt: `2026-05-31T00:00:0${Math.min(sequence, 9)}.000Z`,
     sequence,
     sequenceSource: "harness",
     externalEventId: `upstream-${sequence}`,
     protocol: "acp",
-    harnessId: "hermes-acp",
+    harness: "hermes-acp",
     ...overrides,
+    payload: { runtimeSessionId: "acp-session-1", ...payload },
   } as RunActivityEvent;
 }
 

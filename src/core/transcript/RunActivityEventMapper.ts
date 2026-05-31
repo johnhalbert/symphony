@@ -144,10 +144,9 @@ function runActivityPatchFromHarnessMetadata(runActivity: RunActivityEvent | und
     actor: runActivity.actor,
     channel: runActivity.channel,
     protocol: runActivity.protocol,
-    harnessId: runActivity.harnessId,
-    activityId: runActivity.id,
-    activityRunId: runActivity.runId,
-    activitySessionId: runActivity.sessionId,
+    harnessId: runActivity.harness,
+    activityId: runActivity.eventId,
+    ...(runActivity.payload.runtimeSessionId === undefined ? {} : { activitySessionId: runActivity.payload.runtimeSessionId }),
     runSessionId: runActivity.runSessionId,
     activitySequence: runActivity.sequence,
     sequenceSource: runActivity.sequenceSource,
@@ -171,16 +170,14 @@ function isValidRunActivityEvent(value: unknown): value is RunActivityEvent {
   if (!isRunActivityKindForChannel(channel, value.kind)) return false;
   if (!isRunActivityActorForChannel(channel, value.actor)) return false;
   return (
-    nonEmptyString(value.id) &&
-    nonEmptyString(value.runId) &&
-    (value.sessionId === null || nonEmptyString(value.sessionId)) &&
+    nonEmptyString(value.eventId) &&
     nonEmptyString(value.runSessionId) &&
-    nonEmptyString(value.at) &&
-    positiveInteger(value.sequence) &&
-    isRunActivitySequenceSource(value.sequenceSource) &&
+    nonEmptyString(value.occurredAt) &&
+    (value.sequence === undefined || value.sequence === null || positiveInteger(value.sequence)) &&
+    (value.sequenceSource === undefined || value.sequenceSource === null || isRunActivitySequenceSource(value.sequenceSource)) &&
     (value.externalEventId === undefined || value.externalEventId === null || nonEmptyString(value.externalEventId)) &&
-    isRunActivityProtocol(value.protocol) &&
-    nonEmptyString(value.harnessId) &&
+    (value.protocol === undefined || value.protocol === null || isRunActivityProtocol(value.protocol)) &&
+    nonEmptyString(value.harness) &&
     (value.text === null || typeof value.text === "string") &&
     isRecord(value.payload)
   );
