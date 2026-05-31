@@ -1,13 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
+import type { ProjectionChangeEvent } from "../src/data/dataSource";
 import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
 import type { ChatMessage, DashboardModel, HistoryModel, IssueBoardModel, TranscriptMessage } from "../src/types/symphony";
 
 const originalFetch = globalThis.fetch;
+const originalEventSource = globalThis.EventSource;
 
 afterEach(() => {
   vi.restoreAllMocks();
   globalThis.fetch = originalFetch;
+  if (originalEventSource) {
+    globalThis.EventSource = originalEventSource;
+  } else {
+    Reflect.deleteProperty(globalThis, "EventSource");
+  }
 });
 
 function mockJsonResponse(body: unknown, status = 200): Response {
@@ -32,6 +39,40 @@ function deferred<T>() {
     reject = promiseReject;
   });
   return { promise, resolve, reject };
+}
+
+class FakeEventSource {
+  static instances: FakeEventSource[] = [];
+
+  readonly url: string;
+  closed = false;
+  private readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+
+  constructor(url: string) {
+    this.url = url;
+    FakeEventSource.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    const listeners = this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  emit(type: string, data: string): void {
+    const event = new MessageEvent(type, { data });
+    for (const listener of this.listeners.get(type) ?? []) {
+      if (typeof listener === "function") {
+        listener(event);
+      } else {
+        listener.handleEvent(event);
+      }
+    }
+  }
 }
 
 const chatResponse: ChatMessage[] = [{ who: "agent", text: "Chat loaded from the API." }];
@@ -281,6 +322,56 @@ describe("API data source", () => {
     dateNow.mockReturnValue(6_001);
     await expect(dataSource.getDashboard()).resolves.toEqual(refreshedDashboard);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates cached GET responses when realtime projection changes arrive", async () => {
+    const refreshedDashboard = { ...dashboardModel, pollLabel: "poll realtime" };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(dashboardModel))
+      .mockResolvedValueOnce(jsonResponse(refreshedDashboard));
+    const dataSource = createApiDataSource("/status-server/");
+
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    dataSource.invalidateCachedReads?.();
+
+    await expect(dataSource.getDashboard()).resolves.toEqual(refreshedDashboard);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("subscribes to projection revision events through EventSource and ignores malformed payload shape safely", () => {
+    FakeEventSource.instances = [];
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const events: ProjectionChangeEvent[] = [];
+    const dataSource = createApiDataSource("/status-server/");
+
+    const unsubscribe = dataSource.subscribeToProjectionChanges?.((event) => events.push(event));
+    expect(unsubscribe).toBeDefined();
+    const eventSource = FakeEventSource.instances[0];
+    expect(eventSource?.url).toBe("/status-server/api/v1/web/events");
+
+    eventSource?.emit("projection_revision", JSON.stringify({ type: "projection_revision", generation: 4, source: "runs", revision: 9 }));
+    eventSource?.emit("projection_revision", "not-json");
+    unsubscribe?.();
+
+    expect(events).toEqual([
+      { type: "projection_revision", generation: 4, source: "runs", revision: 9 },
+      { type: "projection_revision" },
+    ]);
+    expect(eventSource?.closed).toBe(true);
+  });
+
+  it("treats missing EventSource support as a no-op projection subscription", () => {
+    Reflect.deleteProperty(globalThis, "EventSource");
+    const events: ProjectionChangeEvent[] = [];
+
+    const unsubscribe = createApiDataSource("").subscribeToProjectionChanges?.((event) => events.push(event));
+    unsubscribe?.();
+
+    expect(events).toEqual([]);
   });
 
   it("does not cache failed GET responses", async () => {

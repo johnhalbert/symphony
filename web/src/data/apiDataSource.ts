@@ -1,4 +1,4 @@
-import type { SymphonyDataSource } from "./dataSource";
+import type { ProjectionChangeEvent, ProjectionChangeListener, ProjectionChangeUnsubscribe, SymphonyDataSource } from "./dataSource";
 import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
@@ -23,11 +23,16 @@ interface FetchJsonOptions {
   cacheable?: boolean;
 }
 
-function createGetJsonFetcher() {
+interface GetJsonFetcher {
+  fetchJson<T>(baseUrl: string, path: string, options?: FetchJsonOptions): Promise<T>;
+  invalidateCache(): void;
+}
+
+function createGetJsonFetcher(): GetJsonFetcher {
   const inFlight = new Map<string, Promise<unknown>>();
   const successCache = new Map<string, CachedGetResponse>();
 
-  return async function fetchJson<T>(baseUrl: string, path: string, options: FetchJsonOptions = {}): Promise<T> {
+  async function fetchJson<T>(baseUrl: string, path: string, options: FetchJsonOptions = {}): Promise<T> {
     const url = `${baseUrl}${path}`;
     const { signal, cacheable = true } = options;
     if (!cacheable) return fetchJsonOnce<T>(url, signal);
@@ -48,6 +53,13 @@ function createGetJsonFetcher() {
       () => inFlight.delete(url),
     );
     return resolveSharedGet(promise, signal);
+  }
+
+  return {
+    fetchJson,
+    invalidateCache() {
+      successCache.clear();
+    },
   };
 }
 
@@ -95,6 +107,34 @@ async function fetchJsonOnce<T>(url: string, signal?: AbortSignal): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function openProjectionChangeSubscription(baseUrl: string, listener: ProjectionChangeListener): ProjectionChangeUnsubscribe {
+  if (typeof EventSource === "undefined") return () => undefined;
+
+  const eventSource = new EventSource(`${baseUrl}/api/v1/web/events`);
+  const handleProjectionEvent = (event: MessageEvent) => {
+    listener(parseProjectionChangeEvent(event));
+  };
+  eventSource.addEventListener("projection_revision", handleProjectionEvent);
+  eventSource.addEventListener("projection_closed", handleProjectionEvent);
+  eventSource.addEventListener("message", handleProjectionEvent);
+  return () => {
+    eventSource.close();
+  };
+}
+
+function parseProjectionChangeEvent(event: MessageEvent): ProjectionChangeEvent {
+  if (typeof event.data !== "string") return { type: event.type };
+  try {
+    const parsed = JSON.parse(event.data) as unknown;
+    if (parsed && typeof parsed === "object" && typeof (parsed as { type?: unknown }).type === "string") {
+      return parsed as ProjectionChangeEvent;
+    }
+  } catch {
+    // Ignore malformed SSE payloads; the caller can still treat the event type as a coarse invalidation signal.
+  }
+  return { type: event.type };
+}
+
 function normalizeReferenceRecord(record: Record<string, ApiReferenceEntry | null> | null | undefined) {
   return Object.fromEntries(
     Object.entries(record ?? {}).map(([key, entry]) => [
@@ -116,7 +156,8 @@ export function normalizeReferenceData(input: ApiReferenceData): ReferenceData {
 
 export function createApiDataSource(baseUrl: string): SymphonyDataSource {
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
-  const fetchJson = createGetJsonFetcher();
+  const getJsonFetcher = createGetJsonFetcher();
+  const { fetchJson } = getJsonFetcher;
 
   return {
     async getReferenceData(signal) {
@@ -158,6 +199,12 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       });
       if (!response.ok) throw new Error(`Symphony API returned HTTP ${response.status}`);
       return response.json() as Promise<ChatMessage[]>;
+    },
+    invalidateCachedReads() {
+      getJsonFetcher.invalidateCache();
+    },
+    subscribeToProjectionChanges(listener) {
+      return openProjectionChangeSubscription(normalizedBaseUrl, listener);
     },
   };
 }

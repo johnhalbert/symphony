@@ -125,6 +125,11 @@ interface StatusServerWebProjectionContextAcquireResult {
   reusedCompleted: boolean;
 }
 
+interface WebProjectionEventClient {
+  id: number;
+  response: ServerResponse;
+}
+
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
   workspaceManager: WorkspaceManager;
@@ -163,6 +168,8 @@ export class StatusServer {
   private readonly webAssetsRoot: string | null;
   private readonly webProjectionRevisionProviders: readonly WebProjectionRevisionProvider[];
   private readonly webProjectionRevisionUnsubscribes: WebProjectionRevisionUnsubscribe[] = [];
+  private readonly webProjectionEventClients = new Map<number, WebProjectionEventClient>();
+  private nextWebProjectionEventClientId = 1;
   private webProjectionDirtyGeneration = 0;
 
   constructor(private readonly options: StatusServerOptions) {
@@ -197,6 +204,7 @@ export class StatusServer {
     }
     const server = this.server;
     this.server = null;
+    this.closeWebProjectionEventClients();
     try {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
@@ -228,9 +236,64 @@ export class StatusServer {
     }
   }
 
-  private markCompletedWebProjectionContextDirty(_revision: WebProjectionSourceRevision): void {
+  private markCompletedWebProjectionContextDirty(revision: WebProjectionSourceRevision): void {
     this.webProjectionDirtyGeneration += 1;
     this.completedWebProjectionContext = null;
+    this.broadcastWebProjectionRevision(revision);
+  }
+
+  private handleWebProjectionEvents(request: IncomingMessage, response: ServerResponse): void {
+    const clientId = this.nextWebProjectionEventClientId;
+    this.nextWebProjectionEventClientId += 1;
+    const client: WebProjectionEventClient = { id: clientId, response };
+    this.webProjectionEventClients.set(clientId, client);
+
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+    });
+    writeWebProjectionSseEvent(response, "projection_ready", {
+      type: "projection_ready",
+      generation: this.webProjectionDirtyGeneration,
+    });
+
+    const unsubscribe = (): void => {
+      this.webProjectionEventClients.delete(clientId);
+    };
+    request.on("close", unsubscribe);
+    response.on("close", unsubscribe);
+  }
+
+  private broadcastWebProjectionRevision(revision: WebProjectionSourceRevision): void {
+    const eventId = String(this.webProjectionDirtyGeneration);
+    const payload = {
+      type: "projection_revision",
+      generation: this.webProjectionDirtyGeneration,
+      source: revision.source,
+      revision: revision.revision,
+      observedAt: revision.observedAt,
+    };
+    for (const client of Array.from(this.webProjectionEventClients.values())) {
+      try {
+        writeWebProjectionSseEvent(client.response, "projection_revision", payload, eventId);
+      } catch {
+        this.webProjectionEventClients.delete(client.id);
+      }
+    }
+  }
+
+  private closeWebProjectionEventClients(): void {
+    for (const client of Array.from(this.webProjectionEventClients.values())) {
+      try {
+        writeWebProjectionSseEvent(client.response, "projection_closed", { type: "projection_closed" });
+        client.response.end();
+      } catch {
+        // Closing the status server should not fail because an SSE client has already disconnected.
+      }
+      this.webProjectionEventClients.delete(client.id);
+    }
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -249,6 +312,10 @@ export class StatusServer {
             this.options.staleThresholdMs,
           ),
         );
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/web/events") {
+        this.handleWebProjectionEvents(request, response);
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/state") {
@@ -1408,6 +1475,12 @@ function webProjectionSourceIndexWithTrackerCacheHit(
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(`${JSON.stringify(body, null, 2)}\n`);
+}
+
+function writeWebProjectionSseEvent(response: ServerResponse, event: string, body: unknown, id?: string): void {
+  if (id) response.write(`id: ${id}\n`);
+  response.write(`event: ${event}\n`);
+  response.write(`data: ${JSON.stringify(body)}\n\n`);
 }
 
 function sendHtml(response: ServerResponse, body: string): void {
