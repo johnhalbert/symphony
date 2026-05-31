@@ -725,6 +725,107 @@ describe("HermesAcpHarness", () => {
     );
   });
 
+  it.each([
+    {
+      name: "missing terminal toolCall",
+      params: () => ({ sessionId: "acp-session-1", options: terminalPermissionOptions() }),
+      reason: "missing_permission_tool_call",
+    },
+    {
+      name: "missing edit toolCall",
+      params: () => ({ session_id: "acp-session-1", permission_options: editPermissionOptions() }),
+      reason: "missing_permission_tool_call",
+    },
+    {
+      name: "missing terminal toolCall kind",
+      params: () => ({
+        ...terminalPermissionRequest(),
+        toolCall: { toolCallId: "perm-tool-1", rawInput: { command: "rm -rf /" } },
+      }),
+      reason: "missing_permission_tool_call_kind",
+    },
+    {
+      name: "missing edit toolCall kind",
+      params: () => ({
+        ...editPermissionRequest(),
+        tool_call: { tool_call_id: "edit-tool-1", rawInput: { path: "README.md" } },
+      }),
+      reason: "missing_permission_tool_call_kind",
+    },
+    {
+      name: "unknown terminal toolCall kind",
+      params: () => ({
+        ...terminalPermissionRequest(),
+        toolCall: { toolCallId: "perm-tool-1", kind: "web_search", rawInput: { command: "rm -rf /" } },
+      }),
+      reason: "unsupported_permission_tool_call",
+    },
+    {
+      name: "unknown edit toolCall kind",
+      params: () => ({
+        ...editPermissionRequest(),
+        tool_call: { tool_call_id: "edit-tool-1", kind: "database_write", rawInput: { path: "README.md" } },
+      }),
+      reason: "unsupported_permission_tool_call",
+    },
+    {
+      name: "missing terminal toolCall id",
+      params: () => ({
+        ...terminalPermissionRequest(),
+        toolCall: { kind: "execute", title: "dangerous command", rawInput: { command: "rm -rf /" } },
+      }),
+      reason: "missing_permission_tool_call_id",
+    },
+    {
+      name: "missing edit toolCall id",
+      params: () => ({
+        ...editPermissionRequest(),
+        tool_call: { kind: "edit", title: "edit file", rawInput: { path: "README.md" } },
+      }),
+      reason: "missing_permission_tool_call_id",
+    },
+    {
+      name: "missing terminal toolCall content",
+      params: () => ({
+        ...terminalPermissionRequest(),
+        toolCall: { toolCallId: "perm-tool-1", kind: "execute" },
+      }),
+      reason: "missing_permission_tool_call_content",
+    },
+    {
+      name: "missing edit toolCall content",
+      params: () => ({
+        ...editPermissionRequest(),
+        tool_call: { tool_call_id: "edit-tool-1", kind: "edit" },
+      }),
+      reason: "missing_permission_tool_call_content",
+    },
+  ])("rejects unsupported permission tool-call shape before consulting the bridge: $name", async ({ params, reason }) => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    const permissionResolver = vi.fn(() => "allow_once");
+    const { ctx, harness } = await fixture({ client, permissionResolver });
+    const { runPromise } = await startPendingRun({ client, ctx, harness });
+
+    const responses = await client.invokeClientRequest("session/request_permission", params());
+    client.promptDeferred.resolve({ stopReason: "end_turn" });
+    const events = await runPromise;
+
+    expect(permissionResolver).not.toHaveBeenCalled();
+    expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "run_diagnostic",
+          code: "hermes_acp_permission_denied",
+          message: `Host Hermes ACP permission request denied: ${reason}`,
+        }),
+      ]),
+    );
+  });
+
   it("rejects unknown permission option shapes before consulting the bridge", async () => {
     const client = new FakeAcpClient();
     client.promptDeferred = deferred<Record<string, unknown> | null>();
@@ -893,11 +994,15 @@ function editPermissionRequest(): Record<string, unknown> {
       title: "edit file",
       rawInput: { path: "README.md" },
     },
-    permission_options: [
-      { option_id: "allow_once", kind: "allow_once", name: "Allow edit" },
-      { option_id: "deny", kind: "reject_once", name: "Deny" },
-    ],
+    permission_options: editPermissionOptions(),
   };
+}
+
+function editPermissionOptions(): Array<Record<string, unknown>> {
+  return [
+    { option_id: "allow_once", kind: "allow_once", name: "Allow edit" },
+    { option_id: "deny", kind: "reject_once", name: "Deny" },
+  ];
 }
 
 async function fixture(
