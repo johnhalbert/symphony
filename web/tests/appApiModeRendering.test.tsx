@@ -506,9 +506,12 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("poll 5s");
     expect(markup).toContain("2/9 agents");
     expect(markup).toContain("concurrency cap 9");
-    expect(markup).toContain("8/32 done");
-    expect(markup).toMatch(/target\s+32/);
-    expect(markup).toMatch(/completed\s+8/);
+    expect(markup).toContain("8/32 done · schedule unavailable");
+    expect(markup).toContain("Burn-up unavailable");
+    expect(markup).toContain("Velocity trend unavailable");
+    expect(markup).toContain("ETA unavailable");
+    expect(markup).toContain("connection unavailable");
+    expect(markup).toContain("errors unavailable");
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
     expect(markup).toContain("Full-app suggestion");
@@ -518,6 +521,13 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("dashboard embedded fallback should not render");
     expect(markup).not.toContain("dashboard stale suggestion");
     expect(markup).not.toContain("Restart SYM-42");
+    expect(markup).not.toMatch(/target\s+\d/);
+    expect(markup).not.toMatch(/completed\s+\d/);
+    expect(markup).not.toContain("Cycle 14");
+    expect(markup).not.toContain("3.2");
+    expect(markup).not.toContain("PR/day");
+    expect(markup).not.toContain("linear · connected");
+    expect(markup).not.toContain("0 errors");
   });
 
   it("keeps mock-mode app-shell resources eager once reference data is loaded", async () => {
@@ -640,6 +650,27 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("Add exponential backoff to retry queue with jitter");
     expect(markup).not.toContain("Backoff curve");
     expect(markup).not.toContain("No issue activity in the mock data.");
+  });
+
+  it("renders API issue detail with empty activity as neutral unavailable copy", async () => {
+    const emptyActivityDetail: IssueDetailModel = {
+      ...apiSelectedIssueDetail,
+      issue: {
+        ...apiSelectedIssueDetail.issue,
+        activity: [],
+      },
+    };
+
+    const { markup, requestedIssueIds } = await renderIssuesViewWithDetail({
+      board: apiIssueBoard,
+      detail: loaded(emptyActivityDetail),
+    });
+
+    expect(requestedIssueIds).toEqual([apiSelectedIssue.id]);
+    expect(markup).toContain("API issue detail title from GET /api/v1/web/issues/API-SELECTED");
+    expect(markup).toContain("No issue activity available.");
+    expect(markup).not.toContain("No issue activity in the mock data.");
+    expect(markup).not.toContain("mock data");
   });
 
   it("renders API issue references with deterministic fallback labels and users", async () => {

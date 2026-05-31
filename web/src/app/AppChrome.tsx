@@ -16,12 +16,14 @@ export function AppChrome({
   onTabChange,
   children,
   rightSlot,
-  runningCount = 4,
-  repoLabel = "openai/symphony",
-  branch = "main",
-  pollLabel = "poll 22s · next in 8s",
+  runningCount = 0,
+  repoLabel = "",
+  branch = "",
+  pollLabel = "poll unavailable",
   agentUsageLabel,
-  dataSourceLabel = "api source · mock",
+  dataSourceLabel = "data source unavailable",
+  connectionStatusLabel = "connection unavailable",
+  errorStatusLabel = "errors unavailable",
 }: {
   activeTab: AppTab;
   onTabChange: (tab: AppTab) => void;
@@ -33,8 +35,10 @@ export function AppChrome({
   pollLabel?: string;
   agentUsageLabel?: string;
   dataSourceLabel?: string;
+  connectionStatusLabel?: string;
+  errorStatusLabel?: string;
 }) {
-  const repoBranchLabel = branch ? `${repoLabel}@${branch}` : repoLabel;
+  const repoBranchLabel = branch ? `${repoLabel || "repo unavailable"}@${branch}` : repoLabel || "repo unavailable";
   const runningLabel = agentUsageLabel ?? `${runningCount} agents running`;
 
   return (
@@ -85,11 +89,11 @@ export function AppChrome({
         <span className="statusbar__sep">·</span>
         <span className="statusbar__seg mono">{pollLabel}</span>
         <div className="statusbar__right">
-          <span className="statusbar__seg mono">linear · connected</span>
+          <span className="statusbar__seg mono">{connectionStatusLabel}</span>
           <span className="statusbar__sep">·</span>
           <span className="statusbar__seg mono">{dataSourceLabel}</span>
           <span className="statusbar__sep">·</span>
-          <span className="statusbar__seg mono">0 errors · 24h</span>
+          <span className="statusbar__seg mono">{errorStatusLabel}</span>
         </div>
       </div>
     </div>

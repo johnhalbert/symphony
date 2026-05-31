@@ -208,6 +208,49 @@ export interface DashboardTotals {
   completeness: number;
 }
 
+export interface DashboardCycleMetrics {
+  label?: string | null;
+  dateRange?: string | null;
+  remainingLabel?: string | null;
+  completenessDeltaLabel?: string | null;
+  projectedCompletionLabel?: string | null;
+}
+
+export interface DashboardVelocityMetrics {
+  valueLabel?: string | null;
+  unitLabel?: string | null;
+  etaLabel?: string | null;
+  windowLabel?: string | null;
+  deltaLabel?: string | null;
+  trendLabel?: string | null;
+  sparkline?: number[] | null;
+}
+
+export interface DashboardBurnupMetrics {
+  title?: string | null;
+  remainingLabel?: string | null;
+  completedSeries?: number[] | null;
+  targetSeries?: number[] | null;
+  completedEnd?: number | null;
+  targetEnd?: number | null;
+  currentIndex?: number | null;
+  totalPoints?: number | null;
+}
+
+export interface DashboardHealthMetrics {
+  connectionLabel?: string | null;
+  stateLabel?: string | null;
+  errorSummaryLabel?: string | null;
+  reviewQueueLabel?: string | null;
+}
+
+export interface DashboardMetrics {
+  cycle?: DashboardCycleMetrics | null;
+  velocity?: DashboardVelocityMetrics | null;
+  burnup?: DashboardBurnupMetrics | null;
+  health?: DashboardHealthMetrics | null;
+}
+
 export interface DashboardModel {
   projectName: string;
   repoLabel: string;
@@ -221,6 +264,7 @@ export interface DashboardModel {
   activity: ActivityModel[];
   chat: ChatMessage[];
   totals: DashboardTotals;
+  metrics?: DashboardMetrics | null;
 }
 
 export interface IssueBoardModel {
