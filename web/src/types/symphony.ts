@@ -153,8 +153,15 @@ export interface SessionModel {
 }
 
 export interface ChatMessage {
+  id?: string;
+  conversationId?: string;
   who: "agent" | "user";
+  role?: "user" | "assistant" | "system" | "server";
   text: string;
+  status?: "pending" | "streaming" | "completed" | "failed" | "disabled" | "unavailable";
+  createdAt?: string;
+  updatedAt?: string;
+  metadata?: Record<string, unknown>;
   suggestions?: string[];
 }
 

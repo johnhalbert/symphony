@@ -6,6 +6,11 @@ import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { StatusServer } from "../src/app/http.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import {
+  DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+  FileOrchestratorConversationStore,
+  type OrchestratorConversationStore,
+} from "../src/core/persistence/OrchestratorConversationStore.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { testConfig } from "./helpers.js";
@@ -61,6 +66,110 @@ describe("web orchestrator chat API", () => {
       expect(text).not.toContain("please inspect ENG-94");
       expect(text).not.toMatch(/assistant|suggestion|mock|command|transcript/i);
       expect(calls).toEqual(zeroCallCounts());
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("persists valid POST messages into durable orchestrator chat without orchestration side effects", async () => {
+    const store = new FileOrchestratorConversationStore(path.join(root, "state"));
+    const { server, calls } = createStatusServer(root, { orchestratorConversationStore: store });
+    const address = await server.start();
+    try {
+      const response = await fetch(chatUrl(address), {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input: "please inspect ENG-94", messageId: "client-message-1" }),
+      });
+      const posted = (await response.json()) as Array<Record<string, unknown>>;
+
+      expect(response.status).toBe(200);
+      expect(posted).toHaveLength(1);
+      expect(posted[0]).toMatchObject({
+        id: "client-message-1",
+        conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+        who: "user",
+        role: "user",
+        text: "please inspect ENG-94",
+        status: "completed",
+        metadata: {
+          source: "web_orchestrator_chat",
+          actionDispatched: false,
+        },
+      });
+      expect(calls).toEqual(zeroCallCounts());
+
+      const getResponse = await fetch(chatUrl(address));
+      expect(getResponse.status).toBe(200);
+      expect(await getResponse.json()).toEqual(posted);
+
+      const replayResponse = await fetch(chatUrl(address), {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input: "please inspect ENG-94", messageId: "client-message-1" }),
+      });
+      const replayed = (await replayResponse.json()) as Array<Record<string, unknown>>;
+      expect(replayResponse.status).toBe(200);
+      expect(replayed).toEqual(posted);
+      expect(await store.listMessages()).toHaveLength(1);
+
+      const alphaUrl = chatUrl(address) + "?conversationId=alpha";
+      const alphaResponse = await fetch(alphaUrl, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input: "alpha scoped message" }),
+      });
+      const alphaPosted = (await alphaResponse.json()) as Array<Record<string, unknown>>;
+      expect(alphaResponse.status).toBe(200);
+      expect(alphaPosted).toMatchObject([
+        {
+          conversationId: "alpha",
+          who: "user",
+          role: "user",
+          text: "alpha scoped message",
+        },
+      ]);
+      expect(await (await fetch(alphaUrl)).json()).toEqual(alphaPosted);
+      expect(await (await fetch(chatUrl(address))).json()).toEqual(posted);
+      expect(calls).toEqual(zeroCallCounts());
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves sidebar chat from persisted orchestrator conversation messages", async () => {
+    const store = new FileOrchestratorConversationStore(path.join(root, "state"));
+    await store.appendMessage({
+      role: "assistant",
+      body: "Durable orchestration status is available.",
+      status: "completed",
+      metadata: { token: "SECRET_VALUE", safe: "visible" },
+    });
+    const { server } = createStatusServer(root, { orchestratorConversationStore: store });
+    const address = await server.start();
+    try {
+      const response = await fetch("http://" + address.host + ":" + String(address.port) + "/api/v1/web/sidebar");
+      const body = (await response.json()) as { chat?: Array<Record<string, unknown>> };
+
+      expect(response.status).toBe(200);
+      expect(body.chat).toEqual([
+        expect.objectContaining({
+          conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+          who: "agent",
+          role: "assistant",
+          text: "Durable orchestration status is available.",
+          metadata: { token: "[redacted]", safe: "visible" },
+        }),
+      ]);
     } finally {
       await server.stop();
     }
@@ -134,7 +243,10 @@ function chatUrl(address: { host: string; port: number }): string {
   return "http://" + address.host + ":" + String(address.port) + "/api/v1/web/orchestrator-chat";
 }
 
-function createStatusServer(root: string): { server: StatusServer; calls: OrchestratorCallCounts } {
+function createStatusServer(
+  root: string,
+  options: { orchestratorConversationStore?: OrchestratorConversationStore } = {},
+): { server: StatusServer; calls: OrchestratorCallCounts } {
   const config = testConfig(path.join(root, "workspaces"));
   const { orchestrator, calls } = instrumentedOrchestrator();
   const server = new StatusServer({
@@ -145,6 +257,9 @@ function createStatusServer(root: string): { server: StatusServer; calls: Orches
       logger: new StructuredLogger(() => undefined),
     }),
     workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+    ...(options.orchestratorConversationStore === undefined
+      ? {}
+      : { orchestratorConversationStore: options.orchestratorConversationStore }),
     host: "127.0.0.1",
     port: 0,
     openWorkspaceToken: null,
