@@ -709,9 +709,19 @@ describe("HermesAcpHarness", () => {
     const events = await collectEvents(harness.run(ctx, "Do work"));
     const activities = events.map((event) => event.runActivity);
 
-    expect(events.map((event) => event.type)).toEqual(["session_started", "progress", "progress", "progress", "progress", "progress", "tokens", "completed"]);
+    expect(events.map((event) => event.type)).toEqual([
+      "session_started",
+      "progress",
+      "run_diagnostic",
+      "progress",
+      "progress",
+      "progress",
+      "progress",
+      "tokens",
+      "completed",
+    ]);
     expect(activities.every(Boolean)).toBe(true);
-    expect(activities.map((activity) => activity?.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(activities.map((activity) => activity?.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(activities[0]).toMatchObject({
       protocol: "acp",
       harness: "hermes_acp",
@@ -811,6 +821,7 @@ describe("HermesAcpHarness", () => {
     expect(transcriptEventTypes).toEqual([
       "session_started",
       "runtime_ready",
+      "runtime_diagnostic",
       "tool_call_started",
       "tool_call_completed",
       "tool_call_started",
@@ -1145,10 +1156,10 @@ describe("HermesAcpHarness", () => {
     const client = new FakeAcpClient();
     const { ctx, harness, leaseFactory, leases } = await fixture({ client, lifecycle: "reuse_by_issue" });
 
-    await collectEvents(harness.run(ctx, "First"));
+    const firstEvents = await collectEvents(harness.run(ctx, "First"));
     client.promptNotificationParams = { sessionId: "acp-session-2", update: { sessionUpdate: "agent_message_chunk", content: "again" } };
     client.sessionId = "acp-session-2";
-    await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
+    const secondEvents = await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
     await harness.dispose();
     await harness.dispose();
 
@@ -1161,7 +1172,128 @@ describe("HermesAcpHarness", () => {
       "session/new",
       "session/prompt",
     ]);
+    expect(leaseDecisionPayloads(firstEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_no_existing_reusable_lease",
+        reusable: true,
+        profileName: "profile-1",
+      }),
+    ]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "reused",
+        reuseMode: "reuse_by_issue",
+        reason: "compatible_reusable_worker_implementation",
+        reusable: true,
+        profileName: "profile-1",
+        existingProfileName: "profile-1",
+      }),
+    ]);
     expect(leases[0]?.disposeStatuses).toEqual([null]);
+  });
+
+  it("uses fresh leases for isolated reviewer contexts and explains the reuse decision", async () => {
+    const { ctx, harness, leaseFactory, leases } = await fixture({ lifecycle: "reuse_by_issue" });
+    const reviewerCtx: AgentRunContext = { ...ctx, role: "reviewer", runPhase: "review" };
+
+    const firstEvents = await collectEvents(harness.run(reviewerCtx, "Review"));
+    const secondEvents = await collectEvents(harness.run({ ...reviewerCtx, turnNumber: 2 }, "Review again"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(leases[0]?.disposeStatuses).toEqual(["succeeded"]);
+    expect(leases[1]?.disposeStatuses).toEqual(["succeeded"]);
+    expect(leaseDecisionPayloads(firstEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "fresh_per_run",
+        reason: "fresh_isolated_role",
+        reusable: false,
+        profileName: "profile-1",
+      }),
+    ]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "fresh_per_run",
+        reason: "fresh_isolated_role",
+        reusable: false,
+        profileName: "profile-2",
+      }),
+    ]);
+  });
+
+  it("does not reuse a worker lease when the resolved host context is incompatible", async () => {
+    const firstClient = new FakeAcpClient();
+    const secondClient = new FakeAcpClient();
+    secondClient.sessionId = "acp-session-2";
+    secondClient.promptNotificationParams = {
+      sessionId: "acp-session-2",
+      update: { sessionUpdate: "agent_message_chunk", content: "second" },
+    };
+    const { ctx, harness, leaseFactory, leases, root } = await fixture({
+      clients: [firstClient, secondClient],
+      lifecycle: "reuse_by_issue",
+      sourceProfile: "host-source",
+    });
+
+    await collectEvents(harness.run(ctx, "First"));
+    const nextConfig = serviceConfig(root, "reuse_by_issue", { sourceProfile: "other-source" });
+    const secondEvents = await collectEvents(harness.run({ ...runContext(nextConfig, root), turnNumber: 2 }, "Second"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(firstClient.kills).toEqual(expect.arrayContaining([expect.stringContaining("reuse_incompatible")]));
+    expect(leases[0]?.disposeStatuses).toEqual([null]);
+    expect(leases[1]?.disposeStatuses).toEqual([]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_incompatible_context",
+        reusable: true,
+        profileName: "profile-2",
+        existingProfileName: "profile-1",
+        incompatibleFields: expect.arrayContaining(["sourceProfile"]),
+      }),
+    ]);
+  });
+
+  it("keeps reusable worker leases isolated by workspace as well as issue and phase", async () => {
+    const firstClient = new FakeAcpClient();
+    const secondClient = new FakeAcpClient();
+    secondClient.sessionId = "acp-session-2";
+    secondClient.promptNotificationParams = {
+      sessionId: "acp-session-2",
+      update: { sessionUpdate: "agent_message_chunk", content: "second" },
+    };
+    const { ctx, harness, leaseFactory, leases, root } = await fixture({
+      clients: [firstClient, secondClient],
+      lifecycle: "reuse_by_issue",
+    });
+
+    await collectEvents(harness.run(ctx, "First"));
+    const otherWorkspaceCtx: AgentRunContext = {
+      ...ctx,
+      workspace: { ...ctx.workspace, path: path.join(root, "workspace-two"), workspaceKey: "ENG-139-other" },
+      turnNumber: 2,
+    };
+    const secondEvents = await collectEvents(harness.run(otherWorkspaceCtx, "Second"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(firstClient.kills).toEqual([]);
+    expect(leases[0]?.disposeStatuses).toEqual([]);
+    expect(leases[1]?.disposeStatuses).toEqual([]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_no_existing_reusable_lease",
+        reusable: true,
+        profileName: "profile-2",
+      }),
+    ]);
+    await harness.dispose();
   });
 
   it("creates a new reusable lease and repeats the ACP handshake after a process restart", async () => {
@@ -1172,7 +1304,7 @@ describe("HermesAcpHarness", () => {
       sessionId: "acp-session-2",
       update: { sessionUpdate: "agent_message_chunk", content: "after restart" },
     };
-    const { ctx, harness, acpClientFactory, leaseFactory } = await fixture({
+    const { ctx, harness, acpClientFactory, leaseFactory, leases } = await fixture({
       clients: [firstClient, secondClient],
       lifecycle: "reuse_by_issue",
     });
@@ -1180,7 +1312,7 @@ describe("HermesAcpHarness", () => {
     await collectEvents(harness.run(ctx, "First"));
     firstClient.emitExit({ code: 0, signal: null });
     await Promise.resolve();
-    await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
+    const secondEvents = await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
     await harness.dispose();
 
     expect(leaseFactory).toHaveBeenCalledTimes(2);
@@ -1196,6 +1328,17 @@ describe("HermesAcpHarness", () => {
       "authenticate",
       "session/new",
       "session/prompt",
+    ]);
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+    expect(leases[1]?.disposeStatuses).toEqual([null]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_previous_process_exited",
+        reusable: true,
+        profileName: "profile-2",
+      }),
     ]);
   });
 
@@ -1295,7 +1438,7 @@ describe("HermesAcpHarness", () => {
       assistant_message_delta: 2,
       runtime_status_update: 1,
       available_commands_update: 1,
-      runtime_diagnostic: 3,
+      runtime_diagnostic: 4,
       token_usage_reported: 1,
       run_succeeded: 1,
     });
@@ -1315,6 +1458,7 @@ describe("HermesAcpHarness", () => {
     expect(call2Events.map((event) => event.eventType)).toEqual(["tool_call_started", "tool_call_failed"]);
     expect(transcript.events.filter((event) => event.eventType === "runtime_diagnostic").map((event) => event.payload)).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({ code: "hermes_acp_lease_reuse_decision" }),
         expect.objectContaining({ code: "hermes_acp_session_update_unmapped" }),
         expect.objectContaining({ code: "host_hermes_notice", severity: "info" }),
         expect.objectContaining({ code: "hermes_acp_permission_denied", severity: "warning" }),
@@ -1982,6 +2126,12 @@ function transcriptEventsFromAgentEvents(events: AgentEvent[]): TranscriptEvent[
     source: "harness",
     ...mapAgentEventToRunActivityEvent(event),
   }));
+}
+
+function leaseDecisionPayloads(events: AgentEvent[]): unknown[] {
+  return events.flatMap((event) =>
+    event.type === "run_diagnostic" && event.code === "hermes_acp_lease_reuse_decision" ? [event.payload] : [],
+  );
 }
 
 function eventTypeCounts(events: TranscriptEvent[]): Record<string, number> {
