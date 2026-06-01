@@ -41,6 +41,17 @@ describe("ProjectionTransactionService", () => {
         { source: "linear", revision: "10", observedAt: fixedTime },
       ],
       sourceCursors: { z: "cursor", a: 1 },
+      sourceFreshness: [
+        {
+          source: "linear",
+          status: "stale",
+          checkedAt: fixedTime,
+          revision: "10",
+          lastSuccessAt: "2026-01-02T03:03:05.000Z",
+          staleMs: 60_000,
+          detail: "Linear import is outside the freshness SLA",
+        },
+      ],
       fields: { fetchedStates: [{ id: "started" }] },
     });
     const repeated = await service.writeProjection({
@@ -51,6 +62,17 @@ describe("ProjectionTransactionService", () => {
         { source: "runs", revision: 2 },
       ],
       sourceCursors: { a: 1, z: "cursor" },
+      sourceFreshness: [
+        {
+          source: "linear",
+          status: "stale",
+          checkedAt: fixedTime,
+          revision: "10",
+          lastSuccessAt: "2026-01-02T03:03:05.000Z",
+          staleMs: 60_000,
+          detail: "Linear import is outside the freshness SLA",
+        },
+      ],
       fields: { fetchedStates: [{ id: "started" }] },
     });
 
@@ -62,6 +84,29 @@ describe("ProjectionTransactionService", () => {
     expect(repeated.revision.contentSha256).toBe(first.revision.contentSha256);
     expect(store.revisions()).toHaveLength(1);
     expect(store.payloadWrites()).toHaveLength(1);
+    expect(first.revision.sourceFreshness).toEqual([
+      {
+        source: "linear",
+        status: "stale",
+        checkedAt: fixedTime,
+        revision: "10",
+        lastSuccessAt: "2026-01-02T03:03:05.000Z",
+        lastErrorAt: null,
+        staleMs: 60_000,
+        detail: "Linear import is outside the freshness SLA",
+      },
+      {
+        source: "runs",
+        status: "fresh",
+        checkedAt: fixedTime,
+        revision: 2,
+        lastSuccessAt: fixedTime,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "runs source revision 2 observed",
+      },
+    ]);
+    expect(first.revision.sourceCursors.sourceFreshness).toEqual(first.revision.sourceFreshness);
 
     expect(publications).toEqual([
       {
@@ -77,6 +122,245 @@ describe("ProjectionTransactionService", () => {
     });
 
     unsubscribe();
+  });
+
+  it("derives non-success freshness from tracker failure source revisions without misclassifying run statuses", async () => {
+    const store = new InMemoryProjectionTransactionStore();
+    const service = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });
+
+    const trackerError = await service.writeProjection({
+      projectionName: "issue_board_projection",
+      payload: { issues: [] },
+      sourceRevisions: [
+        { source: "trackerIssues", revision: "error:Todo:0:none" },
+        { source: "runs", revision: "failed:run-1", observedAt: fixedTime },
+      ],
+    });
+    const trackerUnavailable = await service.writeProjection({
+      projectionName: "dashboard_projection",
+      payload: { totals: {} },
+      sourceRevisions: [{ source: "trackerIssues", revision: "unavailable:Todo:0:none" }],
+    });
+    const trackerEmptySuccess = await service.writeProjection({
+      projectionName: "sidebar_projection",
+      payload: { reviewIssues: [] },
+      sourceRevisions: [{ source: "trackerIssues", revision: "ok:Todo:0:none", observedAt: fixedTime }],
+    });
+
+    const errorFreshness = trackerError.revision.sourceFreshness.find((record) => record.source === "trackerIssues");
+    expect(errorFreshness).toMatchObject({
+      source: "trackerIssues",
+      status: "error",
+      checkedAt: fixedTime,
+      revision: "error:Todo:0:none",
+      lastSuccessAt: null,
+      lastErrorAt: fixedTime,
+      staleMs: null,
+      detail: "trackerIssues source reported an error (error:Todo:0:none)",
+    });
+    expect(trackerError.revision.sourceFreshness.find((record) => record.source === "runs")).toMatchObject({
+      source: "runs",
+      status: "fresh",
+      revision: "failed:run-1",
+      lastSuccessAt: fixedTime,
+      lastErrorAt: null,
+    });
+    expect(trackerUnavailable.revision.sourceFreshness).toContainEqual({
+      source: "trackerIssues",
+      status: "error",
+      checkedAt: fixedTime,
+      revision: "unavailable:Todo:0:none",
+      lastSuccessAt: null,
+      lastErrorAt: fixedTime,
+      staleMs: null,
+      detail: "trackerIssues source is unavailable (unavailable:Todo:0:none)",
+    });
+    expect(trackerEmptySuccess.revision.sourceFreshness).toContainEqual({
+      source: "trackerIssues",
+      status: "empty",
+      checkedAt: fixedTime,
+      revision: "ok:Todo:0:none",
+      lastSuccessAt: fixedTime,
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "trackerIssues source is empty",
+    });
+  });
+
+  it("normalizes, persists, and publishes freshness statuses for independent projection sources", async () => {
+    const store = new InMemoryProjectionTransactionStore();
+    const service = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });
+    const publications: unknown[] = [];
+    service.onProjectionChanged((event) => publications.push(event));
+
+    const expectedSourceFreshness = [
+      {
+        source: "github",
+        status: "stale",
+        checkedAt: fixedTime,
+        revision: "gh-55",
+        lastSuccessAt: "2026-01-02T03:00:05.000Z",
+        lastErrorAt: null,
+        staleMs: 240_000,
+        detail: "GitHub webhook cursor is behind",
+      },
+      {
+        source: "harness",
+        status: "error",
+        checkedAt: fixedTime,
+        revision: "harness-run-7",
+        lastSuccessAt: null,
+        lastErrorAt: fixedTime,
+        staleMs: null,
+        detail: "Harness transcript ingest failed",
+      },
+      {
+        source: "linear",
+        status: "fresh",
+        checkedAt: fixedTime,
+        revision: "lin-42",
+        lastSuccessAt: fixedTime,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "Linear import is current",
+      },
+      {
+        source: "local",
+        status: "never_synced",
+        checkedAt: fixedTime,
+        revision: null,
+        lastSuccessAt: null,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "Local workspace snapshot has not run",
+      },
+      {
+        source: "runs",
+        status: "loading",
+        checkedAt: fixedTime,
+        revision: null,
+        lastSuccessAt: null,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "Run projection is still loading",
+      },
+      {
+        source: "workspaces",
+        status: "empty",
+        checkedAt: fixedTime,
+        revision: 0,
+        lastSuccessAt: fixedTime,
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "No workspace rows are available yet",
+      },
+    ];
+
+    const first = await service.writeProjection({
+      projectionName: "dashboard_projection",
+      payload: { agents: [] },
+      sourceRevisions: [
+        { source: "linear", revision: "lin-42", observedAt: fixedTime },
+        { source: "github", revision: "gh-55", observedAt: fixedTime },
+        { source: "harness", revision: "harness-run-7", observedAt: fixedTime },
+        { source: "local", revision: "local-snapshot-0", observedAt: null },
+      ],
+      sourceFreshness: [
+        {
+          source: "linear",
+          status: "fresh",
+          revision: "lin-42",
+          detail: "Linear import is current",
+        },
+        {
+          source: "github",
+          status: "stale",
+          revision: "gh-55",
+          lastSuccessAt: "2026-01-02T03:00:05.000Z",
+          detail: "GitHub webhook cursor is behind",
+        },
+        {
+          source: "harness",
+          status: "failed",
+          revision: "harness-run-7",
+          detail: "Harness transcript ingest failed",
+        },
+        {
+          source: "local",
+          status: "never-synced",
+          detail: "Local workspace snapshot has not run",
+        },
+        {
+          source: "runs",
+          status: "pending",
+          detail: "Run projection is still loading",
+        },
+        {
+          source: "workspaces",
+          status: "empty",
+          revision: 0,
+          detail: "No workspace rows are available yet",
+        },
+      ],
+    });
+    const repeated = await service.writeProjection({
+      projectionName: "dashboard_projection",
+      payload: { agents: [] },
+      sourceRevisions: [
+        { source: "github", revision: "gh-55", observedAt: fixedTime },
+        { source: "harness", revision: "harness-run-7", observedAt: fixedTime },
+        { source: "linear", revision: "lin-42", observedAt: fixedTime },
+        { source: "local", revision: "local-snapshot-0", observedAt: null },
+      ],
+      sourceFreshness: [
+        {
+          source: "github",
+          status: "stale",
+          revision: "gh-55",
+          lastSuccessAt: "2026-01-02T03:00:05.000Z",
+          detail: "GitHub webhook cursor is behind",
+        },
+        {
+          source: "harness",
+          status: "error",
+          revision: "harness-run-7",
+          detail: "Harness transcript ingest failed",
+        },
+        {
+          source: "linear",
+          status: "fresh",
+          revision: "lin-42",
+          detail: "Linear import is current",
+        },
+        {
+          source: "local",
+          status: "never_synced",
+          detail: "Local workspace snapshot has not run",
+        },
+        {
+          source: "runs",
+          status: "loading",
+          detail: "Run projection is still loading",
+        },
+        {
+          source: "workspaces",
+          status: "empty",
+          revision: 0,
+          detail: "No workspace rows are available yet",
+        },
+      ],
+    });
+    const current = await service.readCurrentRevision({ projectionName: "dashboard_projection" });
+
+    expect(first.status).toBe("written");
+    expect(repeated.status).toBe("unchanged");
+    expect(repeated.revision.projectionRevisionId).toBe(first.revision.projectionRevisionId);
+    expect(store.revisions()).toHaveLength(1);
+    expect(first.revision.sourceFreshness).toEqual(expectedSourceFreshness);
+    expect(first.revision.sourceCursors.sourceFreshness).toEqual(expectedSourceFreshness);
+    expect(current?.sourceFreshness).toEqual(expectedSourceFreshness);
+    expect(publications).toHaveLength(1);
+    expect((publications[0] as { sourceFreshness?: unknown }).sourceFreshness).toEqual(expectedSourceFreshness);
   });
 
   it("keeps revisions monotonic across service instances and concurrent updates", async () => {
@@ -292,6 +576,7 @@ class InMemoryProjectionTransaction implements ProjectionTransactionRevisionPort
       revision: input.revision,
       sourceRevisions: input.sourceRevisions.map((revision) => ({ ...revision })),
       sourceCursors: cloneJson(input.sourceCursors),
+      sourceFreshness: input.sourceFreshness.map((freshness) => ({ ...freshness })),
       contentSha256: input.contentSha256,
       generatedAt: input.generatedAt,
       expiresAt: input.expiresAt,
@@ -341,11 +626,12 @@ class RecordingProjectionSqlRunner implements ProjectionSqlQueryRunner {
         revision: values[3],
         source_revisions: JSON.parse(String(values[4])) as unknown,
         source_cursors: JSON.parse(String(values[5])) as unknown,
-        content_sha256: values[6],
-        generated_at: values[7],
-        expires_at: values[8] ?? null,
+        source_freshness: JSON.parse(String(values[6])) as unknown,
+        content_sha256: values[7],
+        generated_at: values[8],
+        expires_at: values[9] ?? null,
         superseded_at: null,
-        created_at: values[7],
+        created_at: values[8],
       };
       this.nextProjectionRevisionId += 1;
       return { rows: [row as TRow] };
@@ -407,6 +693,7 @@ function cloneRevisionRecord(record: ProjectionRevisionRecord): ProjectionRevisi
     ...record,
     sourceRevisions: record.sourceRevisions.map((revision) => ({ ...revision })),
     sourceCursors: cloneJson(record.sourceCursors),
+    sourceFreshness: record.sourceFreshness.map((freshness) => ({ ...freshness })),
   };
 }
 

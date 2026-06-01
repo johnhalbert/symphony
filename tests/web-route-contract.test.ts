@@ -12,6 +12,7 @@ import type {
 } from "../src/core/persistence/ProjectionTransactionService.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { TrackerStateLists } from "../src/core/types.js";
+import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { testConfig } from "./helpers.js";
 
@@ -204,6 +205,91 @@ describe("/api/v1/web route contracts", () => {
       fields: { conversationKey: "operator-room", messageCount: 0 },
       sourceCursors: { conversationKey: "operator-room", messageCount: 0 },
     });
+  });
+
+  it("records non-success source freshness for unavailable and failing tracker web projections", async () => {
+    const cases: Array<{
+      name: string;
+      tracker?: TrackerClient;
+      revisionPrefix: string;
+      detail: string;
+    }> = [
+      {
+        name: "tracker unavailable",
+        revisionPrefix: "unavailable:",
+        detail: "Issue board requires a configured tracker client",
+      },
+      {
+        name: "tracker fetch throws",
+        tracker: trackerClient(async () => {
+          throw new Error("Linear request failed");
+        }),
+        revisionPrefix: "error:",
+        detail: "Issue board tracker fetch failed: Linear request failed",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const projectionWriter = new RecordingProjectionWriter();
+      const { server } = createStatusServer(root, {
+        projectionWriter,
+        ...(testCase.tracker ? { tracker: testCase.tracker } : {}),
+      });
+      const address = await server.start();
+      try {
+        const { response } = await getJson(`${baseUrlFor(address)}/api/v1/web/issues`);
+        expect({ name: testCase.name, status: response.status }).toEqual({ name: testCase.name, status: 200 });
+      } finally {
+        await server.stop();
+      }
+
+      const issueBoard = projectionWriter.writeFor("issue_board_projection");
+      const trackerRevision = issueBoard.sourceRevisions?.find((revision) => revision.source === "trackerIssues");
+      const trackerFreshness = issueBoard.sourceFreshness?.find((record) => record.source === "trackerIssues");
+      expect(String(trackerRevision?.revision)).toMatch(new RegExp(`^${testCase.revisionPrefix}`));
+      expect(trackerFreshness).toMatchObject({
+        source: "trackerIssues",
+        status: "error",
+        checkedAt: "2026-01-01T00:00:00.000Z",
+        revision: expect.stringMatching(new RegExp(`^${testCase.revisionPrefix}`)),
+        lastSuccessAt: null,
+        lastErrorAt: "2026-01-01T00:00:00.000Z",
+        detail: expect.stringContaining(testCase.detail),
+      });
+    }
+  });
+
+  it("records successful empty tracker freshness distinctly from tracker failure states", async () => {
+    const projectionWriter = new RecordingProjectionWriter();
+    const fetchedAt = "2026-01-01T00:00:10.000Z";
+    const { server } = createStatusServer(root, {
+      projectionWriter,
+      tracker: trackerClient(async () => []),
+      webProjectionContextClock: () => new Date(fetchedAt),
+    });
+    const address = await server.start();
+    try {
+      const { response } = await getJson(`${baseUrlFor(address)}/api/v1/web/issues`);
+      expect(response.status).toBe(200);
+    } finally {
+      await server.stop();
+    }
+
+    const issueBoard = projectionWriter.writeFor("issue_board_projection");
+    expect(issueBoard.sourceRevisions?.find((revision) => revision.source === "trackerIssues")?.revision).toBe(
+      "ok:Backlog,Todo,In Progress,Blocked,In Review,Done,Closed,Cancelled,Canceled,Duplicate:0:none",
+    );
+    const emptyTrackerFreshness = issueBoard.sourceFreshness?.find((record) => record.source === "trackerIssues");
+    expect(emptyTrackerFreshness).toMatchObject({
+      source: "trackerIssues",
+      status: "empty",
+      checkedAt: expect.any(String),
+      revision: "ok:Backlog,Todo,In Progress,Blocked,In Review,Done,Closed,Cancelled,Canceled,Duplicate:0:none",
+      lastSuccessAt: expect.any(String),
+      lastErrorAt: null,
+      detail: "Issue board tracker source returned no issues",
+    });
+    expect(emptyTrackerFreshness?.lastSuccessAt).toBe(emptyTrackerFreshness?.checkedAt);
   });
 
   it("keeps web responses available when durable projection persistence rejects", async () => {
@@ -481,6 +567,8 @@ interface OrchestratorCallCounts {
 interface CreateStatusServerOptions {
   webAssetsRoot?: string | null;
   projectionWriter?: StatusServerProjectionWriter;
+  tracker?: TrackerClient;
+  webProjectionContextClock?: () => Date;
 }
 
 class RecordingProjectionWriter implements StatusServerProjectionWriter {
@@ -521,6 +609,7 @@ function projectionRevisionRecordFixture(input: ProjectionPayloadWriteInput, rev
     revision,
     sourceRevisions: [],
     sourceCursors: {},
+    sourceFreshness: [],
     contentSha256: "0".repeat(64),
     generatedAt: "2026-01-01T00:00:00.000Z",
     expiresAt: null,
@@ -551,8 +640,22 @@ function createStatusServer(
       trackerStateLists: testTrackerStateLists(),
       staleThresholdMs: 300_000,
       webAssetsRoot: options.webAssetsRoot,
+      ...(options.tracker ? { tracker: options.tracker } : {}),
+      ...(options.webProjectionContextClock ? { webProjectionContextClock: options.webProjectionContextClock } : {}),
       ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
     }),
+  };
+}
+
+function trackerClient(fetchIssuesByStates: TrackerClient["fetchIssuesByStates"]): TrackerClient {
+  return {
+    async fetchCandidateIssues() {
+      return [];
+    },
+    fetchIssuesByStates,
+    async fetchIssueStatesByIds() {
+      return [];
+    },
   };
 }
 

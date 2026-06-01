@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   HermesAcpHarness,
   mapHermesAcpSessionUpdate,
+  mcpServersToAcpStdioServers,
   type HermesAcpHarnessOptions,
   type HermesAcpPermissionResolver,
   type HermesAcpRuntimeClient,
@@ -62,8 +63,11 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
   initializeResult: Record<string, unknown> = {
     authMethods: [{ id: "openai-codex", name: "OpenAI Codex", type: "provider" }],
   };
+  authenticateResult: unknown = {};
+  authenticateError: unknown = null;
   sessionId = "acp-session-1";
   promptResult: Record<string, unknown> | null = { stopReason: "end_turn", usage: { input: 1, output: 2, total: 3 } };
+  sessionNewError: Error | null = null;
   promptNotificationParams: unknown | unknown[] | null = {
     sessionId: "acp-session-1",
     update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } },
@@ -81,8 +85,10 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
       case "initialize":
         return this.initializeResult as T;
       case "authenticate":
-        return {} as T;
+        if (this.authenticateError !== null) throw this.authenticateError;
+        return this.authenticateResult as T;
       case "session/new":
+        if (this.sessionNewError) throw this.sessionNewError;
         this.emitSessionUpdateNotifications(this.sessionNewNotificationParams);
         return { sessionId: this.sessionId } as T;
       case "session/prompt":
@@ -168,6 +174,50 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
   }
 }
 
+describe("mcpServersToAcpStdioServers", () => {
+  it("converts an empty role MCP server map into an empty ACP mcpServers payload", () => {
+    expect(mcpServersToAcpStdioServers({})).toEqual([]);
+  });
+
+  it("converts one stdio role MCP server into the ACP session/new payload shape", () => {
+    const servers = {
+      symphony: {
+        type: "stdio",
+        command: "/usr/bin/node",
+        args: ["cli.js", "completion-report-mcp"],
+        cwd: "/workspace",
+        env: { LINEAR_API_KEY: "secret", EMPTY_ALLOWED: "" },
+      },
+    } satisfies Parameters<typeof mcpServersToAcpStdioServers>[0];
+
+    expect(mcpServersToAcpStdioServers(servers)).toEqual([
+      {
+        name: "symphony",
+        command: "/usr/bin/node",
+        args: ["cli.js", "completion-report-mcp"],
+        env: [
+          { name: "LINEAR_API_KEY", value: "secret" },
+          { name: "EMPTY_ALLOWED", value: "" },
+        ],
+      },
+    ]);
+  });
+
+  it("rejects malformed or unsupported role MCP server configs before session creation", () => {
+    const missingCommand = {
+      symphony: { type: "stdio", args: [], cwd: "/workspace", env: {} },
+    } as unknown as Parameters<typeof mcpServersToAcpStdioServers>[0];
+    const httpStyleUnsupported = {
+      remote: { type: "http", url: "https://mcp.example.test", headers: {} },
+    } as unknown as Parameters<typeof mcpServersToAcpStdioServers>[0];
+
+    expect(() => mcpServersToAcpStdioServers(missingCommand)).toThrow(/MCP server symphony command/);
+    expect(() => mcpServersToAcpStdioServers(httpStyleUnsupported)).toThrow(
+      /MCP server remote uses unsupported MCP server type http/,
+    );
+  });
+});
+
 describe("HermesAcpHarness", () => {
   it("constructs with default dependencies, prepares handoff context, and disposes before acquiring leases", async () => {
     const defaultHarness = new HermesAcpHarness();
@@ -226,12 +276,29 @@ describe("HermesAcpHarness", () => {
       prompt: [{ type: "text", text: "Do work" }],
     });
     expect(events[0]).toMatchObject({ type: "session_started", threadId: "acp-session-1" });
-    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "completed", message: "done" })]));
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "completed",
+          message: "done",
+          payload: {
+            acpResponse: expect.objectContaining({
+              stopReason: "end_turn",
+              terminalStatus: "succeeded",
+              usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+              responseTextPreview: "done",
+              resultPreview: expect.stringContaining("stopReason"),
+              redacted: true,
+            }),
+          },
+        }),
+      ]),
+    );
     expect(events).toEqual(
       expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } })]),
     );
     expect(leases[0]?.disposeStatuses).toEqual(["succeeded"]);
-    expect(client.kills).toEqual(expect.arrayContaining([expect.stringContaining("run_finished")]))
+    expect(client.kills).toEqual(expect.arrayContaining([expect.stringContaining("run_finished")]));
 
     const activeContext = JSON.parse(
       await readFile(path.join(ctx.config.workspace.stateDir, "completion-report-mcp", "issue-1-1.json"), "utf8"),
@@ -239,6 +306,275 @@ describe("HermesAcpHarness", () => {
     expect(activeContext.activeRunId).toMatch(/^hermes-acp-/);
     expect(activeContext.sessionId).toContain("acp-session-1");
     expect(activeContext.workspacePath).toBe(ctx.workspace.path);
+  });
+
+  it("selects the expected provider auth method even when it is not advertised first", async () => {
+    const client = new FakeAcpClient();
+    client.initializeResult = {
+      authMethods: [
+        { id: "anthropic", name: "Anthropic", type: "agent" },
+        { id: "openai-codex", name: "OpenAI Codex", type: "agent" },
+        { id: "hermes-setup", name: "Configure Hermes", type: "terminal" },
+      ],
+    };
+    const { ctx, harness } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+
+    expect(client.requests.map((request) => request.method)).toEqual([
+      "initialize",
+      "authenticate",
+      "session/new",
+      "session/prompt",
+    ]);
+    expect(client.requests[1]?.params).toEqual({ methodId: "openai-codex" });
+    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "completed" })]));
+  });
+
+  it("selects the source-profile provider when the configured provider is unset", async () => {
+    const client = new FakeAcpClient();
+    client.initializeResult = {
+      authMethods: [
+        { id: "anthropic", name: "Anthropic", type: "agent" },
+        { id: "openai-codex", name: "OpenAI Codex", type: "agent" },
+      ],
+    };
+    const { ctx, harness } = await fixture({ client, provider: null, sourceProfile: "openai-codex" });
+
+    await collectEvents(harness.run(ctx, "Do work"));
+
+    expect(client.requests[1]?.params).toEqual({ methodId: "openai-codex" });
+  });
+
+  it("prioritizes the configured provider over a different source-profile hint", async () => {
+    const client = new FakeAcpClient();
+    client.initializeResult = {
+      authMethods: [
+        { id: "anthropic", name: "Anthropic", type: "agent" },
+        { id: "openai-codex", name: "OpenAI Codex", type: "agent" },
+      ],
+    };
+    const { ctx, harness } = await fixture({ client, provider: "openai-codex", sourceProfile: "anthropic" });
+
+    await collectEvents(harness.run(ctx, "Do work"));
+
+    expect(client.requests[1]?.params).toEqual({ methodId: "openai-codex" });
+  });
+
+  it("falls back to the sole non-terminal provider method when selection is otherwise not explicit", async () => {
+    const client = new FakeAcpClient();
+    client.initializeResult = {
+      authMethods: [
+        { id: "anthropic", name: "Anthropic", type: "agent" },
+        { id: "hermes-setup", name: "Configure Hermes", type: "terminal" },
+      ],
+    };
+    const { ctx, harness } = await fixture({ client, provider: null });
+
+    await collectEvents(harness.run(ctx, "Do work"));
+
+    expect(client.requests.map((request) => request.method)).toEqual([
+      "initialize",
+      "authenticate",
+      "session/new",
+      "session/prompt",
+    ]);
+    expect(client.requests[1]?.params).toEqual({ methodId: "anthropic" });
+  });
+
+  it("fails before creating sessions when initialize advertises no provider auth methods", async () => {
+    const client = new FakeAcpClient();
+    client.initializeResult = { authMethods: [] };
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const text = eventText(events);
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize"]);
+    expect(text).toContain("did not advertise a non-terminal provider auth method");
+    expect(text).toContain("advertised authMethods=[]");
+    expect(text).toContain("expectedProviders");
+    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "failed" })]));
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("fails before creating sessions when multiple provider auth methods are ambiguous", async () => {
+    const client = new FakeAcpClient();
+    client.initializeResult = {
+      authMethods: [
+        { id: "anthropic", label: "Anthropic", type: "agent", access_token: "sk-should-not-appear" },
+        { id: "gemini", label: "Gemini", type: "agent", providerSecret: "SECRET_PROVIDER_TOKEN" },
+      ],
+    };
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const text = eventText(events);
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize"]);
+    expect(text).toContain("multiple non-terminal provider auth methods");
+    expect(text).toContain("advertised authMethods");
+    expect(text).toContain("anthropic");
+    expect(text).toContain("gemini");
+    expect(text).not.toContain("sk-should-not-appear");
+    expect(text).not.toContain("SECRET_PROVIDER_TOKEN");
+    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "failed" })]));
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("rejects unattended setup-only authentication before creating sessions with sanitized advertised-method diagnostics", async () => {
+    const client = new FakeAcpClient();
+    const secret = `sk-${"x".repeat(32)}`;
+    client.initializeResult = {
+      authMethods: [{ id: "hermes-setup", type: "terminal", name: `Configure Hermes ${secret}`, access_token: secret }],
+    };
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const text = eventText(events);
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize"]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_run_error" }),
+        expect.objectContaining({ type: "failed" }),
+      ]),
+    );
+    expect(text).toContain("advertised authMethods");
+    expect(text).toContain("hermes-setup");
+    expect(text).toContain("terminal");
+    expect(text).toContain("[redacted]");
+    expect(text).not.toContain(secret);
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("fails before creating sessions when provider authentication is rejected with null", async () => {
+    const client = new FakeAcpClient();
+    client.authenticateResult = null;
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const text = eventText(events);
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize", "authenticate"]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_run_error" }),
+        expect.objectContaining({ type: "failed", error: expect.stringContaining("authenticate rejected auth method") }),
+      ]),
+    );
+    expect(text).toContain("advertised authMethods");
+    expect(text).toContain("openai-codex");
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("fails before creating sessions when provider authentication returns false", async () => {
+    const client = new FakeAcpClient();
+    client.authenticateResult = false;
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const text = eventText(events);
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize", "authenticate"]);
+    expect(text).toContain("authenticate rejected auth method");
+    expect(text).toContain("advertised authMethods");
+    expect(client.requests.some((request) => request.method === "session/new")).toBe(false);
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("redacts authenticate errors while preserving advertised-method diagnostics", async () => {
+    const client = new FakeAcpClient();
+    const secret = `sk-${"y".repeat(32)}`;
+    client.authenticateError = new Error(`upstream auth failed access_token=${secret}`);
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const text = eventText(events);
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize", "authenticate"]);
+    expect(text).toContain("authenticate failed for auth method");
+    expect(text).toContain("advertised authMethods");
+    expect(text).toContain("[redacted]");
+    expect(text).not.toContain(secret);
+    expect(client.requests.some((request) => request.method === "session/new")).toBe(false);
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it.each([
+    {
+      name: "throws with a secret-bearing selected label",
+      displayField: "label",
+      authenticate: "throw",
+      expectedText: "authenticate failed for auth method",
+    },
+    {
+      name: "returns null with a secret-bearing selected name",
+      displayField: "name",
+      authenticate: "null",
+      expectedText: "authenticate rejected auth method",
+    },
+    {
+      name: "returns false with a secret-bearing selected label",
+      displayField: "label",
+      authenticate: "false",
+      expectedText: "authenticate rejected auth method",
+    },
+    {
+      name: "returns an invalid primitive with a secret-bearing selected name",
+      displayField: "name",
+      authenticate: "invalidPrimitive",
+      expectedText: "authenticate returned an invalid response",
+    },
+  ] as const)("redacts selected auth method display values when authenticate $name", async ({
+    displayField,
+    authenticate,
+    expectedText,
+  }) => {
+    const client = new FakeAcpClient();
+    const secret = `sk-${"z".repeat(32)}`;
+    const methodId = `openai-codex-${secret}`;
+    const selectedMethod: Record<string, unknown> = {
+      id: methodId,
+      provider: "openai-codex",
+      type: "agent",
+    };
+    selectedMethod[displayField] = `OpenAI Codex ${secret}`;
+    client.initializeResult = { authMethods: [selectedMethod] };
+    switch (authenticate) {
+      case "throw":
+        client.authenticateError = new Error(`upstream auth failed access_token=${secret}`);
+        break;
+      case "null":
+        client.authenticateResult = null;
+        break;
+      case "false":
+        client.authenticateResult = false;
+        break;
+      case "invalidPrimitive":
+        client.authenticateResult = "unexpected authenticate response";
+        break;
+    }
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const text = eventText(events);
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize", "authenticate"]);
+    expect(text).toContain(expectedText);
+    expect(text).toContain("advertised authMethods");
+    expect(text).toContain("openai-codex");
+    expect(text).toContain("[redacted]");
+    expect(text).not.toContain(secret);
+    expect(JSON.stringify(events)).not.toContain(secret);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_run_error" }),
+        expect.objectContaining({ type: "failed" }),
+      ]),
+    );
+    expect(client.requests.some((request) => request.method === "session/new")).toBe(false);
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
   });
 
   it("passes the profile lease command into the ACP facade and records run-start profile metadata", async () => {
@@ -373,9 +709,19 @@ describe("HermesAcpHarness", () => {
     const events = await collectEvents(harness.run(ctx, "Do work"));
     const activities = events.map((event) => event.runActivity);
 
-    expect(events.map((event) => event.type)).toEqual(["session_started", "progress", "progress", "progress", "progress", "progress", "tokens", "completed"]);
+    expect(events.map((event) => event.type)).toEqual([
+      "session_started",
+      "progress",
+      "run_diagnostic",
+      "progress",
+      "progress",
+      "progress",
+      "progress",
+      "tokens",
+      "completed",
+    ]);
     expect(activities.every(Boolean)).toBe(true);
-    expect(activities.map((activity) => activity?.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(activities.map((activity) => activity?.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(activities[0]).toMatchObject({
       protocol: "acp",
       harness: "hermes_acp",
@@ -475,6 +821,7 @@ describe("HermesAcpHarness", () => {
     expect(transcriptEventTypes).toEqual([
       "session_started",
       "runtime_ready",
+      "runtime_diagnostic",
       "tool_call_started",
       "tool_call_completed",
       "tool_call_started",
@@ -585,6 +932,36 @@ describe("HermesAcpHarness", () => {
       expect.arrayContaining([
         expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_refusal" }),
         expect.objectContaining({ type: "failed", error: "Host Hermes ACP refused the prompt." }),
+      ]),
+    );
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("maps model or provider prompt failures to failed terminal outcome and failed-profile cleanup", async () => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    client.logTail = "provider error: model unavailable";
+    const { ctx, harness, leases } = await fixture({ client });
+    const started = deferred<void>();
+
+    const runPromise = collectEvents(harness.run(ctx, "Do work"), (event) => {
+      if (event.type === "session_started") started.resolve();
+    });
+    await started.promise;
+    await client.promptStarted.promise;
+    client.promptDeferred.reject(new Error("provider rejected configured model"));
+    const events = await runPromise;
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "run_diagnostic",
+          code: "hermes_acp_run_error",
+          message: expect.stringContaining("provider rejected configured model"),
+        }),
+        expect.objectContaining({ type: "failed", error: expect.stringContaining("provider rejected configured model") }),
       ]),
     );
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
@@ -712,7 +1089,7 @@ describe("HermesAcpHarness", () => {
     });
     const runId = await started.promise;
     await client.promptStarted.promise;
-    await harness.stop(runId);
+    await Promise.all([harness.stop(runId), harness.stop(runId)]);
     const events = await runPromise;
 
     expect(client.cancelledParams).toEqual([{ sessionId: "acp-session-1" }]);
@@ -751,14 +1128,38 @@ describe("HermesAcpHarness", () => {
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
   });
 
+  it("surfaces session creation failures with profile, cwd, and stderr context", async () => {
+    const client = new FakeAcpClient();
+    client.sessionNewError = new Error("session failed");
+    client.logTail = "fatal: session new failed";
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const diagnostic = events.find((event) => event.type === "run_diagnostic" && event.code === "hermes_acp_run_error");
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize", "authenticate", "session/new"]);
+    expect(diagnostic).toMatchObject({
+      type: "run_diagnostic",
+      message: "Host Hermes ACP run failed: session failed",
+      payload: {
+        sessionId: null,
+        profileName: "profile-1",
+        cwd: ctx.workspace.path,
+        acpLogTail: { lines: ["fatal: session new failed"], lineCount: 1 },
+      },
+    });
+    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "failed" })]));
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
   it("reuses the profile-scoped ACP process across successful worker implementation runs but creates fresh ACP sessions", async () => {
     const client = new FakeAcpClient();
     const { ctx, harness, leaseFactory, leases } = await fixture({ client, lifecycle: "reuse_by_issue" });
 
-    await collectEvents(harness.run(ctx, "First"));
+    const firstEvents = await collectEvents(harness.run(ctx, "First"));
     client.promptNotificationParams = { sessionId: "acp-session-2", update: { sessionUpdate: "agent_message_chunk", content: "again" } };
     client.sessionId = "acp-session-2";
-    await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
+    const secondEvents = await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
     await harness.dispose();
     await harness.dispose();
 
@@ -771,7 +1172,174 @@ describe("HermesAcpHarness", () => {
       "session/new",
       "session/prompt",
     ]);
+    expect(leaseDecisionPayloads(firstEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_no_existing_reusable_lease",
+        reusable: true,
+        profileName: "profile-1",
+      }),
+    ]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "reused",
+        reuseMode: "reuse_by_issue",
+        reason: "compatible_reusable_worker_implementation",
+        reusable: true,
+        profileName: "profile-1",
+        existingProfileName: "profile-1",
+      }),
+    ]);
     expect(leases[0]?.disposeStatuses).toEqual([null]);
+  });
+
+  it("uses fresh leases for isolated reviewer contexts and explains the reuse decision", async () => {
+    const { ctx, harness, leaseFactory, leases } = await fixture({ lifecycle: "reuse_by_issue" });
+    const reviewerCtx: AgentRunContext = { ...ctx, role: "reviewer", runPhase: "review" };
+
+    const firstEvents = await collectEvents(harness.run(reviewerCtx, "Review"));
+    const secondEvents = await collectEvents(harness.run({ ...reviewerCtx, turnNumber: 2 }, "Review again"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(leases[0]?.disposeStatuses).toEqual(["succeeded"]);
+    expect(leases[1]?.disposeStatuses).toEqual(["succeeded"]);
+    expect(leaseDecisionPayloads(firstEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "fresh_per_run",
+        reason: "fresh_isolated_role",
+        reusable: false,
+        profileName: "profile-1",
+      }),
+    ]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "fresh_per_run",
+        reason: "fresh_isolated_role",
+        reusable: false,
+        profileName: "profile-2",
+      }),
+    ]);
+  });
+
+  it("does not reuse a worker lease when the resolved host context is incompatible", async () => {
+    const firstClient = new FakeAcpClient();
+    const secondClient = new FakeAcpClient();
+    secondClient.sessionId = "acp-session-2";
+    secondClient.promptNotificationParams = {
+      sessionId: "acp-session-2",
+      update: { sessionUpdate: "agent_message_chunk", content: "second" },
+    };
+    const { ctx, harness, leaseFactory, leases, root } = await fixture({
+      clients: [firstClient, secondClient],
+      lifecycle: "reuse_by_issue",
+      sourceProfile: "host-source",
+    });
+
+    await collectEvents(harness.run(ctx, "First"));
+    const nextConfig = serviceConfig(root, "reuse_by_issue", { sourceProfile: "other-source" });
+    const secondEvents = await collectEvents(harness.run({ ...runContext(nextConfig, root), turnNumber: 2 }, "Second"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(firstClient.kills).toEqual(expect.arrayContaining([expect.stringContaining("reuse_incompatible")]));
+    expect(leases[0]?.disposeStatuses).toEqual([null]);
+    expect(leases[1]?.disposeStatuses).toEqual([]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_incompatible_context",
+        reusable: true,
+        profileName: "profile-2",
+        existingProfileName: "profile-1",
+        incompatibleFields: expect.arrayContaining(["sourceProfile"]),
+      }),
+    ]);
+  });
+
+  it("keeps reusable worker leases isolated by workspace as well as issue and phase", async () => {
+    const firstClient = new FakeAcpClient();
+    const secondClient = new FakeAcpClient();
+    secondClient.sessionId = "acp-session-2";
+    secondClient.promptNotificationParams = {
+      sessionId: "acp-session-2",
+      update: { sessionUpdate: "agent_message_chunk", content: "second" },
+    };
+    const { ctx, harness, leaseFactory, leases, root } = await fixture({
+      clients: [firstClient, secondClient],
+      lifecycle: "reuse_by_issue",
+    });
+
+    await collectEvents(harness.run(ctx, "First"));
+    const otherWorkspaceCtx: AgentRunContext = {
+      ...ctx,
+      workspace: { ...ctx.workspace, path: path.join(root, "workspace-two"), workspaceKey: "ENG-139-other" },
+      turnNumber: 2,
+    };
+    const secondEvents = await collectEvents(harness.run(otherWorkspaceCtx, "Second"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(firstClient.kills).toEqual([]);
+    expect(leases[0]?.disposeStatuses).toEqual([]);
+    expect(leases[1]?.disposeStatuses).toEqual([]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_no_existing_reusable_lease",
+        reusable: true,
+        profileName: "profile-2",
+      }),
+    ]);
+    await harness.dispose();
+  });
+
+  it("creates a new reusable lease and repeats the ACP handshake after a process restart", async () => {
+    const firstClient = new FakeAcpClient();
+    const secondClient = new FakeAcpClient();
+    secondClient.sessionId = "acp-session-2";
+    secondClient.promptNotificationParams = {
+      sessionId: "acp-session-2",
+      update: { sessionUpdate: "agent_message_chunk", content: "after restart" },
+    };
+    const { ctx, harness, acpClientFactory, leaseFactory, leases } = await fixture({
+      clients: [firstClient, secondClient],
+      lifecycle: "reuse_by_issue",
+    });
+
+    await collectEvents(harness.run(ctx, "First"));
+    firstClient.emitExit({ code: 0, signal: null });
+    await Promise.resolve();
+    const secondEvents = await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
+    await harness.dispose();
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(acpClientFactory).toHaveBeenCalledTimes(2);
+    expect(firstClient.requests.map((request) => request.method)).toEqual([
+      "initialize",
+      "authenticate",
+      "session/new",
+      "session/prompt",
+    ]);
+    expect(secondClient.requests.map((request) => request.method)).toEqual([
+      "initialize",
+      "authenticate",
+      "session/new",
+      "session/prompt",
+    ]);
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+    expect(leases[1]?.disposeStatuses).toEqual([null]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_previous_process_exited",
+        reusable: true,
+        profileName: "profile-2",
+      }),
+    ]);
   });
 
   it("persists actual ACP harness updates exactly once through the orchestrator shared runStore", async () => {
@@ -870,7 +1438,7 @@ describe("HermesAcpHarness", () => {
       assistant_message_delta: 2,
       runtime_status_update: 1,
       available_commands_update: 1,
-      runtime_diagnostic: 3,
+      runtime_diagnostic: 4,
       token_usage_reported: 1,
       run_succeeded: 1,
     });
@@ -890,6 +1458,7 @@ describe("HermesAcpHarness", () => {
     expect(call2Events.map((event) => event.eventType)).toEqual(["tool_call_started", "tool_call_failed"]);
     expect(transcript.events.filter((event) => event.eventType === "runtime_diagnostic").map((event) => event.payload)).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({ code: "hermes_acp_lease_reuse_decision" }),
         expect.objectContaining({ code: "hermes_acp_session_update_unmapped" }),
         expect.objectContaining({ code: "host_hermes_notice", severity: "info" }),
         expect.objectContaining({ code: "hermes_acp_permission_denied", severity: "warning" }),
@@ -1380,15 +1949,22 @@ function editPermissionOptions(): Array<Record<string, unknown>> {
 async function fixture(
   input: {
     client?: FakeAcpClient;
+    clients?: FakeAcpClient[];
     lifecycle?: HermesWorkerSessionLifecycle;
+    provider?: string | null;
+    sourceProfile?: string | null;
     permissionResolver?: HermesAcpPermissionResolver;
     permissionRequestTimeoutMs?: number;
   } = {},
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-"));
-  const config = serviceConfig(root, input.lifecycle ?? "fresh_per_run");
+  const config = serviceConfig(root, input.lifecycle ?? "fresh_per_run", {
+    provider: input.provider,
+    sourceProfile: input.sourceProfile,
+  });
   const ctx = runContext(config, root);
-  const client = input.client ?? new FakeAcpClient();
+  const clients = input.clients ?? [input.client ?? new FakeAcpClient()];
+  const client = clients[0] ?? new FakeAcpClient();
   const leases: FakeLeaseRecord[] = [];
   const leaseFactory = vi.fn(async (options: HostHermesAcpProfileLeaseOptions): Promise<HostHermesAcpProfileLease> => {
     const disposeStatuses: HostHermesAcpTerminalStatus[] = [];
@@ -1410,9 +1986,12 @@ async function fixture(
     leases.push({ lease, disposeStatuses });
     return lease;
   });
-  const acpClientFactory = vi.fn(
-    (_command: HostHermesAcpProcessCommand, _options: HermesAcpRuntimeClientOptions): HermesAcpRuntimeClient => client,
-  );
+  let clientIndex = 0;
+  const acpClientFactory = vi.fn((_command: HostHermesAcpProcessCommand, _options: HermesAcpRuntimeClientOptions): HermesAcpRuntimeClient => {
+    const nextClient = clients[Math.min(clientIndex, clients.length - 1)] ?? client;
+    clientIndex += 1;
+    return nextClient;
+  });
   const harnessOptions = {
     cliPath: path.join(root, "src", "cli.ts"),
     profileLeaseFactory: leaseFactory,
@@ -1424,7 +2003,23 @@ async function fixture(
   return { root, config, ctx, client, harness, leaseFactory, acpClientFactory, leases };
 }
 
-function serviceConfig(root: string, lifecycle: HermesWorkerSessionLifecycle): ServiceConfig {
+function serviceConfig(
+  root: string,
+  lifecycle: HermesWorkerSessionLifecycle,
+  options: { provider?: string | null | undefined; sourceProfile?: string | null | undefined } = {},
+): ServiceConfig {
+  const hermesConfig: Record<string, unknown> = {
+    upstream_root: path.join(root, "hermes-src"),
+    templates_dir: path.join(root, "templates"),
+    model: "gpt-5.5",
+    keep_profiles: "never",
+    worker_session_lifecycle: lifecycle,
+    startup_timeout_ms: 1_000,
+    request_timeout_ms: 1_000,
+    acp_binary_path: "/host/bin/hermes",
+  };
+  if (options.provider !== null) hermesConfig.provider = options.provider ?? "openai-codex";
+  if (options.sourceProfile !== null) hermesConfig.acp_source_profile = options.sourceProfile ?? "host-source";
   return parseServiceConfig(
     {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -1435,18 +2030,7 @@ function serviceConfig(root: string, lifecycle: HermesWorkerSessionLifecycle): S
         source: { kind: "none" },
       },
       github: { publish_pull_requests: false },
-      hermes: {
-        upstream_root: path.join(root, "hermes-src"),
-        templates_dir: path.join(root, "templates"),
-        provider: "openai-codex",
-        model: "gpt-5.5",
-        keep_profiles: "never",
-        worker_session_lifecycle: lifecycle,
-        startup_timeout_ms: 1_000,
-        request_timeout_ms: 1_000,
-        acp_binary_path: "/host/bin/hermes",
-        acp_source_profile: "host-source",
-      },
+      hermes: hermesConfig,
     },
     path.join(root, "WORKFLOW.md"),
     { LINEAR_API_KEY: "secret" },
@@ -1515,6 +2099,23 @@ async function collectEvents(
   return events;
 }
 
+function eventText(events: AgentEvent[]): string {
+  return events
+    .map((event) => {
+      switch (event.type) {
+        case "run_diagnostic":
+        case "progress":
+        case "completed":
+          return event.message ?? "";
+        case "failed":
+          return event.error;
+        default:
+          return "";
+      }
+    })
+    .join("\n");
+}
+
 function transcriptEventsFromAgentEvents(events: AgentEvent[]): TranscriptEvent[] {
   const started = events.find((event): event is Extract<AgentEvent, { type: "session_started" }> => event.type === "session_started");
   const runId = started?.runId ?? started?.sessionId ?? "hermes-acp-test-run";
@@ -1525,6 +2126,12 @@ function transcriptEventsFromAgentEvents(events: AgentEvent[]): TranscriptEvent[
     source: "harness",
     ...mapAgentEventToRunActivityEvent(event),
   }));
+}
+
+function leaseDecisionPayloads(events: AgentEvent[]): unknown[] {
+  return events.flatMap((event) =>
+    event.type === "run_diagnostic" && event.code === "hermes_acp_lease_reuse_decision" ? [event.payload] : [],
+  );
 }
 
 function eventTypeCounts(events: TranscriptEvent[]): Record<string, number> {

@@ -80,7 +80,11 @@ export function sanitizeAgentEventForPublicOutput(event: AgentEvent): AgentEvent
         ...(event.payload === undefined ? {} : { payload: sanitizePublicJson(event.payload) }),
       };
     case "completed":
-      return event.message === undefined ? event : { ...event, message: sanitizedPreviewValue(event.message).preview ?? "" };
+      return {
+        ...event,
+        ...(event.message === undefined ? {} : { message: sanitizedPreviewValue(event.message).preview ?? "" }),
+        ...(event.payload === undefined ? {} : { payload: sanitizePublicJson(event.payload) }),
+      };
     case "failed":
       return { ...event, error: sanitizedPreviewValue(event.error).preview ?? "" };
     case "rate_limits":

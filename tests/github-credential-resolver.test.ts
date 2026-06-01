@@ -33,6 +33,27 @@ describe("GitHub credential resolver", () => {
     }
   });
 
+  it("ignores optional App client-id-only environment when falling back to legacy tokens", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        github: { owner: "acme", repo: "symphony" },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_TOKEN: "legacy-github-secret",
+        GITHUB_APP_CLIENT_ID: "Iv1.client-only",
+      },
+    );
+
+    const resolved = resolveGitHubClientConfig(config, "github.review_feedback_write");
+    expect(config.github.app).toBeNull();
+    expect(resolved.github.token).toBe("legacy-github-secret");
+    expect(resolved.github.app).toBeNull();
+    expect(resolved.credential).toMatchObject({ source: "legacy" });
+  });
+
   it("selects separate profile tokens per GitHub operation", () => {
     const config = parseServiceConfig(
       {

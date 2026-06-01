@@ -29,6 +29,7 @@ import {
   type HostHermesAcpProfileLeaseOptions,
   type HostHermesAcpTerminalStatus,
 } from "./HostHermesAcpProfileLease.js";
+import { normalizeHermesAuthProvider } from "./HermesAuthManager.js";
 import {
   HostHermesAcpStdioJsonRpcFacade,
   type HostHermesAcpDiagnostic,
@@ -105,7 +106,9 @@ export interface HermesAcpRuntimeClient {
 
 interface HermesAcpLease {
   key: string;
+  scopeKey: string;
   reusable: boolean;
+  compatibility: HermesAcpLeaseCompatibility;
   profile: HostHermesAcpProfileLease;
   client: HermesAcpRuntimeClient;
   initialized: boolean;
@@ -118,8 +121,46 @@ interface ActiveHermesAcpRun {
   lease: HermesAcpLease;
   acpSessionId: string | null;
   symphonySessionId: string | null;
+  cancelPromise: Promise<void> | null;
   cancelled: boolean;
   permissionCancellationWaiters: Set<() => void>;
+}
+
+interface HermesAcpLeaseCompatibility {
+  binaryPath: string;
+  cwd: string;
+  sourceProfile: string;
+  profilePrefix: string | null;
+  keepProfiles: string;
+  startupTimeoutMs: number;
+  requestTimeoutMs: number;
+  cliPath: string;
+}
+
+type HermesAcpLeaseReuseDecisionReason =
+  | "compatible_reusable_worker_implementation"
+  | "fresh_worker_session_lifecycle"
+  | "fresh_isolated_role"
+  | "fresh_non_implementation_phase"
+  | "fresh_no_existing_reusable_lease"
+  | "fresh_existing_disposed"
+  | "fresh_previous_process_exited"
+  | "fresh_incompatible_context";
+
+interface HermesAcpLeaseReuseDecision {
+  outcome: "created" | "reused";
+  reuseMode: "reuse_by_issue" | "fresh_per_run";
+  reason: HermesAcpLeaseReuseDecisionReason;
+  key: string;
+  scopeKey: string;
+  compatibility: HermesAcpLeaseCompatibility;
+  existingProfileName?: string;
+  incompatibleFields?: string[];
+}
+
+interface HermesAcpLeaseAcquisition {
+  lease: HermesAcpLease;
+  decision: HermesAcpLeaseReuseDecision;
 }
 
 type TerminalStatus = HostHermesAcpTerminalStatus;
@@ -132,6 +173,17 @@ type HermesAcpRuntimeEvent =
 const TERMINAL_SETUP_AUTH_METHOD_ID = "hermes-setup";
 const DEFAULT_PROFILE_PREFIX = "symphony";
 const RUN_CANCELLED = Symbol("hermes_acp_run_cancelled");
+
+interface SelectedAuthMethod {
+  id: string;
+  display: string;
+  diagnostics: string;
+}
+
+interface AuthMethodSelectionContext {
+  expectedProvider: string | null;
+  sourceProfile: string | null;
+}
 
 export class HermesAcpHarness implements AgentHarness {
   readonly id = "hermes_acp";
@@ -146,6 +198,7 @@ export class HermesAcpHarness implements AgentHarness {
   private readonly leases = new Map<string, HermesAcpLease>();
   private readonly activeRuns = new Map<string, ActiveHermesAcpRun>();
   private readonly cancelledRuns = new Set<string>();
+  private readonly retiredReusableLeaseReasons = new Map<string, HermesAcpLeaseReuseDecisionReason>();
   private readonly discoverHostHermes: (options: Parameters<typeof discoverHostHermes>[0]) => Promise<HostHermesDiscoveryResult>;
   private readonly profileLeaseFactory: (options: HostHermesAcpProfileLeaseOptions) => Promise<HostHermesAcpProfileLease>;
   private readonly acpClientFactory: (command: HostHermesAcpProcessCommand, options: HermesAcpRuntimeClientOptions) => HermesAcpRuntimeClient;
@@ -173,11 +226,13 @@ export class HermesAcpHarness implements AgentHarness {
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     await writeInitialHandoffMcpContexts(ctx);
     const runId = `hermes-acp-${randomUUID()}`;
-    const lease = await this.getOrCreateLease(ctx, runId);
+    const leaseAcquisition = await this.getOrCreateLease(ctx, runId);
+    const lease = leaseAcquisition.lease;
     const activeRun: ActiveHermesAcpRun = {
       lease,
       acpSessionId: null,
       symphonySessionId: null,
+      cancelPromise: null,
       cancelled: false,
       permissionCancellationWaiters: new Set(),
     };
@@ -260,6 +315,7 @@ export class HermesAcpHarness implements AgentHarness {
         runId,
         sessionId: activeRun.symphonySessionId,
         profileName: lease.profile.profileName,
+        cwd: ctx.workspace.path,
         exit,
         acpLogTail: acpLogTailPayload(lease),
       });
@@ -306,6 +362,7 @@ export class HermesAcpHarness implements AgentHarness {
           },
         },
       );
+      enqueue(hermesAcpLeaseReuseDecisionDiagnostic(leaseAcquisition.decision, lease));
 
       const promptTask = lease.client
         .request<Record<string, unknown> | null>(
@@ -338,6 +395,7 @@ export class HermesAcpHarness implements AgentHarness {
             runId,
             sessionId: activeRun.symphonySessionId,
             profileName: lease.profile.profileName,
+            cwd: ctx.workspace.path,
             acpLogTail: acpLogTailPayload(lease),
           });
         });
@@ -370,6 +428,7 @@ export class HermesAcpHarness implements AgentHarness {
             runId,
             sessionId: activeRun.symphonySessionId,
             profileName: lease.profile.profileName,
+            cwd: ctx.workspace.path,
             acpLogTail: acpLogTailPayload(lease),
           },
         });
@@ -478,16 +537,63 @@ export class HermesAcpHarness implements AgentHarness {
   async dispose(): Promise<void> {
     await Promise.all([...this.leases.values()].map((lease) => this.disposeLease(lease, null, "harness_dispose")));
     this.leases.clear();
+    this.retiredReusableLeaseReasons.clear();
   }
 
-  private async getOrCreateLease(ctx: AgentRunContext, runId: string): Promise<HermesAcpLease> {
-    const reusable = shouldReuseLease(ctx);
-    const key = reusable ? reusableLeaseKey(ctx) : `fresh:${runId}`;
-    const existing = reusable ? this.leases.get(key) : undefined;
-    if (existing && !existing.disposed && !existing.transportExited) return existing;
-
+  private async getOrCreateLease(ctx: AgentRunContext, runId: string): Promise<HermesAcpLeaseAcquisition> {
+    const policy = hermesAcpLeaseReusePolicy(ctx);
+    const scopeKey = reusableLeaseScopeKey(ctx);
+    let key = policy.reusable ? reusableLeaseKey(ctx) : `fresh:${runId}`;
     const binaryPath = await this.resolveBinaryPath(ctx);
     const sourceProfile = await this.resolveSourceProfile(ctx, binaryPath);
+    const compatibility = hermesAcpLeaseCompatibility(ctx, {
+      binaryPath,
+      sourceProfile,
+      cliPath: this.cliPath(),
+    });
+    let reusable = policy.reusable;
+    let reason = policy.reason;
+    const existingLease = reusable ? this.leases.get(key) : undefined;
+    let incompatibleFields: string[] | undefined;
+    let existingProfileName: string | undefined;
+
+    if (existingLease) {
+      existingProfileName = existingLease.profile.profileName;
+      if (existingLease.disposed) {
+        this.leases.delete(existingLease.key);
+        reason = "fresh_existing_disposed";
+      } else if (existingLease.transportExited) {
+        this.retireLeaseAfterTransportExit(existingLease);
+        reason = "fresh_previous_process_exited";
+      } else {
+        incompatibleFields = incompatibleHermesAcpLeaseFields(existingLease.compatibility, compatibility);
+        if (incompatibleFields.length === 0) {
+          return {
+            lease: existingLease,
+            decision: {
+              outcome: "reused",
+              reuseMode: "reuse_by_issue",
+              reason: "compatible_reusable_worker_implementation",
+              key: existingLease.key,
+              scopeKey,
+              compatibility,
+              existingProfileName: existingLease.profile.profileName,
+            },
+          };
+        }
+        reason = "fresh_incompatible_context";
+        if (this.leaseHasActiveRun(existingLease)) {
+          reusable = false;
+          key = `fresh:${runId}`;
+        } else {
+          await this.disposeLease(existingLease, null, "reuse_incompatible");
+        }
+      }
+    } else if (reusable) {
+      reason = this.retiredReusableLeaseReasons.get(key) ?? "fresh_no_existing_reusable_lease";
+    }
+
+    if (reusable) this.retiredReusableLeaseReasons.delete(key);
     const phase = currentRunPhase(ctx);
     const profile = await this.profileLeaseFactory({
       binaryPath,
@@ -495,6 +601,7 @@ export class HermesAcpHarness implements AgentHarness {
       timeoutMs: ctx.config.hermes.startupTimeoutMs,
       sourceProfile,
       keepProfiles: ctx.config.hermes.keepProfiles,
+      reusable,
       nameInput: {
         workspaceKey: ctx.workspace.workspaceKey,
         issueIdentifier: ctx.issue.identifier,
@@ -508,7 +615,9 @@ export class HermesAcpHarness implements AgentHarness {
     const client = this.acpClientFactory(profile.acpCommand, { requestTimeoutMs: ctx.config.hermes.requestTimeoutMs });
     const lease: HermesAcpLease = {
       key,
+      scopeKey,
       reusable,
+      compatibility,
       profile,
       client,
       initialized: false,
@@ -519,7 +628,19 @@ export class HermesAcpHarness implements AgentHarness {
     lease.transportExitListener = (exit) => this.handleLeaseTransportExit(lease, exit);
     lease.client.on("exit", lease.transportExitListener);
     if (reusable) this.leases.set(key, lease);
-    return lease;
+    return {
+      lease,
+      decision: {
+        outcome: "created",
+        reuseMode: reusable ? "reuse_by_issue" : "fresh_per_run",
+        reason,
+        key,
+        scopeKey,
+        compatibility,
+        ...(existingProfileName === undefined ? {} : { existingProfileName }),
+        ...(incompatibleFields === undefined ? {} : { incompatibleFields }),
+      },
+    };
   }
 
   private async resolveBinaryPath(ctx: AgentRunContext): Promise<string> {
@@ -561,8 +682,25 @@ export class HermesAcpHarness implements AgentHarness {
       },
       { timeoutMs: ctx.config.hermes.startupTimeoutMs },
     );
-    const method = selectNonTerminalAuthMethod(initializeResult);
-    await lease.client.request("authenticate", { methodId: method.id }, { timeoutMs: ctx.config.hermes.startupTimeoutMs });
+    const method = selectNonTerminalAuthMethod(initializeResult, {
+      expectedProvider: ctx.config.hermes.provider,
+      sourceProfile: lease.profile.sourceProfile,
+    });
+    let authenticateResult: unknown;
+    try {
+      authenticateResult = await lease.client.request<unknown>(
+        "authenticate",
+        { methodId: method.id },
+        { timeoutMs: ctx.config.hermes.startupTimeoutMs },
+      );
+    } catch (error) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `Host Hermes ACP authenticate failed for auth method ${method.display}: ${redactLogLine(errorMessage(error))}. ${method.diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
+        error,
+      );
+    }
+    validateAcpAuthenticateResult(authenticateResult, method);
     lease.initialized = true;
   }
 
@@ -581,6 +719,12 @@ export class HermesAcpHarness implements AgentHarness {
   }
 
   private async interruptActiveRun(activeRun: ActiveHermesAcpRun, reason: string): Promise<void> {
+    if (activeRun.cancelPromise) return activeRun.cancelPromise;
+    activeRun.cancelPromise = this.cancelActiveRunOnce(activeRun, reason);
+    return activeRun.cancelPromise;
+  }
+
+  private async cancelActiveRunOnce(activeRun: ActiveHermesAcpRun, reason: string): Promise<void> {
     const lease = activeRun.lease;
     if (lease.disposed) return;
     const sessionId = activeRun.acpSessionId;
@@ -618,6 +762,11 @@ export class HermesAcpHarness implements AgentHarness {
     lease.transportExited = true;
     lease.initialized = false;
     this.leases.delete(lease.key);
+    if (lease.reusable) this.retiredReusableLeaseReasons.set(lease.key, "fresh_previous_process_exited");
+  }
+
+  private leaseHasActiveRun(lease: HermesAcpLease): boolean {
+    return [...this.activeRuns.values()].some((activeRun) => activeRun.lease === lease);
   }
 
   private cliPath(): string {
@@ -898,28 +1047,173 @@ function finiteNumber(value: unknown): number | null {
 }
 
 export function mcpServersToAcpStdioServers(servers: Record<string, McpSubprocessServerConfig>): AcpMcpServerStdio[] {
-  return Object.entries(servers).map(([name, server]) => ({
-    name,
-    command: server.command,
-    args: [...server.args],
-    env: Object.entries(server.env).map(([envName, value]) => ({ name: envName, value })),
-  }));
+  return Object.entries(servers).map(([name, server]) => {
+    const config = requireStdioMcpServerConfig(name, server);
+    return {
+      name: requireNonEmptyMcpString(name, `MCP server name for ${name || "<empty>"}`),
+      command: config.command,
+      args: [...config.args],
+      env: Object.entries(config.env).map(([envName, value]) => ({
+        name: requireNonEmptyMcpString(envName, `MCP server ${name} env variable name`),
+        value,
+      })),
+    };
+  });
+}
+
+function requireStdioMcpServerConfig(name: string, server: unknown): McpSubprocessServerConfig {
+  const label = `MCP server ${name || "<empty>"}`;
+  if (!isRecord(server)) {
+    throw new SymphonyError("config_validation_error", `${label} config must be an object.`);
+  }
+  const type = nonEmptyString(server.type);
+  if (type !== "stdio") {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${label} uses unsupported MCP server type ${type ?? "<missing>"}; Symphony role MCP handoff currently supports stdio servers only.`,
+    );
+  }
+  return {
+    type: "stdio",
+    command: requireNonEmptyMcpString(server.command, `${label} command`),
+    args: requireStringArray(server.args, `${label} args`),
+    cwd: requireNonEmptyMcpString(server.cwd, `${label} cwd`),
+    env: requireStringRecord(server.env, `${label} env`),
+  };
+}
+
+function requireNonEmptyMcpString(value: unknown, label: string): string {
+  const normalized = nonEmptyString(value);
+  if (normalized === null) {
+    throw new SymphonyError("config_validation_error", `${label} must be a non-empty string.`);
+  }
+  return normalized;
+}
+
+function requireStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new SymphonyError("config_validation_error", `${label} must be an array of strings.`);
+  }
+  return [...value];
+}
+
+function requireStringRecord(value: unknown, label: string): Record<string, string> {
+  if (!isRecord(value)) {
+    throw new SymphonyError("config_validation_error", `${label} must be an object with string values.`);
+  }
+  const output: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== "string") {
+      throw new SymphonyError("config_validation_error", `${label}.${key} must be a string.`);
+    }
+    output[key] = item;
+  }
+  return output;
 }
 
 function shouldDisposeLeaseAfterRun(lease: HermesAcpLease, terminalStatus: TerminalStatus): boolean {
   return !lease.reusable || terminalStatus !== "succeeded" || lease.transportExited;
 }
 
-function shouldReuseLease(ctx: AgentRunContext): boolean {
-  return (
-    ctx.role === "worker" &&
-    currentRunPhase(ctx) === "implementation" &&
-    ctx.config.hermes.workerSessionLifecycle === "reuse_by_issue"
-  );
+function hermesAcpLeaseReusePolicy(ctx: AgentRunContext): { reusable: boolean; reason: HermesAcpLeaseReuseDecisionReason } {
+  const phase = currentRunPhase(ctx);
+  if (ctx.role !== "worker") return { reusable: false, reason: "fresh_isolated_role" };
+  if (phase !== "implementation") return { reusable: false, reason: "fresh_non_implementation_phase" };
+  if (ctx.config.hermes.workerSessionLifecycle !== "reuse_by_issue") {
+    return { reusable: false, reason: "fresh_worker_session_lifecycle" };
+  }
+  return { reusable: true, reason: "fresh_no_existing_reusable_lease" };
+}
+
+function reusableLeaseScopeKey(ctx: AgentRunContext): string {
+  return `${ctx.role}:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
 }
 
 function reusableLeaseKey(ctx: AgentRunContext): string {
-  return `${ctx.workspace.path}:worker:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
+  return `${ctx.workspace.path}:${reusableLeaseScopeKey(ctx)}`;
+}
+
+function hermesAcpLeaseCompatibility(
+  ctx: AgentRunContext,
+  input: { binaryPath: string; sourceProfile: string; cliPath: string },
+): HermesAcpLeaseCompatibility {
+  return {
+    binaryPath: input.binaryPath,
+    cwd: ctx.workspace.path,
+    sourceProfile: input.sourceProfile,
+    profilePrefix: configuredHermesAcpProfilePrefix(ctx) ?? DEFAULT_PROFILE_PREFIX,
+    keepProfiles: ctx.config.hermes.keepProfiles,
+    startupTimeoutMs: ctx.config.hermes.startupTimeoutMs,
+    requestTimeoutMs: ctx.config.hermes.requestTimeoutMs,
+    cliPath: input.cliPath,
+  };
+}
+
+function incompatibleHermesAcpLeaseFields(
+  existing: HermesAcpLeaseCompatibility,
+  next: HermesAcpLeaseCompatibility,
+): string[] {
+  const fields: Array<keyof HermesAcpLeaseCompatibility> = [
+    "binaryPath",
+    "cwd",
+    "sourceProfile",
+    "profilePrefix",
+    "keepProfiles",
+    "startupTimeoutMs",
+    "requestTimeoutMs",
+    "cliPath",
+  ];
+  return fields.filter((field) => existing[field] !== next[field]);
+}
+
+function hermesAcpLeaseReuseDecisionDiagnostic(
+  decision: HermesAcpLeaseReuseDecision,
+  lease: HermesAcpLease,
+): AgentEvent {
+  const reused = decision.outcome === "reused";
+  const reason = formatHermesAcpLeaseReuseReason(decision.reason);
+  return {
+    type: "run_diagnostic",
+    code: "hermes_acp_lease_reuse_decision",
+    message: reused
+      ? `Host Hermes ACP lease reused for ${lease.profile.profileName}: ${reason}.`
+      : `Host Hermes ACP lease created for ${lease.profile.profileName}: ${reason}.`,
+    payload: {
+      harnessId: "hermes_acp",
+      profileName: lease.profile.profileName,
+      sourceProfile: lease.profile.sourceProfile,
+      reusable: lease.reusable,
+      outcome: decision.outcome,
+      reuseMode: decision.reuseMode,
+      reason: decision.reason,
+      key: decision.key,
+      scopeKey: decision.scopeKey,
+      existingProfileName: decision.existingProfileName ?? null,
+      incompatibleFields: decision.incompatibleFields ?? [],
+      compatibility: decision.compatibility,
+    },
+  };
+}
+
+function formatHermesAcpLeaseReuseReason(reason: HermesAcpLeaseReuseDecisionReason): string {
+  switch (reason) {
+    case "compatible_reusable_worker_implementation":
+      return "existing worker implementation context is compatible";
+    case "fresh_worker_session_lifecycle":
+      return "hermes.worker_session_lifecycle requires a fresh run";
+    case "fresh_isolated_role":
+      return "role requires an isolated fresh lease";
+    case "fresh_non_implementation_phase":
+      return "run phase requires an isolated fresh lease";
+    case "fresh_no_existing_reusable_lease":
+      return "no compatible reusable worker lease exists yet";
+    case "fresh_existing_disposed":
+      return "previous reusable lease was already disposed";
+    case "fresh_previous_process_exited":
+      return "previous reusable ACP process exited before reuse";
+    case "fresh_incompatible_context":
+      return "existing reusable lease context is incompatible";
+  }
 }
 
 function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
@@ -955,23 +1249,72 @@ function formatHostHermesDiagnostic(diagnostic: HostHermesDiscoveryDiagnostic): 
   return `${diagnostic.code}: ${diagnostic.message}`;
 }
 
-function selectNonTerminalAuthMethod(initializeResult: Record<string, unknown>): { id: string; label: string } {
+function selectNonTerminalAuthMethod(
+  initializeResult: Record<string, unknown>,
+  context: AuthMethodSelectionContext,
+): SelectedAuthMethod {
   const authMethods = authMethodsFromInitializeResult(initializeResult);
-  const selected = authMethods.find((method) => {
-    const id = authMethodId(method);
-    return id !== null && !isTerminalAuthMethod(method);
-  });
-  if (!selected) {
+  const diagnostics = advertisedAuthMethodsDiagnostic(authMethods, context);
+  const nonTerminalMethods = authMethods.filter((method) => authMethodId(method) !== null && !isTerminalAuthMethod(method));
+  const expectedProviders = expectedAuthProviderKeys(context);
+
+  if (nonTerminalMethods.length === 0) {
     throw new SymphonyError(
       "config_validation_error",
-      "Host Hermes ACP initialize did not advertise a non-terminal provider auth method. Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.",
+      `Host Hermes ACP initialize did not advertise a non-terminal provider auth method. ${diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
     );
   }
-  const id = authMethodId(selected);
-  if (!id) {
-    throw new SymphonyError("agent_error", "Host Hermes ACP selected auth method did not include an id.");
+
+  if (expectedProviders.length > 0) {
+    const matchingMethods = nonTerminalMethods.filter((method) => authMethodMatchesExpectedProvider(method, expectedProviders));
+    if (matchingMethods.length === 1) return selectedAuthMethod(matchingMethods[0]!, diagnostics);
+    if (matchingMethods.length > 1) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `Host Hermes ACP initialize advertised multiple non-terminal auth methods matching expected provider(s) ${expectedProviders.join(", ")}. ${diagnostics} Refusing unattended hermes_acp run until the provider auth method is unambiguous.`,
+      );
+    }
   }
-  return { id, label: authMethodLabel(selected) ?? id };
+
+  if (nonTerminalMethods.length === 1) return selectedAuthMethod(nonTerminalMethods[0]!, diagnostics);
+
+  const expected = expectedProviders.length > 0 ? ` for expected provider(s) ${expectedProviders.join(", ")}` : "";
+  throw new SymphonyError(
+    "config_validation_error",
+    `Host Hermes ACP initialize advertised multiple non-terminal provider auth methods but none matched unambiguously${expected}. ${diagnostics} Refusing unattended hermes_acp run until the provider auth method is explicit.`,
+  );
+}
+
+function selectedAuthMethod(
+  method: Record<string, unknown>,
+  diagnostics: string,
+): SelectedAuthMethod {
+  const id = authMethodId(method);
+  if (!id) {
+    throw new SymphonyError("agent_error", `Host Hermes ACP selected auth method did not include an id. ${diagnostics}`);
+  }
+  return { id, display: selectedAuthMethodDisplay(method, id), diagnostics };
+}
+
+function selectedAuthMethodDisplay(method: Record<string, unknown>, id: string): string {
+  const displayLabel = sanitizedAuthMethodField(authMethodLabel(method) ?? id) ?? "[redacted]";
+  const displayId = sanitizedAuthMethodField(id) ?? "[redacted]";
+  return `${displayLabel} (${displayId})`;
+}
+
+function validateAcpAuthenticateResult(result: unknown, method: SelectedAuthMethod): void {
+  if (result === null || result === undefined || result === false) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `Host Hermes ACP authenticate rejected auth method ${method.display}. ${method.diagnostics} Refusing unattended hermes_acp run; configure Hermes provider credentials before using the ACP harness.`,
+    );
+  }
+  if (!isRecord(result)) {
+    throw new SymphonyError(
+      "agent_error",
+      `Host Hermes ACP authenticate returned an invalid response for auth method ${method.display}. ${method.diagnostics}`,
+    );
+  }
 }
 
 function authMethodsFromInitializeResult(initializeResult: Record<string, unknown>): Record<string, unknown>[] {
@@ -983,17 +1326,88 @@ function authMethodsFromInitializeResult(initializeResult: Record<string, unknow
   return value.filter(isRecord);
 }
 
+function expectedAuthProviderKeys(context: AuthMethodSelectionContext): string[] {
+  const configuredProvider = normalizedAuthProviderKey(context.expectedProvider);
+  if (configuredProvider.length > 0) return [configuredProvider];
+  return uniqueNonEmptyStrings([context.sourceProfile].map(normalizedAuthProviderKey));
+}
+
+function authMethodMatchesExpectedProvider(method: Record<string, unknown>, expectedProviders: string[]): boolean {
+  return authMethodProviderKeys(method).some((provider) => expectedProviders.includes(provider));
+}
+
+function authMethodProviderKeys(method: Record<string, unknown>): string[] {
+  return uniqueNonEmptyStrings(
+    [
+      method.provider,
+      method.providerId,
+      method.provider_id,
+      method.providerName,
+      method.provider_name,
+      authMethodId(method),
+    ].map(normalizedAuthProviderKey),
+  );
+}
+
+function normalizedAuthProviderKey(value: unknown): string {
+  const provider = nonEmptyString(value);
+  return provider ? normalizeHermesAuthProvider(provider) : "";
+}
+
+function uniqueNonEmptyStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
+}
+
+function advertisedAuthMethodsDiagnostic(authMethods: Record<string, unknown>[], context: AuthMethodSelectionContext): string {
+  const expectedProviders = expectedAuthProviderKeys(context);
+  const expected = expectedProviders.length > 0 ? ` expectedProviders=${JSON.stringify(expectedProviders)};` : "";
+  return `advertised authMethods=${JSON.stringify(authMethods.map(sanitizedAuthMethodForDiagnostics))};${expected}`;
+}
+
+function sanitizedAuthMethodForDiagnostics(method: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: sanitizedAuthMethodField(authMethodId(method)),
+    type: sanitizedAuthMethodField(authMethodType(method)),
+    label: sanitizedAuthMethodField(authMethodLabel(method)),
+    provider: sanitizedAuthMethodField(authMethodProviderForDiagnostics(method)),
+    terminal: isTerminalAuthMethod(method),
+  };
+}
+
+function sanitizedAuthMethodField(value: string | null): string | null {
+  if (!value) return null;
+  const sanitized = preview(value, 160);
+  return sanitized.length > 0 ? sanitized : null;
+}
+
+function authMethodProviderForDiagnostics(method: Record<string, unknown>): string | null {
+  const explicitProvider =
+    nonEmptyString(method.provider) ??
+    nonEmptyString(method.providerId) ??
+    nonEmptyString(method.provider_id) ??
+    nonEmptyString(method.providerName) ??
+    nonEmptyString(method.provider_name);
+  if (explicitProvider) return normalizeHermesAuthProvider(explicitProvider);
+  if (isTerminalAuthMethod(method)) return null;
+  const id = authMethodId(method);
+  return id ? normalizeHermesAuthProvider(id) : null;
+}
+
 function authMethodId(method: Record<string, unknown>): string | null {
   return nonEmptyString(method.id) ?? nonEmptyString(method.methodId) ?? nonEmptyString(method.method_id);
 }
 
+function authMethodType(method: Record<string, unknown>): string | null {
+  return nonEmptyString(method.type) ?? nonEmptyString(method.kind);
+}
+
 function authMethodLabel(method: Record<string, unknown>): string | null {
-  return nonEmptyString(method.name) ?? nonEmptyString(method.title) ?? nonEmptyString(method.description);
+  return nonEmptyString(method.label) ?? nonEmptyString(method.name) ?? nonEmptyString(method.title) ?? nonEmptyString(method.description);
 }
 
 function isTerminalAuthMethod(method: Record<string, unknown>): boolean {
   const id = authMethodId(method);
-  const type = nonEmptyString(method.type)?.toLowerCase() ?? "";
+  const type = authMethodType(method)?.toLowerCase() ?? "";
   return id === TERMINAL_SETUP_AUTH_METHOD_ID || type === "terminal" || type === "terminalauthmethod";
 }
 
@@ -1533,13 +1947,17 @@ function mapHermesAcpPromptResult(
       type: "run_diagnostic",
       code: "hermes_acp_refusal",
       message: "Host Hermes ACP refused the prompt.",
-      payload: { stopReason },
+      payload: promptResultPayload(result, stopReason, input.responseText, "failed"),
     });
     events.push({ type: "failed", error: "Host Hermes ACP refused the prompt." });
     return events;
   }
   if (stopReason === null || stopReason === "end_turn" || stopReason === "stop" || stopReason === "max_turn_requests") {
-    const completed: AgentEvent = input.responseText.length > 0 ? { type: "completed", message: input.responseText } : { type: "completed" };
+    const completed: AgentEvent = {
+      type: "completed",
+      ...(input.responseText.trim().length > 0 ? { message: input.responseText } : {}),
+      payload: promptResultPayload(result, stopReason, input.responseText, "succeeded"),
+    };
     events.push(completed);
     return events;
   }
@@ -1547,10 +1965,28 @@ function mapHermesAcpPromptResult(
     type: "run_diagnostic",
     code: "hermes_acp_unexpected_stop_reason",
     message: `Host Hermes ACP stopped with unsupported stop reason ${stopReason}.`,
-    payload: { stopReason },
+    payload: promptResultPayload(result, stopReason, input.responseText, "failed"),
   });
   events.push({ type: "failed", error: `Host Hermes ACP stopped with unsupported stop reason ${stopReason}.` });
   return events;
+}
+
+function promptResultPayload(
+  result: Record<string, unknown> | null,
+  stopReason: string | null,
+  responseText: string,
+  terminalStatus: Exclude<TerminalStatus, null>,
+): Record<string, unknown> {
+  return {
+    acpResponse: {
+      stopReason,
+      terminalStatus,
+      usage: usageTokens(result?.usage),
+      responseTextPreview: preview(responseText, 1_000),
+      resultPreview: preview(result, 1_000),
+      redacted: true,
+    },
+  };
 }
 
 function providerLimitSignalFromHermesAcpPromptResult(
