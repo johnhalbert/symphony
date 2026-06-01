@@ -177,12 +177,29 @@ describe("HermesAcpHarness", () => {
       prompt: [{ type: "text", text: "Do work" }],
     });
     expect(events[0]).toMatchObject({ type: "session_started", threadId: "acp-session-1" });
-    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "completed", message: "done" })]));
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "completed",
+          message: "done",
+          payload: {
+            acpResponse: expect.objectContaining({
+              stopReason: "end_turn",
+              terminalStatus: "succeeded",
+              usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+              responseTextPreview: "done",
+              resultPreview: expect.stringContaining("stopReason"),
+              redacted: true,
+            }),
+          },
+        }),
+      ]),
+    );
     expect(events).toEqual(
       expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } })]),
     );
     expect(leases[0]?.disposeStatuses).toEqual(["succeeded"]);
-    expect(client.kills).toEqual(expect.arrayContaining([expect.stringContaining("run_finished")]))
+    expect(client.kills).toEqual(expect.arrayContaining([expect.stringContaining("run_finished")]));
 
     const activeContext = JSON.parse(
       await readFile(path.join(ctx.config.workspace.stateDir, "completion-report-mcp", "issue-1-1.json"), "utf8"),
@@ -226,6 +243,36 @@ describe("HermesAcpHarness", () => {
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
   });
 
+  it("maps model or provider prompt failures to failed terminal outcome and failed-profile cleanup", async () => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    client.logTail = "provider error: model unavailable";
+    const { ctx, harness, leases } = await fixture({ client });
+    const started = deferred<void>();
+
+    const runPromise = collectEvents(harness.run(ctx, "Do work"), (event) => {
+      if (event.type === "session_started") started.resolve();
+    });
+    await started.promise;
+    await client.promptStarted.promise;
+    client.promptDeferred.reject(new Error("provider rejected configured model"));
+    const events = await runPromise;
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "run_diagnostic",
+          code: "hermes_acp_run_error",
+          message: expect.stringContaining("provider rejected configured model"),
+        }),
+        expect.objectContaining({ type: "failed", error: expect.stringContaining("provider rejected configured model") }),
+      ]),
+    );
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
   it("implements stop(runId) by cancelling the active ACP session", async () => {
     const client = new FakeAcpClient();
     client.promptDeferred = deferred<Record<string, unknown> | null>();
@@ -239,7 +286,7 @@ describe("HermesAcpHarness", () => {
     });
     const runId = await started.promise;
     await client.promptStarted.promise;
-    await harness.stop(runId);
+    await Promise.all([harness.stop(runId), harness.stop(runId)]);
     const events = await runPromise;
 
     expect(client.cancelledParams).toEqual([{ sessionId: "acp-session-1" }]);

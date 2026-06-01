@@ -83,6 +83,7 @@ interface ActiveHermesAcpRun {
   lease: HermesAcpLease;
   acpSessionId: string | null;
   symphonySessionId: string | null;
+  cancelPromise: Promise<void> | null;
 }
 
 type TerminalStatus = HostHermesAcpTerminalStatus;
@@ -136,7 +137,7 @@ export class HermesAcpHarness implements AgentHarness {
     await writeInitialHandoffMcpContexts(ctx);
     const runId = `hermes-acp-${randomUUID()}`;
     const lease = await this.getOrCreateLease(ctx, runId);
-    const activeRun: ActiveHermesAcpRun = { lease, acpSessionId: null, symphonySessionId: null };
+    const activeRun: ActiveHermesAcpRun = { lease, acpSessionId: null, symphonySessionId: null, cancelPromise: null };
     this.activeRuns.set(runId, activeRun);
 
     const queue = new AsyncEventQueue<AgentEvent>();
@@ -434,6 +435,12 @@ export class HermesAcpHarness implements AgentHarness {
   }
 
   private async interruptActiveRun(activeRun: ActiveHermesAcpRun, reason: string): Promise<void> {
+    if (activeRun.cancelPromise) return activeRun.cancelPromise;
+    activeRun.cancelPromise = this.cancelActiveRunOnce(activeRun, reason);
+    return activeRun.cancelPromise;
+  }
+
+  private async cancelActiveRunOnce(activeRun: ActiveHermesAcpRun, reason: string): Promise<void> {
     const lease = activeRun.lease;
     if (lease.disposed) return;
     const sessionId = activeRun.acpSessionId;
@@ -713,13 +720,17 @@ function mapHermesAcpPromptResult(
       type: "run_diagnostic",
       code: "hermes_acp_refusal",
       message: "Host Hermes ACP refused the prompt.",
-      payload: { stopReason },
+      payload: promptResultPayload(result, stopReason, input.responseText, "failed"),
     });
     events.push({ type: "failed", error: "Host Hermes ACP refused the prompt." });
     return events;
   }
   if (stopReason === null || stopReason === "end_turn" || stopReason === "stop" || stopReason === "max_turn_requests") {
-    const completed: AgentEvent = input.responseText.trim().length > 0 ? { type: "completed", message: input.responseText } : { type: "completed" };
+    const completed: AgentEvent = {
+      type: "completed",
+      ...(input.responseText.trim().length > 0 ? { message: input.responseText } : {}),
+      payload: promptResultPayload(result, stopReason, input.responseText, "succeeded"),
+    };
     events.push(completed);
     return events;
   }
@@ -727,10 +738,28 @@ function mapHermesAcpPromptResult(
     type: "run_diagnostic",
     code: "hermes_acp_unexpected_stop_reason",
     message: `Host Hermes ACP stopped with unsupported stop reason ${stopReason}.`,
-    payload: { stopReason },
+    payload: promptResultPayload(result, stopReason, input.responseText, "failed"),
   });
   events.push({ type: "failed", error: `Host Hermes ACP stopped with unsupported stop reason ${stopReason}.` });
   return events;
+}
+
+function promptResultPayload(
+  result: Record<string, unknown> | null,
+  stopReason: string | null,
+  responseText: string,
+  terminalStatus: Exclude<TerminalStatus, null>,
+): Record<string, unknown> {
+  return {
+    acpResponse: {
+      stopReason,
+      terminalStatus,
+      usage: usageTokens(result?.usage),
+      responseTextPreview: preview(responseText, 1_000),
+      resultPreview: preview(result, 1_000),
+      redacted: true,
+    },
+  };
 }
 
 function terminalStatusFromEvents(events: AgentEvent[]): TerminalStatus {

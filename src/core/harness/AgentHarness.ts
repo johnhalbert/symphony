@@ -74,6 +74,7 @@ export type AgentEvent =
   | {
       type: "completed";
       message?: string;
+      payload?: unknown;
       at?: string;
     }
   | {
