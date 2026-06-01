@@ -124,6 +124,69 @@ describe("ProjectionTransactionService", () => {
     unsubscribe();
   });
 
+  it("derives non-success freshness from tracker failure source revisions without misclassifying run statuses", async () => {
+    const store = new InMemoryProjectionTransactionStore();
+    const service = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });
+
+    const trackerError = await service.writeProjection({
+      projectionName: "issue_board_projection",
+      payload: { issues: [] },
+      sourceRevisions: [
+        { source: "trackerIssues", revision: "error:Todo:0:none" },
+        { source: "runs", revision: "failed:run-1", observedAt: fixedTime },
+      ],
+    });
+    const trackerUnavailable = await service.writeProjection({
+      projectionName: "dashboard_projection",
+      payload: { totals: {} },
+      sourceRevisions: [{ source: "trackerIssues", revision: "unavailable:Todo:0:none" }],
+    });
+    const trackerEmptySuccess = await service.writeProjection({
+      projectionName: "sidebar_projection",
+      payload: { reviewIssues: [] },
+      sourceRevisions: [{ source: "trackerIssues", revision: "ok:Todo:0:none", observedAt: fixedTime }],
+    });
+
+    const errorFreshness = trackerError.revision.sourceFreshness.find((record) => record.source === "trackerIssues");
+    expect(errorFreshness).toMatchObject({
+      source: "trackerIssues",
+      status: "error",
+      checkedAt: fixedTime,
+      revision: "error:Todo:0:none",
+      lastSuccessAt: null,
+      lastErrorAt: fixedTime,
+      staleMs: null,
+      detail: "trackerIssues source reported an error (error:Todo:0:none)",
+    });
+    expect(trackerError.revision.sourceFreshness.find((record) => record.source === "runs")).toMatchObject({
+      source: "runs",
+      status: "fresh",
+      revision: "failed:run-1",
+      lastSuccessAt: fixedTime,
+      lastErrorAt: null,
+    });
+    expect(trackerUnavailable.revision.sourceFreshness).toContainEqual({
+      source: "trackerIssues",
+      status: "error",
+      checkedAt: fixedTime,
+      revision: "unavailable:Todo:0:none",
+      lastSuccessAt: null,
+      lastErrorAt: fixedTime,
+      staleMs: null,
+      detail: "trackerIssues source is unavailable (unavailable:Todo:0:none)",
+    });
+    expect(trackerEmptySuccess.revision.sourceFreshness).toContainEqual({
+      source: "trackerIssues",
+      status: "empty",
+      checkedAt: fixedTime,
+      revision: "ok:Todo:0:none",
+      lastSuccessAt: fixedTime,
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "trackerIssues source is empty",
+    });
+  });
+
   it("normalizes, persists, and publishes freshness statuses for independent projection sources", async () => {
     const store = new InMemoryProjectionTransactionStore();
     const service = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });

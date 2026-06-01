@@ -103,6 +103,7 @@ import type {
   ProjectionSourceRevision,
   ProjectionWriteResult,
 } from "../core/persistence/ProjectionTransactionService.js";
+import type { ProjectionSourceFreshnessInput } from "../core/persistence/ProjectionSourceFreshness.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -1468,6 +1469,7 @@ export class StatusServer {
       scopeKey: "global",
       payload: dashboard,
       sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceFreshness: statusServerProjectionSourceFreshness(input.sourceIndex),
       sourceCursors: {
         generatedAt: input.sourceIndex?.generatedAt ?? null,
         issueCount: dashboard.totals.all,
@@ -1492,6 +1494,7 @@ export class StatusServer {
       scopeKey: "default-board",
       payload: issues,
       sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceFreshness: statusServerProjectionSourceFreshness(input.sourceIndex),
       sourceCursors: {
         generatedAt: input.sourceIndex?.generatedAt ?? null,
         issueCount: issues.issues.length,
@@ -1520,6 +1523,7 @@ export class StatusServer {
       scopeKey: "global",
       payload: sidebar,
       sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceFreshness: statusServerProjectionSourceFreshness(input.sourceIndex),
       sourceCursors: {
         generatedAt: input.sourceIndex?.generatedAt ?? null,
         runningAgentCount: sidebar.runningAgents.length,
@@ -1547,6 +1551,7 @@ export class StatusServer {
       scopeKey: historyProjectionScopeKey(input.limits),
       payload: history,
       sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
+      sourceFreshness: statusServerProjectionSourceFreshness(input.sourceIndex),
       sourceCursors: {
         sessionLimit: input.limits.sessionLimit,
         timelineLimit: input.limits.timelineLimit,
@@ -1943,6 +1948,43 @@ function statusServerProjectionSourceRevisions(
     statusServerStoreProjectionSourceRevision("lifecycles", options.lifecycleStore),
     statusServerStoreProjectionSourceRevision("writebacks", options.writebackOutbox),
   ].filter((revision): revision is ProjectionSourceRevision => revision !== null);
+}
+
+function statusServerProjectionSourceFreshness(
+  sourceIndex: BuiltWebProjectionSourceIndex | null,
+): ProjectionSourceFreshnessInput[] {
+  if (!sourceIndex) return [];
+  const trackerIssues = sourceIndex.trackerIssues;
+  const trackerRevision = sourceIndex.durableSourceRevisions.find((revision) => revision.source === "trackerIssues") ?? null;
+  const checkedAt = trackerIssues.fetchedAt ?? sourceIndex.generatedAt;
+  const revision = trackerRevision?.revision ?? null;
+
+  if (trackerIssues.status !== "ok") {
+    return [
+      {
+        source: "trackerIssues",
+        status: "error",
+        checkedAt,
+        revision,
+        lastSuccessAt: null,
+        lastErrorAt: checkedAt,
+        detail: trackerIssues.error?.message ?? "Issue board tracker source is unavailable",
+      },
+    ];
+  }
+
+  const status = trackerIssues.issues.length === 0 ? "empty" : "fresh";
+  return [
+    {
+      source: "trackerIssues",
+      status,
+      checkedAt,
+      revision,
+      lastSuccessAt: checkedAt,
+      lastErrorAt: null,
+      detail: status === "empty" ? "Issue board tracker source returned no issues" : "Issue board tracker source is current",
+    },
+  ];
 }
 
 function statusServerTranscriptProjectionSourceRevisions(

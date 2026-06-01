@@ -46,6 +46,7 @@ export interface ProjectionSourceFreshnessFromRevisionsOptions extends Normalize
 }
 
 const DEFAULT_EMPTY_REVISION_SOURCES = ["runs", "workspaces", "lifecycles", "writebacks"] as const;
+const STATUS_CODED_REVISION_SOURCES = new Set(["github", "harness", "linear", "trackerIssues"]);
 
 export function normalizeProjectionSourceFreshnessList(
   input: unknown,
@@ -75,15 +76,14 @@ export function projectionSourceFreshnessFromRevisions(
   const inputs = revisions.map((revision) => {
     const observedAt = revision.observedAt ?? null;
     const revisionText = String(revision.revision);
-    const empty = isEmptyRevision(revision.revision) && emptySources.has(revision.source);
-    const status: ProjectionSourceFreshnessStatus = empty ? "empty" : "fresh";
+    const derivedFreshness = deriveSourceFreshnessFromRevision(revision.source, revision.revision, emptySources);
     return {
       source: revision.source,
-      status,
+      status: derivedFreshness.status,
       checkedAt: observedAt ?? options.defaultCheckedAt,
       revision: revision.revision,
-      lastSuccessAt: observedAt,
-      detail: freshnessDetailForRevision(revision.source, status, revisionText),
+      lastSuccessAt: sourceRevisionStatusCanHaveLastSuccess(derivedFreshness.status) ? observedAt : null,
+      detail: derivedFreshness.detail ?? freshnessDetailForRevision(revision.source, derivedFreshness.status, revisionText),
     } satisfies ProjectionSourceFreshnessInput;
   });
   return normalizeProjectionSourceFreshnessList(inputs, options);
@@ -200,6 +200,54 @@ function inferredStaleMs(status: ProjectionSourceFreshnessStatus, checkedAt: str
   return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : null;
 }
 
+function deriveSourceFreshnessFromRevision(
+  source: string,
+  revision: string | number,
+  emptySources: ReadonlySet<string>,
+): { status: ProjectionSourceFreshnessStatus; detail?: string } {
+  const revisionText = String(revision);
+  if (isEmptyRevision(revision) && emptySources.has(source)) return { status: "empty" };
+
+  const encodedStatus = sourceRevisionCanEncodeFreshnessStatus(source) ? encodedRevisionFreshnessStatus(revisionText) : null;
+  if (!encodedStatus) return { status: "fresh" };
+  if (encodedStatus === "fresh" && sourceRevisionRepresentsEmptySuccess(source, revisionText)) return { status: "empty" };
+  if (encodedStatus === "error") {
+    return {
+      status: "error",
+      detail: sourceRevisionErrorDetail(source, revisionText),
+    };
+  }
+  return { status: encodedStatus };
+}
+
+function encodedRevisionFreshnessStatus(revision: string): ProjectionSourceFreshnessStatus | null {
+  const prefix = revision.split(":", 1)[0]?.trim();
+  if (!prefix) return null;
+  const normalized = prefix.toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "ok" || normalized === "success" || normalized === "synced") return "fresh";
+  if (normalized === "failed" || normalized === "failure" || normalized === "unavailable") return "error";
+  if (normalized === "pending") return "loading";
+  if ((PROJECTION_SOURCE_FRESHNESS_STATUSES as readonly string[]).includes(normalized)) return normalized as ProjectionSourceFreshnessStatus;
+  return null;
+}
+
+function sourceRevisionCanEncodeFreshnessStatus(source: string): boolean {
+  return STATUS_CODED_REVISION_SOURCES.has(source);
+}
+
+function sourceRevisionRepresentsEmptySuccess(source: string, revision: string): boolean {
+  return source === "trackerIssues" && /^(?:ok|success|synced|fresh):.*:0:none$/i.test(revision);
+}
+
+function sourceRevisionErrorDetail(source: string, revision: string): string {
+  if (/^unavailable:/i.test(revision)) return `${source} source is unavailable (${revision})`;
+  return `${source} source reported an error (${revision})`;
+}
+
+function sourceRevisionStatusCanHaveLastSuccess(status: ProjectionSourceFreshnessStatus): boolean {
+  return status === "fresh" || status === "empty" || status === "stale";
+}
+
 function isEmptyRevision(revision: string | number): boolean {
   return revision === 0 || revision === "0" || String(revision).startsWith("0:");
 }
@@ -207,6 +255,9 @@ function isEmptyRevision(revision: string | number): boolean {
 function freshnessDetailForRevision(source: string, status: ProjectionSourceFreshnessStatus, revision: string): string {
   if (status === "empty") return `${source} source is empty`;
   if (status === "never_synced") return `${source} source has not synced yet`;
+  if (status === "loading") return `${source} source is loading`;
+  if (status === "stale") return `${source} source revision ${revision} is stale`;
+  if (status === "error") return `${source} source reported an error (${revision})`;
   return `${source} source revision ${revision} observed`;
 }
 
