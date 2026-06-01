@@ -30,6 +30,10 @@ const canonicalChannelMigrationUrl = new URL(
   "../migrations/postgres/0004_run_activity_canonical_channels.sql",
   import.meta.url,
 );
+const projectionSourceFreshnessMigrationUrl = new URL(
+  "../migrations/postgres/0005_projection_source_freshness.sql",
+  import.meta.url,
+);
 const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
 const stateOwnershipUrl = new URL("../docs/state-ownership-and-migration.md", import.meta.url);
 const publishedOwnedStateChecksumSha256 = "8e10c03c6cfa34e9672e350c59ff4998459989529a82c98cbd9f714469799298";
@@ -114,6 +118,10 @@ async function canonicalChannelMigrationSql(): Promise<string> {
   return readFile(canonicalChannelMigrationUrl, "utf8");
 }
 
+async function projectionSourceFreshnessMigrationSql(): Promise<string> {
+  return readFile(projectionSourceFreshnessMigrationUrl, "utf8");
+}
+
 async function configuredMigrationSql(): Promise<string> {
   const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
   return migrations.map((migration) => migration.sql).join("\n");
@@ -144,13 +152,16 @@ describe("Postgres Symphony-owned state migration", () => {
       "0002_symphony_owned_state",
       "0003_projection_freshness_indexes",
       "0004_run_activity_canonical_channels",
+      "0005_projection_source_freshness",
     ]);
     const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
     const projectionFreshness = migrations.find((migration) => migration.id === "0003_projection_freshness_indexes");
     const canonicalChannels = migrations.find((migration) => migration.id === "0004_run_activity_canonical_channels");
+    const projectionSourceFreshness = migrations.find((migration) => migration.id === "0005_projection_source_freshness");
     expect(ownedState?.filePath).toBe(fileURLToPath(ownedStateMigrationUrl));
     expect(projectionFreshness?.filePath).toBe(fileURLToPath(projectionFreshnessMigrationUrl));
     expect(canonicalChannels?.filePath).toBe(fileURLToPath(canonicalChannelMigrationUrl));
+    expect(projectionSourceFreshness?.filePath).toBe(fileURLToPath(projectionSourceFreshnessMigrationUrl));
     expect(sha256(ownedState?.sql ?? "")).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.checksumSha256).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_session");
@@ -162,6 +173,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(ownedState?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(canonicalChannels?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+    expect(projectionSourceFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
   });
 
   it("delivers projection updated_at columns and freshness indexes through the follow-up migration", async () => {
@@ -196,6 +208,17 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain(
       "add constraint run_activity_event_channel_check check (channel in ('lifecycle', 'chat', 'tool', 'diagnostic', 'token', 'rate_limit', 'terminal'))",
     );
+  });
+
+  it("delivers durable projection source freshness metadata through a checksum-safe follow-up migration", async () => {
+    const normalized = normalizedSql(await projectionSourceFreshnessMigrationSql());
+
+    expect(normalized).toContain("alter table symphony.projection_revision add column if not exists source_freshness jsonb not null default '[]'::jsonb");
+    expect(normalized).toContain("source_cursors ? 'sourcefreshness'");
+    expect(normalized).toContain("projection_revision_source_freshness_array_check");
+    expect(normalized).toContain("check (jsonb_typeof(source_freshness) = 'array')");
+    expect(normalized).toContain("create index if not exists projection_revision_source_freshness_gin_idx");
+    expect(normalized).toContain("using gin (source_freshness jsonb_path_ops)");
   });
 
   it("declares all required operational and projection tables", async () => {
@@ -300,9 +323,11 @@ describe("Postgres Symphony-owned state migration", () => {
       "migrations/postgres/0002_symphony_owned_state.sql",
       "migrations/postgres/0003_projection_freshness_indexes.sql",
       "migrations/postgres/0004_run_activity_canonical_channels.sql",
+      "migrations/postgres/0005_projection_source_freshness.sql",
       "checksum-stable",
       "projection `updated_at` freshness columns",
       "canonical run activity channel names",
+      "projection_revision.source_freshness",
     ]) {
       expect(ownership, `missing ownership guide fragment: ${fragment}`).toContain(fragment);
     }
@@ -423,6 +448,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0002_symphony_owned_state",
           "0003_projection_freshness_indexes",
           "0004_run_activity_canonical_channels",
+          "0005_projection_source_freshness",
         ]);
 
         const tableCount = await psql(
@@ -477,21 +503,28 @@ describe("Postgres Symphony-owned state migration", () => {
           publishedOwnedStateChecksumSha256,
         );
         await seedLegacyRunActivityChannelAliases(containerName);
+        await seedLegacyProjectionSourceFreshness(containerName);
 
         const result = await applyConfiguredMigrations(connectionString);
         expect(result.skipped).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
-        expect(result.applied).toEqual(["0003_projection_freshness_indexes", "0004_run_activity_canonical_channels"]);
+        expect(result.applied).toEqual([
+          "0003_projection_freshness_indexes",
+          "0004_run_activity_canonical_channels",
+          "0005_projection_source_freshness",
+        ]);
         expect(await appliedMigrationIds(containerName)).toEqual([
           "0001_migration_foundation",
           "0002_symphony_owned_state",
           "0003_projection_freshness_indexes",
           "0004_run_activity_canonical_channels",
+          "0005_projection_source_freshness",
         ]);
         expect(await appliedMigrationChecksum(containerName, "0002_symphony_owned_state")).toBe(
           publishedOwnedStateChecksumSha256,
         );
         await expectProjectionFreshnessCatalog(containerName);
         await expectLegacyRunActivityChannelsMigrated(containerName);
+        await expectLegacyProjectionSourceFreshnessMigrated(containerName);
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
       } finally {
         await docker(["rm", "-f", containerName]).catch(() => undefined);
@@ -642,6 +675,102 @@ async function seedLegacyRunActivityChannelAliases(containerName: string): Promi
   );
 }
 
+async function seedLegacyProjectionSourceFreshness(containerName: string): Promise<void> {
+  await psql(
+    containerName,
+    String.raw`
+      insert into symphony.projection_revision (
+        projection_name,
+        scope_kind,
+        scope_key,
+        revision,
+        source_revisions,
+        source_cursors,
+        content_sha256,
+        generated_at
+      ) values (
+        'dashboard_projection',
+        'upgrade-test',
+        'legacy-source-freshness',
+        1,
+        jsonb_build_array(
+          jsonb_build_object('source', 'github', 'revision', 'gh-55', 'observedAt', '2026-01-02T03:04:05.000Z'),
+          jsonb_build_object('source', 'harness', 'revision', 'harness-run-7', 'observedAt', '2026-01-02T03:04:05.000Z'),
+          jsonb_build_object('source', 'linear', 'revision', 'lin-42', 'observedAt', '2026-01-02T03:04:05.000Z'),
+          jsonb_build_object('source', 'local', 'revision', 'local-snapshot-0', 'observedAt', null)
+        ),
+        jsonb_build_object(
+          'sourceFreshness',
+          jsonb_build_array(
+            jsonb_build_object(
+              'source', 'github',
+              'status', 'stale',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', 'gh-55',
+              'lastSuccessAt', '2026-01-02T03:00:05.000Z',
+              'lastErrorAt', null,
+              'staleMs', 240000,
+              'detail', 'legacy GitHub cursor is behind'
+            ),
+            jsonb_build_object(
+              'source', 'harness',
+              'status', 'error',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', 'harness-run-7',
+              'lastSuccessAt', null,
+              'lastErrorAt', '2026-01-02T03:04:05.000Z',
+              'staleMs', null,
+              'detail', 'legacy harness transcript ingest failed'
+            ),
+            jsonb_build_object(
+              'source', 'linear',
+              'status', 'fresh',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', 'lin-42',
+              'lastSuccessAt', '2026-01-02T03:04:05.000Z',
+              'lastErrorAt', null,
+              'staleMs', null,
+              'detail', 'legacy Linear import is current'
+            ),
+            jsonb_build_object(
+              'source', 'local',
+              'status', 'never_synced',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', null,
+              'lastSuccessAt', null,
+              'lastErrorAt', null,
+              'staleMs', null,
+              'detail', 'legacy local snapshot has not run'
+            ),
+            jsonb_build_object(
+              'source', 'runs',
+              'status', 'loading',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', null,
+              'lastSuccessAt', null,
+              'lastErrorAt', null,
+              'staleMs', null,
+              'detail', 'legacy run projection is loading'
+            ),
+            jsonb_build_object(
+              'source', 'workspaces',
+              'status', 'empty',
+              'checkedAt', '2026-01-02T03:04:05.000Z',
+              'revision', 0,
+              'lastSuccessAt', '2026-01-02T03:04:05.000Z',
+              'lastErrorAt', null,
+              'staleMs', null,
+              'detail', 'legacy workspace source is empty'
+            )
+          )
+        ),
+        'legacy-source-freshness-sha',
+        '2026-01-02T03:04:05.000Z'
+      );
+    `,
+  );
+}
+
 async function expectLegacyRunActivityChannelsMigrated(containerName: string): Promise<void> {
   const channelCounts = await psql(
     containerName,
@@ -712,6 +841,81 @@ async function expectLegacyRunActivityChannelsMigrated(containerName: string): P
   ).rejects.toThrow(/run_activity_event_channel_check|violates check constraint/i);
 }
 
+async function expectLegacyProjectionSourceFreshnessMigrated(containerName: string): Promise<void> {
+  const sourceFreshness = await psql(
+    containerName,
+    String.raw`
+      select source_freshness::text
+      from symphony.projection_revision
+      where projection_name = 'dashboard_projection'
+        and scope_kind = 'upgrade-test'
+        and scope_key = 'legacy-source-freshness';
+    `,
+  );
+  expect(JSON.parse(sourceFreshness.trim())).toEqual([
+    {
+      source: "github",
+      status: "stale",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: "gh-55",
+      lastSuccessAt: "2026-01-02T03:00:05.000Z",
+      lastErrorAt: null,
+      staleMs: 240_000,
+      detail: "legacy GitHub cursor is behind",
+    },
+    {
+      source: "harness",
+      status: "error",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: "harness-run-7",
+      lastSuccessAt: null,
+      lastErrorAt: "2026-01-02T03:04:05.000Z",
+      staleMs: null,
+      detail: "legacy harness transcript ingest failed",
+    },
+    {
+      source: "linear",
+      status: "fresh",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: "lin-42",
+      lastSuccessAt: "2026-01-02T03:04:05.000Z",
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "legacy Linear import is current",
+    },
+    {
+      source: "local",
+      status: "never_synced",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: null,
+      lastSuccessAt: null,
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "legacy local snapshot has not run",
+    },
+    {
+      source: "runs",
+      status: "loading",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: null,
+      lastSuccessAt: null,
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "legacy run projection is loading",
+    },
+    {
+      source: "workspaces",
+      status: "empty",
+      checkedAt: "2026-01-02T03:04:05.000Z",
+      revision: 0,
+      lastSuccessAt: "2026-01-02T03:04:05.000Z",
+      lastErrorAt: null,
+      staleMs: null,
+      detail: "legacy workspace source is empty",
+    },
+  ]);
+}
+
 async function expectProjectionFreshnessCatalog(containerName: string): Promise<void> {
   const columnMetadata = await psql(
     containerName,
@@ -736,6 +940,32 @@ async function expectProjectionFreshnessCatalog(containerName: string): Promise<
     expect(columns[table], `missing updated_at metadata for ${table}`).toMatchObject({ nullable: "NO" });
     expect(columns[table]?.default, `missing updated_at default for ${table}`).toContain("now()");
   }
+
+  const sourceFreshnessColumnMetadata = await psql(
+    containerName,
+    String.raw`
+      select coalesce(jsonb_build_object('nullable', is_nullable, 'default', column_default), '{}'::jsonb)::text
+      from information_schema.columns
+      where table_schema = 'symphony'
+        and table_name = 'projection_revision'
+        and column_name = 'source_freshness';
+    `,
+  );
+  const sourceFreshnessColumn = JSON.parse(sourceFreshnessColumnMetadata.trim()) as { nullable?: string; default?: string | null };
+  expect(sourceFreshnessColumn).toMatchObject({ nullable: "NO" });
+  expect(sourceFreshnessColumn.default?.toLowerCase()).toContain("'[]'::jsonb");
+
+  const sourceFreshnessIndex = await psql(
+    containerName,
+    String.raw`
+      select coalesce(indexdef, '')
+      from pg_indexes
+      where schemaname = 'symphony'
+        and indexname = 'projection_revision_source_freshness_gin_idx';
+    `,
+  );
+  expect(sourceFreshnessIndex.toLowerCase()).toContain("using gin");
+  expect(sourceFreshnessIndex.toLowerCase()).toContain("source_freshness");
 
   const indexMetadata = await psql(
     containerName,
