@@ -270,12 +270,24 @@ fake_git = os.path.join(fake_bin, "git")
 with open(fake_git, "w", encoding="utf-8") as handle:
     handle.write("#!/bin/sh\necho FAKE_GIT_RAN >&2\nexit 99\n")
 os.chmod(fake_git, 0o755)
+script_absolute = os.path.join(fake_bin, "absolute-fetch.sh")
+with open(script_absolute, "w", encoding="utf-8") as handle:
+    handle.write(f"#!/bin/sh\n{fake_git} fetch origin\n")
+os.chmod(script_absolute, 0o755)
+script_path_reset = os.path.join(fake_bin, "path-reset-fetch.sh")
+with open(script_path_reset, "w", encoding="utf-8") as handle:
+    handle.write(f"#!/bin/sh\nPATH={fake_bin} git fetch origin\n")
+os.chmod(script_path_reset, 0o755)
 
 cases = [
     ["bash", "-c", f"{fake_git} fetch origin"],
     ["sh", "-c", f"PATH={fake_bin} git fetch origin"],
     ["bash", "-lc", f"{fake_git} fetch origin"],
     ["env", "-i", f"PATH={fake_bin}", "git", "fetch", "origin"],
+    ["bash", script_absolute],
+    ["bash", script_path_reset],
+    ["env", "-i", f"PATH={fake_bin}", "bash", script_path_reset],
+    [script_absolute],
 ]
 for argv in cases:
     try:
@@ -294,7 +306,7 @@ for argv in cases:
 
         self.assertEqual(result["status"], "success")
         combined = result.get("output", "") + result.get("error", "")
-        self.assertEqual(combined.count("BLOCKED_WRAPPER"), 4)
+        self.assertEqual(combined.count("BLOCKED_WRAPPER"), 8)
         self.assertNotIn("FAKE_GIT_RAN", combined)
 
     def test_single_tool_call(self):

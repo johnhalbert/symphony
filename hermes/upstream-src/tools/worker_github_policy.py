@@ -294,6 +294,16 @@ _POSIX_SHELL_WRAPPERS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
 _CMD_SHELL_WRAPPERS = {"cmd"}
 _POWERSHELL_WRAPPERS = {"powershell", "pwsh", "powershell_ise"}
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_POSIX_SHELL_OPTIONS_WITH_VALUES = {
+    "-o",
+    "+o",
+    "-O",
+    "+O",
+    "--rcfile",
+    "--init-file",
+    "--command",
+}
+_POSIX_SHELL_SCRIPT_EXTENSIONS = (".sh", ".bash", ".zsh", ".dash", ".ksh", ".fish")
 
 
 def _joined_shell_command(parts: Sequence[str]) -> str:
@@ -315,6 +325,49 @@ def _posix_shell_command_from_args(args: Sequence[str]) -> Optional[str]:
             return None
         index += 1
     return None
+
+
+def _posix_shell_script_entrypoint(args: Sequence[str]) -> Optional[str]:
+    """Return a POSIX shell script/stdin entrypoint when argv cannot be inspected.
+
+    Shell ``-c`` payloads are inspectable command strings and are handled by
+    ``_posix_shell_command_from_args``.  Shell script files (``bash script.sh``)
+    and stdin/interactive shell entrypoints are not inspectable before the shell
+    starts, and can hide absolute tool paths or reset PATH before invoking
+    GitHub commands.  Worker/reviewer policy therefore fails these wrappers
+    closed rather than relying on PATH shims inside the script body.
+    """
+
+    index = 0
+    saw_non_version_option = False
+    while index < len(args):
+        arg = str(args[index])
+        lower = arg.lower()
+        if arg == "--":
+            if index + 1 < len(args):
+                return str(args[index + 1])
+            return "stdin or interactive shell"
+        if lower in {"--help", "--version", "-version"}:
+            return None
+        if lower in _POSIX_SHELL_OPTIONS_WITH_VALUES:
+            saw_non_version_option = True
+            index += 2
+            continue
+        if lower.startswith("--rcfile=") or lower.startswith("--init-file=") or lower.startswith("--command="):
+            saw_non_version_option = True
+            index += 1
+            continue
+        if arg.startswith("-") or arg.startswith("+"):
+            saw_non_version_option = True
+            index += 1
+            continue
+        return arg
+    return "stdin or interactive shell" if saw_non_version_option or not args else None
+
+
+def _looks_like_shell_script_path(tool: str) -> bool:
+    base = _strip_windows_suffix(tool)
+    return base.endswith(_POSIX_SHELL_SCRIPT_EXTENSIONS)
 
 
 def _cmd_shell_command_from_args(args: Sequence[str]) -> Optional[str]:
@@ -414,6 +467,13 @@ def check_worker_reviewer_github_argv(
         decision = check_worker_reviewer_github_command(shell_command, env=env)
         if decision is not None:
             return decision
+    elif canonical in _POSIX_SHELL_WRAPPERS:
+        script_entrypoint = _posix_shell_script_entrypoint(args)
+        if script_entrypoint is not None:
+            return _decision("uninspectable POSIX shell script execution", command)
+
+    if _looks_like_shell_script_path(canonical):
+        return _decision("uninspectable shell script execution", command)
 
     if canonical == "env":
         wrapped_tool, wrapped_args, split_command = _env_wrapped_command(args)
@@ -813,8 +873,9 @@ def install_worker_reviewer_github_runtime(
 
     This protects shell children that try to bypass the terminal command-string
     guard by launching Python subprocesses directly.  ``sitecustomize`` blocks
-    Python ``subprocess``/``os.system``/``os.exec*`` calls, while PATH shims
-    catch ordinary shell scripts and aliases that invoke ``git``/``gh``/``ssh``.
+    Python ``subprocess``/``os.system``/``os.exec*`` calls, fails closed on
+    uninspectable shell script entrypoints, and uses PATH shims for ordinary
+    aliases or command resolution that invoke ``git``/``gh``/``ssh``.
     """
 
     if not apply_worker_reviewer_github_child_env(env, env):

@@ -6,6 +6,7 @@ import type { HookConfig, WorkspaceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue, Workspace } from "../types.js";
 import type { Logger } from "../logging/StructuredLogger.js";
+import { serviceOwnedGitCommandEnv } from "../harness/AgentCommandPolicy.js";
 import { createGitPlanningCheckout, createGitWorktree, removeGitWorktree } from "./GitWorktreeManager.js";
 import { FileRunTranscriptStore, type WorkspaceRecord } from "../persistence/RunTranscriptStore.js";
 
@@ -545,7 +546,7 @@ function runShellScript(script: string, cwd: string, timeoutMs: number): Promise
 
 function runCommand(command: string, args: string[], cwd: string, timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { cwd, env: command === "git" ? serviceOwnedGitCommandEnv() : undefined, stdio: ["ignore", "pipe", "pipe"] });
     let settled = false;
     let stderr = "";
     const timer = setTimeout(() => {

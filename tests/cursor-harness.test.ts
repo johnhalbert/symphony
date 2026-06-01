@@ -23,7 +23,11 @@ import {
   transcriptRecallMcpServerConfig,
 } from "../cursor/src/CursorHarness.js";
 import { issue, testConfig } from "./helpers.js";
-import { workerReviewerGithubCommandPolicyProcessEnv } from "../src/core/harness/AgentCommandPolicy.js";
+import {
+  withWorkerReviewerGithubCommandPolicyProcessEnv,
+  workerReviewerGithubCommandPolicyProcessEnv,
+} from "../src/core/harness/AgentCommandPolicy.js";
+import { createGitWorktree } from "../src/core/workspace/GitWorktreeManager.js";
 
 const cursorSdk = vi.hoisted(() => ({
   create: vi.fn(),
@@ -364,6 +368,52 @@ describe("Cursor event mapping", () => {
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps service-owned git worktree preparation off Cursor worker policy shims during overlap", async () => {
+    if (spawnSync("git", ["--version"], { encoding: "utf8" }).status !== 0) return;
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-cursor-service-git-"));
+    try {
+      const originRepo = path.join(tempRoot, "origin.git");
+      const seedRepo = path.join(tempRoot, "seed");
+      const serviceRepo = path.join(tempRoot, "service.git");
+      const workspacePath = path.join(tempRoot, "workspace", "TEST-1");
+      const stateDir = path.join(tempRoot, "state");
+
+      runGitForTest(["init", "--bare", originRepo], tempRoot);
+      await mkdir(seedRepo, { recursive: true });
+      runGitForTest(["init"], seedRepo);
+      await writeFile(path.join(seedRepo, "README.md"), "seed\n", "utf8");
+      runGitForTest(["add", "README.md"], seedRepo);
+      runGitForTest(["-c", "user.name=Symphony", "-c", "user.email=symphony@example.invalid", "commit", "-m", "seed"], seedRepo);
+      runGitForTest(["branch", "-M", "main"], seedRepo);
+      runGitForTest(["remote", "add", "origin", originRepo], seedRepo);
+      runGitForTest(["push", "origin", "main"], seedRepo);
+      runGitForTest(["init", "--bare", serviceRepo], tempRoot);
+      runGitForTest(["remote", "add", "origin", originRepo], serviceRepo);
+
+      const config = testConfig(path.join(tempRoot, "workspace"));
+      config.workspace.stateDir = stateDir;
+      config.hermes.upstreamRoot = path.resolve("hermes/upstream-src");
+      config.hermes.python = process.env.PYTHON || "python";
+
+      await withWorkerReviewerGithubCommandPolicyProcessEnv(agentContext(config, "worker"), async () => {
+        expect(process.env.SYMPHONY_COMMAND_POLICY_SHIM_DIR).toBeTruthy();
+        await createGitWorktree({
+          source: { kind: "git_worktree", repository: serviceRepo, baseRef: "main" },
+          stateDir,
+          workspacePath,
+          branchName: "symphony/TEST-1",
+          timeoutMs: 10_000,
+          logger: new StructuredLogger(() => undefined),
+        });
+      });
+
+      expect(runGitForTest(["-C", serviceRepo, "rev-parse", "--verify", "origin/main"], tempRoot).status).toBe(0);
+      expect(runGitForTest(["-C", workspacePath, "status", "--short"], tempRoot).status).toBe(0);
+    } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
   });
@@ -1078,6 +1128,14 @@ async function writeFakeGit(binDir: string): Promise<void> {
       ].join("\n");
   await writeFile(filePath, content, "utf8");
   if (process.platform !== "win32") await chmod(filePath, 0o755);
+}
+
+function runGitForTest(args: string[], cwd: string): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", timeout: 10_000 });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+  }
+  return { status: result.status, stdout: result.stdout || "", stderr: result.stderr || "" };
 }
 
 function runPolicyShim(

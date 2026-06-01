@@ -6,6 +6,22 @@ import type { AgentRunContext } from "./AgentHarness.js";
 export const SYMPHONY_AGENT_COMMAND_POLICY = "worker_reviewer_github_upstream_block";
 
 const SHIM_TOOLS = ["git", "gh", "ssh", "ssh-keyscan", "ssh-keygen", "ssh-add", "curl", "wget"] as const;
+const REAL_TOOL_ENV_PREFIX = "SYMPHONY_REAL_";
+const WORKER_REVIEWER_POLICY_ENV_KEYS = [
+  "SYMPHONY_AGENT_COMMAND_POLICY",
+  "SYMPHONY_AGENT_COMMAND_POLICY_DISABLED",
+  "SYMPHONY_AGENT_ROLE",
+  "SYMPHONY_RUN_ROLE",
+  "HERMES_SYMPHONY_ROLE",
+  "SYMPHONY_COMMAND_POLICY_SHIM_DIR",
+  "GIT_ASKPASS",
+  "SSH_ASKPASS",
+  "GIT_TERMINAL_PROMPT",
+  "GCM_INTERACTIVE",
+  "GH_PROMPT_DISABLED",
+  "GIT_SSH_COMMAND",
+  "SSH_ASKPASS_REQUIRE",
+] as const;
 
 export function workerReviewerGithubCommandPolicyEnv(ctx: Pick<AgentRunContext, "role">): Record<string, string> {
   if (ctx.role !== "worker" && ctx.role !== "reviewer") return {};
@@ -53,6 +69,46 @@ export async function withWorkerReviewerGithubCommandPolicyProcessEnv<T>(
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+  }
+}
+
+export function serviceOwnedGitCommandEnv(sourceEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...sourceEnv };
+  const shimDir = sourceEnv.SYMPHONY_COMMAND_POLICY_SHIM_DIR;
+  const effectivePath = sourceEnv.PATH ?? sourceEnv.Path;
+  for (const key of WORKER_REVIEWER_POLICY_ENV_KEYS) delete env[key];
+  for (const key of Object.keys(env)) {
+    if (key.startsWith(REAL_TOOL_ENV_PREFIX)) delete env[key];
+  }
+  if (effectivePath !== undefined) {
+    const cleanedPath = shimDir ? pathWithoutEntry(effectivePath, shimDir) : effectivePath;
+    if (cleanedPath) {
+      env.PATH = cleanedPath;
+      if (process.platform === "win32") env.Path = cleanedPath;
+    } else {
+      delete env.PATH;
+      delete env.Path;
+    }
+  }
+  return env;
+}
+
+function pathWithoutEntry(value: string, removedEntry: string): string {
+  return value
+    .split(path.delimiter)
+    .filter((entry) => entry.length > 0 && !samePathEntry(entry, removedEntry))
+    .join(path.delimiter);
+}
+
+function samePathEntry(left: string, right: string): boolean {
+  try {
+    const resolvedLeft = path.resolve(left);
+    const resolvedRight = path.resolve(right);
+    return process.platform === "win32"
+      ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+      : resolvedLeft === resolvedRight;
+  } catch {
+    return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
   }
 }
 

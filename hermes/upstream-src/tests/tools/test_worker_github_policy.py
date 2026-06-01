@@ -116,6 +116,41 @@ def test_policy_blocks_shell_and_env_wrapper_argv(policy_env, tool, args):
 
 
 @pytest.mark.parametrize(
+    "tool,args,description",
+    [
+        ("bash", ["script.sh"], "uninspectable POSIX shell script execution"),
+        ("bash", ["-e", "script.sh"], "uninspectable POSIX shell script execution"),
+        ("sh", ["./script.sh"], "uninspectable POSIX shell script execution"),
+        ("env", ["-i", "PATH=/real-bin", "bash", "script.sh"], "uninspectable POSIX shell script execution"),
+        ("./script.sh", [], "uninspectable shell script execution"),
+    ],
+)
+def test_policy_blocks_uninspectable_shell_script_argv(policy_env, tool, args, description):
+    decision = policy.check_worker_reviewer_github_argv(tool, args)
+
+    assert decision is not None
+    assert decision["blocked"] is True
+    assert decision["description"] == description
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash script.sh",
+        "sh ./script.sh",
+        "env -i PATH=/real-bin bash script.sh",
+        "./script.sh",
+    ],
+)
+def test_policy_blocks_uninspectable_shell_script_command_strings(policy_env, command):
+    decision = policy.check_worker_reviewer_github_command(command)
+
+    assert decision is not None
+    assert decision["blocked"] is True
+    assert "script execution" in decision["description"]
+
+
+@pytest.mark.parametrize(
     "tool,args",
     [
         ("bash", ["-c", "git status --short"]),
@@ -219,6 +254,13 @@ def test_runtime_sitecustomize_blocks_shell_and_env_wrapper_subprocess_bypasses(
     env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
     assert policy.install_worker_reviewer_github_runtime(str(runtime_dir), env, python_executable=sys.executable)
 
+    script_absolute = tmp_path / "absolute-fetch.sh"
+    script_absolute.write_text(f"#!/bin/sh\n{fake_git.as_posix()} fetch origin\n", encoding="utf-8")
+    script_absolute.chmod(0o755)
+    script_path_reset = tmp_path / "path-reset-fetch.sh"
+    script_path_reset.write_text(f"#!/bin/sh\nPATH={fake_bin.as_posix()} git fetch origin\n", encoding="utf-8")
+    script_path_reset.chmod(0o755)
+
     fake_git_text = fake_git.as_posix()
     fake_bin_text = fake_bin.as_posix()
     argv_cases = [
@@ -227,6 +269,10 @@ def test_runtime_sitecustomize_blocks_shell_and_env_wrapper_subprocess_bypasses(
         ["bash", "-lc", f"{fake_git_text} fetch origin"],
         ["env", "-i", f"PATH={fake_bin_text}", "git", "fetch", "origin"],
         ["env", "-i", f"PATH={fake_bin_text}", "bash", "-c", f"{fake_git_text} fetch origin"],
+        ["bash", script_absolute.as_posix()],
+        ["bash", script_path_reset.as_posix()],
+        ["env", "-i", f"PATH={fake_bin_text}", "bash", script_path_reset.as_posix()],
+        [script_absolute.as_posix()],
     ]
 
     for argv in argv_cases:
