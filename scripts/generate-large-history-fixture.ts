@@ -1,11 +1,15 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { Command } from "commander";
+import { PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON } from "../src/core/CompletionReportService.js";
+import type { OperatorApprovalRecord, OperatorApprovalStatus } from "../src/core/approval/OperatorApprovalService.js";
 import { buildIssueHandoffState, type IssueCompletionReportRecord, type IssueLifecyclePhase, type IssueLifecycleRecord, type IssueLifecycleSummaryPointers, type IssueReviewVerdictRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { RunRecord, RunStatus, TranscriptEvent, WorkspaceRecord } from "../src/core/persistence/RunTranscriptStore.js";
+import type { ProviderLimitSignal } from "../src/core/provider/ProviderLimits.js";
 import type { WritebackOperation, WritebackStatus } from "../src/core/writeback/WritebackOutbox.js";
 import { runKindForPhase, type AgentRunPhase, type AgentRunRole } from "../src/core/types.js";
 
@@ -71,6 +75,7 @@ export interface LargeHistoryFixtureManifest {
     lifecycleRecords: number;
     runs: number;
     transcriptEvents: number;
+    approvalRequests: number;
     writebackOperations: number;
   };
   apiHints: {
@@ -86,6 +91,7 @@ interface FixtureIssueBuildResult {
   issue: LargeHistoryFixtureIssueSummary;
   runs: RunRecord[];
   transcriptEvents: number;
+  approvalRequests: number;
   writebackOperations: number;
 }
 
@@ -106,6 +112,7 @@ export async function generateLargeHistoryFixture(
   const issues: LargeHistoryFixtureIssueSummary[] = [];
   let runCount = 0;
   let transcriptEventCount = 0;
+  let approvalRequestCount = 0;
   let writebackOperationCount = 0;
 
   for (let issueIndex = 0; issueIndex < options.issueCount; issueIndex += 1) {
@@ -113,6 +120,7 @@ export async function generateLargeHistoryFixture(
     issues.push(result.issue);
     runCount += result.runs.length;
     transcriptEventCount += result.transcriptEvents;
+    approvalRequestCount += result.approvalRequests;
     writebackOperationCount += result.writebackOperations;
   }
 
@@ -135,6 +143,7 @@ export async function generateLargeHistoryFixture(
       lifecycleRecords: options.issueCount,
       runs: runCount,
       transcriptEvents: transcriptEventCount,
+      approvalRequests: approvalRequestCount,
       writebackOperations: writebackOperationCount,
     },
     apiHints: {
@@ -238,6 +247,7 @@ async function writeFixtureIssue(
   await writeJson(path.join(options.outputDir, "workspaces", `${safeFileName(workspaceKey)}.json`), workspace);
 
   const runs: RunRecord[] = [];
+  const runEvents: Array<{ run: RunRecord; events: TranscriptEvent[] }> = [];
   let transcriptEvents = 0;
   for (let runIndex = 0; runIndex < options.runsPerIssue; runIndex += 1) {
     const run = buildRunRecord({
@@ -256,9 +266,8 @@ async function writeFixtureIssue(
     });
     runs.push(run);
     const events = buildTranscriptEvents(run, options.eventsPerRun);
+    runEvents.push({ run, events });
     transcriptEvents += events.length;
-    await writeJson(path.join(options.outputDir, "runs", safeFileName(run.runId), "meta.json"), run);
-    await writeJsonl(path.join(options.outputDir, "runs", safeFileName(run.runId), "events.jsonl"), events);
   }
 
   const writebackOperations = await writeWritebackOperations({
@@ -282,6 +291,25 @@ async function writeFixtureIssue(
     runs,
     writebackOperationKeys: writebackOperations.map((operation) => operation.idempotencyKey),
   });
+  const approvalRecords = buildApprovalRecords({
+    issueId,
+    issueIdentifier,
+    issueIndex,
+    issueStartMs,
+    workspacePath,
+    branchName,
+    baseRef,
+    lifecycle,
+  });
+  applyPendingApprovalMetadata(runs, approvalRecords);
+
+  for (const { run, events } of runEvents) {
+    await writeJson(path.join(options.outputDir, "runs", safeFileName(run.runId), "meta.json"), run);
+    await writeJsonl(path.join(options.outputDir, "runs", safeFileName(run.runId), "events.jsonl"), events);
+  }
+  for (const approval of approvalRecords) {
+    await writeJson(path.join(options.outputDir, "approval-requests", `${safeFileName(approval.requestId)}.json`), approval);
+  }
   await writeJson(path.join(options.outputDir, "issue-lifecycle", `${safeFileName(issueId)}.json`), lifecycle);
 
   return {
@@ -293,6 +321,7 @@ async function writeFixtureIssue(
     },
     runs,
     transcriptEvents,
+    approvalRequests: approvalRecords.length,
     writebackOperations: writebackOperations.length,
   };
 }
@@ -323,6 +352,22 @@ function buildRunRecord(input: {
   const updatedAt = completedAt ?? iso(input.startedAtMs + Math.max(input.eventCount, 1) * 60 * 1000);
   const error = status === "failed" ? "Synthetic fixture failure for large-history UI validation" : null;
   const hasPullRequest = role === "worker" && input.runIndex % 2 === 0 && input.issueIndex % 4 === 0;
+  const providerLimit = (input.issueIndex + input.runIndex) % 11 === 0
+    ? providerLimitSignalFor(
+        {
+          runId,
+          sessionId,
+          role,
+          runPhase,
+          issueId: input.issueId,
+          issueIdentifier: input.issueIdentifier,
+          runtimeModel: "gpt-5.5-fixture",
+          harnessId: "hermes",
+        },
+        iso(terminalAtMs - 60_000),
+        input.runIndex + 1,
+      )
+    : null;
   return {
     runId,
     sessionId,
@@ -383,12 +428,7 @@ function buildRunRecord(input: {
           cancellationOutcome: "cancelled" as const,
         }
       : {}),
-    ...(status === "running" && input.issueIndex % 6 === 0
-      ? {
-          pendingApprovalRequestId: `fixture-approval-${input.issueNumber}`,
-          pendingApprovalRequestedAt: iso(input.startedAtMs + 90_000),
-        }
-      : {}),
+    ...(providerLimit ? { providerLimit } : {}),
     ...(status === "failed"
       ? {
           failureKind: "fixture_failure",
@@ -413,26 +453,24 @@ function buildTranscriptEvents(run: RunRecord, eventCount: number): TranscriptEv
         source: "harness",
         eventType: "user_prompt",
         message: `Fixture prompt accepted for ${run.issueIdentifier}`,
+        payload: { kind: "user", issueIdentifier: run.issueIdentifier, prompt: run.prompt },
       };
     }
     if (sequence === eventCount && run.status !== "running") {
       return terminalTranscriptEvent(run, sequence, at);
     }
-    if (sequence % 11 === 0) {
-      return {
-        runId: run.runId,
-        sequence,
-        at,
-        source: "cursor",
-        eventType: "tool_call",
-        message: `Fixture tool call ${sequence} completed`,
-        payload: {
-          name: sequence % 22 === 0 ? "read_file" : "search_files",
-          status: "completed",
-          truncated: false,
-        },
-      };
-    }
+    if (sequence === 2) return runStatusTranscriptEvent(run, sequence, at, "initial");
+    if (sequence === 3) return tokenTranscriptEvent(run, sequence, at);
+    if (sequence === 4) return diagnosticTranscriptEvent(run, sequence, at, { oversized: true });
+    if (sequence === 5) return rateLimitTranscriptEvent(run, sequence, at);
+    if (sequence === 6) return providerLimitTranscriptEvent(run, sequence, at);
+    if (sequence === 7 || sequence === 8) return assistantDeltaTranscriptEvent(run, sequence, at);
+    if (sequence === 9) return assistantCompleteTranscriptEvent(run, sequence, at);
+    if (sequence === 10) return toolCallTranscriptEvent(run, sequence, at);
+    if (sequence % 19 === 0) return providerLimitTranscriptEvent(run, sequence, at);
+    if (sequence % 17 === 0) return rateLimitTranscriptEvent(run, sequence, at);
+    if (sequence % 13 === 0) return diagnosticTranscriptEvent(run, sequence, at, { oversized: true });
+    if (sequence % 11 === 0) return toolCallTranscriptEvent(run, sequence, at);
     if (sequence % 7 === 0) {
       return {
         runId: run.runId,
@@ -441,6 +479,7 @@ function buildTranscriptEvents(run: RunRecord, eventCount: number): TranscriptEv
         source: "runtime",
         eventType: "thinking",
         message: `Fixture reasoning checkpoint ${sequence}`,
+        payload: { kind: "thinking", checkpoint: sequence },
       };
     }
     if (sequence % 5 === 0) {
@@ -451,6 +490,7 @@ function buildTranscriptEvents(run: RunRecord, eventCount: number): TranscriptEv
         source: "runtime",
         eventType: "assistant_message",
         message: `Fixture assistant progress update ${sequence}`,
+        payload: { kind: "assistant", text: `Fixture assistant progress update ${sequence}` },
       };
     }
     return {
@@ -460,19 +500,199 @@ function buildTranscriptEvents(run: RunRecord, eventCount: number): TranscriptEv
       source: "harness",
       eventType: "progress",
       message: `Fixture progress event ${sequence}`,
+      payload: { type: "progress", message: `Fixture progress event ${sequence}` },
     };
   });
 }
 
+function runStatusTranscriptEvent(
+  run: RunRecord,
+  sequence: number,
+  at: string,
+  source: "initial" | "onDidChangeStatus" | "wait",
+): TranscriptEvent {
+  const sdkStatus = run.status === "succeeded" ? "finished" : run.status === "failed" ? "error" : run.status;
+  return {
+    runId: run.runId,
+    sequence,
+    at,
+    source: "harness",
+    eventType: "run_status",
+    message: `Fixture SDK status ${sdkStatus}`,
+    payload: {
+      type: "run_status",
+      runId: run.runId,
+      sdkStatus,
+      source,
+      status: sdkStatus,
+      at,
+    },
+  };
+}
+
+function tokenTranscriptEvent(run: RunRecord, sequence: number, at: string): TranscriptEvent {
+  return {
+    runId: run.runId,
+    sequence,
+    at,
+    source: "harness",
+    eventType: "tokens",
+    message: `Fixture token update ${run.tokens.totalTokens}`,
+    payload: {
+      type: "tokens",
+      tokens: run.tokens,
+      inputTokens: run.tokens.inputTokens,
+      outputTokens: run.tokens.outputTokens,
+      totalTokens: run.tokens.totalTokens,
+      at,
+    },
+  };
+}
+
+function diagnosticTranscriptEvent(
+  run: RunRecord,
+  sequence: number,
+  at: string,
+  options: { oversized?: boolean } = {},
+): TranscriptEvent {
+  const code = run.status === "failed" ? "FIXTURE_FAILURE_DIAGNOSTIC" : "FIXTURE_CONTEXT_WINDOW_DIAGNOSTIC";
+  const diagnosticPayload = {
+    category: run.status === "failed" ? "harness_failure" : "context_governor",
+    observedValue: run.tokens.totalTokens + sequence * 97,
+    threshold: 272_000,
+    remediation: "Synthetic diagnostic included so large-history scans exercise diagnostic payload projection.",
+    oversizedContextPreview: options.oversized ? oversizedText(`${run.issueIdentifier}:${run.runId}:diagnostic:${sequence}`) : undefined,
+    redactionProbe: {
+      apiToken: "[REDACTED]",
+      authorization: "Bearer [REDACTED]",
+    },
+  };
+  return {
+    runId: run.runId,
+    sequence,
+    at,
+    source: "harness",
+    eventType: "run_diagnostic",
+    message: `Fixture diagnostic ${code} for ${run.issueIdentifier}`,
+    payload: {
+      type: "run_diagnostic",
+      code,
+      message: `Fixture diagnostic ${code} for ${run.issueIdentifier}`,
+      payload: diagnosticPayload,
+      at,
+    },
+  };
+}
+
+function rateLimitTranscriptEvent(run: RunRecord, sequence: number, at: string): TranscriptEvent {
+  return {
+    runId: run.runId,
+    sequence,
+    at,
+    source: "harness",
+    eventType: "rate_limits",
+    message: "Fixture provider rate-limit snapshot",
+    payload: {
+      type: "rate_limits",
+      status: "observed",
+      provider: "openai-codex-fixture",
+      requests: {
+        limit: 1_000,
+        remaining: Math.max(0, 1_000 - sequence * 3),
+        resetAt: iso(Date.parse(at) + 45 * 60 * 1000),
+      },
+      tokens: {
+        limit: 272_000,
+        remaining: Math.max(0, 272_000 - run.tokens.totalTokens),
+        resetAt: iso(Date.parse(at) + 45 * 60 * 1000),
+      },
+    },
+  };
+}
+
+function providerLimitTranscriptEvent(run: RunRecord, sequence: number, at: string): TranscriptEvent {
+  const signal = providerLimitSignalFor(run, at, sequence);
+  return {
+    runId: run.runId,
+    sequence,
+    at,
+    source: "harness",
+    eventType: "provider_limit",
+    message: signal.message,
+    payload: {
+      type: "provider_limit",
+      signal,
+      at,
+    },
+  };
+}
+
+function assistantDeltaTranscriptEvent(run: RunRecord, sequence: number, at: string): TranscriptEvent {
+  const delta = sequence % 2 === 0 ? "with deterministic continuation chunks." : `Fixture assistant delta for ${run.issueIdentifier}`;
+  return {
+    runId: run.runId,
+    sequence,
+    at,
+    source: "runtime",
+    eventType: "assistant_delta",
+    message: delta,
+    payload: {
+      type: "assistant_delta",
+      kind: "assistant",
+      text: delta,
+      delta,
+    },
+  };
+}
+
+function assistantCompleteTranscriptEvent(run: RunRecord, sequence: number, at: string): TranscriptEvent {
+  const text = `Fixture assistant complete response for ${run.issueIdentifier} after streamed deltas.`;
+  return {
+    runId: run.runId,
+    sequence,
+    at,
+    source: "runtime",
+    eventType: "assistant_complete",
+    message: text,
+    payload: {
+      type: "assistant_complete",
+      kind: "assistant",
+      text,
+    },
+  };
+}
+
+function toolCallTranscriptEvent(run: RunRecord, sequence: number, at: string): TranscriptEvent {
+  return {
+    runId: run.runId,
+    sequence,
+    at,
+    source: "cursor",
+    eventType: "tool_call",
+    message: `Fixture tool call ${sequence} completed`,
+    payload: {
+      type: "tool_call",
+      call_id: `fixture-call-${run.runId}-${sequence}`,
+      name: sequence % 22 === 0 ? "read_file" : "search_files",
+      status: "completed",
+      args: { pattern: "fixture", path: run.workspacePath },
+      result: sequence % 22 === 0 ? oversizedText(`${run.runId}:tool-result:${sequence}`, 120) : "Fixture tool result loaded.",
+      truncated: sequence % 22 === 0,
+    },
+  };
+}
+
 function terminalTranscriptEvent(run: RunRecord, sequence: number, at: string): TranscriptEvent {
   if (run.status === "failed") {
+    const error = run.error ?? "Fixture run failed";
     return {
       runId: run.runId,
       sequence,
       at,
       source: "harness",
-      eventType: "error",
-      message: run.error ?? "Fixture run failed",
+      eventType: "failed",
+      message: error,
+      payload: { type: "failed", error, at },
     };
   }
   if (run.status === "cancelled") {
@@ -483,6 +703,7 @@ function terminalTranscriptEvent(run: RunRecord, sequence: number, at: string): 
       source: "harness",
       eventType: "cancelled",
       message: "Fixture run cancelled",
+      payload: { type: "cancelled", at },
     };
   }
   return {
@@ -492,6 +713,7 @@ function terminalTranscriptEvent(run: RunRecord, sequence: number, at: string): 
     source: "harness",
     eventType: "completed",
     message: "Fixture run completed",
+    payload: { type: "completed", message: "Fixture run completed", at },
   };
 }
 
@@ -553,6 +775,99 @@ async function writeWritebackOperations(input: {
   return operations;
 }
 
+function buildApprovalRecords(input: {
+  issueId: string;
+  issueIdentifier: string;
+  issueIndex: number;
+  issueStartMs: number;
+  workspacePath: string;
+  branchName: string;
+  baseRef: string;
+  lifecycle: IssueLifecycleRecord;
+}): OperatorApprovalRecord[] {
+  const runId = input.lifecycle.completionReports.at(-1)?.runId ?? input.lifecycle.summaryPointers.lastRunId;
+  if (!runId) return [];
+  const evidenceCursor = input.lifecycle.completionReports.at(-1)?.idempotencyKey ?? `fixture:${input.issueIdentifier}:publication-evidence`;
+  const status = approvalStatusFor(input.issueIndex);
+  const requestedAt = iso(input.issueStartMs + 46 * 60 * 1000);
+  const expiresAt = status === "expired" ? iso(input.issueStartMs + 50 * 60 * 1000) : iso(input.issueStartMs + 24 * 60 * 60 * 1000);
+  const resolvedAt = status === "pending" ? null : iso(input.issueStartMs + 52 * 60 * 1000);
+  const requestId = approvalRequestIdFor(runId, evidenceCursor);
+  const record: OperatorApprovalRecord = {
+    requestId,
+    status,
+    issueId: input.issueId,
+    issueIdentifier: input.issueIdentifier,
+    runId,
+    evidenceCursor,
+    dedupeKey: approvalDedupeKey(runId, evidenceCursor),
+    action: {
+      kind: "push_and_pr",
+      branchName: input.branchName,
+      baseBranch: input.baseRef,
+      workspacePath: input.workspacePath,
+      title: `${input.issueIdentifier}: synthetic publication approval`,
+      evidenceCursor,
+      summaryPreview: `Synthetic ${status} publication approval fixture for ${input.issueIdentifier}`,
+      changedFiles: ["scripts/generate-large-history-fixture.ts", "tests/large-history-fixture.test.ts"],
+      plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+    },
+    requestedAt,
+    expiresAt: status === "pending" || status === "expired" ? expiresAt : null,
+    resolvedAt,
+    resolvedBy: approvalResolvedBy(status),
+    decision: approvalDecision(status),
+    staleReason: approvalStaleReason(status),
+  };
+  return [record];
+}
+
+function applyPendingApprovalMetadata(runs: RunRecord[], approvals: readonly OperatorApprovalRecord[]): void {
+  for (const approval of approvals) {
+    if (approval.status !== "pending") continue;
+    const run = runs.find((candidate) => candidate.runId === approval.runId);
+    if (!run) continue;
+    run.pendingApprovalRequestId = approval.requestId;
+    run.pendingApprovalRequestedAt = approval.requestedAt;
+  }
+}
+
+function approvalStatusFor(issueIndex: number): OperatorApprovalStatus {
+  const statuses: OperatorApprovalStatus[] = ["approved", "rejected", "cancelled", "pending", "stale", "expired"];
+  return statuses[issueIndex % statuses.length] ?? "approved";
+}
+
+function isPendingFixturePublicationApproval(issueIndex: number): boolean {
+  return lifecyclePhaseFor(issueIndex) === "blocked" && approvalStatusFor(issueIndex) === "pending";
+}
+
+function approvalDecision(status: OperatorApprovalStatus): OperatorApprovalRecord["decision"] {
+  if (status === "approved") return "approve";
+  if (status === "rejected") return "reject";
+  return null;
+}
+
+function approvalResolvedBy(status: OperatorApprovalStatus): OperatorApprovalRecord["resolvedBy"] {
+  if (status === "pending") return null;
+  if (status === "approved" || status === "rejected") return "operator";
+  return "system";
+}
+
+function approvalStaleReason(status: OperatorApprovalStatus): string | null {
+  if (status === "stale") return "superseded by newer completion report evidence cursor";
+  if (status === "expired") return "approval request expired";
+  if (status === "cancelled") return "publication approval cancelled by fixture cancellation path";
+  return null;
+}
+
+function approvalDedupeKey(runId: string, evidenceCursor: string): string {
+  return `${runId}:${evidenceCursor}:push_and_pr`;
+}
+
+function approvalRequestIdFor(runId: string, evidenceCursor: string): string {
+  return `approval_${createHash("sha256").update(approvalDedupeKey(runId, evidenceCursor)).digest("hex").slice(0, 16)}`;
+}
+
 function buildLifecycleRecord(input: {
   issueId: string;
   issueIdentifier: string;
@@ -588,6 +903,10 @@ function buildLifecycleRecord(input: {
   };
   const completionReports = buildCompletionReports(input, lastWorkerRun, summaryPointers);
   const reviewVerdicts = buildReviewVerdicts(input, lastReviewerRun, phase);
+  const oversizedSummary = oversizedText(`${input.issueIdentifier}:continuation-summary`, 90);
+  const oversizedTranscriptPointer = `/api/v1/runs/${input.runs[0]?.runId ?? "missing"}/transcript?fixtureReference=${textFingerprint(
+    oversizedSummary,
+  )}&payload=${"x".repeat(4_096)}`;
   const baseRecord: Omit<IssueLifecycleRecord, "handoff"> = {
     issueId: input.issueId,
     issueIdentifier: input.issueIdentifier,
@@ -601,7 +920,7 @@ function buildLifecycleRecord(input: {
     lastPlanningFailureAt: input.issueIndex % 13 === 0 ? iso(input.issueStartMs + 5 * 60 * 1000) : null,
     lastCompletionReportId: completionReports.at(-1)?.id ?? null,
     lastReviewVerdictId: reviewVerdicts.at(-1)?.id ?? null,
-    blockedReason: phase === "blocked" ? "Synthetic large-history fixture blocker" : null,
+    blockedReason: phase === "blocked" ? (isPendingFixturePublicationApproval(input.issueIndex) ? PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON : "Synthetic large-history fixture blocker") : null,
     summaryPointers,
     summaryReferences: [
       {
@@ -620,6 +939,23 @@ function buildLifecycleRecord(input: {
         configFingerprint: "large-history-fixture",
         cursorMode: null,
         createdAt: iso(input.issueStartMs + 30 * 60 * 1000),
+      },
+      {
+        id: `fixture-summary-oversized-${input.issueIdentifier}`,
+        kind: "continuation_history",
+        summary: oversizedSummary,
+        runIds: input.runs.map((run) => run.runId),
+        transcriptEventCount: input.runs.reduce((count, run) => count + (run.transcriptEventCount ?? 0), 0),
+        transcriptPointers: [oversizedTranscriptPointer, ...input.runs.map((run) => `/api/v1/runs/${run.runId}/transcript?limit=1000&offset=0`)],
+        statusApiPointers: [
+          `/api/v1/issues/${input.issueIdentifier}?include=oversized-summary`,
+          `/api/v1/web/history?issue=${input.issueIdentifier}&include=summaryReferences`,
+        ],
+        issueUpdatedAt: updatedAt,
+        issueContentFingerprint: `fixture-content-oversized-${textFingerprint(oversizedSummary)}`,
+        configFingerprint: "large-history-fixture-oversized-reference",
+        cursorMode: null,
+        createdAt: iso(input.issueStartMs + 31 * 60 * 1000),
       },
     ],
     issueBreakdownPlans: [],
@@ -687,7 +1023,7 @@ function buildCompletionReports(
       pullRequest,
       risks: [],
       acceptedAt: iso(input.issueStartMs + 45 * 60 * 1000),
-      writebackOperationKeys: input.writebackOperationKeys,
+      writebackOperationKeys: isPendingFixturePublicationApproval(input.issueIndex) ? [] : input.writebackOperationKeys,
     },
   ];
 }
@@ -748,6 +1084,62 @@ function tokenCountsFor(issueIndex: number, runIndex: number, eventCount: number
     outputTokens,
     totalTokens: inputTokens + outputTokens,
   };
+}
+
+function providerLimitSignalFor(
+  run: Pick<RunRecord, "runId" | "sessionId" | "role" | "runPhase" | "issueId" | "issueIdentifier" | "runtimeModel" | "harnessId">,
+  observedAt: string,
+  sequence: number,
+): ProviderLimitSignal {
+  const retryAfterMs = 15 * 60 * 1000 + sequence * 1_000;
+  const kind = sequence % 2 === 0 ? "windowed_bucket_exhausted" : "transient_rate_limit";
+  return {
+    scope: {
+      harnessId: run.harnessId ?? "hermes",
+      providerId: "openai-codex-fixture",
+      model: run.runtimeModel ?? null,
+      accountScopeKey: `fixture-${run.issueIdentifier.toLowerCase()}`,
+    },
+    kind,
+    window: {
+      resumeAt: iso(Date.parse(observedAt) + retryAfterMs),
+      retryAfterMs,
+      windowLabel: sequence % 2 === 0 ? "Synthetic 5h fixture bucket" : "Synthetic retry-after fixture window",
+      windowKind: sequence % 2 === 0 ? "codex_5h" : "retry_after",
+    },
+    resumePolicy: "auto_at_window_close",
+    message: `Synthetic provider limit for ${run.issueIdentifier} (${kind})`,
+    observedAt,
+    source: {
+      issueId: run.issueId,
+      issueIdentifier: run.issueIdentifier,
+      runId: run.runId,
+      sessionId: run.sessionId,
+      role: run.role,
+      runPhase: run.runPhase ?? null,
+    },
+    raw: {
+      fixture: true,
+      sequence,
+      headers: {
+        "x-ratelimit-limit": "1000",
+        "x-ratelimit-remaining": String(Math.max(0, 1000 - sequence)),
+        "retry-after-ms": String(retryAfterMs),
+      },
+    },
+  };
+}
+
+function oversizedText(seed: string, repeat = 260): string {
+  const fingerprint = createHash("sha256").update(seed).digest("hex").slice(0, 16);
+  return Array.from(
+    { length: repeat },
+    (_, index) => `large-history-fixture:${fingerprint}:${pad(index + 1, 4)}:${seed}: deterministic payload segment for pagination and projection truncation`,
+  ).join("\n");
+}
+
+function textFingerprint(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
 function writebackStatusFor(index: number): WritebackStatus {

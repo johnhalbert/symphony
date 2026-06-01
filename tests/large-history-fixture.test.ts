@@ -3,6 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { projectWebHistory } from "../src/app/WebHistoryProjection.js";
+import { projectWebTranscript } from "../src/app/WebTranscriptProjection.js";
+import { approvalMatchesReport, isAwaitingPublicationApprovalLifecycle, pendingPublicationReport } from "../src/core/CompletionReportService.js";
+import { FileOperatorApprovalStore } from "../src/core/approval/OperatorApprovalService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
@@ -36,6 +39,7 @@ describe("generateLargeHistoryFixture", () => {
       lifecycleRecords: 6,
       runs: 24,
       transcriptEvents: 192,
+      approvalRequests: 6,
       writebackOperations: 30,
     });
     expect(manifest.issues[0]).toMatchObject({
@@ -48,6 +52,7 @@ describe("generateLargeHistoryFixture", () => {
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const writebackStore = new FileWritebackOutboxStore(stateDir);
+    const approvalStore = new FileOperatorApprovalStore(stateDir);
 
     const runs = await runStore.listRuns();
     expect(runs).toHaveLength(24);
@@ -82,6 +87,34 @@ describe("generateLargeHistoryFixture", () => {
       summaryPointers: { workspaceKey: "LH-0003", branchName: "fixture/lh-0003" },
     });
 
+    const approvals = await approvalStore.list();
+    expect(approvals).toHaveLength(6);
+    expect(new Set(approvals.map((record) => record.status))).toEqual(
+      new Set(["pending", "approved", "rejected", "cancelled", "stale", "expired"]),
+    );
+    const pendingApproval = await approvalStore.findPendingForIssue(["LH-0004", "fixture-issue-0004"]);
+    expect(pendingApproval).toMatchObject({
+      status: "pending",
+      issueId: "fixture-issue-0004",
+      issueIdentifier: "LH-0004",
+    });
+    const pendingRun = pendingApproval ? await runStore.getRun(pendingApproval.runId) : null;
+    expect(pendingApproval ? await approvalStore.findPendingForRun(pendingApproval.runId) : null).toMatchObject({
+      requestId: pendingApproval?.requestId,
+    });
+    expect(pendingRun).toMatchObject({
+      pendingApprovalRequestId: pendingApproval?.requestId,
+      pendingApprovalRequestedAt: pendingApproval?.requestedAt,
+    });
+    const pendingLifecycle = await lifecycleStore.get("LH-0004");
+    expect(pendingLifecycle).not.toBeNull();
+    if (!pendingLifecycle) throw new Error("expected pending approval lifecycle fixture");
+    expect(isAwaitingPublicationApprovalLifecycle(pendingLifecycle)).toBe(true);
+    const pendingReport = pendingPublicationReport(pendingLifecycle);
+    expect(pendingReport).not.toBeNull();
+    expect(pendingReport?.writebackOperationKeys).toEqual([]);
+    expect(pendingApproval && pendingReport ? approvalMatchesReport(pendingApproval, pendingReport) : false).toBe(true);
+
     const writebacks = await writebackStore.list();
     expect(writebacks).toHaveLength(30);
     expect(new Set(writebacks.map((operation) => operation.status))).toEqual(
@@ -97,6 +130,69 @@ describe("generateLargeHistoryFixture", () => {
     expect(history.sessions).toHaveLength(24);
     expect(history.defaultSessionId).not.toBe("");
     expect(history.sessions.some((session) => session.runSession.runtime.agentLifecycle === "reuse_by_issue")).toBe(true);
+    expect(history.sessions.some((session) => session.runSession.approval.pendingRequestId === pendingApproval?.requestId)).toBe(true);
+  });
+
+  it("generates diagnostic, token, limit, approval, and oversized-reference scenarios through existing projections", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "large-history-fixture-scenarios");
+
+    await generateLargeHistoryFixture({
+      outputDir: stateDir,
+      issueCount: 6,
+      runsPerIssue: 4,
+      eventsPerRun: 14,
+      writebacksPerIssue: 2,
+      baseTimestamp: "2026-03-04T05:06:07.000Z",
+      issuePrefix: "TR",
+    });
+
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const run = await runStore.getRun("fixture-run-0001-01");
+    expect(run).not.toBeNull();
+
+    const transcriptPage = await runStore.readTranscript("fixture-run-0001-01", { offset: 0, limit: 14 });
+    const eventTypes = new Set(transcriptPage.events.map((event) => event.eventType));
+    for (const eventType of [
+      "user_prompt",
+      "run_status",
+      "tokens",
+      "run_diagnostic",
+      "rate_limits",
+      "provider_limit",
+      "assistant_delta",
+      "assistant_complete",
+      "tool_call",
+      "progress",
+    ]) {
+      expect(eventTypes.has(eventType)).toBe(true);
+    }
+
+    const diagnostic = transcriptPage.events.find((event) => event.eventType === "run_diagnostic");
+    const diagnosticPayload = asRecord(diagnostic?.payload);
+    const nestedDiagnosticPayload = asRecord(diagnosticPayload.payload);
+    expect(String(nestedDiagnosticPayload.oversizedContextPreview)).toContain("[truncated]");
+    expect(asRecord(nestedDiagnosticPayload.redactionProbe).apiToken).toBe("[redacted]");
+
+    const providerLimit = asRecord(transcriptPage.events.find((event) => event.eventType === "provider_limit")?.payload);
+    expect(asRecord(providerLimit.signal).kind).toBe("windowed_bucket_exhausted");
+    const tokens = asRecord(transcriptPage.events.find((event) => event.eventType === "tokens")?.payload);
+    expect(asRecord(tokens.tokens).totalTokens).toBe(run?.tokens.totalTokens);
+
+    const messages = projectWebTranscript(transcriptPage.events, { run });
+    expect(messages.some((message) => message.kind === "assistant" && message.text.includes("complete response"))).toBe(true);
+    expect(messages.some((message) => message.kind === "tool_call" && message.name === "search_files")).toBe(true);
+    expect(messages.some((message) => message.kind === "status" && message.state === "tokens")).toBe(true);
+
+    await expectTerminalEvent(runStore, "fixture-run-0001-02", "completed");
+    await expectTerminalEvent(runStore, "fixture-run-0003-04", "cancelled");
+    await expectTerminalEvent(runStore, "fixture-run-0005-04", "failed");
+
+    const lifecycle = await lifecycleStore.get("TR-0004");
+    const oversizedReference = lifecycle?.summaryReferences.find((reference) => reference.id.includes("oversized"));
+    expect(oversizedReference?.summary.length).toBeGreaterThan(5_000);
+    expect(oversizedReference?.transcriptPointers.some((pointer) => pointer.length > 4_000)).toBe(true);
   });
 
   it("supports empty transcript/writeback boundaries without omitting durable run and lifecycle records", async () => {
@@ -164,4 +260,16 @@ async function makeTempRoot(): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "symphony-large-history-fixture-"));
   tempRoots.push(root);
   return root;
+}
+
+async function expectTerminalEvent(runStore: FileRunTranscriptStore, runId: string, eventType: string): Promise<void> {
+  const tail = await runStore.readTranscriptTail(runId, { limit: 1 });
+  expect(tail.events.at(-1)?.eventType).toBe(eventType);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  expect(value).toBeTruthy();
+  expect(typeof value).toBe("object");
+  expect(Array.isArray(value)).toBe(false);
+  return value as Record<string, unknown>;
 }
