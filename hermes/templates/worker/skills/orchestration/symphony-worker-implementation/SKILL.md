@@ -41,8 +41,13 @@ Keep delegated work bounded:
 
 - Ask one concrete question per subagent.
 - Provide paths, symbols, issue context, and success criteria; do not paste large file bodies.
+- Tell research subagents not to call `delegate_task`; child research must be leaf-only.
+- Give each research subagent a hard stop: answer after the first useful map of paths/symbols/tests, after roughly five tool rounds, or when context pressure/compression appears. Partial concise findings are preferable to continued exploration.
+- Limit broad search/read behavior: use targeted search patterns and read only the smallest relevant files or sections. Do not dump large recursive search results; summarize matches by path and symbol.
+- Prefer five to eight highly relevant files per research task. If more are needed, report the next files to inspect instead of reading all of them.
 - Tell research subagents to avoid file edits, package installs, git mutations, GitHub/Linear writes, secrets inspection, and lifecycle writeback.
 - Ask for concise output: answer, evidence paths/symbols, relevant tests, risks/open questions, and no raw transcript dump.
+- If the subagent reaches compression or is about to compact, stop and return current findings instead of continuing the research chain.
 - Prefer at most three parallel research subagents for independent questions.
 
 Do not delegate:

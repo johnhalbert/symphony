@@ -6,6 +6,8 @@ agent:
   tool_use_enforcement: auto
   disabled_toolsets:
     - tts
+compression:
+  threshold: 0.75
 memory:
   memory_enabled: false
   user_profile_enabled: false

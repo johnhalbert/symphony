@@ -29,6 +29,18 @@ describe("Hermes role template policy", () => {
     expect(agentMaxTurns(planner)).toBe(SYMPHONY_HERMES_AGENT_MAX_TURNS);
   });
 
+  it("delays compression for all Symphony role profiles", async () => {
+    const templatesDir = path.resolve("hermes", "templates");
+
+    const worker = await readTemplateConfig(path.join(templatesDir, "worker", "config.yaml"));
+    const reviewer = await readTemplateConfig(path.join(templatesDir, "reviewer", "config.yaml"));
+    const planner = await readTemplateConfig(path.join(templatesDir, "planner", "config.yaml"));
+
+    expect(compressionThreshold(worker)).toBe(0.75);
+    expect(compressionThreshold(reviewer)).toBe(0.75);
+    expect(compressionThreshold(planner)).toBe(0.75);
+  });
+
   it("seeds and requires the Symphony worker implementation skill", async () => {
     const workerTemplateDir = path.resolve("hermes", "templates", "worker");
     const soul = await readFile(path.join(workerTemplateDir, "SOUL.md"), "utf8");
@@ -42,6 +54,9 @@ describe("Hermes role template policy", () => {
     expect(skill).toContain("name: symphony-worker-implementation");
     expect(skill).toContain("delegate_task");
     expect(skill).toContain("bounded read-only research");
+    expect(skill).toContain("child research must be leaf-only");
+    expect(skill).toContain("Do not dump large recursive search results");
+    expect(skill).toContain("stop and return current findings");
     expect(skill).toContain("Do not perform service-owned publication actions");
   });
 });
@@ -63,4 +78,11 @@ function agentMaxTurns(config: Record<string, unknown>): number | null {
   if (typeof agent !== "object" || agent === null || Array.isArray(agent)) return null;
   const maxTurns = (agent as Record<string, unknown>).max_turns;
   return typeof maxTurns === "number" ? maxTurns : null;
+}
+
+function compressionThreshold(config: Record<string, unknown>): number | null {
+  const compression = config.compression;
+  if (typeof compression !== "object" || compression === null || Array.isArray(compression)) return null;
+  const threshold = (compression as Record<string, unknown>).threshold;
+  return typeof threshold === "number" ? threshold : null;
 }
