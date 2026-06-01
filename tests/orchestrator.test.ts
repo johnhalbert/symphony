@@ -361,7 +361,7 @@ describe("Orchestrator", () => {
         { kind: "assistant", ts: expect.any(String), text: "hello" },
         { kind: "thinking", ts: expect.any(String), text: "Hermes ACP thought update" },
         expect.objectContaining({ kind: "tool_call", call_id: "call-1", name: "terminal", status: "succeeded", result: "tests passed" }),
-        { kind: "status", state: "token_usage_reported", ts: expect.any(String), text: "Token usage reported" },
+        { kind: "status", state: "token_usage_reported", ts: expect.any(String), text: "Tokens: input 3 · output 5 · total 8" },
         { kind: "status", state: "runtime_diagnostic", ts: expect.any(String), text: "ACP permission denied" },
         { kind: "status", state: "run_succeeded", ts: expect.any(String), text: "Run completed" },
       ]),
