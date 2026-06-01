@@ -61,6 +61,17 @@ describe("issues components", () => {
     expect(blankHtml).toContain("blank");
   });
 
+  it("renders existing issue empty activity with neutral copy", () => {
+    const html = renderToStaticMarkup(
+      <ReferenceDataProvider value={{ users: {}, labels: {} }}>
+        <DetailColumn issue={makeIssue({ activity: [] })} onClose={() => {}} />
+      </ReferenceDataProvider>,
+    );
+
+    expect(html).toContain("No issue activity available.");
+    expect(html).not.toContain("mock data");
+  });
+
   it("renders the empty detail state without dereferencing a null issue", () => {
     const html = renderToStaticMarkup(
       <ReferenceDataProvider value={{ users: {}, labels: {} }}>

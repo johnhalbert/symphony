@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StatusServer } from "../src/app/http.js";
+import { projectWebTranscript } from "../src/app/WebTranscriptProjection.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import {
   CompletionReportService,
@@ -22,6 +23,7 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import type { RunActivityEvent } from "../src/core/runActivity/RunActivityEvent.js";
 import {
   planIssueBreakdownApplicationWritebacks,
   planIssueBreakdownFinalizationWritebacks,
@@ -130,6 +132,267 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
     expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
+  });
+
+  it("persists distinct Hermes ACP runtime metadata on started runs", async () => {
+    const config = testConfig(root);
+    config.agent.harness = "hermes_acp";
+    config.hermes.provider = "openrouter";
+    config.hermes.model = "anthropic/claude-sonnet-test";
+    config.hermes.acpBinaryPath = "/opt/hermes/bin/hermes";
+    config.hermes.acpSourceProfile = "dogfood";
+    config.hermes.acpProfilePrefix = "sym-test";
+    config.hermes.workerSessionLifecycle = "fresh_per_run";
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness: AgentHarness & { runs: Array<{ ctx: AgentRunContext; prompt: string }> } = {
+      id: "hermes_acp",
+      capabilities: { continuation: true, mcpHandoff: true },
+      runs: [],
+      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+        this.runs.push({ ctx, prompt });
+        yield { type: "session_started", sessionId: `hermes-acp-${ctx.issue.id}-${ctx.turnNumber}` };
+        yield { type: "completed", message: "hermes acp completed" };
+      },
+    };
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "Hermes ACP dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "Hermes ACP run completion");
+    await orchestrator.stop();
+
+    await expect(runStore.latestRunForIssue(candidate.id)).resolves.toMatchObject({
+      harnessId: "hermes_acp",
+      runtimeModel: "anthropic/claude-sonnet-test",
+      runtimeModelParams: [],
+      runtimeSettingSources: [
+        "host_hermes:/opt/hermes/bin/hermes",
+        "source_profile:dogfood",
+        "profile_prefix:sym-test",
+        "provider:openrouter",
+      ],
+      runtimeMode: null,
+      runtimeAgentLifecycle: "fresh_per_run",
+    });
+  });
+
+  it("persists harness-provided ACP RunActivityEvent metadata through the shared orchestrator transcript path", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    let active = true;
+    let refreshes = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return active ? [candidate] : [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        refreshes += 1;
+        if (refreshes === 1) return [candidate];
+        active = false;
+        return [{ ...candidate, state: "Done" }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const runId = `fake-${candidate.id}-1`;
+    const harness = new RunActivityHarness([
+      {
+        type: "progress",
+        activitySource: "delta",
+        message: "hello",
+        runActivity: acpActivity(runId, 2, {
+          actor: "assistant",
+          channel: "chat",
+          kind: "assistant_message_delta",
+          text: "hello",
+          payload: { delta: true, messagePreview: "hello", redacted: true },
+        }),
+      },
+      {
+        type: "progress",
+        activitySource: "stream",
+        message: "Hermes ACP thought update",
+        runActivity: acpActivity(runId, 3, {
+          actor: "assistant",
+          channel: "chat",
+          kind: "assistant_reasoning_delta",
+          text: "Hermes ACP thought update",
+          payload: { reasoning: true, messagePreview: "thought preview", redacted: true },
+        }),
+      },
+      {
+        type: "progress",
+        activitySource: "tool",
+        message: "Hermes ACP tool started: terminal",
+        runActivity: acpActivity(runId, 4, {
+          actor: "tool",
+          channel: "tool",
+          kind: "tool_call_started",
+          text: "Hermes ACP tool started: terminal",
+          payload: { toolCallId: "call-1", toolName: "terminal", status: "running", outputPreview: "started", redacted: true },
+        }),
+      },
+      {
+        type: "progress",
+        activitySource: "tool",
+        message: "Hermes ACP tool completed: terminal",
+        runActivity: acpActivity(runId, 5, {
+          actor: "tool",
+          channel: "tool",
+          kind: "tool_call_completed",
+          text: "Hermes ACP tool completed: terminal",
+          payload: { toolCallId: "call-1", toolName: "terminal", status: "succeeded", outputPreview: "tests passed", redacted: true },
+        }),
+      },
+      {
+        type: "tokens",
+        tokens: { inputTokens: 3, outputTokens: 5, totalTokens: 8 },
+        runActivity: acpActivity(runId, 6, {
+          actor: "runtime",
+          channel: "token",
+          kind: "token_usage_reported",
+          text: "Token usage reported",
+          payload: { inputTokens: 3, outputTokens: 5, totalTokens: 8, usageSource: "stream" },
+        }),
+      },
+      {
+        type: "run_diagnostic",
+        code: "hermes_acp_permission_denied",
+        message: "ACP permission denied",
+        payload: { paramsPreview: "safe" },
+        runActivity: acpActivity(runId, 7, {
+          actor: "runtime",
+          channel: "diagnostic",
+          kind: "runtime_diagnostic",
+          text: "ACP permission denied",
+          payload: { code: "hermes_acp_permission_denied", severity: "info", messagePreview: "permission denied", redacted: true },
+        }),
+      },
+      {
+        type: "completed",
+        message: "Run completed",
+        runActivity: acpActivity(runId, 8, {
+          actor: "runtime",
+          channel: "terminal",
+          kind: "run_succeeded",
+          text: "Run completed",
+          payload: { reason: "run_succeeded" },
+        }),
+      },
+    ]);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "run-activity harness dispatched");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "run-activity harness exited");
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    const run = await runStore.latestRunForIssue(candidate.id);
+    expect(run).toMatchObject({ runId, status: "succeeded", tokens: { inputTokens: 3, outputTokens: 5, totalTokens: 8 } });
+    const transcript = await runStore.readTranscript(runId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
+    expect(eventTypes).toEqual(
+      expect.arrayContaining([
+        "session_started",
+        "assistant_message_delta",
+        "assistant_reasoning_delta",
+        "tool_call_started",
+        "tool_call_completed",
+        "token_usage_reported",
+        "runtime_diagnostic",
+        "run_succeeded",
+      ]),
+    );
+    expect(eventTypes).not.toContain("agent_message_chunk");
+    expect(eventTypes).not.toContain("session/update");
+    expect(transcript.events.find((event) => event.eventType === "assistant_message_delta")).toMatchObject({
+      source: "harness",
+      message: "hello",
+      payload: {
+        kind: "assistant_message_delta",
+        actor: "assistant",
+        channel: "chat",
+        protocol: "acp",
+        activitySequence: 2,
+        sequenceSource: "harness",
+      },
+    });
+    expect(transcript.events.find((event) => event.eventType === "runtime_diagnostic")).toMatchObject({
+      payload: { kind: "runtime_diagnostic", code: "hermes_acp_permission_denied", messagePreview: "permission denied" },
+    });
+    const projected = projectWebTranscript(transcript.events, { includeRunPrelude: false });
+    expect(projected).toEqual(
+      expect.arrayContaining([
+        { kind: "assistant", ts: expect.any(String), text: "hello" },
+        { kind: "thinking", ts: expect.any(String), text: "Hermes ACP thought update" },
+        expect.objectContaining({ kind: "tool_call", call_id: "call-1", name: "terminal", status: "succeeded", result: "tests passed" }),
+        { kind: "status", state: "token_usage_reported", ts: expect.any(String), text: "Token usage reported" },
+        { kind: "status", state: "runtime_diagnostic", ts: expect.any(String), text: "ACP permission denied" },
+        { kind: "status", state: "run_succeeded", ts: expect.any(String), text: "Run completed" },
+      ]),
+    );
+  });
+
+  it("persists harness-provided ACP terminal failure and cancellation metadata through the shared orchestrator transcript path", async () => {
+    const failed = await runTerminalRunActivityScenario(root, "failed");
+    expect(failed.run).toMatchObject({ status: "failed", error: "Run failed token=[redacted]" });
+    expect(failed.eventTypes).toContain("run_failed");
+    expect(failed.eventTypes).not.toContain("failed");
+    expect(failed.transcript.events.find((event) => event.eventType === "run_failed")).toMatchObject({
+      message: "Run failed token=[redacted]",
+      payload: { kind: "run_failed", actor: "runtime", channel: "terminal", protocol: "acp", reason: "provider_error" },
+    });
+    expect(failed.projected).toEqual(
+      expect.arrayContaining([{ kind: "status", state: "run_failed", ts: expect.any(String), text: "Run failed token=[redacted]" }]),
+    );
+    expect(JSON.stringify(failed.transcript)).not.toContain("SECRET_TERMINAL_TOKEN");
+
+    const cancelled = await runTerminalRunActivityScenario(root, "cancelled");
+    expect(cancelled.run).toMatchObject({ status: "cancelled" });
+    expect(cancelled.eventTypes).toContain("run_cancelled");
+    expect(cancelled.eventTypes).not.toContain("cancelled");
+    expect(cancelled.transcript.events.find((event) => event.eventType === "run_cancelled")).toMatchObject({
+      message: "Run cancelled",
+      payload: { kind: "run_cancelled", actor: "runtime", channel: "terminal", protocol: "acp", reason: "operator_cancelled" },
+    });
+    expect(cancelled.projected).toEqual(
+      expect.arrayContaining([{ kind: "status", state: "run_cancelled", ts: expect.any(String), text: "Run cancelled" }]),
+    );
   });
 
   it("records provider-limit gates without normal retry and resumes after the window closes", async () => {
@@ -655,35 +918,216 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
   });
 
+  it("[event-guard:completed] treats accepted issue breakdown plans as succeeded when the harness completes after submitting", async () => {
+    const result = await runAcceptedIssueBreakdownHandoffScenario(root, { type: "completed" });
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
+
+    expect(eventTypes).toEqual(
+      expect.arrayContaining(["session_started", "handoff_terminal", "completed"]),
+    );
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
+  });
+
   it("[event-guard:failed] treats accepted issue breakdown plans as succeeded when the harness fails after submitting", async () => {
     const result = await runAcceptedIssueBreakdownHandoffScenario(root, {
       type: "failed",
       error: "post-plan harness failure",
     });
-    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "issue_breakdown_plan",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("failed");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
   });
 
   it("[event-guard:cancelled] treats accepted issue breakdown plans as succeeded when the harness is cancelled after submitting", async () => {
     const result = await runAcceptedIssueBreakdownHandoffScenario(root, { type: "cancelled" });
-    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "issue_breakdown_plan",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
   });
 
   it("[exit-guard:throw] terminalizes accepted planning runs when the harness throws after submitting without a terminal event", async () => {
     const result = await runAcceptedIssueBreakdownHandoffScenario(root, "throw");
-    const eventTypes = (await result.runStore.readTranscript(result.planRunId)).events.map((event) => event.eventType);
+    const transcript = await result.runStore.readTranscript(result.planRunId);
+    const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "issue_breakdown_plan",
+      status: "succeeded",
+    });
     expect(eventTypes).not.toContain("failed");
     expect(eventTypes).not.toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
+  });
+
+  it("[replay:planning-no-plan] records durable failed state when issue breakdown completes without a submitted plan", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.maxPlanningFailures = 3;
+    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownRejectingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    const run = await waitForTerminalRunRecord(runStore, "rejecting-plan-run-1");
+    await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
+    await settleOrchestratorExit();
+    const transcript = await runStore.readTranscript("rejecting-plan-run-1");
+    await orchestrator.stop();
+
+    const eventTypes = transcript.events.map((event) => event.eventType);
+    const planningEventTypes = eventTypes.filter((eventType) =>
+      ["session_started", "completed", "failed", "cancelled", "planning_run_failed"].includes(eventType),
+    );
+    expect(planningEventTypes).toEqual(["session_started", "completed", "planning_run_failed"]);
+    expect(transcript.events.find((event) => event.eventType === "planning_run_failed")?.payload).toMatchObject({
+      status: "failed",
+      error: "Planning run completed without submit_issue_breakdown_plan",
+      planningFailureCount: 1,
+    });
+    expect(run).toMatchObject({
+      status: "failed",
+      error: "Planning run completed without submit_issue_breakdown_plan",
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+      failureKind: "planning_run_failed",
+      failureDiagnosticCode: "planning_run_failed",
+      failureDiagnosticMessage: "Planning run completed without submit_issue_breakdown_plan",
+    });
+    await expectReplayFailedFromPlanningFailure(
+      config.workspace.stateDir,
+      "rejecting-plan-run-1",
+      "Planning run completed without submit_issue_breakdown_plan",
+    );
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(lifecycle?.lastPlanningFailureRunId).toBe("rejecting-plan-run-1");
+    expect(lifecycle?.incompleteTurnCount).toBe(0);
+  });
+
+  it("[replay:planning-no-plan] records durable failed state when issue breakdown fails or throws before submitting a plan", async () => {
+    for (const scenario of [
+      {
+        terminal: { type: "failed", error: "planning harness reported failure" } as const,
+        expectedRunId: "no-plan-terminal-run-1",
+        expectedEvents: ["session_started", "failed", "planning_run_failed"],
+        expectedError: "planning harness reported failure",
+      },
+      {
+        terminal: "throw" as const,
+        expectedRunId: "no-plan-terminal-run-1",
+        expectedEvents: ["session_started", "planning_run_failed"],
+        expectedError: "planning harness threw before submitting a plan",
+      },
+    ]) {
+      const scenarioRoot = path.join(root, `no-plan-${typeof scenario.terminal === "string" ? scenario.terminal : scenario.terminal.type}`);
+      const config = testConfig(scenarioRoot);
+      config.issueBreakdown.enabled = true;
+      config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+      config.issueBreakdown.planningLabels = ["planning"];
+      config.issueBreakdown.maxPlanningFailures = 3;
+      const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [candidate];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [candidate];
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+      const harness = new IssueBreakdownNoPlanTerminalHarness(scenario.terminal);
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        harness,
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore,
+      });
+
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1);
+      await waitForTerminalRunRecord(runStore, scenario.expectedRunId);
+      await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
+      await settleOrchestratorExit();
+      const transcript = await runStore.readTranscript(scenario.expectedRunId);
+      await orchestrator.stop();
+
+      const scenarioEventTypes = transcript.events
+        .map((event) => event.eventType)
+        .filter((eventType) => ["session_started", "completed", "failed", "cancelled", "planning_run_failed"].includes(eventType));
+      expect(scenarioEventTypes).toEqual(scenario.expectedEvents);
+      await expectReplayFailedFromPlanningFailure(config.workspace.stateDir, scenario.expectedRunId, scenario.expectedError);
+      const lifecycle = await lifecycleStore.get(candidate.id);
+      expect(lifecycle?.lastPlanningFailureRunId).toBe(scenario.expectedRunId);
+      expect(lifecycle?.incompleteTurnCount).toBe(0);
+    }
   });
 
   it("blocks repeated issue breakdown failures without incrementing implementation incomplete turns", async () => {
@@ -2704,8 +3148,20 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript("report-run-1");
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "pull_request_handoff",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("failed");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(stateDir, "report-run-1", {
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -2810,8 +3266,20 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript("report-run-1");
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "pull_request_handoff",
+      status: "succeeded",
+    });
     expect(eventTypes).toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(stateDir, "report-run-1", {
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -2914,9 +3382,21 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript("report-run-1");
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
+    expect(eventTypes).toContain("handoff_terminal");
+    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+      kind: "pull_request_handoff",
+      status: "succeeded",
+    });
     expect(eventTypes).not.toContain("failed");
     expect(eventTypes).not.toContain("cancelled");
     expect(eventTypes).not.toContain("completed");
+    await expectReplaySucceededFromHandoff(stateDir, "report-run-1", {
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/TEST-1",
+      lastEvidenceCursor: "idem-1",
+    });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -4751,7 +5231,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => harness.runs.length === 1, "head-advanced repair dispatch");
     await orchestrator.stop();
 
     expect(pullRequestClient.branches[0]).toBe("symphony/TEST-1");
@@ -5244,6 +5724,85 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("persists tool, diagnostic, token, and rate-limit harness events while applying side effects", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 1;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new DiagnosticActivityHarness();
+    const runStore = new FileRunTranscriptStore(root);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitForAsync(async () => (await runStore.getRun("diagnostic-run-1"))?.status === "succeeded", "diagnostic activity run");
+    await orchestrator.stop();
+
+    const run = await runStore.getRun("diagnostic-run-1");
+    const transcript = await runStore.readTranscript("diagnostic-run-1");
+    const serializedTranscript = JSON.stringify(transcript.events);
+
+    expect(run).toMatchObject({
+      tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+      transcriptEventCount: 6,
+    });
+    expect(orchestrator.snapshot().totals).toMatchObject({ inputTokens: 12, outputTokens: 8, totalTokens: 20 });
+    expect(orchestrator.snapshot().rateLimits).toEqual({
+      requests: { remaining: 2, resetAt: "2026-01-01T00:30:00.000Z" },
+      authorization: "[redacted]",
+    });
+    expect(transcript.events.map((event) => event.eventType)).toEqual([
+      "session_started",
+      "progress",
+      "run_diagnostic",
+      "tokens",
+      "rate_limits",
+      "completed",
+    ]);
+    expect(transcript.events[1]).toMatchObject({
+      message: "terminal tool completed",
+      payload: { kind: "tool", activitySource: "tool", progressKind: "tool" },
+    });
+    expect(transcript.events[2]).toMatchObject({
+      eventType: "run_diagnostic",
+      message: "Hermes gateway diagnostic token=[redacted]",
+      payload: { kind: "diagnostic", code: "hermes_gateway_protocol_error" },
+    });
+    expect(transcript.events[3]).toMatchObject({
+      eventType: "tokens",
+      payload: { kind: "usage", tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 } },
+    });
+    expect(transcript.events[4]).toMatchObject({
+      eventType: "rate_limits",
+      payload: {
+        kind: "rate_limits",
+        rateLimits: { requests: { remaining: 2, resetAt: "2026-01-01T00:30:00.000Z" }, authorization: "[redacted]" },
+      },
+    });
+    expect(serializedTranscript).not.toContain("SECRET_DIAGNOSTIC_TOKEN");
+    expect(serializedTranscript).not.toContain("SECRET_RATE_LIMIT_TOKEN");
+    expect(serializedTranscript).not.toContain("rawPayload");
+  });
+
   it("includes compact handoff for prior-run-only follow-up prompts", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -5339,7 +5898,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => harness.runs.length === 2, "continuation dispatch below event threshold", 5_000);
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(2);
@@ -5421,7 +5980,7 @@ describe("Orchestrator", () => {
     const storedLifecycle = await lifecycleStore.get(candidate.identifier);
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => harness.runs.length === 2, "continuation dispatch above event threshold", 5_000);
     await orchestrator.stop();
 
     expect(createdSummary.summaryReference.id).toContain("continuation-summary:issue-1:");
@@ -5944,6 +6503,110 @@ function createdIssueRefForOperation(operation: IssueCreateWriteback): IssueBrea
   };
 }
 
+class RunActivityHarness implements AgentHarness {
+  readonly id = "fake";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(private readonly events: AgentEvent[]) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    yield { type: "session_started", sessionId: `fake-${ctx.issue.id}-${ctx.turnNumber}` };
+    for (const event of this.events) yield event;
+  }
+}
+
+function acpActivity(runId: string, sequence: number, overrides: Partial<RunActivityEvent>): RunActivityEvent {
+  const payload =
+    overrides.payload && typeof overrides.payload === "object" && !Array.isArray(overrides.payload) ? overrides.payload : {};
+  return {
+    eventId: `${runId}:activity:${sequence}`,
+    runSessionId: `profile:acp-session-1:${runId}`,
+    occurredAt: `2026-05-31T00:00:0${Math.min(sequence, 9)}.000Z`,
+    sequence,
+    sequenceSource: "harness",
+    externalEventId: `upstream-${sequence}`,
+    protocol: "acp",
+    harness: "hermes-acp",
+    ...overrides,
+    payload: { runtimeSessionId: "acp-session-1", ...payload },
+  } as RunActivityEvent;
+}
+
+async function runTerminalRunActivityScenario(root: string, terminal: "failed" | "cancelled") {
+  const config = testConfig(root);
+  const candidate = issue({ id: `issue-${terminal}`, identifier: `TEST-${terminal.toUpperCase()}`, state: "Todo" });
+  let active = true;
+  let refreshes = 0;
+  const tracker: TrackerClient = {
+    async fetchCandidateIssues() {
+      return active ? [candidate] : [];
+    },
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssueStatesByIds() {
+      refreshes += 1;
+      if (refreshes === 1) return [candidate];
+      active = false;
+      return [{ ...candidate, state: "Done" }];
+    },
+  };
+  const logger = new StructuredLogger(() => undefined);
+  const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+  const runId = `fake-${candidate.id}-1`;
+  const terminalEvent: AgentEvent =
+    terminal === "failed"
+      ? {
+          type: "failed",
+          error: "Run failed token=SECRET_TERMINAL_TOKEN",
+          runActivity: acpActivity(runId, 2, {
+            actor: "runtime",
+            channel: "terminal",
+            kind: "run_failed",
+            text: "Run failed token=SECRET_TERMINAL_TOKEN",
+            payload: { reason: "provider_error", errorPreview: "Run failed token=SECRET_TERMINAL_TOKEN", redacted: true },
+          }),
+        }
+      : {
+          type: "cancelled",
+          runActivity: acpActivity(runId, 2, {
+            actor: "runtime",
+            channel: "terminal",
+            kind: "run_cancelled",
+            text: "Run cancelled",
+            payload: { reason: "operator_cancelled" },
+          }),
+        };
+  const harness = new RunActivityHarness([terminalEvent]);
+  const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+  const orchestrator = new Orchestrator({
+    config,
+    tracker,
+    workspaceManager,
+    harness,
+    logger,
+    promptTemplate: "Work on {{ issue.identifier }}",
+    runStore,
+  });
+
+  await orchestrator.refreshNow();
+  await waitFor(() => harness.runs.length === 1, `${terminal} run-activity harness dispatched`);
+  await waitFor(() => orchestrator.snapshot().counts.running === 0, `${terminal} run-activity harness exited`);
+  await settleOrchestratorExit();
+  await orchestrator.stop();
+
+  const run = await runStore.latestRunForIssue(candidate.id);
+  const transcript = await runStore.readTranscript(runId);
+  return {
+    run,
+    transcript,
+    eventTypes: transcript.events.map((event) => event.eventType),
+    projected: projectWebTranscript(transcript.events, { includeRunPrelude: false }),
+  };
+}
+
 async function waitFor(predicate: () => boolean, description = "condition", timeoutMs = 2_000): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -6004,12 +6667,52 @@ async function settleOrchestratorExit(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 25));
 }
 
+async function expectReplaySucceededFromHandoff(
+  stateDir: string,
+  runId: string,
+  expected: Record<string, unknown> = {},
+): Promise<void> {
+  const rebuilt = await new FileRunTranscriptStore(stateDir).rebuildRunFromTranscript(runId);
+  expect(rebuilt).toMatchObject({
+    status: "succeeded",
+    completedAt: expect.any(String),
+    error: null,
+    ...expected,
+  });
+  expect(rebuilt?.failureKind ?? null).toBeNull();
+  expect(rebuilt?.failureDiagnosticCode ?? null).toBeNull();
+  expect(rebuilt?.failureDiagnosticMessage ?? null).toBeNull();
+  expect(rebuilt?.failureDiagnosticAt ?? null).toBeNull();
+}
+
+async function expectReplayFailedFromPlanningFailure(
+  stateDir: string,
+  runId: string,
+  error: string,
+  expected: Record<string, unknown> = {},
+): Promise<void> {
+  const rebuilt = await new FileRunTranscriptStore(stateDir).rebuildRunFromTranscript(runId);
+  expect(rebuilt).toMatchObject({
+    status: "failed",
+    completedAt: expect.any(String),
+    error,
+    runPhase: "issue_breakdown",
+    runKind: "planning",
+    failureKind: "planning_run_failed",
+    failureDiagnosticCode: "planning_run_failed",
+    failureDiagnosticMessage: error,
+    failureDiagnosticAt: expect.any(String),
+    ...expected,
+  });
+}
+
 async function runAcceptedIssueBreakdownHandoffScenario(
   root: string,
   terminal: IssueBreakdownHandoffTerminal,
 ): Promise<{
   runStore: FileRunTranscriptStore;
   planRunId: string;
+  stateDir: string;
 }> {
   const config = testConfig(root);
   config.issueBreakdown.enabled = true;
@@ -6076,7 +6779,7 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   await orchestrator.stop();
   expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
 
-  return { runStore, planRunId };
+  return { runStore, planRunId, stateDir: config.workspace.stateDir };
 }
 
 class BlockingHarness implements AgentHarness {
@@ -6329,7 +7032,7 @@ class IssueBreakdownAcceptingHarness implements AgentHarness {
   }
 }
 
-type IssueBreakdownHandoffTerminal = { type: "failed"; error: string } | { type: "cancelled" } | "throw";
+type IssueBreakdownHandoffTerminal = { type: "completed" } | { type: "failed"; error: string } | { type: "cancelled" } | "throw";
 
 class IssueBreakdownHandoffHarness implements AgentHarness {
   readonly id = "issue-breakdown-handoff";
@@ -6392,6 +7095,21 @@ class IssueBreakdownRejectingHarness implements AgentHarness {
   }
 }
 
+class IssueBreakdownNoPlanTerminalHarness implements AgentHarness {
+  readonly id = "issue-breakdown-no-plan-terminal";
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(private readonly terminal: Extract<AgentEvent, { type: "failed" }> | "throw") {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    const runId = `no-plan-terminal-run-${this.runs.length}`;
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    if (this.terminal === "throw") throw new Error("planning harness threw before submitting a plan");
+    yield this.terminal;
+  }
+}
+
 class TokenSequenceHarness implements AgentHarness {
   readonly id = "token-sequence";
   readonly runs: string[] = [];
@@ -6406,6 +7124,30 @@ class TokenSequenceHarness implements AgentHarness {
     const tokens = this.tokenEvents[runNumber - 1];
     if (tokens) yield { type: "tokens", tokens };
     yield { type: "completed" };
+  }
+}
+
+class DiagnosticActivityHarness implements AgentHarness {
+  readonly id = "diagnostic-activity";
+
+  async *run(): AsyncIterable<AgentEvent> {
+    yield { type: "session_started", sessionId: "diagnostic-session-1", runId: "diagnostic-run-1" };
+    yield { type: "progress", activitySource: "tool", message: "terminal tool completed" };
+    yield {
+      type: "run_diagnostic",
+      code: "hermes_gateway_protocol_error",
+      message: "Hermes gateway diagnostic token=SECRET_DIAGNOSTIC_TOKEN",
+      payload: { preview: "malformed gateway line", rawPayload: { token: "SECRET_DIAGNOSTIC_TOKEN" } },
+    };
+    yield { type: "tokens", tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 } };
+    yield {
+      type: "rate_limits",
+      payload: {
+        requests: { remaining: 2, resetAt: "2026-01-01T00:30:00.000Z" },
+        authorization: "Bearer SECRET_RATE_LIMIT_TOKEN",
+      },
+    };
+    yield { type: "completed", message: "diagnostic run completed" };
   }
 }
 
