@@ -1,5 +1,11 @@
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { IssueLifecycleRecord } from "../core/persistence/IssueLifecycleStore.js";
+import type {
+  OrchestratorConversationMessage,
+  OrchestratorConversationRole,
+  OrchestratorConversationStatus,
+} from "../core/persistence/OrchestratorConversationStore.js";
+import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 import type { HistoryModel as WebHistoryModel } from "./WebHistoryProjection.js";
 import { projectWebTranscript, type TranscriptMessage as WebTranscriptMessage } from "./WebTranscriptProjection.js";
@@ -149,8 +155,15 @@ export interface SessionModel {
 }
 
 export interface ChatMessage {
+  id?: string;
+  conversationId?: string;
   who: "agent" | "user";
+  role?: OrchestratorConversationRole;
   text: string;
+  status?: OrchestratorConversationStatus;
+  createdAt?: string;
+  updatedAt?: string;
+  metadata?: Record<string, unknown>;
   suggestions?: string[];
 }
 
@@ -553,13 +566,30 @@ export function emptyChatMessages(): ChatMessage[] {
   return [];
 }
 
-export function projectWebOrchestratorChat(): ChatMessage[] {
-  return emptyChatMessages();
+export function projectWebOrchestratorChat(messages: readonly OrchestratorConversationMessage[] = []): ChatMessage[] {
+  return messages.map(projectWebOrchestratorChatMessage);
 }
 
-export function projectWebOrchestratorChatPost(input: string): ChatMessage[] {
+export function projectWebOrchestratorChatPost(
+  input: string,
+  messages: readonly OrchestratorConversationMessage[] = [],
+): ChatMessage[] {
   void input;
-  return emptyChatMessages();
+  return projectWebOrchestratorChat(messages);
+}
+
+function projectWebOrchestratorChatMessage(message: OrchestratorConversationMessage): ChatMessage {
+  return {
+    id: message.id,
+    conversationId: message.conversationId,
+    who: message.role === "user" ? "user" : "agent",
+    role: message.role,
+    text: sanitizedPreviewValue(message.body, 10_000).preview ?? "",
+    status: message.status,
+    createdAt: message.createdAt,
+    updatedAt: message.updatedAt,
+    metadata: sanitizePublicJson(message.metadata) as Record<string, unknown>,
+  };
 }
 
 export function projectIssueModel(

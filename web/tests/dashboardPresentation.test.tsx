@@ -202,8 +202,12 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain('<div class="stat__value">73<span class="suffix">%</span></div>');
     expect(markup).toContain('<div class="stat__value">11</div>');
     expect(markup).toContain("8/32 done");
+    expect(markup).toContain("8/32 done · schedule unavailable");
     expect(markup).toContain("done 8");
     expect(markup).toContain("total 32");
+    expect(markup).toContain("Burn-up unavailable");
+    expect(markup).toContain("Velocity trend unavailable");
+    expect(markup).toContain("ETA unavailable");
     expect(markup).toMatch(/API-1/);
     expect(markup).toContain("Implement API dashboard");
     expect(markup).toContain("Rendering dashboard model");
@@ -236,8 +240,10 @@ describe("dashboard API presentation", () => {
     const markup = renderDashboard(apiDashboard, "grid");
 
     expect(markup).toContain("8/32 done");
+    expect(markup).toContain("8/32 done · schedule unavailable");
     expect(markup).toContain("done 8");
     expect(markup).toContain("total 32");
+    expect(markup).toContain("Burn-up unavailable");
     expect(markup).toContain("Throughput history");
     expect(markup).toContain("Velocity trend unavailable; no durable throughput history is present.");
     expectNoFabricatedDashboardMetrics(markup);
@@ -257,6 +263,12 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("2/9 agents");
     expect(markup).toContain("2 running / 9 cap");
     expect(markup).toContain("poll 5s");
+    expect(markup).toContain("cycle unavailable · schedule unavailable ·");
+    expect(markup).toContain('projection <span style="color:var(--text-3)">unavailable</span>');
+    expect(markup).toContain("backend metric unavailable");
+    expect(markup).toContain("5 issues in review · queue age unavailable");
+    expect(markup).toContain("status unavailable");
+    expect(markup).toContain("errors unavailable");
     expect(markup).toContain("cycle dates, throughput, ETA, health, and error-window metrics need durable source fields");
     expect(markup).not.toContain("4 running");
     expect(markup).not.toContain("last poll 8s ago");
@@ -285,6 +297,8 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("api/repo@api-branch");
     expect(markup).toContain("poll 5s");
     expect(markup).toContain("api source · api");
+    expect(markup).toContain("connection unavailable");
+    expect(markup).toContain("errors unavailable");
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("api source · mock");
@@ -386,6 +400,8 @@ describe("dashboard API presentation", () => {
 
       const chrome = renderChromeForDashboard(scenario.dashboard, `api source · ${scenario.name}`);
       expect(chrome).toContain(`api source · ${scenario.name}`);
+      expect(chrome).toContain("connection unavailable");
+      expect(chrome).toContain("errors unavailable");
       expectNoFabricatedDashboardMetrics(chrome);
     }
   });

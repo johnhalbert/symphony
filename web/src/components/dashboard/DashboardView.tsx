@@ -88,7 +88,7 @@ export function DashboardView({
 
         {variant === "grid" ? <StatsGridDense totals={totals} /> : <StatsRow dashboard={dashboard} />}
 
-        {variant === "command-center" ? <BurndownCommandCenter dashboard={dashboard} /> : <BurndownPanel totals={totals} useModelBurnupTotals={useModelBurnupTotals} />}
+        {variant === "command-center" ? <BurndownCommandCenter dashboard={dashboard} /> : <BurndownPanel totals={totals} metrics={dashboard.metrics} useModelBurnupTotals={useModelBurnupTotals} />}
 
         <div className="section-head">
           <h2>Running agents</h2>
@@ -155,6 +155,7 @@ export function DashboardView({
       <OrchestratorChat
         messages={chat}
         onSend={sendChat}
+        agentLabel={chatAgentLabel(dashboard)}
         subtitle={chatSubtitle(dashboard)}
         loading={orchestratorChatLoading}
         error={orchestratorChatError}
@@ -166,6 +167,10 @@ export function DashboardView({
 
 function chatSubtitle(dashboard: DashboardModel) {
   return [dashboard.agentUsageLabel, dashboard.workflowLabel, dashboard.pollLabel].filter(Boolean).join(" · ");
+}
+
+function chatAgentLabel(dashboard: DashboardModel) {
+  return dashboard.runningAgents[0]?.id ?? null;
 }
 
 function dotColorForVerb(verb: string) {

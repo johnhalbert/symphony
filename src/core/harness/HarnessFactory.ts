@@ -27,8 +27,9 @@ export interface AgentHarnessFactoryOptions {
 export const BUILTIN_AGENT_HARNESSES: Readonly<Record<string, AgentHarnessProvider>> = {
   cursor: (_config, options) => new CursorHarness(options.runStore === undefined ? {} : { runStore: options.runStore }),
   hermes: (_config, options) => new HermesHarness(options.runStore === undefined ? {} : { runStore: options.runStore }),
-  hermes_acp: (_config, options) =>
-    new HermesAcpHarness(options.runStore === undefined ? {} : { runStore: options.runStore }),
+  // The ACP harness emits normalized RunActivityEvent metadata on AgentEvents;
+  // the orchestrator is the only durable transcript writer for those events.
+  hermes_acp: () => new HermesAcpHarness(),
 };
 
 export function createAgentHarness(config: ServiceConfig, options: AgentHarnessFactoryOptions = {}): DisposableAgentHarness {

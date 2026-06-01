@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AppChrome } from "./app/AppChrome";
 import { resolveAppResourceLoading } from "./app/resourceLoading";
 import { ThemeFrame } from "./app/ThemeFrame";
@@ -7,7 +7,7 @@ import { SidebarViews } from "./components/sidebar/SidebarViews";
 import { ChatHistoryView } from "./components/history/ChatHistoryView";
 import { DashboardView } from "./components/dashboard/DashboardView";
 import { IssuesView } from "./components/issues/IssuesView";
-import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
+import { DataSourceProvider, defaultDataSourceConfig, useDataSource } from "./data/dataSourceContext";
 import { fallbackReferenceData, ReferenceDataProvider } from "./data/referenceDataContext";
 import {
   useDashboard,
@@ -20,10 +20,14 @@ import {
 import type {
   AppTab,
   DashboardVariant,
+  HistoryModel,
   HistoryVariant,
+  IssueBoardModel,
   IssuesVariant,
   ReferenceData,
+  RunningAgentModel,
   RunState,
+  SessionModel,
   SidebarVariant,
 } from "./types/symphony";
 
@@ -68,6 +72,26 @@ function referenceStatusLabel(reference: { data: ReferenceData | null; loading: 
   return null;
 }
 
+function useProjectionRefreshToken(enabled: boolean): number {
+  const dataSource = useDataSource();
+  const [refreshToken, setRefreshToken] = useState(0);
+
+  useEffect(() => {
+    if (!enabled || !dataSource.subscribeToProjectionChanges) return undefined;
+    return dataSource.subscribeToProjectionChanges((event) => {
+      if (event.type !== "projection_revision") return;
+      dataSource.invalidateCachedReads?.();
+      setRefreshToken((current) => current + 1);
+    });
+  }, [dataSource, enabled]);
+
+  return refreshToken;
+}
+
+function resourceOptions(enabled: boolean, refreshToken: number) {
+  return refreshToken > 0 ? { enabled, refreshToken } : { enabled };
+}
+
 function AppShell({
   initialReferenceData,
   lazyReferenceData = false,
@@ -82,18 +106,20 @@ function AppShell({
   const [sidebarVariant, setSidebarVariant] = useState<SidebarVariant>("primary");
   const apiMode = defaultDataSourceConfig.mode === "api";
   const resourceLoading = resolveAppResourceLoading(activeTab, apiMode);
+  const projectionRefreshToken = useProjectionRefreshToken(apiMode);
 
-  const reference = useReferenceResource({ enabled: lazyReferenceData && resourceLoading.referenceData });
+  const reference = useReferenceResource(resourceOptions(lazyReferenceData && resourceLoading.referenceData, projectionRefreshToken));
   const referenceData = lazyReferenceData ? (reference.data ?? initialReferenceData) : initialReferenceData;
   const referenceLabel = lazyReferenceData ? referenceStatusLabel(reference) : null;
-  const dashboard = useDashboard({ enabled: resourceLoading.dashboard });
-  const issueBoard = useIssueBoard({ enabled: resourceLoading.issueBoard });
-  const history = useHistory({ enabled: resourceLoading.history });
+  const dashboard = useDashboard(resourceOptions(resourceLoading.dashboard, projectionRefreshToken));
+  const issueBoard = useIssueBoard(resourceOptions(resourceLoading.issueBoard, projectionRefreshToken));
+  const history = useHistory(resourceOptions(resourceLoading.history, projectionRefreshToken));
   const sidebarEnabled = resourceLoading.sidebar || (apiMode && Boolean(dashboard.error));
-  const sidebar = useSidebar({ enabled: sidebarEnabled });
-  const orchestratorChat = useOrchestratorChat({ enabled: resourceLoading.orchestratorChat });
+  const sidebar = useSidebar(resourceOptions(sidebarEnabled, projectionRefreshToken));
+  const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, projectionRefreshToken));
   const dashboardChrome = dashboard.data;
   const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
+  const tabBadges = resolveTabBadges(issueBoard.data, history.data);
 
   return (
     <ReferenceDataProvider value={referenceData}>
@@ -101,11 +127,14 @@ function AppShell({
         <AppChrome
           activeTab={activeTab}
           onTabChange={setActiveTab}
+          tabBadges={tabBadges}
           runningCount={runningCount}
           repoLabel={dashboardChrome?.repoLabel ?? "repository unavailable"}
           branch={dashboardChrome?.branch ?? ""}
           pollLabel={dashboardChrome?.pollLabel ?? "poll unavailable"}
           agentUsageLabel={dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`}
+          connectionStatusLabel={dashboardChrome?.metrics?.health?.connectionLabel ?? undefined}
+          errorStatusLabel={dashboardChrome?.metrics?.health?.errorSummaryLabel ?? undefined}
           dataSourceLabel={[
             `api source · ${defaultDataSourceConfig.mode}`,
             apiMode ? referenceLabel : null,
@@ -139,8 +168,12 @@ function AppShell({
                 />
               ))
             : null}
-          {activeTab === "issues" ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} />) : null}
-          {activeTab === "history" ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} />) : null}
+          {activeTab === "issues"
+            ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} refreshToken={projectionRefreshToken} />)
+            : null}
+          {activeTab === "history"
+            ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} refreshToken={projectionRefreshToken} />)
+            : null}
           {activeTab === "sidebar"
             ? renderLoadable(sidebar, (data) => (
                 <SidebarViews
@@ -153,7 +186,14 @@ function AppShell({
                 />
               ))
             : null}
-          {activeTab === "states" ? <StateCardsView /> : null}
+          {activeTab === "states" ? (
+            <StateCardsView
+              runningAgents={dashboard.data?.runningAgents ?? []}
+              sessions={history.data?.sessions ?? []}
+              loading={dashboard.loading || history.loading}
+              error={dashboard.error ?? history.error}
+            />
+          ) : null}
         </AppChrome>
       </ThemeFrame>
     </ReferenceDataProvider>
@@ -237,22 +277,87 @@ function ViewControls({
   return null;
 }
 
-function StateCardsView() {
-  const cards: Array<{ state: RunState; issue: string; title: string; agent: string | null; step: string; duration: string }> = [
-    { state: "creating", issue: "SYM-42", title: "Stream agent app-server updates to orchestrator", agent: "codex-08", step: "Acquiring workspace lock", duration: "3s" },
-    { state: "running", issue: "SYM-12", title: "Add exponential backoff to retry queue with jitter", agent: "codex-04", step: "Running mix test", duration: "4m 41s" },
-    { state: "queued", issue: "SYM-50", title: "Document trust & safety posture", agent: null, step: "Waiting for concurrency slot", duration: "--" },
-    { state: "review", issue: "SYM-15", title: "Workspace cleanup hook for terminal-state issues", agent: "codex-02", step: "Agent review queue · PR #1248", duration: "24m" },
-    { state: "finished", issue: "SYM-52", title: "Linear GraphQL query isolation + tests", agent: "codex-06", step: "Merged · #1190", duration: "1h 14m" },
-    { state: "error", issue: "SYM-09", title: "Initial Linear tracker integration", agent: "codex-11", step: "rate-limit cascade - 429", duration: "18s" },
-    { state: "cancelled", issue: "SYM-07", title: "WORKFLOW.md loader", agent: "codex-10", step: "Cancelled by operator", duration: "9s" },
-    { state: "expired", issue: "SYM-03", title: "Workspace prune (terminal)", agent: "codex--", step: "Idle 30m - released", duration: "30m" },
-  ];
+function resolveTabBadges(issueBoard: IssueBoardModel | null, history: HistoryModel | null): Partial<Record<AppTab, string>> {
+  const liveSessions = history?.sessions.filter((session) => session.state === "running").length ?? null;
+  return {
+    issues: issueBoard ? String(issueBoard.issues.length) : undefined,
+    history: history ? (liveSessions ? `${liveSessions} live` : String(history.sessions.length)) : undefined,
+  };
+}
+
+interface StateCardData {
+  state: RunState;
+  issue: string;
+  title: string;
+  agent: string | null;
+  step: string;
+  duration: string;
+}
+
+function textOrUnavailable(value: string | null | undefined, fallback: string) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : fallback;
+}
+
+function sessionStateToRunState(state: SessionModel["state"]): RunState {
+  if (state === "finished" || state === "error" || state === "cancelled" || state === "queued" || state === "running") {
+    return state;
+  }
+  return "running";
+}
+
+function createStateCards(runningAgents: RunningAgentModel[], sessions: SessionModel[]): StateCardData[] {
+  const cards: StateCardData[] = runningAgents.map((agent) => ({
+    state: agent.state,
+    issue: textOrUnavailable(agent.issue, "Issue unavailable"),
+    title: textOrUnavailable(agent.title, "Run title unavailable"),
+    agent: textOrUnavailable(agent.id, "").trim() || null,
+    step: textOrUnavailable(agent.step, "Step unavailable"),
+    duration: textOrUnavailable(agent.duration, "duration unavailable"),
+  }));
+
+  const seenRunKeys = new Set(cards.map((card) => `${card.issue}:${card.agent ?? ""}`));
+  for (const session of sessions) {
+    if (cards.length >= 8) break;
+    const agent = session.runSession?.agentId ?? null;
+    const issue = textOrUnavailable(session.issue, "Issue unavailable");
+    const runKey = `${issue}:${agent ?? ""}`;
+    if (seenRunKeys.has(runKey)) continue;
+    seenRunKeys.add(runKey);
+    cards.push({
+      state: sessionStateToRunState(session.state),
+      issue,
+      title: textOrUnavailable(session.title, "Run title unavailable"),
+      agent,
+      step: textOrUnavailable(session.lastEvent, "Status unavailable"),
+      duration: textOrUnavailable(session.updatedAt, "updated time unavailable"),
+    });
+  }
+
+  return cards.slice(0, 8);
+}
+
+export function StateCardsView({
+  runningAgents = [],
+  sessions = [],
+  loading = false,
+  error = null,
+}: {
+  runningAgents?: RunningAgentModel[];
+  sessions?: SessionModel[];
+  loading?: boolean;
+  error?: string | null;
+}) {
+  const cards = createStateCards(runningAgents, sessions);
+
+  if (loading && cards.length === 0) return <div className="view-loading">Loading run state data...</div>;
+  if (error && cards.length === 0) return <div className="view-error">Run state data unavailable: {error}</div>;
+  if (cards.length === 0) return <div className="view-empty">Run state data unavailable.</div>;
 
   return (
     <div className="state-card-grid">
       {cards.map((card) => (
-        <div className="state-card-cell" key={card.state}>
+        <div className="state-card-cell" key={`${card.state}-${card.issue}-${card.agent ?? card.title}`}>
           <AgentStateCard {...card} />
         </div>
       ))}

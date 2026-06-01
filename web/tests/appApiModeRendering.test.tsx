@@ -474,9 +474,9 @@ describe("App API-mode rendering", () => {
       },
       states: {
         referenceData: true,
-        dashboard: false,
+        dashboard: true,
         issueBoard: false,
-        history: false,
+        history: true,
         sidebar: false,
         orchestratorChat: false,
       },
@@ -507,8 +507,14 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("2/9 agents");
     expect(markup).toContain("concurrency cap 9");
     expect(markup).toContain("8/32 done");
+    expect(markup).toContain("8/32 done · schedule unavailable");
     expect(markup).toContain("total 32");
     expect(markup).toContain("done 8");
+    expect(markup).toContain("Burn-up unavailable");
+    expect(markup).toContain("Velocity trend unavailable");
+    expect(markup).toContain("ETA unavailable");
+    expect(markup).toContain("connection unavailable");
+    expect(markup).toContain("errors unavailable");
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
     expect(markup).toContain("Full-app suggestion");
@@ -518,6 +524,15 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("dashboard embedded fallback should not render");
     expect(markup).not.toContain("dashboard stale suggestion");
     expect(markup).not.toContain("Restart SYM-42");
+    expect(markup).not.toContain('class="badge"');
+    expect(markup).not.toContain("4 live");
+    expect(markup).not.toMatch(/target\s+\d/);
+    expect(markup).not.toMatch(/completed\s+\d/);
+    expect(markup).not.toContain("Cycle 14");
+    expect(markup).not.toContain("3.2");
+    expect(markup).not.toContain("PR/day");
+    expect(markup).not.toContain("linear · connected");
+    expect(markup).not.toContain("0 errors");
   });
 
   it("keeps mock-mode app-shell resources eager once reference data is loaded", async () => {
