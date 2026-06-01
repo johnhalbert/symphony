@@ -53,9 +53,18 @@ type NotificationHandler = (params: unknown, notification: HostHermesAcpJsonRpcN
 type ClientRequestHandler = (params: unknown, request: HostHermesAcpJsonRpcRequest) => unknown | Promise<unknown>;
 
 const tempRoots: string[] = [];
-const adapterCases: AdapterCase[] = harnessActivityConformanceFixtures.flatMap((fixture) =>
-  HARNESS_ACTIVITY_ADAPTER_IDS.filter((adapterId) => fixture.protocols[adapterId] !== undefined).map((adapterId) => ({ adapterId, fixture })),
-);
+const REQUIRED_BASELINE_ADAPTER_CASE_KEYS = [
+  "hermes_jsonrpc:streaming_tool_tokens_success",
+  "hermes_acp:streaming_tool_tokens_success",
+  "hermes_jsonrpc:terminal_error_failure",
+  "hermes_acp:terminal_error_failure",
+  "hermes_jsonrpc:cancelled_terminal",
+  "hermes_acp:cancelled_terminal",
+  "hermes_jsonrpc:provider_limit_terminal",
+  "hermes_jsonrpc:malformed_incomplete_negative",
+  "hermes_acp:malformed_incomplete_negative",
+] as const;
+const adapterCases: AdapterCase[] = buildAdapterCases(harnessActivityConformanceFixtures);
 
 afterEach(async () => {
   await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -63,18 +72,39 @@ afterEach(async () => {
 
 describe("harness activity contract conformance", () => {
   it("keeps the shared scenario matrix adapter-oriented so future harnesses can extend it without rewriting expectations", () => {
-    expect(adapterCases.map(({ adapterId, fixture }) => `${adapterId}:${fixture.name}`)).toEqual([
-      "hermes_jsonrpc:streaming_tool_tokens_success",
-      "hermes_acp:streaming_tool_tokens_success",
-      "hermes_jsonrpc:terminal_error_failure",
-      "hermes_acp:terminal_error_failure",
-      "hermes_jsonrpc:cancelled_terminal",
-      "hermes_acp:cancelled_terminal",
-      "hermes_jsonrpc:provider_limit_terminal",
-      "hermes_jsonrpc:malformed_incomplete_negative",
-      "hermes_acp:malformed_incomplete_negative",
-    ]);
-    expect(harnessActivityConformanceFixtures.filter((fixture) => fixture.expected.negative)).toHaveLength(1);
+    const adapterCaseKeys = adapterCases.map(adapterCaseKey);
+
+    expect(adapterCaseKeys).toEqual(expect.arrayContaining([...REQUIRED_BASELINE_ADAPTER_CASE_KEYS]));
+    expect(adapterCases.length).toBeGreaterThanOrEqual(REQUIRED_BASELINE_ADAPTER_CASE_KEYS.length);
+    expect(harnessActivityConformanceFixtures.some((fixture) => fixture.expected.negative)).toBe(true);
+
+    for (const fixture of harnessActivityConformanceFixtures) {
+      const registeredProtocols = registeredFixtureProtocols(fixture);
+
+      expect(fixture.name).toMatch(/\S/);
+      expect(fixture.description).toMatch(/\S/);
+      expect(registeredProtocols.length).toBeGreaterThan(0);
+      expect(adapterCases.filter((adapterCase) => adapterCase.fixture === fixture).map(({ adapterId }) => adapterId)).toEqual(
+        registeredProtocols,
+      );
+    }
+  });
+
+  it("accepts additional fixture rows without changing the shared matrix expectation", () => {
+    const futureFixture: HarnessActivityConformanceFixture = {
+      name: "future_extension_success",
+      description: "Synthetic extension fixture proving the conformance matrix is open to additional rows.",
+      protocols: {
+        hermes_jsonrpc: { events: [] },
+      },
+      expected: { terminal: "completed" },
+    };
+    const extendedCaseKeys = buildAdapterCases([...harnessActivityConformanceFixtures, futureFixture]).map(adapterCaseKey);
+
+    expect(extendedCaseKeys).toEqual(
+      expect.arrayContaining([...REQUIRED_BASELINE_ADAPTER_CASE_KEYS, "hermes_jsonrpc:future_extension_success"]),
+    );
+    expect(extendedCaseKeys.length).toBeGreaterThan(adapterCases.length);
   });
 
   it("redacts runActivity extension data when sanitizing public AgentEvents", () => {
@@ -106,6 +136,18 @@ describe("harness activity contract conformance", () => {
     expect(projectWebTranscript(transcriptEvents)).toEqual(frontendMessages);
   });
 });
+
+function buildAdapterCases(fixtures: readonly HarnessActivityConformanceFixture[]): AdapterCase[] {
+  return fixtures.flatMap((fixture) => registeredFixtureProtocols(fixture).map((adapterId) => ({ adapterId, fixture })));
+}
+
+function registeredFixtureProtocols(fixture: HarnessActivityConformanceFixture): HarnessActivityProtocolAdapterId[] {
+  return HARNESS_ACTIVITY_ADAPTER_IDS.filter((adapterId) => fixture.protocols[adapterId] !== undefined);
+}
+
+function adapterCaseKey({ adapterId, fixture }: AdapterCase): string {
+  return `${adapterId}:${fixture.name}`;
+}
 
 async function runAdapterFixture(
   adapterId: HarnessActivityProtocolAdapterId,
