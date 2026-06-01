@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   HermesAcpHarness,
   mapHermesAcpSessionUpdate,
+  mcpServersToAcpStdioServers,
   type HermesAcpHarnessOptions,
   type HermesAcpPermissionResolver,
   type HermesAcpRuntimeClient,
@@ -66,6 +67,7 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
   authenticateError: unknown = null;
   sessionId = "acp-session-1";
   promptResult: Record<string, unknown> | null = { stopReason: "end_turn", usage: { input: 1, output: 2, total: 3 } };
+  sessionNewError: Error | null = null;
   promptNotificationParams: unknown | unknown[] | null = {
     sessionId: "acp-session-1",
     update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } },
@@ -86,6 +88,7 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
         if (this.authenticateError !== null) throw this.authenticateError;
         return this.authenticateResult as T;
       case "session/new":
+        if (this.sessionNewError) throw this.sessionNewError;
         this.emitSessionUpdateNotifications(this.sessionNewNotificationParams);
         return { sessionId: this.sessionId } as T;
       case "session/prompt":
@@ -170,6 +173,50 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
     return Promise.all([...this.clientRequestHandlers.get(method) ?? []].map((handler) => handler(params, request)));
   }
 }
+
+describe("mcpServersToAcpStdioServers", () => {
+  it("converts an empty role MCP server map into an empty ACP mcpServers payload", () => {
+    expect(mcpServersToAcpStdioServers({})).toEqual([]);
+  });
+
+  it("converts one stdio role MCP server into the ACP session/new payload shape", () => {
+    const servers = {
+      symphony: {
+        type: "stdio",
+        command: "/usr/bin/node",
+        args: ["cli.js", "completion-report-mcp"],
+        cwd: "/workspace",
+        env: { LINEAR_API_KEY: "secret", EMPTY_ALLOWED: "" },
+      },
+    } satisfies Parameters<typeof mcpServersToAcpStdioServers>[0];
+
+    expect(mcpServersToAcpStdioServers(servers)).toEqual([
+      {
+        name: "symphony",
+        command: "/usr/bin/node",
+        args: ["cli.js", "completion-report-mcp"],
+        env: [
+          { name: "LINEAR_API_KEY", value: "secret" },
+          { name: "EMPTY_ALLOWED", value: "" },
+        ],
+      },
+    ]);
+  });
+
+  it("rejects malformed or unsupported role MCP server configs before session creation", () => {
+    const missingCommand = {
+      symphony: { type: "stdio", args: [], cwd: "/workspace", env: {} },
+    } as unknown as Parameters<typeof mcpServersToAcpStdioServers>[0];
+    const httpStyleUnsupported = {
+      remote: { type: "http", url: "https://mcp.example.test", headers: {} },
+    } as unknown as Parameters<typeof mcpServersToAcpStdioServers>[0];
+
+    expect(() => mcpServersToAcpStdioServers(missingCommand)).toThrow(/MCP server symphony command/);
+    expect(() => mcpServersToAcpStdioServers(httpStyleUnsupported)).toThrow(
+      /MCP server remote uses unsupported MCP server type http/,
+    );
+  });
+});
 
 describe("HermesAcpHarness", () => {
   it("constructs with default dependencies, prepares handoff context, and disposes before acquiring leases", async () => {
@@ -1020,6 +1067,30 @@ describe("HermesAcpHarness", () => {
       payload: { acpLogTail: { lines: ["stderr with api_key=[redacted]"], lineCount: 1 } },
     });
     expect(JSON.stringify(diagnostic)).not.toContain("should-not-leak");
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("surfaces session creation failures with profile, cwd, and stderr context", async () => {
+    const client = new FakeAcpClient();
+    client.sessionNewError = new Error("session failed");
+    client.logTail = "fatal: session new failed";
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const diagnostic = events.find((event) => event.type === "run_diagnostic" && event.code === "hermes_acp_run_error");
+
+    expect(client.requests.map((request) => request.method)).toEqual(["initialize", "authenticate", "session/new"]);
+    expect(diagnostic).toMatchObject({
+      type: "run_diagnostic",
+      message: "Host Hermes ACP run failed: session failed",
+      payload: {
+        sessionId: null,
+        profileName: "profile-1",
+        cwd: ctx.workspace.path,
+        acpLogTail: { lines: ["fatal: session new failed"], lineCount: 1 },
+      },
+    });
+    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "failed" })]));
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
   });
 

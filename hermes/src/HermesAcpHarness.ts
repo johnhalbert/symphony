@@ -272,6 +272,7 @@ export class HermesAcpHarness implements AgentHarness {
         runId,
         sessionId: activeRun.symphonySessionId,
         profileName: lease.profile.profileName,
+        cwd: ctx.workspace.path,
         exit,
         acpLogTail: acpLogTailPayload(lease),
       });
@@ -350,6 +351,7 @@ export class HermesAcpHarness implements AgentHarness {
             runId,
             sessionId: activeRun.symphonySessionId,
             profileName: lease.profile.profileName,
+            cwd: ctx.workspace.path,
             acpLogTail: acpLogTailPayload(lease),
           });
         });
@@ -382,6 +384,7 @@ export class HermesAcpHarness implements AgentHarness {
             runId,
             sessionId: activeRun.symphonySessionId,
             profileName: lease.profile.profileName,
+            cwd: ctx.workspace.path,
             acpLogTail: acpLogTailPayload(lease),
           },
         });
@@ -927,12 +930,68 @@ function finiteNumber(value: unknown): number | null {
 }
 
 export function mcpServersToAcpStdioServers(servers: Record<string, McpSubprocessServerConfig>): AcpMcpServerStdio[] {
-  return Object.entries(servers).map(([name, server]) => ({
-    name,
-    command: server.command,
-    args: [...server.args],
-    env: Object.entries(server.env).map(([envName, value]) => ({ name: envName, value })),
-  }));
+  return Object.entries(servers).map(([name, server]) => {
+    const config = requireStdioMcpServerConfig(name, server);
+    return {
+      name: requireNonEmptyMcpString(name, `MCP server name for ${name || "<empty>"}`),
+      command: config.command,
+      args: [...config.args],
+      env: Object.entries(config.env).map(([envName, value]) => ({
+        name: requireNonEmptyMcpString(envName, `MCP server ${name} env variable name`),
+        value,
+      })),
+    };
+  });
+}
+
+function requireStdioMcpServerConfig(name: string, server: unknown): McpSubprocessServerConfig {
+  const label = `MCP server ${name || "<empty>"}`;
+  if (!isRecord(server)) {
+    throw new SymphonyError("config_validation_error", `${label} config must be an object.`);
+  }
+  const type = nonEmptyString(server.type);
+  if (type !== "stdio") {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${label} uses unsupported MCP server type ${type ?? "<missing>"}; Symphony role MCP handoff currently supports stdio servers only.`,
+    );
+  }
+  return {
+    type: "stdio",
+    command: requireNonEmptyMcpString(server.command, `${label} command`),
+    args: requireStringArray(server.args, `${label} args`),
+    cwd: requireNonEmptyMcpString(server.cwd, `${label} cwd`),
+    env: requireStringRecord(server.env, `${label} env`),
+  };
+}
+
+function requireNonEmptyMcpString(value: unknown, label: string): string {
+  const normalized = nonEmptyString(value);
+  if (normalized === null) {
+    throw new SymphonyError("config_validation_error", `${label} must be a non-empty string.`);
+  }
+  return normalized;
+}
+
+function requireStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new SymphonyError("config_validation_error", `${label} must be an array of strings.`);
+  }
+  return [...value];
+}
+
+function requireStringRecord(value: unknown, label: string): Record<string, string> {
+  if (!isRecord(value)) {
+    throw new SymphonyError("config_validation_error", `${label} must be an object with string values.`);
+  }
+  const output: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== "string") {
+      throw new SymphonyError("config_validation_error", `${label}.${key} must be a string.`);
+    }
+    output[key] = item;
+  }
+  return output;
 }
 
 function shouldDisposeLeaseAfterRun(lease: HermesAcpLease, terminalStatus: TerminalStatus): boolean {

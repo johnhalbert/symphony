@@ -207,6 +207,27 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     await expect(response).resolves.toEqual({ sessionId: "s1" });
   });
 
+  it("writes the exact session/new payload shape with ACP mcpServers", async () => {
+    const { child, facade, writes } = createSpawnedFacade();
+    const payload = {
+      cwd: "/workspace",
+      mcpServers: [
+        {
+          name: "symphony",
+          command: "node",
+          args: ["cli.js", "completion-report-mcp", "--context-file", "/state/context.json"],
+          env: [{ name: "LINEAR_API_KEY", value: "secret" }],
+        },
+      ],
+    };
+
+    const response = facade.request<{ sessionId: string }>("session/new", payload);
+
+    expect(writes).toEqual([{ jsonrpc: "2.0", id: 1, method: "session/new", params: payload }]);
+    writeJsonRpc(child, { jsonrpc: "2.0", id: 1, result: { sessionId: "symphony-acp-session" } });
+    await expect(response).resolves.toEqual({ sessionId: "symphony-acp-session" });
+  });
+
   it("resolves concurrent in-flight requests by id even when responses arrive out of order or with JSON-RPC errors", async () => {
     const { child, facade, writes } = createSpawnedFacade();
 
