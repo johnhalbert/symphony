@@ -5,6 +5,118 @@ import type { RunRecord, RunTranscriptStore, TranscriptEvent } from "../src/core
 import type { TrackerStateLists } from "../src/core/types.js";
 
 describe("web history/transcript durable projection writes", () => {
+  it("backfills selected durable projections from source stores with stable scope keys", async () => {
+    const projectionWriter = recordingProjectionWriter();
+    const run = runFixture({ runId: "run-1", sessionId: "session-1", transcriptEventCount: 3 });
+    const server = createStatusServer({
+      runStore: runStoreFixture({
+        runs: [run],
+        transcriptEventsByRunId: new Map([
+          [
+            run.runId,
+            [
+              transcriptEventFixture({ runId: run.runId, sequence: 1, message: "first" }),
+              transcriptEventFixture({ runId: run.runId, sequence: 2, message: "second" }),
+              transcriptEventFixture({ runId: run.runId, sequence: 3, message: "third" }),
+            ],
+          ],
+        ]),
+      }),
+      projectionWriter,
+    });
+
+    const result = await server.rebuildDurableWebProjections({
+      projections: ["history_projection", "transcript_projection"],
+      historyLimits: { sessionLimit: 1, timelineLimit: 5 },
+      transcriptPageLimit: 2,
+    });
+
+    expect(result).toMatchObject({ attempted: 3, written: 3, unchanged: 0, skipped: 0, failed: 0 });
+    expect(result.entries.map((entry) => [entry.projectionName, entry.scopeKey, entry.status])).toEqual([
+      ["history_projection", "global:session:1:timeline:5", "written"],
+      ["transcript_projection", "run-1:offset:0:limit:2", "written"],
+      ["transcript_projection", "run-1:offset:2:limit:2", "written"],
+    ]);
+    expect(projectionWriter.writes.map((write) => write.projectionName)).toEqual([
+      "history_projection",
+      "transcript_projection",
+      "transcript_projection",
+    ]);
+    expect(projectionWriter.writes[0]).toMatchObject({
+      projectionName: "history_projection",
+      sourceCursors: { sessionLimit: 1, timelineLimit: 5, sessionCount: 1, defaultSessionId: "run-1" },
+      fields: { messageCount: 1 },
+    });
+    expect(projectionWriter.writes[1]).toMatchObject({
+      projectionName: "transcript_projection",
+      scopeKey: "run-1:offset:0:limit:2",
+      fields: { runId: "run-1", sessionId: "session-1", offsetStart: 0, offsetLimit: 2, nextOffset: 2 },
+    });
+    expect(projectionWriter.writes[2]).toMatchObject({
+      projectionName: "transcript_projection",
+      scopeKey: "run-1:offset:2:limit:2",
+      fields: { runId: "run-1", sessionId: "session-1", offsetStart: 2, offsetLimit: 2, nextOffset: null },
+    });
+  });
+
+  it("exposes a token-protected rebuild endpoint with projection filters", async () => {
+    const projectionWriter = recordingProjectionWriter();
+    const server = createStatusServer({
+      openWorkspaceToken: "test-token",
+      runStore: runStoreFixture({ runs: [runFixture({ runId: "run-1" })] }),
+      projectionWriter,
+    });
+    const address = await server.start();
+
+    try {
+      const missingToken = await postJson(`${baseUrlFor(address)}/api/v1/web/projections/rebuild?projection=history_projection`);
+      const invalidProjection = await postJson(
+        `${baseUrlFor(address)}/api/v1/web/projections/rebuild?projection=unknown_projection`,
+        "test-token",
+      );
+      const valid = await postJson(
+        `${baseUrlFor(address)}/api/v1/web/projections/rebuild?projection=history_projection&sessionLimit=1&timelineLimit=5`,
+        "test-token",
+      );
+
+      expect(missingToken.response.status).toBe(401);
+      expect(invalidProjection.response.status).toBe(400);
+      expect(valid.response.status).toBe(200);
+      expect(valid.body).toMatchObject({ attempted: 1, written: 1, skipped: 0, failed: 0 });
+      expect(valid.body.entries).toMatchObject([
+        { projectionName: "history_projection", scopeKey: "global:session:1:timeline:5", status: "written" },
+      ]);
+      expect(projectionWriter.writes).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("reports skipped rebuild entries when projection writer or transcript source is unavailable", async () => {
+    const server = createStatusServer();
+
+    const result = await server.rebuildDurableWebProjections({
+      projections: ["history_projection", "transcript_projection"],
+      historyLimits: { sessionLimit: 1, timelineLimit: 5 },
+    });
+
+    expect(result).toMatchObject({ attempted: 0, written: 0, unchanged: 0, skipped: 2, failed: 0 });
+    expect(result.entries).toMatchObject([
+      {
+        projectionName: "history_projection",
+        scopeKey: "global:session:1:timeline:5",
+        status: "skipped",
+        reason: "Durable projection writer is not configured",
+      },
+      {
+        projectionName: "transcript_projection",
+        scopeKey: "*",
+        status: "skipped",
+        reason: "Run transcript store is not configured",
+      },
+    ]);
+  });
+
   it("persists bounded history projection rows after serving the canonical response", async () => {
     const projectionWriter = recordingProjectionWriter();
     const server = createStatusServer({
@@ -160,7 +272,15 @@ function recordingProjectionWriter(options: { fail?: boolean } = {}): StatusServ
     async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
       writes.push(JSON.parse(JSON.stringify(input)) as ProjectionPayloadWriteInput);
       if (options.fail) throw new Error("simulated projection persistence failure");
-      return { status: "written", revision: {} as ProjectionWriteResult["revision"], previousRevision: null, contentSha256: "", payloadSha256: "", event: null };
+      const revisionNumber = writes.length;
+      return {
+        status: "written",
+        revision: { revision: revisionNumber } as ProjectionWriteResult["revision"],
+        previousRevision: null,
+        contentSha256: "",
+        payloadSha256: "",
+        event: null,
+      };
     },
   };
 }
@@ -283,5 +403,12 @@ function baseUrlFor(address: { host: string; port: number }): string {
 
 async function getJson(url: string): Promise<{ response: Response; body: any }> {
   const response = await fetch(url);
+  return { response, body: await response.json() };
+}
+
+async function postJson(url: string, token?: string): Promise<{ response: Response; body: any }> {
+  const request: RequestInit = { method: "POST" };
+  if (token) request.headers = { "X-Symphony-Token": token };
+  const response = await fetch(url, request);
   return { response, body: await response.json() };
 }
