@@ -28,6 +28,22 @@ describe("Hermes role template policy", () => {
     expect(agentMaxTurns(reviewer)).toBe(SYMPHONY_HERMES_AGENT_MAX_TURNS);
     expect(agentMaxTurns(planner)).toBe(SYMPHONY_HERMES_AGENT_MAX_TURNS);
   });
+
+  it("seeds and requires the Symphony worker implementation skill", async () => {
+    const workerTemplateDir = path.resolve("hermes", "templates", "worker");
+    const soul = await readFile(path.join(workerTemplateDir, "SOUL.md"), "utf8");
+    const skill = await readFile(
+      path.join(workerTemplateDir, "skills", "orchestration", "symphony-worker-implementation", "SKILL.md"),
+      "utf8",
+    );
+
+    expect(soul).toContain("skill_view");
+    expect(soul).toContain("symphony-worker-implementation");
+    expect(skill).toContain("name: symphony-worker-implementation");
+    expect(skill).toContain("delegate_task");
+    expect(skill).toContain("bounded read-only research");
+    expect(skill).toContain("Do not perform service-owned publication actions");
+  });
 });
 
 async function readTemplateConfig(filePath: string): Promise<Record<string, unknown>> {
