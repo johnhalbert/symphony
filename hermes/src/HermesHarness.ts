@@ -8,12 +8,14 @@ import {
   writeActiveHandoffMcpContexts,
   writeInitialHandoffMcpContexts,
 } from "../../src/core/harness/HandoffMcp.js";
+import { workerReviewerGithubCommandPolicyEnv } from "../../src/core/harness/AgentCommandPolicy.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
 import { redactTranscriptText, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
 import { resolveRuntimeCredential } from "../../src/app/RuntimeDependencies.js";
 import { ScopedGatewayClient, type GatewayEvent, type HermesGatewayClient, type HermesGatewayEnvironment } from "./GatewayFacade.js";
+
 import {
   HermesAuthManager,
   hermesOwnedAuthProvidersForRuntime,
@@ -273,7 +275,7 @@ export class HermesHarness implements AgentHarness {
     }
 
     const credential = requiredAuthProviders.length > 0 ? null : resolveRuntimeCredential(ctx.config, ctx.role, this.id);
-    const extraEnv: Record<string, string> = {};
+    const extraEnv: Record<string, string> = { ...workerReviewerGithubCommandPolicyEnv(ctx) };
     if (credential?.value) extraEnv[ctx.config.hermes.runtimeCredentialEnv] = credential.value;
     const client = this.gatewayFactory({
       upstreamRoot: ctx.config.hermes.upstreamRoot,

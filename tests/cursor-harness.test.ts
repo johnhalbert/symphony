@@ -261,6 +261,60 @@ describe("Cursor event mapping", () => {
     );
   });
 
+
+  it("hardens Cursor worker process env around create and send", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const originalPolicy = process.env.SYMPHONY_AGENT_COMMAND_POLICY;
+    let createEnv: Record<string, string | undefined> | null = null;
+    let sendEnv: Record<string, string | undefined> | null = null;
+    const capturePolicyEnv = () => ({
+      SYMPHONY_AGENT_COMMAND_POLICY: process.env.SYMPHONY_AGENT_COMMAND_POLICY,
+      SYMPHONY_AGENT_ROLE: process.env.SYMPHONY_AGENT_ROLE,
+      GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT,
+      GCM_INTERACTIVE: process.env.GCM_INTERACTIVE,
+      GH_PROMPT_DISABLED: process.env.GH_PROMPT_DISABLED,
+      GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND,
+      PATH: process.env.PATH,
+      PYTHONPATH: process.env.PYTHONPATH,
+    });
+    const send = vi.fn(async () => {
+      sendEnv = capturePolicyEnv();
+      return completedSdkRun("sdk-run-policy");
+    });
+    cursorSdk.create.mockImplementation(async () => {
+      createEnv = capturePolicyEnv();
+      return {
+        agentId: "agent-policy",
+        send,
+        reload: vi.fn(),
+        [Symbol.asyncDispose]: vi.fn(),
+      };
+    });
+    const harness = new CursorHarness();
+
+    const events: unknown[] = [];
+    for await (const event of harness.run(agentContext(config, "worker"), "Work on TEST-1")) {
+      events.push(event);
+    }
+
+    for (const env of [createEnv, sendEnv]) {
+      expect(env).not.toBeNull();
+      const captured = env as unknown as Record<string, string | undefined>;
+      expect(captured).toMatchObject({
+        SYMPHONY_AGENT_COMMAND_POLICY: "worker_reviewer_github_upstream_block",
+        SYMPHONY_AGENT_ROLE: "worker",
+        GIT_TERMINAL_PROMPT: "0",
+        GCM_INTERACTIVE: "never",
+        GH_PROMPT_DISABLED: "1",
+        GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
+      });
+      expect(captured.PATH?.split(path.delimiter)[0]).toContain(path.join("command-policy", "TEST-1", "worker", "bin"));
+      expect(captured.PYTHONPATH?.split(path.delimiter)[0]).toBe(config.hermes.upstreamRoot);
+    }
+    expect(process.env.SYMPHONY_AGENT_COMMAND_POLICY).toBe(originalPolicy);
+    expect(events).toContainEqual({ type: "completed" });
+  });
+
   it("passes configured plan mode to worker create and send options", async () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     config.cursor.mode = "plan";

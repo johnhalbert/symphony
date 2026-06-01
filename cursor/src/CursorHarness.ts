@@ -8,6 +8,7 @@ import {
   writeActiveHandoffMcpContexts,
   writeInitialHandoffMcpContexts,
 } from "../../src/core/harness/HandoffMcp.js";
+import { withWorkerReviewerGithubCommandPolicyProcessEnv } from "../../src/core/harness/AgentCommandPolicy.js";
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
@@ -86,7 +87,7 @@ export class CursorHarness implements AgentHarness {
     });
     let run: Run;
     try {
-      run = await agent.send(prompt, runOptions);
+      run = await withWorkerReviewerGithubCommandPolicyProcessEnv(ctx, () => agent.send(prompt, runOptions));
     } catch (error) {
       if (!reusable) {
         this.agents.delete(agentKey(ctx));
@@ -406,20 +407,21 @@ export class CursorHarness implements AgentHarness {
         : null;
     let agent: SDKAgent;
     if (latestRun?.agentId) {
+      const latestAgentId = latestRun.agentId;
       try {
-        agent = await Agent.resume(latestRun.agentId, resumeOptions);
+        agent = await withWorkerReviewerGithubCommandPolicyProcessEnv(ctx, () => Agent.resume(latestAgentId, resumeOptions));
         return { agent, created: false, resumeAttempted: true, resumeUsed: true, outcome: "resumed" };
       } catch (error) {
         ctx.logger.warn("cursor agent resume failed; creating a new agent", {
-          agent_id: latestRun.agentId,
+          agent_id: latestAgentId,
           workspace_path: ctx.workspace.path,
           error: errorMessage(error),
         });
-        agent = await Agent.create(createOptions);
+        agent = await withWorkerReviewerGithubCommandPolicyProcessEnv(ctx, () => Agent.create(createOptions));
         return { agent, created: true, resumeAttempted: true, resumeUsed: false, outcome: "created" };
       }
     } else {
-      agent = await Agent.create(createOptions);
+      agent = await withWorkerReviewerGithubCommandPolicyProcessEnv(ctx, () => Agent.create(createOptions));
       return { agent, created: true, resumeAttempted: false, resumeUsed: false, outcome: "created" };
     }
   }

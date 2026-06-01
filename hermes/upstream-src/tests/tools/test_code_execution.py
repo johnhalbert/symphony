@@ -206,6 +206,22 @@ class TestExecuteCode(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertIn("hermes_constants.py", result["output"])
 
+    def test_worker_reviewer_policy_blocks_direct_subprocess_bypass(self):
+        """execute_code sitecustomize blocks subprocesses that bypass terminal()."""
+        code = """
+import subprocess
+subprocess.run(['/usr/bin/git', 'fetch', 'origin'], check=True)
+"""
+        with patch.dict(os.environ, {
+            "SYMPHONY_AGENT_COMMAND_POLICY": "worker_reviewer_github_upstream_block",
+            "SYMPHONY_AGENT_ROLE": "worker",
+            "HERMES_YOLO_MODE": "1",
+        }, clear=False):
+            result = self._run(code)
+        self.assertEqual(result["status"], "error")
+        combined = result.get("output", "") + result.get("error", "")
+        self.assertIn("BLOCKED by Symphony worker/reviewer GitHub command policy", combined)
+
     def test_single_tool_call(self):
         """Script calls terminal and prints the result."""
         code = """

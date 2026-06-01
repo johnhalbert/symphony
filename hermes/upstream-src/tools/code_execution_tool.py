@@ -887,6 +887,24 @@ def _execute_remote(
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
+        from tools import worker_github_policy as _worker_github_policy
+        _worker_github_policy_active = _worker_github_policy.is_worker_reviewer_github_policy_enabled(os.environ)
+        if _worker_github_policy_active:
+            quoted_tools_dir = shlex.quote(f"{sandbox_dir}/tools")
+            quoted_bin_dir = shlex.quote(f"{sandbox_dir}/bin")
+            env.execute(f"mkdir -p {quoted_tools_dir} {quoted_bin_dir}", cwd="/", timeout=10)
+            _ship_file_to_remote(env, f"{sandbox_dir}/tools/__init__.py", "")
+            with open(_worker_github_policy.__file__, "r", encoding="utf-8") as policy_file:
+                _ship_file_to_remote(env, f"{sandbox_dir}/tools/worker_github_policy.py", policy_file.read())
+            _ship_file_to_remote(env, f"{sandbox_dir}/sitecustomize.py", _worker_github_policy.python_sitecustomize_source())
+            for tool_name in _worker_github_policy._SHIM_TOOLS:
+                _ship_file_to_remote(
+                    env,
+                    f"{sandbox_dir}/bin/{tool_name}",
+                    _worker_github_policy.posix_tool_shim_source(tool_name, "python3"),
+                )
+            _ship_file_to_remote(env, f"{sandbox_dir}/bin/symphony-deny-askpass", _worker_github_policy.posix_askpass_source())
+            env.execute(f"chmod +x {quoted_bin_dir}/*", cwd="/", timeout=10)
 
         # Start RPC polling thread
         rpc_thread = threading.Thread(
@@ -905,6 +923,10 @@ def _execute_remote(
             f"HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
+        if _worker_github_policy_active:
+            policy_prefix = _worker_github_policy.remote_policy_env_prefix(os.environ, sandbox_dir)
+            if policy_prefix:
+                env_prefix += f" {policy_prefix}"
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={tz}"
@@ -1116,6 +1138,15 @@ def execute_code(
         with open(os.path.join(tmpdir, "script.py"), "w", encoding="utf-8") as f:
             f.write(code)
 
+        from tools.worker_github_policy import (
+            is_worker_reviewer_github_policy_enabled,
+            python_sitecustomize_source,
+        )
+        _worker_github_policy_active = is_worker_reviewer_github_policy_enabled(os.environ)
+        if _worker_github_policy_active:
+            with open(os.path.join(tmpdir, "sitecustomize.py"), "w", encoding="utf-8") as f:
+                f.write(python_sitecustomize_source())
+
         # --- Start RPC server ---
         # Two transports:
         #   POSIX: AF_UNIX stream socket on sock_path, chmod 0600 for
@@ -1213,6 +1244,13 @@ def execute_code(
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir)
         _script_path = os.path.join(tmpdir, "script.py")
+        if _worker_github_policy_active:
+            from tools.worker_github_policy import (
+                apply_worker_reviewer_github_child_env,
+                install_worker_reviewer_github_shims,
+            )
+            apply_worker_reviewer_github_child_env(child_env, os.environ)
+            install_worker_reviewer_github_shims(os.path.join(tmpdir, "bin"), child_env, python_executable=_child_python)
 
         proc = subprocess.Popen(
             [_child_python, _script_path],

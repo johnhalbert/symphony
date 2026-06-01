@@ -50,6 +50,7 @@ interface Deferred<T> {
 
 interface FakeLeaseRecord {
   lease: HostHermesAcpProfileLease;
+  options: HostHermesAcpProfileLeaseOptions;
   disposeStatuses: HostHermesAcpTerminalStatus[];
 }
 
@@ -297,6 +298,12 @@ describe("HermesAcpHarness", () => {
     expect(events).toEqual(
       expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } })]),
     );
+    expect(leases[0]?.options.env).toMatchObject({
+      SYMPHONY_AGENT_COMMAND_POLICY: "worker_reviewer_github_upstream_block",
+      SYMPHONY_AGENT_ROLE: "worker",
+      GIT_TERMINAL_PROMPT: "0",
+      GH_PROMPT_DISABLED: "1",
+    });
     expect(leases[0]?.disposeStatuses).toEqual(["succeeded"]);
     expect(client.kills).toEqual(expect.arrayContaining([expect.stringContaining("run_finished")]));
 
@@ -1983,7 +1990,7 @@ async function fixture(
         return { profileName, reason: "deleted" as const, deleted: true };
       }),
     };
-    leases.push({ lease, disposeStatuses });
+    leases.push({ lease, options, disposeStatuses });
     return lease;
   });
   let clientIndex = 0;
