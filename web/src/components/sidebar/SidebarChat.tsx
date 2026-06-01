@@ -7,15 +7,18 @@ export function SidebarChat({
   loading = false,
   messages,
   readOnly = false,
+  subtitle,
 }: {
   error?: string | null;
   loading?: boolean;
   messages: ChatMessage[];
   readOnly?: boolean;
+  subtitle?: string | null;
 }) {
   const recent = messages.slice(-3);
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this compact chat is not supported yet; no orchestrator action will be dispatched.";
+  const contextLabel = readOnly ? "read-only API mode" : (subtitle?.trim() || "agent context unavailable");
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "40px 1fr auto", background: "var(--panel)" }}>
       <div style={{ display: "flex", alignItems: "center", padding: "0 12px", gap: 10, background: "var(--panel)", borderBottom: "1px solid var(--border)" }}>
@@ -25,7 +28,7 @@ export function SidebarChat({
         <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
           <span style={{ fontSize: 12, fontWeight: 500 }}>Orchestrator</span>
           <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {readOnly ? "read-only API mode" : "codex-1 · cycle 14"}
+            {contextLabel}
           </span>
         </div>
         <div style={{ flex: 1 }} />
