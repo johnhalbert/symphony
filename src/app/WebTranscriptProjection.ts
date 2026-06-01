@@ -54,6 +54,7 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
 
   for (const event of events) {
     const projected = projectWebTranscriptEvent(event);
+    if (projected === null) continue;
     if (projected.kind === "tool_call") {
       const existingIndex = toolMessageIndexByCallId.get(projected.call_id);
       if (existingIndex !== undefined) {
@@ -71,7 +72,10 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
       if (pendingAssistantDeltaIndex !== null) {
         const existing = messages[pendingAssistantDeltaIndex];
         if (existing?.kind === "assistant") {
-          messages[pendingAssistantDeltaIndex] = { ...existing, text: combineAssistantDeltaText(existing.text, projected.text) };
+          messages[pendingAssistantDeltaIndex] = {
+            ...existing,
+            text: combineAssistantDeltaText(existing.text, projected.text, shouldConcatenateAssistantDeltaExactly(event)),
+          };
           continue;
         }
       }
@@ -96,22 +100,28 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
   return messages;
 }
 
-function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
+function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage | null {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
   const payloadKind = normalizedPayloadKind(payload);
+  const activitySource = normalizedActivitySource(payload);
   if (isToolEvent(eventType, payloadKind, payload)) return projectToolCallMessage(event, payload, eventType);
-  if (isRunDiagnosticEvent(eventType, payloadKind)) return projectRunDiagnosticStatusMessage(event, payload, eventType);
+  if (isDiagnosticEvent(eventType, payloadKind)) return projectDiagnosticStatusMessage(event, payload, eventType);
   if (isTokenUsageEvent(eventType, payloadKind)) return projectTokenUsageStatusMessage(event, payload, eventType);
   if (isProviderLimitEvent(eventType, payloadKind)) return projectProviderLimitStatusMessage(event, payload, eventType);
   if (isRateLimitEvent(eventType, payloadKind)) return projectRateLimitStatusMessage(event, payload, eventType);
+  if (isHiddenMetadataEvent(eventType, payloadKind, activitySource)) return null;
+  if (isTerminalStatusEvent(eventType)) return projectTerminalStatusMessage(event, payload, eventType);
+  if (isLegacyAcpProtocolEvent(eventType)) {
+    return { ...projectStatusMessage(event, payload, "runtime_diagnostic"), state: "runtime_diagnostic" };
+  }
   if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
   if (isTaskEvent(eventType, payloadKind)) return projectTaskMessage(event, payload);
   if (isRequestEvent(eventType, payloadKind)) return projectRequestMessage(event, payload);
   if (isUserEvent(eventType, payloadKind)) return projectUserMessage(event, payload);
   if (isSystemEvent(eventType, payloadKind)) return projectSystemMessage(event, payload);
-  if (isStatusEvent(eventType, payloadKind)) return projectStatusMessage(event, payload, eventType);
-  if (isAssistantEvent(event, eventType, payloadKind)) {
+  if (isStatusEvent(eventType, payloadKind, payload)) return projectStatusMessage(event, payload, eventType);
+  if (isAssistantEvent(event, eventType, payloadKind, payload)) {
     return { kind: "assistant", ts: event.at, text: eventText(event, payload) };
   }
   return projectStatusMessage(event, payload, eventType);
@@ -119,14 +129,14 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
 
 function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, unknown>, eventType: string): TranscriptMessage {
   const progressTool = progressToolSummary(event, payload);
-  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.args, payload.arguments, payload.input);
+  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.inputPreview, payload.args, payload.arguments, payload.input);
   const resultPreview = firstPublicPreview(payload.resultPreview, payload.result, payload.summary);
   const outputPreview = firstPublicPreview(payload.outputPreview, payload.output);
   const errorPreview = firstPublicPreview(payload.errorPreview, payload.error);
   return {
     kind: "tool_call",
     ts: event.at,
-    call_id: firstCleanString(payload.call_id, payload.callId, payload.id, payload.toolId, payload.tool_id) ?? `${event.runId}:${event.sequence}`,
+    call_id: firstCleanString(payload.call_id, payload.callId, payload.toolCallId, payload.id, payload.toolId, payload.tool_id) ?? `${event.runId}:${event.sequence}`,
     name: firstCleanString(payload.name, payload.tool, payload.toolName, progressTool?.name) ?? event.eventType,
     status: inferredToolStatus(eventType, payload, errorPreview !== null, progressTool?.status),
     args: argsPreview ? { preview: argsPreview.preview } : {},
@@ -136,72 +146,6 @@ function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, 
     ...(payload.truncated === true || argsPreview?.truncated || resultPreview?.truncated || outputPreview?.truncated || errorPreview?.truncated
       ? { truncated: true }
       : {}),
-  };
-}
-
-function projectRunDiagnosticStatusMessage(
-  event: TranscriptEvent,
-  payload: Record<string, unknown>,
-  eventType: string,
-): TranscriptMessage {
-  return {
-    kind: "status",
-    state: firstCleanString(payload.code, payload.diagnosticCode, payload.status, payload.state) ?? eventType,
-    ts: event.at,
-    text: eventText(event, payload),
-  };
-}
-
-function projectTokenUsageStatusMessage(
-  event: TranscriptEvent,
-  payload: Record<string, unknown>,
-  eventType: string,
-): TranscriptMessage {
-  const tokens = tokenCountsFrom(payload.tokens) ?? tokenCountsFrom(payload.usage) ?? tokenCountsFrom(payload);
-  const tokenText = tokens ? formatTokenCounts(tokens) : null;
-  return {
-    kind: "status",
-    state: "tokens",
-    ts: event.at,
-    text: tokenText ? `Tokens: ${tokenText}` : eventText(event, payload) || eventType,
-  };
-}
-
-function projectProviderLimitStatusMessage(
-  event: TranscriptEvent,
-  payload: Record<string, unknown>,
-  eventType: string,
-): TranscriptMessage {
-  const signal = providerLimitSignal(payload);
-  const scope = recordValue(signal?.scope) ?? recordValue(payload.scope);
-  const window = recordValue(signal?.window) ?? recordValue(payload.window);
-  const kind = firstCleanString(signal?.kind, payload.limitKind, payload.providerLimitKind, payload.status, payload.state) ?? eventType;
-  const message = firstCleanString(signal?.message, payload.message, event.message) ?? eventText(event, payload);
-  const resumeAt = firstCleanString(window?.resumeAt, payload.resumeAt);
-  const details = compactStrings([
-    firstCleanString(scope?.providerId, scope?.provider, payload.providerId, payload.provider),
-    firstCleanString(scope?.model, payload.model),
-    resumeAt ? `resume ${resumeAt}` : null,
-  ]);
-  return {
-    kind: "status",
-    state: kind,
-    ts: event.at,
-    text: `Provider limit: ${message}${details.length > 0 ? ` (${details.join(" · ")})` : ""}`,
-  };
-}
-
-function projectRateLimitStatusMessage(
-  event: TranscriptEvent,
-  payload: Record<string, unknown>,
-  eventType: string,
-): TranscriptMessage {
-  const preview = firstPublicPreview(payload.payload, payload.rateLimits, payload.rate_limits, payload.limits);
-  return {
-    kind: "status",
-    state: firstCleanString(payload.status, payload.state, payload.kind) ?? "rate_limits",
-    ts: event.at,
-    text: preview?.preview ? `Rate limits: ${preview.preview}` : eventText(event, payload) || eventType,
   };
 }
 
@@ -288,12 +232,91 @@ function projectStatusMessage(
   event: TranscriptEvent,
   payload: Record<string, unknown>,
   eventType: string,
-): TranscriptMessage {
+): Extract<TranscriptMessage, { kind: "status" }> {
   return {
     kind: "status",
     state: firstCleanString(payload.state, payload.status, payload.subtype, payload.kind) ?? eventType,
     ts: event.at,
     text: eventText(event, payload),
+  };
+}
+
+function projectDiagnosticStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  return {
+    kind: "status",
+    state: firstCleanString(payload.code, payload.diagnosticCode, payload.state, payload.status) ?? eventType,
+    ts: event.at,
+    text: firstCleanString(payload.message, payload.messagePreview, payload.textPreview, event.message) ?? eventText(event, payload),
+  };
+}
+
+function projectTokenUsageStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const tokens = tokenCountsFrom(payload.tokens) ?? tokenCountsFrom(payload.usage) ?? tokenCountsFrom(payload);
+  const tokenText = tokens ? formatTokenCounts(tokens) : null;
+  return {
+    kind: "status",
+    state: firstCleanString(payload.state, payload.status, payload.kind, payload.type) ?? "tokens",
+    ts: event.at,
+    text: tokenText ? `Tokens: ${tokenText}` : eventText(event, payload) || eventType,
+  };
+}
+
+function projectProviderLimitStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const signal = providerLimitSignal(payload);
+  const scope = recordValue(signal?.scope) ?? recordValue(payload.scope);
+  const window = recordValue(signal?.window) ?? recordValue(payload.window);
+  const kind = firstCleanString(signal?.kind, payload.limitKind, payload.providerLimitKind, payload.state, payload.status) ?? eventType;
+  const message = firstCleanString(signal?.message, payload.message, event.message) ?? eventText(event, payload);
+  const resumeAt = firstCleanString(window?.resumeAt, payload.resumeAt);
+  const details = compactStrings([
+    firstCleanString(scope?.providerId, scope?.provider, payload.providerId, payload.provider),
+    firstCleanString(scope?.model, payload.model),
+    resumeAt ? `resume ${resumeAt}` : null,
+  ]);
+  return {
+    kind: "status",
+    state: kind,
+    ts: event.at,
+    text: `Provider limit: ${message}${details.length > 0 ? ` (${details.join(" · ")})` : ""}`,
+  };
+}
+
+function projectRateLimitStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const preview = firstPublicPreview(payload.payload, payload.rateLimits, payload.rate_limits, payload.limits);
+  return {
+    kind: "status",
+    state: firstCleanString(payload.state, payload.status, payload.kind, payload.type) ?? "rate_limits",
+    ts: event.at,
+    text: preview?.preview ? `Rate limits: ${preview.preview}` : eventText(event, payload) || eventType,
+  };
+}
+
+function projectTerminalStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  return {
+    kind: "status",
+    state: eventType,
+    ts: event.at,
+    text: firstCleanString(payload.message, payload.error, payload.reason, event.message) ?? terminalStatusText(eventType),
   };
 }
 
@@ -329,31 +352,7 @@ function projectRunSystemMessage(run: RunRecord): TranscriptMessage {
 }
 
 function isToolEvent(eventType: string, payloadKind: string | null, payload: Record<string, unknown>): boolean {
-  const activitySource = firstCleanString(payload.activitySource, payload.activity_source);
-  return eventType.includes("tool") || payloadKindIncludes(payloadKind, "tool") || normalizeToken(activitySource ?? "") === "tool";
-}
-
-function isRunDiagnosticEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType === "run_diagnostic" || payloadKindIncludes(payloadKind, "run_diagnostic") || payloadKind === "diagnostic";
-}
-
-function isTokenUsageEvent(eventType: string, payloadKind: string | null): boolean {
-  return (
-    eventType === "tokens" ||
-    eventType === "token_usage" ||
-    eventType === "usage_update" ||
-    payloadKind === "tokens" ||
-    payloadKind === "token_usage" ||
-    payloadKind === "usage_update"
-  );
-}
-
-function isProviderLimitEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType === "provider_limit" || payloadKindIncludes(payloadKind, "provider_limit");
-}
-
-function isRateLimitEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType === "rate_limit" || eventType === "rate_limits" || payloadKindIncludes(payloadKind, "rate_limit");
+  return eventType.includes("tool") || payloadKindIncludes(payloadKind, "tool") || normalizedActivitySource(payload) === "tool";
 }
 
 function isThinkingEvent(eventType: string, payloadKind: string | null): boolean {
@@ -392,40 +391,171 @@ function isSystemEvent(eventType: string, payloadKind: string | null): boolean {
   return eventType === "system" || eventType === "session_info" || eventType === "hermes_profile" || payloadKind === "system";
 }
 
-function isStatusEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType === "status" || eventType === "status_update" || payloadKind === "status";
+function isStatusEvent(eventType: string, payloadKind: string | null, payload: Record<string, unknown>): boolean {
+  if (isAssistantDeltaLikePayload(payloadKind, payload)) return false;
+  return (
+    eventType === "status" ||
+    eventType === "status_update" ||
+    eventType === "runtime_diagnostic" ||
+    eventType === "diagnostic" ||
+    eventType === "token_usage_reported" ||
+    eventType === "token_budget_warning" ||
+    eventType === "token_budget_exceeded" ||
+    eventType === "rate_limit_updated" ||
+    eventType === "provider_limit_updated" ||
+    eventType === "run_cancelled" ||
+    eventType === "run_canceled" ||
+    eventType === "run_failed" ||
+    eventType === "run_completed" ||
+    eventType === "run_status" ||
+    (eventType === "progress" && isStatusLikePayload(payloadKind, payload)) ||
+    isStatusLikePayload(payloadKind, payload)
+  );
 }
 
-function isAssistantEvent(event: TranscriptEvent, eventType: string, payloadKind: string | null): boolean {
+function isHiddenMetadataEvent(eventType: string, _payloadKind: string | null, _activitySource: string | null): boolean {
+  return eventType === "session_started" || eventType === "run_status";
+}
+
+function isDiagnosticEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "run_diagnostic" || payloadKindIncludes(payloadKind, "run_diagnostic") || payloadKind === "diagnostic";
+}
+
+function isTokenUsageEvent(eventType: string, payloadKind: string | null): boolean {
+  return (
+    eventType === "tokens" ||
+    eventType === "token_usage" ||
+    eventType === "token_usage_reported" ||
+    eventType === "usage_update" ||
+    payloadKind === "tokens" ||
+    payloadKind === "token_usage" ||
+    payloadKind === "token_usage_reported" ||
+    payloadKind === "usage_update" ||
+    payloadKindIncludes(payloadKind, "token_budget")
+  );
+}
+
+function isProviderLimitEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "provider_limit" || eventType === "provider_limit_updated" || payloadKindIncludes(payloadKind, "provider_limit");
+}
+
+function isRateLimitEvent(eventType: string, payloadKind: string | null): boolean {
+  return (
+    eventType === "rate_limit" ||
+    eventType === "rate_limits" ||
+    eventType === "rate_limit_updated" ||
+    payloadKindIncludes(payloadKind, "rate_limit")
+  );
+}
+
+function isTerminalStatusEvent(eventType: string): boolean {
+  return eventType === "completed" || eventType === "failed" || eventType === "cancelled";
+}
+
+function isLegacyAcpProtocolEvent(eventType: string): boolean {
+  return eventType === "acp_session_update" || eventType === "acp_permission_denied" || eventType === "acp_diagnostic" || eventType === "hermes_acp_profile";
+}
+
+function isAssistantEvent(
+  event: TranscriptEvent,
+  eventType: string,
+  payloadKind: string | null,
+  payload: Record<string, unknown>,
+): boolean {
   if (eventType === "assistant" || payloadKind === "assistant") return true;
+  if (isAssistantDeltaLikePayload(payloadKind, payload)) return true;
   if (
     eventType === "message_delta" ||
     eventType === "message_complete" ||
     eventType === "assistant_delta" ||
     eventType === "assistant_complete" ||
+    eventType === "assistant_message_delta" ||
+    eventType === "assistant_message_completed" ||
     eventType === "response_delta" ||
     eventType === "response_complete"
   ) {
     return true;
   }
-  return event.source === "harness" && (eventType === "progress" || eventType === "completed");
+  return event.source === "harness" && !isStatusLikePayload(payloadKind, payload) && eventType === "progress";
 }
 
 function isAssistantDeltaEvent(event: TranscriptEvent): boolean {
   const eventType = normalizeToken(event.eventType);
-  return eventType === "message_delta" || eventType === "assistant_delta" || eventType === "response_delta";
+  const payload = sanitizedPayloadRecord(event);
+  const payloadKind = normalizedPayloadKind(payload);
+  return (
+    eventType === "message_delta" ||
+    eventType === "assistant_delta" ||
+    eventType === "assistant_message_delta" ||
+    eventType === "response_delta" ||
+    isAssistantDeltaLikePayload(payloadKind, payload)
+  );
 }
 
 function isAssistantCompleteEvent(event: TranscriptEvent): boolean {
   const eventType = normalizeToken(event.eventType);
-  return eventType === "message_complete" || eventType === "assistant_complete" || eventType === "response_complete" || eventType === "completed";
+  return (
+    eventType === "message_complete" ||
+    eventType === "assistant_complete" ||
+    eventType === "assistant_message_completed" ||
+    eventType === "response_complete" ||
+    eventType === "completed"
+  );
 }
 
-function combineAssistantDeltaText(existing: string, next: string): string {
+function shouldConcatenateAssistantDeltaExactly(event: TranscriptEvent): boolean {
+  return normalizeToken(event.eventType) === "progress" && normalizedActivitySource(sanitizedPayloadRecord(event)) === "delta";
+}
+
+function combineAssistantDeltaText(existing: string, next: string, exact = false): string {
   if (existing.length === 0) return next;
   if (next.length === 0) return existing;
+  if (exact) return existing + next;
   if (/\s$/.test(existing) || /^\s/.test(next)) return existing + next;
   return `${existing} ${next}`;
+}
+
+function isAssistantDeltaLikePayload(payloadKind: string | null, payload: Record<string, unknown>): boolean {
+  const actor = normalizedOptionalToken(payload.actor);
+  const channel = normalizedOptionalToken(payload.channel);
+  const activitySource = normalizedOptionalToken(payload.activitySource);
+  const progressKind = normalizedOptionalToken(payload.progressKind);
+  const assistantChannel = channel === "message" || channel === "chat" || channel === "assistant";
+  return (
+    payloadKind === "assistant_delta" ||
+    payloadKind === "assistant_message_delta" ||
+    payloadKind === "response_delta" ||
+    (payloadKind === "progress" && actor === "assistant" && assistantChannel && payload.delta === true) ||
+    (payloadKind === "progress" && (activitySource === "delta" || progressKind === "assistant_delta"))
+  );
+}
+
+function isStatusLikePayload(payloadKind: string | null, payload: Record<string, unknown>): boolean {
+  const actor = normalizedOptionalToken(payload.actor);
+  const channel = normalizedOptionalToken(payload.channel);
+  return (
+    payloadKind === "status" ||
+    payloadKind === "progress" ||
+    payloadKind === "usage" ||
+    payloadKind === "diagnostic" ||
+    payloadKind === "terminal" ||
+    payloadKindIncludes(payloadKind, "token") ||
+    payloadKindIncludes(payloadKind, "rate_limit") ||
+    payloadKindIncludes(payloadKind, "provider_limit") ||
+    payloadKindIncludes(payloadKind, "runtime") ||
+    payloadKindIncludes(payloadKind, "diagnostic") ||
+    payloadKindIncludes(payloadKind, "run_") ||
+    actor === "runtime" ||
+    channel === "status" ||
+    channel === "token" ||
+    channel === "runtime" ||
+    channel === "terminal"
+  );
+}
+
+function normalizedOptionalToken(value: unknown): string | null {
+  const text = firstCleanString(value);
+  return text ? normalizeToken(text) : null;
 }
 
 function sanitizedPayloadRecord(event: TranscriptEvent): Record<string, unknown> {
@@ -438,6 +568,19 @@ function eventText(event: TranscriptEvent, payload: Record<string, unknown>): st
     firstCleanString(payload.textPreview, payload.summary, payload.messagePreview, payload.text, payload.message, event.message) ??
     event.eventType
   );
+}
+
+function terminalStatusText(eventType: string): string {
+  switch (eventType) {
+    case "completed":
+      return "Run completed";
+    case "failed":
+      return "Run failed";
+    case "cancelled":
+      return "Run cancelled";
+    default:
+      return eventType;
+  }
 }
 
 function actionLabels(value: unknown): string[] {
@@ -467,6 +610,11 @@ function normalizedPayloadKind(payload: Record<string, unknown>): string | null 
   return kind ? normalizeToken(kind) : null;
 }
 
+function normalizedActivitySource(payload: Record<string, unknown>): string | null {
+  const source = firstCleanString(payload.activitySource, payload.activity_source);
+  return source ? normalizeToken(source) : null;
+}
+
 function payloadKindIncludes(payloadKind: string | null, token: string): boolean {
   return payloadKind?.includes(token) ?? false;
 }
@@ -487,19 +635,43 @@ function publicMultilineText(value: string, maxLength: number): string | null {
   return `${redacted.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`;
 }
 
+
 function progressToolSummary(
   event: TranscriptEvent,
   payload: Record<string, unknown>,
 ): { name: string | null; status: string | null } | null {
-  const activitySource = firstCleanString(payload.activitySource, payload.activity_source);
-  if (normalizeToken(activitySource ?? "") !== "tool") return null;
+  if (normalizedActivitySource(payload) !== "tool") return null;
+  const explicitName = firstCleanString(payload.name, payload.tool, payload.toolName);
   const message = firstCleanString(payload.message, event.message);
-  if (!message) return { name: "tool", status: "running" };
-  const withoutPrefix = message.replace(/^Hermes\s+ACP\s+/i, "").trim();
-  const statusMatch = withoutPrefix.match(/\(([^()]*)\)\s*$/);
-  const status = statusMatch ? firstCleanString(statusMatch[1]) : null;
-  const name = (statusMatch ? withoutPrefix.slice(0, statusMatch.index).trim() : withoutPrefix) || "tool";
-  return { name: firstCleanString(name), status: status ?? "running" };
+  const parsed = parseProgressToolMessage(message);
+  return { name: explicitName ?? parsed.name ?? "tool", status: parsed.status ?? "running" };
+}
+
+function parseProgressToolMessage(message: string | null): { name: string | null; status: string | null } {
+  if (!message) return { name: null, status: null };
+  let text = message.replace(/^Hermes\s+(?:ACP\s+)?/i, "").trim();
+  text = text.replace(/^tool\s+/i, "").trim();
+  const statusMatch = text.match(/\(([^()]*)\)\s*$/);
+  const statusText = statusMatch?.[1] ?? null;
+  const status = statusText ? toolStatusFromText(statusText) ?? firstCleanString(statusText) : toolStatusFromText(text);
+  if (statusMatch) text = text.slice(0, statusMatch.index).trim();
+  const colonIndex = text.indexOf(":");
+  if (colonIndex >= 0) {
+    const before = text.slice(0, colonIndex).trim();
+    const after = text.slice(colonIndex + 1).trim();
+    text = toolStatusFromText(before) && after.length > 0 ? after : before;
+  }
+  text = text.replace(/\b(started|starting|running|completed|complete|finished|failed|error|cancelled|canceled)\b$/i, "").trim();
+  return { name: firstCleanString(text), status };
+}
+
+function toolStatusFromText(value: string): string | null {
+  const token = normalizeToken(value);
+  if (token.includes("fail") || token.includes("error")) return "failed";
+  if (token.includes("cancel")) return "cancelled";
+  if (token.includes("complete") || token.includes("finish") || token.includes("succeed")) return "completed";
+  if (token.includes("start") || token.includes("running")) return "running";
+  return null;
 }
 
 interface ProjectedTokenCounts {

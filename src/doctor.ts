@@ -32,6 +32,12 @@ import {
   normalizeHermesAuthProvider,
   redactHermesAuthMessage,
 } from "../hermes/src/HermesAuthManager.js";
+import {
+  discoverHostHermes,
+  hostHermesCommandEnvironment,
+  type HostHermesCommandRunner,
+  type HostHermesDiagnostic,
+} from "../hermes/src/HostHermesDiscovery.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -68,6 +74,7 @@ export interface RuntimeHarnessDependencyDoctorCheckOptions {
   cliPath?: string | undefined;
   hermesGatewayFactory?: ((env: HermesGatewayEnvironment) => HermesGatewayClient) | undefined;
   hermesAuthManagerFactory?: ((options: HermesAuthManagerOptions) => Pick<HermesAuthManager, "prepare" | "validateOpenAiCodex">) | undefined;
+  hostHermesCommandRunner?: HostHermesCommandRunner | undefined;
 }
 
 export type McpToolServerCommand = "completion-report-mcp" | "review-verdict-mcp" | "review-feedback-mcp";
@@ -245,6 +252,7 @@ export function runtimeHarnessDoctorChecks(config: ServiceConfig): DoctorCheck[]
   ];
   if (config.agent.harness === "cursor") return [...checks, ...cursorPolicyDoctorChecks(config)];
   if (config.agent.harness === "hermes") return [...checks, ...hermesRuntimeDoctorChecks(config)];
+  if (config.agent.harness === "hermes_acp") return [...checks, ...hermesAcpRuntimeDoctorChecks(config)];
   return [
     ...checks,
     {
@@ -278,10 +286,31 @@ export function hermesRuntimeDoctorChecks(config: ServiceConfig): DoctorCheck[] 
   ];
 }
 
+export function hermesAcpRuntimeDoctorChecks(config: ServiceConfig): DoctorCheck[] {
+  const binary = config.hermes.acpBinaryPath ?? "hermes (PATH)";
+  const sourceProfile = config.hermes.acpSourceProfile ?? "active host Hermes profile";
+  const prefix = config.hermes.acpProfilePrefix ?? "symphony";
+  return [
+    {
+      id: "hermes_acp.runtime",
+      status: "ok",
+      message: `Hermes ACP uses host Hermes binary ${binary}; source profile is ${sourceProfile}`,
+    },
+    {
+      id: "hermes_acp.profiles",
+      status: "ok",
+      message:
+        `ACP managed profile prefix is ${prefix}; worker lifecycle is ${config.hermes.workerSessionLifecycle}; ` +
+        `profile retention is ${config.hermes.keepProfiles}`,
+    },
+  ];
+}
+
 export async function runtimeHarnessDependencyDoctorChecks(
   config: ServiceConfig,
   options: RuntimeHarnessDependencyDoctorCheckOptions = {},
 ): Promise<DoctorCheck[]> {
+  if (config.agent.harness === "hermes_acp") return hostHermesAcpDoctorChecks(config, options);
   if (config.agent.harness !== "hermes") return [];
   const checks: DoctorCheck[] = [];
   checks.push(await hermesPathDoctorCheck("hermes.upstream_root", config.hermes.upstreamRoot, [
@@ -310,6 +339,175 @@ export async function runtimeHarnessDependencyDoctorChecks(
     );
   }
   return checks;
+}
+
+export async function hostHermesAcpDoctorChecks(
+  config: ServiceConfig,
+  options: Pick<RuntimeHarnessDependencyDoctorCheckOptions, "hostHermesCommandRunner"> = {},
+): Promise<DoctorCheck[]> {
+  const cwd = config.workspace.root;
+  const timeoutMs = config.hermes.startupTimeoutMs;
+  const env = hostHermesCommandEnvironment(process.env);
+  const discovery = await discoverHostHermes({
+    binaryPath: config.hermes.acpBinaryPath,
+    sourceProfile: config.hermes.acpSourceProfile,
+    cwd,
+    env,
+    timeoutMs,
+    ...(options.hostHermesCommandRunner === undefined ? {} : { runner: options.hostHermesCommandRunner }),
+  });
+
+  const checks: DoctorCheck[] = [];
+  if (discovery.binary) {
+    checks.push({
+      id: "hermes_acp.host_hermes",
+      status: "ok",
+      message:
+        `Host Hermes binary resolved from ${discovery.binary.source} at ${discovery.binary.path}` +
+        (discovery.binary.versionText ? `; ${discovery.binary.versionText}` : ""),
+    });
+  }
+  checks.push(...discovery.diagnostics.map(hostHermesDiagnosticDoctorCheck));
+  if (!discovery.binary) return checks;
+
+  checks.push(
+    await hostHermesAcpCommandDoctorCheck({
+      id: "hermes_acp.acp_check",
+      successMessage: "Host Hermes `hermes acp --check` completed successfully",
+      file: discovery.binary.path,
+      args: ["acp", "--check"],
+      cwd,
+      env,
+      timeoutMs,
+      runner: options.hostHermesCommandRunner,
+    }),
+  );
+
+  if (!discovery.sourceProfile) {
+    checks.push({
+      id: "hermes_acp.source_profile",
+      status: "error",
+      message: "Host Hermes ACP source profile could not be resolved from config or the active host Hermes profile",
+    });
+    return checks;
+  }
+
+  checks.push({
+    id: "hermes_acp.source_profile",
+    status: "ok",
+    message: `Hermes ACP source profile is ${discovery.sourceProfile.name} (${discovery.sourceProfile.source})`,
+  });
+  checks.push(
+    await hostHermesAcpCommandDoctorCheck({
+      id: "hermes_acp.source_profile_check",
+      successMessage: `Host Hermes ACP source profile ${discovery.sourceProfile.name} passed \`hermes -p ${discovery.sourceProfile.name} acp --check\``,
+      file: discovery.binary.path,
+      args: ["-p", discovery.sourceProfile.name, "acp", "--check"],
+      cwd,
+      env,
+      timeoutMs,
+      runner: options.hostHermesCommandRunner,
+    }),
+  );
+  return checks;
+}
+
+async function hostHermesAcpCommandDoctorCheck(input: {
+  id: string;
+  successMessage: string;
+  file: string;
+  args: readonly string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  runner?: HostHermesCommandRunner | undefined;
+}): Promise<DoctorCheck> {
+  try {
+    const result = input.runner
+      ? await input.runner(input.file, input.args, { cwd: input.cwd, env: input.env, timeoutMs: input.timeoutMs })
+      : await defaultHostHermesDoctorCommandRunner(input.file, input.args, {
+          cwd: input.cwd,
+          env: input.env,
+          timeoutMs: input.timeoutMs,
+        });
+    const exitCode = result.exitCode ?? 0;
+    if (exitCode === 0) return { id: input.id, status: "ok", message: input.successMessage };
+    return {
+      id: input.id,
+      status: "error",
+      message: redactDoctorDiagnosticMessage(
+        `Host Hermes ACP command failed with exit code ${exitCode}: ${input.file} ${input.args.join(" ")}${hostHermesCommandOutputSummary(result.stdout, result.stderr)}`,
+      ),
+    };
+  } catch (error) {
+    return {
+      id: input.id,
+      status: "error",
+      message: redactDoctorDiagnosticMessage(
+        `Host Hermes ACP command failed: ${input.file} ${input.args.join(" ")}: ${errorMessage(error)}${hostHermesCommandOutputSummary(
+          commandErrorOutput(error, "stdout"),
+          commandErrorOutput(error, "stderr"),
+        )}`,
+      ),
+    };
+  }
+}
+
+async function defaultHostHermesDoctorCommandRunner(
+  file: string,
+  args: readonly string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
+): Promise<{ stdout: string; stderr: string; exitCode?: number | null }> {
+  const result = await execFileAsync(file, [...args], {
+    cwd: options.cwd,
+    env: options.env,
+    timeout: options.timeoutMs,
+    windowsHide: true,
+  });
+  return { stdout: commandOutputToString(result.stdout), stderr: commandOutputToString(result.stderr), exitCode: 0 };
+}
+
+function hostHermesDiagnosticDoctorCheck(diagnostic: HostHermesDiagnostic): DoctorCheck {
+  return {
+    id: `hermes_acp.${diagnostic.code}`,
+    status: hostHermesDiagnosticStatus(diagnostic),
+    message: redactDoctorDiagnosticMessage(diagnostic.message),
+  };
+}
+
+function hostHermesDiagnosticStatus(diagnostic: HostHermesDiagnostic): DoctorStatus {
+  if (diagnostic.severity === "error") return "error";
+  if (diagnostic.severity === "warning") return "warn";
+  return "ok";
+}
+
+function hostHermesCommandOutputSummary(stdout: string, stderr: string): string {
+  const output = [stdout, stderr]
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .join("\n")
+    .trim();
+  if (output.length === 0) return "";
+  return `\n${output.slice(0, 800)}`;
+}
+
+function commandOutputToString(value: string | Buffer): string {
+  return typeof value === "string" ? value : value.toString("utf8");
+}
+
+function commandErrorOutput(error: unknown, field: "stdout" | "stderr"): string {
+  if (typeof error !== "object" || error === null) return "";
+  const value = (error as Record<string, unknown>)[field];
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  return "";
+}
+
+function redactDoctorDiagnosticMessage(message: string): string {
+  return redactHermesAuthMessage(message)
+    .replace(/\[redacted\]/gi, "[REDACTED]")
+    .replace(/("(?:api[_-]?key|token|authorization|password|secret)"\s*:\s*")[^"]+(")/gi, "$1[REDACTED]$2")
+    .replace(/((?:api[_-]?key|token|authorization|password|secret)\s*[=:]\s*)[^\s,)]+/gi, "$1[REDACTED]");
 }
 
 export async function hermesLiveRuntimeDoctorCheck(
@@ -852,6 +1050,13 @@ function githubCredentialAccessDescription(
 export function runtimeCredentialDoctorCheck(config: ServiceConfig): DoctorCheck {
   if (config.agent.harness === "cursor") return cursorRuntimeDoctorCheck(config);
   if (config.agent.harness === "hermes") return hermesRuntimeCredentialDoctorCheck(config);
+  if (config.agent.harness === "hermes_acp") {
+    return {
+      id: "env.hermes_acp",
+      status: "ok",
+      message: "Hermes ACP uses host Hermes profile credentials; Symphony runtime credential env injection is not used",
+    };
+  }
   return {
     id: "env.runtime",
     status: "warn",
