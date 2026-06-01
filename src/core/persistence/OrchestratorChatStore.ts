@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 
-export const ORCHESTRATOR_CHAT_PROJECTION_SOURCE = "orchestratorChat";
+export const ORCHESTRATOR_CHAT_PROJECTION_SOURCE = "orchestrator_conversations";
 
 export type OrchestratorChatMessageActor = "agent" | "user";
 

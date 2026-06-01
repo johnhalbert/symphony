@@ -1,6 +1,6 @@
+import { useEffect, useState } from "react";
 import { SidebarChrome } from "../../app/SidebarChrome";
 import { useDataSource } from "../../data/dataSourceContext";
-import { useEffect, useState } from "react";
 import type { ChatMessage, SidebarModel, SidebarVariant } from "../../types/symphony";
 import { SidebarChat } from "./SidebarChat";
 import { SidebarHistory } from "./SidebarHistory";
@@ -35,9 +35,19 @@ export function SidebarViews({
     setChatMessages(nextMessages);
   }
 
+  const sidebarChatSubtitle = sidebar.runningAgents[0]
+    ? `${sidebar.runningAgents[0].id} · ${sidebar.runningAgents[0].issue}`
+    : undefined;
   const child =
     variant === "chat" ? (
-      <SidebarChat messages={chatMessages} onSend={sendChat} loading={orchestratorChatLoading} error={orchestratorChatError} readOnly={orchestratorChatReadOnly} />
+      <SidebarChat
+        messages={chatMessages}
+        onSend={sendChat}
+        loading={orchestratorChatLoading}
+        error={orchestratorChatError}
+        readOnly={orchestratorChatReadOnly}
+        subtitle={sidebarChatSubtitle}
+      />
     ) : variant === "history" ? (
       <SidebarHistory sessions={sidebar.sessions} />
     ) : (

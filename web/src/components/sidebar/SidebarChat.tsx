@@ -9,18 +9,22 @@ export function SidebarChat({
   messages,
   onSend,
   readOnly = false,
+  subtitle,
 }: {
   error?: string | null;
   loading?: boolean;
   messages: ChatMessage[];
   onSend: (input: string) => Promise<void>;
   readOnly?: boolean;
+  subtitle?: string | null;
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const recent = messages.slice(-3);
-  const readOnlyNotice = "This compact chat is showing durable orchestrator history in read-only mode; no command will be dispatched.";
+  const readOnlyNotice =
+    "API mode shows durable chat history only. Sending commands from this compact chat is not supported yet; no orchestrator action will be dispatched.";
+  const contextLabel = readOnly ? "read-only API mode" : sending ? "sending command..." : (subtitle?.trim() || "agent context unavailable");
 
   async function submit(input = draft) {
     const trimmed = input.trim();
@@ -46,7 +50,7 @@ export function SidebarChat({
         <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
           <span style={{ fontSize: 12, fontWeight: 500 }}>Orchestrator</span>
           <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {readOnly ? "read-only history" : sending ? "sending command..." : "live commands"}
+            {contextLabel}
           </span>
         </div>
         <div style={{ flex: 1 }} />

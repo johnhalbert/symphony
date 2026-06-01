@@ -104,14 +104,16 @@ function renderSidebarChat(props: {
   readOnly?: boolean;
 }): string {
   return renderToStaticMarkup(
-    <SidebarViews
-      sidebar={sidebarWithEmbeddedChat}
-      variant="chat"
-      orchestratorChat={props.chat}
-      orchestratorChatError={props.error ?? null}
-      orchestratorChatLoading={props.loading ?? false}
-      orchestratorChatReadOnly={props.readOnly ?? false}
-    />,
+    <DataSourceProvider value={dataSourceForChat(props.chat)}>
+      <SidebarViews
+        sidebar={sidebarWithEmbeddedChat}
+        variant="chat"
+        orchestratorChat={props.chat}
+        orchestratorChatError={props.error ?? null}
+        orchestratorChatLoading={props.loading ?? false}
+        orchestratorChatReadOnly={props.readOnly ?? false}
+      />
+    </DataSourceProvider>,
   );
 }
 
@@ -144,13 +146,14 @@ describe("dashboard orchestrator chat integration", () => {
     expect(markup).not.toContain("dashboard embedded chat should not render");
   });
 
-  it("renders explicitly read-only dashboard chat for the exact empty API response", () => {
+  it("renders API-mode dashboard chat as read-only for the exact empty API response", () => {
     const markup = renderDashboardChat({ chat: [], readOnly: true });
 
     expect(markup).toContain("Symphony orchestrator");
     expect(markup).toContain(emptyChatCopy);
-    expect(markup).toContain("This chat is showing durable orchestrator history in read-only mode");
-    expect(markup).toContain("no command will be dispatched");
+    expect(markup).toContain("API mode shows durable chat history only");
+    expect(markup).toContain("Sending commands from this web chat is not supported yet");
+    expect(markup).toContain("no orchestrator action will be dispatched");
     expect(markup).not.toContain("Ask about the project, or issue a command");
     expect(markup).not.toContain("/ commands");
     expect(markup).not.toContain("codex-1");
@@ -161,10 +164,13 @@ describe("dashboard orchestrator chat integration", () => {
     const markup = renderDashboardChat({ chat: [] });
 
     expect(markup).toContain("Ask about the project, or issue a command");
+    expect(markup).toContain("show stalled agents");
     expect(markup).toContain("/ commands");
-    expect(markup).toContain("codex-1");
+    expect(markup).toContain("agent unavailable");
+    expect(markup).not.toContain("codex-1");
+    expect(markup).not.toContain("pause SYM-42");
     expect(markup).toContain("type=\"submit\"");
-    expect(markup).not.toContain("This chat is showing durable orchestrator history in read-only mode");
+    expect(markup).not.toContain("API mode shows durable chat history only");
   });
 });
 
@@ -197,16 +203,17 @@ describe("sidebar orchestrator chat integration", () => {
     expect(markup).not.toContain("sidebar stale suggestion");
   });
 
-  it("renders explicitly read-only compact sidebar chat for the exact empty API response", () => {
+  it("renders API-mode compact sidebar chat as read-only for the exact empty API response", () => {
     const markup = renderSidebarChat({ chat: [], readOnly: true });
 
     expect(markup).toContain(emptyChatCopy);
-    expect(markup).toContain("read-only history");
-    expect(markup).toContain("This compact chat is showing durable orchestrator history in read-only mode");
-    expect(markup).toContain("no command will be dispatched");
+    expect(markup).toContain("read-only API mode");
+    expect(markup).toContain("API mode shows durable chat history only");
+    expect(markup).toContain("Sending commands from this compact chat is not supported yet");
+    expect(markup).toContain("no orchestrator action will be dispatched");
     expect(markup).not.toContain("Ask or command");
     expect(markup).not.toContain("@ context");
-    expect(markup).not.toContain("live commands");
+    expect(markup).not.toContain("codex-1 · cycle 14");
   });
 
   it("preserves mock-mode compact sidebar chat send affordances", () => {
@@ -214,8 +221,9 @@ describe("sidebar orchestrator chat integration", () => {
 
     expect(markup).toContain("Ask or command");
     expect(markup).toContain("@ context");
-    expect(markup).toContain("live commands");
-    expect(markup).not.toContain("read-only history");
-    expect(markup).not.toContain("This compact chat is showing durable orchestrator history in read-only mode");
+    expect(markup).toContain("agent context unavailable");
+    expect(markup).not.toContain("codex-1 · cycle 14");
+    expect(markup).not.toContain("read-only API mode");
+    expect(markup).not.toContain("Sending commands from this compact chat is not supported yet");
   });
 });

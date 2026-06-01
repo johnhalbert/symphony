@@ -17,9 +17,15 @@ let root: string;
 describe("review feedback MCP handoff", () => {
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-review-feedback-mcp-"));
+    vi.stubEnv("GITHUB_APP_ID", "");
+    vi.stubEnv("GITHUB_APP_CLIENT_ID", "");
+    vi.stubEnv("GITHUB_APP_INSTALLATION_ID", "");
+    vi.stubEnv("GITHUB_APP_PRIVATE_KEY", "");
+    vi.stubEnv("GITHUB_APP_PRIVATE_KEY_PATH", "");
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });

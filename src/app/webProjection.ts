@@ -1,6 +1,11 @@
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
+import type {
+  OrchestratorConversationMessage,
+  OrchestratorConversationRole,
+  OrchestratorConversationStatus,
+} from "../core/persistence/OrchestratorConversationStore.js";
+import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
-import type { OrchestratorChatMessageRecord } from "../core/persistence/OrchestratorChatStore.js";
 import type { HistoryModel as WebHistoryModel } from "./WebHistoryProjection.js";
 import { projectWebTranscript, type TranscriptMessage as WebTranscriptMessage } from "./WebTranscriptProjection.js";
 import type {
@@ -149,8 +154,15 @@ export interface SessionModel {
 }
 
 export interface ChatMessage {
+  id?: string;
+  conversationId?: string;
   who: "agent" | "user";
+  role?: OrchestratorConversationRole;
   text: string;
+  status?: OrchestratorConversationStatus;
+  createdAt?: string;
+  updatedAt?: string;
+  metadata?: Record<string, unknown>;
   suggestions?: string[];
 }
 
@@ -551,23 +563,50 @@ export function emptyChatMessages(): ChatMessage[] {
 }
 
 export function projectWebOrchestratorChat(
-  messages: readonly OrchestratorChatMessageRecord[] | readonly ChatMessage[] = emptyChatMessages(),
+  messages: readonly OrchestratorConversationMessage[] | readonly ChatMessage[] = [],
 ): ChatMessage[] {
-  return messages.map((message) => {
-    const projected: ChatMessage = {
-      who: message.who === "user" ? "user" : "agent",
-      text: message.text,
-    };
-    const suggestions = Array.isArray(message.suggestions)
-      ? message.suggestions.map((suggestion) => suggestion.trim()).filter((suggestion) => suggestion.length > 0)
-      : [];
-    if (suggestions.length > 0) projected.suggestions = suggestions;
-    return projected;
-  });
+  return messages.map(projectWebOrchestratorChatMessage);
 }
 
-export function projectWebOrchestratorChatPost(input: string): ChatMessage[] {
-  return projectWebOrchestratorChat([{ who: "user", text: input.trim() }]);
+export function projectWebOrchestratorChatPost(
+  input: string,
+  messages: readonly OrchestratorConversationMessage[] | readonly ChatMessage[] = [],
+): ChatMessage[] {
+  if (messages.length > 0) return projectWebOrchestratorChat(messages);
+  const trimmed = input.trim();
+  return trimmed ? projectWebOrchestratorChat([{ who: "user", text: trimmed }]) : [];
+}
+
+function projectWebOrchestratorChatMessage(message: OrchestratorConversationMessage | ChatMessage): ChatMessage {
+  if (isOrchestratorConversationMessage(message)) {
+    return {
+      id: message.id,
+      conversationId: message.conversationId,
+      who: message.role === "user" ? "user" : "agent",
+      role: message.role,
+      text: sanitizedPreviewValue(message.body, 10_000).preview ?? "",
+      status: message.status,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+      metadata: sanitizePublicJson(message.metadata) as Record<string, unknown>,
+    };
+  }
+
+  const projected: ChatMessage = {
+    who: message.who === "user" ? "user" : "agent",
+    text: message.text,
+  };
+  const suggestions = Array.isArray(message.suggestions)
+    ? message.suggestions.map((suggestion) => suggestion.trim()).filter((suggestion) => suggestion.length > 0)
+    : [];
+  if (suggestions.length > 0) projected.suggestions = suggestions;
+  return projected;
+}
+
+function isOrchestratorConversationMessage(
+  message: OrchestratorConversationMessage | ChatMessage,
+): message is OrchestratorConversationMessage {
+  return "body" in message && typeof message.body === "string" && "role" in message && typeof message.role === "string";
 }
 
 export function projectIssueModel(
