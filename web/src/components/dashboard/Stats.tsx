@@ -31,6 +31,8 @@ function PanelUnavailable({ children }: { children: string }) {
   return <div className="view-empty" style={{ minHeight: 132, display: "grid", placeItems: "center" }}>{children}</div>;
 }
 
+const unavailableValue = "—";
+
 export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
   const totals = dashboard.totals;
   const runningCount = dashboard.runningAgents.length;
@@ -54,7 +56,7 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
         <div className="completeness-bar">
           <div style={{ width: `${totals.completeness}%` }} />
         </div>
-        <div className={completenessDelta ? "stat__delta stat__delta--up" : "stat__delta"}>{completenessDelta ?? "Trend unavailable"}</div>
+        <div className={completenessDelta ? "stat__delta stat__delta--up" : "stat__delta"}>{completenessDelta ?? "derived from stored issue/run state"}</div>
       </div>
       <div className="stat">
         <div className="stat__label">Running agents</div>
@@ -93,9 +95,9 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
         <div className="stat__delta">{totals.backlog} in backlog</div>
       </div>
       <div className="stat">
-        <div className="stat__label">Velocity / ETA</div>
+        <div className="stat__label">Throughput / ETA</div>
         <div className="stat__value">
-          {velocityValue ?? "—"}
+          {velocityValue ?? unavailableValue}
           {velocityUnit ? <span className="suffix">{velocityUnit}</span> : null}
         </div>
         {velocitySparkline.length >= 2 ? (
@@ -105,21 +107,21 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
         ) : (
           <InlineUnavailable>Velocity trend unavailable</InlineUnavailable>
         )}
-        <div className={velocityEta ? "stat__delta stat__delta--warn" : "stat__delta"}>{velocityEta ?? "ETA unavailable"}</div>
+        <div className={velocityEta ? "stat__delta stat__delta--warn" : "stat__delta stat__delta--warn"}>{velocityEta ?? "ETA unavailable: no durable throughput or ETA source"}</div>
       </div>
     </div>
   );
 }
 
-export function StatsGridDense({ totals, metrics }: { totals: DashboardTotals; metrics?: DashboardMetrics | null }) {
+export function StatsGridDense({ totals }: { totals: DashboardTotals }) {
   return (
     <div className="stats" style={{ gridTemplateColumns: "repeat(6, 1fr)" }}>
-      <DenseStat label="Done" value={totals.done} sub="this cycle" color="var(--st-done)" />
-      <DenseStat label="In Review" value={totals.review} sub="agent review" color="var(--st-review)" />
-      <DenseStat label="In Progress" value={totals.progress} sub="running" color="var(--st-progress)" />
-      <DenseStat label="Todo" value={totals.todo} sub="dispatchable" color="var(--st-todo)" />
-      <DenseStat label="Backlog" value={totals.backlog} sub="" color="var(--st-backlog)" />
-      <DenseStat label="Completeness" value={`${totals.completeness}%`} sub={textOr(metrics?.cycle?.label, "cycle unavailable")} color="var(--accent)" emphasis />
+      <DenseStat label="Done" value={totals.done} sub="done" color="var(--st-done)" />
+      <DenseStat label="In Review" value={totals.review} sub="in review" color="var(--st-review)" />
+      <DenseStat label="In Progress" value={totals.progress} sub="in progress" color="var(--st-progress)" />
+      <DenseStat label="Todo" value={totals.todo} sub="todo" color="var(--st-todo)" />
+      <DenseStat label="Backlog" value={totals.backlog} sub="backlog" color="var(--st-backlog)" />
+      <DenseStat label="Completeness" value={`${totals.completeness}%`} sub="from totals" color="var(--accent)" emphasis />
     </div>
   );
 }
@@ -164,13 +166,20 @@ export function BurndownPanel({
   return (
     <div className="panel" style={{ marginBottom: 0 }}>
       <div className="panel__head">
-        <span>{textOr(burnup?.title, "Burn-up unavailable")}</span>
+        <span>{hasBurnup ? textOr(burnup?.title, "Burn-up") : "Progress totals"}</span>
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>
-          {totals.done}/{totals.all} done · {textOr(burnup?.remainingLabel, "schedule unavailable")}
+          {totals.done}/{totals.all} done · {hasBurnup ? textOr(burnup?.remainingLabel, "schedule unavailable") : "schedule unavailable"}
         </span>
       </div>
       <div style={{ padding: "14px 18px 18px" }}>
-        {hasBurnup && burnup ? <BurnupChart burnup={burnup} /> : <PanelUnavailable>Burn-up trend unavailable until the API provides cycle history.</PanelUnavailable>}
+        {hasBurnup && burnup ? (
+          <BurnupChart burnup={burnup} />
+        ) : (
+          <>
+            <ProgressTotalsChart totals={totals} />
+            <InlineUnavailable>Burn-up unavailable; no durable cycle history is present.</InlineUnavailable>
+          </>
+        )}
       </div>
     </div>
   );
@@ -197,14 +206,20 @@ export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase" }}>
           ./symphony status --branch {dashboard.branch || "--"}
         </span>
-        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: health?.stateLabel ? "var(--accent)" : "var(--text-3)" }}>● {healthState}</span>
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: health?.stateLabel ? "var(--accent)" : "var(--text-3)" }}>● {health?.stateLabel ? healthState : "projection"}</span>
       </div>
       <div style={{ padding: "12px 16px 14px", fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.65 }}>
+        <div>
+          <span style={{ color: "var(--text-3)" }}>scope      </span> current durable dashboard projection
+        </div>
         <div>
           <span style={{ color: "var(--text-3)" }}>cycle      </span> {cycleLabel} · {dateRange} · <span style={{ color: "var(--text)" }}>{remainingLabel}</span>
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>completion </span> <span style={{ color: "var(--st-done)" }}>{totals.completeness}%</span> ({totals.done}/{totals.all}) · projection <span style={{ color: cycle?.projectedCompletionLabel ? "var(--st-done)" : "var(--text-3)" }}>{projectedCompletion}</span>
+          <span style={{ color: "var(--text-3)" }}>completion </span> <span style={{ color: "var(--st-done)" }}>{totals.completeness}%</span> ({totals.done}/{totals.all} done) · total {totals.all} · projection <span style={{ color: cycle?.projectedCompletionLabel ? "var(--st-done)" : "var(--text-3)" }}>{projectedCompletion}</span> · from stored totals
+        </div>
+        <div>
+          <span style={{ color: "var(--text-3)" }}>open       </span> {totals.open} open · {totals.todo} todo · {totals.progress} in progress · {totals.review} in review
         </div>
         <div>
           <span style={{ color: "var(--text-3)" }}>velocity   </span> <span style={{ color: velocity?.valueLabel ? "var(--accent)" : "var(--text-3)" }}>{velocityLabel}</span> · {velocityTrend}
@@ -218,6 +233,9 @@ export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel
         <div>
           <span style={{ color: "var(--text-3)" }}>health     </span> <span style={{ color: health?.stateLabel ? "var(--st-done)" : "var(--text-3)" }}>{healthState}</span> · {dashboard.pollLabel || "poll unavailable"} · {errorSummary}
         </div>
+        <div>
+          <span style={{ color: "var(--text-3)" }}>unavailable</span> cycle dates, throughput, ETA, health, and error-window metrics need durable source fields
+        </div>
       </div>
     </div>
   );
@@ -228,6 +246,38 @@ function velocityValueLabel(value: string | null | undefined, unit: string | nul
   if (!valueLabel) return "unavailable";
   const unitLabel = textOrNull(unit);
   return unitLabel ? `${valueLabel} ${unitLabel}` : valueLabel;
+}
+
+function ProgressTotalsChart({ totals }: { totals: DashboardTotals }) {
+  const width = 700;
+  const height = 120;
+  const padding = 18;
+  const usableWidth = width - padding * 2;
+  const done = chartValue(totals.done);
+  const total = chartValue(totals.all);
+  const denominator = Math.max(done, total, 1);
+  const doneWidth = (done / denominator) * usableWidth;
+  const remaining = Math.max(total - done, 0);
+  const completion = total === 0 ? 0 : Math.round((done / total) * 100);
+
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height }}>
+      <rect x={padding} y="42" width={usableWidth} height="18" rx="9" fill="var(--elevated)" />
+      <rect x={padding} y="42" width={doneWidth} height="18" rx="9" fill="var(--accent)" />
+      <text x={padding} y="24" fill="var(--accent)" fontSize="10.5" fontFamily="var(--font-mono)">
+        done {formatChartValue(done)}
+      </text>
+      <text x={width - padding} y="24" textAnchor="end" fill="var(--text-3)" fontSize="10.5" fontFamily="var(--font-mono)">
+        total {formatChartValue(total)}
+      </text>
+      <text x={padding} y="82" fill="var(--text-3)" fontSize="10.5" fontFamily="var(--font-mono)">
+        remaining {formatChartValue(remaining)}
+      </text>
+      <text x={width - padding} y="82" textAnchor="end" fill="var(--text-3)" fontSize="10.5" fontFamily="var(--font-mono)">
+        completion {completion}%
+      </text>
+    </svg>
+  );
 }
 
 function BurnupChart({ burnup }: { burnup: DashboardBurnupMetrics }) {
@@ -274,9 +324,6 @@ function BurnupChart({ burnup }: { burnup: DashboardBurnupMetrics }) {
       })}
       <text x={width - 14} y={sy(targetEnd) + 3} textAnchor="end" fill="var(--text-3)" fontSize="9.5" fontFamily="var(--font-mono)">
         target {formatChartValue(targetEnd)}
-      </text>
-      <text x={width - 14} y={sy(completedEnd) - 6} textAnchor="end" fill="var(--accent)" fontSize="9.5" fontFamily="var(--font-mono)">
-        completed {formatChartValue(completedEnd)}
       </text>
     </svg>
   );

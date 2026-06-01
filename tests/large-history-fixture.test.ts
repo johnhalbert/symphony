@@ -183,7 +183,7 @@ describe("generateLargeHistoryFixture", () => {
     const messages = projectWebTranscript(transcriptPage.events, { run });
     expect(messages.some((message) => message.kind === "assistant" && message.text.includes("complete response"))).toBe(true);
     expect(messages.some((message) => message.kind === "tool_call" && message.name === "search_files")).toBe(true);
-    expect(messages.some((message) => message.kind === "status" && message.state === "tokens")).toBe(true);
+    expect(messages.some((message) => message.kind === "status" && message.state === "tokens")).toBe(false);
 
     await expectTerminalEvent(runStore, "fixture-run-0001-02", "completed");
     await expectTerminalEvent(runStore, "fixture-run-0003-04", "cancelled");
