@@ -100,7 +100,11 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
   const payloadKind = normalizedPayloadKind(payload);
-  if (isToolEvent(eventType, payloadKind)) return projectToolCallMessage(event, payload, eventType);
+  if (isToolEvent(eventType, payloadKind, payload)) return projectToolCallMessage(event, payload, eventType);
+  if (isRunDiagnosticEvent(eventType, payloadKind)) return projectRunDiagnosticStatusMessage(event, payload, eventType);
+  if (isTokenUsageEvent(eventType, payloadKind)) return projectTokenUsageStatusMessage(event, payload, eventType);
+  if (isProviderLimitEvent(eventType, payloadKind)) return projectProviderLimitStatusMessage(event, payload, eventType);
+  if (isRateLimitEvent(eventType, payloadKind)) return projectRateLimitStatusMessage(event, payload, eventType);
   if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
   if (isTaskEvent(eventType, payloadKind)) return projectTaskMessage(event, payload);
   if (isRequestEvent(eventType, payloadKind)) return projectRequestMessage(event, payload);
@@ -114,6 +118,7 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
 }
 
 function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, unknown>, eventType: string): TranscriptMessage {
+  const progressTool = progressToolSummary(event, payload);
   const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.args, payload.arguments, payload.input);
   const resultPreview = firstPublicPreview(payload.resultPreview, payload.result, payload.summary);
   const outputPreview = firstPublicPreview(payload.outputPreview, payload.output);
@@ -122,8 +127,8 @@ function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, 
     kind: "tool_call",
     ts: event.at,
     call_id: firstCleanString(payload.call_id, payload.callId, payload.id, payload.toolId, payload.tool_id) ?? `${event.runId}:${event.sequence}`,
-    name: firstCleanString(payload.name, payload.tool, payload.toolName) ?? event.eventType,
-    status: inferredToolStatus(eventType, payload, errorPreview !== null),
+    name: firstCleanString(payload.name, payload.tool, payload.toolName, progressTool?.name) ?? event.eventType,
+    status: inferredToolStatus(eventType, payload, errorPreview !== null, progressTool?.status),
     args: argsPreview ? { preview: argsPreview.preview } : {},
     result: resultPreview?.preview ?? outputPreview?.preview ?? errorPreview?.preview ?? null,
     ...(outputPreview ? { output: outputPreview.preview } : {}),
@@ -131,6 +136,72 @@ function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, 
     ...(payload.truncated === true || argsPreview?.truncated || resultPreview?.truncated || outputPreview?.truncated || errorPreview?.truncated
       ? { truncated: true }
       : {}),
+  };
+}
+
+function projectRunDiagnosticStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  return {
+    kind: "status",
+    state: firstCleanString(payload.code, payload.diagnosticCode, payload.status, payload.state) ?? eventType,
+    ts: event.at,
+    text: eventText(event, payload),
+  };
+}
+
+function projectTokenUsageStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const tokens = tokenCountsFrom(payload.tokens) ?? tokenCountsFrom(payload.usage) ?? tokenCountsFrom(payload);
+  const tokenText = tokens ? formatTokenCounts(tokens) : null;
+  return {
+    kind: "status",
+    state: "tokens",
+    ts: event.at,
+    text: tokenText ? `Tokens: ${tokenText}` : eventText(event, payload) || eventType,
+  };
+}
+
+function projectProviderLimitStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const signal = providerLimitSignal(payload);
+  const scope = recordValue(signal?.scope) ?? recordValue(payload.scope);
+  const window = recordValue(signal?.window) ?? recordValue(payload.window);
+  const kind = firstCleanString(signal?.kind, payload.limitKind, payload.providerLimitKind, payload.status, payload.state) ?? eventType;
+  const message = firstCleanString(signal?.message, payload.message, event.message) ?? eventText(event, payload);
+  const resumeAt = firstCleanString(window?.resumeAt, payload.resumeAt);
+  const details = compactStrings([
+    firstCleanString(scope?.providerId, scope?.provider, payload.providerId, payload.provider),
+    firstCleanString(scope?.model, payload.model),
+    resumeAt ? `resume ${resumeAt}` : null,
+  ]);
+  return {
+    kind: "status",
+    state: kind,
+    ts: event.at,
+    text: `Provider limit: ${message}${details.length > 0 ? ` (${details.join(" · ")})` : ""}`,
+  };
+}
+
+function projectRateLimitStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const preview = firstPublicPreview(payload.payload, payload.rateLimits, payload.rate_limits, payload.limits);
+  return {
+    kind: "status",
+    state: firstCleanString(payload.status, payload.state, payload.kind) ?? "rate_limits",
+    ts: event.at,
+    text: preview?.preview ? `Rate limits: ${preview.preview}` : eventText(event, payload) || eventType,
   };
 }
 
@@ -155,9 +226,15 @@ function mergeToolStatus(existingStatus: string, nextStatus: string): string {
   return nextStatus;
 }
 
-function inferredToolStatus(eventType: string, payload: Record<string, unknown>, hasErrorPreview: boolean): string {
+function inferredToolStatus(
+  eventType: string,
+  payload: Record<string, unknown>,
+  hasErrorPreview: boolean,
+  fallbackStatus?: string | null,
+): string {
   const explicit = firstCleanString(payload.status, payload.state);
   if (explicit) return explicit;
+  if (fallbackStatus) return fallbackStatus;
   if (eventType.includes("start") || eventType.includes("progress")) return "running";
   if (eventType.includes("complete") || eventType.includes("completed") || eventType.includes("finish")) {
     return hasErrorPreview ? "failed" : "completed";
@@ -251,8 +328,32 @@ function projectRunSystemMessage(run: RunRecord): TranscriptMessage {
   };
 }
 
-function isToolEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType.includes("tool") || payloadKindIncludes(payloadKind, "tool");
+function isToolEvent(eventType: string, payloadKind: string | null, payload: Record<string, unknown>): boolean {
+  const activitySource = firstCleanString(payload.activitySource, payload.activity_source);
+  return eventType.includes("tool") || payloadKindIncludes(payloadKind, "tool") || normalizeToken(activitySource ?? "") === "tool";
+}
+
+function isRunDiagnosticEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "run_diagnostic" || payloadKindIncludes(payloadKind, "run_diagnostic") || payloadKind === "diagnostic";
+}
+
+function isTokenUsageEvent(eventType: string, payloadKind: string | null): boolean {
+  return (
+    eventType === "tokens" ||
+    eventType === "token_usage" ||
+    eventType === "usage_update" ||
+    payloadKind === "tokens" ||
+    payloadKind === "token_usage" ||
+    payloadKind === "usage_update"
+  );
+}
+
+function isProviderLimitEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "provider_limit" || payloadKindIncludes(payloadKind, "provider_limit");
+}
+
+function isRateLimitEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "rate_limit" || eventType === "rate_limits" || payloadKindIncludes(payloadKind, "rate_limit");
 }
 
 function isThinkingEvent(eventType: string, payloadKind: string | null): boolean {
@@ -384,6 +485,67 @@ function publicMultilineText(value: string, maxLength: number): string | null {
   if (redacted.length === 0) return null;
   if (redacted.length <= maxLength) return redacted;
   return `${redacted.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`;
+}
+
+function progressToolSummary(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+): { name: string | null; status: string | null } | null {
+  const activitySource = firstCleanString(payload.activitySource, payload.activity_source);
+  if (normalizeToken(activitySource ?? "") !== "tool") return null;
+  const message = firstCleanString(payload.message, event.message);
+  if (!message) return { name: "tool", status: "running" };
+  const withoutPrefix = message.replace(/^Hermes\s+ACP\s+/i, "").trim();
+  const statusMatch = withoutPrefix.match(/\(([^()]*)\)\s*$/);
+  const status = statusMatch ? firstCleanString(statusMatch[1]) : null;
+  const name = (statusMatch ? withoutPrefix.slice(0, statusMatch.index).trim() : withoutPrefix) || "tool";
+  return { name: firstCleanString(name), status: status ?? "running" };
+}
+
+interface ProjectedTokenCounts {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+}
+
+function tokenCountsFrom(value: unknown): ProjectedTokenCounts | null {
+  if (!isRecord(value)) return null;
+  const inputTokens = numberFromUnknown(value.inputTokens) ?? numberFromUnknown(value.input_tokens) ?? numberFromUnknown(value.input);
+  const outputTokens = numberFromUnknown(value.outputTokens) ?? numberFromUnknown(value.output_tokens) ?? numberFromUnknown(value.output);
+  const totalTokens = numberFromUnknown(value.totalTokens) ?? numberFromUnknown(value.total_tokens) ?? numberFromUnknown(value.total);
+  if (inputTokens === null && outputTokens === null && totalTokens === null) return null;
+  return {
+    ...(inputTokens === null ? {} : { inputTokens }),
+    ...(outputTokens === null ? {} : { outputTokens }),
+    ...(totalTokens === null ? {} : { totalTokens }),
+  };
+}
+
+function formatTokenCounts(tokens: ProjectedTokenCounts): string {
+  return compactStrings([
+    tokens.inputTokens === undefined ? null : `input ${tokens.inputTokens}`,
+    tokens.outputTokens === undefined ? null : `output ${tokens.outputTokens}`,
+    tokens.totalTokens === undefined ? null : `total ${tokens.totalTokens}`,
+  ]).join(" · ");
+}
+
+function providerLimitSignal(payload: Record<string, unknown>): Record<string, unknown> | null {
+  return recordValue(payload.signal) ?? recordValue(payload.providerLimit) ?? recordValue(payload.provider_limit) ?? null;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return isRecord(value) ? value : null;
+}
+
+function compactStrings(values: Array<string | null | undefined>): string[] {
+  return values.filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function numberFromUnknown(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function firstPublicPreview(...values: unknown[]): { preview: string; truncated: boolean } | null {

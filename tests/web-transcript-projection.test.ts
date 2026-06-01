@@ -198,6 +198,95 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("SECRET_PROMPT_VALUE");
   });
 
+  it("surfaces Hermes grouped tool activity, diagnostics, tokens, and provider/rate limits as public web messages", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hermes ACP terminal (completed)",
+        payload: { type: "progress", activitySource: "tool", message: "Hermes ACP terminal (completed)" },
+      }),
+      event({
+        eventType: "run_diagnostic",
+        source: "harness",
+        message: "Host Hermes ACP refused the prompt.",
+        payload: { type: "run_diagnostic", code: "hermes_acp_refusal", message: "Host Hermes ACP refused the prompt." },
+        sequence: 2,
+      }),
+      event({
+        eventType: "tokens",
+        source: "harness",
+        payload: { type: "tokens", tokens: { inputTokens: 10, outputTokens: 20, totalTokens: 30 } },
+        sequence: 3,
+      }),
+      event({
+        eventType: "provider_limit",
+        source: "harness",
+        payload: {
+          type: "provider_limit",
+          signal: {
+            kind: "windowed_bucket_exhausted",
+            message: "5h bucket exhausted",
+            scope: { providerId: "openai-codex", model: "gpt-5.5" },
+            window: { resumeAt: "2026-01-01T05:00:00.000Z" },
+            raw: { apiKey: "SECRET_PROVIDER_KEY" },
+          },
+        },
+        sequence: 4,
+      }),
+      event({
+        eventType: "rate_limits",
+        source: "harness",
+        payload: {
+          type: "rate_limits",
+          payload: { provider: "cursor", remaining: 0, authorization: "Bearer SECRET_RATE_TOKEN" },
+        },
+        sequence: 5,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      {
+        kind: "tool_call",
+        ts: "2026-01-01T00:00:00.000Z",
+        call_id: "run-1:1",
+        name: "terminal",
+        status: "completed",
+        args: {},
+        result: null,
+      },
+      {
+        kind: "status",
+        state: "hermes_acp_refusal",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Host Hermes ACP refused the prompt.",
+      },
+      {
+        kind: "status",
+        state: "tokens",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Tokens: input 10 · output 20 · total 30",
+      },
+      {
+        kind: "status",
+        state: "windowed_bucket_exhausted",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Provider limit: 5h bucket exhausted (openai-codex · gpt-5.5 · resume 2026-01-01T05:00:00.000Z)",
+      },
+      {
+        kind: "status",
+        state: "rate_limits",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: 'Rate limits: {"provider":"cursor","remaining":0,"authorization":"[redacted]"}',
+      },
+    ]);
+    expect(messages.map((message) => message.kind)).not.toContain("assistant");
+    const serialized = JSON.stringify(messages);
+    expect(serialized).not.toContain("SECRET_PROVIDER_KEY");
+    expect(serialized).not.toContain("SECRET_RATE_TOKEN");
+    expect(serialized).not.toContain("Bearer");
+  });
+
   it("maps reasoning aliases to thinking with public text previews", () => {
     expect(
       projectWebTranscript([
