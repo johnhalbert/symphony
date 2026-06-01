@@ -145,6 +145,7 @@ Expected result:
 - A git worktree is created.
 - The run transcript is persisted.
 - The worker calls `submit_completion_report` with summary, validation evidence, acceptance checklist, changed files, branch/PR details, risks, and an idempotency key.
+- The worker does not run `git commit`, `git push`, or create/update GitHub PRs directly; implementation changes remain in the assigned worktree for service-owned publication.
 - Symphony publishes or reuses the lifecycle-bound pull request and moves the issue directly to `In Review` because `github.pr_handoff.enabled` is false.
 - The reviewer records a pass verdict for the tiny smoke.
 - Symphony applies the configured `Ready to Merge` pass destination.
@@ -170,6 +171,7 @@ During the smoke:
 
 - No issue becomes a worker candidate until an operator intentionally moves it to `Todo` with the required label.
 - No issue enters `In Review` until the lifecycle record has an accepted worker completion report and any configured PR publication step has completed.
+- Worker implementation and merge-gate repair prompts instruct workers to submit completion reports instead of committing, pushing, or mutating lifecycle-bound PRs directly.
 - No reviewer dispatch occurs without a last completion report.
 - A fail verdict returns the issue to `In Progress`, increments the review round, and includes a revision-request comment.
 - A pass verdict is recorded before the configured pass destination is applied.

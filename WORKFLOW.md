@@ -184,8 +184,9 @@ Transcript search remains disabled until the transcript recall implementation is
 3. Follow repository style and keep changes focused on the issue.
 4. Run the smallest meaningful validation for the change, and run broader tests when touching shared orchestration, workflow, tracker, harness, or persistence code.
 5. Do not push directly to `main`, merge PRs, force-push protected branches, or remove dirty worktrees.
-6. When `github.publish_pull_requests` and `github.operator_approval.required_for_publication` are enabled, do not run `git push` or create/update GitHub pull requests yourself. Call `submit_completion_report` when ready; Symphony will create an `approval_request` transcript event and wait for operator approval before service-owned commit, push, and PR publication.
-7. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will publish or reuse the lifecycle-bound pull request and move accepted completion reports directly to `In Review` while PR handoff remains disabled.
+6. Do not run `git commit`, `git push`, `gh pr create`, `gh pr edit`, or otherwise create/update the lifecycle-bound GitHub PR yourself during implementation or merge-gate repair runs. Leave the implementation changes in the assigned worktree and call `submit_completion_report` when ready; Symphony performs service-owned commit, push, and PR creation/reuse after the completion report is accepted.
+7. When `github.operator_approval.required_for_publication` is enabled, `submit_completion_report` creates an `approval_request` transcript event and Symphony waits for operator approval before the service-owned commit, push, and PR publication.
+8. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will publish or reuse the lifecycle-bound pull request and move accepted completion reports directly to `In Review` while PR handoff remains disabled.
 
 ## Prompt Extension Layers
 

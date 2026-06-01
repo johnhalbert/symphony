@@ -281,6 +281,34 @@ describe("ReviewVerdictService", () => {
     expect(result?.text).toContain("- lint: missing_observed; firstObservedAt: 2026-01-01T00:00:01.000Z; actionableSince: n/a");
     expect(result?.text).toContain("- test: failing / failure (https://ci.test/test)");
     expect(result?.text).not.toContain("- test: failing / failure (https://ci.test/test); firstObservedAt");
+    expect(result?.text).toContain("leave the final implementation changes uncommitted and unpushed");
+    expect(result?.text).toContain("Do not run git commit, git push");
+    expect(result?.text).not.toContain("commit and push the repaired branch");
+  });
+
+  it("formats conflicted merge-gate repair prompts without worker publication commands", () => {
+    const result = formatWorkerMergeGatePromptResult(
+      lifecycle({
+        mergeGate: mergeGate({
+          mergeability: {
+            status: "conflicted",
+            pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+            mergeable: false,
+            mergeableState: "dirty",
+            reason: "Pull request branch is out of date",
+            baseBranch: "main",
+            baseHeadSha: "base-sha-1",
+            checkedAt: "2026-01-01T00:00:02.000Z",
+          },
+        }),
+      }),
+    );
+
+    expect(result?.kind).toBe("repair");
+    expect(result?.text).toContain("reconcile the lifecycle-bound PR changes with origin/main");
+    expect(result?.text).toContain("leave the final implementation changes uncommitted and unpushed");
+    expect(result?.text).toContain("Symphony performs service-owned commit, push, and PR publication/reuse");
+    expect(result?.text).not.toContain("commit and push the repaired branch");
   });
 
   it("warns without stale repair details when a merge gate belongs to an older PR head", () => {
