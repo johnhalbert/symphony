@@ -4,7 +4,7 @@ import { ChatHistoryView } from "../src/components/history/ChatHistoryView";
 import type { HistoryModel, Loadable, SessionModel, TranscriptMessage } from "../src/types/symphony";
 
 const { useTranscriptMock } = vi.hoisted(() => ({
-  useTranscriptMock: vi.fn<(sessionId: string | null) => Loadable<TranscriptMessage[]>>(),
+  useTranscriptMock: vi.fn<(sessionId: string | null, refreshToken?: unknown) => Loadable<TranscriptMessage[]>>(),
 }));
 
 vi.mock("../src/hooks/useSymphonyData", () => ({
@@ -102,7 +102,7 @@ describe("ChatHistoryView", () => {
     const markup = renderToStaticMarkup(<ChatHistoryView history={history()} />);
 
     expect(useTranscriptMock).toHaveBeenCalledTimes(1);
-    expect(useTranscriptMock).toHaveBeenCalledWith("run-two");
+    expect(useTranscriptMock).toHaveBeenCalledWith("run-two", undefined);
     expect(markup).toContain("Sessions");
     expect(markup).toContain("API selected session");
     expect(markup).toContain("Dedicated session transcript loaded from the API.");
@@ -131,7 +131,7 @@ describe("ChatHistoryView", () => {
       <ChatHistoryView history={history({ transcriptBySession: { "run-two": embeddedTranscript } })} />,
     );
 
-    expect(useTranscriptMock).toHaveBeenCalledWith("run-two");
+    expect(useTranscriptMock).toHaveBeenCalledWith("run-two", undefined);
     expect(markup).toContain("No transcript messages for this session.");
     expect(markup).not.toContain("Mock transcript remains embedded.");
   });
@@ -143,7 +143,7 @@ describe("ChatHistoryView", () => {
       <ChatHistoryView history={history({ transcriptBySession: { "run-two": embeddedTranscript } })} />,
     );
 
-    expect(useTranscriptMock).toHaveBeenCalledWith("run-two");
+    expect(useTranscriptMock).toHaveBeenCalledWith("run-two", undefined);
     expect(markup).toContain("Mock transcript remains embedded.");
     expect(markup).not.toContain("Loading transcript...");
   });

@@ -438,6 +438,42 @@ describe("StatusServer web projection context cache", () => {
     });
   });
 
+  it("streams durable projection revisions over the web events endpoint and closes clients on stop", async () => {
+    const revisions = controllableRevisionProvider();
+    const server = createStatusServer({
+      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      clock: () => new Date("2026-01-01T00:00:00.000Z"),
+      revisionProviders: [revisions.provider],
+    });
+    const address = await server.start();
+    let stopped = false;
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/web/events`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      expect(response.headers.get("cache-control")).toContain("no-cache");
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("expected web events response body");
+
+      const ready = await readResponseBodyUntil(reader, "event: projection_ready");
+      expect(ready).toContain('data: {"type":"projection_ready","generation":0}');
+
+      revisions.emit(2);
+      const revision = await readResponseBodyUntil(reader, "revision\":2");
+      expect(revision).toContain("id: 1");
+      expect(revision).toContain("event: projection_revision");
+      expect(revision).toContain('"source":"controllable"');
+      expect(revision).toContain('"generation":1');
+
+      const closed = readResponseBodyUntil(reader, "event: projection_closed");
+      stopped = true;
+      await server.stop();
+      expect(await closed).toContain('data: {"type":"projection_closed"}');
+    } finally {
+      if (!stopped) await server.stop();
+    }
+  });
+
   it("functions without optional durable stores using TTL and runtime fingerprint behavior", async () => {
     let builds = 0;
     const server = createStatusServer({
@@ -726,6 +762,31 @@ function controllableRevisionProvider(): {
       return listeners.size;
     },
   };
+}
+
+async function readResponseBodyUntil(reader: ReadableStreamDefaultReader<Uint8Array>, needle: string): Promise<string> {
+  const decoder = new TextDecoder();
+  let body = "";
+  while (!body.includes(needle)) {
+    const next = await withTimeout(reader.read(), `timed out waiting for ${needle} in SSE body:\n${body}`);
+    if (next.done) throw new Error(`response body closed before ${needle}:\n${body}`);
+    body += decoder.decode(next.value, { stream: true });
+  }
+  return body;
+}
+
+async function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs = 1_000): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 async function settleMicrotasks(): Promise<void> {

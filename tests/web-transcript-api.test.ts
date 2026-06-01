@@ -2,10 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { StatusServer } from "../src/app/http.js";
+import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileRunTranscriptStore, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import type { ProjectionPayloadWriteInput, ProjectionWriteResult } from "../src/core/persistence/ProjectionTransactionService.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
@@ -168,7 +169,8 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       };
     };
 
-    const server = createServer(config, runStore);
+    const projectionWriter = new RecordingProjectionWriter();
+    const server = createServer(config, runStore, { projectionWriter });
     const address = await server.start();
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/query-run/transcript?offset=2&limit=9999`);
@@ -195,6 +197,35 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         { offset: 0, limit: 500 },
         { offset: 0, limit: 500 },
       ]);
+      expect(projectionWriter.writes).toHaveLength(4);
+      expect(projectionWriter.writes[0]).toMatchObject({
+        projectionName: "transcript_projection",
+        scopeKind: "run_page",
+        scopeKey: "query-run:offset:2:limit:1000",
+        fields: {
+          issueKey: "TEST-1",
+          runId: "query-run",
+          sessionId: "query-session",
+          offsetStart: 2,
+          offsetLimit: 1_000,
+          nextOffset: null,
+          messageCount: 5,
+        },
+        sourceCursors: {
+          runId: "query-run",
+          sessionId: "query-session",
+          issueKey: "TEST-1",
+          offset: 2,
+          limit: 1_000,
+          nextOffset: null,
+          eventCount: 3,
+          firstSequence: 3,
+          lastSequence: 5,
+        },
+      });
+      expect(projectionWriter.writes[0]?.sourceRevisions?.map((revision) => revision.source)).toEqual(
+        expect.arrayContaining(["runs", "transcript:query-run"]),
+      );
     } finally {
       await server.stop();
     }
@@ -426,7 +457,15 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
 
 });
 
-function createServer(config: ReturnType<typeof testConfig>, runStore: FileRunTranscriptStore | undefined): StatusServer {
+interface CreateServerOptions {
+  projectionWriter?: StatusServerProjectionWriter;
+}
+
+function createServer(
+  config: ReturnType<typeof testConfig>,
+  runStore: FileRunTranscriptStore | undefined,
+  options: CreateServerOptions = {},
+): StatusServer {
   const workspaceManager = new WorkspaceManager({
     workspace: config.workspace,
     hooks: config.hooks,
@@ -442,7 +481,38 @@ function createServer(config: ReturnType<typeof testConfig>, runStore: FileRunTr
     openWorkspaceToken: "secret",
     trackerStateLists: testTrackerStateLists(),
     staleThresholdMs: 300_000,
+    ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
   });
+}
+
+class RecordingProjectionWriter implements StatusServerProjectionWriter {
+  readonly writes: ProjectionPayloadWriteInput[] = [];
+
+  async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
+    this.writes.push(JSON.parse(JSON.stringify(input)) as ProjectionPayloadWriteInput);
+    return {
+      status: "written",
+      revision: {
+        projectionRevisionId: this.writes.length,
+        projectionName: input.projectionName,
+        scopeKind: input.scopeKind ?? "global",
+        scopeKey: input.scopeKey ?? "global",
+        revision: this.writes.length,
+        sourceRevisions: [],
+        sourceCursors: {},
+        sourceFreshness: [],
+        contentSha256: "0".repeat(64),
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        expiresAt: null,
+        supersededAt: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      previousRevision: null,
+      contentSha256: "0".repeat(64),
+      payloadSha256: "1".repeat(64),
+      event: null,
+    };
+  }
 }
 
 async function startRun(

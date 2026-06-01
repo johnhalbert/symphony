@@ -17,10 +17,12 @@ export function IssuesView({
   board,
   variant = "balanced",
   detailDefaultOpen = true,
+  refreshToken,
 }: {
   board: IssueBoardModel;
   variant?: IssuesVariant;
   detailDefaultOpen?: boolean;
+  refreshToken?: unknown;
 }) {
   const [selectedId, setSelectedId] = useState(board.selectedIssueId);
   const [detailOpen, setDetailOpen] = useState(detailDefaultOpen);
@@ -31,7 +33,7 @@ export function IssuesView({
 
   const effectiveSelectedId = resolveSelectedIssueId(selectedId, board);
   const selectedDetailId = detailOpen && effectiveSelectedId ? effectiveSelectedId : null;
-  const issueDetail = useIssueDetail(selectedDetailId);
+  const issueDetail = useIssueDetail(selectedDetailId, refreshToken);
   const columns = variant === "detail-heavy" ? "240px minmax(0, 1fr) 480px" : "280px minmax(0, 1fr) 400px";
   const closedColumns = `${columns.split(" ").slice(0, 2).join(" ")} 0`;
   const layoutStyle = {
