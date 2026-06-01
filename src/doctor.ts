@@ -13,6 +13,11 @@ import {
 import { WorkflowLoader } from "./core/workflow/WorkflowLoader.js";
 import { errorMessage } from "./core/errors.js";
 import type { ServiceConfig } from "./core/config/Config.js";
+import type { Issue } from "./core/types.js";
+import {
+  AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS,
+  lintAgentEligibleIssueContracts,
+} from "./core/IssueContractLint.js";
 import { resolveCursorRuntimeApiKey, resolveRuntimeApiKey } from "./app/RuntimeDependencies.js";
 import { COMPLETION_REPORT_TOOL_NAME } from "./core/harness/CompletionReportMcpServer.js";
 import {
@@ -130,6 +135,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
         status: candidates.length === 0 ? "ok" : "warn",
         message: `${candidates.length} candidate issue(s) currently match active states and assignee routing`,
       });
+      checks.push(issueContractDoctorCheck(config, candidates));
     } catch (error) {
       checks.push({ id: "linear.candidates", status: "error", message: errorMessage(error) });
     }
@@ -148,6 +154,29 @@ export function formatDoctorResult(result: DoctorResult): string {
   return result.checks
     .map((check) => `[${check.status.toUpperCase()}] ${check.id}: ${check.message}`)
     .join("\n");
+}
+
+export function issueContractDoctorCheck(config: ServiceConfig, issues: readonly Issue[]): DoctorCheck {
+  const results = lintAgentEligibleIssueContracts(issues, config);
+  const failures = results.filter((result) => result.missingSections.length > 0);
+  if (failures.length === 0) {
+    return {
+      id: "linear.issue_contract",
+      status: "ok",
+      message:
+        results.length === 0
+          ? "No agent-eligible candidate issues require the authoring contract check"
+          : `${results.length} agent-eligible candidate issue(s) include required authoring sections: ${AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS.join(", ")}`,
+    };
+  }
+
+  return {
+    id: "linear.issue_contract",
+    status: "warn",
+    message: `Agent-eligible issue(s) are missing required authoring sections: ${failures
+      .map((failure) => `${failure.issue.identifier} missing ${failure.missingSections.join(", ")}`)
+      .join("; ")}`,
+  };
 }
 
 export function trackerHandoffDoctorCheck(config: ServiceConfig): DoctorCheck {

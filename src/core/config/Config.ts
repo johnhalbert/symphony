@@ -573,6 +573,8 @@ const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
   "",
   "Before ending the run, call submit_issue_breakdown_plan with a concise summary, an idempotencyKey, and proposedIssues[].",
   "Each proposed issue must include title, description, acceptanceCriteria[], dependencies[], and labels[].",
+  "Each proposed issue description must use the agent-eligible issue contract section headings `Problem / Goal`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`; use the same headings for docs-only and implementation issues.",
+  "Do not include secrets, tokens, private keys, or credential values in proposed issue descriptions. Do not add `dogfood-ready` automatically; leave readiness as an explicit Promotion Readiness decision for operator review.",
   "Symphony persists these proposals locally; do not create or modify Linear issues.",
 ].join("\n");
 
