@@ -9,6 +9,9 @@ import type {
   TranscriptMessage,
 } from "../types/symphony";
 
+export type OrchestratorChatListener = (messages: ChatMessage[]) => void;
+export type OrchestratorChatErrorListener = (message: string) => void;
+
 export interface SymphonyDataSource {
   getReferenceData(signal?: AbortSignal): Promise<ReferenceData>;
   getDashboard(signal?: AbortSignal): Promise<DashboardModel>;
@@ -20,4 +23,5 @@ export interface SymphonyDataSource {
   getSidebar(signal?: AbortSignal): Promise<SidebarModel>;
   getOrchestratorChat(signal?: AbortSignal): Promise<ChatMessage[]>;
   sendOrchestratorMessage(input: string): Promise<ChatMessage[]>;
+  subscribeOrchestratorChat?(onMessages: OrchestratorChatListener, onError?: OrchestratorChatErrorListener): () => void;
 }

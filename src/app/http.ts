@@ -10,7 +10,6 @@ import {
   projectWebIssueBoard,
   projectWebIssueDetail,
   projectWebOrchestratorChat,
-  projectWebOrchestratorChatPost,
   projectWebReferenceData,
   projectWebSidebar,
   type DashboardRuntimeConfig,
@@ -51,6 +50,11 @@ import {
   type TranscriptEvent,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
+import {
+  InMemoryOrchestratorChatStore,
+  ORCHESTRATOR_CHAT_PROJECTION_SOURCE,
+  type OrchestratorChatStore,
+} from "../core/persistence/OrchestratorChatStore.js";
 import {
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
@@ -130,6 +134,7 @@ export interface StatusServerOptions {
   workspaceManager: WorkspaceManager;
   workspaceOpener: WorkspaceOpener;
   runStore?: RunTranscriptStore;
+  orchestratorChatStore?: OrchestratorChatStore;
   lifecycleStore?: IssueLifecycleStore;
   mcpExposureDiagnosticsStore?: FileMcpExposureDiagnosticsStore;
   writebackOutbox?: StatusServerWritebackOutbox;
@@ -161,13 +166,16 @@ export class StatusServer {
   private completedWebProjectionContext: StatusServerWebProjectionContext | null = null;
   private readonly pendingWebProjectionContexts = new Map<string, Promise<StatusServerWebProjectionContext>>();
   private readonly webAssetsRoot: string | null;
+  private readonly orchestratorChatStore: OrchestratorChatStore;
+  private readonly webOrchestratorChatEventClients = new Set<ServerResponse>();
   private readonly webProjectionRevisionProviders: readonly WebProjectionRevisionProvider[];
   private readonly webProjectionRevisionUnsubscribes: WebProjectionRevisionUnsubscribe[] = [];
   private webProjectionDirtyGeneration = 0;
 
   constructor(private readonly options: StatusServerOptions) {
     this.webAssetsRoot = resolveWebAssetsRootOption(options.webAssetsRoot);
-    this.webProjectionRevisionProviders = createStatusServerWebProjectionRevisionProviders(options);
+    this.orchestratorChatStore = options.orchestratorChatStore ?? new InMemoryOrchestratorChatStore();
+    this.webProjectionRevisionProviders = createStatusServerWebProjectionRevisionProviders(options, this.orchestratorChatStore);
   }
 
   async start(): Promise<{ host: string; port: number }> {
@@ -192,6 +200,7 @@ export class StatusServer {
 
   async stop(): Promise<void> {
     if (!this.server) {
+      this.closeWebOrchestratorChatEventClients();
       this.unsubscribeWebProjectionRevisionListeners();
       return;
     }
@@ -202,6 +211,7 @@ export class StatusServer {
         server.close((error) => (error ? reject(error) : resolve()));
       });
     } finally {
+      this.closeWebOrchestratorChatEventClients();
       this.unsubscribeWebProjectionRevisionListeners();
     }
   }
@@ -212,6 +222,9 @@ export class StatusServer {
       if (!provider.subscribe) continue;
       const unsubscribe = provider.subscribe((revision) => {
         this.markCompletedWebProjectionContextDirty(revision);
+        if (revision.source === ORCHESTRATOR_CHAT_PROJECTION_SOURCE) {
+          void this.broadcastWebOrchestratorChat();
+        }
       });
       this.webProjectionRevisionUnsubscribes.push(unsubscribe);
     }
@@ -396,9 +409,13 @@ export class StatusServer {
         sendJson(response, 200, projectWebTranscript(await readBoundedWebTranscript(this.options.runStore, run.runId, url), { run }));
         return;
       }
+      if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat/events") {
+        await this.openWebOrchestratorChatEventStream(request, response);
+        return;
+      }
       if (url.pathname === "/api/v1/web/orchestrator-chat") {
         if (request.method === "GET") {
-          sendJson(response, 200, projectWebOrchestratorChat());
+          sendJson(response, 200, await this.fetchWebOrchestratorChat());
           return;
         }
         if (request.method === "POST") {
@@ -431,7 +448,9 @@ export class StatusServer {
             throw error;
           }
 
-          sendJson(response, 200, projectWebOrchestratorChatPost(input));
+          const command = parseWebOrchestratorChatCommand(input);
+          if (isWebOrchestratorChatMutationCommand(command)) this.requireMutationToken(request);
+          sendJson(response, 200, await this.submitWebOrchestratorChat(input, command));
           return;
         }
       }
@@ -833,6 +852,160 @@ export class StatusServer {
     }
   }
 
+  private async fetchWebOrchestratorChat() {
+    return projectWebOrchestratorChat(await this.orchestratorChatStore.listMessages());
+  }
+
+  private async submitWebOrchestratorChat(input: string, command: WebOrchestratorChatCommand) {
+    await this.orchestratorChatStore.appendMessages([{ who: "user", text: input }]);
+    let responseMessage: { text: string; suggestions?: string[] };
+    try {
+      responseMessage = await this.executeWebOrchestratorChatCommand(command);
+    } catch (error) {
+      responseMessage = {
+        text: `Command failed: ${errorMessage(error)}`,
+        suggestions: webOrchestratorChatCommandSuggestions(),
+      };
+    }
+    await this.orchestratorChatStore.appendMessages([{ who: "agent", ...responseMessage }]);
+    return this.fetchWebOrchestratorChat();
+  }
+
+  private async executeWebOrchestratorChatCommand(
+    command: WebOrchestratorChatCommand,
+  ): Promise<{ text: string; suggestions?: string[] }> {
+    switch (command.kind) {
+      case "help":
+        return {
+          text: webOrchestratorChatBoundaryText(),
+          suggestions: webOrchestratorChatCommandSuggestions(),
+        };
+      case "unknown":
+        return {
+          text: `Message saved. No orchestration command was run because "${command.input}" is outside the current web chat command boundary. ${webOrchestratorChatBoundaryText()}`,
+          suggestions: webOrchestratorChatCommandSuggestions(),
+        };
+      case "missing_issue":
+        return {
+          text: `${capitalize(command.command)} requires an issue identifier, for example: ${command.command} ENG-123.`,
+          suggestions: [`${command.command} ENG-123`, "status"],
+        };
+      case "status":
+        return this.executeStatusChatCommand();
+      case "refresh":
+        return this.executeNoArgumentOrchestratorCommand("refreshNow", "Refresh requested; the orchestrator ran one reconciliation tick.");
+      case "inspect":
+        return this.executeInspectChatCommand(command.issue);
+      case "pause":
+        return this.executeIssueOrchestratorCommand("pauseIssue", command.issue, `Pause requested for ${command.issue}.`);
+      case "resume":
+        return this.executeIssueOrchestratorCommand("resumeIssue", command.issue, `Resume requested for ${command.issue}.`);
+      case "cancel":
+        return this.executeIssueOrchestratorCommand("cancelIssue", command.issue, `Cancellation requested for ${command.issue}.`);
+    }
+  }
+
+  private executeStatusChatCommand(): { text: string; suggestions?: string[] } {
+    const snapshot = this.options.orchestrator.snapshot();
+    const running = snapshot.running ?? [];
+    const runningSummary = running.length
+      ? ` Running: ${running
+          .slice(0, 5)
+          .map((row) => row.issueIdentifier || row.issueId || row.runId)
+          .filter(Boolean)
+          .join(", ")}.`
+      : "";
+    const providerGateCount = snapshot.counts.providerGates ?? snapshot.providerGates?.length ?? 0;
+    const providerGateSummary = providerGateCount > 0 ? ` Provider gates active: ${providerGateCount}.` : "";
+    return {
+      text: `Status: ${snapshot.counts.running ?? running.length} running, ${snapshot.counts.retrying ?? 0} retrying, ${snapshot.counts.paused ?? 0} paused.${providerGateSummary}${runningSummary}`,
+      suggestions: ["refresh", "show running agents"],
+    };
+  }
+
+  private async executeInspectChatCommand(issue: string): Promise<{ text: string; suggestions?: string[] }> {
+    const method = this.options.orchestrator.getIssueDetails;
+    if (typeof method !== "function") return unavailableWebOrchestratorCommand("inspect");
+    const details = method.call(this.options.orchestrator, issue);
+    if (!details) {
+      return {
+        text: `No running orchestrator issue matched ${issue}. Inspect currently reports live orchestrator state only; no worker was dispatched.`,
+        suggestions: ["status", "refresh"],
+      };
+    }
+    const title = details.issueDetails?.title ? ` (${details.issueDetails.title})` : "";
+    const state = details.liveness?.status ?? details.state ?? "unknown";
+    const step = details.lastMessage ?? details.lastEvent ?? "no recent activity";
+    return {
+      text: `${details.issueIdentifier ?? issue}${title}: ${state}; ${step}.`,
+      suggestions: ["status", `cancel ${details.issueIdentifier ?? issue}`],
+    };
+  }
+
+  private async executeNoArgumentOrchestratorCommand(
+    methodName: "refreshNow",
+    successText: string,
+  ): Promise<{ text: string; suggestions?: string[] }> {
+    const method = this.options.orchestrator[methodName];
+    if (typeof method !== "function") return unavailableWebOrchestratorCommand(methodName);
+    await method.call(this.options.orchestrator);
+    return { text: successText, suggestions: ["status"] };
+  }
+
+  private async executeIssueOrchestratorCommand(
+    methodName: "pauseIssue" | "resumeIssue" | "cancelIssue",
+    issue: string,
+    successText: string,
+  ): Promise<{ text: string; suggestions?: string[] }> {
+    const method = this.options.orchestrator[methodName];
+    if (typeof method !== "function") return unavailableWebOrchestratorCommand(methodName);
+    await Promise.resolve((method as (issueId: string) => void | Promise<void>).call(this.options.orchestrator, issue));
+    return { text: successText, suggestions: ["status"] };
+  }
+
+  private async openWebOrchestratorChatEventStream(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+    });
+    response.write(": connected\n\n");
+    this.webOrchestratorChatEventClients.add(response);
+    request.on("close", () => {
+      this.webOrchestratorChatEventClients.delete(response);
+    });
+    await this.writeWebOrchestratorChatEvent(response);
+  }
+
+  private async broadcastWebOrchestratorChat(): Promise<void> {
+    if (this.webOrchestratorChatEventClients.size === 0) return;
+    const clients = [...this.webOrchestratorChatEventClients];
+    await Promise.all(clients.map((client) => this.writeWebOrchestratorChatEvent(client)));
+  }
+
+  private async writeWebOrchestratorChatEvent(response: ServerResponse): Promise<void> {
+    if (response.destroyed || response.writableEnded) {
+      this.webOrchestratorChatEventClients.delete(response);
+      return;
+    }
+    try {
+      writeServerSentEvent(response, "orchestrator_chat", await this.fetchWebOrchestratorChat());
+    } catch (error) {
+      writeServerSentEvent(response, "orchestrator_chat_error", { message: errorMessage(error) });
+    }
+  }
+
+  private closeWebOrchestratorChatEventClients(): void {
+    for (const client of this.webOrchestratorChatEventClients) {
+      if (!client.destroyed && !client.writableEnded) client.end();
+    }
+    this.webOrchestratorChatEventClients.clear();
+  }
+
   private requireApprovalMutationToken(request: IncomingMessage): void {
     if (!(this.options.operatorApproval?.isRequired() ?? false)) {
       this.requireMutationToken(request);
@@ -1003,7 +1176,7 @@ export class StatusServer {
       }),
       projectWebIssueBoard(board),
       projectWebHistory(activitySources.runs, historyActivity.activity),
-      projectWebOrchestratorChat(),
+      await this.fetchWebOrchestratorChat(),
     );
   }
 
@@ -1301,6 +1474,7 @@ export class StatusServer {
 
 function createStatusServerWebProjectionRevisionProviders(
   options: StatusServerOptions,
+  orchestratorChatStore: OrchestratorChatStore,
 ): readonly WebProjectionRevisionProvider[] {
   const providers: WebProjectionRevisionProvider[] = [...(options.webProjectionRevisionProviders ?? [])];
   const runStoreProvider = createStatusServerStoreRevisionProvider("runStore", options.runStore);
@@ -1309,6 +1483,11 @@ function createStatusServerWebProjectionRevisionProviders(
   if (lifecycleStoreProvider) providers.push(lifecycleStoreProvider);
   const writebackOutboxProvider = createStatusServerStoreRevisionProvider("writebackOutbox", options.writebackOutbox);
   if (writebackOutboxProvider) providers.push(writebackOutboxProvider);
+  const orchestratorChatProvider = createStatusServerStoreRevisionProvider(
+    ORCHESTRATOR_CHAT_PROJECTION_SOURCE,
+    orchestratorChatStore,
+  );
+  if (orchestratorChatProvider) providers.push(orchestratorChatProvider);
   return providers;
 }
 
@@ -1413,6 +1592,15 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
 function sendHtml(response: ServerResponse, body: string): void {
   response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   response.end(body);
+}
+
+function writeServerSentEvent(response: ServerResponse, event: string, data: unknown): void {
+  const serialized = JSON.stringify(data).replace(/\u2028|\u2029/g, "");
+  response.write(`event: ${event}\n`);
+  for (const line of serialized.split("\n")) {
+    response.write(`data: ${line}\n`);
+  }
+  response.write("\n");
 }
 
 const WEB_MOUNT_PATH = "/web";
@@ -1706,6 +1894,74 @@ function parseWebOrchestratorChatPostRequest(body: unknown): string {
     );
   }
   return input;
+}
+
+type WebOrchestratorChatIssueCommandKind = "inspect" | "pause" | "resume" | "cancel";
+type WebOrchestratorChatMutationCommandKind = "refresh" | "pause" | "resume" | "cancel";
+
+type WebOrchestratorChatCommand =
+  | { kind: "help" }
+  | { kind: "status" }
+  | { kind: "refresh" }
+  | { kind: "unknown"; input: string }
+  | { kind: "missing_issue"; command: WebOrchestratorChatIssueCommandKind }
+  | { kind: WebOrchestratorChatIssueCommandKind; issue: string };
+
+function parseWebOrchestratorChatCommand(input: string): WebOrchestratorChatCommand {
+  const trimmed = input.trim();
+  const normalized = trimmed.replace(/^\//, "").trim();
+  const lower = normalized.toLowerCase();
+  if (lower === "help" || lower === "commands" || lower === "?" || lower === "show commands") return { kind: "help" };
+  if (/^(status|state|summary|show status|show running agents|running|show stalled agents)$/.test(lower)) return { kind: "status" };
+  if (/^(refresh|refresh now|reconcile|sync|tick)$/.test(lower)) return { kind: "refresh" };
+
+  const issue = normalized.match(/\b[A-Z][A-Z0-9]+-\d+\b/i)?.[0]?.toUpperCase() ?? null;
+  if (issue && normalized.toUpperCase() === issue) return { kind: "inspect", issue };
+
+  const issueCommand = firstMatchedWebOrchestratorChatIssueCommand(lower);
+  if (issueCommand) {
+    if (!issue) return { kind: "missing_issue", command: issueCommand };
+    return { kind: issueCommand, issue };
+  }
+
+  return { kind: "unknown", input: trimmed };
+}
+
+function firstMatchedWebOrchestratorChatIssueCommand(input: string): WebOrchestratorChatIssueCommandKind | null {
+  if (/\b(inspect|show|open|details?)\b/.test(input)) return "inspect";
+  if (/\b(pause|hold|suspend)\b/.test(input)) return "pause";
+  if (/\b(resume|unpause|continue)\b/.test(input)) return "resume";
+  if (/\b(cancel|stop|abort)\b/.test(input)) return "cancel";
+  return null;
+}
+
+function isWebOrchestratorChatMutationCommand(command: WebOrchestratorChatCommand): boolean {
+  return (
+    command.kind === "refresh" ||
+    command.kind === "pause" ||
+    command.kind === "resume" ||
+    command.kind === "cancel" ||
+    (command.kind === "missing_issue" && command.command !== "inspect")
+  );
+}
+
+function webOrchestratorChatBoundaryText(): string {
+  return "Supported commands: status, refresh, inspect <issue>, pause <issue>, resume <issue>, cancel <issue>. Free-form messages are saved to durable chat history but do not dispatch workers or change Linear lifecycle state.";
+}
+
+function webOrchestratorChatCommandSuggestions(): string[] {
+  return ["status", "refresh", "inspect ENG-123", "pause ENG-123", "resume ENG-123"];
+}
+
+function unavailableWebOrchestratorCommand(command: string): { text: string; suggestions?: string[] } {
+  return {
+    text: `Command ${command} is unavailable in this runtime. No orchestrator action was dispatched.`,
+    suggestions: webOrchestratorChatCommandSuggestions(),
+  };
+}
+
+function capitalize(value: string): string {
+  return value.length === 0 ? value : `${value[0]?.toUpperCase() ?? ""}${value.slice(1)}`;
 }
 
 function parseIssueBreakdownApplyRequest(body: unknown): { dryRun: boolean } {

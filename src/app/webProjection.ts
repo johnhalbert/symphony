@@ -1,5 +1,6 @@
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
+import type { OrchestratorChatMessageRecord } from "../core/persistence/OrchestratorChatStore.js";
 import type { HistoryModel as WebHistoryModel } from "./WebHistoryProjection.js";
 import { projectWebTranscript, type TranscriptMessage as WebTranscriptMessage } from "./WebTranscriptProjection.js";
 import type {
@@ -549,13 +550,24 @@ export function emptyChatMessages(): ChatMessage[] {
   return [];
 }
 
-export function projectWebOrchestratorChat(): ChatMessage[] {
-  return emptyChatMessages();
+export function projectWebOrchestratorChat(
+  messages: readonly OrchestratorChatMessageRecord[] | readonly ChatMessage[] = emptyChatMessages(),
+): ChatMessage[] {
+  return messages.map((message) => {
+    const projected: ChatMessage = {
+      who: message.who === "user" ? "user" : "agent",
+      text: message.text,
+    };
+    const suggestions = Array.isArray(message.suggestions)
+      ? message.suggestions.map((suggestion) => suggestion.trim()).filter((suggestion) => suggestion.length > 0)
+      : [];
+    if (suggestions.length > 0) projected.suggestions = suggestions;
+    return projected;
+  });
 }
 
 export function projectWebOrchestratorChatPost(input: string): ChatMessage[] {
-  void input;
-  return emptyChatMessages();
+  return projectWebOrchestratorChat([{ who: "user", text: input.trim() }]);
 }
 
 export function projectIssueModel(

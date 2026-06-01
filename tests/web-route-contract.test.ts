@@ -145,16 +145,23 @@ describe("/api/v1/web route contracts", () => {
     }
   });
 
-  it("keeps the orchestrator chat POST contract side-effect-free and validates malformed input", async () => {
+  it("keeps the orchestrator chat POST contract durable, bounded, and validates malformed input", async () => {
     const { server, calls } = createStatusServer(root);
     const address = await server.start();
     const url = `${baseUrlFor(address)}/api/v1/web/orchestrator-chat`;
     try {
       const accepted = await postJson(url, { input: "summarize ENG-113" });
       expect(accepted.response.status).toBe(200);
-      expect(accepted.body).toEqual([]);
-      expect(accepted.text.trim()).toBe("[]");
-      expect(accepted.text).not.toContain("summarize ENG-113");
+      expect(accepted.body).toMatchObject([
+        { who: "user", text: "summarize ENG-113" },
+        { who: "agent" },
+      ]);
+      expect(accepted.text).toContain("summarize ENG-113");
+      expect(accepted.text).toContain("No orchestration command was run");
+
+      const persisted = await getJson(url);
+      expect(persisted.response.status).toBe(200);
+      expect(persisted.body).toEqual(accepted.body);
 
       const malformed = await fetch(url, {
         method: "POST",

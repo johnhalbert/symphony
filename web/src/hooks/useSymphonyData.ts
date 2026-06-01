@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDataSource } from "../data/dataSourceContext";
 import { useAsyncResource } from "./useAsyncResource";
-import type { IssueDetailModel, Loadable, TranscriptMessage } from "../types/symphony";
+import type { ChatMessage, IssueDetailModel, Loadable, TranscriptMessage } from "../types/symphony";
 
 interface SymphonyResourceOptions {
   enabled?: boolean;
@@ -124,5 +124,50 @@ export function useSidebar(options: SymphonyResourceOptions = {}) {
 
 export function useOrchestratorChat(options: SymphonyResourceOptions = {}) {
   const dataSource = useDataSource();
-  return useAsyncResource(useCallback((signal?: AbortSignal) => dataSource.getOrchestratorChat(signal), [dataSource]), [dataSource], options);
+  const enabled = options.enabled ?? true;
+  const [state, setState] = useState<Loadable<ChatMessage[]> & { enabled: boolean }>({
+    data: null,
+    loading: enabled,
+    error: null,
+    enabled,
+  });
+
+  useEffect(() => {
+    if (!enabled) {
+      setState((current) => ({ data: current.data, loading: false, error: null, enabled: false }));
+      return;
+    }
+
+    let active = true;
+    const controller = new AbortController();
+    setState((current) => ({ data: current.data, loading: true, error: null, enabled: true }));
+    dataSource
+      .getOrchestratorChat(controller.signal)
+      .then((data) => {
+        if (active) setState({ data, loading: false, error: null, enabled: true });
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setState({ data: null, loading: false, error: message, enabled: true });
+      });
+
+    const unsubscribe = dataSource.subscribeOrchestratorChat?.(
+      (data) => {
+        if (active) setState({ data, loading: false, error: null, enabled: true });
+      },
+      (message) => {
+        if (active) setState((current) => ({ data: current.data, loading: false, error: message, enabled: true }));
+      },
+    );
+
+    return () => {
+      active = false;
+      controller.abort();
+      unsubscribe?.();
+    };
+  }, [dataSource, enabled]);
+
+  if (enabled && !state.enabled) return { data: state.data, loading: true, error: null };
+  return { data: state.data, loading: state.loading, error: state.error };
 }

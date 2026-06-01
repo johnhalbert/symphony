@@ -967,20 +967,27 @@ describe("web projection foundation", () => {
     expect(JSON.stringify(legacyDashboard)).not.toContain("assistant suggestion");
   });
 
-  it("projects orchestrator chat as the exact empty default without mock content", () => {
+  it("projects orchestrator chat as an empty default and maps durable messages without mock content", () => {
     const chat = projectWebOrchestratorChat();
     const replay = projectWebOrchestratorChat();
     const postChat = projectWebOrchestratorChatPost("please inspect ENG-94");
+    const durableChat = projectWebOrchestratorChat([
+      { who: "agent", text: "  ready  ", suggestions: [" status ", "", "inspect ENG-123"] },
+      { who: "user", text: "pause ENG-123" },
+    ]);
 
     expect(chat).toEqual([]);
     expect(replay).toEqual([]);
-    expect(postChat).toEqual([]);
+    expect(postChat).toEqual([{ who: "user", text: "please inspect ENG-94" }]);
+    expect(durableChat).toEqual([
+      { who: "agent", text: "  ready  ", suggestions: ["status", "inspect ENG-123"] },
+      { who: "user", text: "pause ENG-123" },
+    ]);
     expect(replay).not.toBe(chat);
     expect(postChat).not.toBe(chat);
+    expect(durableChat).not.toBe(chat);
     expect(JSON.stringify(chat)).not.toContain("assistant");
-    expect(JSON.stringify(postChat)).not.toContain("assistant");
-    expect(JSON.stringify(postChat)).not.toContain("please inspect ENG-94");
-    expect(JSON.stringify(postChat)).not.toContain("suggestion");
-    expect(JSON.stringify(postChat)).not.toContain("command");
+    expect(JSON.stringify(durableChat)).not.toContain("mock");
+    expect(JSON.stringify(durableChat)).not.toContain("assistant");
   });
 });

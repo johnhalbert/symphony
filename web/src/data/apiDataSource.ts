@@ -1,4 +1,4 @@
-import type { SymphonyDataSource } from "./dataSource";
+import type { OrchestratorChatErrorListener, OrchestratorChatListener, SymphonyDataSource } from "./dataSource";
 import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
@@ -114,6 +114,39 @@ export function normalizeReferenceData(input: ApiReferenceData): ReferenceData {
   };
 }
 
+function subscribeToOrchestratorChatEvents(
+  baseUrl: string,
+  onMessages: OrchestratorChatListener,
+  onError?: OrchestratorChatErrorListener,
+): () => void {
+  if (typeof EventSource === "undefined") {
+    onError?.("This browser does not support live orchestrator chat updates.");
+    return () => undefined;
+  }
+
+  const source = new EventSource(`${baseUrl}/api/v1/web/orchestrator-chat/events`);
+  source.addEventListener("orchestrator_chat", (event) => {
+    try {
+      const messages = JSON.parse((event as MessageEvent<string>).data) as ChatMessage[];
+      if (Array.isArray(messages)) onMessages(messages);
+    } catch (error) {
+      onError?.(error instanceof Error ? error.message : String(error));
+    }
+  });
+  source.addEventListener("orchestrator_chat_error", (event) => {
+    try {
+      const payload = JSON.parse((event as MessageEvent<string>).data) as { message?: string };
+      onError?.(payload.message || "Orchestrator chat stream reported an error.");
+    } catch {
+      onError?.("Orchestrator chat stream reported an error.");
+    }
+  });
+  source.onerror = () => {
+    onError?.("Orchestrator chat live updates disconnected; the browser will retry automatically.");
+  };
+  return () => source.close();
+}
+
 export function createApiDataSource(baseUrl: string): SymphonyDataSource {
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
   const fetchJson = createGetJsonFetcher();
@@ -145,7 +178,7 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       return fetchJson(normalizedBaseUrl, "/api/v1/web/sidebar", { signal });
     },
     async getOrchestratorChat(signal) {
-      return fetchJson<ChatMessage[]>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat", { signal });
+      return fetchJson<ChatMessage[]>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat", { signal, cacheable: false });
     },
     async sendOrchestratorMessage(input) {
       const response = await fetch(`${normalizedBaseUrl}/api/v1/web/orchestrator-chat`, {
@@ -158,6 +191,9 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       });
       if (!response.ok) throw new Error(`Symphony API returned HTTP ${response.status}`);
       return response.json() as Promise<ChatMessage[]>;
+    },
+    subscribeOrchestratorChat(onMessages, onError) {
+      return subscribeToOrchestratorChatEvents(normalizedBaseUrl, onMessages, onError);
     },
   };
 }

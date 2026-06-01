@@ -1,4 +1,6 @@
 import { SidebarChrome } from "../../app/SidebarChrome";
+import { useDataSource } from "../../data/dataSourceContext";
+import { useEffect, useState } from "react";
 import type { ChatMessage, SidebarModel, SidebarVariant } from "../../types/symphony";
 import { SidebarChat } from "./SidebarChat";
 import { SidebarHistory } from "./SidebarHistory";
@@ -19,10 +21,23 @@ export function SidebarViews({
   sidebar: SidebarModel;
   variant: SidebarVariant;
 }) {
-  const chatMessages = orchestratorChat ?? sidebar.chat;
+  const dataSource = useDataSource();
+  const sourceChat = orchestratorChat ?? sidebar.chat;
+  const [chatMessages, setChatMessages] = useState(sourceChat);
+
+  useEffect(() => {
+    setChatMessages(sourceChat);
+  }, [sourceChat]);
+
+  async function sendChat(input: string) {
+    if (orchestratorChatReadOnly) return;
+    const nextMessages = await dataSource.sendOrchestratorMessage(input);
+    setChatMessages(nextMessages);
+  }
+
   const child =
     variant === "chat" ? (
-      <SidebarChat messages={chatMessages} loading={orchestratorChatLoading} error={orchestratorChatError} readOnly={orchestratorChatReadOnly} />
+      <SidebarChat messages={chatMessages} onSend={sendChat} loading={orchestratorChatLoading} error={orchestratorChatError} readOnly={orchestratorChatReadOnly} />
     ) : variant === "history" ? (
       <SidebarHistory sessions={sidebar.sessions} />
     ) : (

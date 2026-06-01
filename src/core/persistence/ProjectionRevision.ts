@@ -1,4 +1,4 @@
-export type ProjectionChangeSource = "runs" | "workspaces" | "lifecycle" | "writeback";
+export type ProjectionChangeSource = "runs" | "workspaces" | "lifecycle" | "writeback" | "orchestratorChat";
 
 export interface ProjectionChangeEvent {
   source: ProjectionChangeSource;
