@@ -293,10 +293,20 @@ function realtimeEventTypesForSourceRevision(revision: WebProjectionSourceRevisi
   if (source === "runs" || source === "runstore" || source === "transcript") {
     types.push("run.updated", "transcript.delta");
   }
-  if (source === "orchestrator-chat" || source === "chat") {
+  if (isOrchestratorChatRealtimeSource(source)) {
     types.push("orchestrator.message");
   }
   return types;
+}
+
+function isOrchestratorChatRealtimeSource(source: string): boolean {
+  return (
+    source === "orchestrator-chat" ||
+    source === "chat" ||
+    source === "orchestrator_conversations" ||
+    source.startsWith("orchestrator_conversations:") ||
+    source.startsWith("orchestrator_chat:")
+  );
 }
 
 function normalizeRealtimeSourceRevision(revision: WebProjectionSourceRevision): WebProjectionSourceRevision {
