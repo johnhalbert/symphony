@@ -56,6 +56,34 @@ Hermes owns OpenAI Codex auth. Symphony bootstraps selected provider state from 
 
 The reference workflow configures Hermes with `provider: openai-codex` and `model: gpt-5.5`. The generated worker, reviewer, and planner profile templates set Hermes `agent.reasoning_effort: xhigh`.
 
+### Host Hermes ACP harness setup
+
+`agent.harness: hermes_acp` uses the operator's host Hermes executable and host profile store. It does **not** run the vendored `hermes/upstream-src` gateway, does **not** use `hermes.auth.managed_root`, and does **not** read `HERMES_AUTH_HOME` for ACP credentials. Before enabling it for dogfood, verify the host CLI directly:
+
+```powershell
+hermes --version
+hermes profile
+hermes acp --check
+```
+
+Configure `hermes.acp_binary_path` when the intended host `hermes` is not first on `PATH`. Configure `hermes.acp_source_profile` when the source profile should be a specific host profile rather than the active profile, and optionally configure `hermes.acp_profile_prefix` to identify Symphony-created clones. The source profile must already be authenticated for the configured provider/model, must pass `hermes acp --check` without interactive terminal setup, and must be safe to clone with `hermes profile create <disposable> --clone --clone-from <source> --no-alias`.
+
+Run the opt-in ACP smoke only when host Hermes credentials are available:
+
+```powershell
+npm run smoke:hermes-acp -- --source-profile <host-profile>
+```
+
+The smoke strips vendored/managed Hermes environment overrides (`HERMES_HOME`, `HERMES_AUTH_HOME`, `HERMES_PYTHON_SRC_ROOT`, `PYTHONPATH`, `HERMES_MODEL`, and `HERMES_TUI_PROVIDER`), verifies `hermes --version`, `hermes acp --check`, verifies the source profile with `hermes -p <source> acp --check`, creates a disposable cloned profile, verifies `hermes -p <clone> acp --check`, sends one small ACP prompt through the clone, deletes the clone by default, and confirms the active host profile selection did not change. Use `--keep-profile` or `--keep-temp` only for troubleshooting; delete retained smoke profiles before promoting more work.
+
+Troubleshooting:
+
+- Missing binary: install host Hermes or set `hermes.acp_binary_path`/`--binary-path`; do not point this at `hermes/upstream-src`.
+- Missing ACP dependencies: run `hermes acp --check` in the host profile and fix the host Hermes installation until it passes.
+- Auth failures or only terminal auth methods: refresh provider auth in the host source profile with the normal host Hermes auth flow, then rerun `hermes acp --check`; do not expect `HERMES_AUTH_HOME` or Symphony managed auth bootstrap to satisfy ACP.
+- Clone/create failures: choose a fresh `--profile-name` or remove stale smoke profiles with `hermes profile delete <name> --yes`.
+- Prompt failures after successful checks: rerun with `--keep-profile --keep-temp`, inspect the retained host profile and workspace, then delete the retained profile manually.
+
 ## 4. Preflight
 
 Run:
@@ -68,13 +96,28 @@ npm test
 npm run doctor -- --strict
 npm run doctor -- --strict --live-runtime
 npm run smoke:hermes-local
+# Opt-in only when validating the host Hermes ACP harness with host credentials:
+npm run smoke:hermes-acp -- --source-profile <host-profile>
 ```
 
 Set `LINEAR_API_KEY`, `SYMPHONY_WORKSPACE_TOKEN`, and the GitHub credential variables in the workflow root `.env` file or process environment as needed. The reference workflow uses app-backed credential profiles: existing `GITHUB_APP_*` variables identify the publication/merge app, and `GITHUB_REVIEW_APP_*` variables identify a separate reviewer app for PR approvals and change requests. Static-token profiles such as `GITHUB_PUBLICATION_TOKEN` and `GITHUB_FEEDBACK_TOKEN` remain supported for non-app deployments.
 
 Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable workspace paths, git availability, runtime harness/provider checks, Hermes paths, Python importability, managed auth readiness when `openai-codex` is selected, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, subprocess MCP tool availability, candidate isolation, and current Linear candidates.
 
-`doctor --live-runtime` is the opt-in live Hermes gateway readiness check. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory.
+`doctor --live-runtime` is the opt-in live Hermes gateway readiness check. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory. `npm run smoke:hermes-acp` is a separate opt-in live host ACP check; it is not part of default unit tests and should only be run when host Hermes ACP credentials are available.
+
+### ACP final live validation checklist
+
+Before removing `dogfood-blocked` from Hermes ACP dogfood issues, record the following evidence in the operator notes or issue comments:
+
+- `hermes --version`, `hermes profile`, `hermes acp --check`, and `hermes -p <source> acp --check` succeeded for the intended host source profile.
+- `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded and reported a deleted disposable profile.
+- The smoke response contained the expected text, the prompt stopped with a normal stop reason, and the ACP session id was recorded.
+- The active host profile before and after the smoke matched; the source profile was not renamed, selected, deleted, or used directly as the disposable smoke profile.
+- No retained `symphony-smoke-*` profile remains unless an operator intentionally used `--keep-profile` for troubleshooting and tracked the cleanup.
+- Default validation remains non-ACP unless the operator explicitly runs this smoke; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
+
+Only unblock `dogfood-blocked` after the checklist passes for the same host environment that will run the dogfood worker. If any item fails, leave the issue blocked, fix the host Hermes installation/auth/profile setup, and rerun the ACP smoke before promotion.
 
 ## 5. Promotion Policy
 
@@ -85,6 +128,7 @@ Before promotion, verify:
 - The issue has no open blockers.
 - The issue is assigned according to the workflow route.
 - The issue has `dogfood-ready`.
+- `dogfood-blocked` has been removed only after the ACP final live validation checklist passes when the issue depends on `hermes_acp`.
 - The issue does not have `dogfood-blocked` or `safety-blocked`.
 - The issue does not touch protected paths unless a human is implementing it manually.
 - The issue is not a continuation search or richer summarization placeholder that should remain `Backlog` with `dogfood-blocked`.

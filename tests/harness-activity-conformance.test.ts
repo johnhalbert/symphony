@@ -77,6 +77,20 @@ describe("harness activity contract conformance", () => {
     expect(harnessActivityConformanceFixtures.filter((fixture) => fixture.expected.negative)).toHaveLength(1);
   });
 
+  it("redacts runActivity extension data when sanitizing public AgentEvents", () => {
+    const publicEvent = sanitizeAgentEventForPublicOutput({
+      type: "progress",
+      message: "streamed SECRET_ACP_DELTA_TOKEN",
+      runActivity: {
+        text: "activity SECRET_ACP_DELTA_TOKEN",
+        payload: { nestedToken: "SECRET_ACP_MALFORMED_TOKEN" },
+      },
+    } as unknown as AgentEvent);
+
+    expect(JSON.stringify(publicEvent)).not.toContain("SECRET_ACP_DELTA_TOKEN");
+    expect(JSON.stringify(publicEvent)).not.toContain("SECRET_ACP_MALFORMED_TOKEN");
+  });
+
   it.each(adapterCases)("normalizes $adapterId $fixture.name activity through the shared contract", async ({ adapterId, fixture }) => {
     const result = await runAdapterFixture(adapterId, fixture);
     const publicEvents = result.events.map((event) => sanitizeAgentEventForPublicOutput(event));

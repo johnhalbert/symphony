@@ -72,24 +72,32 @@ export function sanitizePublicJson(value: unknown, maxStringLength = DEFAULT_PRE
 export function sanitizeAgentEventForPublicOutput(event: AgentEvent): AgentEvent {
   switch (event.type) {
     case "progress":
-      return { ...event, message: sanitizedPreviewValue(event.message).preview ?? "" };
+      return withSanitizedAgentEventExtras({ ...event, message: sanitizedPreviewValue(event.message).preview ?? "" });
     case "run_diagnostic":
-      return {
+      return withSanitizedAgentEventExtras({
         ...event,
         message: sanitizedPreviewValue(event.message).preview ?? "",
         ...(event.payload === undefined ? {} : { payload: sanitizePublicJson(event.payload) }),
-      };
+      });
     case "completed":
-      return event.message === undefined ? event : { ...event, message: sanitizedPreviewValue(event.message).preview ?? "" };
+      return withSanitizedAgentEventExtras(
+        event.message === undefined ? event : { ...event, message: sanitizedPreviewValue(event.message).preview ?? "" },
+      );
     case "failed":
-      return { ...event, error: sanitizedPreviewValue(event.error).preview ?? "" };
+      return withSanitizedAgentEventExtras({ ...event, error: sanitizedPreviewValue(event.error).preview ?? "" });
     case "rate_limits":
-      return { ...event, payload: sanitizePublicJson(event.payload) };
+      return withSanitizedAgentEventExtras({ ...event, payload: sanitizePublicJson(event.payload) });
     case "provider_limit":
-      return { ...event, signal: sanitizePublicJson(event.signal) as typeof event.signal };
+      return withSanitizedAgentEventExtras({ ...event, signal: sanitizePublicJson(event.signal) as typeof event.signal });
     default:
-      return event;
+      return withSanitizedAgentEventExtras(event);
   }
+}
+
+function withSanitizedAgentEventExtras<T extends AgentEvent>(event: T): T {
+  const runActivity = (event as { runActivity?: unknown }).runActivity;
+  if (runActivity === undefined) return event;
+  return { ...event, runActivity: sanitizePublicJson(runActivity, 1_000) } as T;
 }
 
 export function projectTranscriptEventForPublicRead(event: TranscriptEvent): TranscriptEvent {

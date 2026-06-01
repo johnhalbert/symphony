@@ -3,8 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { StatusServer } from "../src/app/http.js";
+import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import type {
+  ProjectionPayloadWriteInput,
+  ProjectionRevisionRecord,
+  ProjectionWriteResult,
+} from "../src/core/persistence/ProjectionTransactionService.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -148,16 +153,102 @@ describe("/api/v1/web route contracts", () => {
     }
   });
 
-  it("keeps the orchestrator chat POST contract side-effect-free and validates malformed input", async () => {
+  it("records durable projection writes for web collection and chat routes", async () => {
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, { projectionWriter });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      for (const path of [
+        "/api/v1/web/dashboard",
+        "/api/v1/web/issues",
+        "/api/v1/web/history?sessionLimit=7&timelineLimit=9",
+        "/api/v1/web/sidebar",
+        "/api/v1/web/orchestrator-chat?conversationId=operator-room",
+      ]) {
+        const { response } = await getJson(`${baseUrl}${path}`);
+        expect({ path, status: response.status }).toEqual({ path, status: 200 });
+      }
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionWriter.writes.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      {
+        projectionName: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:7:timeline:9",
+      },
+      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+      { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+    ]);
+    const dashboard = projectionWriter.writeFor("dashboard_projection");
+    expect(dashboard.sourceCursors).toMatchObject({
+      issueCount: 0,
+      openIssueCount: 0,
+      runningAgentCount: 0,
+      providerGateCount: 0,
+      activityCount: 0,
+    });
+    const issueBoard = projectionWriter.writeFor("issue_board_projection");
+    expect(issueBoard.fields?.fetchedStates).toEqual(
+      expect.arrayContaining(["Backlog", "Todo", "In Progress", "In Review", "Done", "Cancelled"]),
+    );
+    expect(issueBoard.sourceCursors).toMatchObject({ issueCount: 0 });
+    expect(projectionWriter.writeFor("history_projection").sourceCursors).toMatchObject({
+      sessionLimit: 7,
+      timelineLimit: 9,
+      sessionCount: 0,
+      timelineCount: 0,
+    });
+    expect(projectionWriter.writeFor("orchestrator_chat_projection")).toMatchObject({
+      fields: { conversationKey: "operator-room", messageCount: 0 },
+      sourceCursors: { conversationKey: "operator-room", messageCount: 0 },
+    });
+  });
+
+  it("keeps web responses available when durable projection persistence rejects", async () => {
+    const { server } = createStatusServer(root, { projectionWriter: new FailingProjectionWriter() });
+    const address = await server.start();
+    try {
+      const { response, body } = await getJson(`${baseUrlFor(address)}/api/v1/web/dashboard`);
+      expect(response.status).toBe(200);
+      expectTopLevelKeys(body, [
+        "activity",
+        "agentUsageLabel",
+        "branch",
+        "chat",
+        "concurrencyCap",
+        "pollLabel",
+        "projectName",
+        "providerGates",
+        "repoLabel",
+        "runningAgents",
+        "totals",
+        "workflowLabel",
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps the orchestrator chat POST contract bounded when storage is absent and validates malformed input", async () => {
     const { server, calls } = createStatusServer(root);
     const address = await server.start();
     const url = `${baseUrlFor(address)}/api/v1/web/orchestrator-chat`;
     try {
-      const accepted = await postJson(url, { input: "summarize ENG-113" });
-      expect(accepted.response.status).toBe(200);
-      expect(accepted.body).toEqual([]);
-      expect(accepted.text.trim()).toBe("[]");
-      expect(accepted.text).not.toContain("summarize ENG-113");
+      const unavailable = await postJson(url, { input: "summarize ENG-113" });
+      expect(unavailable.response.status).toBe(503);
+      expect(unavailable.body).toEqual({
+        error: {
+          code: "orchestrator_chat_unavailable",
+          message: "Web orchestrator chat is unavailable because durable conversation storage is not configured",
+        },
+        chat: [],
+      });
+      expect(unavailable.text).not.toContain("summarize ENG-113");
 
       const malformed = await fetch(url, {
         method: "POST",
@@ -392,6 +483,53 @@ interface OrchestratorCallCounts {
 
 interface CreateStatusServerOptions {
   webAssetsRoot?: string | null;
+  projectionWriter?: StatusServerProjectionWriter;
+}
+
+class RecordingProjectionWriter implements StatusServerProjectionWriter {
+  readonly writes: ProjectionPayloadWriteInput[] = [];
+
+  async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
+    this.writes.push(JSON.parse(JSON.stringify(input)) as ProjectionPayloadWriteInput);
+    const revision = projectionRevisionRecordFixture(input, this.writes.length);
+    return {
+      status: "written",
+      revision,
+      previousRevision: null,
+      contentSha256: "0".repeat(64),
+      payloadSha256: "1".repeat(64),
+      event: null,
+    };
+  }
+
+  writeFor(projectionName: ProjectionPayloadWriteInput["projectionName"]): ProjectionPayloadWriteInput {
+    const write = this.writes.find((candidate) => candidate.projectionName === projectionName);
+    if (!write) throw new Error(`expected projection write for ${projectionName}`);
+    return write;
+  }
+}
+
+class FailingProjectionWriter implements StatusServerProjectionWriter {
+  async writeProjection(): Promise<ProjectionWriteResult> {
+    throw new Error("simulated projection persistence failure");
+  }
+}
+
+function projectionRevisionRecordFixture(input: ProjectionPayloadWriteInput, revision: number): ProjectionRevisionRecord {
+  return {
+    projectionRevisionId: revision,
+    projectionName: input.projectionName,
+    scopeKind: input.scopeKind ?? "global",
+    scopeKey: input.scopeKey ?? "global",
+    revision,
+    sourceRevisions: [],
+    sourceCursors: {},
+    contentSha256: "0".repeat(64),
+    generatedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: null,
+    supersededAt: null,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
 }
 
 function createStatusServer(
@@ -416,6 +554,7 @@ function createStatusServer(
       trackerStateLists: testTrackerStateLists(),
       staleThresholdMs: 300_000,
       webAssetsRoot: options.webAssetsRoot,
+      ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
     }),
   };
 }
