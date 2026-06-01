@@ -23,8 +23,10 @@ the backend and web UI:
 
 Raw token-count telemetry is not a chat transcript message. The run/session
 summary owns aggregate token display. When the durable RunActivity taxonomy emits
-a sanitized, low-frequency `token_usage_reported`/token-budget event, it may
-appear as a concise `status` row; raw legacy `tokens` payloads remain hidden.
+a sanitized, low-frequency `token_usage_reported`/token-budget event, or a
+migration fixture emits a legacy `tokens` row with public summary text plus
+top-level counts, it may appear as a concise `status` row; raw legacy `tokens`
+payloads without that public summary remain hidden.
 
 ## Grouping boundaries
 

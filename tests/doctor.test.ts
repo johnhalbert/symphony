@@ -10,17 +10,21 @@ import {
   cursorPolicyDoctorChecks,
   githubPublicationDoctorCheck,
   githubReviewFeedbackDoctorCheck,
+  hermesAcpRuntimeDoctorChecks,
   hermesAuthDoctorChecks,
   hermesLiveRuntimeDoctorCheck,
   hermesRuntimeDoctorChecks,
+  hostHermesAcpDoctorChecks,
   reviewLoopDoctorChecks,
   runDoctor,
   runtimeCredentialDoctorCheck,
+  runtimeHarnessDependencyDoctorChecks,
   runtimeHarnessDoctorChecks,
   trackerHandoffDoctorCheck,
 } from "../src/doctor.js";
 import { testConfig } from "./helpers.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
+import type { HostHermesCommandRunner } from "../hermes/src/HostHermesDiscovery.js";
 
 describe("doctor review-loop checks", () => {
   afterEach(() => {
@@ -369,6 +373,181 @@ github:
       id: "env.hermes",
       status: "warn",
     });
+  });
+
+  it("reports Hermes ACP runtime config without requiring Symphony-managed runtime credentials", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { harness: "hermes_acp" },
+        hermes: {
+          acp_binary_path: "/opt/hermes/bin/hermes",
+          acp_source_profile: "dogfood",
+          acp_profile_prefix: "sym-test",
+          provider: "openrouter",
+          model: "anthropic/claude-sonnet-test",
+          worker_session_lifecycle: "fresh_per_run",
+          keep_profiles: "always",
+        },
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.hermes.acpBinaryPath).toBe("/opt/hermes/bin/hermes");
+    expect(config.hermes.acpSourceProfile).toBe("dogfood");
+    expect(config.hermes.acpProfilePrefix).toBe("sym-test");
+    expect(hermesAcpRuntimeDoctorChecks(config)).toEqual([
+      {
+        id: "hermes_acp.runtime",
+        status: "ok",
+        message: "Hermes ACP uses host Hermes binary /opt/hermes/bin/hermes; source profile is dogfood",
+      },
+      {
+        id: "hermes_acp.profiles",
+        status: "ok",
+        message: "ACP managed profile prefix is sym-test; worker lifecycle is fresh_per_run; profile retention is always",
+      },
+    ]);
+    expect(runtimeHarnessDoctorChecks(config)).toEqual([
+      {
+        id: "runtime.harness",
+        status: "ok",
+        message: "Runtime harness is hermes_acp",
+      },
+      ...hermesAcpRuntimeDoctorChecks(config),
+    ]);
+    expect(runtimeCredentialDoctorCheck(config)).toEqual({
+      id: "env.hermes_acp",
+      status: "ok",
+      message: "Hermes ACP uses host Hermes profile credentials; Symphony runtime credential env injection is not used",
+    });
+  });
+
+  it("checks host Hermes ACP binary and configured source profile through doctor dependencies", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-acp-"));
+    try {
+      const binaryPath = path.join(root, "bin", "hermes");
+      await mkdir(path.dirname(binaryPath), { recursive: true });
+      await writeFile(binaryPath, "#!/usr/bin/env node\n", "utf8");
+      vi.stubEnv("HERMES_HOME", "secret-home");
+      const calls: Array<{ file: string; args: string[]; hermesHome: string | undefined }> = [];
+      const runner: HostHermesCommandRunner = async (file, args, options) => {
+        calls.push({ file, args: [...args], hermesHome: options.env.HERMES_HOME });
+        const command = args.join(" ");
+        if (command === "--version") return { stdout: "hermes 1.2.3\n", stderr: "", exitCode: 0 };
+        if (command === "acp --check") return { stdout: "ACP OK\n", stderr: "", exitCode: 0 };
+        if (command === "-p dogfood acp --check") return { stdout: "profile ACP OK\n", stderr: "", exitCode: 0 };
+        return { stdout: "", stderr: `unexpected command ${command}`, exitCode: 99 };
+      };
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
+          agent: { harness: "hermes_acp" },
+          hermes: {
+            acp_binary_path: binaryPath,
+            acp_source_profile: "dogfood",
+          },
+        },
+        path.join(root, "WORKFLOW.md"),
+        { LINEAR_API_KEY: "secret" },
+      );
+
+      await expect(hostHermesAcpDoctorChecks(config, { hostHermesCommandRunner: runner })).resolves.toEqual([
+        {
+          id: "hermes_acp.host_hermes",
+          status: "ok",
+          message: `Host Hermes binary resolved from config at ${binaryPath}; hermes 1.2.3`,
+        },
+        {
+          id: "hermes_acp.acp_check",
+          status: "ok",
+          message: "Host Hermes `hermes acp --check` completed successfully",
+        },
+        {
+          id: "hermes_acp.source_profile",
+          status: "ok",
+          message: "Hermes ACP source profile is dogfood (config)",
+        },
+        {
+          id: "hermes_acp.source_profile_check",
+          status: "ok",
+          message: "Host Hermes ACP source profile dogfood passed `hermes -p dogfood acp --check`",
+        },
+      ]);
+      await expect(runtimeHarnessDependencyDoctorChecks(config, { hostHermesCommandRunner: runner })).resolves.toContainEqual({
+        id: "hermes_acp.source_profile_check",
+        status: "ok",
+        message: "Host Hermes ACP source profile dogfood passed `hermes -p dogfood acp --check`",
+      });
+      expect(calls.map((call) => call.args)).toEqual([
+        ["--version"],
+        ["acp", "--check"],
+        ["-p", "dogfood", "acp", "--check"],
+        ["--version"],
+        ["acp", "--check"],
+        ["-p", "dogfood", "acp", "--check"],
+      ]);
+      expect(calls.every((call) => call.file === binaryPath)).toBe(true);
+      expect(calls.every((call) => call.hermesHome === undefined)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts credentials from failing host Hermes ACP doctor output", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-acp-redact-"));
+    try {
+      const binaryPath = path.join(root, "bin", "hermes");
+      await mkdir(path.dirname(binaryPath), { recursive: true });
+      await writeFile(binaryPath, "#!/usr/bin/env node\n", "utf8");
+      const longToken = "x".repeat(90);
+      const runner: HostHermesCommandRunner = async (_file, args) => {
+        const command = args.join(" ");
+        if (command === "--version") return { stdout: "hermes 1.2.3\n", stderr: "", exitCode: 0 };
+        if (command === "acp --check") {
+          return {
+            stdout: "",
+            stderr: `api_key=*** token=secret-token password=hunter2 {\"access_token\":\"${longToken}\"}`,
+            exitCode: 2,
+          };
+        }
+        if (command === "-p dogfood acp --check") return { stdout: "profile ACP OK\n", stderr: "", exitCode: 0 };
+        return { stdout: "", stderr: `unexpected command ${command}`, exitCode: 99 };
+      };
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
+          agent: { harness: "hermes_acp" },
+          hermes: {
+            acp_binary_path: binaryPath,
+            acp_source_profile: "dogfood",
+          },
+        },
+        path.join(root, "WORKFLOW.md"),
+        { LINEAR_API_KEY: "secret" },
+      );
+
+      const checks = await hostHermesAcpDoctorChecks(config, { hostHermesCommandRunner: runner });
+      const acpCheck = checks.find((check) => check.id === "hermes_acp.acp_check");
+      expect(acpCheck).toMatchObject({
+        id: "hermes_acp.acp_check",
+        status: "error",
+      });
+      expect(acpCheck?.message).toContain("api_key=[REDACTED]");
+      expect(acpCheck?.message).toContain("token=[REDACTED]");
+      expect(acpCheck?.message).toContain("password=[REDACTED]");
+      expect(acpCheck?.message).toContain('\"access_token\":\"[REDACTED]\"');
+      expect(acpCheck?.message).not.toContain("***");
+      expect(acpCheck?.message).not.toContain("secret-token");
+      expect(acpCheck?.message).not.toContain("hunter2");
+      expect(acpCheck?.message).not.toContain(longToken);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("validates review state, blocked state, MCP tools, and candidate isolation", async () => {

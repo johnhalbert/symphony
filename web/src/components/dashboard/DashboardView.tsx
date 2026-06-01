@@ -6,6 +6,15 @@ import { AgentRow } from "./AgentRow";
 import { BurndownCommandCenter, BurndownPanel, Sparkline, StatsGridDense, StatsRow } from "./Stats";
 import { OrchestratorChat } from "./OrchestratorChat";
 
+function textOr(value: string | null | undefined, fallback: string) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : fallback;
+}
+
+function metricSeries(series: number[] | null | undefined) {
+  return (series ?? []).filter((value) => Number.isFinite(value)).map((value) => Math.max(value, 0));
+}
+
 export function DashboardView({
   dashboard,
   orchestratorChat,
@@ -27,6 +36,11 @@ export function DashboardView({
   const sourceChat = orchestratorChat ?? dashboard.chat;
   const [chat, setChat] = useState(sourceChat);
   const totals = dashboard.totals;
+  const cycleLabel = textOr(dashboard.metrics?.cycle?.label, "Cycle unavailable");
+  const velocity = dashboard.metrics?.velocity;
+  const velocityWindow = textOr(velocity?.windowLabel, "metric unavailable");
+  const velocityDelta = textOr(velocity?.deltaLabel, "—");
+  const velocitySparkline = metricSeries(velocity?.sparkline);
 
   useEffect(() => {
     setChat(sourceChat);
@@ -56,7 +70,7 @@ export function DashboardView({
           </div>
           <div className="dash__actions">
             <button className="btn" type="button">
-              {Icon.filter()}Cycle 14
+              {Icon.filter()}{cycleLabel}
             </button>
             <button className="btn" type="button">
               {Icon.bolt()}Trigger poll
@@ -86,9 +100,9 @@ export function DashboardView({
           </div>
         ) : null}
 
-        {variant === "grid" ? <StatsGridDense totals={totals} /> : <StatsRow dashboard={dashboard} />}
+        {variant === "grid" ? <StatsGridDense totals={totals} metrics={dashboard.metrics} /> : <StatsRow dashboard={dashboard} />}
 
-        {variant === "command-center" ? <BurndownCommandCenter dashboard={dashboard} /> : <BurndownPanel totals={totals} useModelBurnupTotals={useModelBurnupTotals} />}
+        {variant === "command-center" ? <BurndownCommandCenter dashboard={dashboard} /> : <BurndownPanel totals={totals} metrics={dashboard.metrics} useModelBurnupTotals={useModelBurnupTotals} />}
 
         <div className="section-head">
           <h2>Running agents</h2>
@@ -143,11 +157,11 @@ export function DashboardView({
           {variant === "grid" ? (
             <div className="panel">
               <div className="panel__head">
-                <span>Velocity · last 14 days</span>
-                <span className="count">+24</span>
+                <span>Velocity · {velocityWindow}</span>
+                <span className="count">{velocityDelta}</span>
               </div>
               <div style={{ padding: "14px 14px 18px" }}>
-                <Sparkline />
+                {velocitySparkline.length >= 2 ? <Sparkline points={velocitySparkline} /> : <div className="view-empty">Velocity metric unavailable.</div>}
               </div>
             </div>
           ) : null}
@@ -157,6 +171,7 @@ export function DashboardView({
       <OrchestratorChat
         messages={chat}
         onSend={sendChat}
+        agentLabel={chatAgentLabel(dashboard)}
         subtitle={chatSubtitle(dashboard)}
         loading={orchestratorChatLoading}
         error={orchestratorChatError}
@@ -168,6 +183,10 @@ export function DashboardView({
 
 function chatSubtitle(dashboard: DashboardModel) {
   return [dashboard.agentUsageLabel, dashboard.workflowLabel, dashboard.pollLabel].filter(Boolean).join(" · ");
+}
+
+function chatAgentLabel(dashboard: DashboardModel) {
+  return dashboard.runningAgents[0]?.id ?? null;
 }
 
 function dotColorForVerb(verb: string) {

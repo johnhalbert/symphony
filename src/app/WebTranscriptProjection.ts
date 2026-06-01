@@ -109,7 +109,7 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage | 
   const payload = sanitizedPayloadRecord(event);
   const payloadKind = normalizedPayloadKind(payload);
   const activitySource = normalizedActivitySource(payload);
-  if (isHiddenMetadataEvent(eventType, payloadKind, activitySource)) return null;
+  if (isHiddenMetadataEvent(event, eventType, payloadKind, activitySource, payload)) return null;
   if (isDiagnosticEvent(eventType)) return projectDiagnosticStatusMessage(event, payload, eventType);
   if (isProviderLimitEvent(eventType)) return projectProviderLimitStatusMessage(event, payload, eventType);
   if (isTerminalStatusEvent(eventType)) return projectTerminalStatusMessage(event, payload, eventType);
@@ -372,14 +372,28 @@ function isStatusEvent(eventType: string, payloadKind: string | null, payload: R
   );
 }
 
-function isHiddenMetadataEvent(eventType: string, _payloadKind: string | null, activitySource: string | null): boolean {
+function isHiddenMetadataEvent(
+  event: TranscriptEvent,
+  eventType: string,
+  payloadKind: string | null,
+  activitySource: string | null,
+  payload: Record<string, unknown>,
+): boolean {
+  if (eventType === "tokens") return !isDisplayableTokenStatusEvent(event, payloadKind, payload);
   return (
     eventType === "session_started" ||
-    eventType === "tokens" ||
     eventType === "rate_limits" ||
     eventType === "run_status" ||
     (eventType === "progress" && activitySource === "tool")
   );
+}
+
+function isDisplayableTokenStatusEvent(event: TranscriptEvent, payloadKind: string | null, payload: Record<string, unknown>): boolean {
+  if (payloadKind === "usage" || payloadKind === "token_usage_reported") return true;
+  if (payloadKind !== "tokens" && !payloadKindIncludes(payloadKind, "token")) return false;
+  const hasPublicText = firstCleanString(payload.messagePreview, payload.textPreview, payload.summary, payload.message, event.message) !== null;
+  const hasTopLevelTokenCounts = isFiniteNumber(payload.inputTokens) || isFiniteNumber(payload.outputTokens) || isFiniteNumber(payload.totalTokens);
+  return hasPublicText && hasTopLevelTokenCounts;
 }
 
 function isDiagnosticEvent(eventType: string): boolean {
@@ -598,6 +612,10 @@ function normalizedActivitySource(payload: Record<string, unknown>): string | nu
 
 function payloadKindIncludes(payloadKind: string | null, token: string): boolean {
   return payloadKind?.includes(token) ?? false;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function firstCleanString(...values: unknown[]): string | null {

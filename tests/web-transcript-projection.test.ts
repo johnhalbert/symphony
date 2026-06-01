@@ -423,6 +423,38 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("Hermes tool terminal: ");
   });
 
+  it("shows canonical token summaries while preserving raw legacy token telemetry as hidden metadata", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "tokens",
+        source: "harness",
+        message: "Token usage updated",
+        payload: { kind: "usage", tokens: { inputTokens: 4, outputTokens: 6, totalTokens: 10 } },
+      }),
+      event({
+        eventType: "tokens",
+        source: "harness",
+        message: "Fixture token update 12",
+        payload: { type: "tokens", tokens: { inputTokens: 5, outputTokens: 7, totalTokens: 12 }, totalTokens: 12 },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 2,
+      }),
+      event({
+        eventType: "tokens",
+        source: "harness",
+        payload: { type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 }, secret: "SECRET_TOKEN_SUMMARY" },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 3,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      { kind: "status", state: "usage", ts: "2026-01-01T00:00:00.000Z", text: "Token usage updated" },
+      { kind: "status", state: "tokens", ts: "2026-01-01T00:00:01.000Z", text: "Fixture token update 12" },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain("SECRET_TOKEN_SUMMARY");
+  });
+
   it("projects persisted harness-provided ACP RunActivityEvent taxonomy without falling back to legacy progress", () => {
     const messages = projectWebTranscript([
       event({
