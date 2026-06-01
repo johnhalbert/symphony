@@ -47,16 +47,10 @@ class PolicyDecision(dict):
     """Small dict subclass for ergonomic truthiness and JSON-ability."""
 
 
-def _truthy(value: object) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def is_worker_reviewer_github_policy_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
     """Return True when the worker/reviewer GitHub command policy applies."""
 
     source = env or os.environ
-    if _truthy(source.get(POLICY_DISABLED_ENV, "")):
-        return False
     policy = str(source.get(COMMAND_POLICY_ENV, "")).strip().lower()
     role = str(
         source.get(ROLE_ENV)
@@ -94,6 +88,7 @@ def apply_worker_reviewer_github_child_env(
     updates = worker_reviewer_github_child_env(source_env)
     if not updates:
         return False
+    target_env.pop(POLICY_DISABLED_ENV, None)
     target_env.update(updates)
     return True
 
@@ -240,6 +235,10 @@ def _skip_git_global_options(args: Sequence[str]) -> tuple[Optional[str], list[s
             if index + 1 < len(args):
                 sensitive_from_global.append(str(args[index + 1]))
             index += 2
+            continue
+        if lower.startswith("--config-env="):
+            sensitive_from_global.append(arg.split("=", 1)[1])
+            index += 1
             continue
         if lower.startswith("-c") and len(arg) > 2:
             sensitive_from_global.append(arg[2:])
@@ -448,18 +447,112 @@ import subprocess as _subprocess
 
 try:
     from tools.worker_github_policy import (
+        COMMAND_POLICY_ENV as _COMMAND_POLICY_ENV,
+        COMMAND_POLICY_VALUE as _COMMAND_POLICY_VALUE,
+        ROLE_ENV as _ROLE_ENV,
+        POLICY_DISABLED_ENV as _POLICY_DISABLED_ENV,
+        SHIM_DIR_ENV as _SHIM_DIR_ENV,
         check_worker_reviewer_github_argv as _check_argv,
         check_worker_reviewer_github_command as _check_command,
+        is_worker_reviewer_github_policy_enabled as _is_policy_enabled,
+        worker_reviewer_github_child_env as _child_policy_env,
     )
 except Exception:  # pragma: no cover - fail closed only when import worked at generation time
+    _COMMAND_POLICY_ENV = None
+    _COMMAND_POLICY_VALUE = None
+    _ROLE_ENV = None
+    _POLICY_DISABLED_ENV = None
+    _SHIM_DIR_ENV = None
     _check_argv = None
     _check_command = None
+    _is_policy_enabled = None
+    _child_policy_env = None
+
+
+def _policy_is_active(env):
+    if _is_policy_enabled is None:
+        return False
+    try:
+        return bool(_is_policy_enabled(env))
+    except Exception:
+        return False
+
+
+def _prepend_path_value(value, required_prefix):
+    if not required_prefix:
+        return value
+    sep = _os.pathsep
+    parts = [part for part in str(value or "").split(sep) if part]
+    try:
+        required_abs = _os.path.abspath(required_prefix)
+        if any(_os.path.abspath(part) == required_abs for part in parts):
+            return value
+    except Exception:
+        if required_prefix in parts:
+            return value
+    return required_prefix + (sep + str(value) if value else "")
+
+
+def _merge_pythonpath(parent_value, child_value):
+    if not parent_value:
+        return child_value
+    sep = _os.pathsep
+    merged = [part for part in str(child_value or "").split(sep) if part]
+    for part in reversed([part for part in str(parent_value or "").split(sep) if part]):
+        if part not in merged:
+            merged.insert(0, part)
+    return sep.join(merged)
+
+
+def _effective_policy_env(kwargs_env=None):
+    env = dict(kwargs_env) if kwargs_env is not None else dict(_os.environ)
+    parent_active = _policy_is_active(_os.environ)
+    child_active = _policy_is_active(env)
+    if not parent_active and not child_active:
+        return env
+
+    if _child_policy_env is not None:
+        try:
+            env.update(_child_policy_env(_os.environ if parent_active else env))
+        except Exception:
+            pass
+
+    for key in (
+        _COMMAND_POLICY_ENV,
+        _ROLE_ENV,
+        "SYMPHONY_RUN_ROLE",
+        "HERMES_SYMPHONY_ROLE",
+        _SHIM_DIR_ENV,
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_TERMINAL_PROMPT",
+        "GCM_INTERACTIVE",
+        "GH_PROMPT_DISABLED",
+        "GIT_SSH_COMMAND",
+        "SSH_ASKPASS_REQUIRE",
+    ):
+        if key and _os.environ.get(key):
+            env[key] = _os.environ[key]
+    for key, value in _os.environ.items():
+        if key.startswith("SYMPHONY_REAL_"):
+            env[key] = value
+    if _POLICY_DISABLED_ENV:
+        env.pop(_POLICY_DISABLED_ENV, None)
+    if _COMMAND_POLICY_ENV and _COMMAND_POLICY_VALUE and parent_active:
+        env[_COMMAND_POLICY_ENV] = _COMMAND_POLICY_VALUE
+
+    shim_dir = _os.environ.get(_SHIM_DIR_ENV or "")
+    if shim_dir:
+        env["PATH"] = _prepend_path_value(env.get("PATH") or _os.environ.get("PATH"), shim_dir)
+    if _os.environ.get("PYTHONPATH"):
+        env["PYTHONPATH"] = _merge_pythonpath(_os.environ.get("PYTHONPATH"), env.get("PYTHONPATH"))
+    return env
 
 
 def _policy_decision_for_args(args, kwargs_env=None):
     if _check_command is None or _check_argv is None:
         return None
-    env = kwargs_env or _os.environ
+    env = _effective_policy_env(kwargs_env)
     try:
         if isinstance(args, (str, bytes, _os.PathLike)):
             return _check_command(_os.fsdecode(args), env=env)
@@ -481,7 +574,11 @@ _real_popen = _subprocess.Popen
 
 
 def _policy_popen(args, *popen_args, **popen_kwargs):
-    _raise_if_blocked(args, kwargs_env=popen_kwargs.get("env"))
+    caller_env = popen_kwargs.get("env")
+    effective_env = _effective_policy_env(caller_env)
+    _raise_if_blocked(args, kwargs_env=effective_env)
+    if caller_env is not None and _policy_is_active(effective_env):
+        popen_kwargs["env"] = effective_env
     return _real_popen(args, *popen_args, **popen_kwargs)
 
 
@@ -520,7 +617,12 @@ def _wrap_exec_like(name, argv_index):
         env = None
         if name.endswith("e"):
             env = args[-1] if args else None
-        _raise_if_blocked(command_args, kwargs_env=env)
+        effective_env = _effective_policy_env(env)
+        _raise_if_blocked(command_args, kwargs_env=effective_env)
+        if env is not None and _policy_is_active(effective_env):
+            args = list(args)
+            args[-1] = effective_env
+            args = tuple(args)
         return real(*args, **kwargs)
 
     setattr(_os, name, wrapped)
@@ -627,12 +729,24 @@ def remote_policy_env_prefix(source_env: Optional[Mapping[str, str]], sandbox_di
     bin_dir = f"{sandbox_dir}/bin"
     updates.update({
         SHIM_DIR_ENV: bin_dir,
-        "PATH": f"{bin_dir}:$PATH",
-        "PYTHONPATH": f"{sandbox_dir}:${{PYTHONPATH:-}}",
         "GIT_ASKPASS": f"{bin_dir}/symphony-deny-askpass",
         "SSH_ASKPASS": f"{bin_dir}/symphony-deny-askpass",
     })
-    return " ".join(f"{key}={_shell_quote(value)}" for key, value in updates.items())
+    parts = [f"{key}={_shell_quote(value)}" for key, value in updates.items()]
+    parts.append(f"PATH={_shell_quote(bin_dir)}:$PATH")
+    parts.append(f"PYTHONPATH={_shell_quote(sandbox_dir)}:${{PYTHONPATH:-}}")
+    return " ".join(parts)
+
+
+def _shim_invocation_policy_env(source_env: Mapping[str, str]) -> dict[str, str]:
+    """Return fail-closed policy env for PATH shim execution."""
+
+    env = dict(source_env)
+    env.pop(POLICY_DISABLED_ENV, None)
+    if env.get(SHIM_DIR_ENV):
+        env.setdefault(COMMAND_POLICY_ENV, COMMAND_POLICY_VALUE)
+        env.setdefault(ROLE_ENV, env.get("SYMPHONY_RUN_ROLE") or env.get("HERMES_SYMPHONY_ROLE") or "worker")
+    return env
 
 
 def _main(argv: Sequence[str]) -> int:
@@ -641,11 +755,12 @@ def _main(argv: Sequence[str]) -> int:
         return 127
     tool = argv[1]
     tool_args = list(argv[2:])
-    decision = check_worker_reviewer_github_argv(tool, tool_args, env=os.environ)
+    policy_env = _shim_invocation_policy_env(os.environ)
+    decision = check_worker_reviewer_github_argv(tool, tool_args, env=policy_env)
     if decision is not None:
         print(decision["message"], file=sys.stderr)
         return 126
-    real = _find_real_tool(tool, os.environ)
+    real = _find_real_tool(tool, policy_env)
     if not real:
         print(f"Symphony command policy shim could not locate the real executable for {tool!r} outside the shim PATH.", file=sys.stderr)
         return 127

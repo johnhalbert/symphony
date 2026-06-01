@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import path from "node:path";
-import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
@@ -21,6 +23,7 @@ import {
   transcriptRecallMcpServerConfig,
 } from "../cursor/src/CursorHarness.js";
 import { issue, testConfig } from "./helpers.js";
+import { workerReviewerGithubCommandPolicyProcessEnv } from "../src/core/harness/AgentCommandPolicy.js";
 
 const cursorSdk = vi.hoisted(() => ({
   create: vi.fn(),
@@ -274,6 +277,8 @@ describe("Cursor event mapping", () => {
       GCM_INTERACTIVE: process.env.GCM_INTERACTIVE,
       GH_PROMPT_DISABLED: process.env.GH_PROMPT_DISABLED,
       GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND,
+      SYMPHONY_COMMAND_POLICY_SHIM_DIR: process.env.SYMPHONY_COMMAND_POLICY_SHIM_DIR,
+      SYMPHONY_REAL_GIT: process.env.SYMPHONY_REAL_GIT,
       PATH: process.env.PATH,
       PYTHONPATH: process.env.PYTHONPATH,
     });
@@ -308,11 +313,59 @@ describe("Cursor event mapping", () => {
         GH_PROMPT_DISABLED: "1",
         GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
       });
-      expect(captured.PATH?.split(path.delimiter)[0]).toContain(path.join("command-policy", "TEST-1", "worker", "bin"));
+      expect(captured.SYMPHONY_COMMAND_POLICY_SHIM_DIR).toContain(path.join("command-policy", "TEST-1", "worker", "bin"));
+      expect(captured.PATH?.split(path.delimiter)[0]).toBe(captured.SYMPHONY_COMMAND_POLICY_SHIM_DIR);
+      expect(captured.SYMPHONY_REAL_GIT).toBeTruthy();
       expect(captured.PYTHONPATH?.split(path.delimiter)[0]).toBe(config.hermes.upstreamRoot);
     }
     expect(process.env.SYMPHONY_AGENT_COMMAND_POLICY).toBe(originalPolicy);
     expect(events).toContainEqual({ type: "completed" });
+  });
+
+  it("executes Cursor worker command-policy shims for allowed local git and blocked GitHub tools", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-cursor-policy-"));
+    const originalPath = process.env.PATH;
+    try {
+      const fakeBin = path.join(tempRoot, "real-bin");
+      await mkdir(fakeBin, { recursive: true });
+      await writeFakeGit(fakeBin);
+      process.env.PATH = fakeBin + (originalPath ? path.delimiter + originalPath : "");
+
+      const config = testConfig(path.join(tempRoot, "workspace"));
+      config.workspace.stateDir = tempRoot;
+      config.hermes.upstreamRoot = path.resolve("hermes/upstream-src");
+      config.hermes.python = process.env.PYTHON || "python";
+      const env = workerReviewerGithubCommandPolicyProcessEnv(agentContext(config, "worker"));
+      const policyPath = env.PATH;
+
+      expect(env.SYMPHONY_COMMAND_POLICY_SHIM_DIR).toBeTruthy();
+      expect(policyPath).toBeTruthy();
+      expect(policyPath?.split(path.delimiter)[0]).toBe(env.SYMPHONY_COMMAND_POLICY_SHIM_DIR);
+      expect(env.SYMPHONY_REAL_GIT).toBe(path.join(fakeBin, process.platform === "win32" ? "git.cmd" : "git"));
+
+      const gitVersion = runPolicyShim(env, "git", ["--version"]);
+      expect(gitVersion.status).toBe(0);
+      expect(gitVersion.stdout.toLowerCase()).toContain("git version fake");
+
+      const gitStatus = runPolicyShim(env, "git", ["-C", process.cwd(), "status", "--short"]);
+      expect(gitStatus.status).toBe(0);
+
+      for (const [tool, args] of [
+        ["git", ["fetch", "origin"]],
+        ["gh", ["pr", "status"]],
+        ["ssh-keyscan", ["github.com"]],
+        ["wget", ["https://api.github.com/repos/acme/repo"]],
+      ] as const) {
+        const blocked = runPolicyShim(env, tool, args);
+        expect(blocked.status).toBe(126);
+        expect(blocked.stderr).toContain("BLOCKED by Symphony worker/reviewer GitHub command policy");
+        expect(blocked.stderr).not.toContain("FAKE_GIT_RAN");
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it("passes configured plan mode to worker create and send options", async () => {
@@ -1003,6 +1056,50 @@ describe("Cursor event mapping", () => {
     ]);
   });
 });
+
+async function writeFakeGit(binDir: string): Promise<void> {
+  const filePath = path.join(binDir, process.platform === "win32" ? "git.cmd" : "git");
+  const content = process.platform === "win32"
+    ? [
+        "@echo off",
+        "if \"%~1\"==\"--version\" echo git version fake&& exit /b 0",
+        "if \"%~1\"==\"-C\" exit /b 0",
+        "echo FAKE_GIT_RAN 1>&2",
+        "exit /b 99",
+        "",
+      ].join("\r\n")
+    : [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then echo 'git version fake'; exit 0; fi",
+        "if [ \"$1\" = \"-C\" ]; then exit 0; fi",
+        "echo FAKE_GIT_RAN >&2",
+        "exit 99",
+        "",
+      ].join("\n");
+  await writeFile(filePath, content, "utf8");
+  if (process.platform !== "win32") await chmod(filePath, 0o755);
+}
+
+function runPolicyShim(
+  env: Record<string, string>,
+  tool: string,
+  args: readonly string[],
+): { status: number | null; stdout: string; stderr: string } {
+  const shimDir = env.SYMPHONY_COMMAND_POLICY_SHIM_DIR;
+  if (!shimDir) throw new Error("Missing SYMPHONY_COMMAND_POLICY_SHIM_DIR in policy env");
+  const executable = path.join(shimDir, process.platform === "win32" ? `${tool}.cmd` : tool);
+  const result = spawnSync(executable, [...args], {
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+    shell: process.platform === "win32",
+    timeout: 5_000,
+  });
+  return {
+    status: result.status,
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+  };
+}
 
 function agentContext(config: ReturnType<typeof parseServiceConfig>, role: "worker" | "reviewer"): AgentRunContext {
   return {

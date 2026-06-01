@@ -94,6 +94,37 @@ def test_policy_blocks_direct_argv_invocations(policy_env, tool, args):
     assert decision["blocked"] is True
 
 
+def test_policy_disabled_env_cannot_disable_worker_reviewer_classification(policy_env):
+    env = {
+        policy.COMMAND_POLICY_ENV: policy.COMMAND_POLICY_VALUE,
+        policy.ROLE_ENV: "worker",
+        policy.POLICY_DISABLED_ENV: "1",
+    }
+
+    decision = policy.check_worker_reviewer_github_argv("git", ["fetch", "origin"], env=env)
+
+    assert decision is not None
+    assert decision["blocked"] is True
+
+
+@pytest.mark.parametrize(
+    "config_arg",
+    [
+        "--config-env=credential.helper=GIT_CREDENTIAL_HELPER",
+        "--config-env=core.askpass=GIT_ASKPASS",
+        "--config-env=core.sshCommand=GIT_SSH_COMMAND",
+        "--config-env=http.https://github.com/.extraheader=GIT_HEADER",
+        "--config-env=url.https://github.com/.insteadOf=GIT_URL",
+    ],
+)
+def test_policy_blocks_git_config_env_equals_sensitive_values(policy_env, config_arg):
+    decision = policy.check_worker_reviewer_github_argv("git", [config_arg, "status"])
+
+    assert decision is not None
+    assert decision["blocked"] is True
+    assert decision["description"] == "unsafe Git credential or transport configuration"
+
+
 def test_path_shim_blocks_fetch_and_allows_safe_version(policy_env, tmp_path):
     if shutil.which("git") is None:
         pytest.skip("git executable is not available")
@@ -112,6 +143,26 @@ def test_path_shim_blocks_fetch_and_allows_safe_version(policy_env, tmp_path):
     assert "git version" in allowed.stdout.lower()
 
 
+def test_path_shim_cannot_be_disabled_by_agent_env(policy_env, tmp_path):
+    fake_bin = tmp_path / "real-bin"
+    fake_bin.mkdir()
+    _write_fake_tool(fake_bin, "git")
+    shim_dir = tmp_path / "shims"
+    env = os.environ.copy()
+    upstream_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+    env["PYTHONPATH"] = os.pathsep.join([upstream_root, env.get("PYTHONPATH", "")])
+    policy.install_worker_reviewer_github_shims(str(shim_dir), env, python_executable=sys.executable)
+    env[policy.POLICY_DISABLED_ENV] = "1"
+
+    git_shim = shim_dir / ("git.cmd" if os.name == "nt" else "git")
+    blocked = subprocess.run([str(git_shim), "fetch", "origin"], env=env, text=True, capture_output=True)
+
+    assert blocked.returncode == 126
+    assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in blocked.stderr
+    assert "FAKE_GIT_RAN" not in blocked.stderr
+
+
 def test_runtime_sitecustomize_blocks_python_subprocess_bypass(policy_env, tmp_path):
     env = os.environ.copy()
     assert policy.install_worker_reviewer_github_runtime(str(tmp_path), env, python_executable=sys.executable)
@@ -121,6 +172,32 @@ def test_runtime_sitecustomize_blocks_python_subprocess_bypass(policy_env, tmp_p
 
     assert blocked.returncode != 0
     assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in blocked.stderr
+
+
+def test_runtime_sitecustomize_cannot_be_disabled_by_subprocess_env(policy_env, tmp_path):
+    fake_bin = tmp_path / "real-bin"
+    fake_bin.mkdir()
+    _write_fake_tool(fake_bin, "git")
+    runtime_dir = tmp_path / "runtime"
+    env = os.environ.copy()
+    env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+    assert policy.install_worker_reviewer_github_runtime(str(runtime_dir), env, python_executable=sys.executable)
+
+    script = """
+import os
+import subprocess
+
+child_env = {
+    "PATH": os.environ.get("PATH", ""),
+    "SYMPHONY_AGENT_COMMAND_POLICY_DISABLED": "1",
+}
+subprocess.run(["git", "fetch", "origin"], env=child_env, check=True)
+"""
+    blocked = subprocess.run([sys.executable, "-c", script], env=env, text=True, capture_output=True)
+
+    assert blocked.returncode != 0
+    assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in blocked.stderr
+    assert "FAKE_GIT_RAN" not in blocked.stderr
 
 
 def test_sanitize_subprocess_env_installs_terminal_runtime(policy_env, tmp_path, monkeypatch):
@@ -154,3 +231,13 @@ def test_sitecustomize_blocks_execute_code_subprocess_bypass(policy_env, tmp_pat
 
     assert child.returncode != 0
     assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in child.stderr
+
+
+def _write_fake_tool(bin_dir, name, marker="FAKE_GIT_RAN"):
+    path = bin_dir / (f"{name}.cmd" if os.name == "nt" else name)
+    if os.name == "nt":
+        path.write_text(f"@echo off\r\necho {marker} 1>&2\r\nexit /b 99\r\n", encoding="utf-8")
+    else:
+        path.write_text(f"#!/bin/sh\necho {marker} >&2\nexit 99\n", encoding="utf-8")
+        path.chmod(0o755)
+    return path
