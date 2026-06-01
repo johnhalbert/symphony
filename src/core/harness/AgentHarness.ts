@@ -80,6 +80,7 @@ export type AgentEvent = AgentEventBase &
     | {
         type: "completed";
         message?: string;
+        payload?: unknown;
         at?: string;
       }
     | {
