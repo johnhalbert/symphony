@@ -54,6 +54,8 @@ import {
   type TranscriptEvent,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
+import type { RunActivityEventSourceStore } from "../core/persistence/RunActivityAppendStore.js";
+import { mapRunActivityEventToTranscriptEvent } from "../core/transcript/RunActivityEventMapper.js";
 import {
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
@@ -197,6 +199,7 @@ export interface StatusServerOptions {
   workspaceManager: WorkspaceManager;
   workspaceOpener: WorkspaceOpener;
   runStore?: RunTranscriptStore;
+  runActivitySourceStore?: RunActivityEventSourceStore;
   orchestratorConversationStore?: OrchestratorConversationStore;
   lifecycleStore?: IssueLifecycleStore;
   mcpExposureDiagnosticsStore?: FileMcpExposureDiagnosticsStore;
@@ -1256,7 +1259,7 @@ export class StatusServer {
       let offset = 0;
       try {
         do {
-          const page = await runStore.readTranscript(run.runId, { offset, limit: pageLimit });
+          const page = await this.readTranscriptProjectionSourcePage(run, { offset, limit: pageLimit });
           const transcript = projectWebTranscript(page.events, { run });
           await this.recordProjectionRebuildEntry(this.webTranscriptProjectionWriteInput(run, page, transcript), entries);
           if (page.nextOffset === null) break;
@@ -1284,6 +1287,20 @@ export class StatusServer {
         });
       }
     }
+  }
+
+  private async readTranscriptProjectionSourcePage(
+    run: RunRecord,
+    options: { offset: number; limit: number },
+  ): Promise<TranscriptPage> {
+    const durablePage = this.options.runActivitySourceStore
+      ? await readRunActivityTranscriptPage(this.options.runActivitySourceStore, run, options)
+      : null;
+    if (durablePage !== null) return durablePage;
+
+    const runStore = this.options.runStore;
+    if (!runStore) throw new SymphonyError("invalid_request", "Run transcript store is not configured");
+    return runStore.readTranscript(run.runId, options);
   }
 
   private async recordProjectionRebuildEntry(
@@ -2218,6 +2235,22 @@ function isStatusServerProjectionRevisionStore(store: unknown): store is StatusS
       typeof (store as Partial<StatusServerProjectionRevisionStore>).projectionRevision === "function" &&
       typeof (store as Partial<StatusServerProjectionRevisionStore>).onProjectionChanged === "function",
   );
+}
+
+async function readRunActivityTranscriptPage(
+  sourceStore: RunActivityEventSourceStore,
+  run: RunRecord,
+  options: { offset: number; limit: number },
+): Promise<TranscriptPage | null> {
+  const sourcePage = await sourceStore.readRunEvents(run.runId, options);
+  if (sourcePage.total === 0) return null;
+  return {
+    runId: run.runId,
+    offset: sourcePage.offset,
+    limit: sourcePage.limit,
+    nextOffset: sourcePage.nextOffset,
+    events: sourcePage.events.map((stored) => mapRunActivityEventToTranscriptEvent(stored.event, { runId: run.runId })),
+  };
 }
 
 function statusServerProjectionSourceRevisions(

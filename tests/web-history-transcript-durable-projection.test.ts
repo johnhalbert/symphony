@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http.js";
 import type { ProjectionPayloadWriteInput, ProjectionWriteResult } from "../src/core/persistence/ProjectionTransactionService.js";
+import {
+  InMemoryRunActivityAppendStore,
+  type RunActivityAppendInput,
+} from "../src/core/persistence/RunActivityAppendStore.js";
+import type { OrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
 import type { RunRecord, RunTranscriptStore, TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
-import type { TrackerStateLists } from "../src/core/types.js";
+import { mapRunActivityEventToTranscriptEvent } from "../src/core/transcript/RunActivityEventMapper.js";
+import type { Issue, TrackerStateLists } from "../src/core/types.js";
 
 describe("web history/transcript durable projection writes", () => {
   it("backfills selected durable projections from source stores with stable scope keys", async () => {
@@ -225,6 +231,108 @@ describe("web history/transcript durable projection writes", () => {
     }
   });
 
+  it("rebuilds representative durable projection rows from source-table transcript data after rows are cleared", async () => {
+    const projectionWriter = statefulProjectionWriter();
+    const run = runFixture({ runId: "run-parity", sessionId: "session-parity", transcriptEventCount: 2 });
+    const runActivitySourceStore = new InMemoryRunActivityAppendStore();
+    const appended = await runActivitySourceStore.appendEvents([
+      runActivityInputFixture({
+        id: "activity-parity-1",
+        runId: run.runId,
+        sessionId: run.sessionId,
+        sequence: 1,
+        at: "2026-01-01T00:00:01.000Z",
+        text: "first durable source message",
+        payload: { messagePreview: "first durable source message" },
+      }),
+      runActivityInputFixture({
+        id: "activity-parity-2",
+        runId: run.runId,
+        sessionId: run.sessionId,
+        sequence: 2,
+        at: "2026-01-01T00:00:02.000Z",
+        text: "second durable source message",
+        payload: { messagePreview: "second durable source message" },
+      }),
+    ]);
+    expect(appended.rejected).toEqual([]);
+    const transcriptEvents = appended.accepted.map((result) =>
+      mapRunActivityEventToTranscriptEvent(result.event, { runId: run.runId }),
+    );
+    const rawTranscriptAvailable = { current: true };
+    let rawTranscriptReads = 0;
+    const server = createStatusServer({
+      runStore: runStoreFixture({
+        runs: [run],
+        transcriptEventsByRunId: new Map([[run.runId, transcriptEvents]]),
+        beforeReadTranscript: () => {
+          rawTranscriptReads += 1;
+          if (!rawTranscriptAvailable.current) throw new Error("raw events.jsonl unavailable");
+        },
+      }),
+      runActivitySourceStore,
+      orchestratorConversationStore: orchestratorConversationStoreFixture([
+        {
+          id: "chat-message-1",
+          conversationId: "orchestrator-default",
+          sequence: 1,
+          role: "assistant",
+          body: "Durable chat summary",
+          status: "completed",
+          createdAt: "2026-01-01T00:00:03.000Z",
+          updatedAt: "2026-01-01T00:00:03.000Z",
+          metadata: { issueKey: "TEST-1", runId: run.runId },
+          transcriptLinks: [{ runId: run.runId, sequence: 2, eventType: "runtime_log" }],
+        },
+      ]),
+      tracker: trackerFixture([issueFixture()]),
+      projectionWriter,
+      webProjectionContextClock: () => new Date("2026-01-01T00:00:00.000Z"),
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = baseUrlFor(address);
+      const liveResponses = [
+        await getJson(`${baseUrl}/api/v1/web/dashboard?refresh=1`),
+        await getJson(`${baseUrl}/api/v1/web/issues`),
+        await getJson(`${baseUrl}/api/v1/web/sidebar`),
+        await getJson(`${baseUrl}/api/v1/web/history?sessionLimit=1&timelineLimit=5`),
+        await getJson(`${baseUrl}/api/v1/web/sessions/session-parity/transcript?offset=0&limit=2`),
+        await getJson(`${baseUrl}/api/v1/web/orchestrator-chat`),
+      ];
+      expect(liveResponses.map(({ response }) => response.status)).toEqual([200, 200, 200, 200, 200, 200]);
+      const liveRows = projectionRowsByKey(projectionWriter.currentRows());
+      expect(projectionNames(liveRows)).toEqual([
+        "dashboard_projection",
+        "history_projection",
+        "issue_board_projection",
+        "orchestrator_chat_projection",
+        "sidebar_projection",
+        "transcript_projection",
+      ]);
+
+      projectionWriter.clearRows();
+      rawTranscriptAvailable.current = false;
+      const rawReadsBeforeRebuild = rawTranscriptReads;
+      const result = await server.rebuildDurableWebProjections({
+        forceRefresh: false,
+        historyLimits: { sessionLimit: 1, timelineLimit: 5 },
+        transcriptPageLimit: 2,
+      });
+
+      expect(result).toMatchObject({ attempted: 6, written: 6, unchanged: 0, skipped: 0, failed: 0 });
+      expect(rawTranscriptReads).toBe(rawReadsBeforeRebuild);
+      const rebuiltRows = projectionRowsByKey(projectionWriter.currentRows());
+      expect([...rebuiltRows.keys()].sort()).toEqual([...liveRows.keys()].sort());
+      for (const [key, liveRow] of liveRows) {
+        expect(rebuiltRows.get(key)).toEqual(liveRow);
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("does not block status responses when optional projection persistence fails or no transcript run exists", async () => {
     const projectionWriter = recordingProjectionWriter({ fail: true });
     const server = createStatusServer({
@@ -285,9 +393,55 @@ function recordingProjectionWriter(options: { fail?: boolean } = {}): StatusServ
   };
 }
 
+type StatefulProjectionWriter = StatusServerProjectionWriter & {
+  writes: ProjectionPayloadWriteInput[];
+  currentRows(): ProjectionPayloadWriteInput[];
+  clearRows(): void;
+};
+
+function statefulProjectionWriter(): StatefulProjectionWriter {
+  const writes: ProjectionPayloadWriteInput[] = [];
+  const rows = new Map<string, ProjectionPayloadWriteInput>();
+  return {
+    writes,
+    currentRows: () => [...rows.values()].map(cloneProjectionWriteInput),
+    clearRows: () => rows.clear(),
+    async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
+      const stored = cloneProjectionWriteInput(input);
+      writes.push(stored);
+      rows.set(projectionRowKey(stored), stored);
+      return {
+        status: "written",
+        revision: { revision: writes.length } as ProjectionWriteResult["revision"],
+        previousRevision: null,
+        contentSha256: "",
+        payloadSha256: "",
+        event: null,
+      };
+    },
+  };
+}
+
+function projectionRowsByKey(rows: readonly ProjectionPayloadWriteInput[]): Map<string, ProjectionPayloadWriteInput> {
+  return new Map(rows.map((row) => [projectionRowKey(row), row]));
+}
+
+function projectionNames(rows: ReadonlyMap<string, ProjectionPayloadWriteInput>): string[] {
+  return [...new Set([...rows.values()].map((row) => row.projectionName))].sort();
+}
+
+function projectionRowKey(input: ProjectionPayloadWriteInput): string {
+  return [input.projectionName, input.scopeKind ?? "global", input.scopeKey ?? "global"].join("::");
+}
+
+function cloneProjectionWriteInput(input: ProjectionPayloadWriteInput): ProjectionPayloadWriteInput {
+  return JSON.parse(JSON.stringify(input)) as ProjectionPayloadWriteInput;
+}
+
 function runStoreFixture(options: {
   runs?: readonly RunRecord[];
   transcriptEventsByRunId?: ReadonlyMap<string, readonly TranscriptEvent[]>;
+  beforeReadTranscript?: () => void;
 } = {}): RunTranscriptStore {
   const runs = [...(options.runs ?? [])];
   const transcriptEventsByRunId = options.transcriptEventsByRunId ?? new Map<string, readonly TranscriptEvent[]>();
@@ -304,6 +458,7 @@ function runStoreFixture(options: {
       return runs.find((run) => run.runId === runId) ?? null;
     },
     async readTranscript(runId: string, input: { offset?: number; limit?: number } = {}) {
+      options.beforeReadTranscript?.();
       const offset = input.offset ?? 0;
       const limit = input.limit ?? 100;
       const events = [...(transcriptEventsByRunId.get(runId) ?? [])];
@@ -356,6 +511,41 @@ function runFixture(overrides: Partial<RunRecord> = {}): RunRecord {
   };
 }
 
+function issueFixture(overrides: Partial<Issue> = {}): Issue {
+  return {
+    id: "issue-1",
+    identifier: "TEST-1",
+    title: "Representative projection issue",
+    description: "Issue used by durable projection rebuild parity coverage.",
+    priority: 1,
+    state: "In Progress",
+    branchName: "symphony/TEST-1",
+    url: "https://linear.example/TEST-1",
+    assigneeId: "user-1",
+    delegateId: null,
+    assignedToWorker: true,
+    labels: ["dogfood"],
+    blockedBy: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function trackerFixture(issues: readonly Issue[]): NonNullable<ConstructorParameters<typeof StatusServer>[0]["tracker"]> {
+  return {
+    async fetchCandidateIssues() {
+      return [...issues];
+    },
+    async fetchIssuesByStates() {
+      return [...issues];
+    },
+    async fetchIssueStatesByIds() {
+      return [...issues];
+    },
+  } as NonNullable<ConstructorParameters<typeof StatusServer>[0]["tracker"]>;
+}
+
 function transcriptEventFixture(overrides: Partial<TranscriptEvent> = {}): TranscriptEvent {
   const sequence = overrides.sequence ?? 1;
   return {
@@ -368,6 +558,48 @@ function transcriptEventFixture(overrides: Partial<TranscriptEvent> = {}): Trans
     payload: { textPreview: overrides.message ?? "assistant message" },
     ...overrides,
   };
+}
+
+function runActivityInputFixture(overrides: Record<string, unknown> = {}): RunActivityAppendInput {
+  return {
+    id: "activity-1",
+    runId: "run-1",
+    sessionId: "session-1",
+    at: "2026-01-01T00:00:01.000Z",
+    harnessId: "runtime-adapter",
+    actor: "runtime",
+    channel: "status",
+    kind: "runtime_log",
+    text: "runtime event",
+    payload: {},
+    protocol: "json_rpc",
+    ...overrides,
+  } as RunActivityAppendInput;
+}
+
+function orchestratorConversationStoreFixture(
+  messages: Awaited<ReturnType<OrchestratorConversationStore["listMessages"]>>,
+): OrchestratorConversationStore {
+  return {
+    projectionRevision: () => 11,
+    onProjectionChanged: () => () => undefined,
+    async listMessages(conversationId?: string | null) {
+      const normalized = conversationId ?? "orchestrator-default";
+      return messages.filter((message) => message.conversationId === normalized);
+    },
+    async createConversation() {
+      throw new Error("unexpected createConversation call");
+    },
+    async getConversation() {
+      return null;
+    },
+    async appendMessage() {
+      throw new Error("unexpected appendMessage call");
+    },
+    async updateMessage() {
+      throw new Error("unexpected updateMessage call");
+    },
+  } as OrchestratorConversationStore;
 }
 
 function fakeOrchestrator(): ConstructorParameters<typeof StatusServer>[0]["orchestrator"] {
