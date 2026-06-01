@@ -258,6 +258,45 @@ subprocess.run(['/usr/bin/git', 'fetch', 'origin'], check=True)
         combined = result.get("output", "") + result.get("error", "")
         self.assertIn("BLOCKED by Symphony worker/reviewer GitHub command policy", combined)
 
+    def test_worker_reviewer_policy_blocks_shell_and_env_subprocess_wrappers(self):
+        """execute_code sitecustomize unwraps shell/env argv before fake git can run."""
+        code = r'''
+import os
+import subprocess
+import tempfile
+
+fake_bin = tempfile.mkdtemp(prefix="fake-git-")
+fake_git = os.path.join(fake_bin, "git")
+with open(fake_git, "w", encoding="utf-8") as handle:
+    handle.write("#!/bin/sh\necho FAKE_GIT_RAN >&2\nexit 99\n")
+os.chmod(fake_git, 0o755)
+
+cases = [
+    ["bash", "-c", f"{fake_git} fetch origin"],
+    ["sh", "-c", f"PATH={fake_bin} git fetch origin"],
+    ["bash", "-lc", f"{fake_git} fetch origin"],
+    ["env", "-i", f"PATH={fake_bin}", "git", "fetch", "origin"],
+]
+for argv in cases:
+    try:
+        subprocess.run(argv, check=True)
+    except PermissionError as exc:
+        print("BLOCKED_WRAPPER", argv[0], "GitHub command policy" in str(exc))
+    else:
+        raise AssertionError(f"wrapper was not blocked before fake git ran: {argv!r}")
+'''
+        with patch.dict(os.environ, {
+            "SYMPHONY_AGENT_COMMAND_POLICY": "worker_reviewer_github_upstream_block",
+            "SYMPHONY_AGENT_ROLE": "worker",
+            "HERMES_YOLO_MODE": "1",
+        }, clear=False):
+            result = self._run(code)
+
+        self.assertEqual(result["status"], "success")
+        combined = result.get("output", "") + result.get("error", "")
+        self.assertEqual(combined.count("BLOCKED_WRAPPER"), 4)
+        self.assertNotIn("FAKE_GIT_RAN", combined)
+
     def test_single_tool_call(self):
         """Script calls terminal and prints the result."""
         code = """

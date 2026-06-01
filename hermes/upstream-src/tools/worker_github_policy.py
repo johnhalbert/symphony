@@ -290,6 +290,112 @@ def _contains_github_endpoint(args: Sequence[str]) -> bool:
     )
 
 
+_POSIX_SHELL_WRAPPERS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+_CMD_SHELL_WRAPPERS = {"cmd"}
+_POWERSHELL_WRAPPERS = {"powershell", "pwsh", "powershell_ise"}
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _joined_shell_command(parts: Sequence[str]) -> str:
+    return " ".join(str(part) for part in parts)
+
+
+def _posix_shell_command_from_args(args: Sequence[str]) -> Optional[str]:
+    """Return the command string from common POSIX shell -c/-lc wrappers."""
+
+    index = 0
+    while index < len(args):
+        arg = str(args[index])
+        if arg == "--":
+            index += 1
+            continue
+        if arg == "-c" or (arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]):
+            if index + 1 < len(args):
+                return str(args[index + 1])
+            return None
+        index += 1
+    return None
+
+
+def _cmd_shell_command_from_args(args: Sequence[str]) -> Optional[str]:
+    """Return the command string from cmd.exe /c wrappers."""
+
+    for index, arg in enumerate(args):
+        lower = str(arg).lower()
+        if lower in {"/c", "-c"}:
+            if index + 1 < len(args):
+                return _joined_shell_command(args[index + 1:])
+            return None
+    return None
+
+
+def _powershell_command_from_args(args: Sequence[str]) -> Optional[str]:
+    """Return the command string from PowerShell -Command/-c wrappers."""
+
+    for index, arg in enumerate(args):
+        lower = str(arg).lower()
+        if lower in {"-command", "/command", "-c", "/c"}:
+            if index + 1 < len(args):
+                return _joined_shell_command(args[index + 1:])
+            return None
+    return None
+
+
+def _shell_wrapper_command(canonical: str, args: Sequence[str]) -> Optional[str]:
+    if canonical in _POSIX_SHELL_WRAPPERS:
+        return _posix_shell_command_from_args(args)
+    if canonical in _CMD_SHELL_WRAPPERS:
+        return _cmd_shell_command_from_args(args)
+    if canonical in _POWERSHELL_WRAPPERS:
+        return _powershell_command_from_args(args)
+    return None
+
+
+def _env_wrapped_command(args: Sequence[str]) -> tuple[Optional[str], list[str], Optional[str]]:
+    """Return (tool, argv, command_string) for /usr/bin/env-style wrappers.
+
+    ``env`` can clear or replace PATH before launching the real command.  The
+    policy must therefore inspect the wrapped command before the wrapper can run
+    an absolute tool path or a PATH-reset child that bypasses our shims.
+    """
+
+    index = 0
+    while index < len(args):
+        arg = str(args[index])
+        lower = arg.lower()
+        if arg == "--":
+            index += 1
+            break
+        if arg == "-":
+            index += 1
+            continue
+        if _ENV_ASSIGNMENT_RE.match(arg):
+            index += 1
+            continue
+        if lower in {"-i", "--ignore-environment", "-0", "--null"}:
+            index += 1
+            continue
+        if lower in {"-u", "--unset", "-c", "--chdir"}:
+            index += 2
+            continue
+        if lower.startswith("--unset=") or lower.startswith("--chdir="):
+            index += 1
+            continue
+        if lower in {"-s", "--split-string"}:
+            if index + 1 < len(args):
+                return None, [], str(args[index + 1])
+            return None, [], None
+        if lower.startswith("--split-string="):
+            return None, [], arg.split("=", 1)[1]
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return arg, [str(item) for item in args[index + 1:]], None
+    if index < len(args):
+        return str(args[index]), [str(item) for item in args[index + 1:]], None
+    return None, [], None
+
+
 def check_worker_reviewer_github_argv(
     tool: str,
     argv: Sequence[str],
@@ -302,6 +408,24 @@ def check_worker_reviewer_github_argv(
     canonical = _strip_windows_suffix(tool)
     args = [str(arg) for arg in argv]
     command = _argv_command(canonical, args)
+
+    shell_command = _shell_wrapper_command(canonical, args)
+    if shell_command is not None:
+        decision = check_worker_reviewer_github_command(shell_command, env=env)
+        if decision is not None:
+            return decision
+
+    if canonical == "env":
+        wrapped_tool, wrapped_args, split_command = _env_wrapped_command(args)
+        if split_command is not None:
+            decision = check_worker_reviewer_github_command(split_command, env=env)
+            if decision is not None:
+                return decision
+        if wrapped_tool:
+            decision = check_worker_reviewer_github_argv(wrapped_tool, wrapped_args, env=env)
+            if decision is not None:
+                return decision
+        return None
 
     if canonical == "git":
         subcommand, global_configs = _skip_git_global_options(args)

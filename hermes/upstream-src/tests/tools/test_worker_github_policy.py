@@ -94,6 +94,42 @@ def test_policy_blocks_direct_argv_invocations(policy_env, tool, args):
     assert decision["blocked"] is True
 
 
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("bash", ["-c", "/usr/bin/git fetch origin"]),
+        ("/bin/sh", ["-c", "PATH=/usr/bin git fetch origin"]),
+        ("bash", ["-lc", "/usr/bin/git fetch origin"]),
+        ("env", ["-i", "PATH=/usr/bin", "git", "fetch", "origin"]),
+        ("/usr/bin/env", ["--ignore-environment", "PATH=/usr/bin", "/usr/bin/git", "fetch", "origin"]),
+        ("env", ["-i", "PATH=/usr/bin", "bash", "-c", "/usr/bin/git fetch origin"]),
+        ("cmd.exe", ["/c", "git", "fetch", "origin"]),
+        ("pwsh", ["-Command", "git fetch origin"]),
+    ],
+)
+def test_policy_blocks_shell_and_env_wrapper_argv(policy_env, tool, args):
+    decision = policy.check_worker_reviewer_github_argv(tool, args)
+
+    assert decision is not None
+    assert decision["blocked"] is True
+    assert decision["description"] == "upstream Git network operation"
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("bash", ["-c", "git status --short"]),
+        ("sh", ["-lc", "git -C . status --short"]),
+        ("env", ["-i", "PATH=/usr/bin", "git", "status", "--short"]),
+        ("env", ["-i", "PATH=/usr/bin", "bash", "-c", "git status --short"]),
+        ("cmd.exe", ["/c", "git", "status", "--short"]),
+        ("pwsh", ["-Command", "git status --short"]),
+    ],
+)
+def test_policy_allows_shell_and_env_wrapped_local_git_inspection(policy_env, tool, args):
+    assert policy.check_worker_reviewer_github_argv(tool, args) is None
+
+
 def test_policy_disabled_env_cannot_disable_worker_reviewer_classification(policy_env):
     env = {
         policy.COMMAND_POLICY_ENV: policy.COMMAND_POLICY_VALUE,
@@ -172,6 +208,48 @@ def test_runtime_sitecustomize_blocks_python_subprocess_bypass(policy_env, tmp_p
 
     assert blocked.returncode != 0
     assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in blocked.stderr
+
+
+def test_runtime_sitecustomize_blocks_shell_and_env_wrapper_subprocess_bypasses(policy_env, tmp_path):
+    fake_bin = tmp_path / "real-bin"
+    fake_bin.mkdir()
+    fake_git = _write_fake_tool(fake_bin, "git")
+    runtime_dir = tmp_path / "runtime"
+    env = os.environ.copy()
+    env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+    assert policy.install_worker_reviewer_github_runtime(str(runtime_dir), env, python_executable=sys.executable)
+
+    fake_git_text = fake_git.as_posix()
+    fake_bin_text = fake_bin.as_posix()
+    argv_cases = [
+        ["bash", "-c", f"{fake_git_text} fetch origin"],
+        ["sh", "-c", f"PATH={fake_bin_text} git fetch origin"],
+        ["bash", "-lc", f"{fake_git_text} fetch origin"],
+        ["env", "-i", f"PATH={fake_bin_text}", "git", "fetch", "origin"],
+        ["env", "-i", f"PATH={fake_bin_text}", "bash", "-c", f"{fake_git_text} fetch origin"],
+    ]
+
+    for argv in argv_cases:
+        script = f"import subprocess\nsubprocess.run({argv!r}, check=True)\n"
+        blocked = subprocess.run([sys.executable, "-c", script], env=env, text=True, capture_output=True)
+        combined = blocked.stdout + blocked.stderr
+
+        assert blocked.returncode != 0, argv
+        assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in blocked.stderr, argv
+        assert "FAKE_GIT_RAN" not in combined
+
+
+def test_runtime_sitecustomize_allows_shell_wrapped_local_git_inspection(policy_env, tmp_path):
+    if shutil.which("git") is None or shutil.which("bash") is None:
+        pytest.skip("git and bash executables are required")
+    env = os.environ.copy()
+    assert policy.install_worker_reviewer_github_runtime(str(tmp_path), env, python_executable=sys.executable)
+
+    script = "import subprocess; subprocess.run(['bash', '-c', 'git --version'], check=True)"
+    allowed = subprocess.run([sys.executable, "-c", script], env=env, text=True, capture_output=True)
+
+    assert allowed.returncode == 0
+    assert "BLOCKED by Symphony worker/reviewer GitHub command policy" not in allowed.stderr
 
 
 def test_runtime_sitecustomize_cannot_be_disabled_by_subprocess_env(policy_env, tmp_path):
