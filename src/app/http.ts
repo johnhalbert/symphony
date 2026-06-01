@@ -963,6 +963,8 @@ export class StatusServer {
       runtime: snapshot,
       board,
       activity,
+      runs: sourceIndex?.runs.runs ?? activitySources.runs,
+      lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
       config: this.options.dashboard ?? null,
     });
   }
@@ -999,6 +1001,8 @@ export class StatusServer {
         runtime: snapshot,
         board,
         activity: dashboardActivity,
+        runs: sourceIndex?.runs.runs ?? activitySources.runs,
+        lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
         config: this.options.dashboard ?? null,
       }),
       projectWebIssueBoard(board),

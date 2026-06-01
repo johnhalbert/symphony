@@ -2794,7 +2794,7 @@ describe("StatusServer durable API", () => {
         concurrencyCap: 2,
         providerGates: [],
         chat: [],
-        totals: { backlog: 0, todo: 1, progress: 2, review: 4, done: 1, cancelled: 1, open: 7, all: 9, completeness: 11 },
+        totals: { backlog: 0, todo: 1, progress: 2, review: 4, done: 2, cancelled: 1, open: 7, all: 10, completeness: 20 },
       });
       expect(dashboardBody.runningAgents[0]).toMatchObject({
         issue: "TEST-1",
