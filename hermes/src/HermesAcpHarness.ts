@@ -70,7 +70,9 @@ export interface HermesAcpRuntimeClient {
 
 interface HermesAcpLease {
   key: string;
+  scopeKey: string;
   reusable: boolean;
+  compatibility: HermesAcpLeaseCompatibility;
   profile: HostHermesAcpProfileLease;
   client: HermesAcpRuntimeClient;
   initialized: boolean;
@@ -83,6 +85,43 @@ interface ActiveHermesAcpRun {
   lease: HermesAcpLease;
   acpSessionId: string | null;
   symphonySessionId: string | null;
+}
+
+interface HermesAcpLeaseCompatibility {
+  binaryPath: string;
+  cwd: string;
+  sourceProfile: string;
+  profilePrefix: string | null;
+  keepProfiles: string;
+  startupTimeoutMs: number;
+  requestTimeoutMs: number;
+  cliPath: string;
+}
+
+type HermesAcpLeaseReuseDecisionReason =
+  | "compatible_reusable_worker_implementation"
+  | "fresh_worker_session_lifecycle"
+  | "fresh_isolated_role"
+  | "fresh_non_implementation_phase"
+  | "fresh_no_existing_reusable_lease"
+  | "fresh_existing_disposed"
+  | "fresh_previous_process_exited"
+  | "fresh_incompatible_context";
+
+interface HermesAcpLeaseReuseDecision {
+  outcome: "created" | "reused";
+  reuseMode: "reuse_by_issue" | "fresh_per_run";
+  reason: HermesAcpLeaseReuseDecisionReason;
+  key: string;
+  scopeKey: string;
+  compatibility: HermesAcpLeaseCompatibility;
+  existingProfileName?: string;
+  incompatibleFields?: string[];
+}
+
+interface HermesAcpLeaseAcquisition {
+  lease: HermesAcpLease;
+  decision: HermesAcpLeaseReuseDecision;
 }
 
 type TerminalStatus = HostHermesAcpTerminalStatus;
@@ -108,6 +147,7 @@ export class HermesAcpHarness implements AgentHarness {
   private readonly leases = new Map<string, HermesAcpLease>();
   private readonly activeRuns = new Map<string, ActiveHermesAcpRun>();
   private readonly cancelledRuns = new Set<string>();
+  private readonly retiredReusableLeaseReasons = new Map<string, HermesAcpLeaseReuseDecisionReason>();
   private readonly discoverHostHermes: (options: Parameters<typeof discoverHostHermes>[0]) => Promise<HostHermesDiscoveryResult>;
   private readonly profileLeaseFactory: (options: HostHermesAcpProfileLeaseOptions) => Promise<HostHermesAcpProfileLease>;
   private readonly acpClientFactory: (command: HostHermesAcpProcessCommand, options: HermesAcpRuntimeClientOptions) => HermesAcpRuntimeClient;
@@ -135,7 +175,8 @@ export class HermesAcpHarness implements AgentHarness {
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     await writeInitialHandoffMcpContexts(ctx);
     const runId = `hermes-acp-${randomUUID()}`;
-    const lease = await this.getOrCreateLease(ctx, runId);
+    const leaseAcquisition = await this.getOrCreateLease(ctx, runId);
+    const lease = leaseAcquisition.lease;
     const activeRun: ActiveHermesAcpRun = { lease, acpSessionId: null, symphonySessionId: null };
     this.activeRuns.set(runId, activeRun);
 
@@ -240,6 +281,7 @@ export class HermesAcpHarness implements AgentHarness {
       await writeActiveHandoffMcpContexts(ctx, { activeRunId: runId, sessionId: activeRun.symphonySessionId });
       yield { type: "session_started", sessionId: activeRun.symphonySessionId, threadId: acpSessionId, runId };
       sessionStarted = true;
+      yield hermesAcpLeaseReuseDecisionDiagnostic(leaseAcquisition.decision, lease);
       await this.options.runStore?.appendEvent({
         runId,
         at: new Date().toISOString(),
@@ -331,16 +373,63 @@ export class HermesAcpHarness implements AgentHarness {
   async dispose(): Promise<void> {
     await Promise.all([...this.leases.values()].map((lease) => this.disposeLease(lease, null, "harness_dispose")));
     this.leases.clear();
+    this.retiredReusableLeaseReasons.clear();
   }
 
-  private async getOrCreateLease(ctx: AgentRunContext, runId: string): Promise<HermesAcpLease> {
-    const reusable = shouldReuseLease(ctx);
-    const key = reusable ? reusableLeaseKey(ctx) : `fresh:${runId}`;
-    const existing = reusable ? this.leases.get(key) : undefined;
-    if (existing && !existing.disposed && !existing.transportExited) return existing;
-
+  private async getOrCreateLease(ctx: AgentRunContext, runId: string): Promise<HermesAcpLeaseAcquisition> {
+    const policy = hermesAcpLeaseReusePolicy(ctx);
+    const scopeKey = reusableLeaseScopeKey(ctx);
+    let key = policy.reusable ? reusableLeaseKey(ctx) : `fresh:${runId}`;
     const binaryPath = await this.resolveBinaryPath(ctx);
     const sourceProfile = await this.resolveSourceProfile(ctx, binaryPath);
+    const compatibility = hermesAcpLeaseCompatibility(ctx, {
+      binaryPath,
+      sourceProfile,
+      cliPath: this.cliPath(),
+    });
+    let reusable = policy.reusable;
+    let reason = policy.reason;
+    const existingLease = reusable ? this.leases.get(key) : undefined;
+    let incompatibleFields: string[] | undefined;
+    let existingProfileName: string | undefined;
+
+    if (existingLease) {
+      existingProfileName = existingLease.profile.profileName;
+      if (existingLease.disposed) {
+        this.leases.delete(existingLease.key);
+        reason = "fresh_existing_disposed";
+      } else if (existingLease.transportExited) {
+        this.retireLeaseAfterTransportExit(existingLease);
+        reason = "fresh_previous_process_exited";
+      } else {
+        incompatibleFields = incompatibleHermesAcpLeaseFields(existingLease.compatibility, compatibility);
+        if (incompatibleFields.length === 0) {
+          return {
+            lease: existingLease,
+            decision: {
+              outcome: "reused",
+              reuseMode: "reuse_by_issue",
+              reason: "compatible_reusable_worker_implementation",
+              key: existingLease.key,
+              scopeKey,
+              compatibility,
+              existingProfileName: existingLease.profile.profileName,
+            },
+          };
+        }
+        reason = "fresh_incompatible_context";
+        if (this.leaseHasActiveRun(existingLease)) {
+          reusable = false;
+          key = `fresh:${runId}`;
+        } else {
+          await this.disposeLease(existingLease, null, "reuse_incompatible");
+        }
+      }
+    } else if (reusable) {
+      reason = this.retiredReusableLeaseReasons.get(key) ?? "fresh_no_existing_reusable_lease";
+    }
+
+    if (reusable) this.retiredReusableLeaseReasons.delete(key);
     const phase = currentRunPhase(ctx);
     const profile = await this.profileLeaseFactory({
       binaryPath,
@@ -348,6 +437,7 @@ export class HermesAcpHarness implements AgentHarness {
       timeoutMs: ctx.config.hermes.startupTimeoutMs,
       sourceProfile,
       keepProfiles: ctx.config.hermes.keepProfiles,
+      reusable,
       nameInput: {
         workspaceKey: ctx.workspace.workspaceKey,
         issueIdentifier: ctx.issue.identifier,
@@ -361,7 +451,9 @@ export class HermesAcpHarness implements AgentHarness {
     const client = this.acpClientFactory(profile.acpCommand, { requestTimeoutMs: ctx.config.hermes.requestTimeoutMs });
     const lease: HermesAcpLease = {
       key,
+      scopeKey,
       reusable,
+      compatibility,
       profile,
       client,
       initialized: false,
@@ -372,7 +464,19 @@ export class HermesAcpHarness implements AgentHarness {
     lease.transportExitListener = (exit) => this.handleLeaseTransportExit(lease, exit);
     lease.client.on("exit", lease.transportExitListener);
     if (reusable) this.leases.set(key, lease);
-    return lease;
+    return {
+      lease,
+      decision: {
+        outcome: "created",
+        reuseMode: reusable ? "reuse_by_issue" : "fresh_per_run",
+        reason,
+        key,
+        scopeKey,
+        compatibility,
+        ...(existingProfileName === undefined ? {} : { existingProfileName }),
+        ...(incompatibleFields === undefined ? {} : { incompatibleFields }),
+      },
+    };
   }
 
   private async resolveBinaryPath(ctx: AgentRunContext): Promise<string> {
@@ -471,6 +575,11 @@ export class HermesAcpHarness implements AgentHarness {
     lease.transportExited = true;
     lease.initialized = false;
     this.leases.delete(lease.key);
+    if (lease.reusable) this.retiredReusableLeaseReasons.set(lease.key, "fresh_previous_process_exited");
+  }
+
+  private leaseHasActiveRun(lease: HermesAcpLease): boolean {
+    return [...this.activeRuns.values()].some((activeRun) => activeRun.lease === lease);
   }
 
   private cliPath(): string {
@@ -532,16 +641,105 @@ function shouldDisposeLeaseAfterRun(lease: HermesAcpLease, terminalStatus: Termi
   return !lease.reusable || terminalStatus !== "succeeded" || lease.transportExited;
 }
 
-function shouldReuseLease(ctx: AgentRunContext): boolean {
-  return (
-    ctx.role === "worker" &&
-    currentRunPhase(ctx) === "implementation" &&
-    ctx.config.hermes.workerSessionLifecycle === "reuse_by_issue"
-  );
+function hermesAcpLeaseReusePolicy(ctx: AgentRunContext): { reusable: boolean; reason: HermesAcpLeaseReuseDecisionReason } {
+  const phase = currentRunPhase(ctx);
+  if (ctx.role !== "worker") return { reusable: false, reason: "fresh_isolated_role" };
+  if (phase !== "implementation") return { reusable: false, reason: "fresh_non_implementation_phase" };
+  if (ctx.config.hermes.workerSessionLifecycle !== "reuse_by_issue") {
+    return { reusable: false, reason: "fresh_worker_session_lifecycle" };
+  }
+  return { reusable: true, reason: "fresh_no_existing_reusable_lease" };
+}
+
+function reusableLeaseScopeKey(ctx: AgentRunContext): string {
+  return `${ctx.role}:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
 }
 
 function reusableLeaseKey(ctx: AgentRunContext): string {
-  return `${ctx.workspace.path}:worker:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
+  return `${ctx.workspace.path}:${reusableLeaseScopeKey(ctx)}`;
+}
+
+function hermesAcpLeaseCompatibility(
+  ctx: AgentRunContext,
+  input: { binaryPath: string; sourceProfile: string; cliPath: string },
+): HermesAcpLeaseCompatibility {
+  return {
+    binaryPath: input.binaryPath,
+    cwd: ctx.workspace.path,
+    sourceProfile: input.sourceProfile,
+    profilePrefix: configuredHermesAcpProfilePrefix(ctx) ?? DEFAULT_PROFILE_PREFIX,
+    keepProfiles: ctx.config.hermes.keepProfiles,
+    startupTimeoutMs: ctx.config.hermes.startupTimeoutMs,
+    requestTimeoutMs: ctx.config.hermes.requestTimeoutMs,
+    cliPath: input.cliPath,
+  };
+}
+
+function incompatibleHermesAcpLeaseFields(
+  existing: HermesAcpLeaseCompatibility,
+  next: HermesAcpLeaseCompatibility,
+): string[] {
+  const fields: Array<keyof HermesAcpLeaseCompatibility> = [
+    "binaryPath",
+    "cwd",
+    "sourceProfile",
+    "profilePrefix",
+    "keepProfiles",
+    "startupTimeoutMs",
+    "requestTimeoutMs",
+    "cliPath",
+  ];
+  return fields.filter((field) => existing[field] !== next[field]);
+}
+
+function hermesAcpLeaseReuseDecisionDiagnostic(
+  decision: HermesAcpLeaseReuseDecision,
+  lease: HermesAcpLease,
+): AgentEvent {
+  const reused = decision.outcome === "reused";
+  const reason = formatHermesAcpLeaseReuseReason(decision.reason);
+  return {
+    type: "run_diagnostic",
+    code: "hermes_acp_lease_reuse_decision",
+    message: reused
+      ? `Host Hermes ACP lease reused for ${lease.profile.profileName}: ${reason}.`
+      : `Host Hermes ACP lease created for ${lease.profile.profileName}: ${reason}.`,
+    payload: {
+      harnessId: "hermes_acp",
+      profileName: lease.profile.profileName,
+      sourceProfile: lease.profile.sourceProfile,
+      reusable: lease.reusable,
+      outcome: decision.outcome,
+      reuseMode: decision.reuseMode,
+      reason: decision.reason,
+      key: decision.key,
+      scopeKey: decision.scopeKey,
+      existingProfileName: decision.existingProfileName ?? null,
+      incompatibleFields: decision.incompatibleFields ?? [],
+      compatibility: decision.compatibility,
+    },
+  };
+}
+
+function formatHermesAcpLeaseReuseReason(reason: HermesAcpLeaseReuseDecisionReason): string {
+  switch (reason) {
+    case "compatible_reusable_worker_implementation":
+      return "existing worker implementation context is compatible";
+    case "fresh_worker_session_lifecycle":
+      return "hermes.worker_session_lifecycle requires a fresh run";
+    case "fresh_isolated_role":
+      return "role requires an isolated fresh lease";
+    case "fresh_non_implementation_phase":
+      return "run phase requires an isolated fresh lease";
+    case "fresh_no_existing_reusable_lease":
+      return "no compatible reusable worker lease exists yet";
+    case "fresh_existing_disposed":
+      return "previous reusable lease was already disposed";
+    case "fresh_previous_process_exited":
+      return "previous reusable ACP process exited before reuse";
+    case "fresh_incompatible_context":
+      return "existing reusable lease context is incompatible";
+  }
 }
 
 function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {

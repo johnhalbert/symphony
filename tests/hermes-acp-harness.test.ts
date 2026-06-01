@@ -277,10 +277,10 @@ describe("HermesAcpHarness", () => {
     const client = new FakeAcpClient();
     const { ctx, harness, leaseFactory, leases } = await fixture({ client, lifecycle: "reuse_by_issue" });
 
-    await collectEvents(harness.run(ctx, "First"));
+    const firstEvents = await collectEvents(harness.run(ctx, "First"));
     client.promptNotificationParams = { sessionId: "acp-session-2", update: { sessionUpdate: "agent_message_chunk", content: "again" } };
     client.sessionId = "acp-session-2";
-    await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
+    const secondEvents = await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
     await harness.dispose();
 
     expect(leaseFactory).toHaveBeenCalledTimes(1);
@@ -292,7 +292,159 @@ describe("HermesAcpHarness", () => {
       "session/new",
       "session/prompt",
     ]);
+    expect(leaseDecisionPayloads(firstEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_no_existing_reusable_lease",
+        reusable: true,
+        profileName: "profile-1",
+      }),
+    ]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "reused",
+        reuseMode: "reuse_by_issue",
+        reason: "compatible_reusable_worker_implementation",
+        reusable: true,
+        profileName: "profile-1",
+        existingProfileName: "profile-1",
+      }),
+    ]);
     expect(leases[0]?.disposeStatuses).toEqual([null]);
+  });
+
+  it("uses fresh leases for isolated reviewer contexts and explains the reuse decision", async () => {
+    const { ctx, harness, leaseFactory, leases } = await fixture({ lifecycle: "reuse_by_issue" });
+    const reviewerCtx: AgentRunContext = { ...ctx, role: "reviewer", runPhase: "review" };
+
+    const firstEvents = await collectEvents(harness.run(reviewerCtx, "Review"));
+    const secondEvents = await collectEvents(harness.run({ ...reviewerCtx, turnNumber: 2 }, "Review again"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(leases[0]?.disposeStatuses).toEqual(["succeeded"]);
+    expect(leases[1]?.disposeStatuses).toEqual(["succeeded"]);
+    expect(leaseDecisionPayloads(firstEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "fresh_per_run",
+        reason: "fresh_isolated_role",
+        reusable: false,
+        profileName: "profile-1",
+      }),
+    ]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "fresh_per_run",
+        reason: "fresh_isolated_role",
+        reusable: false,
+        profileName: "profile-2",
+      }),
+    ]);
+  });
+
+  it("does not reuse a worker lease when the resolved host context is incompatible", async () => {
+    const firstClient = new FakeAcpClient();
+    const secondClient = new FakeAcpClient();
+    secondClient.sessionId = "acp-session-2";
+    secondClient.promptNotificationParams = {
+      sessionId: "acp-session-2",
+      update: { sessionUpdate: "agent_message_chunk", content: "second" },
+    };
+    const { ctx, harness, leaseFactory, leases, root } = await fixture({
+      clients: [firstClient, secondClient],
+      lifecycle: "reuse_by_issue",
+      sourceProfile: "host-source",
+    });
+
+    await collectEvents(harness.run(ctx, "First"));
+    const nextConfig = serviceConfig(root, "reuse_by_issue", { sourceProfile: "other-source" });
+    const secondEvents = await collectEvents(harness.run({ ...runContext(nextConfig, root), turnNumber: 2 }, "Second"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(firstClient.kills).toEqual(expect.arrayContaining([expect.stringContaining("reuse_incompatible")]));
+    expect(leases[0]?.disposeStatuses).toEqual([null]);
+    expect(leases[1]?.disposeStatuses).toEqual([]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_incompatible_context",
+        reusable: true,
+        profileName: "profile-2",
+        existingProfileName: "profile-1",
+        incompatibleFields: expect.arrayContaining(["sourceProfile"]),
+      }),
+    ]);
+  });
+
+  it("keeps reusable worker leases isolated by workspace as well as issue and phase", async () => {
+    const firstClient = new FakeAcpClient();
+    const secondClient = new FakeAcpClient();
+    secondClient.sessionId = "acp-session-2";
+    secondClient.promptNotificationParams = {
+      sessionId: "acp-session-2",
+      update: { sessionUpdate: "agent_message_chunk", content: "second" },
+    };
+    const { ctx, harness, leaseFactory, leases, root } = await fixture({
+      clients: [firstClient, secondClient],
+      lifecycle: "reuse_by_issue",
+    });
+
+    await collectEvents(harness.run(ctx, "First"));
+    const otherWorkspaceCtx: AgentRunContext = {
+      ...ctx,
+      workspace: { ...ctx.workspace, path: path.join(root, "workspace-two"), workspaceKey: "ENG-139-other" },
+      turnNumber: 2,
+    };
+    const secondEvents = await collectEvents(harness.run(otherWorkspaceCtx, "Second"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(firstClient.kills).toEqual([]);
+    expect(leases[0]?.disposeStatuses).toEqual([]);
+    expect(leases[1]?.disposeStatuses).toEqual([]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_no_existing_reusable_lease",
+        reusable: true,
+        profileName: "profile-2",
+      }),
+    ]);
+    await harness.dispose();
+  });
+
+  it("creates a new reusable lease after the previous ACP process exits before reuse", async () => {
+    const firstClient = new FakeAcpClient();
+    const secondClient = new FakeAcpClient();
+    secondClient.sessionId = "acp-session-2";
+    secondClient.promptNotificationParams = {
+      sessionId: "acp-session-2",
+      update: { sessionUpdate: "agent_message_chunk", content: "second" },
+    };
+    const { ctx, harness, leaseFactory, leases } = await fixture({
+      clients: [firstClient, secondClient],
+      lifecycle: "reuse_by_issue",
+    });
+
+    await collectEvents(harness.run(ctx, "First"));
+    firstClient.emitExit({ code: 9, signal: null });
+    const secondEvents = await collectEvents(harness.run({ ...ctx, turnNumber: 2 }, "Second"));
+
+    expect(leaseFactory).toHaveBeenCalledTimes(2);
+    expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+    expect(leases[1]?.disposeStatuses).toEqual([]);
+    expect(leaseDecisionPayloads(secondEvents)).toEqual([
+      expect.objectContaining({
+        outcome: "created",
+        reuseMode: "reuse_by_issue",
+        reason: "fresh_previous_process_exited",
+        reusable: true,
+        profileName: "profile-2",
+      }),
+    ]);
   });
 
   it("denies ACP permission requests until Symphony has an approval bridge", async () => {
@@ -320,11 +472,24 @@ describe("HermesAcpHarness", () => {
   });
 });
 
-async function fixture(input: { client?: FakeAcpClient; lifecycle?: HermesWorkerSessionLifecycle } = {}) {
+async function fixture(
+  input: {
+    client?: FakeAcpClient;
+    clients?: FakeAcpClient[];
+    lifecycle?: HermesWorkerSessionLifecycle;
+    sourceProfile?: string | undefined;
+    profilePrefix?: string | undefined;
+  } = {},
+) {
   const root = await mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-"));
-  const config = serviceConfig(root, input.lifecycle ?? "fresh_per_run");
+  const config = serviceConfig(root, input.lifecycle ?? "fresh_per_run", {
+    sourceProfile: input.sourceProfile,
+    profilePrefix: input.profilePrefix,
+  });
   const ctx = runContext(config, root);
-  const client = input.client ?? new FakeAcpClient();
+  const clients = input.clients ?? [input.client ?? new FakeAcpClient()];
+  const client = clients[0] ?? new FakeAcpClient();
+  let clientIndex = 0;
   const leases: FakeLeaseRecord[] = [];
   const leaseFactory = vi.fn(async (options: HostHermesAcpProfileLeaseOptions): Promise<HostHermesAcpProfileLease> => {
     const disposeStatuses: HostHermesAcpTerminalStatus[] = [];
@@ -347,17 +512,22 @@ async function fixture(input: { client?: FakeAcpClient; lifecycle?: HermesWorker
     return lease;
   });
   const acpClientFactory = vi.fn(
-    (_command: HostHermesAcpProcessCommand, _options: HermesAcpRuntimeClientOptions): HermesAcpRuntimeClient => client,
+    (_command: HostHermesAcpProcessCommand, _options: HermesAcpRuntimeClientOptions): HermesAcpRuntimeClient =>
+      clients[Math.min(clientIndex++, clients.length - 1)] ?? client,
   );
   const harness = new HermesAcpHarness({
     cliPath: path.join(root, "src", "cli.ts"),
     profileLeaseFactory: leaseFactory,
     acpClientFactory,
   });
-  return { root, config, ctx, client, harness, leaseFactory, acpClientFactory, leases };
+  return { root, config, ctx, client, clients, harness, leaseFactory, acpClientFactory, leases };
 }
 
-function serviceConfig(root: string, lifecycle: HermesWorkerSessionLifecycle): ServiceConfig {
+function serviceConfig(
+  root: string,
+  lifecycle: HermesWorkerSessionLifecycle,
+  options: { sourceProfile?: string | undefined; profilePrefix?: string | undefined } = {},
+): ServiceConfig {
   return parseServiceConfig(
     {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -378,7 +548,8 @@ function serviceConfig(root: string, lifecycle: HermesWorkerSessionLifecycle): S
         startup_timeout_ms: 1_000,
         request_timeout_ms: 1_000,
         acp_binary_path: "/host/bin/hermes",
-        acp_source_profile: "host-source",
+        acp_source_profile: options.sourceProfile ?? "host-source",
+        ...(options.profilePrefix === undefined ? {} : { acp_profile_prefix: options.profilePrefix }),
       },
     },
     path.join(root, "WORKFLOW.md"),
@@ -446,6 +617,15 @@ async function collectEvents(
     await onEvent(event);
   }
   return events;
+}
+
+function leaseDecisionPayloads(events: AgentEvent[]): Record<string, unknown>[] {
+  return events
+    .filter(
+      (event): event is Extract<AgentEvent, { type: "run_diagnostic" }> =>
+        event.type === "run_diagnostic" && event.code === "hermes_acp_lease_reuse_decision",
+    )
+    .map((event) => (event.payload ?? {}) as Record<string, unknown>);
 }
 
 function deferred<T>(): Deferred<T> {
