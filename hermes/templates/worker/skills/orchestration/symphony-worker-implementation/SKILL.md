@@ -43,6 +43,9 @@ Keep delegated work bounded:
 - Provide paths, symbols, issue context, and success criteria; do not paste large file bodies.
 - Tell research subagents not to call `delegate_task`; child research must be leaf-only.
 - Give each research subagent a hard stop: answer after the first useful map of paths/symbols/tests, after roughly five tool rounds, or when context pressure/compression appears. Partial concise findings are preferable to continued exploration.
+- For repository cartography in child research, prefer capped `terminal` reducer commands before broad `search_files` or `read_file` calls. Use `rg --files`, `rg -n`, `git grep -n`, `node -e`, or `python -c` to aggregate locally and print only compact path, symbol, line, and responsibility summaries.
+- Cap reducer output aggressively: aim for at most 150 lines or 20 KB of stdout, whichever comes first. If more evidence exists, report the next patterns or files to inspect instead of printing them.
+- Example reducer shapes, adapted to the active shell: `rg --files src tests | rg "orchestrator|harness|completion" | head -n 80`, `rg -n --glob "*.ts" "submit_completion_report|delegate_task|toolsets" src tests | head -n 120`, or a short `python -c` / `node -e` script that scans candidate files and prints a small JSON summary.
 - Limit broad search/read behavior: use targeted search patterns and read only the smallest relevant files or sections. Do not dump large recursive search results; summarize matches by path and symbol.
 - Prefer five to eight highly relevant files per research task. If more are needed, report the next files to inspect instead of reading all of them.
 - Tell research subagents to avoid file edits, package installs, git mutations, GitHub/Linear writes, secrets inspection, and lifecycle writeback.

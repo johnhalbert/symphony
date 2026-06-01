@@ -69,6 +69,9 @@ describe("Hermes role template policy", () => {
     expect(skill).toContain("delegate_task");
     expect(skill).toContain("bounded read-only research");
     expect(skill).toContain("child research must be leaf-only");
+    expect(skill).toContain("capped `terminal` reducer commands");
+    expect(skill).toContain("150 lines or 20 KB");
+    expect(skill).toContain("rg --files");
     expect(skill).toContain("Do not dump large recursive search results");
     expect(skill).toContain("stop and return current findings");
     expect(skill).toContain("Do not perform service-owned publication actions");
