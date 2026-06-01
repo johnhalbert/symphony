@@ -16,12 +16,12 @@ export function AppChrome({
   onTabChange,
   children,
   rightSlot,
-  runningCount = 4,
-  repoLabel = "openai/symphony",
-  branch = "main",
-  pollLabel = "poll 22s · next in 8s",
+  runningCount = 0,
+  repoLabel = "repository unavailable",
+  branch = "",
+  pollLabel = "poll unavailable",
   agentUsageLabel,
-  dataSourceLabel = "api source · mock",
+  dataSourceLabel = "source unavailable",
 }: {
   activeTab: AppTab;
   onTabChange: (tab: AppTab) => void;
@@ -85,11 +85,7 @@ export function AppChrome({
         <span className="statusbar__sep">·</span>
         <span className="statusbar__seg mono">{pollLabel}</span>
         <div className="statusbar__right">
-          <span className="statusbar__seg mono">linear · connected</span>
-          <span className="statusbar__sep">·</span>
           <span className="statusbar__seg mono">{dataSourceLabel}</span>
-          <span className="statusbar__sep">·</span>
-          <span className="statusbar__seg mono">0 errors · 24h</span>
         </div>
       </div>
     </div>

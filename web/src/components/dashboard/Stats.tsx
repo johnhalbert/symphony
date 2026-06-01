@@ -1,5 +1,7 @@
 import type { DashboardModel, DashboardTotals } from "../../types/symphony";
 
+const unavailableValue = "—";
+
 export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
   const totals = dashboard.totals;
   const runningCount = dashboard.runningAgents.length;
@@ -16,7 +18,7 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
         <div className="completeness-bar">
           <div style={{ width: `${totals.completeness}%` }} />
         </div>
-        <div className="stat__delta stat__delta--up">▲ 12% this cycle</div>
+        <div className="stat__delta">derived from stored issue/run state</div>
       </div>
       <div className="stat">
         <div className="stat__label">Running agents</div>
@@ -55,14 +57,9 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
         <div className="stat__delta">{totals.backlog} in backlog</div>
       </div>
       <div className="stat">
-        <div className="stat__label">Velocity / ETA</div>
-        <div className="stat__value">
-          3.2<span className="suffix">PR/day</span>
-        </div>
-        <div style={{ marginTop: 8 }}>
-          <Sparkline tiny />
-        </div>
-        <div className="stat__delta stat__delta--warn">ETA: cycle ends ~3 days early</div>
+        <div className="stat__label">Throughput / ETA</div>
+        <div className="stat__value">{unavailableValue}</div>
+        <div className="stat__delta stat__delta--warn">unavailable: no durable throughput or ETA source</div>
       </div>
     </div>
   );
@@ -71,12 +68,12 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
 export function StatsGridDense({ totals }: { totals: DashboardTotals }) {
   return (
     <div className="stats" style={{ gridTemplateColumns: "repeat(6, 1fr)" }}>
-      <DenseStat label="Done" value={totals.done} sub="this cycle" color="var(--st-done)" />
-      <DenseStat label="In Review" value={totals.review} sub="agent review" color="var(--st-review)" />
-      <DenseStat label="In Progress" value={totals.progress} sub="running" color="var(--st-progress)" />
-      <DenseStat label="Todo" value={totals.todo} sub="dispatchable" color="var(--st-todo)" />
-      <DenseStat label="Backlog" value={totals.backlog} sub="" color="var(--st-backlog)" />
-      <DenseStat label="Completeness" value={`${totals.completeness}%`} sub="cycle 14" color="var(--accent)" emphasis />
+      <DenseStat label="Done" value={totals.done} sub="done" color="var(--st-done)" />
+      <DenseStat label="In Review" value={totals.review} sub="in review" color="var(--st-review)" />
+      <DenseStat label="In Progress" value={totals.progress} sub="in progress" color="var(--st-progress)" />
+      <DenseStat label="Todo" value={totals.todo} sub="todo" color="var(--st-todo)" />
+      <DenseStat label="Backlog" value={totals.backlog} sub="backlog" color="var(--st-backlog)" />
+      <DenseStat label="Completeness" value={`${totals.completeness}%`} sub="from totals" color="var(--accent)" emphasis />
     </div>
   );
 }
@@ -108,17 +105,17 @@ function DenseStat({
   );
 }
 
-export function BurndownPanel({ totals, useModelBurnupTotals = true }: { totals: DashboardTotals; useModelBurnupTotals?: boolean }) {
+export function BurndownPanel({ totals }: { totals: DashboardTotals; useModelBurnupTotals?: boolean }) {
   return (
     <div className="panel" style={{ marginBottom: 0 }}>
       <div className="panel__head">
-        <span>Burn-up · Cycle 14</span>
+        <span>Progress totals</span>
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>
-          {totals.done}/{totals.all} done · 7 days left
+          {totals.done}/{totals.all} done · trend unavailable
         </span>
       </div>
       <div style={{ padding: "14px 18px 18px" }}>
-        <BurnupChart totals={useModelBurnupTotals ? totals : null} />
+        <ProgressTotalsChart totals={totals} />
       </div>
     </div>
   );
@@ -133,81 +130,59 @@ export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)", letterSpacing: "0.06em", textTransform: "uppercase" }}>
           ./symphony status --branch {dashboard.branch || "--"}
         </span>
-        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--accent)" }}>● live</span>
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--accent)" }}>● projection</span>
       </div>
       <div style={{ padding: "12px 16px 14px", fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.65 }}>
         <div>
-          <span style={{ color: "var(--text-3)" }}>cycle      </span> 14 · May 15 - May 29 · <span style={{ color: "var(--text)" }}>7 days remaining</span>
+          <span style={{ color: "var(--text-3)" }}>scope      </span> current durable dashboard projection
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>completion </span> <span style={{ color: "var(--st-done)" }}>{totals.completeness}%</span> ({totals.done}/{totals.all}) · projected <span style={{ color: "var(--st-done)" }}>96%</span>
+          <span style={{ color: "var(--text-3)" }}>completion </span> <span style={{ color: "var(--st-done)" }}>{totals.completeness}%</span> ({totals.done}/{totals.all} done) · total {totals.all} · from stored totals
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>velocity   </span> <span style={{ color: "var(--accent)" }}>3.2 PR/day</span> · 7d avg · 14d trend ↑
+          <span style={{ color: "var(--text-3)" }}>open       </span> {totals.open} open · {totals.todo} todo · {totals.progress} in progress · {totals.review} in review
         </div>
         <div>
           <span style={{ color: "var(--text-3)" }}>agents     </span> <span style={{ color: "var(--accent)" }}>{dashboard.agentUsageLabel}</span> · {dashboard.runningAgents.length} running / {dashboard.concurrencyCap} cap
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>review     </span> 3 issues in In Review agent queue · oldest 24m
+          <span style={{ color: "var(--text-3)" }}>poll       </span> {dashboard.pollLabel || "poll unavailable"}
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>health     </span> <span style={{ color: "var(--st-done)" }}>nominal</span> · {dashboard.pollLabel || "poll unavailable"} · 0 errors in 24h
+          <span style={{ color: "var(--text-3)" }}>unavailable</span> cycle dates, throughput, ETA, health, and error-window metrics need durable source fields
         </div>
       </div>
     </div>
   );
 }
 
-const mockBurnupCompleted = [0, 2, 3, 5, 6, 8, 11, 13];
-const mockBurnupTarget = [0, 2.4, 4.8, 7.2, 9.6, 12, 14.4, 16.8];
-const mockBurnupCompletedEnd = 13;
-const mockBurnupTargetEnd = 17;
-
-function BurnupChart({ totals }: { totals: DashboardTotals | null }) {
+function ProgressTotalsChart({ totals }: { totals: DashboardTotals }) {
   const width = 700;
-  const height = 160;
-  const completedEnd = totals ? chartValue(totals.done) : mockBurnupCompletedEnd;
-  const targetEnd = totals ? chartValue(totals.all) : mockBurnupTargetEnd;
-  const max = Math.max(completedEnd, targetEnd, 1);
-  const completed = totals ? scaleSeries(mockBurnupCompleted, completedEnd) : mockBurnupCompleted;
-  const target = totals ? scaleSeries(mockBurnupTarget, targetEnd) : mockBurnupTarget;
-  const gridLines = totals ? [0, max / 3, (max / 3) * 2, max] : [0, 5, 10, 15];
-  const dx = (width - 30) / 13;
-  const sy = (y: number) => height - 18 - (y / max) * (height - 36);
-  const sx = (i: number) => 18 + i * dx;
-  const pathCompleted = completed.map((y, index) => `${index ? "L" : "M"}${sx(index)},${sy(y)}`).join(" ");
-  const pathTarget = target.map((y, index) => `${index ? "L" : "M"}${sx(index)},${sy(y)}`).join(" ");
+  const height = 120;
+  const padding = 18;
+  const usableWidth = width - padding * 2;
+  const done = chartValue(totals.done);
+  const total = chartValue(totals.all);
+  const denominator = Math.max(done, total, 1);
+  const doneWidth = (done / denominator) * usableWidth;
+  const remaining = Math.max(total - done, 0);
+  const completion = total === 0 ? 0 : Math.round((done / total) * 100);
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height }}>
-      {gridLines.map((value) => (
-        <line key={value} x1="18" x2={width - 12} y1={sy(value)} y2={sy(value)} stroke="var(--border-subtle)" strokeWidth="1" />
-      ))}
-      <path d={pathTarget} fill="none" stroke="var(--text-3)" strokeWidth="1.3" strokeDasharray="3 3" opacity="0.7" />
-      <path d={pathCompleted} fill="none" stroke="var(--accent)" strokeWidth="2" />
-      <path d={`${pathCompleted} L${sx(7)},${sy(0)} L${sx(0)},${sy(0)} Z`} fill="var(--accent-soft)" />
-      {completed.map((y, index) => (
-        <circle key={index} cx={sx(index)} cy={sy(y)} r="2.5" fill="var(--accent)" />
-      ))}
-      <path d={`M${sx(7)},${sy(completedEnd)} L${sx(13)},${sy(targetEnd)}`} stroke="var(--accent)" strokeWidth="1.5" strokeDasharray="2 3" opacity="0.55" />
-      <circle cx={sx(13)} cy={sy(targetEnd)} r="3" fill="none" stroke="var(--accent)" strokeWidth="1.5" />
-      <line x1={sx(7)} x2={sx(7)} y1="6" y2={height - 12} stroke="var(--border-strong)" strokeWidth="1" strokeDasharray="2 3" />
-      <text x={sx(7) + 4} y="16" fill="var(--text-3)" fontSize="10" fontFamily="var(--font-mono)">
-        today
+      <rect x={padding} y="42" width={usableWidth} height="18" rx="9" fill="var(--elevated)" />
+      <rect x={padding} y="42" width={doneWidth} height="18" rx="9" fill="var(--accent)" />
+      <text x={padding} y="24" fill="var(--accent)" fontSize="10.5" fontFamily="var(--font-mono)">
+        done {formatChartValue(done)}
       </text>
-      {["Day 1", "", "", "", "", "", "", "Day 7", "", "", "", "", "", "Day 14"].map((label, index) =>
-        label ? (
-          <text key={index} x={sx(index)} y={height - 2} textAnchor="middle" fill="var(--text-4)" fontSize="9.5" fontFamily="var(--font-mono)">
-            {label}
-          </text>
-        ) : null,
-      )}
-      <text x={width - 14} y={sy(targetEnd) + 3} textAnchor="end" fill="var(--text-3)" fontSize="9.5" fontFamily="var(--font-mono)">
-        target {formatChartValue(targetEnd)}
+      <text x={width - padding} y="24" textAnchor="end" fill="var(--text-3)" fontSize="10.5" fontFamily="var(--font-mono)">
+        total {formatChartValue(total)}
       </text>
-      <text x={width - 14} y={sy(completedEnd) - 6} textAnchor="end" fill="var(--accent)" fontSize="9.5" fontFamily="var(--font-mono)">
-        completed {formatChartValue(completedEnd)}
+      <text x={padding} y="82" fill="var(--text-3)" fontSize="10.5" fontFamily="var(--font-mono)">
+        remaining {formatChartValue(remaining)}
+      </text>
+      <text x={width - padding} y="82" textAnchor="end" fill="var(--text-3)" fontSize="10.5" fontFamily="var(--font-mono)">
+        completion {completion}%
       </text>
     </svg>
   );
@@ -217,27 +192,6 @@ function chartValue(value: number) {
   return Number.isFinite(value) ? Math.max(value, 0) : 0;
 }
 
-function scaleSeries(shape: number[], endValue: number) {
-  const shapeEnd = shape[shape.length - 1] ?? 1;
-  if (shapeEnd === 0) return shape.map(() => 0);
-  return shape.map((value) => (value / shapeEnd) * endValue);
-}
-
 function formatChartValue(value: number) {
   return Number.isInteger(value) ? `${value}` : value.toFixed(1);
-}
-
-export function Sparkline({ tiny }: { tiny?: boolean }) {
-  const points = [1, 3, 2, 4, 3, 5, 4, 6, 5, 7, 6, 3, 8, 5];
-  const width = tiny ? 120 : 240;
-  const height = tiny ? 22 : 36;
-  const max = Math.max(...points);
-  const dx = width / (points.length - 1);
-  const path = points.map((y, index) => `${index ? "L" : "M"}${index * dx},${height - (y / max) * (height - 3) - 1}`).join(" ");
-  return (
-    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height }}>
-      <path d={`${path} L${width},${height} L0,${height} Z`} fill="var(--accent-soft)" />
-      <path d={path} fill="none" stroke="var(--accent)" strokeWidth="1.5" />
-    </svg>
-  );
 }

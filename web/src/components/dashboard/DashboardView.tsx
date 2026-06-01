@@ -3,7 +3,7 @@ import { useDataSource } from "../../data/dataSourceContext";
 import type { ChatMessage, DashboardModel, DashboardVariant } from "../../types/symphony";
 import { Icon } from "../common";
 import { AgentRow } from "./AgentRow";
-import { BurndownCommandCenter, BurndownPanel, Sparkline, StatsGridDense, StatsRow } from "./Stats";
+import { BurndownCommandCenter, BurndownPanel, StatsGridDense, StatsRow } from "./Stats";
 import { OrchestratorChat } from "./OrchestratorChat";
 
 export function DashboardView({
@@ -56,7 +56,7 @@ export function DashboardView({
           </div>
           <div className="dash__actions">
             <button className="btn" type="button">
-              {Icon.filter()}Cycle 14
+              {Icon.filter()}Status totals
             </button>
             <button className="btn" type="button">
               {Icon.bolt()}Trigger poll
@@ -121,7 +121,7 @@ export function DashboardView({
                     animation: "pulse 1.6s ease-in-out infinite",
                   }}
                 />
-                live
+                feed
               </span>
             </div>
             <div className="panel__body">
@@ -143,12 +143,10 @@ export function DashboardView({
           {variant === "grid" ? (
             <div className="panel">
               <div className="panel__head">
-                <span>Velocity · last 14 days</span>
-                <span className="count">+24</span>
+                <span>Throughput history</span>
+                <span className="count">unavailable</span>
               </div>
-              <div style={{ padding: "14px 14px 18px" }}>
-                <Sparkline />
-              </div>
+              <div className="view-empty">Velocity trend unavailable; no durable throughput history is present.</div>
             </div>
           ) : null}
         </div>

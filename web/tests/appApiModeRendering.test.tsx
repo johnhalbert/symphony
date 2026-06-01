@@ -507,8 +507,8 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("2/9 agents");
     expect(markup).toContain("concurrency cap 9");
     expect(markup).toContain("8/32 done");
-    expect(markup).toMatch(/target\s+32/);
-    expect(markup).toMatch(/completed\s+8/);
+    expect(markup).toContain("total 32");
+    expect(markup).toContain("done 8");
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
     expect(markup).toContain("Full-app suggestion");
@@ -550,7 +550,7 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("Symphony API returned HTTP 503");
     expect(markup).toContain("api source · api");
     expect(markup).toContain("1 agents running");
-    expect(markup).toContain("poll pending");
+    expect(markup).toContain("poll unavailable");
 
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");

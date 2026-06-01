@@ -101,11 +101,11 @@ function AppShell({
         <AppChrome
           activeTab={activeTab}
           onTabChange={setActiveTab}
-          runningCount={apiMode ? runningCount : undefined}
-          repoLabel={apiMode ? (dashboardChrome?.repoLabel ?? "") : undefined}
-          branch={apiMode ? (dashboardChrome?.branch ?? "") : undefined}
-          pollLabel={apiMode ? (dashboardChrome?.pollLabel ?? "poll pending") : undefined}
-          agentUsageLabel={apiMode ? (dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`) : undefined}
+          runningCount={runningCount}
+          repoLabel={dashboardChrome?.repoLabel ?? "repository unavailable"}
+          branch={dashboardChrome?.branch ?? ""}
+          pollLabel={dashboardChrome?.pollLabel ?? "poll unavailable"}
+          agentUsageLabel={dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`}
           dataSourceLabel={[
             `api source · ${defaultDataSourceConfig.mode}`,
             apiMode ? referenceLabel : null,
