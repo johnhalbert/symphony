@@ -491,9 +491,18 @@ function isAssistantDeltaLikePayload(payloadKind: string | null, payload: Record
 function isStatusLikePayload(payloadKind: string | null, payload: Record<string, unknown>): boolean {
   const actor = normalizedOptionalToken(payload.actor);
   const channel = normalizedOptionalToken(payload.channel);
+  const activitySource = normalizedOptionalToken(payload.activitySource);
+  const progressKind = normalizedOptionalToken(payload.progressKind);
   return (
     payloadKind === "status" ||
-    payloadKind === "progress" ||
+    (payloadKind === "progress" &&
+      (isStatusActivitySource(activitySource) ||
+        payloadKindIncludes(progressKind, "token") ||
+        payloadKindIncludes(progressKind, "rate_limit") ||
+        payloadKindIncludes(progressKind, "provider_limit") ||
+        payloadKindIncludes(progressKind, "runtime") ||
+        payloadKindIncludes(progressKind, "diagnostic") ||
+        payloadKindIncludes(progressKind, "run_"))) ||
     payloadKind === "usage" ||
     payloadKind === "diagnostic" ||
     payloadKind === "terminal" ||
@@ -508,6 +517,20 @@ function isStatusLikePayload(payloadKind: string | null, payload: Record<string,
     channel === "token" ||
     channel === "runtime" ||
     channel === "terminal"
+  );
+}
+
+function isStatusActivitySource(activitySource: string | null): boolean {
+  return (
+    activitySource === "status" ||
+    activitySource === "runtime" ||
+    activitySource === "telemetry" ||
+    activitySource === "token" ||
+    activitySource === "tokens" ||
+    activitySource === "rate_limit" ||
+    activitySource === "rate_limits" ||
+    activitySource === "provider_limit" ||
+    activitySource === "provider_limits"
   );
 }
 

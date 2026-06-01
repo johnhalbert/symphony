@@ -13,7 +13,7 @@ the backend and web UI:
 | Display class | Public `kind` | Source events | Notes |
 | --- | --- | --- | --- |
 | Run prelude | `system`, `user` | Persisted `RunRecord` metadata and prompt | Prepended when no equivalent transcript event exists. System prompt is redacted; user prompt is length-bounded and secret-redacted. |
-| Chat output | `assistant` | `assistant`, `message_*`, `assistant_message_*`, `response_*`, `harness:progress` without a tool activity source, and `harness:progress` with `activitySource: delta` or assistant chat-channel payloads | Text is projected from sanitized preview fields or sanitized event message. Delta fragments are grouped (see below). |
+| Chat output | `assistant` | `assistant`, `message_*`, `assistant_message_*`, `response_*`, `harness:progress` without a status/tool activity source, and `harness:progress` with `activitySource: stream`/`delta` or assistant chat-channel payloads | Text is projected from sanitized preview fields or sanitized event message. Delta fragments are grouped (see below). |
 | Reasoning | `thinking` | `thinking`, `reasoning_*`, `thought_*`, `assistant_reasoning_*` | Uses public summaries/previews only; raw reasoning payloads stay hidden. |
 | Tool rows | `tool_call` | Runtime/Cursor tool events such as `tool_call`, `tool_start`, `tool_complete`, `tool_call_started`, `tool_call_completed` | Start/complete pairs group by call id/tool id. Arguments/results are previews only. Harness tool progress is hidden to avoid duplicate rows and raw command spam. |
 | Work/task summaries | `task` | `task` events | For coarse-grained task updates that are safe to show as milestones. |
@@ -91,7 +91,8 @@ appear as a concise `status` row; raw legacy `tokens` payloads remain hidden.
 
 `tests/web-transcript-projection.test.ts` encodes the high-risk grouping rules:
 
-* sanitized Cursor/runtime message mapping;
+* sanitized Cursor/runtime message mapping, including persisted harness
+  `progress` text with `activitySource: stream` or no status/tool activity source;
 * assistant delta replacement by final completion and canonical
   `assistant_message_delta` grouping;
 * tool start/complete pairing by `toolId`/`toolCallId`;

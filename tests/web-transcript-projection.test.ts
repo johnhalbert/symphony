@@ -113,6 +113,39 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("Cursor task event");
   });
 
+  it("preserves persisted harness stream progress text while routing explicit progress status", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "hello from stream",
+        payload: { type: "progress", activitySource: "stream", message: "hello from stream" },
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "legacy progress text",
+        payload: { type: "progress", message: "legacy progress text" },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 2,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Workspace warming",
+        payload: { type: "progress", activitySource: "status", status: "warming", message: "Workspace warming" },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 3,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "hello from stream" },
+      { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "legacy progress text" },
+      { kind: "status", state: "warming", ts: "2026-01-01T00:00:02.000Z", text: "Workspace warming" },
+    ]);
+  });
+
   it("coalesces Hermes runtime deltas and tool pairs while preserving public-safe run prelude messages", () => {
     const messages = projectWebTranscript(
       [

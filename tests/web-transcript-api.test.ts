@@ -408,6 +408,52 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("serves persisted harness stream progress text as assistant messages", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "stream-progress-run", sessionId: "stream-progress-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "stream-progress-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "hello from stream",
+      payload: { type: "progress", activitySource: "stream", message: "hello from stream" },
+    });
+    await runStore.appendEvent({
+      runId: "stream-progress-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "legacy progress text",
+      payload: { type: "progress", message: "legacy progress text" },
+    });
+    await runStore.appendEvent({
+      runId: "stream-progress-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Workspace warming",
+      payload: { type: "progress", activitySource: "status", status: "warming", message: "Workspace warming" },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/stream-progress-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "stream-progress-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "hello from stream" },
+        { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "legacy progress text" },
+        { kind: "status", state: "warming", ts: "2026-01-01T00:00:03.000Z", text: "Workspace warming" },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves Cursor status, system, and unknown transcript events without assistant fallback", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
