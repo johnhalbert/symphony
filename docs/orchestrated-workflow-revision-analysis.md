@@ -1135,6 +1135,95 @@ Issue queue:
 11. [`ENG-252`](https://linear.app/john-halbert/issue/ENG-252/11-add-api-projection-contract-tests-for-stalefallbackno-mock-behavior):
     Add API projection contract tests for stale/fallback/no-mock behavior.
 
+## Post-Rebase Local Baseline Assessment
+
+Assessment date: 2026-06-01.
+
+Local baseline after catching `main` up:
+
+- `main` was rebased onto `origin/main` at `11ecc05`.
+- Local commit `8928a39` (`Document workflow planning and service-owned
+  publication`) now sits on top of `origin/main`.
+- The commit preserves the working analysis docs plus a small implementation
+  change that tells implementation and merge-gate repair workers to leave
+  changes uncommitted and unpushed, call `submit_completion_report`, and let
+  Symphony perform service-owned commit, push, and PR creation/reuse.
+
+Already covered by the local commit:
+
+- `WORKFLOW.md`, `docs/dogfood-runbook.md`, `docs/trust-and-safety.md`, and
+  `hermes/templates/worker/SOUL.md` now document the service-owned publication
+  boundary.
+- `renderCompletionMcpHandoffPrompt` and the completion-report MCP tool
+  description now tell implementation workers that the completion report is the
+  publication handoff.
+- Merge-gate repair prompt generation in `ReviewVerdictService` and
+  `TransitionPolicy` now says workers should leave repaired changes uncommitted
+  and unpushed.
+- Prompt-level regression tests now assert that merge-gate repair instructions
+  do not say to commit and push the repaired branch.
+- Planning evidence docs now exist for state representation, state ownership
+  and durability, frontend projection performance, Hermes ACP integration, and
+  workflow revision analysis.
+
+Not covered by the local commit:
+
+- There is no process/tool enforcement yet for denied upstream commands.
+  Workers and reviewers could still try `git fetch`, `git push`, `gh pr ...`,
+  `ssh git@github.com`, or raw GitHub API calls if their shell/tool surface
+  permits them.
+- There are no PATH shims, non-interactive Git/SSH environment hardening,
+  Hermes terminal command-policy checks, or `execute_code` inheritance tests.
+- Reviewer-specific command restrictions are not enforced beyond general prompt
+  policy.
+- There is no canonical local CI command shared with GitHub Actions.
+- Revision reason telemetry, counter splitting, verdict/writeback failure-safe
+  handling, credential/writeback smoke coverage, PR-health pre-review gating,
+  replay matrix tests, harness activity normalization, and projection contract
+  tests remain unimplemented.
+
+Important tension introduced by the local baseline:
+
+- The merge-gate repair prompt now says not to commit or push, but it still says
+  to "fetch the latest upstream changes from origin/main".
+- The planned command policy in `ENG-243` denies worker/reviewer-owned
+  `git fetch`, `git pull`, `git remote update`, `git ls-remote`, and comparable
+  upstream reads.
+- `ENG-243` and `ENG-249` therefore need to replace worker-owned fetching with a
+  service-owned ref refresh and a prepared local repair base. Workers should be
+  able to inspect already-refreshed local refs and worktree state, not trigger
+  upstream GitHub auth from their shells.
+
+Adjusted issue impact:
+
+- `ENG-242` remains first. The analysis doc now contains the issue-authoring
+  contract, but the work still needs to productize it in the dogfood runbook,
+  AI issue-creation prompt, promotion checklist, and issue-lint/doctor path.
+- `ENG-243` should be narrowed away from prompt-only work. The prompt/docs
+  baseline exists; remaining work is enforceable command blocking across
+  terminal, subprocess, `execute_code`, `gh`, `ssh`, raw GitHub API shells, and
+  reviewer surfaces. It must also remove or replace remaining worker-owned
+  "fetch latest upstream" instructions.
+- `ENG-244` is unchanged. It should create the canonical local CI command and
+  wire worker completion reports to cite that command when applicable.
+- `ENG-245`, `ENG-246`, and `ENG-247` are unchanged by this baseline.
+- `ENG-248` should treat the current trust-and-safety text as documentation
+  baseline only. The remaining work is fail-closed credential selection,
+  sanitized selected-credential/writeback evidence, and end-to-end smoke
+  coverage.
+- `ENG-249` should not spend effort adding "do not push" language that already
+  exists. Its remaining work is lifecycle-bound PR health gating, service-owned
+  ref/check refresh before reviewer dispatch, and clear routing of merge/CI
+  blockers to either local repair or service/user blocked states.
+- `ENG-250` can use `docs/state-representation.md` and
+  `docs/state-ownership-and-durability.md` as source evidence, but still needs
+  executable replay/restart tests and any missing persisted fields.
+- `ENG-251` is unchanged except that terminal command-denial events from
+  `ENG-243` should be included in the normalized activity taxonomy.
+- `ENG-252` can use `docs/frontend-projection-performance-inventory.md` as
+  source evidence, but still needs route/projection contract tests and
+  production no-mock assertions.
+
 ## Proposed Metrics After Refactor
 
 Report these separately:
