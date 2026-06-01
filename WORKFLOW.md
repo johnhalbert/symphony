@@ -25,11 +25,13 @@ review_loop:
   max_incomplete_turns: 3
   continuation_history_threshold: 5
   reviewer_prompt_extensions:
+    - If an issue is missing `Contract Checklist` or `Validation Requirements`, derive conservative expected behavior from issue text, repository invariants, and the general matrix; fail missed behavior or validation without treating the missing issue contract itself as the implementation defect.
     - Check lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions when shared orchestration behavior is touched.
     - Check MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when the change crosses those systems.
     - Check approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when publication behavior is touched.
     - "Check dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active."
   worker_prompt_extensions:
+    - If the issue lacks `Contract Checklist` or `Validation Requirements`, derive a conservative checklist from acceptance criteria, touched surfaces, repository invariants, and the general scenario matrix; mention the issue-authoring gap in the completion report without reducing validation scope.
     - For Symphony orchestration, workflow, tracker, harness, API, approval, publication, or writeback changes, validate lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
     - Validate MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
     - Cover approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when applicable.

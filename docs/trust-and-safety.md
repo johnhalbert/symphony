@@ -34,6 +34,10 @@ Linear writeback should be idempotent and should re-check current Linear state b
 
 Dogfood dispatch is opt-in. The reference `WORKFLOW.md` requires `dogfood-ready` and excludes `dogfood-blocked` and `safety-blocked`.
 
+Operators must not add `dogfood-ready` or remove `dogfood-blocked` for an agent-eligible issue until the issue uses the required authoring sections from [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md): `Problem / Goal`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`. The `Validation Requirements` section must include a concrete validation plan, and the `Contract Checklist` must be reviewed for the touched surfaces before promotion.
+
+The template explicitly forbids secrets, tokens, private keys, credential values, and private customer data in issue descriptions. Issues should describe credential/security variants without including credential material.
+
 All issues in the dogfood epic remain `Backlog` with `dogfood-blocked` until an operator manually promotes exactly the next issue intended for dispatch.
 
 Continuation search and richer summarization are roadmap placeholders only. Their feature flags default off, doctor warns if an operator enables them before implementation, and their placeholder Linear issues stay `Backlog` with `dogfood-blocked` and without `dogfood-ready`.

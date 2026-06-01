@@ -99,6 +99,9 @@ export function renderIssueBreakdownMcpHandoffPrompt(input: RuntimeHandoffPrompt
     "- Active phase: issue_breakdown",
     "- Before ending the run, call the submit_issue_breakdown_plan MCP tool with summary, proposedIssues, and idempotencyKey.",
     "- Each proposed issue must include title, description, acceptanceCriteria, dependencies, and labels.",
+    "- Each proposed issue description must use the required agent-eligible section headings: `Problem / Goal`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.",
+    "- Use the same section names for docs-only and implementation issue drafts; do not include secrets, tokens, private keys, or credential values.",
+    "- Do not include `dogfood-ready` automatically in proposed labels. Operators add readiness labels only after reviewing the contract checklist and validation plan.",
     "- Do not call submit_completion_report, comment on Linear, transition Linear state, or create child issues.",
     "- Symphony persists the plan locally and injects it into the later implementation prompt after validation.",
   ].join("\n");

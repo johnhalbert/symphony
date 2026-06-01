@@ -129,6 +129,8 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
     expect(harness.runs[0]?.prompt).toContain("address the underlying invariant");
+    expect(harness.runs[0]?.prompt).toContain("derive a conservative checklist");
+    expect(harness.runs[0]?.prompt).toContain("issue-authoring gap");
     expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
     expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
