@@ -29,6 +29,20 @@ describe("Hermes role template policy", () => {
     expect(agentMaxTurns(planner)).toBe(SYMPHONY_HERMES_AGENT_MAX_TURNS);
   });
 
+  it("gives delegating Symphony profiles the extended child-agent budget", async () => {
+    const templatesDir = path.resolve("hermes", "templates");
+
+    const worker = await readTemplateConfig(path.join(templatesDir, "worker", "config.yaml"));
+    const planner = await readTemplateConfig(path.join(templatesDir, "planner", "config.yaml"));
+    const reviewer = await readTemplateConfig(path.join(templatesDir, "reviewer", "config.yaml"));
+
+    expect(disabledToolsets(worker)).not.toContain("delegation");
+    expect(disabledToolsets(planner)).not.toContain("delegation");
+    expect(delegationMaxIterations(worker)).toBe(SYMPHONY_HERMES_AGENT_MAX_TURNS);
+    expect(delegationMaxIterations(planner)).toBe(SYMPHONY_HERMES_AGENT_MAX_TURNS);
+    expect(disabledToolsets(reviewer)).toContain("delegation");
+  });
+
   it("delays compression for all Symphony role profiles", async () => {
     const templatesDir = path.resolve("hermes", "templates");
 
@@ -85,4 +99,11 @@ function compressionThreshold(config: Record<string, unknown>): number | null {
   if (typeof compression !== "object" || compression === null || Array.isArray(compression)) return null;
   const threshold = (compression as Record<string, unknown>).threshold;
   return typeof threshold === "number" ? threshold : null;
+}
+
+function delegationMaxIterations(config: Record<string, unknown>): number | null {
+  const delegation = config.delegation;
+  if (typeof delegation !== "object" || delegation === null || Array.isArray(delegation)) return null;
+  const maxIterations = (delegation as Record<string, unknown>).max_iterations;
+  return typeof maxIterations === "number" ? maxIterations : null;
 }
