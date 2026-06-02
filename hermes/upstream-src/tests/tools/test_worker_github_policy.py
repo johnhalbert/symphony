@@ -253,6 +253,246 @@ def test_policy_blocks_git_config_env_equals_sensitive_values(policy_env, config
     assert decision["description"] == "unsafe Git credential or transport configuration"
 
 
+@pytest.mark.parametrize(
+    "tool,args,description",
+    [
+        ("git", ["-c", "alias.pwn=!fake-helper", "pwn"], "command-executing Git configuration"),
+        ("git", ["-calias.pwn=!fake-helper", "pwn"], "command-executing Git configuration"),
+        ("git", ["-C", ".", "-c", "alias.pwn=!fake-helper", "pwn"], "command-executing Git configuration"),
+        ("git", ["--config-env=alias.pwn=GIT_ALIAS", "pwn"], "command-executing Git configuration"),
+        ("git", ["--config-env=diff.external=GIT_EXTERNAL_DIFF_CONFIG", "diff", "--cached"], "command-executing Git configuration"),
+        ("git", ["-c", "diff.external=fake-helper", "diff", "--cached"], "command-executing Git configuration"),
+        ("git", ["-c", "core.pager=fake-helper", "--paginate", "log", "-1"], "command-executing Git configuration"),
+        ("git", ["-c", "pager.log=fake-helper", "--paginate", "log", "-1"], "command-executing Git configuration"),
+        ("git", ["-c", "difftool.pwn.cmd=fake-helper", "difftool", "--tool=pwn"], "command-executing Git configuration"),
+        ("git", ["-c", "diff.pwn.command=fake-helper", "diff", "--cached"], "command-executing Git configuration"),
+        ("git", ["-c", "include.path=/tmp/policy-bypass.gitconfig", "status"], "command-executing Git configuration"),
+        ("git", ["config", "alias.pwn", "!fake-helper"], "command-executing Git configuration"),
+        ("git", ["config", "--add", "alias.pwn", "!fake-helper"], "command-executing Git configuration"),
+        ("git", ["config", "diff.external", "fake-helper"], "command-executing Git configuration"),
+        ("git", ["config", "core.pager", "fake-helper"], "command-executing Git configuration"),
+        ("git", ["config", "pager.log", "fake-helper"], "command-executing Git configuration"),
+        ("git", ["config", "difftool.pwn.cmd", "fake-helper"], "command-executing Git configuration"),
+        ("git", ["config", "diff.pwn.command", "fake-helper"], "command-executing Git configuration"),
+    ],
+)
+def test_policy_blocks_command_executing_git_config_argv(policy_env, tool, args, description):
+    decision = policy.check_worker_reviewer_github_argv(tool, args)
+
+    assert decision is not None
+    assert decision["blocked"] is True
+    assert decision["description"] == description
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["status", "--short"],
+        ["-C", ".", "status", "--short"],
+        ["diff", "--", "src/core/foo.ts"],
+        ["log", "--oneline", "-5"],
+        ["--no-pager", "log", "--oneline", "-5"],
+        ["-c", "color.ui=never", "status", "--short"],
+        ["-ccore.quotepath=false", "diff", "--", "src/core/foo.ts"],
+        ["config", "user.email", "test@example.com"],
+        ["config", "--get", "alias.pwn"],
+        ["config", "--unset", "alias.pwn"],
+    ],
+)
+def test_policy_allows_safe_git_inspection_and_benign_config(policy_env, args):
+    assert policy.check_worker_reviewer_github_argv("git", args) is None
+
+
+def test_policy_blocks_command_executing_git_config_from_environment(policy_env):
+    env = {
+        policy.COMMAND_POLICY_ENV: policy.COMMAND_POLICY_VALUE,
+        policy.ROLE_ENV: "worker",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "alias.pwn",
+        "GIT_CONFIG_VALUE_0": "!fake-helper",
+    }
+
+    decision = policy.check_worker_reviewer_github_argv("git", ["status", "--short"], env=env)
+
+    assert decision is not None
+    assert decision["blocked"] is True
+    assert decision["description"] == "command-executing Git configuration"
+
+    external_diff_env = {
+        policy.COMMAND_POLICY_ENV: policy.COMMAND_POLICY_VALUE,
+        policy.ROLE_ENV: "worker",
+        "GIT_EXTERNAL_DIFF": "fake-helper",
+    }
+    decision = policy.check_worker_reviewer_github_argv("git", ["diff", "--cached"], env=external_diff_env)
+
+    assert decision is not None
+    assert decision["description"] == "command-executing Git diff environment"
+
+
+def _install_policy_git_shim(tmp_path, fake_bin=None):
+    env = os.environ.copy()
+    upstream_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    if fake_bin is not None:
+        env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+    env["PYTHONPATH"] = os.pathsep.join([upstream_root, env.get("PYTHONPATH", "")])
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    env["GIT_CONFIG_GLOBAL"] = str(tmp_path / "global.gitconfig")
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    shim_dir = tmp_path / "shims"
+    policy.install_worker_reviewer_github_shims(str(shim_dir), env, python_executable=sys.executable)
+    return env, shim_dir / ("git.cmd" if os.name == "nt" else "git")
+
+
+def test_path_shim_blocks_inline_command_executing_git_config_before_fake_tool(policy_env, tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("git executable is not available")
+    fake_bin = tmp_path / "real-bin"
+    fake_bin.mkdir()
+    fake_tool = _write_fake_tool(fake_bin, "fake-helper", marker="FAKE_GIT_CONFIG_RAN")
+    file_a = tmp_path / "a.txt"
+    file_b = tmp_path / "b.txt"
+    file_a.write_text("a\n", encoding="utf-8")
+    file_b.write_text("b\n", encoding="utf-8")
+    env, git_shim = _install_policy_git_shim(tmp_path, fake_bin=fake_bin)
+
+    cases = [
+        ["-c", f"alias.pwn=!{fake_tool}", "pwn"],
+        [f"-calias.pwn=!{fake_tool}", "pwn"],
+        ["--config-env=alias.pwn=GIT_ALIAS", "pwn"],
+        ["-c", f"diff.external={fake_tool}", "diff", "--no-index", str(file_a), str(file_b)],
+        ["-c", f"core.pager={fake_tool}", "--paginate", "log", "-1"],
+        ["-c", f"pager.log={fake_tool}", "--paginate", "log", "-1"],
+        ["-c", f"difftool.pwn.cmd={fake_tool}", "difftool", "--tool=pwn", "--no-prompt"],
+    ]
+    for args in cases:
+        blocked = subprocess.run([str(git_shim), *args], env=env, text=True, capture_output=True)
+        combined = blocked.stdout + blocked.stderr
+
+        assert blocked.returncode == 126, args
+        assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in blocked.stderr, args
+        assert "FAKE_GIT_CONFIG_RAN" not in combined, args
+
+
+def test_path_shim_blocks_persisted_git_alias_and_diff_external_before_fake_tool(policy_env, tmp_path):
+    real_git = shutil.which("git")
+    if real_git is None:
+        pytest.skip("git executable is not available")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    setup_env = os.environ.copy()
+    setup_env["GIT_CONFIG_NOSYSTEM"] = "1"
+    subprocess.run([real_git, "init", "-q"], cwd=repo, env=setup_env, check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("hello\n", encoding="utf-8")
+    subprocess.run([real_git, "-C", str(repo), "add", "tracked.txt"], env=setup_env, check=True)
+
+    fake_bin = tmp_path / "real-bin"
+    fake_bin.mkdir()
+    fake_tool = _write_fake_tool(fake_bin, "fake-helper", marker="FAKE_PERSISTED_GIT_CONFIG_RAN")
+    subprocess.run([real_git, "-C", str(repo), "config", "alias.pwn", f"!{fake_tool}"], env=setup_env, check=True)
+    subprocess.run([real_git, "-C", str(repo), "config", "diff.external", str(fake_tool)], env=setup_env, check=True)
+    subprocess.run([real_git, "-C", str(repo), "config", "core.pager", str(fake_tool)], env=setup_env, check=True)
+
+    env, git_shim = _install_policy_git_shim(tmp_path, fake_bin=fake_bin)
+    preflight_decision = policy.check_worker_reviewer_git_persisted_config(
+        "git",
+        ["-C", str(repo), "pwn"],
+        env=env,
+        real_git=real_git,
+    )
+    assert preflight_decision is not None
+    assert preflight_decision["description"] == "persisted Git alias command execution"
+
+    blocked_alias = subprocess.run([str(git_shim), "-C", str(repo), "pwn"], env=env, text=True, capture_output=True)
+    alias_combined = blocked_alias.stdout + blocked_alias.stderr
+    assert blocked_alias.returncode == 126
+    assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in blocked_alias.stderr
+    assert "FAKE_PERSISTED_GIT_CONFIG_RAN" not in alias_combined
+
+    blocked_diff = subprocess.run([str(git_shim), "-C", str(repo), "diff", "--cached"], env=env, text=True, capture_output=True)
+    diff_combined = blocked_diff.stdout + blocked_diff.stderr
+    assert blocked_diff.returncode == 126
+    assert "persisted command-executing Git diff configuration" in blocked_diff.stderr
+    assert "FAKE_PERSISTED_GIT_CONFIG_RAN" not in diff_combined
+
+    blocked_pager = subprocess.run([str(git_shim), "-C", str(repo), "--paginate", "log", "-1"], env=env, text=True, capture_output=True)
+    pager_combined = blocked_pager.stdout + blocked_pager.stderr
+    assert blocked_pager.returncode == 126
+    assert "persisted command-executing Git pager configuration" in blocked_pager.stderr
+    assert "FAKE_PERSISTED_GIT_CONFIG_RAN" not in pager_combined
+
+
+def test_path_shim_allows_safe_status_diff_log_with_fake_tools_on_path(policy_env, tmp_path):
+    real_git = shutil.which("git")
+    if real_git is None:
+        pytest.skip("git executable is not available")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    setup_env = os.environ.copy()
+    setup_env["GIT_CONFIG_NOSYSTEM"] = "1"
+    subprocess.run([real_git, "init", "-q"], cwd=repo, env=setup_env, check=True)
+    subprocess.run([real_git, "-C", str(repo), "config", "user.email", "test@example.com"], env=setup_env, check=True)
+    subprocess.run([real_git, "-C", str(repo), "config", "user.name", "Test User"], env=setup_env, check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("hello\n", encoding="utf-8")
+    subprocess.run([real_git, "-C", str(repo), "add", "tracked.txt"], env=setup_env, check=True)
+    subprocess.run([real_git, "-C", str(repo), "commit", "-q", "-m", "initial"], env=setup_env, check=True)
+    tracked.write_text("hello\nworld\n", encoding="utf-8")
+
+    fake_bin = tmp_path / "real-bin"
+    fake_bin.mkdir()
+    _write_fake_tool(fake_bin, "fake-helper", marker="FAKE_SAFE_LOCAL_GIT_RAN")
+    env, git_shim = _install_policy_git_shim(tmp_path, fake_bin=fake_bin)
+
+    commands = [
+        ["-C", str(repo), "status", "--short"],
+        ["-C", str(repo), "diff", "--", "tracked.txt"],
+        ["-C", str(repo), "--no-pager", "log", "--oneline", "-1"],
+    ]
+    for args in commands:
+        allowed = subprocess.run([str(git_shim), *args], env=env, text=True, capture_output=True)
+        combined = allowed.stdout + allowed.stderr
+
+        assert allowed.returncode == 0, (args, combined)
+        assert "BLOCKED by Symphony worker/reviewer GitHub command policy" not in allowed.stderr
+        assert "FAKE_SAFE_LOCAL_GIT_RAN" not in combined
+
+
+def test_runtime_sitecustomize_blocks_persisted_git_config_bypass(policy_env, tmp_path):
+    real_git = shutil.which("git")
+    if real_git is None:
+        pytest.skip("git executable is not available")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    setup_env = os.environ.copy()
+    setup_env["GIT_CONFIG_NOSYSTEM"] = "1"
+    subprocess.run([real_git, "init", "-q"], cwd=repo, env=setup_env, check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("hello\n", encoding="utf-8")
+    subprocess.run([real_git, "-C", str(repo), "add", "tracked.txt"], env=setup_env, check=True)
+    fake_bin = tmp_path / "real-bin"
+    fake_bin.mkdir()
+    fake_tool = _write_fake_tool(fake_bin, "fake-helper", marker="FAKE_SITE_GIT_CONFIG_RAN")
+    subprocess.run([real_git, "-C", str(repo), "config", "diff.external", str(fake_tool)], env=setup_env, check=True)
+
+    env = os.environ.copy()
+    env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+    assert policy.install_worker_reviewer_github_runtime(str(tmp_path / "runtime"), env, python_executable=sys.executable)
+    script = (
+        "import subprocess\n"
+        f"subprocess.run([{real_git!r}, '-C', {str(repo)!r}, 'diff', '--cached'], check=True)\n"
+    )
+    blocked = subprocess.run([sys.executable, "-c", script], env=env, text=True, capture_output=True)
+    combined = blocked.stdout + blocked.stderr
+
+    assert blocked.returncode != 0
+    assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in blocked.stderr
+    assert "FAKE_SITE_GIT_CONFIG_RAN" not in combined
+
+
 def test_path_shim_blocks_fetch_and_allows_safe_version(policy_env, tmp_path):
     if shutil.which("git") is None:
         pytest.skip("git executable is not available")

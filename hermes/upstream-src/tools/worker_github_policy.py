@@ -243,6 +243,112 @@ def _argv_command(tool: str, argv: Sequence[str]) -> str:
     return " ".join(_shell_quote(part) for part in parts)
 
 
+_GIT_GLOBAL_OPTIONS_WITH_VALUES = {
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--html-path",
+    "--man-path",
+    "--info-path",
+    "--super-prefix",
+}
+_GIT_GLOBAL_OPTIONS_WITH_ATTACHED_VALUES = (
+    "--git-dir=",
+    "--work-tree=",
+    "--namespace=",
+    "--exec-path=",
+    "--super-prefix=",
+)
+_GIT_CONTEXT_OPTIONS_WITH_VALUES = {"--git-dir", "--work-tree", "--namespace"}
+_GIT_CONTEXT_OPTIONS_WITH_ATTACHED_VALUES = ("--git-dir=", "--work-tree=", "--namespace=")
+_GIT_SAFE_LOCAL_SUBCOMMANDS = {
+    "add",
+    "branch",
+    "cat-file",
+    "check-ignore",
+    "checkout",
+    "config",
+    "describe",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "for-each-ref",
+    "grep",
+    "help",
+    "init",
+    "log",
+    "merge-base",
+    "name-rev",
+    "remote",
+    "restore",
+    "rev-list",
+    "rev-parse",
+    "shortlog",
+    "show",
+    "show-branch",
+    "show-ref",
+    "status",
+    "symbolic-ref",
+    "tag",
+    "version",
+    "whatchanged",
+}
+_GIT_COMMAND_EXECUTING_CONFIG_DESCRIPTION = "command-executing Git configuration"
+_GIT_SENSITIVE_CONFIG_TOKENS = (
+    "credential",
+    "askpass",
+    "core.sshcommand",
+    "extraheader",
+    "insteadof",
+)
+_GIT_COMMAND_EXECUTING_CONFIG_EXACT_KEYS = {
+    "core.editor",
+    "core.fsmonitor",
+    "core.hookspath",
+    "core.pager",
+    "diff.external",
+    "gpg.program",
+    "interactive.difffilter",
+    "sequence.editor",
+}
+_GIT_COMMAND_EXECUTING_CONFIG_PREFIXES = ("alias.", "include.", "includeif.", "pager.")
+_GIT_COMMAND_EXECUTING_CONFIG_SUFFIXES = (
+    ".clean",
+    ".cmd",
+    ".command",
+    ".path",
+    ".process",
+    ".smudge",
+    ".textconv",
+)
+_GIT_CONFIG_OPTIONS_WITH_VALUES = {
+    "--blob",
+    "--default",
+    "--file",
+    "--type",
+    "-f",
+}
+_GIT_CONFIG_READ_OPTIONS = {
+    "--get",
+    "--get-all",
+    "--get-color",
+    "--get-colorbool",
+    "--get-regexp",
+    "--get-urlmatch",
+    "--list",
+    "--name-only",
+    "--show-origin",
+    "--show-scope",
+    "-l",
+}
+_GIT_CONFIG_REMOVE_OPTIONS = {"--remove-section", "--rename-section", "--unset", "--unset-all"}
+_GIT_CONFIG_WRITE_OPTIONS = {"--add", "--replace-all", "--set", "--set-all"}
+_GIT_CONFIG_EDITOR_OPTIONS = {"--edit", "-e"}
+
+
+
 def _skip_git_global_options(args: Sequence[str]) -> tuple[Optional[str], list[str]]:
     sensitive_from_global: list[str] = []
     index = 0
@@ -252,7 +358,7 @@ def _skip_git_global_options(args: Sequence[str]) -> tuple[Optional[str], list[s
         if arg == "--":
             index += 1
             break
-        if lower in {"-c", "--config-env", "-c"}:
+        if arg == "-c" or lower == "--config-env":
             if index + 1 < len(args):
                 sensitive_from_global.append(str(args[index + 1]))
             index += 2
@@ -261,14 +367,20 @@ def _skip_git_global_options(args: Sequence[str]) -> tuple[Optional[str], list[s
             sensitive_from_global.append(arg.split("=", 1)[1])
             index += 1
             continue
-        if lower.startswith("-c") and len(arg) > 2:
+        if arg.startswith("-c") and len(arg) > 2:
             sensitive_from_global.append(arg[2:])
             index += 1
             continue
-        if lower in {"-C".lower(), "--git-dir", "--work-tree", "--namespace", "--exec-path", "--html-path", "--man-path", "--info-path"}:
+        if arg == "-C":
             index += 2
             continue
-        if lower.startswith(("--git-dir=", "--work-tree=", "--namespace=", "--exec-path=")):
+        if arg.startswith("-C") and len(arg) > 2:
+            index += 1
+            continue
+        if lower in _GIT_GLOBAL_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if lower.startswith(_GIT_GLOBAL_OPTIONS_WITH_ATTACHED_VALUES):
             index += 1
             continue
         if arg.startswith("-"):
@@ -280,9 +392,320 @@ def _skip_git_global_options(args: Sequence[str]) -> tuple[Optional[str], list[s
     return None, sensitive_from_global
 
 
+def _git_config_key_from_assignment(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "=" in text:
+        text = text.split("=", 1)[0]
+    else:
+        text = text.split(None, 1)[0]
+    return text.strip().strip("'\"").lower()
+
+
+def _is_sensitive_git_config_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(token in lowered for token in _GIT_SENSITIVE_CONFIG_TOKENS)
+
+
+def _is_command_executing_git_config_key(key: str) -> bool:
+    lowered = key.lower()
+    if lowered in _GIT_COMMAND_EXECUTING_CONFIG_EXACT_KEYS:
+        return True
+    if lowered.startswith(_GIT_COMMAND_EXECUTING_CONFIG_PREFIXES):
+        return True
+    parts = lowered.split(".")
+    if len(parts) >= 3:
+        family = parts[0]
+        leaf = parts[-1]
+        if family in {"diff", "difftool", "mergetool", "filter"} and f".{leaf}" in _GIT_COMMAND_EXECUTING_CONFIG_SUFFIXES:
+            return True
+    return False
+
+
 def _contains_sensitive_git_config(values: Sequence[str]) -> bool:
-    joined = " ".join(str(value).lower() for value in values)
-    return any(token in joined for token in ("credential", "askpass", "core.sshcommand", "extraheader", "insteadof"))
+    return any(_is_sensitive_git_config_key(_git_config_key_from_assignment(str(value))) for value in values)
+
+
+def _contains_command_executing_git_config(values: Sequence[str]) -> bool:
+    return any(_is_command_executing_git_config_key(_git_config_key_from_assignment(str(value))) for value in values)
+
+
+def _git_config_values_from_env(env: Optional[Mapping[str, str]]) -> list[str]:
+    if not env:
+        return []
+    values: list[str] = []
+    try:
+        count = int(str(env.get("GIT_CONFIG_COUNT") or "0"))
+    except ValueError:
+        count = 0
+    for index in range(max(count, 0)):
+        key = env.get(f"GIT_CONFIG_KEY_{index}")
+        if key:
+            value = env.get(f"GIT_CONFIG_VALUE_{index}", "")
+            values.append(f"{key}={value}")
+    parameters = env.get("GIT_CONFIG_PARAMETERS")
+    if parameters:
+        values.append(str(parameters))
+    return values
+
+
+def _git_env_requests_external_diff(env: Optional[Mapping[str, str]]) -> bool:
+    return bool(env and str(env.get("GIT_EXTERNAL_DIFF") or "").strip())
+
+
+def _git_env_requests_pager(env: Optional[Mapping[str, str]]) -> bool:
+    if not env:
+        return False
+    return bool(str(env.get("GIT_PAGER") or "").strip() or str(env.get("PAGER") or "").strip())
+
+
+def _git_context_options(args: Sequence[str]) -> list[str]:
+    """Return safe repository-context global options to reuse for config preflight."""
+
+    context: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = str(args[index])
+        lower = arg.lower()
+        if arg == "--":
+            break
+        if arg == "-c" or lower == "--config-env":
+            index += 2
+            continue
+        if lower.startswith("--config-env=") or (arg.startswith("-c") and len(arg) > 2):
+            index += 1
+            continue
+        if arg == "-C":
+            if index + 1 < len(args):
+                context.extend([arg, str(args[index + 1])])
+            index += 2
+            continue
+        if arg.startswith("-C") and len(arg) > 2:
+            context.append(arg)
+            index += 1
+            continue
+        if lower in _GIT_CONTEXT_OPTIONS_WITH_VALUES:
+            if index + 1 < len(args):
+                context.extend([arg, str(args[index + 1])])
+            index += 2
+            continue
+        if lower.startswith(_GIT_CONTEXT_OPTIONS_WITH_ATTACHED_VALUES):
+            context.append(arg)
+            index += 1
+            continue
+        if lower in _GIT_GLOBAL_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if lower.startswith(_GIT_GLOBAL_OPTIONS_WITH_ATTACHED_VALUES) or arg.startswith("-"):
+            index += 1
+            continue
+        break
+    return context
+
+
+def _git_args_request_pager(args: Sequence[str]) -> bool:
+    requested = False
+    index = 0
+    while index < len(args):
+        text = str(args[index])
+        lower = text.lower()
+        if text == "--":
+            break
+        if text == "-P" or lower == "--no-pager":
+            return False
+        if text == "-p" or lower == "--paginate":
+            requested = True
+            index += 1
+            continue
+        if text == "-c" or lower == "--config-env" or text == "-C" or lower in _GIT_GLOBAL_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if lower.startswith("--config-env=") or text.startswith("-c") and len(text) > 2:
+            index += 1
+            continue
+        if text.startswith("-C") and len(text) > 2:
+            index += 1
+            continue
+        if lower.startswith(_GIT_GLOBAL_OPTIONS_WITH_ATTACHED_VALUES) or text.startswith("-"):
+            index += 1
+            continue
+        break
+    return requested
+
+
+def _git_subcommand_may_run_diff_driver(subcommand: Optional[str], args: Sequence[str]) -> bool:
+    if subcommand in {"diff", "diff-files", "diff-index", "diff-tree", "difftool"}:
+        return True
+    if subcommand == "show":
+        return not any(str(arg).lower() in {"--no-patch", "-s", "--quiet"} for arg in args)
+    if subcommand in {"log", "whatchanged"}:
+        return any(
+            str(arg) in {"-p", "-c"}
+            or str(arg).lower() in {"--patch", "--patch-with-stat", "--cc"}
+            or str(arg).lower().startswith(("-p", "--patch="))
+            for arg in args
+        )
+    return False
+
+
+def _git_config_non_option_tokens(args: Sequence[str]) -> tuple[list[str], set[str]]:
+    tokens: list[str] = []
+    modes: set[str] = set()
+    index = 0
+    while index < len(args):
+        arg = str(args[index])
+        lower = arg.lower()
+        if arg == "--":
+            tokens.extend(str(item) for item in args[index + 1:])
+            break
+        if lower in _GIT_CONFIG_EDITOR_OPTIONS:
+            modes.add("editor")
+            index += 1
+            continue
+        if lower in _GIT_CONFIG_READ_OPTIONS or lower.startswith("--get-"):
+            modes.add("read")
+            index += 1
+            continue
+        if lower in _GIT_CONFIG_REMOVE_OPTIONS:
+            modes.add("remove")
+            index += 1
+            continue
+        if lower in _GIT_CONFIG_WRITE_OPTIONS:
+            modes.add("write")
+            index += 1
+            continue
+        if lower in _GIT_CONFIG_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if any(lower.startswith(prefix + "=") for prefix in _GIT_CONFIG_OPTIONS_WITH_VALUES if prefix.startswith("--")):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        tokens.append(arg)
+        index += 1
+    return tokens, modes
+
+
+def _git_config_command_decision(args: Sequence[str], command: str) -> Optional[PolicyDecision]:
+    try:
+        config_index = next(index for index, arg in enumerate(args) if str(arg).lower() == "config")
+    except StopIteration:
+        return None
+    config_args = args[config_index + 1:]
+    tokens, modes = _git_config_non_option_tokens(config_args)
+    if "editor" in modes:
+        return _decision("Git config editor execution", command)
+    if _contains_sensitive_git_config(tokens):
+        return _decision("unsafe Git credential or transport configuration", command)
+    command_keys = [token for token in tokens if _is_command_executing_git_config_key(_git_config_key_from_assignment(token))]
+    if not command_keys:
+        return None
+    if "remove" in modes and "write" not in modes:
+        return None
+    if "read" in modes and "write" not in modes and len(tokens) <= 1:
+        return None
+    if len(tokens) <= 1 and "write" not in modes:
+        # ``git config alias.name`` reads a key; writing requires a value or an explicit write option.
+        return None
+    return _decision(_GIT_COMMAND_EXECUTING_CONFIG_DESCRIPTION, command)
+
+
+def _git_query_env(env: Mapping[str, str]) -> dict[str, str]:
+    query_env = dict(env)
+    query_env.pop(POLICY_DISABLED_ENV, None)
+    query_env["PATH"] = _path_without_shim_dir(query_env)
+    query_env["GIT_TERMINAL_PROMPT"] = "0"
+    query_env["GCM_INTERACTIVE"] = "never"
+    query_env["GIT_PAGER"] = "cat"
+    query_env["PAGER"] = "cat"
+    return query_env
+
+
+def _run_git_config_query(
+    real_git: str,
+    context_args: Sequence[str],
+    query_args: Sequence[str],
+    env: Mapping[str, str],
+    popen_factory=None,
+) -> tuple[int, str]:
+    command = [real_git] + list(context_args) + ["config", "--includes"] + list(query_args)
+    query_env = _git_query_env(env)
+    if popen_factory is None:
+        import subprocess
+        completed = subprocess.run(command, env=query_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return completed.returncode, completed.stdout or ""
+    import subprocess as _query_subprocess
+    proc = popen_factory(command, env=query_env, text=True, stdout=_query_subprocess.PIPE, stderr=_query_subprocess.PIPE)
+    try:
+        stdout, _stderr = proc.communicate(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return 124, ""
+    return int(getattr(proc, "returncode", 1) or 0), stdout or ""
+
+
+def check_worker_reviewer_git_persisted_config(
+    tool: str,
+    argv: Sequence[str],
+    env: Optional[Mapping[str, str]] = None,
+    real_git: Optional[str] = None,
+    popen_factory=None,
+) -> Optional[PolicyDecision]:
+    """Detect persisted Git config that can execute commands before real git runs."""
+
+    source_env = env or os.environ
+    if not is_worker_reviewer_github_policy_enabled(source_env):
+        return None
+    if _strip_windows_suffix(tool) != "git":
+        return None
+    args = [str(arg) for arg in argv]
+    subcommand, _global_configs = _skip_git_global_options(args)
+    if not subcommand or subcommand == "config":
+        return None
+    command = _argv_command("git", args)
+    real = real_git or _find_real_tool(tool, source_env)
+    if not real:
+        return None
+    context_args = _git_context_options(args)
+
+    if subcommand not in _GIT_SAFE_LOCAL_SUBCOMMANDS:
+        code, value = _run_git_config_query(real, context_args, ["--get", f"alias.{subcommand}"], source_env, popen_factory=popen_factory)
+        if code == 0 and value.strip():
+            return _decision("persisted Git alias command execution", command)
+        return _decision("unrecognized Git subcommand that could execute an alias or external helper", command)
+
+    if _git_subcommand_may_run_diff_driver(subcommand, args):
+        code, value = _run_git_config_query(
+            real,
+            context_args,
+            ["--get-regexp", r"^(diff\.external|diff\..*\.(command|textconv)|difftool\..*\.(cmd|path))$"],
+            source_env,
+            popen_factory=popen_factory,
+        )
+        if code == 0 and value.strip():
+            return _decision("persisted command-executing Git diff configuration", command)
+
+    if _git_args_request_pager(args):
+        code, value = _run_git_config_query(
+            real,
+            context_args,
+            ["--get-regexp", r"^(core\.pager|pager\..*)$"],
+            source_env,
+            popen_factory=popen_factory,
+        )
+        if code == 0 and value.strip():
+            return _decision("persisted command-executing Git pager configuration", command)
+
+    if subcommand in {"difftool", "mergetool"}:
+        return _decision(_GIT_COMMAND_EXECUTING_CONFIG_DESCRIPTION, command)
+
+    return None
 
 
 def _next_non_option(args: Sequence[str], start: int = 0) -> Optional[str]:
@@ -714,10 +1137,17 @@ def check_worker_reviewer_github_argv(
 
     if canonical == "git":
         subcommand, global_configs = _skip_git_global_options(args)
-        if _contains_sensitive_git_config(global_configs):
+        env_configs = _git_config_values_from_env(env)
+        if _contains_sensitive_git_config([*global_configs, *env_configs]):
             return _decision("unsafe Git credential or transport configuration", command)
+        if _contains_command_executing_git_config([*global_configs, *env_configs]):
+            return _decision(_GIT_COMMAND_EXECUTING_CONFIG_DESCRIPTION, command)
         if subcommand in {"fetch", "pull", "push", "ls-remote"}:
             return _decision("upstream Git network operation", command)
+        if _git_env_requests_external_diff(env) and _git_subcommand_may_run_diff_driver(subcommand, args):
+            return _decision("command-executing Git diff environment", command)
+        if _git_env_requests_pager(env) and _git_args_request_pager(args):
+            return _decision("command-executing Git pager environment", command)
         if subcommand and subcommand.startswith("credential"):
             return _decision("Git credential helper access", command)
         if subcommand == "remote":
@@ -726,11 +1156,13 @@ def check_worker_reviewer_github_argv(
             except ValueError:
                 start = 0
             remote_subcommand = _next_non_option(args, start)
-            if remote_subcommand in {"update", "add", "set-url", "remove", "rename", "prune"}:
-                description = "upstream Git remote update" if remote_subcommand == "update" else "Git remote mutation"
+            if remote_subcommand in {"update", "add", "set-url", "remove", "rename", "prune", "show"}:
+                description = "upstream Git remote update" if remote_subcommand in {"update", "show"} else "Git remote mutation"
                 return _decision(description, command)
-        if subcommand == "config" and _contains_sensitive_git_config(args):
-            return _decision("unsafe Git credential or transport configuration", command)
+        if subcommand == "config":
+            decision = _git_config_command_decision(args, command)
+            if decision is not None:
+                return decision
         if subcommand == "clone" and _contains_github_endpoint(args):
             return _decision("GitHub clone from worker/reviewer shell", command)
         if subcommand == "submodule":
@@ -741,6 +1173,10 @@ def check_worker_reviewer_github_argv(
             submodule_action = _next_non_option(args, start)
             if submodule_action in {"update", "sync", "foreach"}:
                 return _decision("Git submodule upstream operation", command)
+        if subcommand in {"difftool", "mergetool"}:
+            return _decision(_GIT_COMMAND_EXECUTING_CONFIG_DESCRIPTION, command)
+        if subcommand and subcommand not in _GIT_SAFE_LOCAL_SUBCOMMANDS:
+            return _decision("unrecognized Git subcommand that could execute an alias or external helper", command)
         return None
 
     if canonical == "gh":
@@ -867,6 +1303,7 @@ try:
         SHIM_DIR_ENV as _SHIM_DIR_ENV,
         check_worker_reviewer_github_argv as _check_argv,
         check_worker_reviewer_github_command as _check_command,
+        check_worker_reviewer_git_persisted_config as _check_persisted_git_config,
         is_worker_reviewer_github_policy_enabled as _is_policy_enabled,
         worker_reviewer_github_child_env as _child_policy_env,
     )
@@ -878,6 +1315,7 @@ except Exception:  # pragma: no cover - fail closed only when import worked at g
     _SHIM_DIR_ENV = None
     _check_argv = None
     _check_command = None
+    _check_persisted_git_config = None
     _is_policy_enabled = None
     _child_policy_env = None
 
@@ -972,7 +1410,14 @@ def _policy_decision_for_args(args, kwargs_env=None):
         seq = list(args)
         if not seq:
             return None
-        return _check_argv(_os.fsdecode(seq[0]), [_os.fsdecode(item) for item in seq[1:]], env=env)
+        tool = _os.fsdecode(seq[0])
+        argv = [_os.fsdecode(item) for item in seq[1:]]
+        decision = _check_argv(tool, argv, env=env)
+        if decision is not None:
+            return decision
+        if _check_persisted_git_config is not None:
+            return _check_persisted_git_config(tool, argv, env=env, popen_factory=_real_popen)
+        return None
     except Exception:
         return None
 
@@ -1181,6 +1626,10 @@ def _main(argv: Sequence[str]) -> int:
     if not real:
         print(f"Symphony command policy shim could not locate the real executable for {tool!r} outside the shim PATH.", file=sys.stderr)
         return 127
+    persisted_decision = check_worker_reviewer_git_persisted_config(tool, tool_args, env=policy_env, real_git=real)
+    if persisted_decision is not None:
+        print(persisted_decision["message"], file=sys.stderr)
+        return 126
     if os.name == "nt":
         import subprocess
         return subprocess.call([real] + tool_args)
