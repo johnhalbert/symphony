@@ -42,9 +42,13 @@ describe("Hermes command policy profile hooks", () => {
 
   it("installs gateway/TUI pre_tool_call command-policy hooks for worker and reviewer profiles", async () => {
     const clients: FakeGatewayClient[] = [];
+    const verifications: unknown[] = [];
     const cliPath = path.join(root, "cli.js");
     const harness = new HermesHarness({
       cliPath,
+      commandPolicyHookVerifier: async (options) => {
+        verifications.push(options);
+      },
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
         clients.push(client);
@@ -71,9 +75,35 @@ describe("Hermes command policy profile hooks", () => {
     expectPolicyHook(workerConfig, { role: "worker", phase: "implementation", issueId: "issue-1", cliPath });
     expectPolicyHook(reviewerConfig, { role: "reviewer", phase: "review", issueId: "issue-1", cliPath });
     expectPolicyHook(mergeConflictConfig, { role: "worker", phase: "merge_conflict_resolution", issueId: "issue-1", cliPath });
+    expect(verifications).toHaveLength(3);
     expect(plannerConfig.hooks).toBeUndefined();
     expect(plannerConfig.hooks_auto_accept).toBeUndefined();
 
+    await harness.dispose();
+  });
+  it("fails closed before creating a gateway client when command-policy hook validation is unverifiable", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const cliPath = path.join(root, "cli.js");
+    const harness = new HermesHarness({
+      cliPath,
+      commandPolicyHookVerifier: async () => {
+        throw new Error("simulated hook registration failure");
+      },
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
+        clients.push(client);
+        return client;
+      },
+    });
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    await expect(
+      collect(harness.run(context(config, { workspacePath, role: "worker", runPhase: "implementation", turnNumber: 1 }), "worker")),
+    ).rejects.toThrow(/simulated hook registration failure/);
+
+    expect(clients).toHaveLength(0);
     await harness.dispose();
   });
 });
