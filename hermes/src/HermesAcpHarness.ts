@@ -221,6 +221,16 @@ interface NormalizedHermesAcpToolUpdate extends NormalizedHermesAcpSessionUpdate
   status: string | null;
 }
 
+interface HermesAcpToolIdentity {
+  toolKind: string | null;
+  title: string | null;
+  name: string | null;
+}
+
+interface HermesAcpSessionUpdateMappingOptions {
+  toolIdentities?: Map<string, HermesAcpToolIdentity>;
+}
+
 interface NormalizedHermesAcpPlanEntry {
   content: string;
   status: string | null;
@@ -349,6 +359,7 @@ export class HermesAcpHarness implements AgentHarness {
     let responseText = "";
     let pendingFinalUsageUpdateTokens: Partial<TokenCounts> | null = null;
     let activitySequence = 0;
+    const toolIdentities = new Map<string, HermesAcpToolIdentity>();
 
     const runActivityContext = (at: string, sequence: number, idScope?: string): HermesAcpRunActivityContext => ({
       runId,
@@ -372,7 +383,7 @@ export class HermesAcpHarness implements AgentHarness {
     const onSessionUpdate = (params: unknown): void => {
       const event = hermesAcpSessionUpdateEvent(params);
       if (!acceptAcpSessionEvent(event, activeRun.acpSessionId)) return;
-      const mappedEvents = mapHermesAcpSessionUpdateWithMetadata(event.update).map((mapped) =>
+      const mappedEvents = mapHermesAcpSessionUpdateWithMetadata(event.update, { toolIdentities }).map((mapped) =>
         withAcpSessionUpdateMetadata(mapped, event.sessionId, event.update),
       );
       responseText += hermesAcpAgentMessageDelta(event.update);
@@ -1772,7 +1783,10 @@ function normalizeModeUpdate(update: Record<string, unknown>): NormalizedHermesA
   };
 }
 
-function mapHermesAcpSessionUpdateWithMetadata(update: NormalizedHermesAcpSessionUpdate): HermesAcpMappedAgentEvent[] {
+function mapHermesAcpSessionUpdateWithMetadata(
+  update: NormalizedHermesAcpSessionUpdate,
+  options: HermesAcpSessionUpdateMappingOptions = {},
+): HermesAcpMappedAgentEvent[] {
   const diagnostics = mapSessionUpdateDiagnosticsWithMetadata(update);
   const raw = update.rawRecord;
   switch (update.category) {
@@ -1877,17 +1891,18 @@ function mapHermesAcpSessionUpdateWithMetadata(update: NormalizedHermesAcpSessio
     }
     case "tool": {
       if (!raw) return diagnostics;
-      if (update.kind === "tool_call") {
-        const message = `Hermes ACP tool started: ${formatToolUpdate(raw, "started")}`;
+      const toolUpdate = correlateToolIdentity(update, options.toolIdentities);
+      if (toolUpdate.kind === "tool_call") {
+        const message = `Hermes ACP tool started: ${formatNormalizedToolUpdate(toolUpdate, "started")}`;
         return [
           ...diagnostics,
-          mappedAgentEvent({ type: "progress", activitySource: "tool", message }, toolRunActivityMetadata(raw, message, "running", update)),
+          mappedAgentEvent({ type: "progress", activitySource: "tool", message }, toolRunActivityMetadata(raw, message, "running", toolUpdate)),
         ];
       }
-      const message = `Hermes ACP tool ${formatToolStatus(raw)}: ${formatToolUpdate(raw)}`;
+      const message = `Hermes ACP tool ${formatNormalizedToolStatus(toolUpdate)}: ${formatNormalizedToolUpdate(toolUpdate)}`;
       return [
         ...diagnostics,
-        mappedAgentEvent({ type: "progress", activitySource: "tool", message }, toolRunActivityMetadata(raw, message, null, update)),
+        mappedAgentEvent({ type: "progress", activitySource: "tool", message }, toolRunActivityMetadata(raw, message, null, toolUpdate)),
       ];
     }
     case "plan": {
@@ -1902,7 +1917,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: NormalizedHermesAcpSessio
             channel: "chat",
             kind: "plan_update",
             text: message,
-            payload: { entriesPreview: preview(raw.entries ?? raw, 1_000), ...acpSessionUpdatePreviewPayload(update) },
+            payload: { ...planRunActivityPayload(update, raw), ...acpSessionUpdatePreviewPayload(update) },
           },
         ),
       ];
@@ -2136,9 +2151,38 @@ function formatToolUpdate(update: Record<string, unknown>, defaultStatus?: strin
   return status ? `${title} (${status})` : title;
 }
 
-function formatToolStatus(update: Record<string, unknown>): string {
-  const toolCall = isRecord(update.toolCall) ? update.toolCall : isRecord(update.tool_call) ? update.tool_call : update;
-  return nonEmptyString(update.status) ?? nonEmptyString(toolCall.status) ?? "updated";
+function correlateToolIdentity(
+  update: NormalizedHermesAcpToolUpdate,
+  toolIdentities: Map<string, HermesAcpToolIdentity> | undefined,
+): NormalizedHermesAcpToolUpdate {
+  const callId = update.toolCallId;
+  if (!toolIdentities || !callId) return update;
+
+  const stored = toolIdentities.get(callId);
+  const correlated: NormalizedHermesAcpToolUpdate = {
+    ...update,
+    toolKind: update.toolKind ?? stored?.toolKind ?? null,
+    title: update.title ?? stored?.title ?? null,
+    name: update.name ?? stored?.name ?? stored?.title ?? null,
+  };
+
+  const nextIdentity: HermesAcpToolIdentity = {
+    toolKind: correlated.toolKind,
+    title: correlated.title,
+    name: correlated.name,
+  };
+  if (nextIdentity.toolKind || nextIdentity.title || nextIdentity.name) toolIdentities.set(callId, nextIdentity);
+  return correlated;
+}
+
+function formatNormalizedToolUpdate(update: NormalizedHermesAcpToolUpdate, defaultStatus?: string): string {
+  const title = update.title ?? update.name ?? update.toolKind ?? "tool update";
+  const status = update.status ?? defaultStatus;
+  return status ? `${title} (${status})` : title;
+}
+
+function formatNormalizedToolStatus(update: NormalizedHermesAcpToolUpdate): string {
+  return update.status ?? "updated";
 }
 
 function toolRunActivityMetadata(
@@ -2147,7 +2191,7 @@ function toolRunActivityMetadata(
   fallbackStatus: "running" | null,
   normalizedUpdate: NormalizedHermesAcpSessionUpdate = normalizeHermesAcpSessionUpdate(update),
 ): HermesAcpRunActivityMetadata {
-  const tool = toolDetailsFromUpdate(update);
+  const tool = toolDetailsFromUpdate(update, normalizedUpdate, fallbackStatus);
   const status = normalizedToolStatus(tool.status, fallbackStatus);
   const payload: Record<string, unknown> = {
     status,
@@ -2155,6 +2199,7 @@ function toolRunActivityMetadata(
   };
   if (tool.callId) payload.toolCallId = tool.callId;
   if (tool.name) payload.toolName = tool.name;
+  if (tool.toolKind) payload.toolKind = tool.toolKind;
   if (tool.title && tool.title !== tool.name) payload.toolTitle = tool.title;
   if (tool.inputPreview) payload.inputPreview = tool.inputPreview;
   if (tool.argsPreview) payload.argsPreview = tool.argsPreview;
@@ -2173,6 +2218,7 @@ function toolRunActivityMetadata(
 interface HermesAcpToolDetails {
   callId: string | null;
   name: string | null;
+  toolKind: string | null;
   title: string | null;
   status: string | null;
   inputPreview: string | null;
@@ -2182,9 +2228,15 @@ interface HermesAcpToolDetails {
   errorPreview: string | null;
 }
 
-function toolDetailsFromUpdate(update: Record<string, unknown>): HermesAcpToolDetails {
+function toolDetailsFromUpdate(
+  update: Record<string, unknown>,
+  normalizedUpdate: NormalizedHermesAcpSessionUpdate = normalizeHermesAcpSessionUpdate(update),
+  fallbackStatus: "running" | null = null,
+): HermesAcpToolDetails {
   const toolCall = isRecord(update.toolCall) ? update.toolCall : isRecord(update.tool_call) ? update.tool_call : {};
+  const normalizedToolUpdate = normalizedUpdate.category === "tool" ? normalizedUpdate : null;
   const callId = firstScalarString(
+    normalizedToolUpdate?.toolCallId,
     update.toolCallId,
     update.tool_call_id,
     update.callId,
@@ -2200,8 +2252,18 @@ function toolDetailsFromUpdate(update: Record<string, unknown>): HermesAcpToolDe
     toolCall.toolId,
     toolCall.tool_id,
   );
-  const title = firstScalarString(toolCall.title, update.title);
+  const title = firstScalarString(normalizedToolUpdate?.title, toolCall.title, update.title);
+  const toolKind = firstScalarString(
+    normalizedToolUpdate?.toolKind,
+    toolCall.kind,
+    update.kind,
+    toolCall.toolKind,
+    toolCall.tool_kind,
+    update.toolKind,
+    update.tool_kind,
+  );
   const name = firstScalarString(
+    normalizedToolUpdate?.name,
     toolCall.toolName,
     toolCall.tool_name,
     update.toolName,
@@ -2212,17 +2274,46 @@ function toolDetailsFromUpdate(update: Record<string, unknown>): HermesAcpToolDe
     update.tool,
     title,
   );
-  const status = firstScalarString(update.status, toolCall.status, update.state, toolCall.state, update.phase, toolCall.phase);
+  const status = firstScalarString(normalizedToolUpdate?.status, update.status, toolCall.status, update.state, toolCall.state, update.phase, toolCall.phase);
+  const normalizedStatus = normalizedToolStatus(status, fallbackStatus);
+  const content = firstPresent(toolCall.content, update.content);
+  const startContent = normalizedToolUpdate?.kind === "tool_call" ? content : undefined;
+  const updateContent = normalizedToolUpdate?.kind === "tool_call_update" ? content : undefined;
+  const outputContent = normalizedStatus === "failed" ? undefined : updateContent;
+  const errorContent = normalizedStatus === "failed" ? updateContent : undefined;
   return {
     callId,
     name,
+    toolKind,
     title,
     status,
-    inputPreview: previewIfPresent(firstPresent(toolCall.input, update.input, toolCall.parameters, update.parameters), 1_000),
+    inputPreview: previewIfPresent(
+      firstPresent(
+        toolCall.input,
+        update.input,
+        toolCall.rawInput,
+        update.rawInput,
+        toolCall.raw_input,
+        update.raw_input,
+        toolCall.parameters,
+        update.parameters,
+        startContent,
+      ),
+      1_000,
+    ),
     argsPreview: previewIfPresent(firstPresent(toolCall.args, update.args, toolCall.arguments, update.arguments), 1_000),
-    resultPreview: previewIfPresent(firstPresent(toolCall.result, update.result, toolCall.summary, update.summary), 1_000),
-    outputPreview: previewIfPresent(firstPresent(toolCall.output, update.output, toolCall.content, update.content, toolCall.message, update.message), 1_000),
-    errorPreview: previewIfPresent(firstPresent(toolCall.error, update.error, toolCall.errorMessage, update.errorMessage, toolCall.error_message, update.error_message), 1_000),
+    resultPreview: previewIfPresent(
+      firstPresent(toolCall.result, update.result, toolCall.rawResult, update.rawResult, toolCall.raw_result, update.raw_result, toolCall.summary, update.summary),
+      1_000,
+    ),
+    outputPreview: previewIfPresent(
+      firstPresent(toolCall.output, update.output, toolCall.rawOutput, update.rawOutput, toolCall.raw_output, update.raw_output, outputContent, toolCall.message, update.message),
+      1_000,
+    ),
+    errorPreview: previewIfPresent(
+      firstPresent(toolCall.error, update.error, toolCall.errorMessage, update.errorMessage, toolCall.error_message, update.error_message, errorContent),
+      1_000,
+    ),
   };
 }
 
@@ -2273,6 +2364,44 @@ function previewIfPresent(value: unknown, maxLength: number): string | null {
   return output.length > 0 ? output : null;
 }
 
+function planRunActivityPayload(update: NormalizedHermesAcpPlanUpdate, raw: Record<string, unknown>): Record<string, unknown> {
+  const entries = update.entries.slice(0, 20).map((entry, index) => ({
+    index,
+    contentPreview: preview(entry.content, 300),
+    status: normalizedPlanStatus(entry.status),
+    ...(entry.priority ? { priority: preview(entry.priority, 80) } : {}),
+  }));
+  return {
+    entriesPreview: preview(raw.entries ?? raw, 1_000),
+    entries,
+    statusCounts: planStatusCounts(update.entries),
+    activeEntries: update.entries
+      .filter((entry) => normalizedPlanStatus(entry.status) === "in_progress")
+      .slice(0, 5)
+      .map((entry) => preview(entry.content, 300)),
+  };
+}
+
+function planStatusCounts(entries: readonly NormalizedHermesAcpPlanEntry[]): Record<string, number> {
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    const status = normalizedPlanStatus(entry.status);
+    counts.set(status, (counts.get(status) ?? 0) + 1);
+  }
+  return Object.fromEntries(counts.entries());
+}
+
+function normalizedPlanStatus(status: string | null | undefined): string {
+  return toSnakeCase(nonEmptyString(status) ?? "pending") || "pending";
+}
+
+function planEntryContentPreview(entry: Record<string, unknown>, maxLength: number): string | null {
+  const content = nonEmptyString(entry.content) ?? nonEmptyString(entry.title);
+  if (content) return preview(content, maxLength);
+  const fallback = preview(entry, maxLength);
+  return fallback.length > 0 ? fallback : null;
+}
+
 function availableCommandNames(update: Record<string, unknown>): string[] {
   const rawCommands = Array.isArray(update.availableCommands)
     ? update.availableCommands
@@ -2292,10 +2421,10 @@ function formatPlanUpdate(update: Record<string, unknown>): string {
   const counts = new Map<string, number>();
   const active: string[] = [];
   for (const entry of entries) {
-    const status = toSnakeCase(nonEmptyString(entry.status) ?? "pending");
+    const status = normalizedPlanStatus(nonEmptyString(entry.status));
     counts.set(status, (counts.get(status) ?? 0) + 1);
     if (status === "in_progress") {
-      const content = nonEmptyString(entry.content) ?? nonEmptyString(entry.title);
+      const content = planEntryContentPreview(entry, 240);
       if (content) active.push(content);
     }
   }
