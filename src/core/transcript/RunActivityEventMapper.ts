@@ -205,7 +205,7 @@ function runActivityPatchFromHarnessMetadata(runActivity: RunActivityEvent | und
 }
 
 function isAssistantDeltaRunActivity(runActivity: RunActivityEvent): boolean {
-  return runActivity.actor === "assistant" && runActivity.channel === "chat" && (runActivity.kind === "assistant_message_delta" || runActivity.payload.delta === true);
+  return runActivity.actor === "assistant" && runActivity.channel === "chat" && runActivity.kind === "assistant_message_delta";
 }
 
 function isValidRunActivityEvent(value: unknown): value is RunActivityEvent {

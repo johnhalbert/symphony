@@ -584,12 +584,20 @@ describe("projectWebTranscript", () => {
         sequence: 2,
       }),
       event({
+        eventType: "user_message_submitted",
+        source: "harness",
+        message: "Do work",
+        payload: { kind: "user_message_submitted", actor: "user", channel: "chat", replay: true, textPreview: "Do work" },
+        at: "2026-01-01T00:00:01.500Z",
+        sequence: 3,
+      }),
+      event({
         eventType: "assistant_reasoning_delta",
         source: "harness",
         message: "Hermes ACP thought update",
-        payload: { kind: "assistant_reasoning_delta", actor: "assistant", channel: "message", messagePreview: "public thought preview" },
+        payload: { kind: "assistant_reasoning_delta", actor: "assistant", channel: "message", delta: true, reasoningPreview: "public thought preview" },
         at: "2026-01-01T00:00:02.000Z",
-        sequence: 3,
+        sequence: 4,
       }),
       event({
         eventType: "tool_call_started",
@@ -597,7 +605,7 @@ describe("projectWebTranscript", () => {
         message: "Hermes ACP tool started: terminal",
         payload: { kind: "tool_call_started", actor: "tool", channel: "tool", toolCallId: "call-1", toolName: "terminal", status: "running", inputPreview: 'cmd="npm test"' },
         at: "2026-01-01T00:00:03.000Z",
-        sequence: 4,
+        sequence: 5,
       }),
       event({
         eventType: "tool_call_completed",
@@ -605,7 +613,7 @@ describe("projectWebTranscript", () => {
         message: "Hermes ACP tool completed: terminal",
         payload: { kind: "tool_call_completed", actor: "tool", channel: "tool", toolCallId: "call-1", toolName: "terminal", status: "succeeded", outputPreview: "tests passed" },
         at: "2026-01-01T00:00:04.000Z",
-        sequence: 5,
+        sequence: 6,
       }),
       event({
         eventType: "token_usage_reported",
@@ -613,7 +621,7 @@ describe("projectWebTranscript", () => {
         message: "Token usage reported",
         payload: { kind: "token_usage_reported", actor: "runtime", channel: "token", inputTokens: 3, outputTokens: 5, totalTokens: 8 },
         at: "2026-01-01T00:00:05.000Z",
-        sequence: 6,
+        sequence: 7,
       }),
       event({
         eventType: "runtime_diagnostic",
@@ -621,7 +629,7 @@ describe("projectWebTranscript", () => {
         message: "ACP permission denied",
         payload: { kind: "runtime_diagnostic", actor: "runtime", channel: "status", code: "hermes_acp_permission_denied", messagePreview: "permission denied" },
         at: "2026-01-01T00:00:06.000Z",
-        sequence: 7,
+        sequence: 8,
       }),
       event({
         eventType: "run_cancelled",
@@ -629,7 +637,7 @@ describe("projectWebTranscript", () => {
         message: "Run cancelled",
         payload: { kind: "run_cancelled", actor: "runtime", channel: "terminal", reason: "run_cancelled" },
         at: "2026-01-01T00:00:07.000Z",
-        sequence: 8,
+        sequence: 9,
       }),
       event({
         eventType: "run_failed",
@@ -637,12 +645,13 @@ describe("projectWebTranscript", () => {
         message: "Run failed token=SECRET_FAILURE_TOKEN",
         payload: { kind: "run_failed", actor: "runtime", channel: "terminal", errorPreview: "Run failed token=SECRET_FAILURE_TOKEN", redacted: true },
         at: "2026-01-01T00:00:08.000Z",
-        sequence: 9,
+        sequence: 10,
       }),
     ]);
 
     expect(messages).toEqual([
       { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello world" },
+      { kind: "user", ts: "2026-01-01T00:00:01.500Z", from: "user", issue: "", text: "Do work" },
       { kind: "thinking", ts: "2026-01-01T00:00:02.000Z", text: "public thought preview" },
       {
         kind: "tool_call",

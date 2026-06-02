@@ -1778,7 +1778,28 @@ function mapHermesAcpSessionUpdateWithMetadata(update: NormalizedHermesAcpSessio
   switch (update.category) {
     case "message_chunk": {
       const text = update.text;
-      if (update.role === "user") return diagnostics;
+      if (update.role === "user") {
+        const message = "Hermes ACP user message replay";
+        return text.length > 0
+          ? [
+              ...diagnostics,
+              mappedAgentEvent(
+                { type: "progress", activitySource: "stream", message },
+                {
+                  actor: "user",
+                  channel: "chat",
+                  kind: "user_message_submitted",
+                  text,
+                  payload: {
+                    replay: true,
+                    messagePreview: preview(text, 1_000),
+                    ...acpSessionUpdatePreviewPayload(update),
+                  },
+                },
+              ),
+            ]
+          : diagnostics;
+      }
       if (update.role === "agent_thought") {
         const message = "Hermes ACP thought update";
         return [
