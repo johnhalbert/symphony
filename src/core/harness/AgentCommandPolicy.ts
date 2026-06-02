@@ -83,10 +83,39 @@ const SHELL_OR_WRAPPER_EXECUTABLES = new Set([
   "yarn",
   "zsh",
 ]);
+const COMMAND_TEXT_KEYS = ["command", "cmd", "code"] as const;
+const CREDENTIAL_ASSIGNMENT_KEY_PATTERN =
+  "[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL|API_KEY|ACCESS_KEY)[A-Z0-9_]*";
+const CREDENTIAL_ASSIGNMENT_WHOLE_QUOTED_PATTERN = new RegExp(
+  `(["'])\\b(${CREDENTIAL_ASSIGNMENT_KEY_PATTERN})=(?:\\\\.|(?!\\1).)*\\1`,
+  "gi",
+);
+const CREDENTIAL_ASSIGNMENT_QUOTED_VALUE_PATTERN = new RegExp(
+  `\\b(${CREDENTIAL_ASSIGNMENT_KEY_PATTERN})=(?!<redacted>)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`,
+  "gi",
+);
+const CREDENTIAL_ASSIGNMENT_UNQUOTED_VALUE_PATTERN = new RegExp(
+  `\\b(${CREDENTIAL_ASSIGNMENT_KEY_PATTERN})=(?!<redacted>)[^\\s]+`,
+  "gi",
+);
+
+export type AgentCommandPolicyCommandTextKey = (typeof COMMAND_TEXT_KEYS)[number];
+
+export type AgentCommandPolicyCommandTextExtraction =
+  | { status: "ok"; command: string }
+  | { status: "missing" }
+  | { status: "malformed"; key: AgentCommandPolicyCommandTextKey }
+  | { status: "ambiguous"; keys: AgentCommandPolicyCommandTextKey[] }
+  | { status: "mismatched"; key: AgentCommandPolicyCommandTextKey; expectedKey: AgentCommandPolicyCommandTextKey };
+
+type AgentCommandPolicyCommandTextFailure = Exclude<AgentCommandPolicyCommandTextExtraction, { status: "ok" }>;
 
 export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentCommandPolicyDecision {
-  const command = commandTextFromRawInput(input.rawInput);
-  const baseAudit = auditBase(input, command ?? undefined);
+  const commandExtraction = extractAgentCommandPolicyCommandText(input.rawInput, input.surface);
+  const baseAudit = auditBase(
+    input,
+    commandExtraction.status === "ok" ? commandExtraction.command : undefined,
+  );
 
   if (!isRestrictedAgentRole(input.role)) {
     return allowDecision(input, {
@@ -96,7 +125,23 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
     }, "role_not_restricted", "role_not_restricted", "Agent command policy is not applied to this role.");
   }
 
-  if (command === null || command.trim().length === 0) {
+  if (commandExtraction.status !== "ok") {
+    const commandClass = commandInputFailureCommandClass(commandExtraction);
+    return denyDecision(
+      input,
+      {
+        ...baseAudit,
+        commandClass,
+        upstreamContactAttempted: false,
+      },
+      commandInputFailureReasonKind(commandExtraction),
+      commandClass,
+      commandInputFailureMessage(commandExtraction),
+    );
+  }
+
+  const command = commandExtraction.command;
+  if (command.trim().length === 0) {
     return denyDecision(
       input,
       {
@@ -228,8 +273,16 @@ export function environmentKeysOnly(environment: Record<string, string | undefin
 export function redactedCommandPreview(command: string, maxLength = 240): string {
   const redacted = command
     .replace(/(https?:\/\/)([^\s/@]+)@github\.com/gi, "$1<redacted>@github.com")
-    .replace(/\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*)=([^\s]+)/gi, "$1=<redacted>")
-    .replace(/\b(?:ghp|github_pat)_[A-Za-z0-9_]+/g, "<redacted-github-token>");
+    .replace(CREDENTIAL_ASSIGNMENT_WHOLE_QUOTED_PATTERN, (_match: string, quote: string, key: string) => {
+      return `${quote}${key}=<redacted>${quote}`;
+    })
+    .replace(CREDENTIAL_ASSIGNMENT_QUOTED_VALUE_PATTERN, (_match: string, key: string) => {
+      return `${key}=<redacted>`;
+    })
+    .replace(CREDENTIAL_ASSIGNMENT_UNQUOTED_VALUE_PATTERN, (_match: string, key: string) => {
+      return `${key}=<redacted>`;
+    })
+    .replace(/\b(?:ghp|github_pat)_[A-Za-z0-9_.-]+/g, "<redacted-github-token>");
   return redacted.length <= maxLength ? redacted : `${redacted.slice(0, maxLength - 1)}…`;
 }
 
@@ -369,12 +422,66 @@ function isRestrictedAgentRole(role: string): boolean {
   return RESTRICTED_ROLES.has(role);
 }
 
-function commandTextFromRawInput(rawInput: Record<string, unknown>): string | null {
-  for (const key of ["command", "cmd", "code"] as const) {
-    const value = rawInput[key];
-    if (typeof value === "string") return value;
+export function extractAgentCommandPolicyCommandText(
+  rawInput: Record<string, unknown>,
+  surface: string,
+): AgentCommandPolicyCommandTextExtraction {
+  const presentKeys = COMMAND_TEXT_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(rawInput, key));
+  if (presentKeys.length === 0) return { status: "missing" };
+  if (presentKeys.length > 1) return { status: "ambiguous", keys: [...presentKeys] };
+
+  const key = presentKeys[0];
+  if (key === undefined) return { status: "missing" };
+  const value = rawInput[key];
+  if (typeof value !== "string") return { status: "malformed", key };
+
+  const expectedKey = expectedCommandTextKeyForSurface(surface);
+  if (expectedKey !== null && key !== expectedKey) {
+    return { status: "mismatched", key, expectedKey };
+  }
+
+  return { status: "ok", command: value };
+}
+
+function expectedCommandTextKeyForSurface(surface: string): AgentCommandPolicyCommandTextKey | null {
+  const normalized = surface.trim().toLowerCase().replace(/[-\s]+/g, "_");
+  if (normalized === "execute_code" || normalized === "code_execution") return "code";
+  if (normalized === "terminal" || normalized === "terminal_execute" || normalized === "execute" || normalized === "shell") {
+    return "command";
   }
   return null;
+}
+
+function commandInputFailureReasonKind(
+  failure: AgentCommandPolicyCommandTextFailure,
+): Extract<AgentCommandPolicyReasonKind, "ambiguous_command" | "malformed_command"> {
+  return failure.status === "ambiguous" ? "ambiguous_command" : "malformed_command";
+}
+
+function commandInputFailureCommandClass(failure: AgentCommandPolicyCommandTextFailure): string {
+  switch (failure.status) {
+    case "ambiguous":
+      return "ambiguous_command_input";
+    case "mismatched":
+      return "mismatched_command_input";
+    case "malformed":
+      return "malformed_command_input";
+    case "missing":
+      return "malformed_command";
+  }
+}
+
+function commandInputFailureMessage(failure: AgentCommandPolicyCommandTextFailure): string {
+  switch (failure.status) {
+    case "ambiguous":
+      return `Blocked worker/reviewer command: command-capable hook payload included multiple command-bearing fields (${failure.keys.join(", ")}) and cannot be safely classified. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.`;
+    case "mismatched":
+      return `Blocked worker/reviewer command: command-capable hook payload used '${failure.key}' for a tool surface that requires '${failure.expectedKey}'. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.`;
+    case "malformed":
+      return `Blocked worker/reviewer command: command-capable hook payload field '${failure.key}' was not a command string. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.`;
+    case "missing":
+      return "Blocked worker/reviewer command: command-capable hook payload did not include a command string. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.";
+  }
 }
 
 function tokenizeCommandPreview(command: string): string[] {

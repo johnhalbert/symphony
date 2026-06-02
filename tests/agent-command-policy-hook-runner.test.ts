@@ -73,6 +73,67 @@ describe("AgentCommandPolicyHookRunner", () => {
     expect(evaluation.stdout).toBe("");
   });
 
+  it.each([
+    { name: "command and cmd", toolInput: { command: "git status --short", cmd: "gh pr create" } },
+    { name: "command and code", toolInput: { command: "git status --short", code: "gh pr create" } },
+    { name: "cmd and code", toolInput: { cmd: "git status --short", code: "gh pr create" } },
+    { name: "string command and non-string code", toolInput: { command: "git status --short", code: ["gh pr create"] } },
+    { name: "non-string command and string code", toolInput: { command: ["git status --short"], code: "git status --short" } },
+  ])("fails closed for ambiguous command-bearing hook payloads ($name)", async ({ toolInput }) => {
+    const evaluation = await evaluateAgentCommandPolicyHookPayload(JSON.stringify(hermesPayload(toolInput)), {
+      role: "worker",
+      phase: "implementation",
+    });
+
+    expect(evaluation.policyInput).toMatchObject({
+      role: "worker",
+      phase: "implementation",
+      surface: "terminal",
+      rawInput: toolInput,
+    });
+    expect(evaluation.decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "ambiguous_command",
+      commandClass: "ambiguous_command_input",
+    });
+    expect(evaluation.decision.audit.commandPreview).toBeUndefined();
+    expect(evaluation.hookResponse?.action).toBe("block");
+    expect(JSON.parse(evaluation.stdout) as unknown).toMatchObject({
+      action: "block",
+      message: expect.stringContaining("multiple command-bearing fields") as string,
+    });
+    expect(JSON.stringify(evaluation.decision.audit)).not.toContain("gh pr create");
+  });
+
+  it.each([
+    {
+      name: "terminal payload with code instead of command",
+      payload: hermesPayload({ code: "git status --short" }),
+      expectedKey: "command",
+    },
+    {
+      name: "execute_code payload with command instead of code",
+      payload: hermesPayload({ command: "git status --short" }, { toolName: "execute_code" }),
+      expectedKey: "code",
+    },
+  ])("fails closed for mismatched tool name and raw-input shape ($name)", async ({ payload, expectedKey }) => {
+    const evaluation = await evaluateAgentCommandPolicyHookPayload(JSON.stringify(payload), {
+      role: "reviewer",
+      phase: "review",
+    });
+
+    expect(evaluation.decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "malformed_command",
+      commandClass: "mismatched_command_input",
+    });
+    expect(evaluation.hookResponse?.action).toBe("block");
+    expect(JSON.parse(evaluation.stdout) as unknown).toMatchObject({
+      action: "block",
+      message: expect.stringContaining(`requires '${expectedKey}'`) as string,
+    });
+  });
+
   it("fails closed with block JSON for malformed hook payloads before policy classification", async () => {
     const evaluation = await evaluateAgentCommandPolicyHookPayload("{not-json", {
       role: "worker",
@@ -197,24 +258,36 @@ describe("AgentCommandPolicyHookRunner", () => {
 
   it("redacts credential values from default policy audit previews and hook stdout", async () => {
     const ambientSecret = "ambient-secret-value";
+    const ambientApiSecret = "ambient-api-secret-value";
     const inlineSecret = "inline-secret-value";
+    const openAiApiKey = "openai-api-key-value";
+    const awsAccessKey = "aws-access-key-value";
+    const quotedAccessKey = "quoted-access-key-value";
     const urlSecret = "url-secret-value";
-    const githubToken = "ghp_SECRET123456789";
+    const githubToken = "ghp_SECRET12345";
     const evaluation = await evaluateAgentCommandPolicyHookPayload(
       JSON.stringify(
         hermesPayload({
-          command: `GITHUB_TOKEN=${inlineSecret} git ls-remote https://${urlSecret}@github.com/org/repo.git ${githubToken}`,
+          command: [
+            `GITHUB_TOKEN=${inlineSecret}`,
+            `OPENAI_API_KEY=${openAiApiKey}`,
+            `AWS_ACCESS_KEY_ID="${awsAccessKey}"`,
+            `'ACCESS_KEY_ID=${quotedAccessKey}'`,
+            `git ls-remote https://${urlSecret}@github.com/org/repo.git`,
+            githubToken,
+          ].join(" "),
         }),
       ),
       {
         role: "worker",
         phase: "implementation",
-        environment: { GITHUB_TOKEN: ambientSecret, PATH: "/bin" },
+        environment: { GITHUB_TOKEN: ambientSecret, OPENAI_API_KEY: ambientApiSecret, PATH: "/bin" },
       },
     );
 
-    expect(evaluation.policyInput?.environment).toEqual({ keysOnly: ["GITHUB_TOKEN", "PATH"] });
+    expect(evaluation.policyInput?.environment).toEqual({ keysOnly: ["GITHUB_TOKEN", "OPENAI_API_KEY", "PATH"] });
     expect(JSON.stringify(evaluation.policyInput?.environment)).not.toContain(ambientSecret);
+    expect(JSON.stringify(evaluation.policyInput?.environment)).not.toContain(ambientApiSecret);
     expect(evaluation.decision).toMatchObject({
       outcome: "deny",
       reasonKind: "github_host_reference",
@@ -223,23 +296,40 @@ describe("AgentCommandPolicyHookRunner", () => {
     expect(evaluation.hookResponse?.action).toBe("block");
 
     const stdoutJson = JSON.stringify(evaluation.hookResponse);
-    for (const secret of [ambientSecret, inlineSecret, urlSecret, githubToken]) {
+    for (const secret of [
+      ambientSecret,
+      ambientApiSecret,
+      inlineSecret,
+      openAiApiKey,
+      awsAccessKey,
+      quotedAccessKey,
+      urlSecret,
+      githubToken,
+    ]) {
       expect(evaluation.stdout).not.toContain(secret);
       expect(stdoutJson).not.toContain(secret);
       expect(JSON.stringify(evaluation.decision.audit)).not.toContain(secret);
     }
 
-    expect(evaluation.decision.audit.inlineEnvironmentKeys).toEqual(["GITHUB_TOKEN"]);
+    expect(evaluation.decision.audit.inlineEnvironmentKeys).toEqual([
+      "ACCESS_KEY_ID",
+      "AWS_ACCESS_KEY_ID",
+      "GITHUB_TOKEN",
+      "OPENAI_API_KEY",
+    ]);
     expect(evaluation.decision.audit.commandPreview).toContain("GITHUB_TOKEN=<redacted>");
+    expect(evaluation.decision.audit.commandPreview).toContain("OPENAI_API_KEY=<redacted>");
+    expect(evaluation.decision.audit.commandPreview).toContain("AWS_ACCESS_KEY_ID=<redacted>");
+    expect(evaluation.decision.audit.commandPreview).toContain("'ACCESS_KEY_ID=<redacted>'");
     expect(evaluation.decision.audit.commandPreview).toContain("https://<redacted>@github.com");
     expect(evaluation.decision.audit.commandPreview).toContain("<redacted-github-token>");
   });
 });
 
-function hermesPayload(toolInput: Record<string, unknown>) {
+function hermesPayload(toolInput: Record<string, unknown>, options: { toolName?: string } = {}) {
   return {
     hook_event_name: "pre_tool_call",
-    tool_name: "terminal",
+    tool_name: options.toolName ?? "terminal",
     tool_input: toolInput,
     session_id: "test-session",
     cwd: "/repo/worktree",
