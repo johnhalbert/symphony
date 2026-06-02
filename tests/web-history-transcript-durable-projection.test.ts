@@ -37,14 +37,16 @@ describe("web history/transcript durable projection writes", () => {
       transcriptPageLimit: 2,
     });
 
-    expect(result).toMatchObject({ attempted: 3, written: 3, unchanged: 0, skipped: 0, failed: 0 });
+    expect(result).toMatchObject({ attempted: 4, written: 4, unchanged: 0, skipped: 0, failed: 0 });
     expect(result.entries.map((entry) => [entry.projectionName, entry.scopeKey, entry.status])).toEqual([
       ["history_projection", "global:session:1:timeline:5", "written"],
+      ["transcript_projection", "run-1:offset:0:limit:500", "written"],
       ["transcript_projection", "run-1:offset:0:limit:2", "written"],
       ["transcript_projection", "run-1:offset:2:limit:2", "written"],
     ]);
     expect(projectionWriter.writes.map((write) => write.projectionName)).toEqual([
       "history_projection",
+      "transcript_projection",
       "transcript_projection",
       "transcript_projection",
     ]);
@@ -55,10 +57,15 @@ describe("web history/transcript durable projection writes", () => {
     });
     expect(projectionWriter.writes[1]).toMatchObject({
       projectionName: "transcript_projection",
+      scopeKey: "run-1:offset:0:limit:500",
+      fields: { runId: "run-1", sessionId: "session-1", offsetStart: 0, offsetLimit: 500, nextOffset: null },
+    });
+    expect(projectionWriter.writes[2]).toMatchObject({
+      projectionName: "transcript_projection",
       scopeKey: "run-1:offset:0:limit:2",
       fields: { runId: "run-1", sessionId: "session-1", offsetStart: 0, offsetLimit: 2, nextOffset: 2 },
     });
-    expect(projectionWriter.writes[2]).toMatchObject({
+    expect(projectionWriter.writes[3]).toMatchObject({
       projectionName: "transcript_projection",
       scopeKey: "run-1:offset:2:limit:2",
       fields: { runId: "run-1", sessionId: "session-1", offsetStart: 2, offsetLimit: 2, nextOffset: null },
@@ -233,28 +240,23 @@ describe("web history/transcript durable projection writes", () => {
 
   it("rebuilds representative durable projection rows from source-table transcript data after rows are cleared", async () => {
     const projectionWriter = statefulProjectionWriter();
-    const run = runFixture({ runId: "run-parity", sessionId: "session-parity", transcriptEventCount: 2 });
+    const run = runFixture({ runId: "run-parity", sessionId: "session-parity", transcriptEventCount: 1_200 });
     const runActivitySourceStore = new InMemoryRunActivityAppendStore();
-    const appended = await runActivitySourceStore.appendEvents([
-      runActivityInputFixture({
-        id: "activity-parity-1",
-        runId: run.runId,
-        sessionId: run.sessionId,
-        sequence: 1,
-        at: "2026-01-01T00:00:01.000Z",
-        text: "first durable source message",
-        payload: { messagePreview: "first durable source message" },
+    const appended = await runActivitySourceStore.appendEvents(
+      Array.from({ length: 1_200 }, (_, index) => {
+        const sequence = index + 1;
+        const text = `durable source message ${sequence}`;
+        return runActivityInputFixture({
+          id: `activity-parity-${sequence}`,
+          runId: run.runId,
+          sessionId: run.sessionId,
+          sequence,
+          at: new Date(Date.UTC(2026, 0, 1, 0, 0, sequence)).toISOString(),
+          text,
+          payload: { messagePreview: text },
+        });
       }),
-      runActivityInputFixture({
-        id: "activity-parity-2",
-        runId: run.runId,
-        sessionId: run.sessionId,
-        sequence: 2,
-        at: "2026-01-01T00:00:02.000Z",
-        text: "second durable source message",
-        payload: { messagePreview: "second durable source message" },
-      }),
-    ]);
+    );
     expect(appended.rejected).toEqual([]);
     const transcriptEvents = appended.accepted.map((result) =>
       mapRunActivityEventToTranscriptEvent(result.event, { runId: run.runId }),
@@ -298,10 +300,12 @@ describe("web history/transcript durable projection writes", () => {
         await getJson(`${baseUrl}/api/v1/web/issues`),
         await getJson(`${baseUrl}/api/v1/web/sidebar`),
         await getJson(`${baseUrl}/api/v1/web/history?sessionLimit=1&timelineLimit=5`),
-        await getJson(`${baseUrl}/api/v1/web/sessions/session-parity/transcript?offset=0&limit=2`),
+        await getJson(`${baseUrl}/api/v1/web/sessions/session-parity/transcript`),
+        await getJson(`${baseUrl}/api/v1/web/sessions/session-parity/transcript?offset=0&limit=1000`),
+        await getJson(`${baseUrl}/api/v1/web/sessions/session-parity/transcript?offset=1000&limit=1000`),
         await getJson(`${baseUrl}/api/v1/web/orchestrator-chat`),
       ];
-      expect(liveResponses.map(({ response }) => response.status)).toEqual([200, 200, 200, 200, 200, 200]);
+      expect(liveResponses.map(({ response }) => response.status)).toEqual([200, 200, 200, 200, 200, 200, 200, 200]);
       const liveRows = projectionRowsByKey(projectionWriter.currentRows());
       expect(projectionNames(liveRows)).toEqual([
         "dashboard_projection",
@@ -318,13 +322,14 @@ describe("web history/transcript durable projection writes", () => {
       const result = await server.rebuildDurableWebProjections({
         forceRefresh: false,
         historyLimits: { sessionLimit: 1, timelineLimit: 5 },
-        transcriptPageLimit: 2,
+        transcriptPageLimit: 1_000,
       });
 
-      expect(result).toMatchObject({ attempted: 6, written: 6, unchanged: 0, skipped: 0, failed: 0 });
+      expect(result).toMatchObject({ attempted: 8, written: 8, unchanged: 0, skipped: 0, failed: 0 });
       expect(rawTranscriptReads).toBe(rawReadsBeforeRebuild);
       const rebuiltRows = projectionRowsByKey(projectionWriter.currentRows());
       expect([...rebuiltRows.keys()].sort()).toEqual([...liveRows.keys()].sort());
+      expect(rebuiltRows.has("transcript_projection::run_page::run-parity:offset:700:limit:500")).toBe(true);
       for (const [key, liveRow] of liveRows) {
         expect(rebuiltRows.get(key)).toEqual(liveRow);
       }
@@ -467,6 +472,7 @@ function runStoreFixture(options: {
       return { runId, offset, limit, nextOffset, events: page };
     },
     async readTranscriptTail(runId: string, input: { limit?: number } = {}) {
+      options.beforeReadTranscript?.();
       const limit = input.limit ?? 100;
       const events = [...(transcriptEventsByRunId.get(runId) ?? [])];
       const offset = Math.max(0, events.length - limit);

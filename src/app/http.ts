@@ -54,7 +54,10 @@ import {
   type TranscriptEvent,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
-import type { RunActivityEventSourceStore } from "../core/persistence/RunActivityAppendStore.js";
+import type {
+  RunActivityEventsPage,
+  RunActivityEventSourceStore,
+} from "../core/persistence/RunActivityAppendStore.js";
 import { mapRunActivityEventToTranscriptEvent } from "../core/transcript/RunActivityEventMapper.js";
 import {
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
@@ -1319,12 +1322,28 @@ export class StatusServer {
     }
 
     for (const run of runs) {
+      const recordedScopeKeys = new Set<string>();
+      try {
+        const tailPage = await this.readTranscriptProjectionSourceTail(run, {
+          limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT,
+        });
+        await this.recordWebTranscriptProjectionRebuildPage(run, tailPage, entries, recordedScopeKeys);
+      } catch (error) {
+        entries.push({
+          projectionName: "transcript_projection",
+          scopeKind: "run_page",
+          scopeKey: `${run.runId}:tail:limit:${WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT}`,
+          status: "failed",
+          revision: null,
+          reason: publicDiagnosticText(errorMessage(error)),
+        });
+      }
+
       let offset = 0;
       try {
         do {
           const page = await this.readTranscriptProjectionSourcePage(run, { offset, limit: pageLimit });
-          const transcript = projectWebTranscript(page.events, { run });
-          await this.recordProjectionRebuildEntry(this.webTranscriptProjectionWriteInput(run, page, transcript), entries);
+          await this.recordWebTranscriptProjectionRebuildPage(run, page, entries, recordedScopeKeys);
           if (page.nextOffset === null) break;
           if (page.nextOffset <= offset) {
             entries.push({
@@ -1350,6 +1369,33 @@ export class StatusServer {
         });
       }
     }
+  }
+
+  private async recordWebTranscriptProjectionRebuildPage(
+    run: RunRecord,
+    page: TranscriptPage,
+    entries: StatusServerProjectionRebuildEntry[],
+    recordedScopeKeys: Set<string>,
+  ): Promise<void> {
+    const scopeKey = transcriptProjectionScopeKey(run, page);
+    if (recordedScopeKeys.has(scopeKey)) return;
+    recordedScopeKeys.add(scopeKey);
+    const transcript = projectWebTranscript(page.events, { run });
+    await this.recordProjectionRebuildEntry(this.webTranscriptProjectionWriteInput(run, page, transcript), entries);
+  }
+
+  private async readTranscriptProjectionSourceTail(
+    run: RunRecord,
+    options: { limit: number },
+  ): Promise<TranscriptPage> {
+    const durablePage = this.options.runActivitySourceStore
+      ? await readRunActivityTranscriptTail(this.options.runActivitySourceStore, run, options)
+      : null;
+    if (durablePage !== null) return durablePage;
+
+    const runStore = this.options.runStore;
+    if (!runStore) throw new SymphonyError("invalid_request", "Run transcript store is not configured");
+    return runStore.readTranscriptTail(run.runId, options);
   }
 
   private async readTranscriptProjectionSourcePage(
@@ -2317,6 +2363,24 @@ async function readRunActivityTranscriptPage(
 ): Promise<TranscriptPage | null> {
   const sourcePage = await sourceStore.readRunEvents(run.runId, options);
   if (sourcePage.total === 0) return null;
+  return runActivityEventsPageToTranscriptPage(sourcePage, run);
+}
+
+async function readRunActivityTranscriptTail(
+  sourceStore: RunActivityEventSourceStore,
+  run: RunRecord,
+  options: { limit: number },
+): Promise<TranscriptPage | null> {
+  const sourceHead = await sourceStore.readRunEvents(run.runId, { offset: 0, limit: 1 });
+  if (sourceHead.total === 0) return null;
+  const offset = Math.max(0, sourceHead.total - options.limit);
+  return runActivityEventsPageToTranscriptPage(
+    await sourceStore.readRunEvents(run.runId, { offset, limit: options.limit }),
+    run,
+  );
+}
+
+function runActivityEventsPageToTranscriptPage(sourcePage: RunActivityEventsPage, run: RunRecord): TranscriptPage {
   return {
     runId: run.runId,
     offset: sourcePage.offset,
