@@ -130,7 +130,7 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage | 
   if (isLegacyAcpProtocolEvent(eventType)) {
     return { ...projectStatusMessage(event, payload, "runtime_diagnostic"), state: "runtime_diagnostic" };
   }
-  if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
+  if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: thinkingText(event, payload) };
   if (isTaskEvent(eventType, payloadKind)) return projectTaskMessage(event, payload);
   if (isRequestEvent(eventType, payloadKind)) return projectRequestMessage(event, payload);
   if (isUserEvent(eventType, payloadKind)) return projectUserMessage(event, payload);
@@ -402,7 +402,16 @@ function isRequestEvent(eventType: string, payloadKind: string | null): boolean 
 }
 
 function isUserEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType === "user" || eventType === "prompt" || eventType === "user_prompt" || payloadKind === "user";
+  return (
+    eventType === "user" ||
+    eventType === "prompt" ||
+    eventType === "user_prompt" ||
+    eventType === "user_message_submitted" ||
+    eventType === "user_message_chunk" ||
+    payloadKind === "user" ||
+    payloadKind === "user_message_submitted" ||
+    payloadKind === "user_message_chunk"
+  );
 }
 
 function isSystemEvent(eventType: string, payloadKind: string | null): boolean {
@@ -688,6 +697,21 @@ function eventText(event: TranscriptEvent, payload: Record<string, unknown>): st
   return (
     firstCleanString(payload.textPreview, payload.summary, payload.messagePreview, payload.text, payload.message, event.message) ??
     event.eventType
+  );
+}
+
+function thinkingText(event: TranscriptEvent, payload: Record<string, unknown>): string {
+  return (
+    firstCleanString(
+      payload.summary,
+      payload.reasoningPreview,
+      payload.thoughtPreview,
+      payload.messagePreview,
+      payload.textPreview,
+      payload.text,
+      payload.message,
+      event.message,
+    ) ?? event.eventType
   );
 }
 

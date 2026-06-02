@@ -652,7 +652,9 @@ describe("HermesAcpHarness", () => {
     expect(mapHermesAcpSessionUpdate({ session_update: "agent_thought_chunk", content: { type: "text", text: "private" } })).toEqual([
       { type: "progress", activitySource: "stream", message: "Hermes ACP thought update" },
     ]);
-    expect(mapHermesAcpSessionUpdate({ sessionUpdate: "user_message_chunk", content: "do not echo user replay" })).toEqual([]);
+    expect(mapHermesAcpSessionUpdate({ sessionUpdate: "user_message_chunk", content: "do not echo user replay" })).toEqual([
+      { type: "progress", activitySource: "stream", message: "Hermes ACP user message replay" },
+    ]);
     expect(mapHermesAcpSessionUpdate({ sessionUpdate: "usage_update", used: 42, size: 200 })).toEqual([
       { type: "progress", activitySource: "stream", message: "Hermes ACP usage update: 42/200 context tokens" },
     ]);
@@ -702,6 +704,7 @@ describe("HermesAcpHarness", () => {
     const client = new FakeAcpClient();
     client.promptNotificationParams = [
       { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "Do work" } } },
       { sessionId: "acp-session-1", update: { session_update: "agent_thought_chunk", content: { type: "text", text: "private" } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "tool_call", toolCall: { title: "terminal", status: "pending" } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "tool_call_update", toolCall: { title: "terminal" }, status: "completed" } },
@@ -721,11 +724,12 @@ describe("HermesAcpHarness", () => {
       "progress",
       "progress",
       "progress",
+      "progress",
       "tokens",
       "completed",
     ]);
     expect(activities.every(Boolean)).toBe(true);
-    expect(activities.map((activity) => activity?.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(activities.map((activity) => activity?.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(activities[0]).toMatchObject({
       protocol: "acp",
       harness: "hermes_acp",
@@ -747,6 +751,15 @@ describe("HermesAcpHarness", () => {
           kind: "assistant_message_delta",
           text: "hello",
           payload: expect.objectContaining({ updateKind: "agent_message_chunk", updateCategory: "message_chunk" }),
+        }),
+        expect.objectContaining({
+          protocol: "acp",
+          harness: "hermes_acp",
+          actor: "user",
+          channel: "chat",
+          kind: "user_message_submitted",
+          text: "Do work",
+          payload: expect.objectContaining({ replay: true, updateKind: "user_message_chunk", updateCategory: "message_chunk" }),
         }),
         expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "assistant", channel: "chat", kind: "assistant_reasoning_delta" }),
         expect.objectContaining({
@@ -776,7 +789,7 @@ describe("HermesAcpHarness", () => {
         expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "runtime", channel: "terminal", kind: "run_succeeded", text: "hello" }),
       ]),
     );
-    expect(activities.map((activity) => activity?.kind)).not.toEqual(expect.arrayContaining(["agent_message_chunk", "agent_thought_chunk", "tool_call", "usage_update"]));
+    expect(activities.map((activity) => activity?.kind)).not.toEqual(expect.arrayContaining(["agent_message_chunk", "agent_thought_chunk", "user_message_chunk", "tool_call", "usage_update"]));
   });
 
   it("streams active ACP session updates with projection-compatible normalized run activity", async () => {
