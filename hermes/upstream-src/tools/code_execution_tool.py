@@ -859,12 +859,16 @@ def _execute_remote(
     rpc_thread = None
 
     try:
-        # Verify Python is available on the remote
-        py_check = env.execute(
-            "command -v python3 >/dev/null 2>&1 && echo OK",
-            cwd="/", timeout=15,
+        # Resolve Python before policy shims are added to PATH.  The top-level
+        # trusted execute_code script must run under the real interpreter with
+        # sitecustomize loaded; only child interpreters/tools should pass
+        # through the worker/reviewer policy shims.
+        py_check = env.execute("command -v python3", cwd="/", timeout=15)
+        remote_python = next(
+            (line.strip() for line in str(py_check.get("output", "")).splitlines() if line.strip()),
+            "",
         )
-        if "OK" not in py_check.get("output", ""):
+        if not remote_python or not remote_python.startswith("/"):
             return json.dumps({
                 "status": "error",
                 "error": (
@@ -875,6 +879,7 @@ def _execute_remote(
                 "tool_calls_made": 0,
                 "duration_seconds": 0,
             })
+        quoted_remote_python = shlex.quote(remote_python)
 
         # Create sandbox directory on remote
         env.execute(
@@ -901,7 +906,11 @@ def _execute_remote(
                 _ship_file_to_remote(
                     env,
                     f"{sandbox_dir}/bin/{tool_name}",
-                    _worker_github_policy.posix_tool_shim_source(tool_name, "python3"),
+                    _worker_github_policy.posix_tool_shim_source(
+                        tool_name,
+                        remote_python,
+                        policy_script=f"{sandbox_dir}/tools/worker_github_policy.py",
+                    ),
                 )
             _ship_file_to_remote(env, f"{sandbox_dir}/bin/symphony-deny-askpass", _worker_github_policy.posix_askpass_source())
             env.execute(f"chmod +x {quoted_bin_dir}/*", cwd="/", timeout=10)
@@ -935,7 +944,7 @@ def _execute_remote(
         logger.info("Executing code on %s backend (task %s)...",
                      env_type, effective_task_id[:8])
         script_result = env.execute(
-            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
+            f"cd {quoted_sandbox_dir} && {env_prefix} {quoted_remote_python} script.py",
             timeout=timeout,
         )
 

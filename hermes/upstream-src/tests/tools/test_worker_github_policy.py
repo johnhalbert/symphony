@@ -171,6 +171,8 @@ def test_policy_allows_shell_and_env_wrapped_local_git_inspection(policy_env, to
         (sys.executable, ["-S", "-c", "import subprocess; subprocess.run(['/usr/bin/git', 'fetch', 'origin'])"], "Python interpreter policy runtime suppression"),
         ("python", ["-I", "-c", "print('isolated')"], "Python interpreter policy runtime suppression"),
         ("python3", ["-E", "-m", "pytest"], "Python interpreter policy runtime suppression"),
+        ("python", ["-c", "import subprocess; subprocess.run(['/usr/bin/git', 'fetch', 'origin'])"], "Python interpreter code execution"),
+        ("python3", ["-m", "pytest", "--version"], "Python interpreter module execution"),
         ("python", ["child.py"], "uninspectable Python script execution"),
         ("python", ["-"], "uninspectable Python stdin execution"),
         ("env", ["-i", "PYTHONPATH=", "python", "-m", "pytest"], "Python interpreter execution with policy-suppressing env wrapper"),
@@ -191,11 +193,9 @@ def test_policy_blocks_python_interpreter_policy_suppression_argv(policy_env, to
     [
         ("python", ["--version"]),
         ("python", ["-V"]),
-        ("python", ["-c", "print('ok')"]),
-        ("python", ["-m", "pytest", "--version"]),
     ],
 )
-def test_policy_allows_python_when_policy_runtime_remains_available(policy_env, tool, args):
+def test_policy_allows_python_help_and_version(policy_env, tool, args):
     assert policy.check_worker_reviewer_github_argv(tool, args) is None
 
 
@@ -203,7 +203,13 @@ def test_policy_allows_python_when_policy_runtime_remains_available(policy_env, 
     "command,description",
     [
         ("python -S -c 'import subprocess; subprocess.run([\"/usr/bin/git\",\"fetch\",\"origin\"])'", "Python interpreter policy runtime suppression"),
+        ("python -c 'import subprocess; subprocess.run([\"/usr/bin/git\",\"fetch\",\"origin\"])'", "Python interpreter code execution"),
+        ("python -m pytest --version", "Python interpreter module execution"),
         ("python ./child.py", "uninspectable Python script execution"),
+        ("PYTHONPATH= python -c 'print(1)'", "Python interpreter code execution"),
+        ("PATH=/real-bin PYTHONPATH= python -m pytest", "Python interpreter module execution"),
+        ("bash -c 'PYTHONPATH= python -c \"print(1)\"'", "Python interpreter code execution"),
+        ("PYTHONPATH= env python -c 'print(1)'", "Python interpreter code execution"),
         ("env -i PYTHONPATH= python -m pytest", "Python interpreter execution with policy-suppressing env wrapper"),
         ("env -i PATH=/real-bin bash -c 'python -m pytest'", "Python interpreter execution with policy-suppressing env wrapper"),
     ],
@@ -264,6 +270,14 @@ def test_path_shim_blocks_fetch_and_allows_safe_version(policy_env, tmp_path):
     assert allowed.returncode == 0
     assert "git version" in allowed.stdout.lower()
 
+    cleared_pythonpath_env = dict(env)
+    cleared_pythonpath_env["PYTHONPATH"] = ""
+    allowed_with_cleared_pythonpath = subprocess.run(
+        [str(git_shim), "--version"], env=cleared_pythonpath_env, text=True, capture_output=True,
+    )
+    assert allowed_with_cleared_pythonpath.returncode == 0
+    assert "git version" in allowed_with_cleared_pythonpath.stdout.lower()
+
 
 def test_path_shim_cannot_be_disabled_by_agent_env(policy_env, tmp_path):
     fake_bin = tmp_path / "real-bin"
@@ -314,12 +328,16 @@ def test_runtime_sitecustomize_blocks_python_interpreter_suppression_bypasses(po
     fake_bin_assignment = "PATH=" + str(fake_bin)
     child_script_text = str(child_script)
     script = f"""
+import shlex
 import subprocess
 import sys
 cases = [
+    [sys.executable, "-c", "import subprocess; subprocess.run([{fake_git_text!r}, 'fetch', 'origin'], check=True)"],
     [sys.executable, "-S", "-c", "import subprocess; subprocess.run([{fake_git_text!r}, 'fetch', 'origin'], check=True)"],
     [sys.executable, {child_script_text!r}],
     ["env", "-i", {fake_bin_assignment!r}, "PYTHONPATH=", sys.executable, "-S", "-c", "import subprocess; subprocess.run([{fake_git_text!r}, 'fetch', 'origin'], check=True)"],
+    ["bash", "-c", "PYTHONPATH= " + shlex.quote(sys.executable) + " -c " + shlex.quote("import subprocess; subprocess.run([{fake_git_text!r}, 'fetch', 'origin'], check=True)")],
+    ["bash", "-c", "PATH=" + shlex.quote({str(fake_bin)!r}) + " PYTHONPATH= " + shlex.quote(sys.executable) + " -c " + shlex.quote("import subprocess; subprocess.run([{fake_git_text!r}, 'fetch', 'origin'], check=True)")],
 ]
 for argv in cases:
     try:
@@ -333,7 +351,7 @@ for argv in cases:
     combined = blocked.stdout + blocked.stderr
 
     assert blocked.returncode == 0
-    assert combined.count("BLOCKED_PYTHON") == 3
+    assert combined.count("BLOCKED_PYTHON") == 6
     assert "FAKE_GIT_RAN" not in combined
 
 

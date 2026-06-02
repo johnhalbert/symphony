@@ -333,8 +333,9 @@ describe("Cursor event mapping", () => {
       const fakeBin = path.join(tempRoot, "real-bin");
       await mkdir(fakeBin, { recursive: true });
       await writeFakeGit(fakeBin);
+      const fakeGitPath = path.join(fakeBin, process.platform === "win32" ? "git.cmd" : "git");
       const scriptAbsolute = path.join(tempRoot, "absolute-fetch.sh");
-      await writeFile(scriptAbsolute, ["#!/bin/sh", `${path.join(fakeBin, process.platform === "win32" ? "git.cmd" : "git")} fetch origin`, ""].join("\n"), "utf8");
+      await writeFile(scriptAbsolute, ["#!/bin/sh", `${fakeGitPath} fetch origin`, ""].join("\n"), "utf8");
       const scriptPathReset = path.join(tempRoot, "path-reset-fetch.sh");
       await writeFile(scriptPathReset, ["#!/bin/sh", `PATH=${fakeBin} git fetch origin`, ""].join("\n"), "utf8");
       const pythonScript = path.join(tempRoot, "child-fetch.py");
@@ -342,7 +343,7 @@ describe("Cursor event mapping", () => {
         pythonScript,
         [
           "import subprocess",
-          `subprocess.run([${JSON.stringify(path.join(fakeBin, process.platform === "win32" ? "git.cmd" : "git"))}, 'fetch', 'origin'], check=True)`,
+          `subprocess.run([${JSON.stringify(fakeGitPath)}, 'fetch', 'origin'], check=True)`,
           "",
         ].join("\n"),
         "utf8",
@@ -372,6 +373,10 @@ describe("Cursor event mapping", () => {
       const gitStatus = runPolicyShim(env, "git", ["-C", process.cwd(), "status", "--short"]);
       expect(gitStatus.status).toBe(0);
 
+      const gitVersionWithClearedPythonPath = runPolicyShim({ ...env, PYTHONPATH: "" }, "git", ["--version"]);
+      expect(gitVersionWithClearedPythonPath.status).toBe(0);
+      expect(gitVersionWithClearedPythonPath.stdout.toLowerCase()).toContain("git version fake");
+
       if (process.platform !== "win32" && env.SYMPHONY_REAL_BASH) {
         const bashGitVersion = runPolicyShim(env, "bash", ["-c", "git --version"]);
         expect(bashGitVersion.status).toBe(0);
@@ -387,15 +392,26 @@ describe("Cursor event mapping", () => {
         ["bash", [scriptPathReset]],
         ["bash", ["-lc", scriptAbsolute]],
         ["env", ["-i", `PATH=${fakeBin}`, "bash", scriptPathReset]],
+        ["python", ["-c", `import subprocess; subprocess.run([${JSON.stringify(fakeGitPath)}, 'fetch', 'origin'], check=True)`]],
+        ["python", ["-m", "pytest", "--version"]],
         ["python", ["-S", "-c", "import subprocess; subprocess.run(['git', 'fetch', 'origin'], check=True)"]],
         ["python", [pythonScript]],
-        ["env", ["-i", "PYTHONPATH=", "python", "-S", "-c", "print('hidden')"]],
+        ["env", ["-i", "PYTHONPATH=", "python", "-c", "print('hidden')"]],
       ] as const) {
         const blocked = runPolicyShim(env, tool, args);
         expect(blocked.status, `${tool} ${args.join(" ")} stdout=${blocked.stdout} stderr=${blocked.stderr}`).toBe(126);
         expect(blocked.stderr).toContain("BLOCKED by Symphony worker/reviewer GitHub command policy");
         expect(blocked.stderr).not.toContain("FAKE_GIT_RAN");
       }
+
+      const clearedPythonPath = runPolicyShim(
+        { ...env, PYTHONPATH: "" },
+        "python",
+        ["-c", `import subprocess; subprocess.run([${JSON.stringify(fakeGitPath)}, 'fetch', 'origin'], check=True)`],
+      );
+      expect(clearedPythonPath.status).toBe(126);
+      expect(clearedPythonPath.stderr).toContain("BLOCKED by Symphony worker/reviewer GitHub command policy");
+      expect(clearedPythonPath.stderr).not.toContain("FAKE_GIT_RAN");
 
       if (env.SHELL) {
         expect(env.SHELL.startsWith(env.SYMPHONY_COMMAND_POLICY_SHIM_DIR ?? "")).toBe(true);
@@ -408,6 +424,18 @@ describe("Cursor event mapping", () => {
         expect(directScriptViaPolicyShell.status).toBe(126);
         expect(directScriptViaPolicyShell.stderr || "").toContain("BLOCKED by Symphony worker/reviewer GitHub command policy");
         expect((directScriptViaPolicyShell.stdout || "") + (directScriptViaPolicyShell.stderr || "")).not.toContain("FAKE_GIT_RAN");
+
+        if (process.platform !== "win32") {
+          const pythonAssignmentViaPolicyShell = spawnSync(env.SHELL, ["-lc", `PYTHONPATH= python -c "import subprocess; subprocess.run([${JSON.stringify(fakeGitPath)}, 'fetch', 'origin'], check=True)"`], {
+            env: { ...process.env, ...env },
+            encoding: "utf8",
+            shell: false,
+            timeout: 5_000,
+          });
+          expect(pythonAssignmentViaPolicyShell.status).toBe(126);
+          expect(pythonAssignmentViaPolicyShell.stderr || "").toContain("BLOCKED by Symphony worker/reviewer GitHub command policy");
+          expect((pythonAssignmentViaPolicyShell.stdout || "") + (pythonAssignmentViaPolicyShell.stderr || "")).not.toContain("FAKE_GIT_RAN");
+        }
       }
     } finally {
       if (originalPath === undefined) delete process.env.PATH;

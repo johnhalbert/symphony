@@ -537,7 +537,16 @@ def _python_argv_executes_code(args: Sequence[str]) -> bool:
 
 
 def _python_interpreter_decision(args: Sequence[str], command: str) -> Optional[PolicyDecision]:
-    """Fail closed on Python entrypoints that can suppress or bypass sitecustomize."""
+    """Fail closed on Python entrypoints that can run arbitrary child commands.
+
+    Worker/reviewer subprocess policy relies on ``sitecustomize`` for trusted
+    top-level execute_code scripts, but child interpreters launched from agent
+    shells, Cursor shims, or nested Python code can be combined with shell
+    assignments such as ``PYTHONPATH=``/``PATH=`` or interpreter flags to evade
+    that runtime before it starts.  Help/version probes are still harmless;
+    every code/module/script/stdin entrypoint is blocked before the child
+    interpreter runs.
+    """
 
     if not args:
         return _decision("uninspectable Python interactive or stdin execution", command)
@@ -553,8 +562,10 @@ def _python_interpreter_decision(args: Sequence[str], command: str) -> Optional[
             return None
         if _python_option_suppresses_policy_runtime(arg):
             return _decision("Python interpreter policy runtime suppression", command)
-        if arg in {"-c", "-m"} or ((arg.startswith("-c") or arg.startswith("-m")) and len(arg) > 2):
-            return None
+        if arg == "-c" or (arg.startswith("-c") and len(arg) > 2):
+            return _decision("Python interpreter code execution", command)
+        if arg == "-m" or (arg.startswith("-m") and len(arg) > 2):
+            return _decision("Python interpreter module execution", command)
         if arg in _PYTHON_OPTIONS_WITH_VALUES:
             index += 2
             continue
@@ -819,11 +830,15 @@ def _write_text_executable(path: str, content: str) -> None:
         pass
 
 
-def posix_tool_shim_source(tool: str, python_command: str = "python3") -> str:
+def posix_tool_shim_source(tool: str, python_command: str = "python3", policy_script: Optional[str] = None) -> str:
+    if policy_script:
+        policy_invocation = f"{_shell_quote(python_command)} {_shell_quote(policy_script)}"
+    else:
+        policy_invocation = f"{_shell_quote(python_command)} -m tools.worker_github_policy"
     return (
         "#!/bin/sh\n"
         f"export {SHIM_DIR_ENV}=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\n"
-        f"exec {_shell_quote(python_command)} -m tools.worker_github_policy {_shell_quote(_strip_windows_suffix(tool))} \"$@\"\n"
+        f"exec {policy_invocation} {_shell_quote(_strip_windows_suffix(tool))} \"$@\"\n"
     )
 
 
@@ -1051,12 +1066,15 @@ def install_worker_reviewer_github_shims(
         real = shutil.which(_strip_windows_suffix(tool), path=original_path)
         if real:
             env[_real_env_name(tool)] = real
-        _write_text_executable(os.path.join(shim_dir, _strip_windows_suffix(tool)), posix_tool_shim_source(tool, python_executable or sys.executable))
+        _write_text_executable(
+            os.path.join(shim_dir, _strip_windows_suffix(tool)),
+            posix_tool_shim_source(tool, python_executable or sys.executable, policy_script=__file__),
+        )
         if os.name == "nt":
             cmd_path = os.path.join(shim_dir, f"{_strip_windows_suffix(tool)}.cmd")
             _write_text_executable(
                 cmd_path,
-                f"@echo off\r\n\"{python_executable or sys.executable}\" -m tools.worker_github_policy {_strip_windows_suffix(tool)} %*\r\n",
+                f"@echo off\r\n\"{python_executable or sys.executable}\" \"{__file__}\" {_strip_windows_suffix(tool)} %*\r\n",
             )
     askpass_name = "symphony-deny-askpass.cmd" if os.name == "nt" else "symphony-deny-askpass"
     askpass_path = os.path.join(shim_dir, askpass_name)

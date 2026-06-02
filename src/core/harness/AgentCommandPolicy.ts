@@ -163,16 +163,19 @@ function ensureWorkerReviewerGithubPolicyShims(ctx: AgentRunContext, pathValue: 
   mkdirSync(shimDir, { recursive: true });
   const pythonCommand = policyShimPythonCommand(ctx, pathValue);
   const python = shellWord(pythonCommand);
+  const policyScript = path.join(ctx.config.hermes.upstreamRoot, "tools", "worker_github_policy.py");
+  const policyScriptShell = shellWord(policyScript);
+  const policyScriptCmd = cmdWord(policyScript);
   for (const tool of SHIM_TOOLS) {
     const posixPath = path.join(shimDir, tool);
     writeExecutable(
       posixPath,
-      `#!/bin/sh\nexport SYMPHONY_COMMAND_POLICY_SHIM_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\nexec ${python} -m tools.worker_github_policy ${shellWord(tool)} "$@"\n`,
+      `#!/bin/sh\nexport SYMPHONY_COMMAND_POLICY_SHIM_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\nexec ${python} ${policyScriptShell} ${shellWord(tool)} "$@"\n`,
     );
     const cmdPath = path.join(shimDir, `${tool}.cmd`);
     writeExecutable(
       cmdPath,
-      `@echo off\r\nset "SYMPHONY_COMMAND_POLICY_SHIM_DIR=%~dp0"\r\n${cmdWord(pythonCommand)} -m tools.worker_github_policy ${tool} %*\r\n`,
+      `@echo off\r\nset "SYMPHONY_COMMAND_POLICY_SHIM_DIR=%~dp0"\r\n${cmdWord(pythonCommand)} ${policyScriptCmd} ${tool} %*\r\n`,
     );
   }
   writeExecutable(
