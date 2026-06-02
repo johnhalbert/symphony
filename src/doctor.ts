@@ -37,6 +37,7 @@ import {
   normalizeHermesAuthProvider,
   redactHermesAuthMessage,
 } from "../hermes/src/HermesAuthManager.js";
+import type { HermesAgentCommandPolicyHookVerifier } from "../hermes/src/HermesMcpConfig.js";
 import {
   discoverHostHermes,
   hostHermesCommandEnvironment,
@@ -78,6 +79,7 @@ export interface RuntimeHarnessDependencyDoctorCheckOptions {
   liveRuntime?: boolean | undefined;
   cliPath?: string | undefined;
   hermesGatewayFactory?: ((env: HermesGatewayEnvironment) => HermesGatewayClient) | undefined;
+  commandPolicyHookVerifier?: HermesAgentCommandPolicyHookVerifier | undefined;
   hermesAuthManagerFactory?: ((options: HermesAuthManagerOptions) => Pick<HermesAuthManager, "prepare" | "validateOpenAiCodex">) | undefined;
   hostHermesCommandRunner?: HostHermesCommandRunner | undefined;
 }
@@ -541,7 +543,7 @@ function redactDoctorDiagnosticMessage(message: string): string {
 
 export async function hermesLiveRuntimeDoctorCheck(
   config: ServiceConfig,
-  options: Pick<RuntimeHarnessDependencyDoctorCheckOptions, "cliPath" | "hermesGatewayFactory"> = {},
+  options: Pick<RuntimeHarnessDependencyDoctorCheckOptions, "cliPath" | "hermesGatewayFactory" | "commandPolicyHookVerifier"> = {},
 ): Promise<DoctorCheck> {
   if (!config.hermes.model) {
     return {
@@ -563,6 +565,9 @@ export async function hermesLiveRuntimeDoctorCheck(
       roles: ["worker", "reviewer"],
       enabled: true,
       ...(options.hermesGatewayFactory === undefined ? {} : { gatewayFactory: options.hermesGatewayFactory }),
+      ...(options.commandPolicyHookVerifier === undefined
+        ? {}
+        : { commandPolicyHookVerifier: options.commandPolicyHookVerifier }),
     });
     if (stage.status === "success") {
       return {
