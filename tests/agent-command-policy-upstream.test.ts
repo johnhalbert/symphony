@@ -210,6 +210,43 @@ describe("AgentCommandPolicy direct upstream GitHub denial", () => {
       targetHosts: ["api.github.com"],
     },
     {
+      name: "GitHub URL query access token and client secret",
+      command:
+        "curl 'https://api.github.com/repos/acme/repo/pulls?access_token=test-query-token-value&client_secret=test-client-secret-value&per_page=1'",
+      commandClass: "curl_github_request",
+      executable: "curl",
+      secretValues: ["test-query-token-value", "test-client-secret-value"],
+      expectedPreviewParts: ["access_token=[redacted]", "client_secret=[redacted]", "per_page=1"],
+      targetHosts: ["api.github.com"],
+    },
+    {
+      name: "curl cookie auth flag",
+      command: "curl --cookie user_session=test-cookie-session-value https://api.github.com/user",
+      commandClass: "curl_github_request",
+      executable: "curl",
+      secretValues: ["test-cookie-session-value", "user_session=test-cookie-session-value"],
+      expectedPreviewParts: ["--cookie [redacted]", "https://api.github.com/user"],
+      targetHosts: ["api.github.com"],
+    },
+    {
+      name: "curl short cookie auth flag",
+      command: "curl -buser_session=test-short-cookie-session-value https://api.github.com/user",
+      commandClass: "curl_github_request",
+      executable: "curl",
+      secretValues: ["test-short-cookie-session-value", "user_session=test-short-cookie-session-value"],
+      expectedPreviewParts: ["-b[redacted]", "https://api.github.com/user"],
+      targetHosts: ["api.github.com"],
+    },
+    {
+      name: "Cookie header",
+      command: "curl -H 'Cookie: user_session=test-header-session-value' https://api.github.com/user",
+      commandClass: "curl_github_request",
+      executable: "curl",
+      secretValues: ["test-header-session-value", "user_session=test-header-session-value"],
+      expectedPreviewParts: ["Cookie: [redacted]", "https://api.github.com/user"],
+      targetHosts: ["api.github.com"],
+    },
+    {
       name: "Authorization header",
       command: "curl -H 'Authorization: Bearer header-secret' https://api.github.com/repos/acme/repo",
       commandClass: "curl_github_request",
@@ -251,8 +288,10 @@ describe("AgentCommandPolicy direct upstream GitHub denial", () => {
     for (const part of expectedPreviewParts) {
       expect(preview).toContain(part);
     }
+    const auditPayload = JSON.stringify(decision.audit);
     for (const secret of secretValues) {
       expect(preview).not.toContain(secret);
+      expect(auditPayload).not.toContain(secret);
       expect(decision.message).not.toContain(secret);
     }
   });

@@ -107,6 +107,7 @@ const REDACTED_GITHUB_TOKEN = "[redacted-github-token]";
 
 const CLI_AUTH_OPTIONS_WITH_VALUE = new Set([
   "-a",
+  "-b",
   "-U",
   "-u",
   "--api-key",
@@ -114,6 +115,7 @@ const CLI_AUTH_OPTIONS_WITH_VALUE = new Set([
   "--auth",
   "--auth-token",
   "--bearer",
+  "--cookie",
   "--ftp-password",
   "--ftp-user",
   "--http-password",
@@ -127,7 +129,10 @@ const CLI_AUTH_OPTIONS_WITH_VALUE = new Set([
   "--user-password",
 ]);
 
-const CLI_AUTH_SHORT_OPTIONS_WITH_ATTACHED_VALUE = new Set(["-a", "-U", "-u"]);
+const CLI_AUTH_SHORT_OPTIONS_WITH_ATTACHED_VALUE = new Set(["-a", "-b", "-U", "-u"]);
+
+const SENSITIVE_QUERY_PARAMETER_PATTERN =
+  /([?&;](?:access[_-]?token|api[_-]?key|auth(?:entication)?[_-]?token|client[_-]?secret|credential|github[_-]?token|gh[_-]?token|id[_-]?token|jwt|oauth[_-]?token|password|passwd|private[_-]?token|refresh[_-]?token|secret|session|token|user[_-]?session)=)([^\s'"&;|]+)/giu;
 
 export function evaluateAgentCommandPolicy(input: AgentCommandPolicyInput): AgentCommandPolicyDecision {
   const parsed = parseCommandAttempt(input);
@@ -590,7 +595,10 @@ function redactSensitiveCommandText(text: string): string {
     .replace(/\b(gh[oprsu]_[A-Za-z0-9_]{8,})\b/gu, REDACTED_GITHUB_TOKEN)
     .replace(/\b(github_pat_[A-Za-z0-9_]+)\b/gu, REDACTED_GITHUB_TOKEN)
     .replace(/(https?:\/\/)([^\s/@]+)@/giu, `$1${REDACTED_VALUE}@`)
+    .replace(SENSITIVE_QUERY_PARAMETER_PATTERN, `$1${REDACTED_VALUE}`)
     .replace(/(Authorization:\s*(?:Basic|Bearer|token)\s+)[^\s'";|&]+/giu, `$1${REDACTED_VALUE}`)
+    .replace(/(['"])(Cookie:\s*)[^'"\r\n]*\1/giu, `$1$2${REDACTED_VALUE}$1`)
+    .replace(/\b(Cookie:\s*)[^\s'";|&]+/giu, `$1${REDACTED_VALUE}`)
     .replace(
       /((?:X-GitHub-Token|X-Hub-Signature(?:-256)?|Private-Token|Job-Token):\s*)[^\s'";|&]+/giu,
       `$1${REDACTED_VALUE}`,
