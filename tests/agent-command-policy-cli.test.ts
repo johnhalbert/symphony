@@ -34,6 +34,27 @@ describe("agent-command-policy-hook CLI", () => {
     expect(result.stdout).toBe("");
   });
 
+  it("blocks inherited unsafe Git environment for otherwise local Git inspection", async () => {
+    const result = await runPolicyHookCli({
+      env: {
+        SYMPHONY_AGENT_ROLE: "worker",
+        SYMPHONY_RUN_PHASE: "implementation",
+        SYMPHONY_ISSUE_ID: "issue-1",
+        SYMPHONY_RUN_ID: "run-1",
+        GIT_PAGER: "sh -c echo blocked",
+      },
+      input: JSON.stringify(hermesPayload("git log -1")),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout) as unknown).toMatchObject({
+      action: "block",
+      message: expect.stringContaining("local Git inspection would execute a configured helper") as string,
+    });
+    expect(result.stdout).not.toContain("sh -c echo blocked");
+  });
+
   it.each([
     { name: "command and cmd", toolInput: { command: "git status --short", cmd: "gh pr create" } },
     { name: "command and code", toolInput: { command: "git status --short", code: "gh pr create" } },
@@ -177,6 +198,43 @@ function hermesPayload(commandOrToolInput: string | Record<string, unknown>, opt
   };
 }
 
+const UNSAFE_POLICY_HOOK_CLI_ENVIRONMENT_KEYS = new Set([
+  "GIT_EXTERNAL_DIFF",
+  "GIT_PAGER",
+  "PAGER",
+  "GIT_ASKPASS",
+  "SSH_ASKPASS",
+  "GIT_CREDENTIAL_HELPER",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "GITHUB_PAT",
+  "GITHUB_APP_PRIVATE_KEY",
+  "GITHUB_PRIVATE_KEY",
+  "GITHUB_CREDENTIALS",
+  "GH_HOSTS",
+  "SSH_AUTH_SOCK",
+  "SSH_AGENT_PID",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_PROXY_COMMAND",
+  "GIT_EXEC_PATH",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+]);
+
+function policyHookCliBaseEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    const normalizedKey = key.toUpperCase();
+    if (UNSAFE_POLICY_HOOK_CLI_ENVIRONMENT_KEYS.has(normalizedKey)) continue;
+    if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/u.test(normalizedKey)) continue;
+    environment[key] = value;
+  }
+  return environment;
+}
+
 async function runPolicyHookCli(options: {
   args?: string[];
   env?: Record<string, string>;
@@ -186,7 +244,7 @@ async function runPolicyHookCli(options: {
   const child = spawn(process.execPath, ["--import", "tsx", cliPath, "agent-command-policy-hook", ...(options.args ?? [])], {
     cwd: process.cwd(),
     env: {
-      ...process.env,
+      ...policyHookCliBaseEnvironment(),
       FORCE_COLOR: "0",
       SYMPHONY_AGENT_ROLE: "",
       SYMPHONY_RUN_PHASE: "",
