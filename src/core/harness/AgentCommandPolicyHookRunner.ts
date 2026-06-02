@@ -7,6 +7,8 @@ import {
   type AgentCommandPolicyInput,
 } from "./AgentCommandPolicy.js";
 
+export const AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES = 1024 * 1024;
+
 export interface AgentCommandPolicyHookRunnerContext {
   role?: string | undefined;
   phase?: string | undefined;
@@ -21,6 +23,7 @@ export interface AgentCommandPolicyHookRunnerStdioOptions extends AgentCommandPo
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;
   errorOutput?: NodeJS.WritableStream;
+  maxStdinBytes?: number | undefined;
 }
 
 export interface HermesPreToolCallHookPayload {
@@ -78,8 +81,14 @@ export async function runAgentCommandPolicyHookStdio(
 ): Promise<AgentCommandPolicyHookEvaluation> {
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
-  const stdinText = await readAll(input);
-  const evaluation = await evaluateAgentCommandPolicyHookPayload(stdinText, options);
+  const stdinPayload = await readBounded(
+    input,
+    options.maxStdinBytes ?? AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES,
+  );
+  const evaluation =
+    stdinPayload.status === "oversized"
+      ? evaluationFromDecision(buildOversizedHookPayloadDecision(options, stdinPayload.maxBytes), null)
+      : await evaluateAgentCommandPolicyHookPayload(stdinPayload.text, options);
   if (evaluation.stdout.length > 0) {
     output.write(evaluation.stdout);
   }
@@ -94,6 +103,21 @@ export function mapAgentCommandPolicyDecisionToHermesHookResponse(
     action: "block",
     message: decision.message,
   };
+}
+
+function buildOversizedHookPayloadDecision(
+  context: AgentCommandPolicyHookRunnerContext,
+  maxBytes: number,
+): AgentCommandPolicyDecision {
+  return buildFailClosedAgentCommandPolicyDecision({
+    role: context.role,
+    phase: context.phase,
+    surface: "unknown",
+    workingDirectory: context.workingDirectory,
+    reasonKind: "oversized_hook_payload",
+    commandClass: "oversized_hermes_hook_payload",
+    message: `Blocked worker/reviewer command: the Hermes pre_tool_call hook payload exceeded the maximum accepted size (${maxBytes} bytes). Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.`,
+  });
 }
 
 function parseHookPayload(
@@ -260,13 +284,33 @@ function evaluationFromDecision(
   };
 }
 
-async function readAll(input: NodeJS.ReadableStream): Promise<string> {
-  input.setEncoding("utf8");
-  let body = "";
+type BoundedStdinReadResult =
+  | { status: "ok"; text: string }
+  | { status: "oversized"; maxBytes: number };
+
+async function readBounded(input: NodeJS.ReadableStream, maxBytes: number): Promise<BoundedStdinReadResult> {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  let oversized = false;
+
   for await (const chunk of input as AsyncIterable<string | Buffer>) {
-    body += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    if (oversized) continue;
+
+    const chunkByteLength =
+      typeof chunk === "string" ? Buffer.byteLength(chunk, "utf8") : chunk.byteLength;
+    const nextTotalBytes = totalBytes + chunkByteLength;
+    if (nextTotalBytes > maxBytes) {
+      oversized = true;
+      chunks.length = 0;
+      continue;
+    }
+
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk);
+    totalBytes = nextTotalBytes;
   }
-  return body;
+
+  if (oversized) return { status: "oversized", maxBytes };
+  return { status: "ok", text: Buffer.concat(chunks, totalBytes).toString("utf8") };
 }
 
 function stringValue(value: unknown): string | null {

@@ -9,6 +9,7 @@ export type AgentCommandPolicyReasonKind =
   | "ambiguous_command"
   | "malformed_command"
   | "malformed_hook_payload"
+  | "oversized_hook_payload"
   | "missing_hook_context"
   | "classifier_error";
 
@@ -185,7 +186,10 @@ export function buildFailClosedAgentCommandPolicyDecision(input: {
   phase?: string | undefined;
   surface?: string | undefined;
   workingDirectory?: string | undefined;
-  reasonKind: Extract<AgentCommandPolicyReasonKind, "malformed_hook_payload" | "missing_hook_context" | "classifier_error">;
+  reasonKind: Extract<
+    AgentCommandPolicyReasonKind,
+    "malformed_hook_payload" | "oversized_hook_payload" | "missing_hook_context" | "classifier_error"
+  >;
   commandClass: string;
   message: string;
 }): AgentCommandPolicyDenyDecision {

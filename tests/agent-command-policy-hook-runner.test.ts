@@ -1,6 +1,7 @@
 import { PassThrough, Readable, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
+  AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES,
   evaluateAgentCommandPolicyHookPayload,
   runAgentCommandPolicyHookStdio,
   type AgentCommandPolicyHookRunnerContext,
@@ -148,6 +149,90 @@ describe("AgentCommandPolicyHookRunner", () => {
 
     expect(evaluation.hookResponse).toBeNull();
     expect(output.text).toBe("");
+  });
+
+  it("fails closed without classification when stdin exceeds the bounded payload size", async () => {
+    const output = new CapturingWritable();
+    let classifyCalls = 0;
+    const oversizedSecret = "oversized-secret-value";
+    const oversizedToken = "ghp_OVERSIZEDSECRET123";
+    const maxStdinBytes = 256;
+    const oversizedPayload = JSON.stringify(
+      hermesPayload({
+        command: `git status --short ${oversizedSecret} ${oversizedToken} ${"x".repeat(maxStdinBytes)}`,
+      }),
+    );
+
+    expect(Buffer.byteLength(oversizedPayload, "utf8")).toBeGreaterThan(maxStdinBytes);
+    expect(maxStdinBytes).toBeLessThan(AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES);
+
+    const evaluation = await runAgentCommandPolicyHookStdio({
+      input: Readable.from([oversizedPayload]),
+      output,
+      role: "worker",
+      phase: "implementation",
+      maxStdinBytes,
+      classify: () => {
+        classifyCalls += 1;
+        throw new Error("classifier should not be called for oversized stdin");
+      },
+    });
+
+    expect(classifyCalls).toBe(0);
+    expect(evaluation.policyInput).toBeNull();
+    expect(evaluation.decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "oversized_hook_payload",
+      commandClass: "oversized_hermes_hook_payload",
+    });
+    const blockResponse = JSON.parse(output.text) as { action: string; message: string };
+    expect(blockResponse).toMatchObject({
+      action: "block",
+      message: expect.stringContaining("exceeded the maximum accepted size") as string,
+    });
+    expect(output.text).toBe(evaluation.stdout);
+    expect(output.text).not.toContain(oversizedSecret);
+    expect(output.text).not.toContain(oversizedToken);
+  });
+
+  it("redacts credential values from default policy audit previews and hook stdout", async () => {
+    const ambientSecret = "ambient-secret-value";
+    const inlineSecret = "inline-secret-value";
+    const urlSecret = "url-secret-value";
+    const githubToken = "ghp_SECRET123456789";
+    const evaluation = await evaluateAgentCommandPolicyHookPayload(
+      JSON.stringify(
+        hermesPayload({
+          command: `GITHUB_TOKEN=${inlineSecret} git ls-remote https://${urlSecret}@github.com/org/repo.git ${githubToken}`,
+        }),
+      ),
+      {
+        role: "worker",
+        phase: "implementation",
+        environment: { GITHUB_TOKEN: ambientSecret, PATH: "/bin" },
+      },
+    );
+
+    expect(evaluation.policyInput?.environment).toEqual({ keysOnly: ["GITHUB_TOKEN", "PATH"] });
+    expect(JSON.stringify(evaluation.policyInput?.environment)).not.toContain(ambientSecret);
+    expect(evaluation.decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "github_host_reference",
+      commandClass: "github_host_reference",
+    });
+    expect(evaluation.hookResponse?.action).toBe("block");
+
+    const stdoutJson = JSON.stringify(evaluation.hookResponse);
+    for (const secret of [ambientSecret, inlineSecret, urlSecret, githubToken]) {
+      expect(evaluation.stdout).not.toContain(secret);
+      expect(stdoutJson).not.toContain(secret);
+      expect(JSON.stringify(evaluation.decision.audit)).not.toContain(secret);
+    }
+
+    expect(evaluation.decision.audit.inlineEnvironmentKeys).toEqual(["GITHUB_TOKEN"]);
+    expect(evaluation.decision.audit.commandPreview).toContain("GITHUB_TOKEN=<redacted>");
+    expect(evaluation.decision.audit.commandPreview).toContain("https://<redacted>@github.com");
+    expect(evaluation.decision.audit.commandPreview).toContain("<redacted-github-token>");
   });
 });
 

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES } from "../src/core/harness/AgentCommandPolicyHookRunner.js";
 
 describe("agent-command-policy-hook CLI", () => {
   it("emits Hermes block JSON for a worker upstream Git command", async () => {
@@ -44,6 +45,57 @@ describe("agent-command-policy-hook CLI", () => {
       action: "block",
       message: expect.stringContaining("context is incomplete") as string,
     });
+  });
+
+  it("fails closed with canonical block JSON when stdin exceeds the bounded payload size", async () => {
+    const oversizedSecret = "oversized-cli-secret-value";
+    const oversizedToken = "ghp_OVERSIZEDCLISECRET123";
+    const oversizedCommand = `git status --short ${oversizedSecret} ${oversizedToken} ${"x".repeat(
+      AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES,
+    )}`;
+    const result = await runPolicyHookCli({
+      args: ["--role", "worker", "--phase", "implementation", "--issue-id", "issue-1", "--run-id", "run-1"],
+      input: JSON.stringify(hermesPayload(oversizedCommand)),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const blockResponse = JSON.parse(result.stdout) as { action: string; message: string };
+    expect(blockResponse).toMatchObject({
+      action: "block",
+      message: expect.stringContaining("exceeded the maximum accepted size") as string,
+    });
+    expect(result.stdout).not.toContain(oversizedSecret);
+    expect(result.stdout).not.toContain(oversizedToken);
+  });
+
+  it("does not expose credential values in CLI block stdout for token-bearing commands", async () => {
+    const ambientSecret = "ambient-cli-secret-value";
+    const inlineSecret = "inline-cli-secret-value";
+    const urlSecret = "url-cli-secret-value";
+    const githubToken = "ghp_CLIREDACTIONSECRET123";
+    const result = await runPolicyHookCli({
+      env: {
+        SYMPHONY_AGENT_ROLE: "worker",
+        SYMPHONY_RUN_PHASE: "implementation",
+        SYMPHONY_ISSUE_ID: "issue-1",
+        SYMPHONY_RUN_ID: "run-1",
+        GITHUB_TOKEN: ambientSecret,
+      },
+      input: JSON.stringify(
+        hermesPayload(`GITHUB_TOKEN=${inlineSecret} git ls-remote https://${urlSecret}@github.com/org/repo.git ${githubToken}`),
+      ),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout) as unknown).toMatchObject({
+      action: "block",
+      message: expect.stringContaining("direct GitHub host") as string,
+    });
+    for (const secret of [ambientSecret, inlineSecret, urlSecret, githubToken]) {
+      expect(result.stdout).not.toContain(secret);
+    }
   });
 });
 
