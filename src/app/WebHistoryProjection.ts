@@ -1,4 +1,5 @@
 import type { RunRecord, RunStatus } from "../core/persistence/RunTranscriptStore.js";
+import type { ProviderLimitSignal } from "../core/provider/ProviderLimits.js";
 import { sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
 import { runKindForPhase } from "../core/types.js";
 
@@ -22,6 +23,31 @@ export interface WebRunSessionCursorModel {
   mode: string | null;
   allowLargeContext: boolean | null;
   workerAgentLifecycle: string | null;
+}
+
+export interface WebRunSessionProviderLimitModel {
+  provider: string | null;
+  providerId: string | null;
+  harnessId: string | null;
+  model: string | null;
+  kind: string | null;
+  message: string | null;
+  observedAt: string | null;
+  resumePolicy: string | null;
+  window: {
+    resumeAt: string | null;
+    retryAfterMs: number | null;
+    windowLabel: string | null;
+    windowKind: string | null;
+  } | null;
+  source: {
+    issueId: string | null;
+    issueIdentifier: string | null;
+    runId: string | null;
+    sessionId: string | null;
+    role: string | null;
+    runPhase: string | null;
+  } | null;
 }
 
 export interface WebRunSessionModel {
@@ -86,6 +112,7 @@ export interface WebRunSessionModel {
     diagnosticMessage: string | null;
     diagnosticAt: string | null;
   };
+  providerLimit: WebRunSessionProviderLimitModel | null;
   links: {
     issue: string;
     run: string;
@@ -311,6 +338,7 @@ export function projectRunSession(run: RunRecord): WebRunSessionModel {
       diagnosticMessage: publicText(run.failureDiagnosticMessage),
       diagnosticAt: cleanString(run.failureDiagnosticAt),
     },
+    providerLimit: projectProviderLimit(run.providerLimit),
     links: {
       issue: `/api/v1/web/issues/${encodeURIComponent(run.issueIdentifier)}`,
       run: `/api/v1/runs/${encodeURIComponent(run.runId)}`,
@@ -428,6 +456,50 @@ function publicText(value: string | null | undefined): string | null {
 
 function numericToken(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function finiteNonNegativeNumber(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function projectProviderLimit(signal: ProviderLimitSignal | null | undefined): WebRunSessionProviderLimitModel | null {
+  if (!signal) return null;
+  const providerId = publicText(signal.scope.providerId);
+  const harnessId = publicText(signal.scope.harnessId);
+  return {
+    provider: providerId ?? harnessId,
+    providerId,
+    harnessId,
+    model: publicText(signal.scope.model),
+    kind: publicText(signal.kind),
+    message: publicText(signal.message),
+    observedAt: cleanString(signal.observedAt),
+    resumePolicy: publicText(signal.resumePolicy),
+    window: projectProviderLimitWindow(signal.window),
+    source: projectProviderLimitSource(signal.source),
+  };
+}
+
+function projectProviderLimitWindow(signalWindow: ProviderLimitSignal["window"]): WebRunSessionProviderLimitModel["window"] {
+  if (!signalWindow) return null;
+  return {
+    resumeAt: cleanString(signalWindow.resumeAt),
+    retryAfterMs: finiteNonNegativeNumber(signalWindow.retryAfterMs),
+    windowLabel: publicText(signalWindow.windowLabel),
+    windowKind: publicText(signalWindow.windowKind),
+  };
+}
+
+function projectProviderLimitSource(signalSource: ProviderLimitSignal["source"]): WebRunSessionProviderLimitModel["source"] {
+  if (!signalSource) return null;
+  return {
+    issueId: publicText(signalSource.issueId),
+    issueIdentifier: publicText(signalSource.issueIdentifier),
+    runId: publicText(signalSource.runId),
+    sessionId: publicText(signalSource.sessionId),
+    role: publicText(signalSource.role),
+    runPhase: publicText(signalSource.runPhase),
+  };
 }
 
 function copyStrings(values: readonly string[] | undefined): string[] {
