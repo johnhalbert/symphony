@@ -75,6 +75,56 @@ describe("AgentCommandPolicy foundation contracts", () => {
     expect(preview.preview?.length).toBeLessThanOrEqual(120);
   });
 
+  const githubTokenKey = "GITHUB_TOKEN";
+  const ghTokenKey = "GH_TOKEN";
+  const sensitiveInlineAssignmentCases = [
+    {
+      label: "unquoted",
+      command: `${githubTokenKey}=plain-visible-value gh auth status`,
+      credentialValue: "plain-visible-value",
+      keys: [githubTokenKey],
+    },
+    {
+      label: "double-quoted",
+      command: `${githubTokenKey}="double visible value" gh api user`,
+      credentialValue: "double visible value",
+      keys: [githubTokenKey],
+    },
+    {
+      label: "single-quoted",
+      command: `${ghTokenKey}='single visible value' git ls-remote origin`,
+      credentialValue: "single visible value",
+      keys: [ghTokenKey],
+    },
+  ] as const;
+
+  for (const testCase of sensitiveInlineAssignmentCases) {
+    it(`redacts ${testCase.label} sensitive inline shell environment assignments`, () => {
+      const preview = redactedAgentCommandPolicyPreview(testCase.command);
+
+      expect(preview.preview).toContain("[redacted]");
+      expect(preview.preview).not.toContain(testCase.credentialValue);
+      expect(preview.redacted).toBe(true);
+      expect(extractAgentCommandPolicyInlineEnvironmentKeys({ kind: "command", command: testCase.command })).toEqual(
+        testCase.keys,
+      );
+    });
+  }
+
+  it("redacts nested tool-call command previews before serializing audit evidence", () => {
+    const visibleValue = "nested visible value";
+    const preview = redactedAgentCommandPolicyPreview({
+      toolName: "terminal",
+      params: {
+        command: `${ghTokenKey}='${visibleValue}' git ls-remote origin`,
+      },
+    });
+
+    expect(preview.preview).toContain("[redacted]");
+    expect(preview.preview).not.toContain(visibleValue);
+    expect(preview.redacted).toBe(true);
+  });
+
   it("extracts sorted unique environment key names without exposing values", () => {
     const keys = extractAgentCommandPolicyEnvironmentKeys({
       keysOnly: ["PATH", " HOME ", "path", ""],
@@ -158,16 +208,18 @@ describe("AgentCommandPolicy foundation contracts", () => {
   });
 
   it("fails closed in the initial evaluator while emitting redacted audit evidence", () => {
+    const visibleAuditValue = "audit visible value";
+    const inheritedVisibleValue = "inherited visible value";
     const decision = evaluateAgentCommandPolicy(
       agentCommandPolicyInput({
         rawInput: {
           kind: "command",
-          command: "GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz /usr/bin/git fetch origin main",
+          command: `${githubTokenKey}="${visibleAuditValue}" /usr/bin/git fetch origin main`,
         },
         environment: {
           inherited: {
             PATH: "/usr/bin",
-            GITHUB_TOKEN: "ghp_should_not_be_audited",
+            [githubTokenKey]: inheritedVisibleValue,
           },
         },
       }),
@@ -188,11 +240,12 @@ describe("AgentCommandPolicy foundation contracts", () => {
       normalizedExecutable: "git",
       inheritedEnvironmentKeys: ["GITHUB_TOKEN", "PATH"],
       inlineEnvironmentKeys: ["GITHUB_TOKEN"],
+      rawInputPreviewRedacted: true,
       upstreamContactAttempted: false,
     });
     expect(decision.audit.rawInputPreview).toContain("[redacted]");
-    expect(decision.audit.rawInputPreview).not.toContain("ghp_1234567890");
-    expect(decision.audit.rawInputPreview).not.toContain("ghp_should_not_be_audited");
+    expect(decision.audit.rawInputPreview).not.toContain(visibleAuditValue);
+    expect(decision.audit.rawInputPreview).not.toContain(inheritedVisibleValue);
     expect(decision.message).toContain("Symphony service-owned GitHub workflow");
   });
 });

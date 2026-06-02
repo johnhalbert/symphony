@@ -1,8 +1,9 @@
 import type { RedactedPreview } from "../transcript/TranscriptProjection.js";
-import { sanitizedPreviewValue } from "../transcript/TranscriptProjection.js";
+import { isSensitivePreviewKey, sanitizedPreviewValue } from "../transcript/TranscriptProjection.js";
 import type { AgentRunPhase, AgentRunRole } from "../types.js";
 
 const DEFAULT_POLICY_PREVIEW_LENGTH = 500;
+const MAX_POLICY_PREVIEW_REDACTION_DEPTH = 8;
 const WINDOWS_EXECUTABLE_SUFFIXES = [".exe", ".cmd", ".bat", ".com", ".ps1"] as const;
 
 const GIT_EXECUTABLES = new Set(["git", "git-lfs"]);
@@ -25,6 +26,9 @@ const INTERPRETER_EXECUTABLES = new Set([
 const PACKAGE_SCRIPT_EXECUTABLES = new Set(["npm", "npx", "pnpm", "yarn", "bun", "bunx"]);
 
 const ENV_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const SENSITIVE_ASSIGNMENT_PATTERN =
+  /(\b([A-Za-z_][A-Za-z0-9_]*)\b\s*=\s*)("(?:[^"\\]|\\.)*(?:"|$)|'(?:[^'\\]|\\.)*(?:'|$)|[^\s"',}]+)/g;
+const REDACTED_ASSIGNMENT_VALUE = "[redacted]";
 
 export type AgentCommandPolicySurface =
   | "terminal"
@@ -247,7 +251,9 @@ export function redactedAgentCommandPolicyPreview(
   value: unknown,
   maxLength = DEFAULT_POLICY_PREVIEW_LENGTH,
 ): RedactedPreview {
-  return sanitizedPreviewValue(value, maxLength);
+  const shellRedactedValue = redactSensitiveShellAssignmentsInPreviewValue(value);
+  const preview = sanitizedPreviewValue(shellRedactedValue.value, maxLength);
+  return shellRedactedValue.redacted ? { ...preview, redacted: true } : preview;
 }
 
 export function extractAgentCommandPolicyEnvironmentKeys(input?: AgentCommandPolicyEnvironmentInput): string[] {
@@ -325,6 +331,61 @@ function rawInputPreviewValue(rawInput: AgentCommandPolicyRawInput): unknown {
         params: rawInput.params,
       };
   }
+}
+
+function redactSensitiveShellAssignmentsInPreviewValue(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+): { value: unknown; redacted: boolean } {
+  if (typeof value === "string") {
+    return redactSensitiveShellAssignmentsInText(value);
+  }
+  if (value === null || typeof value !== "object") {
+    return { value, redacted: false };
+  }
+  if (depth >= MAX_POLICY_PREVIEW_REDACTION_DEPTH || seen.has(value)) {
+    return { value, redacted: false };
+  }
+
+  seen.add(value);
+  if (Array.isArray(value)) {
+    let redacted = false;
+    const items = value.map((item) => {
+      const result = redactSensitiveShellAssignmentsInPreviewValue(item, depth + 1, seen);
+      redacted ||= result.redacted;
+      return result.value;
+    });
+    return redacted ? { value: items, redacted } : { value, redacted: false };
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return { value, redacted: false };
+
+  let redacted = false;
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of entries) {
+    const result = redactSensitiveShellAssignmentsInPreviewValue(item, depth + 1, seen);
+    redacted ||= result.redacted;
+    output[key] = result.value;
+  }
+  return redacted ? { value: output, redacted } : { value, redacted: false };
+}
+
+function redactSensitiveShellAssignmentsInText(value: string): { value: string; redacted: boolean } {
+  const text = value.replace(
+    SENSITIVE_ASSIGNMENT_PATTERN,
+    (match: string, prefix: string, key: string, assignmentValue: string) =>
+      redactSensitiveAssignment(match, prefix, key, assignmentValue),
+  );
+  return { value: text, redacted: text !== value };
+}
+
+function redactSensitiveAssignment(match: string, prefix: string, key: string, assignmentValue: string): string {
+  if (!isSensitivePreviewKey(key)) return match;
+  const quote = assignmentValue[0] === '"' || assignmentValue[0] === "'" ? assignmentValue[0] : "";
+  if (!quote) return `${prefix}${REDACTED_ASSIGNMENT_VALUE}`;
+  return `${prefix}${quote}${REDACTED_ASSIGNMENT_VALUE}${assignmentValue.endsWith(quote) ? quote : ""}`;
 }
 
 function commandTextFromRawInput(rawInput: AgentCommandPolicyRawInput): string | null {
