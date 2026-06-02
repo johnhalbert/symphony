@@ -32,6 +32,7 @@ import { runMergeConflictResolutionMcpServer } from "./core/harness/MergeConflic
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
 import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcpServer.js";
+import { runAgentCommandPolicyHookStdio } from "./core/harness/AgentCommandPolicyHookRunner.js";
 import { FileOperatorApprovalStore, OperatorApprovalService } from "./core/approval/OperatorApprovalService.js";
 import {
   createRuntimeTrackerClient,
@@ -165,6 +166,22 @@ program
     await runTranscriptRecallMcpServer({
       workflowPath: path.resolve(process.cwd(), options.workflow),
       contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
+  });
+
+program
+  .command("agent-command-policy-hook")
+  .description("Evaluate a Hermes pre_tool_call payload against the Symphony agent command policy")
+  .option("--role <role>", "agent role for this hook invocation; falls back to SYMPHONY_AGENT_ROLE")
+  .option("--phase <phase>", "agent run phase for this hook invocation; falls back to SYMPHONY_RUN_PHASE")
+  .option("--issue-id <id>", "active issue id; falls back to SYMPHONY_ISSUE_ID")
+  .option("--run-id <id>", "active run id; falls back to SYMPHONY_RUN_ID or Hermes session_id")
+  .action(async (options: { role?: string; phase?: string; issueId?: string; runId?: string }) => {
+    await runAgentCommandPolicyHookStdio({
+      role: options.role ?? process.env.SYMPHONY_AGENT_ROLE,
+      phase: options.phase ?? process.env.SYMPHONY_RUN_PHASE,
+      issueId: options.issueId ?? process.env.SYMPHONY_ISSUE_ID,
+      runId: options.runId ?? process.env.SYMPHONY_RUN_ID,
     });
   });
 

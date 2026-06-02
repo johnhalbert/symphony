@@ -131,6 +131,8 @@ export function isSensitivePreviewKey(key: string): boolean {
     (normalized.endsWith("token") && !normalized.endsWith("tokens")) ||
     normalized.endsWith("secret") ||
     normalized.endsWith("privatekey") ||
-    normalized.endsWith("apikey")
+    normalized.endsWith("apikey") ||
+    normalized.endsWith("accesskey") ||
+    normalized.endsWith("accesskeyid")
   );
 }

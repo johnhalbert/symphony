@@ -60,15 +60,17 @@ describe("AgentCommandPolicy foundation contracts", () => {
   });
 
   it("redacts and bounds raw command previews without persisting credential material", () => {
+    const accessKeyValue = "aws-visible-access-value";
     const preview = redactedAgentCommandPolicyPreview(
-      "GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz Bearer sk-1234567890abcdef git fetch https://github.com/example/repo.git SECRET_AGENT_VALUE " +
+      `GITHUB_TOKEN=ghp_12...wxyz AWS_ACCESS_KEY_ID=${accessKeyValue} Bearer sk-123...cdef git fetch https://github.com/example/repo.git SECRET_AGENT_VALUE ` +
         "x".repeat(200),
       120,
     );
 
     expect(preview.preview).toContain("[redacted]");
-    expect(preview.preview).not.toContain("ghp_1234567890");
-    expect(preview.preview).not.toContain("sk-1234567890abcdef");
+    expect(preview.preview).not.toContain("ghp_12...wxyz");
+    expect(preview.preview).not.toContain("sk-123...cdef");
+    expect(preview.preview).not.toContain(accessKeyValue);
     expect(preview.preview).not.toContain("SECRET_AGENT_VALUE");
     expect(preview.truncated).toBe(true);
     expect(preview.redacted).toBe(true);
