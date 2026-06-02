@@ -47,20 +47,9 @@ const UPSTREAM_GIT_SUBCOMMANDS = new Set([
 const GIT_REMOTE_UPSTREAM_SUBCOMMANDS = new Set(["prune", "update"]);
 const GIT_UPSTREAM_CHECKOUT_SUBCOMMANDS = new Set(["checkout", "switch"]);
 const SHELL_OR_WRAPPER_EXECUTABLES = new Set([
-  "bash",
-  "cmd",
-  "node",
-  "npm",
-  "npx",
-  "pnpm",
-  "powershell",
-  "pwsh",
-  "python",
-  "python3",
-  "sh",
-  "tsx",
-  "yarn",
-  "zsh",
+  ...SHELL_EXECUTABLES,
+  ...INTERPRETER_EXECUTABLES,
+  ...PACKAGE_SCRIPT_EXECUTABLES,
 ]);
 const COMMAND_TEXT_KEYS = ["command", "cmd", "code"] as const;
 const CREDENTIAL_ASSIGNMENT_KEY_PATTERN =
@@ -263,6 +252,7 @@ export interface AgentCommandPolicyAuditPayload {
   readonly inheritedEnvironmentKeys?: readonly string[] | undefined;
   readonly commandPreview?: string | undefined;
   readonly gitSubcommand?: string | null | undefined;
+  readonly hasNestedCommand?: boolean | undefined;
 }
 
 export interface AgentCommandPolicyDecisionBase {
@@ -374,18 +364,29 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
     );
   }
 
-  const upstreamClass = classifyDirectUpstreamGithubAttempt(parsed);
-  if (upstreamClass !== null) {
+  const upstreamClassification = classifyUpstreamGithubAttempt(parsed);
+  if (upstreamClassification !== null) {
+    return denyDecision(
+      input,
+      auditForUpstreamClassification(audit, upstreamClassification),
+      "upstream_github",
+      upstreamClassification.commandClass,
+      "Blocked worker/reviewer upstream GitHub contact: direct GitHub activity is disallowed for worker/reviewer agents. Use Symphony service-owned workflow actions for publication, review, writeback, mergeability, and CI checks.",
+    );
+  }
+
+  if (parsed.hasNestedCommand || isScriptWrapperAttempt(parsed)) {
+    const commandClass = ambiguousNestedCommandClass(parsed);
     return denyDecision(
       input,
       {
         ...audit,
-        commandClass: upstreamClass,
+        commandClass,
         upstreamContactAttempted: false,
       },
-      "upstream_github",
-      upstreamClass,
-      "Blocked worker/reviewer upstream GitHub contact: direct GitHub activity is disallowed for worker/reviewer agents. Use Symphony service-owned workflow actions for publication, review, writeback, mergeability, and CI checks.",
+      "ambiguous_command",
+      commandClass,
+      "Blocked worker/reviewer command: shell, wrapper, package, interpreter, script, or compound commands are not classified as helper-free local inspection. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
     );
   }
 
@@ -394,15 +395,16 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
   }
 
   if (SHELL_OR_WRAPPER_EXECUTABLES.has(parsed.normalizedExecutable)) {
+    const commandClass = ambiguousNestedCommandClass(parsed);
     return denyDecision(
       input,
       {
         ...audit,
-        commandClass: "ambiguous_wrapper_command",
+        commandClass,
         upstreamContactAttempted: false,
       },
       "ambiguous_command",
-      "ambiguous_wrapper_command",
+      commandClass,
       "Blocked worker/reviewer command: wrapper, shell, package, or interpreter commands are not classified as helper-free local inspection by this policy scaffold. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
     );
   }
@@ -423,30 +425,52 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
 interface ParsedCommandAttempt {
   readonly command: string;
   readonly tokens: string[];
+  readonly executableToken?: string;
+  readonly executableBasename?: string;
+  readonly executablePathStyle?: AgentCommandPolicyPathStyle;
   readonly normalizedExecutable?: string;
   readonly executableKind?: AgentCommandPolicyExecutableKind;
   readonly gitSubcommand?: string;
   readonly targetHosts: readonly string[];
   readonly inlineEnvironmentKeys: readonly string[];
   readonly commandPreview: string;
+  readonly hasNestedCommand: boolean;
 }
 
 function parseCommandAttempt(command: string): ParsedCommandAttempt {
   const tokens = tokenizeCommandPreview(command);
+  return parseCommandAttemptFromTokens(tokens, command);
+}
+
+function parseCommandAttemptFromTokens(tokens: string[], command = tokens.join(" ")): ParsedCommandAttempt {
   const inlineEnvironmentKeys = extractInlineEnvironmentKeys(tokens);
   const executableToken = firstExecutableToken(tokens);
-  const normalizedExecutable = executableToken === null ? undefined : normalizeExecutableName(executableToken);
+  const normalizedExecutableDetails =
+    executableToken === null ? null : normalizeAgentCommandPolicyExecutable(executableToken);
+  const normalizedExecutable = normalizedExecutableDetails?.normalizedExecutable ?? undefined;
   const gitSubcommand = normalizedExecutable === "git" ? extractGitSubcommand(tokens) : null;
+  const executableKind = normalizedExecutableDetails?.executableKind;
+  const executableBasename = normalizedExecutableDetails?.basename ?? undefined;
+  const executablePathStyle = normalizedExecutableDetails?.pathStyle;
 
-  return {
+  const parsed = {
     command,
     tokens,
+    ...(executableToken === null ? {} : { executableToken }),
+    ...(executableBasename === undefined ? {} : { executableBasename }),
+    ...(executablePathStyle === undefined ? {} : { executablePathStyle }),
     ...(normalizedExecutable === undefined ? {} : { normalizedExecutable }),
-    ...(normalizedExecutable === undefined ? {} : { executableKind: classifyExecutableKind(normalizedExecutable) }),
+    ...(executableKind === undefined ? {} : { executableKind }),
     ...(gitSubcommand === null ? {} : { gitSubcommand }),
     targetHosts: extractGithubHosts(tokens),
     inlineEnvironmentKeys,
     commandPreview: redactedCommandPreview(command),
+    hasNestedCommand: false,
+  } satisfies ParsedCommandAttempt;
+
+  return {
+    ...parsed,
+    hasNestedCommand: hasNestedCommandEvidence(parsed),
   };
 }
 
@@ -462,10 +486,43 @@ function auditForParsedCommand(
     ...(parsed.executableKind === undefined ? {} : { executableKind: parsed.executableKind }),
     ...(parsed.gitSubcommand === undefined ? {} : { gitSubcommand: parsed.gitSubcommand }),
     ...(parsed.targetHosts.length === 0 ? {} : { targetHosts: parsed.targetHosts }),
+    ...(parsed.hasNestedCommand ? { hasNestedCommand: true } : {}),
   };
 }
 
-function classifyDirectUpstreamGithubAttempt(parsed: ParsedCommandAttempt): string | null {
+interface UpstreamGithubClassification {
+  readonly commandClass: string;
+  readonly gitSubcommand?: string | null;
+  readonly targetHosts?: readonly string[];
+}
+
+function classifyUpstreamGithubAttempt(parsed: ParsedCommandAttempt): UpstreamGithubClassification | null {
+  return (
+    classifyDirectUpstreamGithubAttempt(parsed, { includeGenericHostReference: false }) ??
+    classifyDisguisedUpstreamGithubAttempt(parsed) ??
+    classifyDirectUpstreamGithubAttempt(parsed, { includeGenericHostReference: true })
+  );
+}
+
+function auditForUpstreamClassification(
+  audit: AgentCommandPolicyAuditPayload,
+  classification: UpstreamGithubClassification,
+): AgentCommandPolicyAuditPayload {
+  return {
+    ...audit,
+    commandClass: classification.commandClass,
+    upstreamContactAttempted: false,
+    ...(classification.gitSubcommand === undefined ? {} : { gitSubcommand: classification.gitSubcommand }),
+    ...(classification.targetHosts === undefined || classification.targetHosts.length === 0
+      ? {}
+      : { targetHosts: sortedUniqueKeys([...(audit.targetHosts ?? []), ...classification.targetHosts]) }),
+  };
+}
+
+function classifyDirectUpstreamGithubAttempt(
+  parsed: ParsedCommandAttempt,
+  options: { readonly includeGenericHostReference: boolean },
+): UpstreamGithubClassification | null {
   const executable = parsed.normalizedExecutable;
   if (executable === undefined) {
     return null;
@@ -473,12 +530,20 @@ function classifyDirectUpstreamGithubAttempt(parsed: ParsedCommandAttempt): stri
 
   if (executable === "git") {
     if (parsed.gitSubcommand && UPSTREAM_GIT_SUBCOMMANDS.has(parsed.gitSubcommand)) {
-      return `git_${parsed.gitSubcommand.replace(/-/g, "_")}`;
+      return {
+        commandClass: `git_${parsed.gitSubcommand.replace(/-/g, "_")}`,
+        gitSubcommand: parsed.gitSubcommand,
+        targetHosts: parsed.targetHosts,
+      };
     }
 
     const remoteAction = parsed.gitSubcommand === "remote" ? gitRemoteSubcommand(parsed.tokens) : null;
     if (remoteAction && GIT_REMOTE_UPSTREAM_SUBCOMMANDS.has(remoteAction)) {
-      return `git_remote_${remoteAction}`;
+      return {
+        commandClass: `git_remote_${remoteAction}`,
+        gitSubcommand: parsed.gitSubcommand ?? null,
+        targetHosts: parsed.targetHosts,
+      };
     }
 
     if (
@@ -486,31 +551,404 @@ function classifyDirectUpstreamGithubAttempt(parsed: ParsedCommandAttempt): stri
       GIT_UPSTREAM_CHECKOUT_SUBCOMMANDS.has(parsed.gitSubcommand) &&
       hasUpstreamCheckoutReference(parsed.tokens)
     ) {
-      return "git_upstream_checkout";
+      return {
+        commandClass: "git_upstream_checkout",
+        gitSubcommand: parsed.gitSubcommand,
+        targetHosts: parsed.targetHosts,
+      };
     }
 
     if (parsed.targetHosts.length > 0) {
-      return "git_github_transport";
+      return {
+        commandClass: "git_github_transport",
+        gitSubcommand: parsed.gitSubcommand ?? null,
+        targetHosts: parsed.targetHosts,
+      };
     }
   }
 
   if (GITHUB_CLI_EXECUTABLES.has(executable)) {
-    return "github_cli";
+    return { commandClass: "github_cli", targetHosts: parsed.targetHosts };
   }
 
   if (SSH_EXECUTABLES.has(executable) && parsed.targetHosts.length > 0) {
-    return `${executable}_github_transport`;
+    return { commandClass: `${executable}_github_transport`, targetHosts: parsed.targetHosts };
   }
 
   if (NETWORK_CLIENT_EXECUTABLES.has(executable) && parsed.targetHosts.length > 0) {
-    return `${executable}_github_request`;
+    return { commandClass: `${executable}_github_request`, targetHosts: parsed.targetHosts };
   }
 
-  if (parsed.targetHosts.length > 0) {
-    return "github_host_reference";
+  if (options.includeGenericHostReference && parsed.targetHosts.length > 0) {
+    return { commandClass: "github_host_reference", targetHosts: parsed.targetHosts };
   }
 
   return null;
+}
+
+function classifyDisguisedUpstreamGithubAttempt(
+  parsed: ParsedCommandAttempt,
+  depth = 0,
+): UpstreamGithubClassification | null {
+  if (depth > 3) {
+    return classifyVisibleCodeUpstreamGithubAttempt(parsed.command);
+  }
+
+  const compoundClassification = classifyCompoundCommandSegments(parsed, depth);
+  if (compoundClassification !== null) return compoundClassification;
+
+  const visibleNestedClassification = classifyVisibleNestedCommandTokens(parsed, depth);
+  if (visibleNestedClassification !== null) {
+    return prefixNestedClassification(parsed, visibleNestedClassification);
+  }
+
+  for (const nestedCommandText of nestedCommandTextsForWrapper(parsed)) {
+    const classification = classifyCommandTextForUpstream(nestedCommandText, depth + 1);
+    if (classification !== null) return prefixNestedClassification(parsed, classification);
+  }
+
+  if (parsed.hasNestedCommand || isScriptWrapperAttempt(parsed)) {
+    const codeClassification = classifyVisibleCodeUpstreamGithubAttempt(parsed.command);
+    if (codeClassification !== null) return prefixNestedClassification(parsed, codeClassification);
+  }
+
+  return null;
+}
+
+function classifyCompoundCommandSegments(
+  parsed: ParsedCommandAttempt,
+  depth: number,
+): UpstreamGithubClassification | null {
+  const segments = splitCommandSegments(parsed.tokens);
+  if (segments.length <= 1) return null;
+
+  for (const segment of segments) {
+    const classification = classifyCommandTokensForUpstream(segment, depth + 1);
+    if (classification !== null) return prefixCommandClass("compound", classification);
+  }
+
+  return null;
+}
+
+function classifyVisibleNestedCommandTokens(
+  parsed: ParsedCommandAttempt,
+  depth: number,
+): UpstreamGithubClassification | null {
+  for (let index = 1; index < parsed.tokens.length; index += 1) {
+    const token = parsed.tokens[index];
+    if (token === undefined || isShellControlOperator(token)) continue;
+
+    const normalized = normalizeAgentCommandPolicyExecutable(token).normalizedExecutable;
+    if (normalized && isDirectlyClassifiableUpstreamExecutable(normalized)) {
+      const segmentTokens = tokensUntilControlOperator(parsed.tokens, index);
+      const classification = classifyCommandTokensForUpstream(segmentTokens, depth + 1);
+      if (classification !== null) return classification;
+    }
+
+    if (isPotentialNestedCommandText(token)) {
+      const classification = classifyCommandTextForUpstream(token, depth + 1);
+      if (classification !== null) return classification;
+    }
+
+    const githubHost = githubHostFromToken(token);
+    if (githubHost !== null) {
+      return { commandClass: "github_host_reference", targetHosts: [githubHost] };
+    }
+  }
+
+  return null;
+}
+
+function classifyCommandTokensForUpstream(
+  tokens: readonly string[],
+  depth: number,
+): UpstreamGithubClassification | null {
+  if (tokens.length === 0) return null;
+  const parsed = parseCommandAttemptFromTokens([...tokens]);
+  return (
+    classifyDirectUpstreamGithubAttempt(parsed, { includeGenericHostReference: false }) ??
+    (depth > 3 ? null : classifyDisguisedUpstreamGithubAttempt(parsed, depth + 1)) ??
+    classifyDirectUpstreamGithubAttempt(parsed, { includeGenericHostReference: true }) ??
+    classifyVisibleCodeUpstreamGithubAttempt(parsed.command)
+  );
+}
+
+function classifyCommandTextForUpstream(command: string, depth: number): UpstreamGithubClassification | null {
+  const parsed = parseCommandAttempt(command);
+  return (
+    classifyDirectUpstreamGithubAttempt(parsed, { includeGenericHostReference: false }) ??
+    (depth > 3 ? null : classifyDisguisedUpstreamGithubAttempt(parsed, depth + 1)) ??
+    classifyDirectUpstreamGithubAttempt(parsed, { includeGenericHostReference: true }) ??
+    classifyVisibleCodeUpstreamGithubAttempt(command)
+  );
+}
+
+function classifyVisibleCodeUpstreamGithubAttempt(text: string): UpstreamGithubClassification | null {
+  const tokens = tokenizeCommandPreview(text);
+  const targetHosts = extractGithubHosts(tokens);
+
+  for (const subcommand of UPSTREAM_GIT_SUBCOMMANDS) {
+    if (containsExecutableAndWord(text, "git", subcommand)) {
+      return {
+        commandClass: `git_${subcommand.replace(/-/g, "_")}`,
+        gitSubcommand: subcommand,
+        targetHosts,
+      };
+    }
+  }
+
+  const remoteAction = gitRemoteActionInText(text);
+  if (remoteAction !== null) {
+    return { commandClass: `git_remote_${remoteAction}`, gitSubcommand: "remote", targetHosts };
+  }
+
+  for (const executable of GITHUB_CLI_EXECUTABLES) {
+    if (containsExecutableWord(text, executable)) return { commandClass: "github_cli", targetHosts };
+  }
+
+  for (const executable of SSH_EXECUTABLES) {
+    if (targetHosts.length > 0 && containsExecutableWord(text, executable)) {
+      return { commandClass: `${executable}_github_transport`, targetHosts };
+    }
+  }
+
+  for (const executable of NETWORK_CLIENT_EXECUTABLES) {
+    if (targetHosts.length > 0 && containsExecutableWord(text, executable)) {
+      return { commandClass: `${executable}_github_request`, targetHosts };
+    }
+  }
+
+  return targetHosts.length > 0 ? { commandClass: "github_host_reference", targetHosts } : null;
+}
+
+function nestedCommandTextsForWrapper(parsed: ParsedCommandAttempt): string[] {
+  switch (parsed.executableKind) {
+    case "shell":
+      return shellNestedCommandTexts(parsed.normalizedExecutable, parsed.tokens);
+    case "interpreter":
+      return interpreterNestedCommandTexts(parsed.tokens);
+    case "package_script":
+      return packageNestedCommandTexts(parsed.normalizedExecutable, parsed.tokens);
+    default:
+      return [];
+  }
+}
+
+function shellNestedCommandTexts(executable: string | undefined, tokens: readonly string[]): string[] {
+  const commandTexts: string[] = [];
+
+  if (executable === "cmd") {
+    for (let index = 1; index < tokens.length; index += 1) {
+      const token = tokens[index]?.toLowerCase();
+      if (token === "/c" || token === "/k" || token === "-c") {
+        const nested = tokens.slice(index + 1).join(" ").trim();
+        if (nested.length > 0) commandTexts.push(nested);
+      }
+    }
+    return commandTexts;
+  }
+
+  if (executable === "powershell" || executable === "pwsh") {
+    for (let index = 1; index < tokens.length; index += 1) {
+      const token = tokens[index]?.toLowerCase();
+      if (token === "-command" || token === "-c" || token === "/c") {
+        const nested = tokens.slice(index + 1).join(" ").trim();
+        if (nested.length > 0) commandTexts.push(nested);
+      }
+    }
+    return commandTexts;
+  }
+
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token !== undefined && token.startsWith("-") && token.toLowerCase().includes("c")) {
+      const nested = tokens.slice(index + 1).join(" ").trim();
+      if (nested.length > 0) commandTexts.push(nested);
+    }
+  }
+
+  return commandTexts;
+}
+
+function interpreterNestedCommandTexts(tokens: readonly string[]): string[] {
+  const commandTexts: string[] = [];
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index]?.toLowerCase();
+    if (token === "-c" || token === "-e" || token === "--eval") {
+      const nested = tokens.slice(index + 1).join(" ").trim();
+      if (nested.length > 0) commandTexts.push(nested);
+    }
+  }
+  return commandTexts;
+}
+
+function packageNestedCommandTexts(executable: string | undefined, tokens: readonly string[]): string[] {
+  if (executable === "npx" || executable === "bunx") return packageCommandAfterOptions(tokens, 1);
+
+  if (executable === "npm" || executable === "pnpm" || executable === "yarn" || executable === "bun") {
+    const actionIndex = firstPackageActionIndex(tokens);
+    if (actionIndex < 0) return [];
+    const action = tokens[actionIndex]?.toLowerCase();
+    if (action === "exec" || action === "x" || action === "dlx") {
+      return packageCommandAfterOptions(tokens, actionIndex + 1);
+    }
+  }
+
+  return [];
+}
+
+function packageCommandAfterOptions(tokens: readonly string[], startIndex: number): string[] {
+  for (let index = startIndex; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined) continue;
+    if (token === "--") {
+      const nested = tokens.slice(index + 1).join(" ").trim();
+      return nested.length > 0 ? [nested] : [];
+    }
+    if (token.startsWith("-")) continue;
+    const nested = tokens.slice(index).join(" ").trim();
+    return nested.length > 0 ? [nested] : [];
+  }
+  return [];
+}
+
+function firstPackageActionIndex(tokens: readonly string[]): number {
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined) continue;
+    if (token === "--") return -1;
+    if (token.startsWith("-")) continue;
+    return index;
+  }
+  return -1;
+}
+
+function splitCommandSegments(tokens: readonly string[]): string[][] {
+  const segments: string[][] = [];
+  let current: string[] = [];
+  for (const token of tokens) {
+    if (isShellControlOperator(token)) {
+      if (current.length > 0) {
+        segments.push(current);
+        current = [];
+      }
+      continue;
+    }
+    current.push(token);
+  }
+  if (current.length > 0) segments.push(current);
+  return segments;
+}
+
+function tokensUntilControlOperator(tokens: readonly string[], startIndex: number): string[] {
+  const segment: string[] = [];
+  for (let index = startIndex; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined || isShellControlOperator(token)) break;
+    segment.push(token);
+  }
+  return segment;
+}
+
+function prefixNestedClassification(
+  parsed: ParsedCommandAttempt,
+  classification: UpstreamGithubClassification,
+): UpstreamGithubClassification {
+  const prefix = nestedCommandClassPrefix(parsed);
+  return prefix === "nested" ? classification : prefixCommandClass(prefix, classification);
+}
+
+function prefixCommandClass(
+  prefix: string,
+  classification: UpstreamGithubClassification,
+): UpstreamGithubClassification {
+  return { ...classification, commandClass: `${prefix}_${classification.commandClass}` };
+}
+
+function nestedCommandClassPrefix(parsed: ParsedCommandAttempt): string {
+  switch (parsed.executableKind) {
+    case "shell":
+      return "shell_wrapped";
+    case "interpreter":
+      return "interpreter_wrapped";
+    case "package_script":
+      return "package_script_wrapped";
+    default:
+      return isScriptWrapperAttempt(parsed) ? "script_wrapped" : "nested";
+  }
+}
+
+function ambiguousNestedCommandClass(parsed: ParsedCommandAttempt): string {
+  if (commandHasShellControl(parsed.tokens)) return "ambiguous_compound_command";
+  switch (parsed.executableKind) {
+    case "shell":
+      return "ambiguous_shell_wrapper_command";
+    case "interpreter":
+      return "ambiguous_interpreter_command";
+    case "package_script":
+      return "ambiguous_package_script";
+    default:
+      return isScriptWrapperAttempt(parsed) ? "ambiguous_script_wrapper" : "ambiguous_wrapper_command";
+  }
+}
+
+function hasNestedCommandEvidence(parsed: ParsedCommandAttempt): boolean {
+  return (
+    commandHasShellControl(parsed.tokens) ||
+    (parsed.normalizedExecutable !== undefined && SHELL_OR_WRAPPER_EXECUTABLES.has(parsed.normalizedExecutable)) ||
+    isScriptWrapperAttempt(parsed)
+  );
+}
+
+function commandHasShellControl(tokens: readonly string[]): boolean {
+  return tokens.some((token) => isShellControlOperator(token));
+}
+
+function isScriptWrapperAttempt(parsed: ParsedCommandAttempt): boolean {
+  const basename = parsed.executableBasename ?? parsed.executableToken ?? "";
+  if (/\.(?:bash|bat|cmd|fish|ps1|sh|zsh)$/iu.test(basename)) return true;
+  return parsed.executableKind === "other" && parsed.executablePathStyle !== undefined && parsed.executablePathStyle !== "bare";
+}
+
+function isDirectlyClassifiableUpstreamExecutable(executable: string): boolean {
+  return (
+    GIT_EXECUTABLES.has(executable) ||
+    GITHUB_CLI_EXECUTABLES.has(executable) ||
+    SSH_EXECUTABLES.has(executable) ||
+    NETWORK_CLIENT_EXECUTABLES.has(executable)
+  );
+}
+
+function isPotentialNestedCommandText(token: string): boolean {
+  return /\s|[;&|]|\b(?:child_process|subprocess|system|exec(?:Sync)?|spawn|popen|urlopen|fetch)\b/iu.test(token);
+}
+
+function gitRemoteActionInText(text: string): string | null {
+  const remoteActionPattern = /\bgit(?:\.exe)?\b[\s\S]{0,120}\bremote\b[\s\S]{0,80}\b(prune|update)\b/iu;
+  const match = remoteActionPattern.exec(text);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+function containsExecutableAndWord(text: string, executable: string, word: string): boolean {
+  return new RegExp(`${executableWordPattern(executable)}[\\s\\S]{0,120}${wordPattern(word)}`, "iu").test(text);
+}
+
+function containsExecutableWord(text: string, executable: string): boolean {
+  return new RegExp(executableWordPattern(executable), "iu").test(text);
+}
+
+function executableWordPattern(executable: string): string {
+  const escapedExecutable = escapeRegExp(executable);
+  const suffix = executable === "git" ? "(?:\\.exe)?" : "";
+  return `(?:^|[^A-Za-z0-9_.-])${escapedExecutable}${suffix}(?:$|[^A-Za-z0-9_.-])`;
+}
+
+function wordPattern(word: string): string {
+  return `(?:^|[^A-Za-z0-9_.-])${escapeRegExp(word)}(?:$|[^A-Za-z0-9_.-])`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
 function gitRemoteSubcommand(tokens: readonly string[]): string | null {
