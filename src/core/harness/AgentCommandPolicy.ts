@@ -31,6 +31,13 @@ const REDACTED_ASSIGNMENT_VALUE = "[redacted]";
 
 const RESTRICTED_ROLES = new Set(["worker", "reviewer", "merge-conflict-repair-worker", "merge_conflict_repair_worker"]);
 const LOCAL_INSPECTION_GIT_SUBCOMMANDS = new Set(["status", "diff", "log", "show", "branch", "blame"]);
+const LOCAL_GIT_INSPECTION_ALLOW_MESSAGE = "Allowed helper-free local Git inspection command.";
+const LOCAL_GIT_HELPER_DENY_MESSAGE =
+  "Blocked worker/reviewer Git command: local Git inspection would execute a configured helper. Use local inspection without helper configuration or rely on Symphony service-owned GitHub workflow actions.";
+const LOCAL_GIT_NON_INSPECTION_DENY_MESSAGE =
+  "Blocked worker/reviewer Git command: only helper-free local inspection commands are allowed. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.";
+const LOCAL_GIT_UNCLASSIFIED_DENY_MESSAGE =
+  "Blocked worker/reviewer Git command: command is not classified as helper-free local inspection. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.";
 const UPSTREAM_GIT_SUBCOMMANDS = new Set([
   "clone",
   "fetch",
@@ -431,7 +438,7 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
       },
       "ambiguous_command",
       commandClass,
-      "Blocked worker/reviewer command: wrapper, shell, package, or interpreter commands are not classified as helper-free local inspection by this policy scaffold. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
+      "Blocked worker/reviewer command: wrapper, shell, package, or interpreter commands are not classified as helper-free local inspection. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
     );
   }
 
@@ -444,7 +451,7 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
     },
     "ambiguous_command",
     "ambiguous_command",
-    "Blocked worker/reviewer command: command is not classified as helper-free local inspection by this policy scaffold. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
+    "Blocked worker/reviewer command: command is not classified as helper-free local inspection. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
   );
 }
 
@@ -1526,13 +1533,9 @@ function classifyGitCommand(
   tokens: string[],
   command: string,
 ): AgentCommandPolicyDecision {
-  const gitSubcommand = extractGitSubcommand(tokens);
-  const gitAudit = {
-    ...audit,
-    ...(gitSubcommand === null ? {} : { gitSubcommand }),
-  } satisfies AgentCommandPolicyAuditPayload;
-
-  if (gitSubcommand === null) {
+  const gitSubcommandDetails = extractGitSubcommandDetails(tokens);
+  if (gitSubcommandDetails === null) {
+    const gitAudit = { ...audit } satisfies AgentCommandPolicyAuditPayload;
     return denyDecision(
       input,
       {
@@ -1545,6 +1548,12 @@ function classifyGitCommand(
       "Blocked worker/reviewer Git command: no Git subcommand was provided. Use helper-free local inspection commands only.",
     );
   }
+
+  const gitSubcommand = gitSubcommandDetails.subcommand;
+  const gitAudit = {
+    ...audit,
+    gitSubcommand,
+  } satisfies AgentCommandPolicyAuditPayload;
 
   if (UPSTREAM_GIT_SUBCOMMANDS.has(gitSubcommand) || isRemoteMutationCommand(tokens, gitSubcommand)) {
     return denyDecision(
@@ -1560,7 +1569,37 @@ function classifyGitCommand(
     );
   }
 
-  if (LOCAL_INSPECTION_GIT_SUBCOMMANDS.has(gitSubcommand) && !containsInlineUnsafeLocalGitOption(command)) {
+  if (LOCAL_INSPECTION_GIT_SUBCOMMANDS.has(gitSubcommand)) {
+    const unsafeConfigCategories = localGitInspectionUnsafeConfigCategories(tokens, gitSubcommandDetails.index, command);
+    if (unsafeConfigCategories.length > 0) {
+      return denyDecision(
+        input,
+        {
+          ...gitAudit,
+          commandClass: "git_local_inspection_with_helper",
+          unsafeConfigCategories,
+          upstreamContactAttempted: false,
+        },
+        "unsafe_git_config",
+        "git_local_inspection_with_helper",
+        LOCAL_GIT_HELPER_DENY_MESSAGE,
+      );
+    }
+
+    if (!isHelperFreeLocalGitInspectionInvocation(tokens, gitSubcommandDetails)) {
+      return denyDecision(
+        input,
+        {
+          ...gitAudit,
+          commandClass: "git_non_inspection_command",
+          upstreamContactAttempted: false,
+        },
+        "ambiguous_command",
+        "git_non_inspection_command",
+        LOCAL_GIT_NON_INSPECTION_DENY_MESSAGE,
+      );
+    }
+
     return allowDecision(
       input,
       {
@@ -1570,7 +1609,7 @@ function classifyGitCommand(
       },
       "local_only_inspection",
       "local_git_inspection",
-      "Allowed helper-free local Git inspection command.",
+      LOCAL_GIT_INSPECTION_ALLOW_MESSAGE,
     );
   }
 
@@ -1583,7 +1622,7 @@ function classifyGitCommand(
     },
     "ambiguous_command",
     "ambiguous_git_command",
-    "Blocked worker/reviewer Git command: command is not classified as helper-free local inspection by this policy scaffold. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
+    LOCAL_GIT_UNCLASSIFIED_DENY_MESSAGE,
   );
 }
 
@@ -1824,7 +1863,16 @@ function firstExecutableToken(tokens: string[]): string | null {
   return null;
 }
 
+interface GitSubcommandDetails {
+  readonly subcommand: string;
+  readonly index: number;
+}
+
 function extractGitSubcommand(tokens: string[]): string | null {
+  return extractGitSubcommandDetails(tokens)?.subcommand ?? null;
+}
+
+function extractGitSubcommandDetails(tokens: string[]): GitSubcommandDetails | null {
   let sawGit = false;
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
@@ -1842,7 +1890,7 @@ function extractGitSubcommand(tokens: string[]): string | null {
     }
     if (token.startsWith("--git-dir=") || token.startsWith("--work-tree=") || token.startsWith("-c")) continue;
     if (token.startsWith("-")) continue;
-    return token.toLowerCase();
+    return { subcommand: token.toLowerCase(), index };
   }
   return null;
 }
@@ -1905,6 +1953,197 @@ function isGithubHost(host: string): boolean {
 
 function isShellControlOperator(token: string): boolean {
   return token === ";" || token === "|" || token === "&" || token === "&&" || token === "||";
+}
+
+function localGitInspectionUnsafeConfigCategories(
+  tokens: readonly string[],
+  gitSubcommandIndex: number,
+  command: string,
+): AgentCommandPolicyUnsafeGitConfigCategory[] {
+  const categories = new Set<AgentCommandPolicyUnsafeGitConfigCategory>();
+
+  if (containsInlineUnsafeLocalGitOption(command)) categories.add("external_diff");
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined) continue;
+
+    if (isLocalGitExternalHelperOption(token)) {
+      categories.add("external_diff");
+      continue;
+    }
+
+    if (index >= gitSubcommandIndex) continue;
+
+    if (isGitGlobalPagerOption(token)) {
+      categories.add("pager");
+      continue;
+    }
+
+    if (isGitInlineConfigOption(token)) {
+      categories.add(unsafeGitConfigCategoryFromInlineConfigOption(tokens, index));
+      continue;
+    }
+
+    if (isGitExecPathOption(token)) {
+      categories.add("other");
+    }
+  }
+
+  return sortedUniqueKeys(categories) as AgentCommandPolicyUnsafeGitConfigCategory[];
+}
+
+function isHelperFreeLocalGitInspectionInvocation(
+  tokens: readonly string[],
+  gitSubcommandDetails: GitSubcommandDetails,
+): boolean {
+  if (gitSubcommandDetails.subcommand !== "branch") return true;
+  return isBranchInspectionInvocation(tokens.slice(gitSubcommandDetails.index + 1));
+}
+
+function isBranchInspectionInvocation(args: readonly string[]): boolean {
+  let allowPatternArgument = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (token === undefined || isShellControlOperator(token)) return false;
+    if (token === "--") return false;
+
+    if (!token.startsWith("-")) {
+      if (allowPatternArgument) continue;
+      return false;
+    }
+
+    if (isBranchMutationOption(token)) return false;
+
+    if (isBranchInspectionShortOptionCluster(token)) {
+      if (token.includes("a") || token.includes("r")) allowPatternArgument = true;
+      continue;
+    }
+
+    const optionName = branchLongOptionName(token);
+    if (optionName === null) return false;
+
+    if (BRANCH_INSPECTION_FLAG_OPTIONS.has(optionName)) {
+      if (optionName === "--all" || optionName === "--remotes" || optionName === "--list") {
+        allowPatternArgument = true;
+      }
+      continue;
+    }
+
+    if (BRANCH_INSPECTION_VALUE_OPTIONS.has(optionName)) {
+      if (!token.includes("=") && args[index + 1] !== undefined && args[index + 1] !== "--") index += 1;
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
+const BRANCH_INSPECTION_FLAG_OPTIONS = new Set([
+  "--all",
+  "--ignore-case",
+  "--list",
+  "--no-abbrev",
+  "--no-color",
+  "--no-column",
+  "--remotes",
+  "--show-current",
+  "--verbose",
+]);
+
+const BRANCH_INSPECTION_VALUE_OPTIONS = new Set([
+  "--abbrev",
+  "--color",
+  "--column",
+  "--contains",
+  "--format",
+  "--merged",
+  "--no-contains",
+  "--no-merged",
+  "--points-at",
+  "--sort",
+]);
+
+const BRANCH_MUTATION_LONG_OPTIONS = new Set([
+  "--copy",
+  "--create-reflog",
+  "--delete",
+  "--edit-description",
+  "--force",
+  "--move",
+  "--no-track",
+  "--set-upstream-to",
+  "--track",
+  "--unset-upstream",
+]);
+
+function isBranchInspectionShortOptionCluster(token: string): boolean {
+  return /^-[arv]+$/u.test(token);
+}
+
+function isBranchMutationOption(token: string): boolean {
+  const optionName = branchLongOptionName(token);
+  if (optionName !== null && BRANCH_MUTATION_LONG_OPTIONS.has(optionName)) return true;
+  return /^-[^-]*[dDmMcCflut]/u.test(token);
+}
+
+function branchLongOptionName(token: string): string | null {
+  if (!token.startsWith("--")) return null;
+  const separatorIndex = token.indexOf("=");
+  return separatorIndex < 0 ? token : token.slice(0, separatorIndex);
+}
+
+function isLocalGitExternalHelperOption(token: string): boolean {
+  return optionTokenName(token) === "--ext-diff" || optionTokenName(token) === "--textconv";
+}
+
+function isGitGlobalPagerOption(token: string): boolean {
+  return token === "--paginate" || token === "-p";
+}
+
+function isGitInlineConfigOption(token: string): boolean {
+  return token === "-c" || token.startsWith("-c") || token === "--config-env" || token.startsWith("--config-env=");
+}
+
+function isGitExecPathOption(token: string): boolean {
+  return token === "--exec-path" || token.startsWith("--exec-path=");
+}
+
+function unsafeGitConfigCategoryFromInlineConfigOption(
+  tokens: readonly string[],
+  optionIndex: number,
+): AgentCommandPolicyUnsafeGitConfigCategory {
+  const token = tokens[optionIndex] ?? "";
+  const configText = inlineGitConfigText(tokens, optionIndex, token).toLowerCase();
+  if (configText.startsWith("alias.")) return "alias";
+  if (configText.includes("pager")) return "pager";
+  if (configText.includes("external") || configText.includes("extcmd") || configText.includes("textconv")) {
+    return "external_diff";
+  }
+  if (configText.includes("credential")) return "credential_helper";
+  if (configText.includes("hook")) return "hook";
+  if (configText.startsWith("filter.")) return "filter";
+  if (configText.includes("signing") || configText.includes("gpg")) return "signing_program";
+  if (configText.includes("fsmonitor")) return "filesystem_monitor";
+  if (configText.includes("ssh") || configText.includes("insteadOf".toLowerCase()) || configText.includes("pushinsteadOf".toLowerCase())) {
+    return "transport_helper";
+  }
+  return "other";
+}
+
+function inlineGitConfigText(tokens: readonly string[], optionIndex: number, token: string): string {
+  if (token === "-c" || token === "--config-env") return tokens[optionIndex + 1] ?? "";
+  if (token.startsWith("-c")) return token.slice(2);
+  if (token.startsWith("--config-env=")) return token.slice("--config-env=".length);
+  return token;
+}
+
+function optionTokenName(token: string): string {
+  const separatorIndex = token.indexOf("=");
+  return separatorIndex < 0 ? token : token.slice(0, separatorIndex);
 }
 
 function containsInlineUnsafeLocalGitOption(command: string): boolean {
