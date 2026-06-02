@@ -13,6 +13,7 @@ interface DisguisedUpstreamDenyCase {
   readonly executableKind?: string;
   readonly gitSubcommand?: string;
   readonly targetHosts?: readonly string[];
+  readonly hasNestedCommand?: boolean;
 }
 
 interface AmbiguousWrapperDenyCase {
@@ -93,9 +94,61 @@ describe("AgentCommandPolicy disguised upstream GitHub command denial", () => {
       executableKind: "git",
       gitSubcommand: "fetch",
     },
+    {
+      name: "$() command substitution hiding GitHub CLI",
+      command: "git status --short $(gh pr create --fill)",
+      commandClass: "shell_substitution_github_cli",
+      executable: "git",
+      executableKind: "git",
+      hasNestedCommand: true,
+    },
+    {
+      name: "$() command substitution hiding Git fetch",
+      command: "git diff -- $(git fetch origin main)",
+      commandClass: "shell_substitution_git_fetch",
+      executable: "git",
+      executableKind: "git",
+      gitSubcommand: "fetch",
+      hasNestedCommand: true,
+    },
+    {
+      name: "backtick substitution hiding GitHub CLI",
+      command: "git status --short `gh pr create --fill`",
+      commandClass: "shell_substitution_github_cli",
+      executable: "git",
+      executableKind: "git",
+      hasNestedCommand: true,
+    },
+    {
+      name: "backtick substitution hiding GitHub API request",
+      command: "git status --short `curl https://api.github.com/repos/acme/repo/pulls`",
+      commandClass: "shell_substitution_curl_github_request",
+      executable: "git",
+      executableKind: "git",
+      targetHosts: ["api.github.com"],
+      hasNestedCommand: true,
+    },
+    {
+      name: "input process substitution hiding Git fetch",
+      command: "git diff -- <(git fetch origin main)",
+      commandClass: "process_substitution_git_fetch",
+      executable: "git",
+      executableKind: "git",
+      gitSubcommand: "fetch",
+      hasNestedCommand: true,
+    },
+    {
+      name: "output process substitution hiding GitHub SSH",
+      command: "git diff -- >(ssh -T git@github.com)",
+      commandClass: "process_substitution_ssh_github_transport",
+      executable: "git",
+      executableKind: "git",
+      targetHosts: ["github.com"],
+      hasNestedCommand: true,
+    },
   ])(
     "denies disguised upstream GitHub activity before execution: $name",
-    ({ command, commandClass, executable, executableKind, gitSubcommand, targetHosts }) => {
+    ({ command, commandClass, executable, executableKind, gitSubcommand, targetHosts, hasNestedCommand }) => {
       const decision = evaluateAgentCommandPolicy(terminalInput(command));
 
       expect(decision).toMatchObject({
@@ -120,6 +173,9 @@ describe("AgentCommandPolicy disguised upstream GitHub command denial", () => {
       }
       if (targetHosts) {
         expect(decision.audit.targetHosts).toEqual(targetHosts);
+      }
+      if (hasNestedCommand !== undefined) {
+        expect(decision.audit.hasNestedCommand).toBe(hasNestedCommand);
       }
     },
   );
@@ -150,6 +206,24 @@ describe("AgentCommandPolicy disguised upstream GitHub command denial", () => {
         redacted: true,
         normalizedExecutable: executable,
         executableKind,
+        upstreamContactAttempted: false,
+      },
+    });
+    expect(decision.message).toContain("service-owned GitHub workflow");
+  });
+
+  it("fails closed for shell substitution even when no upstream executable is visible", () => {
+    const decision = evaluateAgentCommandPolicy(terminalInput("git status --short $(pwd)"));
+
+    expect(decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "ambiguous_command",
+      commandClass: "ambiguous_shell_substitution_command",
+      audit: {
+        redacted: true,
+        normalizedExecutable: "git",
+        executableKind: "git",
+        hasNestedCommand: true,
         upstreamContactAttempted: false,
       },
     });

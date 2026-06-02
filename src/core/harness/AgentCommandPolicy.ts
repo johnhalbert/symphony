@@ -496,6 +496,8 @@ interface UpstreamGithubClassification {
   readonly targetHosts?: readonly string[];
 }
 
+type ShellExecutionExpansionKind = "shell_substitution" | "process_substitution";
+
 function classifyUpstreamGithubAttempt(parsed: ParsedCommandAttempt): UpstreamGithubClassification | null {
   return (
     classifyDirectUpstreamGithubAttempt(parsed, { includeGenericHostReference: false }) ??
@@ -558,7 +560,7 @@ function classifyDirectUpstreamGithubAttempt(
       };
     }
 
-    if (parsed.targetHosts.length > 0) {
+    if (parsed.targetHosts.length > 0 && !parsed.hasNestedCommand) {
       return {
         commandClass: "git_github_transport",
         gitSubcommand: parsed.gitSubcommand ?? null,
@@ -597,6 +599,9 @@ function classifyDisguisedUpstreamGithubAttempt(
   const compoundClassification = classifyCompoundCommandSegments(parsed, depth);
   if (compoundClassification !== null) return compoundClassification;
 
+  const shellExpansionClassification = classifyShellExecutionExpansionUpstreamGithubAttempt(parsed);
+  if (shellExpansionClassification !== null) return shellExpansionClassification;
+
   const visibleNestedClassification = classifyVisibleNestedCommandTokens(parsed, depth);
   if (visibleNestedClassification !== null) {
     return prefixNestedClassification(parsed, visibleNestedClassification);
@@ -628,6 +633,16 @@ function classifyCompoundCommandSegments(
   }
 
   return null;
+}
+
+function classifyShellExecutionExpansionUpstreamGithubAttempt(
+  parsed: ParsedCommandAttempt,
+): UpstreamGithubClassification | null {
+  const expansionKind = shellExecutionExpansionKind(parsed.command);
+  if (expansionKind === null) return null;
+
+  const classification = classifyVisibleCodeUpstreamGithubAttempt(parsed.command);
+  return classification === null ? null : prefixCommandClass(expansionKind, classification);
 }
 
 function classifyVisibleNestedCommandTokens(
@@ -879,6 +894,9 @@ function nestedCommandClassPrefix(parsed: ParsedCommandAttempt): string {
 }
 
 function ambiguousNestedCommandClass(parsed: ParsedCommandAttempt): string {
+  const expansionKind = shellExecutionExpansionKind(parsed.command);
+  if (expansionKind !== null) return `ambiguous_${expansionKind}_command`;
+
   if (commandHasShellControl(parsed.tokens)) return "ambiguous_compound_command";
   switch (parsed.executableKind) {
     case "shell":
@@ -894,10 +912,48 @@ function ambiguousNestedCommandClass(parsed: ParsedCommandAttempt): string {
 
 function hasNestedCommandEvidence(parsed: ParsedCommandAttempt): boolean {
   return (
+    shellExecutionExpansionKind(parsed.command) !== null ||
     commandHasShellControl(parsed.tokens) ||
     (parsed.normalizedExecutable !== undefined && SHELL_OR_WRAPPER_EXECUTABLES.has(parsed.normalizedExecutable)) ||
     isScriptWrapperAttempt(parsed)
   );
+}
+
+function shellExecutionExpansionKind(command: string): ShellExecutionExpansionKind | null {
+  let quote: "'" | '"' | null = null;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (char === undefined) continue;
+
+    if (char === "\\" && quote !== "'") {
+      index += 1;
+      continue;
+    }
+
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      continue;
+    }
+
+    if (char === "'" && quote === null) {
+      quote = "'";
+      continue;
+    }
+
+    if (char === '"') {
+      quote = quote === '"' ? null : '"';
+      continue;
+    }
+
+    if (char === "`") return "shell_substitution";
+
+    const next = command[index + 1];
+    if (char === "$" && next === "(" && command[index + 2] !== "(") return "shell_substitution";
+    if ((char === "<" || char === ">") && next === "(") return "process_substitution";
+  }
+
+  return null;
 }
 
 function commandHasShellControl(tokens: readonly string[]): boolean {
