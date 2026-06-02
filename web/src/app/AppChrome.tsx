@@ -93,7 +93,7 @@ export function AppChrome({
         <span className="statusbar__seg mono">{repoBranchLabel}</span>
         <span className="statusbar__sep">·</span>
         <span className="statusbar__seg mono">{pollLabel}</span>
-        <div className="statusbar__right">
+        <div className="statusbar__right" role="status" aria-live="polite">
           <span className="statusbar__seg mono">{connectionStatusLabel}</span>
           <span className="statusbar__sep">·</span>
           <span className="statusbar__seg mono">{dataSourceLabel}</span>

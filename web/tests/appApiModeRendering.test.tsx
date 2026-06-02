@@ -2,7 +2,8 @@ import { Fragment, createElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveAppResourceLoading } from "../src/app/resourceLoading";
-import type { SymphonyDataSource } from "../src/data/dataSource";
+import type { RealtimeConnectionStatus, SymphonyDataSource } from "../src/data/dataSource";
+import type { LiveResourceState, LiveResourceTokenMap } from "../src/hooks/useLiveResource";
 import { fallbackReferenceData } from "../src/data/referenceDataContext";
 import type {
   AppTab,
@@ -279,6 +280,25 @@ type AppHookCalls = {
   orchestratorChat: HookOptions[];
 };
 
+const zeroLiveResourceTokens: LiveResourceTokenMap = {
+  referenceData: 0,
+  dashboard: 0,
+  issueBoard: 0,
+  issueDetail: 0,
+  history: 0,
+  sidebar: 0,
+  sessionTranscript: 0,
+  orchestratorChat: 0,
+};
+
+function realtimeStatus(kind: RealtimeConnectionStatus["kind"], label: string): RealtimeConnectionStatus {
+  return { kind, label };
+}
+
+function liveResourceState(status = realtimeStatus("connecting", "realtime connecting")): LiveResourceState {
+  return { tokens: { ...zeroLiveResourceTokens }, realtimeStatus: status };
+}
+
 function loaded<T>(data: T): Loadable<T> {
   return { data, loading: false, error: null };
 }
@@ -310,9 +330,11 @@ function appHookState(overrides: Partial<AppHookState> = {}): AppHookState {
 async function renderAppWithMocks({
   mode = "api",
   hooks = appHookState(),
+  liveState = liveResourceState(),
 }: {
   mode?: "api" | "mock";
   hooks?: AppHookState;
+  liveState?: LiveResourceState;
 } = {}) {
   vi.resetModules();
 
@@ -365,6 +387,15 @@ async function renderAppWithMocks({
       return maybeEnabled(hooks.orchestratorChat, options);
     },
   }));
+
+  vi.doMock("../src/hooks/useLiveResource", async (importActual) => {
+    const actual = await importActual<typeof import("../src/hooks/useLiveResource")>();
+    return {
+      ...actual,
+      useLiveResourceState: () => liveState,
+      useLiveResourceTokens: () => liveState.tokens,
+    };
+  });
 
   const { App } = await import("../src/App");
   return { hookCalls, markup: renderToStaticMarkup(<App />) };
@@ -423,6 +454,7 @@ async function renderHistoryView(history: HistoryModel, variant: "list" | "timel
 afterEach(() => {
   vi.doUnmock("../src/data/dataSourceContext");
   vi.doUnmock("../src/hooks/useSymphonyData");
+  vi.doUnmock("../src/hooks/useLiveResource");
   vi.resetModules();
   vi.restoreAllMocks();
 });
@@ -513,7 +545,7 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("Burn-up unavailable");
     expect(markup).toContain("Velocity trend unavailable");
     expect(markup).toContain("ETA unavailable");
-    expect(markup).toContain("connection unavailable");
+    expect(markup).toContain("realtime connecting");
     expect(markup).toContain("errors unavailable");
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
@@ -533,6 +565,24 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("PR/day");
     expect(markup).not.toContain("linear · connected");
     expect(markup).not.toContain("0 errors");
+  });
+
+  it("renders non-blocking realtime connection, reconnect, recovered, and stale status in API chrome", async () => {
+    const statuses = [
+      realtimeStatus("connecting", "realtime connecting"),
+      realtimeStatus("open", "realtime connected"),
+      realtimeStatus("reconnecting", "realtime reconnecting"),
+      realtimeStatus("recovered", "realtime recovered"),
+      realtimeStatus("stale", "realtime stale · refetching"),
+    ] satisfies RealtimeConnectionStatus[];
+
+    for (const status of statuses) {
+      const { markup } = await renderAppWithMocks({ liveState: liveResourceState(status) });
+      expect(markup).toContain(status.label);
+      expect(markup).toContain("api source · api");
+      expect(markup).toContain("API full-app chat");
+      expect(markup).not.toContain("connection unavailable");
+    }
   });
 
   it("keeps mock-mode app-shell resources eager once reference data is loaded", async () => {
