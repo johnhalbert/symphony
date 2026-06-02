@@ -16,7 +16,11 @@ import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubpro
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
 import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
-import { redactTranscriptText, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
+import {
+  redactTranscriptText,
+  sanitizeAgentEventForPublicOutput,
+  sanitizedPreviewValue,
+} from "../../src/core/transcript/TranscriptProjection.js";
 import {
   discoverHostHermes,
   type HostHermesDiscoveryResult,
@@ -882,12 +886,14 @@ class AsyncEventQueue<T> implements AsyncIterable<T> {
 
   push(value: T): void {
     if (this.closed) return;
+    const publicValue =
+      isRecord(value) && typeof value.type === "string" ? (sanitizeAgentEventForPublicOutput(value as unknown as AgentEvent) as T) : value;
     const waiter = this.waiters.shift();
     if (waiter) {
-      waiter({ value, done: false });
+      waiter({ value: publicValue, done: false });
       return;
     }
-    this.values.push(value);
+    this.values.push(publicValue);
   }
 
   close(): void {

@@ -837,7 +837,7 @@ describe("HermesAcpHarness", () => {
       ]),
     );
     expect(events.flatMap((event) => event.type === "progress" && event.activitySource === "delta" ? [event.message] : [])).toEqual([
-      "hello ",
+      "hello",
       "world",
     ]);
     expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { totalTokens: 9 } })]));
