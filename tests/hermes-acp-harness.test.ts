@@ -804,14 +804,22 @@ describe("HermesAcpHarness", () => {
         sessionId: "acp-session-1",
         update: {
           sessionUpdate: "tool_call",
-          toolCall: { id: "call-1", name: "terminal", status: "started", input: { command: "npm test", apiKey: "not-a-real-token-placeholder" } },
+          toolCallId: "call-1",
+          kind: "execute",
+          title: "terminal",
+          status: "started",
+          rawInput: { command: "npm test", apiKey: "not-a-real-token-placeholder" },
         },
       },
       {
         sessionId: "acp-session-1",
         update: {
           sessionUpdate: "tool_call_update",
-          toolCall: { id: "call-1", name: "terminal", output: "tests passed", result: { exitCode: 0 } },
+          toolCallId: "call-1",
+          kind: "execute",
+          title: "terminal",
+          rawOutput: "tests passed",
+          result: { exitCode: 0 },
           status: "completed",
         },
       },
@@ -822,6 +830,16 @@ describe("HermesAcpHarness", () => {
       {
         sessionId: "acp-session-1",
         update: { sessionUpdate: "tool_call_update", toolCall: { id: "call-2", name: "terminal", error: "permission denied" }, status: "failed" },
+      },
+      {
+        sessionId: "acp-session-1",
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            { status: "in_progress", content: "Implement mapping SECRET_ACP_PLAN_TOKEN" },
+            { status: "completed", title: "Inspect context" },
+          ],
+        },
       },
       { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " " } } },
@@ -842,6 +860,11 @@ describe("HermesAcpHarness", () => {
         expect.objectContaining({ type: "progress", activitySource: "tool", message: "Hermes ACP tool started: terminal (started)" }),
         expect.objectContaining({ type: "progress", activitySource: "tool", message: "Hermes ACP tool completed: terminal (completed)" }),
         expect.objectContaining({ type: "progress", activitySource: "tool", message: "Hermes ACP tool failed: terminal (failed)" }),
+        expect.objectContaining({
+          type: "progress",
+          activitySource: "stream",
+          message: "Hermes ACP plan updated: 1 in_progress, 1 completed; active: Implement mapping [redacted]",
+        }),
         expect.objectContaining({ type: "progress", activitySource: "stream", message: "Hermes ACP usage update: 9/100 context tokens" }),
         expect.objectContaining({ type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } }),
         expect.objectContaining({ type: "progress", activitySource: "stream", message: "Hermes ACP commands available: /help" }),
@@ -857,8 +880,10 @@ describe("HermesAcpHarness", () => {
     ]);
     expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { totalTokens: 9 } })]));
 
-    expect(events.map((event) => "message" in event ? event.message : "").join("\n")).not.toContain("before active session");
-    expect(events.map((event) => "message" in event ? event.message : "").join("\n")).not.toContain("wrong session");
+    const eventMessages = events.map((event) => "message" in event ? event.message : "").join("\n");
+    expect(eventMessages).not.toContain("before active session");
+    expect(eventMessages).not.toContain("wrong session");
+    expect(eventMessages).not.toContain("SECRET_ACP_PLAN_TOKEN");
 
     const transcriptEventTypes = transcriptEvents.map((event) => event.eventType);
     expect(transcriptEventTypes).toEqual([
@@ -869,6 +894,7 @@ describe("HermesAcpHarness", () => {
       "tool_call_completed",
       "tool_call_started",
       "tool_call_failed",
+      "plan_update",
       "assistant_message_delta",
       "assistant_message_delta",
       "assistant_message_delta",
@@ -893,16 +919,45 @@ describe("HermesAcpHarness", () => {
     expect(call1Events.map((event) => event.eventType)).toEqual(["tool_call_started", "tool_call_completed"]);
     expect(call1Events.map((event) => event.payload)).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ toolCallId: "call-1", toolName: "terminal", status: "running", inputPreview: expect.stringContaining("npm test") }),
-        expect.objectContaining({ toolCallId: "call-1", toolName: "terminal", status: "succeeded", outputPreview: "tests passed", resultPreview: expect.stringContaining("exitCode") }),
+        expect.objectContaining({
+          toolCallId: "call-1",
+          toolName: "terminal",
+          toolKind: "execute",
+          status: "running",
+          inputPreview: expect.stringContaining("npm test"),
+        }),
+        expect.objectContaining({
+          toolCallId: "call-1",
+          toolName: "terminal",
+          toolKind: "execute",
+          status: "succeeded",
+          outputPreview: "tests passed",
+          resultPreview: expect.stringContaining("exitCode"),
+        }),
       ]),
     );
     const call2Failure = transcriptEvents.find((event) => (event.payload as Record<string, unknown> | undefined)?.toolCallId === "call-2" && event.eventType === "tool_call_failed");
     expect(call2Failure?.payload).toEqual(expect.objectContaining({ toolCallId: "call-2", toolName: "terminal", status: "failed", errorPreview: "permission denied" }));
+    const planUpdate = transcriptEvents.find((event) => event.eventType === "plan_update");
+    expect(planUpdate).toMatchObject({
+      eventType: "plan_update",
+      message: "Hermes ACP plan updated: 1 in_progress, 1 completed; active: Implement mapping [redacted]",
+      payload: expect.objectContaining({
+        updateKind: "plan",
+        updateCategory: "plan",
+        statusCounts: { in_progress: 1, completed: 1 },
+        activeEntries: ["Implement mapping [redacted]"],
+        entries: [
+          expect.objectContaining({ index: 0, status: "in_progress", contentPreview: "Implement mapping [redacted]" }),
+          expect.objectContaining({ index: 1, status: "completed", contentPreview: "Inspect context" }),
+        ],
+      }),
+    });
     const transcriptPayloadJson = JSON.stringify(transcriptEvents.map((event) => event.payload));
     expect(transcriptPayloadJson).not.toContain("before active session");
     expect(transcriptPayloadJson).not.toContain("wrong session");
     expect(transcriptPayloadJson).not.toContain("not-a-real-token-placeholder");
+    expect(transcriptPayloadJson).not.toContain("SECRET_ACP_PLAN_TOKEN");
     expect(transcriptPayloadJson).toContain("[redacted]");
 
     const projected = projectWebTranscript(transcriptEvents);
@@ -920,6 +975,11 @@ describe("HermesAcpHarness", () => {
       }),
       expect.objectContaining({ kind: "tool_call", call_id: "call-2", name: "terminal", status: "failed", error: "permission denied" }),
     ]);
+    expect(projected).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "status", state: "plan_update", text: "Hermes ACP plan updated: 1 in_progress, 1 completed; active: Implement mapping [redacted]" }),
+      ]),
+    );
     expect(projected.flatMap((message) => message.kind === "status" ? [message.state] : [])).not.toEqual(
       expect.arrayContaining(["hermes_acp_profile", "acp_session_update", "acp_permission_denied", "acp_diagnostic", "session_update", "tool_call", "tool_call_update"]),
     );
@@ -1425,6 +1485,16 @@ describe("HermesAcpHarness", () => {
         sessionId: "acp-session-1",
         update: { sessionUpdate: "tool_call_update", toolCall: { id: "call-2", name: "terminal", error: "permission denied" }, status: "failed" },
       },
+      {
+        sessionId: "acp-session-1",
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            { status: "in_progress", content: "Persist plan SECRET_ACP_PLAN_TOKEN" },
+            { status: "completed", title: "Persist tools" },
+          ],
+        },
+      },
       { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello " } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "usage_update", used: 9, size: 100 } },
@@ -1487,6 +1557,7 @@ describe("HermesAcpHarness", () => {
       tool_call_started: 2,
       tool_call_completed: 1,
       tool_call_failed: 1,
+      plan_update: 1,
       assistant_message_delta: 2,
       runtime_status_update: 2,
       available_commands_update: 1,
@@ -1502,12 +1573,24 @@ describe("HermesAcpHarness", () => {
     expect(payloadJson).not.toContain("before active session");
     expect(payloadJson).not.toContain("wrong session");
     expect(payloadJson).not.toContain("not-a-real-token-placeholder");
+    expect(payloadJson).not.toContain("SECRET_ACP_PLAN_TOKEN");
     expect(payloadJson).toContain("[redacted]");
 
     const call1Events = transcript.events.filter((event) => (event.payload as Record<string, unknown> | undefined)?.toolCallId === "call-1");
     expect(call1Events.map((event) => event.eventType)).toEqual(["tool_call_started", "tool_call_completed"]);
     const call2Events = transcript.events.filter((event) => (event.payload as Record<string, unknown> | undefined)?.toolCallId === "call-2");
     expect(call2Events.map((event) => event.eventType)).toEqual(["tool_call_started", "tool_call_failed"]);
+    const persistedPlanUpdate = transcript.events.find((event) => event.eventType === "plan_update");
+    expect(persistedPlanUpdate).toMatchObject({
+      eventType: "plan_update",
+      message: "Hermes ACP plan updated: 1 in_progress, 1 completed; active: Persist plan [redacted]",
+      payload: expect.objectContaining({
+        updateKind: "plan",
+        updateCategory: "plan",
+        statusCounts: { in_progress: 1, completed: 1 },
+        activeEntries: ["Persist plan [redacted]"],
+      }),
+    });
     expect(transcript.events.filter((event) => event.eventType === "runtime_diagnostic").map((event) => event.payload)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ code: "hermes_acp_lease_reuse_decision" }),
@@ -1524,6 +1607,11 @@ describe("HermesAcpHarness", () => {
       expect.objectContaining({ kind: "tool_call", call_id: "call-1", name: "terminal", status: "succeeded", output: "tests passed", result: expect.stringContaining("exitCode") }),
       expect.objectContaining({ kind: "tool_call", call_id: "call-2", name: "terminal", status: "failed", error: "permission denied" }),
     ]);
+    expect(projected).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "status", state: "plan_update", text: "Hermes ACP plan updated: 1 in_progress, 1 completed; active: Persist plan [redacted]" }),
+      ]),
+    );
     expect(projected.flatMap((message) => message.kind === "status" ? [message.state] : [])).not.toEqual(
       expect.arrayContaining(["acp_session_update", "acp_permission_denied", "acp_diagnostic", "session/update", "tool_call", "tool_call_update"]),
     );

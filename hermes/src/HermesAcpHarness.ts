@@ -1902,7 +1902,7 @@ function mapHermesAcpSessionUpdateWithMetadata(update: NormalizedHermesAcpSessio
             channel: "chat",
             kind: "plan_update",
             text: message,
-            payload: { entriesPreview: preview(raw.entries ?? raw, 1_000), ...acpSessionUpdatePreviewPayload(update) },
+            payload: { ...planRunActivityPayload(update, raw), ...acpSessionUpdatePreviewPayload(update) },
           },
         ),
       ];
@@ -2155,6 +2155,7 @@ function toolRunActivityMetadata(
   };
   if (tool.callId) payload.toolCallId = tool.callId;
   if (tool.name) payload.toolName = tool.name;
+  if (tool.toolKind) payload.toolKind = tool.toolKind;
   if (tool.title && tool.title !== tool.name) payload.toolTitle = tool.title;
   if (tool.inputPreview) payload.inputPreview = tool.inputPreview;
   if (tool.argsPreview) payload.argsPreview = tool.argsPreview;
@@ -2173,6 +2174,7 @@ function toolRunActivityMetadata(
 interface HermesAcpToolDetails {
   callId: string | null;
   name: string | null;
+  toolKind: string | null;
   title: string | null;
   status: string | null;
   inputPreview: string | null;
@@ -2201,6 +2203,7 @@ function toolDetailsFromUpdate(update: Record<string, unknown>): HermesAcpToolDe
     toolCall.tool_id,
   );
   const title = firstScalarString(toolCall.title, update.title);
+  const toolKind = firstScalarString(toolCall.kind, update.kind, toolCall.toolKind, toolCall.tool_kind, update.toolKind, update.tool_kind);
   const name = firstScalarString(
     toolCall.toolName,
     toolCall.tool_name,
@@ -2216,12 +2219,19 @@ function toolDetailsFromUpdate(update: Record<string, unknown>): HermesAcpToolDe
   return {
     callId,
     name,
+    toolKind,
     title,
     status,
-    inputPreview: previewIfPresent(firstPresent(toolCall.input, update.input, toolCall.parameters, update.parameters), 1_000),
+    inputPreview: previewIfPresent(
+      firstPresent(toolCall.input, update.input, toolCall.rawInput, update.rawInput, toolCall.raw_input, update.raw_input, toolCall.parameters, update.parameters),
+      1_000,
+    ),
     argsPreview: previewIfPresent(firstPresent(toolCall.args, update.args, toolCall.arguments, update.arguments), 1_000),
-    resultPreview: previewIfPresent(firstPresent(toolCall.result, update.result, toolCall.summary, update.summary), 1_000),
-    outputPreview: previewIfPresent(firstPresent(toolCall.output, update.output, toolCall.content, update.content, toolCall.message, update.message), 1_000),
+    resultPreview: previewIfPresent(firstPresent(toolCall.result, update.result, toolCall.rawResult, update.rawResult, toolCall.raw_result, update.raw_result, toolCall.summary, update.summary), 1_000),
+    outputPreview: previewIfPresent(
+      firstPresent(toolCall.output, update.output, toolCall.rawOutput, update.rawOutput, toolCall.raw_output, update.raw_output, toolCall.content, update.content, toolCall.message, update.message),
+      1_000,
+    ),
     errorPreview: previewIfPresent(firstPresent(toolCall.error, update.error, toolCall.errorMessage, update.errorMessage, toolCall.error_message, update.error_message), 1_000),
   };
 }
@@ -2273,6 +2283,44 @@ function previewIfPresent(value: unknown, maxLength: number): string | null {
   return output.length > 0 ? output : null;
 }
 
+function planRunActivityPayload(update: NormalizedHermesAcpPlanUpdate, raw: Record<string, unknown>): Record<string, unknown> {
+  const entries = update.entries.slice(0, 20).map((entry, index) => ({
+    index,
+    contentPreview: preview(entry.content, 300),
+    status: normalizedPlanStatus(entry.status),
+    ...(entry.priority ? { priority: preview(entry.priority, 80) } : {}),
+  }));
+  return {
+    entriesPreview: preview(raw.entries ?? raw, 1_000),
+    entries,
+    statusCounts: planStatusCounts(update.entries),
+    activeEntries: update.entries
+      .filter((entry) => normalizedPlanStatus(entry.status) === "in_progress")
+      .slice(0, 5)
+      .map((entry) => preview(entry.content, 300)),
+  };
+}
+
+function planStatusCounts(entries: readonly NormalizedHermesAcpPlanEntry[]): Record<string, number> {
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    const status = normalizedPlanStatus(entry.status);
+    counts.set(status, (counts.get(status) ?? 0) + 1);
+  }
+  return Object.fromEntries(counts.entries());
+}
+
+function normalizedPlanStatus(status: string | null | undefined): string {
+  return toSnakeCase(nonEmptyString(status) ?? "pending") || "pending";
+}
+
+function planEntryContentPreview(entry: Record<string, unknown>, maxLength: number): string | null {
+  const content = nonEmptyString(entry.content) ?? nonEmptyString(entry.title);
+  if (content) return preview(content, maxLength);
+  const fallback = preview(entry, maxLength);
+  return fallback.length > 0 ? fallback : null;
+}
+
 function availableCommandNames(update: Record<string, unknown>): string[] {
   const rawCommands = Array.isArray(update.availableCommands)
     ? update.availableCommands
@@ -2292,10 +2340,10 @@ function formatPlanUpdate(update: Record<string, unknown>): string {
   const counts = new Map<string, number>();
   const active: string[] = [];
   for (const entry of entries) {
-    const status = toSnakeCase(nonEmptyString(entry.status) ?? "pending");
+    const status = normalizedPlanStatus(nonEmptyString(entry.status));
     counts.set(status, (counts.get(status) ?? 0) + 1);
     if (status === "in_progress") {
-      const content = nonEmptyString(entry.content) ?? nonEmptyString(entry.title);
+      const content = planEntryContentPreview(entry, 240);
       if (content) active.push(content);
     }
   }
