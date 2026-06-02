@@ -7,6 +7,9 @@ import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
+  projectActivityModels,
+  projectSessionModel,
+  projectTranscriptMessages,
   projectWebDashboard,
   projectWebIssueBoard,
   projectWebIssueDetail,
@@ -1137,7 +1140,12 @@ export class StatusServer {
       forceRefresh,
     );
     if (durableRead.status === "hit" && durableRead.record) {
-      const durableDetail = durableWebIssueDetailFromIssueBoard(durableRead.record.payload, issueId);
+      const durableDetail = await this.buildDurableWebIssueDetailFromIssueBoard(
+        durableRead.record.payload,
+        issueId,
+        durableRead.record,
+        options,
+      );
       if (durableDetail) return webProjectionJsonResponse(durableDetail, durableRead);
       durableRead = {
         ...durableRead,
@@ -1176,6 +1184,42 @@ export class StatusServer {
       }
       throw error;
     }
+  }
+
+  private async buildDurableWebIssueDetailFromIssueBoard(
+    board: WebIssueBoardModel,
+    issueId: string,
+    record: ProjectionPayloadRecord<WebIssueBoardModel>,
+    options: { includeTranscript?: boolean; transcriptUrl?: URL } = {},
+  ): Promise<WebIssueDetailModel | null> {
+    const issue = durableWebIssueFromIssueBoard(board, issueId);
+    if (!issue) return null;
+
+    const issueActivityKey = issue.id || issueId;
+    const issueRuns = this.options.runStore
+      ? (await this.options.runStore.listRuns()).filter((run) => activityRunMatchesIssue(run, issueActivityKey))
+      : [];
+    const detailRuns = selectLatestChronologicalRuns(issueRuns, WEB_ISSUE_DETAIL_RUN_LIMIT);
+    const latestRun = detailRuns.at(-1) ?? null;
+    const activity = await buildActivityFeed({
+      generatedAt: record.generatedAt || record.revision.generatedAt,
+      runStore: this.options.runStore,
+      runs: detailRuns,
+      lifecycleStore: this.options.lifecycleStore,
+      writebackOutbox: this.options.writebackOutbox,
+      query: { issue: issueActivityKey, offset: 0, limit: 50 },
+      includeTranscriptEvents: false,
+    });
+    const transcript =
+      options.includeTranscript === true && this.options.runStore && latestRun
+        ? await readBoundedWebTranscript(this.options.runStore, latestRun.runId, options.transcriptUrl)
+        : [];
+    return {
+      issue: cloneJson(issue),
+      activity: projectActivityModels(activity),
+      runs: detailRuns.map(projectSessionModel),
+      transcript: projectTranscriptMessages(transcript, { run: latestRun, includeRunPrelude: transcript.length > 0 }),
+    };
   }
 
   private async fetchWebDashboard(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebDashboard>>> {
@@ -2362,15 +2406,9 @@ function durableProjectionReadHeaders(read: DurableProjectionReadResult<unknown>
   return headers;
 }
 
-function durableWebIssueDetailFromIssueBoard(board: WebIssueBoardModel, issueId: string): WebIssueDetailModel | null {
+function durableWebIssueFromIssueBoard(board: WebIssueBoardModel, issueId: string): IssueModel | null {
   const issue = board.issues.find((candidate) => webIssueModelMatches(candidate, issueId)) ?? null;
-  if (!issue) return null;
-  return {
-    issue: cloneJson(issue),
-    activity: [],
-    runs: [],
-    transcript: [],
-  };
+  return issue ? cloneJson(issue) : null;
 }
 
 function webIssueModelMatches(issue: IssueModel, issueId: string): boolean {

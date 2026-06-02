@@ -16,7 +16,7 @@ import type {
   ProjectionWriteResult,
 } from "../src/core/persistence/ProjectionTransactionService.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
-import type { RunRecord, RunTranscriptStore, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
+import type { RunRecord, RunTranscriptStore, TranscriptEvent, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { testConfig } from "./helpers.js";
@@ -314,9 +314,24 @@ describe("/api/v1/web route contracts", () => {
       cycleDateRange: "May 2026",
       selectedIssueId: "ENG-179",
     };
-    const run = runRecordFixture({ runId: "run-1", sessionId: "session-1", transcriptEventCount: 1 });
+    const transcriptEvents: TranscriptEvent[] = [
+      {
+        runId: "run-1",
+        sequence: 1,
+        at: "2026-05-31T00:00:30.000Z",
+        source: "runtime",
+        eventType: "assistant_complete",
+        message: "served from durable issue detail transcript",
+      },
+    ];
+    const run = runRecordFixture({
+      runId: "run-1",
+      sessionId: "session-1",
+      cursorModel: "gpt-5-durable",
+      transcriptEventCount: transcriptEvents.length,
+    });
     const durableTranscript = [{ kind: "assistant" as const, ts: "2026-05-31T00:00:00.000Z", text: "served from durable transcript" }];
-    const runStore = new RecordingRunStore([run]);
+    const runStore = new RecordingRunStore([run], { "run-1": transcriptEvents });
     const transcriptSourceRevisions = [
       { source: "runs", revision: runStore.projectionRevision(), observedAt: null },
       { source: "transcript:run-1", revision: "1:1:2026-05-31T00:00:00.000Z", observedAt: "2026-05-31T00:00:00.000Z" },
@@ -359,8 +374,31 @@ describe("/api/v1/web route contracts", () => {
     const baseUrl = baseUrlFor(address);
     try {
       const detail = await getJson(`${baseUrl}/api/v1/web/issues/ENG-179`);
-      expect(detail.body).toEqual({ issue: durableIssue, activity: durableIssue.activity, runs: [], transcript: [] });
+      expect(detail.body).toMatchObject({ issue: durableIssue, transcript: [] });
+      expect((detail.body as { activity: unknown[] }).activity).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ verb: "run_started", id: "ENG-179", extra: "succeeded", who: "agent-1" }),
+          expect.objectContaining({ verb: "run_completed", id: "ENG-179", extra: "succeeded", who: "agent-1" }),
+        ]),
+      );
+      expect((detail.body as { activity: unknown[] }).activity).toHaveLength(2);
+      expect((detail.body as { runs: unknown[] }).runs).toEqual([
+        expect.objectContaining({ id: "session-1", issue: "ENG-179", state: "succeeded", model: "gpt-5-durable", msgCount: 1 }),
+      ]);
       expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(runStore.transcriptReadCount).toBe(0);
+
+      const detailWithTranscript = await getJson(`${baseUrl}/api/v1/web/issues/ENG-179?includeTranscript=1`);
+      expect((detailWithTranscript.body as { activity: unknown[] }).activity).toEqual((detail.body as { activity: unknown[] }).activity);
+      expect((detailWithTranscript.body as { runs: unknown[] }).runs).toEqual((detail.body as { runs: unknown[] }).runs);
+      expect((detailWithTranscript.body as { transcript: unknown[] }).transcript).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "system", model: "gpt-5-durable", workspace: "ENG-179", session: "session-1" }),
+          expect.objectContaining({ kind: "assistant", text: "served from durable issue detail transcript" }),
+        ]),
+      );
+      expect((detailWithTranscript.body as { transcript: unknown[] }).transcript).toHaveLength(3);
+      expect(detailWithTranscript.response.headers.get("x-symphony-projection-status")).toBe("hit");
 
       const transcript = await getJson(`${baseUrl}/api/v1/web/sessions/session-1/transcript`);
       expect(transcript.body).toEqual(durableTranscript);
@@ -374,9 +412,10 @@ describe("/api/v1/web route contracts", () => {
     }
 
     expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
-    expect(runStore.transcriptReadCount).toBe(0);
+    expect(runStore.transcriptReadCount).toBe(1);
     expect(projectionWriter.writes).toEqual([]);
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
       { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
     ]);
@@ -424,6 +463,29 @@ describe("/api/v1/web route contracts", () => {
     }
 
     expect(projectionWriter.writeFor("dashboard_projection").projectionName).toBe("dashboard_projection");
+
+    const staleIssue = issueModelFixture();
+    const staleIssueReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        { issues: [staleIssue], backlog: [], lanes: { todo: [], progress: [staleIssue], review: [] }, cycleLabel: "", cycleDateRange: "", selectedIssueId: staleIssue.id },
+        { sourceRevisions: [{ source: "runs", revision: "old", observedAt: null }] },
+      ),
+    ]);
+    const staleIssueServer = createStatusServer(root, {
+      projectionReader: staleIssueReader,
+      webProjectionRevisionProviders: [{ source: "runs", getRevision: () => ({ source: "runs", revision: "new", observedAt: null }) }],
+    }).server;
+    const staleIssueAddress = await staleIssueServer.start();
+    try {
+      const staleDetail = await getJson(`${baseUrlFor(staleIssueAddress)}/api/v1/web/issues/ENG-179`);
+      expect(staleDetail.body).toBeNull();
+      expect(staleDetail.response.headers.get("x-symphony-projection-status")).toBe("stale");
+      expect(staleDetail.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(staleDetail.response.headers.get("x-symphony-projection-revision")).toBe("1");
+    } finally {
+      await staleIssueServer.stop();
+    }
   });
 
   it("annotates durable projection fallback states for unavailable readers, missing records, refresh bypass, read errors, and missing detail items", async () => {
@@ -450,6 +512,18 @@ describe("/api/v1/web route contracts", () => {
       expect(missing.response.headers.get("x-symphony-projection-name")).toBe("dashboard_projection");
     } finally {
       await missingServer.stop();
+    }
+
+    const missingDetailServer = createStatusServer(root, { projectionReader: new RecordingProjectionReader([]) }).server;
+    const missingDetailAddress = await missingDetailServer.start();
+    try {
+      const missingDetailProjection = await getJson(`${baseUrlFor(missingDetailAddress)}/api/v1/web/issues/ENG-179`);
+      expect(missingDetailProjection.body).toBeNull();
+      expect(missingDetailProjection.response.headers.get("x-symphony-projection-status")).toBe("missing");
+      expect(missingDetailProjection.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(missingDetailProjection.response.headers.get("x-symphony-projection-name")).toBe("issue_board_projection");
+    } finally {
+      await missingDetailServer.stop();
     }
 
     const durableDashboard = {
@@ -479,6 +553,25 @@ describe("/api/v1/web route contracts", () => {
       expect(refreshReader.selectors).toEqual([]);
     } finally {
       await refreshServer.stop();
+    }
+
+    const refreshIssue = issueModelFixture();
+    const refreshIssueReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        { issues: [refreshIssue], backlog: [], lanes: { todo: [], progress: [refreshIssue], review: [] }, cycleLabel: "", cycleDateRange: "", selectedIssueId: refreshIssue.id },
+      ),
+    ]);
+    const refreshDetailServer = createStatusServer(root, { projectionReader: refreshIssueReader }).server;
+    const refreshDetailAddress = await refreshDetailServer.start();
+    try {
+      const refreshDetail = await getJson(`${baseUrlFor(refreshDetailAddress)}/api/v1/web/issues/ENG-179?refresh=true`);
+      expect(refreshDetail.body).toBeNull();
+      expect(refreshDetail.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(refreshDetail.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(refreshIssueReader.selectors).toEqual([]);
+    } finally {
+      await refreshDetailServer.stop();
     }
 
     const failingReader = new FailingProjectionReader();
@@ -855,9 +948,13 @@ class RecordingRunStore {
   transcriptReadCount = 0;
 
   private readonly runsById = new Map<string, RunRecord>();
+  private readonly transcriptEventsByRunId = new Map<string, TranscriptEvent[]>();
 
-  constructor(runs: readonly RunRecord[]) {
+  constructor(runs: readonly RunRecord[], transcriptEvents: Record<string, readonly TranscriptEvent[]> = {}) {
     for (const run of runs) this.runsById.set(run.runId, cloneJson(run));
+    for (const [runId, events] of Object.entries(transcriptEvents)) {
+      this.transcriptEventsByRunId.set(runId, events.map((event) => cloneJson(event)));
+    }
   }
 
   projectionRevision(): number {
@@ -879,12 +976,22 @@ class RecordingRunStore {
 
   async readTranscript(runId: string, page: { offset: number; limit: number }): Promise<TranscriptPage> {
     this.transcriptReadCount += 1;
-    return { runId, offset: page.offset, limit: page.limit, nextOffset: null, events: [] };
+    const events = this.transcriptEventsByRunId.get(runId) ?? [];
+    const pageEvents = events.slice(page.offset, page.offset + page.limit);
+    const nextOffset = page.offset + pageEvents.length < events.length ? page.offset + pageEvents.length : null;
+    return { runId, offset: page.offset, limit: page.limit, nextOffset, events: pageEvents.map((event) => cloneJson(event)) };
   }
 
   async readTranscriptTail(runId: string, page: { limit: number }): Promise<TranscriptPage> {
     this.transcriptReadCount += 1;
-    return { runId, offset: 0, limit: page.limit, nextOffset: null, events: [] };
+    const events = this.transcriptEventsByRunId.get(runId) ?? [];
+    const offset = Math.max(0, events.length - page.limit);
+    const pageEvents = events.slice(offset);
+    return { runId, offset, limit: page.limit, nextOffset: null, events: pageEvents.map((event) => cloneJson(event)) };
+  }
+
+  async readTranscriptEventCount(runId: string): Promise<number> {
+    return this.transcriptEventsByRunId.get(runId)?.length ?? 0;
   }
 
   asRunTranscriptStore(): RunTranscriptStore {
