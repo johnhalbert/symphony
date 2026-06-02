@@ -5,6 +5,7 @@ import {
   type DurableProjectionName,
   type NormalizedProjectionRevisionSelector,
   type ProjectionPayloadInsertInput,
+  type ProjectionPayloadRecord,
   type ProjectionRevisionInsertInput,
   type ProjectionRevisionRecord,
   type ProjectionRevisionSelector,
@@ -442,6 +443,70 @@ describe("ProjectionTransactionService", () => {
     expect(runner.sqls).not.toContain("ROLLBACK");
   });
 
+  it("reads the current Postgres projection payload with its revision metadata", async () => {
+    const runner = new RecordingProjectionSqlRunner({
+      currentPayloadRow: {
+        projection_revision_id: 42,
+        projection_name: "dashboard_projection",
+        scope_kind: "global",
+        scope_key: "global",
+        revision: 3,
+        source_revisions: [{ source: "runs", revision: "run-revision-3", observedAt: null }],
+        source_cursors: { runCount: 2 },
+        content_sha256: "a".repeat(64),
+        generated_at: "2026-01-02T03:04:05.000Z",
+        expires_at: null,
+        superseded_at: null,
+        created_at: "2026-01-02T03:04:05.000Z",
+        payload: { projectName: "Durable Symphony" },
+        payload_sha256: "b".repeat(64),
+        raw_payload_refs: [{ table: "run_activity" }],
+        payload_generated_at: "2026-01-02T03:04:06.000Z",
+        payload_expires_at: null,
+      },
+    });
+    const service = new ProjectionTransactionService(new PostgresProjectionTransactionStore(runner), { clock: () => new Date(fixedTime) });
+
+    const payload = await service.readCurrentPayload<{ projectName: string }>({ projectionName: "dashboard_projection" });
+
+    expect(payload).toEqual<ProjectionPayloadRecord<{ projectName: string }> | null>({
+      revision: {
+        projectionRevisionId: 42,
+        projectionName: "dashboard_projection",
+        scopeKind: "global",
+        scopeKey: "global",
+        revision: 3,
+        sourceRevisions: [{ source: "runs", revision: "run-revision-3", observedAt: null }],
+        sourceCursors: { runCount: 2 },
+        sourceFreshness: [
+          {
+            source: "runs",
+            status: "fresh",
+            checkedAt: "2026-01-02T03:04:05.000Z",
+            revision: "run-revision-3",
+            lastSuccessAt: "2026-01-02T03:04:05.000Z",
+            lastErrorAt: null,
+            staleMs: null,
+            detail: "runs source revision run-revision-3 observed",
+          },
+        ],
+        contentSha256: "a".repeat(64),
+        generatedAt: "2026-01-02T03:04:05.000Z",
+        expiresAt: null,
+        supersededAt: null,
+        createdAt: "2026-01-02T03:04:05.000Z",
+      },
+      payload: { projectName: "Durable Symphony" },
+      payloadSha256: "b".repeat(64),
+      rawPayloadRefs: [{ table: "run_activity" }],
+      generatedAt: "2026-01-02T03:04:06.000Z",
+      expiresAt: null,
+    });
+    expect(runner.values[0]).toEqual(["dashboard_projection", "global", "global"]);
+    expect(runner.sqls[0]).toContain('FROM "symphony"."projection_revision" revision JOIN "symphony"."dashboard_projection" payload');
+    expect(runner.sqls[0]).toContain("revision.superseded_at IS NULL");
+  });
+
   it("rolls back the Postgres transaction and suppresses publication on payload insert failure", async () => {
     const runner = new RecordingProjectionSqlRunner({ failPayloadInsert: true });
     const service = new ProjectionTransactionService(new PostgresProjectionTransactionStore(runner), { clock: () => new Date(fixedTime) });
@@ -597,6 +662,7 @@ class InMemoryProjectionTransaction implements ProjectionTransactionRevisionPort
 
 interface RecordingProjectionSqlRunnerOptions {
   failPayloadInsert?: boolean;
+  currentPayloadRow?: Record<string, unknown>;
 }
 
 class RecordingProjectionSqlRunner implements ProjectionSqlQueryRunner {
@@ -613,6 +679,9 @@ class RecordingProjectionSqlRunner implements ProjectionSqlQueryRunner {
 
     if (normalizedSql === "BEGIN" || normalizedSql === "COMMIT" || normalizedSql === "ROLLBACK") {
       return emptySqlResult<TRow>();
+    }
+    if (normalizedSql.startsWith("SELECT ") && this.options.currentPayloadRow) {
+      return { rows: [this.options.currentPayloadRow as TRow] };
     }
     if (normalizedSql.startsWith('SELECT ') || normalizedSql.startsWith('UPDATE "symphony"."projection_revision"')) {
       return emptySqlResult<TRow>();

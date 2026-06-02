@@ -286,6 +286,7 @@ program
             ...(projectionPersistence
               ? {
                   projectionWriter: projectionPersistence.writer,
+                  projectionReader: projectionPersistence.writer,
                   runActivitySourceStore: projectionPersistence.runActivitySourceStore,
                 }
               : {}),

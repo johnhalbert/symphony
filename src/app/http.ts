@@ -7,6 +7,9 @@ import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
+  projectActivityModels,
+  projectSessionModel,
+  projectTranscriptMessages,
   projectWebDashboard,
   projectWebIssueBoard,
   projectWebIssueDetail,
@@ -16,6 +19,9 @@ import {
   projectWebSidebar,
   type ChatMessage,
   type DashboardRuntimeConfig,
+  type IssueModel,
+  type WebIssueBoardModel,
+  type WebIssueDetailModel,
 } from "./webProjection.js";
 import {
   runKindForPhase,
@@ -106,7 +112,9 @@ import { RealtimeProjectionEventBus } from "./RealtimeProjectionEvents.js";
 import {
   DURABLE_PROJECTION_NAMES,
   type DurableProjectionName,
+  type ProjectionPayloadRecord,
   type ProjectionPayloadWriteInput,
+  type ProjectionRevisionSelector,
   type ProjectionSourceRevision,
   type ProjectionWriteResult,
 } from "../core/persistence/ProjectionTransactionService.js";
@@ -139,6 +147,10 @@ interface StatusServerProjectionRevisionStore {
 
 export interface StatusServerProjectionWriter {
   writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult>;
+}
+
+export interface StatusServerProjectionReader {
+  readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null>;
 }
 
 export type StatusServerProjectionRebuildEntryStatus = ProjectionWriteResult["status"] | "skipped" | "failed";
@@ -199,6 +211,20 @@ interface WebProjectionEventClient {
   response: ServerResponse;
 }
 
+interface WebProjectionJsonResponse<TBody> {
+  body: TBody;
+  headers?: Record<string, string>;
+}
+
+type DurableProjectionReadStatus = "hit" | "refresh_bypass" | "unavailable" | "missing" | "expired" | "stale" | "error" | "missing_item";
+
+interface DurableProjectionReadResult<TPayload> {
+  status: DurableProjectionReadStatus;
+  selector: ProjectionRevisionSelector;
+  record?: ProjectionPayloadRecord<TPayload>;
+  reason?: string;
+}
+
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
   workspaceManager: WorkspaceManager;
@@ -230,6 +256,7 @@ export interface StatusServerOptions {
   webProjectionContextBuilder?: StatusServerWebProjectionContextBuilder;
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
   projectionWriter?: StatusServerProjectionWriter;
+  projectionReader?: StatusServerProjectionReader;
 }
 
 export class StatusServer {
@@ -476,18 +503,15 @@ export class StatusServer {
       const webIssueMatch = /^\/api\/v1\/web\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && webIssueMatch) {
         const issueId = decodeURIComponent(webIssueMatch[1] ?? "");
-        sendJson(
-          response,
-          200,
-          await this.fetchWebIssueDetail(
-            issueId,
-            isWebProjectionRefreshRequested(url.searchParams.get("refresh")),
-            {
-              includeTranscript: parseBooleanWebQueryParam(url.searchParams, "includeTranscript"),
-              transcriptUrl: url,
-            },
-          ),
+        const detail = await this.fetchWebIssueDetail(
+          issueId,
+          isWebProjectionRefreshRequested(url.searchParams.get("refresh")),
+          {
+            includeTranscript: parseBooleanWebQueryParam(url.searchParams, "includeTranscript"),
+            transcriptUrl: url,
+          },
         );
+        sendJson(response, 200, detail.body, detail.headers);
         return;
       }
       const boardIssueMatch = /^\/api\/v1\/board\/issues\/([^/]+)$/.exec(url.pathname);
@@ -502,9 +526,18 @@ export class StatusServer {
       }
 
       if (request.method === "GET" && url.pathname === "/api/v1/web/reference-data") {
+        const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
+        const durableIssues = await this.readDurableWebProjection<WebIssueBoardModel>(
+          { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+          forceRefresh,
+        );
+        if (durableIssues.status === "hit" && durableIssues.record) {
+          sendJson(response, 200, projectWebReferenceData(durableIssues.record.payload), durableProjectionReadHeaders(durableIssues));
+          return;
+        }
         let board: IssueBoardResponse | null = null;
         try {
-          board = await this.fetchIssueBoard(isWebProjectionRefreshRequested(url.searchParams.get("refresh")));
+          board = await this.fetchIssueBoard(forceRefresh);
         } catch (error) {
           if (
             !(error instanceof SymphonyError) ||
@@ -513,23 +546,17 @@ export class StatusServer {
             throw error;
           }
         }
-        sendJson(response, 200, projectWebReferenceData(board));
+        sendJson(response, 200, projectWebReferenceData(board), durableProjectionReadHeaders(durableIssues));
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/dashboard") {
-        sendJson(
-          response,
-          200,
-          await this.fetchWebDashboard(isWebProjectionRefreshRequested(url.searchParams.get("refresh"))),
-        );
+        const dashboard = await this.fetchWebDashboard(isWebProjectionRefreshRequested(url.searchParams.get("refresh")));
+        sendJson(response, 200, dashboard.body, dashboard.headers);
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") {
-        sendJson(
-          response,
-          200,
-          await this.fetchWebSidebar(isWebProjectionRefreshRequested(url.searchParams.get("refresh"))),
-        );
+        const sidebar = await this.fetchWebSidebar(isWebProjectionRefreshRequested(url.searchParams.get("refresh")));
+        sendJson(response, 200, sidebar.body, sidebar.headers);
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/board") {
@@ -546,6 +573,14 @@ export class StatusServer {
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/issues") {
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
+        const durableIssues = await this.readDurableWebProjection<WebIssueBoardModel>(
+          { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+          forceRefresh,
+        );
+        if (durableIssues.status === "hit" && durableIssues.record) {
+          sendJson(response, 200, durableIssues.record.payload, durableProjectionReadHeaders(durableIssues));
+          return;
+        }
         const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
         let board: IssueBoardResponse | null = null;
         if (projection) {
@@ -562,7 +597,7 @@ export class StatusServer {
           sourceIndex: projection?.sourceIndex ?? null,
           issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
         });
-        sendJson(response, 200, issues);
+        sendJson(response, 200, issues, durableProjectionReadHeaders(durableIssues));
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/issue-board") {
@@ -588,11 +623,8 @@ export class StatusServer {
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/history") {
-        sendJson(
-          response,
-          200,
-          await this.fetchWebHistory(isWebProjectionRefreshRequested(url.searchParams.get("refresh")), url),
-        );
+        const history = await this.fetchWebHistory(isWebProjectionRefreshRequested(url.searchParams.get("refresh")), url);
+        sendJson(response, 200, history.body, history.headers);
         return;
       }
       const webTranscriptMatch = /^\/api\/v1\/web\/sessions\/([^/]+)\/transcript$/.exec(url.pathname);
@@ -607,18 +639,40 @@ export class StatusServer {
           sendJson(response, 200, []);
           return;
         }
+        const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
+        const durableTranscript = await this.readDurableWebProjection<ReturnType<typeof projectWebTranscript>>(
+          { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: transcriptProjectionScopeKeyForRequest(run, url) },
+          forceRefresh,
+        );
+        if (durableTranscript.status === "hit" && durableTranscript.record) {
+          sendJson(response, 200, durableTranscript.record.payload, durableProjectionReadHeaders(durableTranscript));
+          return;
+        }
         const transcriptPage = await readBoundedWebTranscriptPage(this.options.runStore, run.runId, url);
         const transcript = projectWebTranscript(transcriptPage.events, { run });
         await this.persistWebTranscriptProjection(run, transcriptPage, transcript);
-        sendJson(response, 200, transcript);
+        sendJson(response, 200, transcript, durableProjectionReadHeaders(durableTranscript));
         return;
       }
       if (url.pathname === "/api/v1/web/orchestrator-chat") {
         const conversationId = parseWebOrchestratorChatConversationId(url.searchParams.get("conversationId"));
         if (request.method === "GET") {
+          const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
+          const durableChat = await this.readDurableWebProjection<readonly ChatMessage[]>(
+            {
+              projectionName: "orchestrator_chat_projection",
+              scopeKind: "conversation",
+              scopeKey: orchestratorChatProjectionScopeKey(conversationId),
+            },
+            forceRefresh,
+          );
+          if (durableChat.status === "hit" && durableChat.record) {
+            sendJson(response, 200, durableChat.record.payload, durableProjectionReadHeaders(durableChat));
+            return;
+          }
           const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages(conversationId));
           await this.persistWebOrchestratorChatProjection(chat, conversationId);
-          sendJson(response, 200, chat);
+          sendJson(response, 200, chat, durableProjectionReadHeaders(durableChat));
           return;
         }
         if (request.method === "POST") {
@@ -1174,6 +1228,8 @@ export class StatusServer {
         runtime: snapshot,
         board,
         activity,
+        runs: sourceIndex?.runs.runs ?? activitySources.runs,
+        lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
         config: this.options.dashboard ?? null,
       });
       await this.recordProjectionRebuildEntry(
@@ -1212,6 +1268,8 @@ export class StatusServer {
         runtime: snapshot,
         board,
         activity: dashboardActivity,
+        runs: sourceIndex?.runs.runs ?? activitySources.runs,
+        lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
         config: this.options.dashboard ?? null,
       });
       const issues = projectWebIssueBoard(board);
@@ -1599,7 +1657,26 @@ export class StatusServer {
     issueId: string,
     forceRefresh: boolean,
     options: { includeTranscript?: boolean; transcriptUrl?: URL } = {},
-  ) {
+  ): Promise<WebProjectionJsonResponse<WebIssueDetailModel | null>> {
+    let durableRead = await this.readDurableWebProjection<WebIssueBoardModel>(
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      forceRefresh,
+    );
+    if (durableRead.status === "hit" && durableRead.record) {
+      const durableDetail = await this.buildDurableWebIssueDetailFromIssueBoard(
+        durableRead.record.payload,
+        issueId,
+        durableRead.record,
+        options,
+      );
+      if (durableDetail) return webProjectionJsonResponse(durableDetail, durableRead);
+      durableRead = {
+        ...durableRead,
+        status: "missing_item",
+        reason: "issue_detail_not_found_in_current_issue_board_projection",
+      };
+    }
+
     try {
       const detail = await this.fetchBoardIssueDetail(issueId, forceRefresh);
       const issueActivityKey =
@@ -1623,16 +1700,60 @@ export class StatusServer {
         options.includeTranscript === true && this.options.runStore && latestRunId
           ? await readBoundedWebTranscript(this.options.runStore, latestRunId, options.transcriptUrl)
           : [];
-      return projectWebIssueDetail({ ...detail, runs: detailRuns, activity, transcript }, issueId);
+      return webProjectionJsonResponse(projectWebIssueDetail({ ...detail, runs: detailRuns, activity, transcript }, issueId), durableRead);
     } catch (error) {
       if (error instanceof SymphonyError && (error.code === "not_found" || error.code === "tracker_unavailable")) {
-        return null;
+        return webProjectionJsonResponse(null, durableRead);
       }
       throw error;
     }
   }
 
-  private async fetchWebDashboard(forceRefresh: boolean) {
+  private async buildDurableWebIssueDetailFromIssueBoard(
+    board: WebIssueBoardModel,
+    issueId: string,
+    record: ProjectionPayloadRecord<WebIssueBoardModel>,
+    options: { includeTranscript?: boolean; transcriptUrl?: URL } = {},
+  ): Promise<WebIssueDetailModel | null> {
+    const issue = durableWebIssueFromIssueBoard(board, issueId);
+    if (!issue) return null;
+
+    const issueActivityKey = issue.id || issueId;
+    const issueRuns = this.options.runStore
+      ? (await this.options.runStore.listRuns()).filter((run) => activityRunMatchesIssue(run, issueActivityKey))
+      : [];
+    const detailRuns = selectLatestChronologicalRuns(issueRuns, WEB_ISSUE_DETAIL_RUN_LIMIT);
+    const latestRun = detailRuns.at(-1) ?? null;
+    const activity = await buildActivityFeed({
+      generatedAt: record.generatedAt || record.revision.generatedAt,
+      runStore: this.options.runStore,
+      runs: detailRuns,
+      lifecycleStore: this.options.lifecycleStore,
+      writebackOutbox: this.options.writebackOutbox,
+      query: { issue: issueActivityKey, offset: 0, limit: 50 },
+      includeTranscriptEvents: false,
+    });
+    const transcript =
+      options.includeTranscript === true && this.options.runStore && latestRun
+        ? await readBoundedWebTranscript(this.options.runStore, latestRun.runId, options.transcriptUrl)
+        : [];
+    return {
+      issue: cloneJson(issue),
+      activity: projectActivityModels(activity),
+      runs: detailRuns.map(projectSessionModel),
+      transcript: projectTranscriptMessages(transcript, { run: latestRun, includeRunPrelude: transcript.length > 0 }),
+    };
+  }
+
+  private async fetchWebDashboard(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebDashboard>>> {
+    const durableDashboard = await this.readDurableWebProjection<ReturnType<typeof projectWebDashboard>>(
+      { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+      forceRefresh,
+    );
+    if (durableDashboard.status === "hit" && durableDashboard.record) {
+      return webProjectionJsonResponse(durableDashboard.record.payload, durableDashboard);
+    }
+
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
     const snapshot = sourceIndex?.runtime.snapshot ?? this.options.orchestrator.snapshot();
@@ -1671,7 +1792,7 @@ export class StatusServer {
       activityCount: activity.activity.length,
       issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
     });
-    return dashboard;
+    return webProjectionJsonResponse(dashboard, durableDashboard);
   }
 
   private async fetchWebOrchestratorChatMessages(
@@ -1901,7 +2022,15 @@ export class StatusServer {
     );
   }
 
-  private async fetchWebSidebar(forceRefresh: boolean) {
+  private async fetchWebSidebar(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebSidebar>>> {
+    const durableSidebar = await this.readDurableWebProjection<ReturnType<typeof projectWebSidebar>>(
+      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+      forceRefresh,
+    );
+    if (durableSidebar.status === "hit" && durableSidebar.record) {
+      return webProjectionJsonResponse(durableSidebar.record.payload, durableSidebar);
+    }
+
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
     const snapshot = sourceIndex?.runtime.snapshot ?? this.options.orchestrator.snapshot();
@@ -1945,11 +2074,19 @@ export class StatusServer {
       activityCount: historyActivity.activity.length,
       issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
     });
-    return sidebar;
+    return webProjectionJsonResponse(sidebar, durableSidebar);
   }
 
-  private async fetchWebHistory(forceRefresh: boolean, url: URL) {
+  private async fetchWebHistory(forceRefresh: boolean, url: URL): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebHistory>>> {
     const limits = parseWebHistoryLimits(url);
+    const durableHistory = await this.readDurableWebProjection<ReturnType<typeof projectWebHistory>>(
+      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: historyProjectionScopeKey(limits) },
+      forceRefresh,
+    );
+    if (durableHistory.status === "hit" && durableHistory.record) {
+      return webProjectionJsonResponse(durableHistory.record.payload, durableHistory);
+    }
+
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
     const activitySources = await this.fetchWebCollectionActivitySources(
@@ -1975,7 +2112,7 @@ export class StatusServer {
       limits,
       activityCount: activityFeed.activity.length,
     });
-    return history;
+    return webProjectionJsonResponse(history, durableHistory);
   }
 
   private async persistWebDashboardProjection(
@@ -2043,6 +2180,35 @@ export class StatusServer {
       // response is derived from canonical stores during this transition phase,
       // so projection persistence failures must not make the UI unavailable.
     }
+  }
+
+  private async readDurableWebProjection<TPayload>(
+    selector: ProjectionRevisionSelector,
+    forceRefresh: boolean,
+  ): Promise<DurableProjectionReadResult<TPayload>> {
+    if (forceRefresh) return { status: "refresh_bypass", selector };
+    const reader = this.options.projectionReader;
+    if (!reader) return { status: "unavailable", selector };
+    try {
+      const record = await reader.readCurrentPayload<TPayload>(selector);
+      if (!record) return { status: "missing", selector };
+      if (isProjectionPayloadExpired(record)) return { status: "expired", selector, record };
+      if (!(await this.isDurableProjectionRecordCurrent(record))) return { status: "stale", selector, record };
+      return { status: "hit", selector, record };
+    } catch {
+      // Durable read models are an acceleration/read path. If the projection reader
+      // is unavailable, malformed, or stale relative to source revision providers,
+      // preserve existing API availability by rebuilding from canonical sources.
+      return { status: "error", selector };
+    }
+  }
+
+  private async isDurableProjectionRecordCurrent(record: ProjectionPayloadRecord): Promise<boolean> {
+    const currentRevisions = projectionCurrentSourceRevisionsForRead(
+      record.revision.projectionName,
+      await this.resolveWebProjectionSourceRevisions(),
+    );
+    return projectionSourceRevisionsCompatible(record.revision.sourceRevisions, currentRevisions);
   }
 
   private async fetchOptionalWebProjectionSourceIndex(forceRefresh: boolean): Promise<{
@@ -2396,9 +2562,9 @@ function statusServerProjectionSourceRevisions(
 ): ProjectionSourceRevision[] {
   if (sourceIndex) return sourceIndex.durableSourceRevisions.map(toProjectionSourceRevision);
   return [
-    statusServerStoreProjectionSourceRevision("runs", options.runStore),
-    statusServerStoreProjectionSourceRevision("lifecycles", options.lifecycleStore),
-    statusServerStoreProjectionSourceRevision("writebacks", options.writebackOutbox),
+    statusServerStoreProjectionSourceRevision("runStore", options.runStore),
+    statusServerStoreProjectionSourceRevision("lifecycleStore", options.lifecycleStore),
+    statusServerStoreProjectionSourceRevision("writebackOutbox", options.writebackOutbox),
   ].filter((revision): revision is ProjectionSourceRevision => revision !== null);
 }
 
@@ -2484,6 +2650,57 @@ function statusServerStoreProjectionSourceRevision(source: string, store: unknow
 
 function toProjectionSourceRevision(revision: WebProjectionSourceRevision): ProjectionSourceRevision {
   return { source: revision.source, revision: revision.revision, observedAt: revision.observedAt };
+}
+
+function isProjectionPayloadExpired(record: ProjectionPayloadRecord): boolean {
+  if (record.expiresAt === null) return false;
+  const expiresAtMs = Date.parse(record.expiresAt);
+  return Number.isFinite(expiresAtMs) && expiresAtMs <= Date.now();
+}
+
+function projectionSourceRevisionsCompatible(
+  storedRevisions: readonly ProjectionSourceRevision[],
+  currentRevisions: readonly WebProjectionSourceRevision[],
+): boolean {
+  if (currentRevisions.length === 0) return true;
+  const storedBySource = new Map(storedRevisions.map((revision) => [revision.source, revision]));
+  for (const current of currentRevisions) {
+    const stored = projectionStoredRevisionForCurrentSource(storedBySource, current.source);
+    if (!stored) return false;
+    if (String(stored.revision) !== String(current.revision)) return false;
+  }
+  return true;
+}
+
+function projectionCurrentSourceRevisionsForRead(
+  projectionName: DurableProjectionName,
+  currentRevisions: readonly WebProjectionSourceRevision[],
+): readonly WebProjectionSourceRevision[] {
+  if (projectionName === "transcript_projection") {
+    return currentRevisions.filter((revision) => revision.source === "runStore" || revision.source === "runs");
+  }
+  if (projectionName === "orchestrator_chat_projection") {
+    return currentRevisions.filter((revision) => revision.source === "orchestrator_conversations");
+  }
+  return currentRevisions;
+}
+
+function projectionStoredRevisionForCurrentSource(
+  storedBySource: ReadonlyMap<string, ProjectionSourceRevision>,
+  currentSource: string,
+): ProjectionSourceRevision | undefined {
+  for (const source of projectionSourceAliases(currentSource)) {
+    const revision = storedBySource.get(source);
+    if (revision) return revision;
+  }
+  return undefined;
+}
+
+function projectionSourceAliases(source: string): readonly string[] {
+  if (source === "runStore") return ["runStore", "runs"];
+  if (source === "lifecycleStore") return ["lifecycleStore", "lifecycles"];
+  if (source === "writebackOutbox") return ["writebackOutbox", "writebacks"];
+  return [source];
 }
 
 function parseStatusServerProjectionRebuildOptions(url: URL): StatusServerProjectionRebuildOptions {
@@ -2653,6 +2870,13 @@ function transcriptProjectionScopeKey(run: RunRecord, page: TranscriptPage): str
   return `${run.runId}:offset:${page.offset}:limit:${page.limit}`;
 }
 
+function transcriptProjectionScopeKeyForRequest(run: RunRecord, url: URL): string {
+  const requestedPage = parseWebTranscriptPagination(url);
+  const offset = requestedPage?.offset ?? Math.max(0, (run.transcriptEventCount ?? 0) - WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT);
+  const limit = requestedPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
+  return `${run.runId}:offset:${offset}:limit:${limit}`;
+}
+
 function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage): Record<string, unknown> {
   const firstEvent = page.events[0] ?? null;
   const lastEvent = page.events.at(-1) ?? null;
@@ -2806,8 +3030,62 @@ function latestTrackerIssueRevision(issues: readonly Issue[]): string | null {
   return latest;
 }
 
-function sendJson(response: ServerResponse, status: number, body: unknown): void {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+function webProjectionJsonResponse<TBody>(
+  body: TBody,
+  durableRead?: DurableProjectionReadResult<unknown>,
+): WebProjectionJsonResponse<TBody> {
+  const headers = durableProjectionReadHeaders(durableRead);
+  return headers ? { body, headers } : { body };
+}
+
+function durableProjectionReadHeaders(read: DurableProjectionReadResult<unknown> | undefined): Record<string, string> | undefined {
+  if (!read) return undefined;
+  const headers: Record<string, string> = {
+    "x-symphony-projection-name": read.selector.projectionName,
+    "x-symphony-projection-scope-kind": read.selector.scopeKind ?? "global",
+    "x-symphony-projection-scope-key": read.selector.scopeKey ?? "global",
+    "x-symphony-projection-status": read.status,
+    "x-symphony-projection-cache": read.status === "hit" ? "hit" : "miss",
+  };
+  if (read.reason) headers["x-symphony-projection-reason"] = headerValue(read.reason);
+  const record = read.record;
+  if (!record) return headers;
+  headers["x-symphony-projection-revision"] = String(record.revision.revision);
+  headers["x-symphony-projection-generated-at"] = record.generatedAt || record.revision.generatedAt;
+  if (record.expiresAt ?? record.revision.expiresAt) {
+    headers["x-symphony-projection-expires-at"] = record.expiresAt ?? record.revision.expiresAt ?? "";
+  }
+  if (record.revision.contentSha256) headers["x-symphony-projection-content-sha256"] = record.revision.contentSha256;
+  if (record.payloadSha256) headers["x-symphony-projection-payload-sha256"] = record.payloadSha256;
+  headers["x-symphony-projection-source-revisions"] = headerJsonValue(record.revision.sourceRevisions);
+  headers["x-symphony-projection-source-cursors"] = headerJsonValue(record.revision.sourceCursors);
+  return headers;
+}
+
+function durableWebIssueFromIssueBoard(board: WebIssueBoardModel, issueId: string): IssueModel | null {
+  const issue = board.issues.find((candidate) => webIssueModelMatches(candidate, issueId)) ?? null;
+  return issue ? cloneJson(issue) : null;
+}
+
+function webIssueModelMatches(issue: IssueModel, issueId: string): boolean {
+  const requested = issueId.trim().toLowerCase();
+  return issue.id.trim().toLowerCase() === requested;
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function headerJsonValue(value: unknown): string {
+  return encodeURIComponent(JSON.stringify(value));
+}
+
+function headerValue(value: string): string {
+  return encodeURIComponent(value);
+}
+
+function sendJson(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8", ...headers });
   response.end(`${JSON.stringify(body, null, 2)}\n`);
 }
 

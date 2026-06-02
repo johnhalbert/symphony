@@ -1,8 +1,8 @@
 # Feature Specification: Block Worker and Reviewer Upstream GitHub Commands
 
-**Feature Branch**: `main`  
-**Created**: 2026-06-01  
-**Status**: Draft  
+**Feature Branch**: `main`
+**Created**: 2026-06-01
+**Status**: Draft
 **Input**: User description: "ENG-243: disallow worker and reviewer agents from calling upstream GitHub commands while preserving local inspection and service-owned workflow actions."
 
 ## User Scenarios & Testing *(mandatory)*
