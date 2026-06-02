@@ -165,7 +165,10 @@ export const harnessActivityConformanceFixtures: readonly HarnessActivityConform
             sessionId: "acp-session-1",
             update: {
               sessionUpdate: "tool_call",
-              toolCall: { id: "tool-acp-1", name: "read_file", status: "running" },
+              toolCallId: "tool-acp-1",
+              kind: "read",
+              title: "read_file",
+              status: "running",
               content: "api_key=SECRET_ACP_TOOL_TOKEN",
             },
           },
@@ -173,7 +176,9 @@ export const harnessActivityConformanceFixtures: readonly HarnessActivityConform
             sessionId: "acp-session-1",
             update: {
               sessionUpdate: "tool_call_update",
-              toolCall: { id: "tool-acp-1", name: "read_file", status: "completed" },
+              toolCallId: "tool-acp-1",
+              kind: "read",
+              status: "completed",
               content: "result SECRET_ACP_RESULT_TOKEN",
             },
           },
