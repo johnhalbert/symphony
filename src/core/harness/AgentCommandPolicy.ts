@@ -101,6 +101,34 @@ const GITHUB_NETWORK_EXECUTABLES = new Set([
   "wget",
 ]);
 
+const COMMAND_PREVIEW_MAX_LENGTH = 240;
+const REDACTED_VALUE = "[redacted]";
+const REDACTED_GITHUB_TOKEN = "[redacted-github-token]";
+
+const CLI_AUTH_OPTIONS_WITH_VALUE = new Set([
+  "-a",
+  "-U",
+  "-u",
+  "--api-key",
+  "--apikey",
+  "--auth",
+  "--auth-token",
+  "--bearer",
+  "--ftp-password",
+  "--ftp-user",
+  "--http-password",
+  "--http-user",
+  "--oauth2-bearer",
+  "--password",
+  "--private-token",
+  "--proxy-user",
+  "--token",
+  "--user",
+  "--user-password",
+]);
+
+const CLI_AUTH_SHORT_OPTIONS_WITH_ATTACHED_VALUE = new Set(["-a", "-U", "-u"]);
+
 export function evaluateAgentCommandPolicy(input: AgentCommandPolicyInput): AgentCommandPolicyDecision {
   const parsed = parseCommandAttempt(input);
 
@@ -485,13 +513,95 @@ function redactCommandPreview(command: string): string {
     return "";
   }
 
-  const redacted = command
-    .replace(/\b(gh[oprsu]_[A-Za-z0-9_]{8,})\b/gu, "[redacted-github-token]")
-    .replace(/\b(github_pat_[A-Za-z0-9_]+)\b/gu, "[redacted-github-token]")
-    .replace(/(https?:\/\/)([^\s/@]+)@/giu, "$1[redacted]@")
-    .replace(/(Authorization:\s*(?:Bearer|token)\s+)[^\s'"]+/giu, "$1[redacted]");
+  const tokens = tokenizeShellLike(redactSensitiveCommandText(command));
+  const redacted = redactSensitiveCommandTokens(tokens).join(" ");
+  const preview = redactSensitiveCommandText(redacted);
 
-  return redacted.length > 240 ? `${redacted.slice(0, 237)}...` : redacted;
+  return preview.length > COMMAND_PREVIEW_MAX_LENGTH
+    ? `${preview.slice(0, COMMAND_PREVIEW_MAX_LENGTH - 3)}...`
+    : preview;
+}
+
+function redactSensitiveCommandTokens(tokens: readonly string[]): string[] {
+  const redacted: string[] = [];
+  let atCommandStart = true;
+  let redactNextAuthValue = false;
+
+  for (const token of tokens) {
+    if (isShellControlOperator(token)) {
+      redacted.push(token);
+      atCommandStart = true;
+      redactNextAuthValue = false;
+      continue;
+    }
+
+    if (redactNextAuthValue) {
+      redacted.push(REDACTED_VALUE);
+      redactNextAuthValue = false;
+      atCommandStart = false;
+      continue;
+    }
+
+    const environmentAssignment = parseEnvironmentAssignment(token);
+    if (environmentAssignment && (atCommandStart || isSensitiveAssignmentKey(environmentAssignment.key))) {
+      redacted.push(`${environmentAssignment.key}=${REDACTED_VALUE}`);
+      continue;
+    }
+
+    const authOption = redactAuthOptionToken(token);
+    redacted.push(authOption.token);
+    redactNextAuthValue = authOption.redactNextValue;
+    atCommandStart = false;
+  }
+
+  return redacted;
+}
+
+function parseEnvironmentAssignment(token: string): { readonly key: string } | null {
+  const match = /^([A-Za-z_][A-Za-z0-9_]*)=.*$/u.exec(token);
+  const key = match?.[1];
+  return key ? { key } : null;
+}
+
+function redactAuthOptionToken(token: string): { readonly token: string; readonly redactNextValue: boolean } {
+  const inlineValueSeparator = token.indexOf("=");
+  if (inlineValueSeparator > 0) {
+    const optionName = token.slice(0, inlineValueSeparator);
+    if (CLI_AUTH_OPTIONS_WITH_VALUE.has(optionName)) {
+      return { token: `${optionName}=${REDACTED_VALUE}`, redactNextValue: false };
+    }
+  }
+
+  if (CLI_AUTH_OPTIONS_WITH_VALUE.has(token)) {
+    return { token, redactNextValue: true };
+  }
+
+  for (const shortOption of CLI_AUTH_SHORT_OPTIONS_WITH_ATTACHED_VALUE) {
+    if (token.startsWith(shortOption) && token.length > shortOption.length && !token.startsWith(`${shortOption}-`)) {
+      return { token: `${shortOption}${REDACTED_VALUE}`, redactNextValue: false };
+    }
+  }
+
+  return { token: redactSensitiveCommandText(token), redactNextValue: false };
+}
+
+function redactSensitiveCommandText(text: string): string {
+  return text
+    .replace(/\b(gh[oprsu]_[A-Za-z0-9_]{8,})\b/gu, REDACTED_GITHUB_TOKEN)
+    .replace(/\b(github_pat_[A-Za-z0-9_]+)\b/gu, REDACTED_GITHUB_TOKEN)
+    .replace(/(https?:\/\/)([^\s/@]+)@/giu, `$1${REDACTED_VALUE}@`)
+    .replace(/(Authorization:\s*(?:Basic|Bearer|token)\s+)[^\s'";|&]+/giu, `$1${REDACTED_VALUE}`)
+    .replace(
+      /((?:X-GitHub-Token|X-Hub-Signature(?:-256)?|Private-Token|Job-Token):\s*)[^\s'";|&]+/giu,
+      `$1${REDACTED_VALUE}`,
+    );
+}
+
+function isSensitiveAssignmentKey(key: string): boolean {
+  const normalized = key.replace(/[-.]/gu, "_").toLowerCase();
+  return /(?:^|_)(?:api_key|auth(?:orization)?|bearer|client_secret|credential|credentials|password|passwd|pat|private_key|secret|token)(?:_|$)/u.test(
+    normalized,
+  );
 }
 
 function isShellControlOperator(token: string): boolean {

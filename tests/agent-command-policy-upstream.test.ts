@@ -13,6 +13,17 @@ interface DirectDenyCase {
   readonly targetHosts?: readonly string[];
 }
 
+interface RedactedPreviewCase {
+  readonly name: string;
+  readonly command: string;
+  readonly commandClass: string;
+  readonly executable: string;
+  readonly secretValues: readonly string[];
+  readonly expectedPreviewParts: readonly string[];
+  readonly inlineEnvironmentKeys?: readonly string[];
+  readonly targetHosts?: readonly string[];
+}
+
 describe("AgentCommandPolicy direct upstream GitHub denial", () => {
   it.each<DirectDenyCase>([
     {
@@ -160,19 +171,90 @@ describe("AgentCommandPolicy direct upstream GitHub denial", () => {
     });
   });
 
-  it("redacts credential material from policy audit previews", () => {
-    const decision = evaluateAgentCommandPolicy(
-      terminalInput("git clone https://ghp_1234567890abcdef@github.com/acme/repo.git"),
-    );
+  it.each<RedactedPreviewCase>([
+    {
+      name: "URL userinfo",
+      command: "git clone https://ghp_12...cdef@github.com/acme/repo.git",
+      commandClass: "git_clone",
+      executable: "git",
+      secretValues: ["ghp_12...cdef"],
+      expectedPreviewParts: ["https://[redacted]@github.com/acme/repo.git"],
+      targetHosts: ["github.com"],
+    },
+    {
+      name: "leading inline environment assignments",
+      command: "FOO=visible-value GH_TOKEN='super secret value' GITHUB_TOKEN=plain-secret-value gh api repos/acme/repo",
+      commandClass: "github_cli",
+      executable: "gh",
+      secretValues: ["visible-value", "super secret value", "plain-secret-value"],
+      expectedPreviewParts: ["FOO=[redacted]", "GH_TOKEN=[redacted]", "GITHUB_TOKEN=[redacted]"],
+      inlineEnvironmentKeys: ["FOO", "GH_TOKEN", "GITHUB_TOKEN"],
+    },
+    {
+      name: "curl short user auth flag",
+      command: "curl -u plain-secret:x-oauth-basic https://api.github.com/repos/acme/repo",
+      commandClass: "curl_github_request",
+      executable: "curl",
+      secretValues: ["plain-secret", "plain-secret:x-oauth-basic"],
+      expectedPreviewParts: ["-u [redacted]", "https://api.github.com/repos/acme/repo"],
+      targetHosts: ["api.github.com"],
+    },
+    {
+      name: "curl long user and bearer auth flags",
+      command:
+        "curl --user=inline-secret:x-oauth-basic --oauth2-bearer bearer-secret https://api.github.com/repos/acme/repo",
+      commandClass: "curl_github_request",
+      executable: "curl",
+      secretValues: ["inline-secret", "inline-secret:x-oauth-basic", "bearer-secret"],
+      expectedPreviewParts: ["--user=[redacted]", "--oauth2-bearer [redacted]"],
+      targetHosts: ["api.github.com"],
+    },
+    {
+      name: "Authorization header",
+      command: "curl -H 'Authorization: Bearer header-secret' https://api.github.com/repos/acme/repo",
+      commandClass: "curl_github_request",
+      executable: "curl",
+      secretValues: ["header-secret"],
+      expectedPreviewParts: ["Authorization: Bearer [redacted]"],
+      targetHosts: ["api.github.com"],
+    },
+  ])("redacts credential material from policy audit previews: $name", ({
+    command,
+    commandClass,
+    executable,
+    expectedPreviewParts,
+    inlineEnvironmentKeys,
+    secretValues,
+    targetHosts,
+  }) => {
+    const decision = evaluateAgentCommandPolicy(terminalInput(command));
 
     expect(decision).toMatchObject({
       outcome: "deny",
       reasonKind: "upstream_github",
-      commandClass: "git_clone",
+      commandClass,
+      audit: {
+        redacted: true,
+        normalizedExecutable: executable,
+        upstreamContactAttempted: false,
+      },
     });
-    expect(decision.audit.commandPreview).toContain("[redacted]");
-    expect(decision.audit.commandPreview).not.toContain("ghp_1234567890abcdef");
-    expect(decision.message).not.toContain("ghp_1234567890abcdef");
+    if (inlineEnvironmentKeys) {
+      expect(decision.audit.inlineEnvironmentKeys).toEqual(inlineEnvironmentKeys);
+    }
+    if (targetHosts) {
+      expect(decision.audit.targetHosts).toEqual(targetHosts);
+    }
+
+    const preview = decision.audit.commandPreview ?? "";
+    expect(preview).toContain("[redacted]");
+    for (const part of expectedPreviewParts) {
+      expect(preview).toContain(part);
+    }
+    for (const secret of secretValues) {
+      expect(preview).not.toContain(secret);
+      expect(decision.message).not.toContain(secret);
+    }
   });
 
   it("fails closed when worker command content is missing", () => {
