@@ -523,6 +523,75 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("serves whitespace-preserving assistant delta streams from persisted public transcript events", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "hermes-whitespace-run", sessionId: "hermes-whitespace-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Hello",
+      payload: { type: "progress", activitySource: "delta", message: "Hello" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: " ",
+      payload: { type: "progress", activitySource: "delta", message: " " },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "world",
+      payload: { type: "progress", activitySource: "delta", message: "world" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:04.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: " Safe", redacted: true },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:05.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: " SECRET_API_DELTA_TOKEN", redacted: true },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:06.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: "", redacted: true },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-whitespace-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "hermes-whitespace-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello world Safe [redacted]" },
+      ]);
+      expect(JSON.stringify(body)).not.toContain("SECRET_API_DELTA_TOKEN");
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves persisted harness stream progress text as assistant messages", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);

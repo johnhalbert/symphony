@@ -1,4 +1,4 @@
-import { redactTranscriptText, sanitizePublicJson, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
+import { redactTranscriptText, sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
 import type { RunRecord, TranscriptEvent } from "../core/persistence/RunTranscriptStore.js";
 
 const USER_PROMPT_MAX_LENGTH = 5_000;
@@ -532,7 +532,12 @@ function isAssistantDeltaEventParts(
 }
 
 function assistantDeltaText(event: TranscriptEvent, payload: Record<string, unknown>): string {
-  return firstCleanString(payload.textPreview, payload.deltaPreview, payload.delta, payload.messagePreview, payload.text, payload.message, event.message) ?? "";
+  const rawPayload = firstDeltaTextFromRecord(rawPayloadRecord(event));
+  if (rawPayload.foundCandidate) return rawPayload.text ?? "";
+  const publicPayload = firstDeltaTextFromRecord(payload);
+  if (publicPayload.foundCandidate) return publicPayload.text ?? "";
+  if (isLabelOnlyRuntimeDeltaEvent(event)) return "";
+  return firstDeltaText(event.message) ?? "";
 }
 
 type AssistantDeltaMirrorSource = "runtime" | "harness";
@@ -674,6 +679,10 @@ function sanitizedPayloadRecord(event: TranscriptEvent): Record<string, unknown>
   return isRecord(payload) ? payload : {};
 }
 
+function rawPayloadRecord(event: TranscriptEvent): Record<string, unknown> {
+  return isRecord(event.payload) ? event.payload : {};
+}
+
 function eventText(event: TranscriptEvent, payload: Record<string, unknown>): string {
   return (
     firstCleanString(payload.textPreview, payload.summary, payload.messagePreview, payload.text, payload.message, event.message) ??
@@ -732,6 +741,38 @@ function payloadKindIncludes(payloadKind: string | null, token: string): boolean
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function firstDeltaText(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const preview = sanitizedDeltaTextValue(value).preview;
+    if (preview !== null && preview.length > 0) return preview;
+  }
+  return null;
+}
+
+const ASSISTANT_DELTA_TEXT_KEYS = ["textPreview", "deltaPreview", "delta", "messagePreview", "text", "message"] as const;
+
+interface AssistantDeltaTextLookup {
+  foundCandidate: boolean;
+  text: string | null;
+}
+
+function firstDeltaTextFromRecord(record: Record<string, unknown>): AssistantDeltaTextLookup {
+  let foundCandidate = false;
+  for (const key of ASSISTANT_DELTA_TEXT_KEYS) {
+    const value = record[key];
+    if (typeof value !== "string") continue;
+    foundCandidate = true;
+    const preview = sanitizedDeltaTextValue(value).preview;
+    if (preview !== null && preview.length > 0) return { foundCandidate: true, text: preview };
+  }
+  return { foundCandidate, text: null };
+}
+
+function isLabelOnlyRuntimeDeltaEvent(event: TranscriptEvent): boolean {
+  return event.source === "runtime" && normalizeToken(event.eventType) === "message_delta" && normalizeToken(event.message ?? "") === "hermes_message_delta";
 }
 
 function firstCleanString(...values: unknown[]): string | null {
