@@ -11,7 +11,7 @@ import {
   type RunActivitySequenceSource,
 } from "../runActivity/RunActivityEvent.js";
 import type { TokenCounts } from "../types.js";
-import { sanitizePublicJson, sanitizedPreviewValue } from "./TranscriptProjection.js";
+import { sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "./TranscriptProjection.js";
 
 export const RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX = "symphony.run_activity.agent_event";
 
@@ -19,6 +19,13 @@ type RunActivityEventPatch = Pick<TranscriptEvent, "eventType"> &
   Partial<Pick<TranscriptEvent, "message" | "payload" | "payloadSchema" | "payloadTruncated" | "payloadByteLength">>;
 
 const RAW_PROTOCOL_KEYS = new Set(["raw", "rawpayload", "protocolpayload", "jsonrpc", "rpcerror"]);
+const ASSISTANT_DELTA_TEXT_KEYS = ["textPreview", "deltaPreview", "messagePreview", "delta", "text", "message"] as const;
+
+interface PreviewText {
+  preview: string;
+  truncated: boolean;
+  redacted: boolean;
+}
 
 /**
  * Convert harness-neutral AgentEvent values into normalized RunActivityEvent
@@ -39,7 +46,7 @@ export function mapAgentEventToRunActivityEvent(event: AgentEvent): RunActivityE
         ...(event.runId === undefined ? {} : { runId: event.runId }),
       });
     case "progress": {
-      const message = previewText(event.message, 500);
+      const message = event.activitySource === "delta" ? deltaPreviewText(event.message, 500) : previewText(event.message, 500);
       return activity("progress", message.preview, {
         // Hermes JSON-RPC status/tool/delta notifications all arrive as
         // progress AgentEvents. Only explicit activitySource="delta" is an
@@ -152,7 +159,10 @@ export function mapRunActivityEventToTranscriptEvent(
 function runActivityPatchFromHarnessMetadata(runActivity: RunActivityEvent | undefined): RunActivityEventPatch | null {
   if (!isValidRunActivityEvent(runActivity)) return null;
 
-  const text = runActivity.text === null ? null : previewText(runActivity.text, 500);
+  const assistantDelta = isAssistantDeltaRunActivity(runActivity);
+  const text = runActivity.text === null ? null : assistantDelta ? deltaPreviewText(runActivity.text, 500) : previewText(runActivity.text, 500);
+  const payloadText = assistantDelta ? firstDeltaPreviewFromPayload(runActivity.payload, 500) : null;
+  const displayText = text ?? payloadText;
   const publicRunActivityPayload = publicPayload(runActivity.payload);
   const payload = isRecord(publicRunActivityPayload) ? publicRunActivityPayload : { value: publicRunActivityPayload };
   const transcriptPayload: Record<string, unknown> = {
@@ -171,16 +181,31 @@ function runActivityPatchFromHarnessMetadata(runActivity: RunActivityEvent | und
     activitySequence: runActivity.sequence,
     sequenceSource: runActivity.sequenceSource,
     ...(runActivity.externalEventId === undefined ? {} : { externalEventId: runActivity.externalEventId }),
-    ...(text === null
+    ...(displayText === null
       ? {}
       : {
-          textPreview: text.preview,
-          textTruncated: text.truncated,
-          redacted: payload.redacted === true || text.redacted,
+          textPreview: displayText.preview,
+          textTruncated: displayText.truncated,
+          redacted: payload.redacted === true || displayText.redacted,
         }),
   };
 
-  return activity(runActivity.kind, text?.preview, transcriptPayload);
+  if (assistantDelta) {
+    const deltaPayload = assistantDeltaPayloadOverrides(runActivity.payload, 500);
+    Object.assign(transcriptPayload, deltaPayload.fields);
+    if (displayText !== null) {
+      transcriptPayload.messagePreview = displayText.preview;
+      transcriptPayload.textPreview = displayText.preview;
+      transcriptPayload.textTruncated = displayText.truncated;
+    }
+    if (payload.redacted === true || displayText?.redacted || deltaPayload.redacted) transcriptPayload.redacted = true;
+  }
+
+  return activity(runActivity.kind, displayText?.preview, transcriptPayload);
+}
+
+function isAssistantDeltaRunActivity(runActivity: RunActivityEvent): boolean {
+  return runActivity.actor === "assistant" && runActivity.channel === "chat" && (runActivity.kind === "assistant_message_delta" || runActivity.payload.delta === true);
 }
 
 function isValidRunActivityEvent(value: unknown): value is RunActivityEvent {
@@ -268,9 +293,39 @@ function finiteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function previewText(value: unknown, maxLength: number): { preview: string; truncated: boolean; redacted: boolean } {
+function previewText(value: unknown, maxLength: number): PreviewText {
   const preview = sanitizedPreviewValue(value, maxLength);
   return { preview: preview.preview ?? "", truncated: preview.truncated, redacted: preview.redacted };
+}
+
+function deltaPreviewText(value: unknown, maxLength: number): PreviewText {
+  const preview = sanitizedDeltaTextValue(value, maxLength);
+  return { preview: preview.preview ?? "", truncated: preview.truncated, redacted: preview.redacted };
+}
+
+function firstDeltaPreviewFromPayload(payload: Record<string, unknown>, maxLength: number): PreviewText | null {
+  let emptyCandidate: PreviewText | null = null;
+  for (const key of ASSISTANT_DELTA_TEXT_KEYS) {
+    const value = payload[key];
+    if (typeof value !== "string") continue;
+    const preview = deltaPreviewText(value, maxLength);
+    if (preview.preview.length > 0) return preview;
+    emptyCandidate ??= preview;
+  }
+  return emptyCandidate;
+}
+
+function assistantDeltaPayloadOverrides(payload: Record<string, unknown>, maxLength: number): { fields: Record<string, unknown>; redacted: boolean } {
+  const fields: Record<string, unknown> = {};
+  let redacted = false;
+  for (const key of ASSISTANT_DELTA_TEXT_KEYS) {
+    const value = payload[key];
+    if (typeof value !== "string") continue;
+    const preview = deltaPreviewText(value, maxLength);
+    fields[key] = preview.preview;
+    if (preview.redacted) redacted = true;
+  }
+  return { fields, redacted };
 }
 
 function payloadContainsTruncatedPreview(value: unknown): boolean {

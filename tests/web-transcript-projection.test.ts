@@ -113,6 +113,39 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("Cursor task event");
   });
 
+  it("preserves persisted harness stream progress text while routing explicit progress status", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "hello from stream",
+        payload: { type: "progress", activitySource: "stream", message: "hello from stream" },
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "legacy progress text",
+        payload: { type: "progress", message: "legacy progress text" },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 2,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Workspace warming",
+        payload: { type: "progress", activitySource: "status", status: "warming", message: "Workspace warming" },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 3,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "hello from stream" },
+      { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "legacy progress text" },
+      { kind: "status", state: "warming", ts: "2026-01-01T00:00:02.000Z", text: "Workspace warming" },
+    ]);
+  });
+
   it("coalesces Hermes runtime deltas and tool pairs while preserving public-safe run prelude messages", () => {
     const messages = projectWebTranscript(
       [
@@ -502,6 +535,38 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("Hermes tool terminal: ");
   });
 
+  it("shows canonical token summaries while preserving raw token telemetry without public counts as hidden metadata", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "tokens",
+        source: "harness",
+        message: "Token usage updated",
+        payload: { kind: "usage", tokens: { inputTokens: 4, outputTokens: 6, totalTokens: 10 } },
+      }),
+      event({
+        eventType: "tokens",
+        source: "harness",
+        message: "Fixture token update 12",
+        payload: { type: "tokens", tokens: { inputTokens: 5, outputTokens: 7, totalTokens: 12 }, totalTokens: 12 },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 2,
+      }),
+      event({
+        eventType: "tokens",
+        source: "harness",
+        payload: { type: "tokens", secret: "SECRET_TOKEN_SUMMARY" },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 3,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      { kind: "status", state: "usage", ts: "2026-01-01T00:00:00.000Z", text: "Tokens: input 4 · output 6 · total 10" },
+      { kind: "status", state: "tokens", ts: "2026-01-01T00:00:01.000Z", text: "Tokens: input 5 · output 7 · total 12" },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain("SECRET_TOKEN_SUMMARY");
+  });
+
   it("projects persisted harness-provided ACP RunActivityEvent taxonomy without falling back to legacy progress", () => {
     const messages = projectWebTranscript([
       event({
@@ -513,8 +578,8 @@ describe("projectWebTranscript", () => {
       event({
         eventType: "assistant_message_delta",
         source: "harness",
-        message: "world",
-        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "message", textPreview: "world", delta: true },
+        message: " world",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "message", textPreview: " world", delta: true },
         at: "2026-01-01T00:00:01.000Z",
         sequence: 2,
       }),
@@ -597,6 +662,52 @@ describe("projectWebTranscript", () => {
     expect(JSON.stringify(messages)).not.toContain("SECRET_FAILURE_TOKEN");
   });
 
+  it("exact-concatenates canonical assistant_message_delta chunks and ignores only empty chunks", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: "H", delta: true },
+        sequence: 20,
+      }),
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: "ello", delta: true },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 21,
+      }),
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: " ", delta: true },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 22,
+      }),
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: "world", delta: true },
+        at: "2026-01-01T00:00:03.000Z",
+        sequence: 23,
+      }),
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: "", delta: true },
+        at: "2026-01-01T00:00:04.000Z",
+        sequence: 24,
+      }),
+    ]);
+
+    expect(messages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello world" }]);
+  });
+
   it("routes progress-shaped token and rate-limit telemetry to status while coalescing assistant progress deltas", () => {
     const messages = projectWebTranscript([
       event({
@@ -644,6 +755,235 @@ describe("projectWebTranscript", () => {
       { kind: "status", state: "provider_rate_limit", ts: "2026-01-01T00:00:03.000Z", text: "rate limit backoff" },
       { kind: "status", state: "completed", ts: "2026-01-01T00:00:04.000Z", text: "legacy harness assistant completion" },
     ]);
+  });
+
+  it("keeps missing-completion assistant streams readable across duplicate and empty deltas", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hel",
+        payload: { type: "progress", activitySource: "delta", message: "Hel" },
+        sequence: 10,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hel",
+        payload: { type: "progress", activitySource: "delta", message: "Hel" },
+        sequence: 10,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "",
+        payload: { type: "progress", activitySource: "delta", message: "" },
+        sequence: 11,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        payload: { type: "progress", activitySource: "delta" },
+        sequence: 12,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "lo",
+        payload: { type: "progress", activitySource: "delta", message: "lo" },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 13,
+      }),
+    ]);
+
+    expect(messages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello" }]);
+  });
+
+  it("exact-concatenates Hermes runtime message_delta streams without completion", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "H", redacted: true },
+      }),
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "ello", redacted: true },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 2,
+      }),
+    ]);
+
+    expect(messages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello" }]);
+  });
+
+  it("preserves whitespace-only and leading-space assistant delta chunks while redacting secrets", () => {
+    const harnessMessages = projectWebTranscript([
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hello",
+        payload: { type: "progress", activitySource: "delta", message: "Hello" },
+        sequence: 30,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: " ",
+        payload: { type: "progress", activitySource: "delta", message: " " },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 31,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "world",
+        payload: { type: "progress", activitySource: "delta", message: "world" },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 32,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "",
+        payload: { type: "progress", activitySource: "delta", message: "" },
+        at: "2026-01-01T00:00:03.000Z",
+        sequence: 33,
+      }),
+    ]);
+    const runtimeMessages = projectWebTranscript([
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "Hello", redacted: true },
+        sequence: 40,
+      }),
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: " world", redacted: true },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 41,
+      }),
+    ]);
+    const redactedMessages = projectWebTranscript([
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Token ",
+        payload: { type: "progress", activitySource: "delta", message: "Token " },
+        sequence: 50,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "SECRET_DELTA_TOKEN",
+        payload: { type: "progress", activitySource: "delta", message: "SECRET_DELTA_TOKEN" },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 51,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: " done",
+        payload: { type: "progress", activitySource: "delta", message: " done" },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 52,
+      }),
+    ]);
+
+    expect(harnessMessages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello world" }]);
+    expect(runtimeMessages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello world" }]);
+    expect(redactedMessages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Token [redacted] done" }]);
+    expect(JSON.stringify(redactedMessages)).not.toContain("SECRET_DELTA_TOKEN");
+  });
+
+  it("coalesces real Hermes runtime and harness mirrored deltas before failed or cancelled terminal rows", () => {
+    const mirroredDeltas: TranscriptEvent[] = [
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "Hel", redacted: true },
+        sequence: 20,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hel",
+        payload: {
+          kind: "assistant_delta",
+          activitySource: "delta",
+          progressKind: "assistant_delta",
+          messagePreview: "Hel",
+          truncated: false,
+          redacted: false,
+        },
+        at: "2026-01-01T00:00:00.100Z",
+        sequence: 21,
+      }),
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "lo", redacted: true },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 22,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "lo",
+        payload: {
+          kind: "assistant_delta",
+          activitySource: "delta",
+          progressKind: "assistant_delta",
+          messagePreview: "lo",
+          truncated: false,
+          redacted: false,
+        },
+        at: "2026-01-01T00:00:01.100Z",
+        sequence: 23,
+      }),
+    ];
+    const terminalCases = [
+      {
+        eventType: "failed",
+        message: "Run failed before message.complete",
+        payload: { kind: "terminal", status: "failed", errorPreview: "Run failed before message.complete" },
+        expected: { kind: "status", state: "failed", ts: "2026-01-01T00:00:02.000Z", text: "Run failed before message.complete" },
+      },
+      {
+        eventType: "cancelled",
+        message: "Run cancelled",
+        payload: { kind: "terminal", status: "cancelled" },
+        expected: { kind: "status", state: "cancelled", ts: "2026-01-01T00:00:02.000Z", text: "Run cancelled" },
+      },
+    ];
+
+    for (const terminalCase of terminalCases) {
+      const messages = projectWebTranscript([
+        ...mirroredDeltas,
+        event({
+          eventType: terminalCase.eventType,
+          source: "harness",
+          message: terminalCase.message,
+          payload: terminalCase.payload,
+          at: "2026-01-01T00:00:02.000Z",
+          sequence: 24,
+        }),
+      ]);
+
+      expect(messages).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello" },
+        terminalCase.expected,
+      ]);
+    }
   });
 
   it("keeps unresolved request actions exact empty arrays and maps unknown payloads without leaking runtime fields", () => {

@@ -810,7 +810,8 @@ describe("HermesAcpHarness", () => {
         sessionId: "acp-session-1",
         update: { sessionUpdate: "tool_call_update", toolCall: { id: "call-2", name: "terminal", error: "permission denied" }, status: "failed" },
       },
-      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello " } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " " } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "usage_update", used: 9, size: 100 } },
       { sessionId: "acp-session-1", update: { sessionUpdate: "available_commands_update", availableCommands: [{ name: "/help" }] } },
@@ -838,9 +839,11 @@ describe("HermesAcpHarness", () => {
     );
     expect(events.flatMap((event) => event.type === "progress" && event.activitySource === "delta" ? [event.message] : [])).toEqual([
       "hello",
+      " ",
       "world",
     ]);
     expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { totalTokens: 9 } })]));
+
     expect(events.map((event) => "message" in event ? event.message : "").join("\n")).not.toContain("before active session");
     expect(events.map((event) => "message" in event ? event.message : "").join("\n")).not.toContain("wrong session");
 
@@ -855,6 +858,7 @@ describe("HermesAcpHarness", () => {
       "tool_call_failed",
       "assistant_message_delta",
       "assistant_message_delta",
+      "assistant_message_delta",
       "runtime_status_update",
       "available_commands_update",
       "runtime_diagnostic",
@@ -865,6 +869,13 @@ describe("HermesAcpHarness", () => {
     expect(transcriptEventTypes).not.toEqual(
       expect.arrayContaining(["hermes_acp_profile", "acp_session_update", "acp_permission_denied", "acp_diagnostic", "session_update"]),
     );
+    const assistantTranscriptEvents = transcriptEvents.filter((event) => event.eventType === "assistant_message_delta");
+    expect(assistantTranscriptEvents.map((event) => event.message)).toEqual(["hello", " ", "world"]);
+    expect(assistantTranscriptEvents.map((event) => (event.payload as Record<string, unknown> | undefined)?.messagePreview)).toEqual([
+      "hello",
+      " ",
+      "world",
+    ]);
     const call1Events = transcriptEvents.filter((event) => (event.payload as Record<string, unknown> | undefined)?.toolCallId === "call-1");
     expect(call1Events.map((event) => event.eventType)).toEqual(["tool_call_started", "tool_call_completed"]);
     expect(call1Events.map((event) => event.payload)).toEqual(

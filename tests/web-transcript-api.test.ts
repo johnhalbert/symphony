@@ -6,6 +6,8 @@ import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileRunTranscriptStore, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import { mapAgentEventToRunActivityEvent } from "../src/core/transcript/RunActivityEventMapper.js";
+import type { RunActivityEvent } from "../src/core/runActivity/RunActivityEvent.js";
 import type { ProjectionPayloadWriteInput, ProjectionWriteResult } from "../src/core/persistence/ProjectionTransactionService.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -381,6 +383,319 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(serialized).not.toContain("partial assistant text");
       expect(serialized).not.toContain("SECRET_MESSAGE_TOKEN");
       expect(serialized).not.toContain("SECRET_TOOL_RESULT");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves persisted Hermes ACP progress deltas as one readable assistant message", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "hermes-acp-run", sessionId: "hermes-acp-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "hermes-acp-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Hel",
+      payload: { type: "progress", activitySource: "delta", message: "Hel" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-acp-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "lo",
+      payload: { type: "progress", activitySource: "delta", message: "lo" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-acp-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Hermes ACP tool terminal: SECRET_TOOL_PROGRESS",
+      payload: { type: "progress", activitySource: "tool", message: "Hermes ACP tool terminal: SECRET_TOOL_PROGRESS" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-acp-run",
+      at: "2026-01-01T00:00:04.000Z",
+      source: "harness",
+      eventType: "cancelled",
+      payload: { type: "cancelled" },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-acp-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "hermes-acp-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
+        {
+          kind: "tool_call",
+          ts: "2026-01-01T00:00:03.000Z",
+          call_id: "hermes-acp-run:3",
+          name: "terminal",
+          status: "running",
+          args: {},
+          result: null,
+        },
+        { kind: "status", state: "cancelled", ts: "2026-01-01T00:00:04.000Z", text: "Run cancelled" },
+      ]);
+      expect(JSON.stringify(body)).not.toContain("SECRET_TOOL_PROGRESS");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves orchestrator-mapped ACP runActivity deltas with exact whitespace through the durable API", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const runId = "mapped-acp-delta-run";
+    await startRun(runStore, config, { runId, sessionId: "mapped-acp-delta-session", issueIdentifier: "TEST-1" });
+    const appendMappedEvent = async (event: Parameters<typeof mapAgentEventToRunActivityEvent>[0]) => {
+      await runStore.appendEvent({
+        runId,
+        at: event.at ?? "2026-01-01T00:00:01.000Z",
+        source: "harness",
+        ...mapAgentEventToRunActivityEvent(event),
+      });
+    };
+    const acpDeltaActivity = (sequence: number, text: string, at: string): RunActivityEvent => ({
+      eventId: `${runId}:activity:${sequence}`,
+      runSessionId: `profile:acp-session-1:${runId}`,
+      occurredAt: at,
+      sequence,
+      sequenceSource: "harness",
+      externalEventId: `external-${sequence}`,
+      protocol: "acp",
+      harness: "hermes_acp",
+      actor: "assistant",
+      channel: "chat",
+      kind: "assistant_message_delta",
+      text,
+      payload: { runtimeSessionId: "acp-session-1", delta: true, messagePreview: text, redacted: true },
+    });
+    const deltaChunks = ["H", "ello", " ", "world", " token=api-delta-value", ""];
+    for (const [index, text] of deltaChunks.entries()) {
+      const sequence = index + 1;
+      const at = `2026-01-01T00:00:0${sequence}.000Z`;
+      await appendMappedEvent({
+        type: "progress",
+        activitySource: "delta",
+        message: "legacy fallback should not persist",
+        at,
+        runActivity: acpDeltaActivity(sequence, text, at),
+      });
+    }
+    await appendMappedEvent({ type: "failed", error: "Run failed before message.complete", at: "2026-01-01T00:00:07.000Z" });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/${runId}/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "mapped-acp-delta-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello world token=[redacted]" },
+        { kind: "status", state: "failed", ts: "2026-01-01T00:00:07.000Z", text: "Run failed before message.complete" },
+      ]);
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("api-delta-value");
+      expect(serialized).not.toContain("legacy fallback should not persist");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves real Hermes runtime and harness mirrored deltas as one readable assistant message without completion", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "hermes-dual-run", sessionId: "hermes-dual-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: "Hel", redacted: true },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:01.100Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Hel",
+      payload: {
+        kind: "assistant_delta",
+        activitySource: "delta",
+        progressKind: "assistant_delta",
+        messagePreview: "Hel",
+        truncated: false,
+        redacted: false,
+      },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: "lo", redacted: true },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:02.100Z",
+      source: "harness",
+      eventType: "progress",
+      message: "lo",
+      payload: {
+        kind: "assistant_delta",
+        activitySource: "delta",
+        progressKind: "assistant_delta",
+        messagePreview: "lo",
+        truncated: false,
+        redacted: false,
+      },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "harness",
+      eventType: "failed",
+      message: "Run failed before message.complete",
+      payload: { kind: "terminal", status: "failed", errorPreview: "Run failed before message.complete" },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-dual-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "hermes-dual-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
+        { kind: "status", state: "failed", ts: "2026-01-01T00:00:03.000Z", text: "Run failed before message.complete" },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves whitespace-preserving assistant delta streams from persisted public transcript events", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "hermes-whitespace-run", sessionId: "hermes-whitespace-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Hello",
+      payload: { type: "progress", activitySource: "delta", message: "Hello" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: " ",
+      payload: { type: "progress", activitySource: "delta", message: " " },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "world",
+      payload: { type: "progress", activitySource: "delta", message: "world" },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:04.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: " Safe", redacted: true },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:05.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: " SECRET_API_DELTA_TOKEN", redacted: true },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-whitespace-run",
+      at: "2026-01-01T00:00:06.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: "", redacted: true },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-whitespace-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "hermes-whitespace-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello world Safe [redacted]" },
+      ]);
+      expect(JSON.stringify(body)).not.toContain("SECRET_API_DELTA_TOKEN");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves persisted harness stream progress text as assistant messages", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "stream-progress-run", sessionId: "stream-progress-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "stream-progress-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "hello from stream",
+      payload: { type: "progress", activitySource: "stream", message: "hello from stream" },
+    });
+    await runStore.appendEvent({
+      runId: "stream-progress-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "legacy progress text",
+      payload: { type: "progress", message: "legacy progress text" },
+    });
+    await runStore.appendEvent({
+      runId: "stream-progress-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Workspace warming",
+      payload: { type: "progress", activitySource: "status", status: "warming", message: "Workspace warming" },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/stream-progress-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "stream-progress-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "hello from stream" },
+        { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "legacy progress text" },
+        { kind: "status", state: "warming", ts: "2026-01-01T00:00:03.000Z", text: "Workspace warming" },
+      ]);
     } finally {
       await server.stop();
     }

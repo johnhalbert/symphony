@@ -13,7 +13,7 @@ the backend and web UI:
 | Display class | Public `kind` | Source events | Notes |
 | --- | --- | --- | --- |
 | Run prelude | `system`, `user` | Persisted `RunRecord` metadata and prompt | Prepended when no equivalent transcript event exists. System prompt is redacted; user prompt is length-bounded and secret-redacted. |
-| Chat output | `assistant` | `assistant`, `message_*`, `assistant_message_*`, `response_*`, `harness:progress` without a tool activity source, and `harness:progress` with `activitySource: delta` or assistant chat-channel payloads | Text is projected from sanitized preview fields or sanitized event message. Delta fragments are grouped (see below). |
+| Chat output | `assistant` | `assistant`, `message_*`, `assistant_message_*`, `response_*`, `harness:progress` without a status/tool activity source, and `harness:progress` with `activitySource: stream`/`delta` or assistant chat-channel payloads | Text is projected from sanitized preview fields or sanitized event message. Delta fragments are grouped (see below). |
 | Reasoning | `thinking` | `thinking`, `reasoning_*`, `thought_*`, `assistant_reasoning_*` | Uses public summaries/previews only; raw reasoning payloads stay hidden. |
 | Tool rows | `tool_call` | Runtime/Cursor tool events such as `tool_call`, `tool_start`, `tool_complete`, `tool_call_started`, `tool_call_completed` | Start/complete pairs group by call id/tool id. Arguments/results are previews only. Harness tool progress is hidden to avoid duplicate rows and raw command spam. |
 | Work/task summaries | `task` | `task` events | For coarse-grained task updates that are safe to show as milestones. |
@@ -23,18 +23,25 @@ the backend and web UI:
 
 Raw token-count telemetry is not a chat transcript message. The run/session
 summary owns aggregate token display. When the durable RunActivity taxonomy emits
-a sanitized, low-frequency `token_usage_reported`/token-budget event, it may
-appear as a concise `status` row; raw legacy `tokens` payloads remain hidden.
+a sanitized, low-frequency `token_usage_reported`/token-budget event, or a
+migration fixture emits a legacy `tokens` row with public summary text plus
+top-level counts, it may appear as a concise `status` row; raw legacy `tokens`
+payloads without that public summary remain hidden.
 
 ## Grouping boundaries
 
 * Assistant deltas: contiguous `message_delta`, `assistant_delta`,
   `assistant_message_delta`, `response_delta`, or harness `progress` events with
   `activitySource: delta` or assistant chat-channel payloads collapse into one
-  `assistant` message. Harness text deltas concatenate exactly so token
-  fragments do not acquire artificial spaces. A final
-  `message_complete`/`assistant_complete`/`assistant_message_completed`/
-  `response_complete` replaces the accumulated delta with the final public text.
+  `assistant` message. Hermes runtime `message_delta` and harness text deltas
+  concatenate exactly so token fragments do not acquire artificial spaces; when
+  Hermes persists the same gateway `message.delta` through both runtime and
+  harness rows, the mirrored fragment is consumed once. Empty delta fragments do
+  not create placeholder rows, and exact replay of the same run sequence/text is
+  idempotent. A final `message_complete`/`assistant_complete`/
+  `assistant_message_completed`/`response_complete` replaces the accumulated
+  delta with the final public text.
+
 * Tool calls: tool start/progress/complete events with the same `callId`,
   `call_id`, `toolCallId`, `toolId`, or `tool_id` collapse into one `tool_call`
   row. The row keeps the first timestamp, merges previews, and prefers terminal
@@ -88,12 +95,16 @@ appear as a concise `status` row; raw legacy `tokens` payloads remain hidden.
 
 `tests/web-transcript-projection.test.ts` encodes the high-risk grouping rules:
 
-* sanitized Cursor/runtime message mapping;
-* assistant delta replacement by final completion and canonical
-  `assistant_message_delta` grouping;
+* sanitized Cursor/runtime message mapping, including persisted harness
+  `progress` text with `activitySource: stream` or no status/tool activity source;
+* assistant delta replacement by final completion, canonical
+  `assistant_message_delta` grouping, runtime-only missing-completion
+  `message_delta` streams, and real Hermes runtime+harness mirrored delta rows;
 * tool start/complete pairing by `toolId`/`toolCallId`;
 * hidden legacy session/token/rate-limit/run-status metadata;
 * exact grouping of harness text deltas across hidden tool-progress spam;
+* missing-completion streams with duplicate replayed deltas, empty deltas, and
+  failed/cancelled terminal rows;
 * diagnostics, provider/rate limits, canonical token summaries, completion,
   failure, and cancellation status rows;
 * legacy ACP protocol events downgraded to neutral runtime diagnostics;

@@ -19,6 +19,7 @@ import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
 import {
   redactTranscriptText,
   sanitizeAgentEventForPublicOutput,
+  sanitizedDeltaTextValue,
   sanitizedPreviewValue,
 } from "../../src/core/transcript/TranscriptProjection.js";
 import {
@@ -1079,12 +1080,13 @@ function progressRunActivityMetadata(event: Extract<AgentEvent, { type: "progres
     };
   }
   if (event.activitySource === "delta") {
+    const deltaPreview = previewDelta(event.message, 1_000);
     return {
       actor: "assistant",
       channel: "chat",
       kind: "assistant_message_delta",
       text: event.message,
-      payload: { delta: true, messagePreview, redacted: true },
+      payload: { delta: true, messagePreview: deltaPreview, redacted: true },
     };
   }
   if (/\b(thought|reasoning)\b/i.test(event.message)) {
@@ -2581,6 +2583,10 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 
 function preview(value: unknown, maxLength: number): string {
   return sanitizedPreviewValue(value, maxLength).preview ?? "";
+}
+
+function previewDelta(value: unknown, maxLength: number): string {
+  return sanitizedDeltaTextValue(value, maxLength).preview ?? "";
 }
 
 function nonEmptyString(value: unknown): string | null {
