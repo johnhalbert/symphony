@@ -1,68 +1,33 @@
-export type AgentCommandPolicyOutcome = "allow" | "deny";
+import type { RedactedPreview } from "../transcript/TranscriptProjection.js";
+import { isSensitivePreviewKey, sanitizedPreviewValue } from "../transcript/TranscriptProjection.js";
 
-export type AgentCommandPolicyReasonKind =
-  | "local_only_inspection"
-  | "role_not_restricted"
-  | "direct_upstream_github"
-  | "github_cli"
-  | "github_host_reference"
-  | "ambiguous_command"
-  | "malformed_command"
-  | "malformed_hook_payload"
-  | "oversized_hook_payload"
-  | "missing_hook_context"
-  | "classifier_error";
+const DEFAULT_POLICY_PREVIEW_LENGTH = 500;
+const MAX_POLICY_PREVIEW_REDACTION_DEPTH = 8;
+const WINDOWS_EXECUTABLE_SUFFIXES = [".exe", ".cmd", ".bat", ".com", ".ps1"] as const;
 
-export type AgentCommandPolicyCommandSurface = string;
+const GIT_EXECUTABLES = new Set(["git", "git-lfs"]);
+const GITHUB_CLI_EXECUTABLES = new Set(["gh", "github"]);
+const SSH_EXECUTABLES = new Set(["ssh", "scp", "sftp", "plink"]);
+const NETWORK_CLIENT_EXECUTABLES = new Set(["curl", "wget", "http", "https", "httpie"]);
+const SHELL_EXECUTABLES = new Set(["bash", "sh", "zsh", "fish", "dash", "cmd", "powershell", "pwsh"]);
+const INTERPRETER_EXECUTABLES = new Set([
+  "node",
+  "python",
+  "python2",
+  "python3",
+  "perl",
+  "ruby",
+  "php",
+  "deno",
+  "tsx",
+  "ts-node",
+]);
+const PACKAGE_SCRIPT_EXECUTABLES = new Set(["npm", "npx", "pnpm", "yarn", "bun", "bunx"]);
 
-export interface AgentCommandPolicyEnvironmentSnapshot {
-  keysOnly: string[];
-}
-
-export interface AgentCommandPolicyInput {
-  role: string;
-  phase: string;
-  surface: AgentCommandPolicyCommandSurface;
-  workingDirectory: string;
-  rawInput: Record<string, unknown>;
-  environment: AgentCommandPolicyEnvironmentSnapshot;
-  runId?: string | undefined;
-  issueId?: string | undefined;
-}
-
-export interface AgentCommandPolicyAuditPayload {
-  redacted: true;
-  surface: AgentCommandPolicyCommandSurface;
-  role: string;
-  phase: string;
-  commandClass: string;
-  inlineEnvironmentKeys: string[];
-  unsafeConfigCategories: string[];
-  upstreamContactAttempted: boolean;
-  commandPreview?: string;
-  normalizedExecutable?: string;
-  gitSubcommand?: string;
-}
-
-export interface AgentCommandPolicyDecisionBase {
-  outcome: AgentCommandPolicyOutcome;
-  reasonKind: AgentCommandPolicyReasonKind;
-  commandClass: string;
-  message: string;
-  audit: AgentCommandPolicyAuditPayload;
-}
-
-export interface AgentCommandPolicyAllowDecision extends AgentCommandPolicyDecisionBase {
-  outcome: "allow";
-}
-
-export interface AgentCommandPolicyDenyDecision extends AgentCommandPolicyDecisionBase {
-  outcome: "deny";
-}
-
-export type AgentCommandPolicyDecision = AgentCommandPolicyAllowDecision | AgentCommandPolicyDenyDecision;
-
-export type AgentCommandPolicyClassifier = (input: AgentCommandPolicyInput) => AgentCommandPolicyDecision | Promise<AgentCommandPolicyDecision>;
+const ENV_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const SENSITIVE_ASSIGNMENT_PATTERN =
+  /(\b([A-Za-z_][A-Za-z0-9_]*)\b\s*=\s*)("(?:[^"\\]|\\.)*(?:"|$)|'(?:[^'\\]|\\.)*(?:'|$)|[^\s"',}]+)/g;
+const REDACTED_ASSIGNMENT_VALUE = "[redacted]";
 
 const RESTRICTED_ROLES = new Set(["worker", "reviewer", "merge-conflict-repair-worker", "merge_conflict_repair_worker"]);
 const LOCAL_INSPECTION_GIT_SUBCOMMANDS = new Set(["status", "diff", "log", "show", "branch", "blame"]);
@@ -99,6 +64,187 @@ const CREDENTIAL_ASSIGNMENT_UNQUOTED_VALUE_PATTERN = new RegExp(
   "gi",
 );
 
+export type AgentCommandPolicySurface = string;
+export type AgentCommandPolicyCommandSurface = AgentCommandPolicySurface;
+
+export type AgentCommandPolicyOutcome = "allow" | "deny";
+
+export type AgentCommandPolicyReasonKind =
+  | "safe_local_inspection"
+  | "upstream_github"
+  | "unsafe_git_config"
+  | "unsafe_environment"
+  | "unknown_command"
+  | "service_owned_not_applicable"
+  | "local_only_inspection"
+  | "role_not_restricted"
+  | "direct_upstream_github"
+  | "github_cli"
+  | "github_host_reference"
+  | "ambiguous_command"
+  | "malformed_command"
+  | "malformed_hook_payload"
+  | "oversized_hook_payload"
+  | "missing_hook_context"
+  | "classifier_error";
+
+export type AgentCommandPolicyExecutableKind =
+  | "git"
+  | "github_cli"
+  | "ssh"
+  | "network_client"
+  | "shell"
+  | "interpreter"
+  | "package_script"
+  | "unknown"
+  | "other";
+
+export type AgentCommandPolicyCommandClass = string;
+
+export type AgentCommandPolicyUnsafeGitConfigSource =
+  | "inline_env"
+  | "inherited_env"
+  | "inline_git_config"
+  | "persisted_repo_config"
+  | "persisted_user_config"
+  | "unknown";
+
+export type AgentCommandPolicyUnsafeGitConfigCategory =
+  | "alias"
+  | "pager"
+  | "external_diff"
+  | "credential_helper"
+  | "hook"
+  | "filter"
+  | "signing_program"
+  | "filesystem_monitor"
+  | "transport_helper"
+  | "ssh_command"
+  | "other";
+
+export type AgentCommandPolicyUnsafeGitConfigEffect =
+  | "executes_helper"
+  | "uses_credentials"
+  | "contacts_remote"
+  | "ambiguous";
+
+export type AgentCommandPolicyPathStyle = "windows" | "posix" | "unc" | "bare" | "unknown";
+
+export type AgentCommandPolicyStructuredRawInput =
+  | {
+      readonly kind: "command";
+      readonly command: string;
+      readonly params?: unknown;
+    }
+  | {
+      readonly kind: "code";
+      readonly code: string;
+      readonly language?: string | null;
+      readonly params?: unknown;
+    }
+  | {
+      readonly kind: "tool_call";
+      readonly toolName?: string | null;
+      readonly params: unknown;
+      readonly command?: string | null;
+      readonly code?: string | null;
+    };
+
+export type AgentCommandPolicyRawInput = AgentCommandPolicyStructuredRawInput | Record<string, unknown>;
+
+export interface AgentCommandPolicyEnvironmentInput {
+  readonly keysOnly?: readonly string[];
+  readonly inherited?: Readonly<Record<string, string | undefined>>;
+}
+
+export interface AgentCommandPolicyEnvironmentSnapshot {
+  keysOnly: string[];
+}
+
+export interface AgentCommandPolicyInput {
+  attemptId?: string | null | undefined;
+  runId?: string | null | undefined;
+  issueId?: string | null | undefined;
+  role: string;
+  phase: string;
+  surface: AgentCommandPolicySurface;
+  workingDirectory: string;
+  rawInput: AgentCommandPolicyRawInput;
+  environment?: AgentCommandPolicyEnvironmentInput | undefined;
+}
+
+export interface AgentCommandPolicyNormalizedExecutable {
+  readonly raw: string | null;
+  readonly normalizedExecutable: string | null;
+  readonly basename: string | null;
+  readonly executableKind: AgentCommandPolicyExecutableKind;
+  readonly hadPathEvidence: boolean;
+  readonly pathStyle: AgentCommandPolicyPathStyle;
+}
+
+export interface AgentCommandPolicyNormalizedCommand {
+  readonly executable: string | null;
+  readonly executableKind: AgentCommandPolicyExecutableKind;
+  readonly argumentsPreview: string | null;
+  readonly gitSubcommand: string | null;
+  readonly targetHosts: readonly string[];
+  readonly hasNestedCommand: boolean;
+  readonly hasInlineEnvironment: boolean;
+  readonly hasUnsafeGitConfig: boolean;
+}
+
+export interface AgentCommandPolicyUnsafeGitConfigFinding {
+  readonly source: AgentCommandPolicyUnsafeGitConfigSource;
+  readonly key: string;
+  readonly category: AgentCommandPolicyUnsafeGitConfigCategory;
+  readonly effect: AgentCommandPolicyUnsafeGitConfigEffect;
+}
+
+export interface AgentCommandPolicyAuditPayload {
+  readonly redacted: true;
+  readonly surface: AgentCommandPolicySurface;
+  readonly role: string;
+  readonly phase: string;
+  readonly commandClass: AgentCommandPolicyCommandClass;
+  readonly inlineEnvironmentKeys: readonly string[];
+  readonly unsafeConfigCategories: readonly AgentCommandPolicyUnsafeGitConfigCategory[];
+  readonly upstreamContactAttempted: boolean;
+  readonly outcome?: AgentCommandPolicyOutcome | undefined;
+  readonly reasonKind?: AgentCommandPolicyReasonKind | undefined;
+  readonly rawInputPreview?: string | null | undefined;
+  readonly rawInputPreviewTruncated?: boolean | undefined;
+  readonly rawInputPreviewRedacted?: boolean | undefined;
+  readonly normalizedExecutable?: string | null | undefined;
+  readonly executableKind?: AgentCommandPolicyExecutableKind | undefined;
+  readonly inheritedEnvironmentKeys?: readonly string[] | undefined;
+  readonly commandPreview?: string | undefined;
+  readonly gitSubcommand?: string | null | undefined;
+}
+
+export interface AgentCommandPolicyDecisionBase {
+  readonly decisionId?: string | null | undefined;
+  readonly attemptId?: string | null | undefined;
+  readonly outcome: AgentCommandPolicyOutcome;
+  readonly reasonKind: AgentCommandPolicyReasonKind;
+  readonly commandClass: AgentCommandPolicyCommandClass;
+  readonly message: string;
+  readonly requiresCodeChange?: boolean | undefined;
+  readonly requiresUserOrServiceFix?: boolean | undefined;
+  readonly normalizedCommand?: AgentCommandPolicyNormalizedCommand | undefined;
+  readonly audit: AgentCommandPolicyAuditPayload;
+}
+
+export interface AgentCommandPolicyAllowDecision extends AgentCommandPolicyDecisionBase {
+  readonly outcome: "allow";
+}
+
+export interface AgentCommandPolicyDenyDecision extends AgentCommandPolicyDecisionBase {
+  readonly outcome: "deny";
+}
+
+export type AgentCommandPolicyDecision = AgentCommandPolicyAllowDecision | AgentCommandPolicyDenyDecision;
+export type AgentCommandPolicyClassifier = (input: AgentCommandPolicyInput) => AgentCommandPolicyDecision | Promise<AgentCommandPolicyDecision>;
+
 export type AgentCommandPolicyCommandTextKey = (typeof COMMAND_TEXT_KEYS)[number];
 
 export type AgentCommandPolicyCommandTextExtraction =
@@ -109,6 +255,55 @@ export type AgentCommandPolicyCommandTextExtraction =
   | { status: "mismatched"; key: AgentCommandPolicyCommandTextKey; expectedKey: AgentCommandPolicyCommandTextKey };
 
 type AgentCommandPolicyCommandTextFailure = Exclude<AgentCommandPolicyCommandTextExtraction, { status: "ok" }>;
+
+export function evaluateAgentCommandPolicy(input: AgentCommandPolicyInput): AgentCommandPolicyDecision {
+  const rawInputPreview = redactedAgentCommandPolicyPreview(rawInputPreviewValue(input.rawInput));
+  const executableCandidate = extractAgentCommandPolicyExecutableCandidate(input.rawInput);
+  const normalizedExecutable = normalizeAgentCommandPolicyExecutable(executableCandidate);
+  const inlineEnvironmentKeys = extractAgentCommandPolicyInlineEnvironmentKeys(input.rawInput);
+  const inheritedEnvironmentKeys = extractAgentCommandPolicyEnvironmentKeys(input.environment);
+  const normalizedCommand: AgentCommandPolicyNormalizedCommand = {
+    executable: normalizedExecutable.normalizedExecutable,
+    executableKind: normalizedExecutable.executableKind,
+    argumentsPreview: null,
+    gitSubcommand: null,
+    targetHosts: [],
+    hasNestedCommand: false,
+    hasInlineEnvironment: inlineEnvironmentKeys.length > 0,
+    hasUnsafeGitConfig: false,
+  };
+
+  return {
+    attemptId: input.attemptId ?? null,
+    outcome: "deny",
+    reasonKind: "unknown_command",
+    commandClass: "unknown_or_malformed",
+    message:
+      "Blocked worker/reviewer command: this command policy foundation cannot yet prove the command is local-only and helper-free. Use safe local inspection once classified, or rely on Symphony service-owned GitHub workflow actions for publication, review, and writeback.",
+    requiresCodeChange: false,
+    requiresUserOrServiceFix: true,
+    normalizedCommand,
+    audit: {
+      redacted: true,
+      surface: input.surface,
+      role: input.role,
+      phase: input.phase,
+      outcome: "deny",
+      reasonKind: "unknown_command",
+      rawInputPreview: rawInputPreview.preview,
+      rawInputPreviewTruncated: rawInputPreview.truncated,
+      rawInputPreviewRedacted: rawInputPreview.redacted,
+      normalizedExecutable: normalizedExecutable.normalizedExecutable,
+      executableKind: normalizedExecutable.executableKind,
+      gitSubcommand: null,
+      commandClass: "unknown_or_malformed",
+      inheritedEnvironmentKeys,
+      inlineEnvironmentKeys,
+      unsafeConfigCategories: [],
+      upstreamContactAttempted: false,
+    },
+  };
+}
 
 export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentCommandPolicyDecision {
   const commandExtraction = extractAgentCommandPolicyCommandText(input.rawInput, input.surface);
@@ -552,4 +747,299 @@ function stripMatchingQuotes(value: string): string {
     return value.slice(1, -1);
   }
   return value;
+}
+
+export function redactedAgentCommandPolicyPreview(
+  value: unknown,
+  maxLength = DEFAULT_POLICY_PREVIEW_LENGTH,
+): RedactedPreview {
+  const shellRedactedValue = redactSensitiveShellAssignmentsInPreviewValue(value);
+  const preview = sanitizedPreviewValue(shellRedactedValue.value, maxLength);
+  return shellRedactedValue.redacted ? { ...preview, redacted: true } : preview;
+}
+
+export function extractAgentCommandPolicyEnvironmentKeys(input?: AgentCommandPolicyEnvironmentInput): string[] {
+  if (!input) return [];
+  return sortedUniqueKeys([...(input.keysOnly ?? []), ...Object.keys(input.inherited ?? {})]);
+}
+
+export function extractAgentCommandPolicyInlineEnvironmentKeys(rawInput: AgentCommandPolicyRawInput): string[] {
+  const command = commandTextFromRawInput(rawInput);
+  if (!command) return [];
+
+  const keys: string[] = [];
+  for (const word of splitShellWords(command)) {
+    if (!ENV_ASSIGNMENT_PATTERN.test(word)) break;
+    const key = word.slice(0, word.indexOf("=")).trim();
+    if (key.length > 0) keys.push(key);
+  }
+  return sortedUniqueKeys(keys);
+}
+
+export function extractAgentCommandPolicyExecutableCandidate(rawInput: AgentCommandPolicyRawInput): string | null {
+  const command = commandTextFromRawInput(rawInput);
+  if (!command) return null;
+
+  for (const word of splitShellWords(command)) {
+    if (ENV_ASSIGNMENT_PATTERN.test(word)) continue;
+    return word;
+  }
+  return null;
+}
+
+export function normalizeAgentCommandPolicyExecutable(value: unknown): AgentCommandPolicyNormalizedExecutable {
+  if (typeof value !== "string") return unknownExecutable(null);
+
+  const raw = value;
+  const unquoted = stripMatchingOuterQuotes(value.trim());
+  if (!unquoted) return unknownExecutable(raw);
+
+  const pathStyle = detectPathStyle(unquoted);
+  const hadPathEvidence = pathStyle !== "bare" && pathStyle !== "unknown";
+  const basename = executableBasename(unquoted);
+  if (!basename) {
+    return {
+      raw,
+      normalizedExecutable: null,
+      basename: null,
+      executableKind: "unknown",
+      hadPathEvidence,
+      pathStyle,
+    };
+  }
+
+  const normalizedExecutable = stripWindowsExecutableSuffix(basename).toLowerCase();
+  return {
+    raw,
+    normalizedExecutable,
+    basename,
+    executableKind: classifyExecutableKind(normalizedExecutable),
+    hadPathEvidence,
+    pathStyle,
+  };
+}
+
+function rawInputPreviewValue(rawInput: AgentCommandPolicyRawInput): unknown {
+  if (!isStructuredAgentCommandPolicyRawInput(rawInput)) return rawInput;
+  switch (rawInput.kind) {
+    case "command":
+      return rawInput.command;
+    case "code":
+      return rawInput.code;
+    case "tool_call":
+      return {
+        toolName: rawInput.toolName,
+        command: rawInput.command ?? null,
+        code: rawInput.code ?? null,
+        params: rawInput.params,
+      };
+  }
+}
+
+function redactSensitiveShellAssignmentsInPreviewValue(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+): { value: unknown; redacted: boolean } {
+  if (typeof value === "string") {
+    return redactSensitiveShellAssignmentsInText(value);
+  }
+  if (value === null || typeof value !== "object") {
+    return { value, redacted: false };
+  }
+  if (depth >= MAX_POLICY_PREVIEW_REDACTION_DEPTH || seen.has(value)) {
+    return { value, redacted: false };
+  }
+
+  seen.add(value);
+  if (Array.isArray(value)) {
+    let redacted = false;
+    const items = value.map((item) => {
+      const result = redactSensitiveShellAssignmentsInPreviewValue(item, depth + 1, seen);
+      redacted ||= result.redacted;
+      return result.value;
+    });
+    return redacted ? { value: items, redacted } : { value, redacted: false };
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return { value, redacted: false };
+
+  let redacted = false;
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of entries) {
+    const result = redactSensitiveShellAssignmentsInPreviewValue(item, depth + 1, seen);
+    redacted ||= result.redacted;
+    output[key] = result.value;
+  }
+  return redacted ? { value: output, redacted } : { value, redacted: false };
+}
+
+function redactSensitiveShellAssignmentsInText(value: string): { value: string; redacted: boolean } {
+  const text = value.replace(
+    SENSITIVE_ASSIGNMENT_PATTERN,
+    (match: string, prefix: string, key: string, assignmentValue: string) =>
+      redactSensitiveAssignment(match, prefix, key, assignmentValue),
+  );
+  return { value: text, redacted: text !== value };
+}
+
+function redactSensitiveAssignment(match: string, prefix: string, key: string, assignmentValue: string): string {
+  if (!isSensitivePreviewKey(key)) return match;
+  const quote = assignmentValue[0] === '"' || assignmentValue[0] === "'" ? assignmentValue[0] : "";
+  if (!quote) return `${prefix}${REDACTED_ASSIGNMENT_VALUE}`;
+  return `${prefix}${quote}${REDACTED_ASSIGNMENT_VALUE}${assignmentValue.endsWith(quote) ? quote : ""}`;
+}
+
+function commandTextFromRawInput(rawInput: AgentCommandPolicyRawInput): string | null {
+  if (isStructuredAgentCommandPolicyRawInput(rawInput)) {
+    switch (rawInput.kind) {
+      case "command":
+        return rawInput.command;
+      case "code":
+        return null;
+      case "tool_call": {
+        const record = commandTextRecordFromRawInput(rawInput);
+        const extraction = extractAgentCommandPolicyCommandText(record, String(rawInput.toolName ?? ""));
+        return extraction.status === "ok" ? extraction.command : null;
+      }
+    }
+  }
+
+  const extraction = extractAgentCommandPolicyCommandText(rawInput, "");
+  return extraction.status === "ok" ? extraction.command : null;
+}
+
+function commandTextRecordFromRawInput(rawInput: AgentCommandPolicyRawInput): Record<string, unknown> {
+  if (!isStructuredAgentCommandPolicyRawInput(rawInput)) return isRecord(rawInput) ? rawInput : {};
+
+  switch (rawInput.kind) {
+    case "command":
+      return { command: rawInput.command };
+    case "code":
+      return { code: rawInput.code };
+    case "tool_call": {
+      const record: Record<string, unknown> = {};
+      if (rawInput.command !== undefined && rawInput.command !== null) record.command = rawInput.command;
+      if (rawInput.code !== undefined && rawInput.code !== null) record.code = rawInput.code;
+      if (isRecord(rawInput.params)) {
+        for (const key of COMMAND_TEXT_KEYS) {
+          if (!Object.prototype.hasOwnProperty.call(record, key) && Object.prototype.hasOwnProperty.call(rawInput.params, key)) {
+            record[key] = rawInput.params[key];
+          }
+        }
+      }
+      return record;
+    }
+  }
+}
+
+function isStructuredAgentCommandPolicyRawInput(value: unknown): value is AgentCommandPolicyStructuredRawInput {
+  if (!isRecord(value)) return false;
+  if (value.kind === "command") return typeof value.command === "string";
+  if (value.kind === "code") return typeof value.code === "string";
+  if (value.kind === "tool_call") return Object.prototype.hasOwnProperty.call(value, "params");
+  return false;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function splitShellWords(command: string): string[] {
+  const words: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+
+  for (const char of command.trim()) {
+    if ((char === '"' || char === "'") && quote === null) {
+      quote = char;
+      continue;
+    }
+    if (char === quote) {
+      quote = null;
+      continue;
+    }
+    if (/\s/.test(char) && quote === null) {
+      if (current.length > 0) {
+        words.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (current.length > 0) words.push(current);
+  return words;
+}
+
+function stripMatchingOuterQuotes(value: string): string {
+  let normalized = value;
+  while (normalized.length >= 2) {
+    const first = normalized[0];
+    const last = normalized[normalized.length - 1];
+    if ((first !== '"' && first !== "'") || first !== last) break;
+    normalized = normalized.slice(1, -1).trim();
+  }
+  return normalized;
+}
+
+function executableBasename(value: string): string | null {
+  const withoutTrailingSeparators = value.replace(/[\\/]+$/g, "");
+  if (!withoutTrailingSeparators) return null;
+  const segments = withoutTrailingSeparators.split(/[\\/]+/).filter((segment) => segment.length > 0);
+  return segments.at(-1) ?? null;
+}
+
+function detectPathStyle(value: string): AgentCommandPolicyPathStyle {
+  if (!value) return "unknown";
+  if (/^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+/.test(value)) return "unc";
+  if (/^[A-Za-z]:(?:[\\/]|$)/.test(value) || value.includes("\\")) return "windows";
+  if (value.startsWith("/") || value.includes("/")) return "posix";
+  return "bare";
+}
+
+function stripWindowsExecutableSuffix(value: string): string {
+  const lower = value.toLowerCase();
+  const suffix = WINDOWS_EXECUTABLE_SUFFIXES.find((candidate) => lower.endsWith(candidate));
+  return suffix ? value.slice(0, -suffix.length) : value;
+}
+
+function classifyExecutableKind(value: string): AgentCommandPolicyExecutableKind {
+  if (!value) return "unknown";
+  if (GIT_EXECUTABLES.has(value)) return "git";
+  if (GITHUB_CLI_EXECUTABLES.has(value)) return "github_cli";
+  if (SSH_EXECUTABLES.has(value)) return "ssh";
+  if (NETWORK_CLIENT_EXECUTABLES.has(value)) return "network_client";
+  if (SHELL_EXECUTABLES.has(value)) return "shell";
+  if (INTERPRETER_EXECUTABLES.has(value)) return "interpreter";
+  if (PACKAGE_SCRIPT_EXECUTABLES.has(value)) return "package_script";
+  return "other";
+}
+
+function sortedUniqueKeys(keys: Iterable<unknown>): string[] {
+  const byNormalizedKey = new Map<string, string>();
+  for (const key of keys) {
+    if (typeof key !== "string") continue;
+    const trimmed = key.trim();
+    if (!trimmed) continue;
+    const normalized = trimmed.toUpperCase();
+    if (!byNormalizedKey.has(normalized)) byNormalizedKey.set(normalized, trimmed);
+  }
+  return [...byNormalizedKey.values()].sort((left, right) => {
+    const normalizedCompare = left.toUpperCase().localeCompare(right.toUpperCase());
+    return normalizedCompare === 0 ? left.localeCompare(right) : normalizedCompare;
+  });
+}
+
+function unknownExecutable(raw: string | null): AgentCommandPolicyNormalizedExecutable {
+  return {
+    raw,
+    normalizedExecutable: null,
+    basename: null,
+    executableKind: "unknown",
+    hadPathEvidence: false,
+    pathStyle: "unknown",
+  };
 }
