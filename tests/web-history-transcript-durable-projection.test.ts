@@ -6,6 +6,7 @@ import {
   type RunActivityAppendInput,
 } from "../src/core/persistence/RunActivityAppendStore.js";
 import type { OrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
+import type { IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { RunRecord, RunTranscriptStore, TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
 import { mapRunActivityEventToTranscriptEvent } from "../src/core/transcript/RunActivityEventMapper.js";
 import type { Issue, TrackerStateLists } from "../src/core/types.js";
@@ -338,6 +339,83 @@ describe("web history/transcript durable projection writes", () => {
     }
   });
 
+  it("rebuilds dashboard and sidebar rows with durable running runs and lifecycle-only issues omitted by the tracker board", async () => {
+    const projectionWriter = statefulProjectionWriter();
+    const runningRun = runFixture({
+      runId: "run-active-only",
+      sessionId: "session-active-only",
+      issueId: "issue-run-only",
+      issueIdentifier: "TEST-RUN-ONLY",
+      workspaceKey: "TEST-RUN-ONLY",
+      status: "running",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:19:00.000Z",
+      completedAt: null,
+      tokens: { inputTokens: 10, outputTokens: 15, totalTokens: 25 },
+    });
+    const lifecycleRecords = [
+      lifecycleFixture({ issueId: "issue-run-only", issueIdentifier: "TEST-RUN-ONLY", phase: "implementation" }),
+      lifecycleFixture({ issueId: "issue-review-only", issueIdentifier: "TEST-REVIEW-ONLY", phase: "review" }),
+    ];
+    const server = createStatusServer({
+      runStore: runStoreFixture({ runs: [runningRun] }),
+      lifecycleStore: lifecycleStoreFixture(lifecycleRecords),
+      tracker: trackerFixture([]),
+      projectionWriter,
+      webProjectionContextClock: () => new Date("2026-01-01T00:20:00.000Z"),
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = baseUrlFor(address);
+      const routeResponses = [
+        await getJson(`${baseUrl}/api/v1/web/dashboard?refresh=1`),
+        await getJson(`${baseUrl}/api/v1/web/sidebar?refresh=1`),
+      ];
+      expect(routeResponses.map(({ response }) => response.status)).toEqual([200, 200]);
+
+      const routeRows = projectionRowsByKey(projectionWriter.currentRows());
+      const routeDashboard = routeRows.get("dashboard_projection::global::global")!;
+      const routeSidebar = routeRows.get("sidebar_projection::global::global")!;
+      expect(routeDashboard).toBeDefined();
+      expect(routeSidebar).toBeDefined();
+
+      const routeDashboardPayload = routeDashboard.payload as {
+        runningAgents: Array<{ id: string; issue: string; state: string; tokens: string }>;
+        totals: Record<string, number>;
+      };
+      const routeSidebarPayload = routeSidebar.payload as {
+        runningAgents: Array<{ id: string; issue: string; state: string; tokens: string }>;
+        totals: Record<string, number>;
+      };
+      expect(routeDashboardPayload.runningAgents).toMatchObject([
+        { id: "run-active-only", issue: "TEST-RUN-ONLY", state: "running", tokens: "25" },
+      ]);
+      expect(routeDashboardPayload.totals).toMatchObject({ progress: 1, review: 1, open: 2, all: 2 });
+      expect(routeDashboard.sourceCursors).toMatchObject({ issueCount: 2, openIssueCount: 2, runningAgentCount: 1 });
+      expect(routeSidebarPayload.runningAgents).toMatchObject(routeDashboardPayload.runningAgents);
+      expect(routeSidebarPayload.totals).toMatchObject(routeDashboardPayload.totals);
+      expect(routeSidebar.sourceCursors).toMatchObject({ runningAgentCount: 1 });
+
+      projectionWriter.clearRows();
+      const result = await server.rebuildDurableWebProjections({
+        forceRefresh: true,
+        projections: ["dashboard_projection", "sidebar_projection"],
+      });
+
+      expect(result).toMatchObject({ attempted: 2, written: 2, unchanged: 0, skipped: 0, failed: 0 });
+      const rebuiltRows = projectionRowsByKey(projectionWriter.currentRows());
+      const rebuiltDashboard = rebuiltRows.get("dashboard_projection::global::global")!;
+      const rebuiltSidebar = rebuiltRows.get("sidebar_projection::global::global")!;
+      expect(rebuiltDashboard.payload).toEqual(routeDashboard.payload);
+      expect(rebuiltDashboard.sourceCursors).toEqual(routeDashboard.sourceCursors);
+      expect(rebuiltSidebar.payload).toEqual(routeSidebar.payload);
+      expect(rebuiltSidebar.sourceCursors).toEqual(routeSidebar.sourceCursors);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("does not block status responses when optional projection persistence fails or no transcript run exists", async () => {
     const projectionWriter = recordingProjectionWriter({ fail: true });
     const server = createStatusServer({
@@ -440,7 +518,11 @@ function projectionRowKey(input: ProjectionPayloadWriteInput): string {
 }
 
 function cloneProjectionWriteInput(input: ProjectionPayloadWriteInput): ProjectionPayloadWriteInput {
-  return JSON.parse(JSON.stringify(input)) as ProjectionPayloadWriteInput;
+  return cloneJson(input);
+}
+
+function cloneJson<T>(input: T): T {
+  return JSON.parse(JSON.stringify(input)) as T;
 }
 
 function runStoreFixture(options: {
@@ -482,6 +564,25 @@ function runStoreFixture(options: {
       return transcriptEventsByRunId.get(runId)?.length ?? 0;
     },
   } as unknown as RunTranscriptStore;
+}
+
+function lifecycleStoreFixture(
+  lifecycleRecords: readonly IssueLifecycleRecord[],
+): NonNullable<ConstructorParameters<typeof StatusServer>[0]["lifecycleStore"]> {
+  const records = lifecycleRecords.map(cloneJson);
+  return {
+    projectionRevision: () => 13,
+    onProjectionChanged: () => () => undefined,
+    async list() {
+      return records.map(cloneJson);
+    },
+    async get(issueIdOrIdentifier: string) {
+      const record = records.find(
+        (candidate) => candidate.issueId === issueIdOrIdentifier || candidate.issueIdentifier === issueIdOrIdentifier,
+      );
+      return record ? cloneJson(record) : null;
+    },
+  } as unknown as NonNullable<ConstructorParameters<typeof StatusServer>[0]["lifecycleStore"]>;
 }
 
 function runFixture(overrides: Partial<RunRecord> = {}): RunRecord {
@@ -536,6 +637,39 @@ function issueFixture(overrides: Partial<Issue> = {}): Issue {
     updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   };
+}
+
+function lifecycleFixture(overrides: Partial<IssueLifecycleRecord> = {}): IssueLifecycleRecord {
+  const issueId = overrides.issueId ?? "issue-1";
+  const issueIdentifier = overrides.issueIdentifier ?? "TEST-1";
+  const updatedAt = overrides.updatedAt ?? "2026-01-01T00:10:00.000Z";
+  const summaryPointers = {
+    workspaceKey: null,
+    workspacePath: null,
+    branchName: null,
+    gitBranchName: null,
+    repoPath: null,
+    baseRef: null,
+    lastRunId: null,
+    prUrl: null,
+    prNumber: null,
+    prHeadSha: null,
+    prBranch: null,
+    ciStatus: null,
+    lastPushedAt: null,
+    lastEvidenceCursor: null,
+    ...(overrides.summaryPointers ?? {}),
+  };
+  return {
+    issueId,
+    issueIdentifier,
+    phase: "implementation",
+    blockedReason: null,
+    updatedAt,
+    createdAt: overrides.createdAt ?? updatedAt,
+    ...overrides,
+    summaryPointers,
+  } as IssueLifecycleRecord;
 }
 
 function trackerFixture(issues: readonly Issue[]): NonNullable<ConstructorParameters<typeof StatusServer>[0]["tracker"]> {
