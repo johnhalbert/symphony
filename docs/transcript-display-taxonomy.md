@@ -33,10 +33,12 @@ payloads without that public summary remain hidden.
 * Assistant deltas: contiguous `message_delta`, `assistant_delta`,
   `assistant_message_delta`, `response_delta`, or harness `progress` events with
   `activitySource: delta` or assistant chat-channel payloads collapse into one
-  `assistant` message. Harness text deltas concatenate exactly so token
-  fragments do not acquire artificial spaces. Empty delta fragments do not create
-  placeholder rows, and exact replay of the same run sequence/text is idempotent.
-  A final `message_complete`/`assistant_complete`/
+  `assistant` message. Hermes runtime `message_delta` and harness text deltas
+  concatenate exactly so token fragments do not acquire artificial spaces; when
+  Hermes persists the same gateway `message.delta` through both runtime and
+  harness rows, the mirrored fragment is consumed once. Empty delta fragments do
+  not create placeholder rows, and exact replay of the same run sequence/text is
+  idempotent. A final `message_complete`/`assistant_complete`/
   `assistant_message_completed`/`response_complete` replaces the accumulated
   delta with the final public text.
 
@@ -95,12 +97,14 @@ payloads without that public summary remain hidden.
 
 * sanitized Cursor/runtime message mapping, including persisted harness
   `progress` text with `activitySource: stream` or no status/tool activity source;
-* assistant delta replacement by final completion and canonical
-  `assistant_message_delta` grouping;
+* assistant delta replacement by final completion, canonical
+  `assistant_message_delta` grouping, runtime-only missing-completion
+  `message_delta` streams, and real Hermes runtime+harness mirrored delta rows;
 * tool start/complete pairing by `toolId`/`toolCallId`;
 * hidden legacy session/token/rate-limit/run-status metadata;
 * exact grouping of harness text deltas across hidden tool-progress spam;
-* missing-completion streams with duplicate replayed deltas and empty deltas;
+* missing-completion streams with duplicate replayed deltas, empty deltas, and
+  failed/cancelled terminal rows;
 * diagnostics, provider/rate limits, canonical token summaries, completion,
   failure, and cancellation status rows;
 * legacy ACP protocol events downgraded to neutral runtime diagnostics;

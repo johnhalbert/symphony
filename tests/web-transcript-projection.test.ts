@@ -641,6 +641,110 @@ describe("projectWebTranscript", () => {
     expect(messages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello" }]);
   });
 
+  it("exact-concatenates Hermes runtime message_delta streams without completion", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "H", redacted: true },
+      }),
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "ello", redacted: true },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 2,
+      }),
+    ]);
+
+    expect(messages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello" }]);
+  });
+
+  it("coalesces real Hermes runtime and harness mirrored deltas before failed or cancelled terminal rows", () => {
+    const mirroredDeltas: TranscriptEvent[] = [
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "Hel", redacted: true },
+        sequence: 20,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hel",
+        payload: {
+          kind: "assistant_delta",
+          activitySource: "delta",
+          progressKind: "assistant_delta",
+          messagePreview: "Hel",
+          truncated: false,
+          redacted: false,
+        },
+        at: "2026-01-01T00:00:00.100Z",
+        sequence: 21,
+      }),
+      event({
+        eventType: "message_delta",
+        source: "runtime",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "lo", redacted: true },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 22,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "lo",
+        payload: {
+          kind: "assistant_delta",
+          activitySource: "delta",
+          progressKind: "assistant_delta",
+          messagePreview: "lo",
+          truncated: false,
+          redacted: false,
+        },
+        at: "2026-01-01T00:00:01.100Z",
+        sequence: 23,
+      }),
+    ];
+    const terminalCases = [
+      {
+        eventType: "failed",
+        message: "Run failed before message.complete",
+        payload: { kind: "terminal", status: "failed", errorPreview: "Run failed before message.complete" },
+        expected: { kind: "status", state: "failed", ts: "2026-01-01T00:00:02.000Z", text: "Run failed before message.complete" },
+      },
+      {
+        eventType: "cancelled",
+        message: "Run cancelled",
+        payload: { kind: "terminal", status: "cancelled" },
+        expected: { kind: "status", state: "cancelled", ts: "2026-01-01T00:00:02.000Z", text: "Run cancelled" },
+      },
+    ];
+
+    for (const terminalCase of terminalCases) {
+      const messages = projectWebTranscript([
+        ...mirroredDeltas,
+        event({
+          eventType: terminalCase.eventType,
+          source: "harness",
+          message: terminalCase.message,
+          payload: terminalCase.payload,
+          at: "2026-01-01T00:00:02.000Z",
+          sequence: 24,
+        }),
+      ]);
+
+      expect(messages).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello" },
+        terminalCase.expected,
+      ]);
+    }
+  });
+
   it("keeps unresolved request actions exact empty arrays and maps unknown payloads without leaking runtime fields", () => {
     const messages = projectWebTranscript([
       event({

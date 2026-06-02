@@ -51,7 +51,14 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
   const messages: TranscriptMessage[] = [];
   const toolMessageIndexByCallId = new Map<string, number>();
   const seenAssistantDeltaReplayKeys = new Set<string>();
+  const assistantDeltaMirrorCounts = createAssistantDeltaMirrorCounts();
   let pendingAssistantDeltaIndex: number | null = null;
+
+  const resetAssistantDeltaGroup = () => {
+    pendingAssistantDeltaIndex = null;
+    assistantDeltaMirrorCounts.runtime.clear();
+    assistantDeltaMirrorCounts.harness.clear();
+  };
 
   for (const event of events) {
     const projected = projectWebTranscriptEvent(event);
@@ -65,7 +72,7 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
         toolMessageIndexByCallId.set(projected.call_id, messages.length);
         messages.push(projected);
       }
-      pendingAssistantDeltaIndex = null;
+      resetAssistantDeltaGroup();
       continue;
     }
 
@@ -73,12 +80,14 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
       const replayKey = assistantDeltaReplayKey(event, projected.text);
       if (seenAssistantDeltaReplayKeys.has(replayKey)) continue;
       seenAssistantDeltaReplayKeys.add(replayKey);
+      const mirrorSource = assistantDeltaMirrorSource(event);
+      if (mirrorSource && consumeAssistantDeltaMirror(mirrorSource, projected.text, assistantDeltaMirrorCounts)) continue;
       if (pendingAssistantDeltaIndex !== null) {
         const existing = messages[pendingAssistantDeltaIndex];
         if (existing?.kind === "assistant") {
           messages[pendingAssistantDeltaIndex] = {
             ...existing,
-            text: combineAssistantDeltaText(existing.text, projected.text, shouldConcatenateAssistantDeltaExactly(event)),
+            text: combineAssistantDeltaText(existing.text, projected.text, assistantDeltaJoinMode(event)),
           };
           continue;
         }
@@ -92,13 +101,13 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
       const existing = messages[pendingAssistantDeltaIndex];
       if (existing?.kind === "assistant") {
         messages[pendingAssistantDeltaIndex] = projected;
-        pendingAssistantDeltaIndex = null;
+        resetAssistantDeltaGroup();
         continue;
       }
     }
 
     messages.push(projected);
-    pendingAssistantDeltaIndex = null;
+    resetAssistantDeltaGroup();
   }
 
   return messages;
@@ -460,6 +469,30 @@ function assistantDeltaText(event: TranscriptEvent, payload: Record<string, unkn
   return firstCleanString(payload.textPreview, payload.deltaPreview, payload.delta, payload.messagePreview, payload.text, payload.message, event.message) ?? "";
 }
 
+type AssistantDeltaMirrorSource = "runtime" | "harness";
+
+type AssistantDeltaMirrorCounts = Record<AssistantDeltaMirrorSource, Map<string, number>>;
+
+function createAssistantDeltaMirrorCounts(): AssistantDeltaMirrorCounts {
+  return { runtime: new Map<string, number>(), harness: new Map<string, number>() };
+}
+
+function assistantDeltaMirrorSource(event: TranscriptEvent): AssistantDeltaMirrorSource | null {
+  const eventType = normalizeToken(event.eventType);
+  const payload = sanitizedPayloadRecord(event);
+  if (event.source === "runtime" && eventType === "message_delta") return "runtime";
+  if (event.source === "harness" && eventType === "progress" && normalizedActivitySource(payload) === "delta") return "harness";
+  return null;
+}
+
+function consumeAssistantDeltaMirror(source: AssistantDeltaMirrorSource, text: string, counts: AssistantDeltaMirrorCounts): boolean {
+  const opposite = source === "runtime" ? "harness" : "runtime";
+  const sourceCount = counts[source].get(text) ?? 0;
+  const oppositeCount = counts[opposite].get(text) ?? 0;
+  counts[source].set(text, sourceCount + 1);
+  return oppositeCount > sourceCount;
+}
+
 function assistantDeltaReplayKey(event: TranscriptEvent, text: string): string {
   return `${event.runId}:${event.sequence}:${normalizeToken(event.eventType)}:${text}`;
 }
@@ -475,16 +508,33 @@ function isAssistantCompleteEvent(event: TranscriptEvent): boolean {
   );
 }
 
-function shouldConcatenateAssistantDeltaExactly(event: TranscriptEvent): boolean {
-  return normalizeToken(event.eventType) === "progress" && normalizedActivitySource(sanitizedPayloadRecord(event)) === "delta";
+type AssistantDeltaJoinMode = "spaced" | "exact" | "token";
+
+function assistantDeltaJoinMode(event: TranscriptEvent): AssistantDeltaJoinMode {
+  const eventType = normalizeToken(event.eventType);
+  const payload = sanitizedPayloadRecord(event);
+  if (eventType === "progress" && normalizedActivitySource(payload) === "delta") return "exact";
+  if (eventType === "message_delta" && isHermesRuntimeMessageDelta(event, payload)) return "exact";
+  if (eventType === "message_delta") return "token";
+  return "spaced";
 }
 
-function combineAssistantDeltaText(existing: string, next: string, exact = false): string {
+function isHermesRuntimeMessageDelta(event: TranscriptEvent, payload: Record<string, unknown>): boolean {
+  return event.source === "runtime" && (typeof payload.harnessId === "string" || (typeof event.message === "string" && normalizeToken(event.message) === "hermes_message_delta"));
+}
+
+function combineAssistantDeltaText(existing: string, next: string, mode: AssistantDeltaJoinMode = "spaced"): string {
   if (existing.length === 0) return next;
   if (next.length === 0) return existing;
-  if (exact) return existing + next;
+  if (mode === "exact" || (mode === "token" && shouldJoinTokenFragmentWithoutSpace(existing, next))) return existing + next;
   if (/\s$/.test(existing) || /^\s/.test(next)) return existing + next;
   return `${existing} ${next}`;
+}
+
+function shouldJoinTokenFragmentWithoutSpace(existing: string, next: string): boolean {
+  if (/^[,.;:!?)}\]"']/.test(next)) return true;
+  if (/[({\["']$/.test(existing)) return true;
+  return /^[\p{L}\p{N}]+$/u.test(existing) && /^[\p{L}\p{N}]+$/u.test(next) && existing.length >= 2 && existing.length <= 4 && next.length <= 3;
 }
 
 function isAssistantDeltaLikePayload(payloadKind: string | null, payload: Record<string, unknown>): boolean {

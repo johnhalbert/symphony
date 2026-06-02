@@ -439,6 +439,81 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("serves real Hermes runtime and harness mirrored deltas as one readable assistant message without completion", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "hermes-dual-run", sessionId: "hermes-dual-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: "Hel", redacted: true },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:01.100Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Hel",
+      payload: {
+        kind: "assistant_delta",
+        activitySource: "delta",
+        progressKind: "assistant_delta",
+        messagePreview: "Hel",
+        truncated: false,
+        redacted: false,
+      },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "runtime",
+      eventType: "message_delta",
+      message: "Hermes message delta",
+      payload: { harnessId: "hermes", textPreview: "lo", redacted: true },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:02.100Z",
+      source: "harness",
+      eventType: "progress",
+      message: "lo",
+      payload: {
+        kind: "assistant_delta",
+        activitySource: "delta",
+        progressKind: "assistant_delta",
+        messagePreview: "lo",
+        truncated: false,
+        redacted: false,
+      },
+    });
+    await runStore.appendEvent({
+      runId: "hermes-dual-run",
+      at: "2026-01-01T00:00:03.000Z",
+      source: "harness",
+      eventType: "failed",
+      message: "Run failed before message.complete",
+      payload: { kind: "terminal", status: "failed", errorPreview: "Run failed before message.complete" },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-dual-run/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "hermes-dual-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
+        { kind: "status", state: "failed", ts: "2026-01-01T00:00:03.000Z", text: "Run failed before message.complete" },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves persisted harness stream progress text as assistant messages", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
