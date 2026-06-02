@@ -1415,6 +1415,16 @@ function tokenizeCommandPreview(command: string): string[] {
       continue;
     }
 
+    if (char === "\n" || char === "\r") {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = "";
+      }
+      tokens.push(";");
+      if (char === "\r" && command[index + 1] === "\n") index += 1;
+      continue;
+    }
+
     if (/\s/u.test(char)) {
       if (current.length > 0) {
         tokens.push(current);

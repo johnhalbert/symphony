@@ -24,6 +24,11 @@ interface AmbiguousWrapperDenyCase {
   readonly executableKind: string;
 }
 
+interface AmbiguousCompoundDenyCase {
+  readonly name: string;
+  readonly command: string;
+}
+
 describe("AgentCommandPolicy disguised upstream GitHub command denial", () => {
   it.each<DisguisedUpstreamDenyCase>([
     {
@@ -206,6 +211,62 @@ describe("AgentCommandPolicy disguised upstream GitHub command denial", () => {
         redacted: true,
         normalizedExecutable: executable,
         executableKind,
+        upstreamContactAttempted: false,
+      },
+    });
+    expect(decision.message).toContain("service-owned GitHub workflow");
+  });
+
+  it.each<AmbiguousCompoundDenyCase>([
+    {
+      name: "LF before opaque npm package script",
+      command: "git status --short\nnpm run publish-pr",
+    },
+    {
+      name: "CRLF before opaque npm package script",
+      command: "git status --short\r\nnpm run publish-pr",
+    },
+    {
+      name: "LF before opaque yarn package script",
+      command: "git status --short\nyarn publish-pr",
+    },
+    {
+      name: "LF before script-wrapper path",
+      command: "git status --short\n./scripts/publish-pr.sh",
+    },
+    {
+      name: "CRLF before script-wrapper path",
+      command: "git status --short\r\n./scripts/publish-pr.sh",
+    },
+    {
+      name: "LF before shell-wrapper command",
+      command: "git status --short\nbash -lc ./scripts/publish-pr.sh",
+    },
+    {
+      name: "CRLF before shell-wrapper command",
+      command: "git status --short\r\nbash -lc ./scripts/publish-pr.sh",
+    },
+    {
+      name: "LF before interpreter-wrapper command",
+      command: "git status --short\npython ./scripts/publish-pr.py",
+    },
+    {
+      name: "CRLF before interpreter-wrapper command",
+      command: "git status --short\r\npython ./scripts/publish-pr.py",
+    },
+  ])("fails closed for newline-separated wrapper content: $name", ({ command }) => {
+    const decision = evaluateAgentCommandPolicy(terminalInput(command));
+
+    expect(decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "ambiguous_command",
+      commandClass: "ambiguous_compound_command",
+      audit: {
+        redacted: true,
+        normalizedExecutable: "git",
+        executableKind: "git",
+        gitSubcommand: "status",
+        hasNestedCommand: true,
         upstreamContactAttempted: false,
       },
     });
