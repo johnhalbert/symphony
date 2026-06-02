@@ -43,13 +43,13 @@ export function redactTranscriptText(value: string): { text: string; redacted: b
   text = text.replace(/\bBearer\s+[^\s"',}]+/gi, `Bearer ${REDACTED}`);
   text = text.replace(TOKEN_PREFIX_PATTERN, REDACTED);
   text = text.replace(
-    /(\b([A-Za-z][A-Za-z0-9_-]*)\b\s*=\s*)([^\s"',}]+)/g,
-    (match: string, prefix: string, label: string) => (isSensitiveKey(label) ? `${prefix}${REDACTED}` : match),
+    /(\b([A-Za-z][A-Za-z0-9_-]*)\b\s*=\s*)("(?:[^"\\]|\\.)*(?:"|$)|'(?:[^'\\]|\\.)*(?:'|$)|[^\s"',}]+)/g,
+    (match: string, prefix: string, label: string, value: string) => redactKeyValueAssignment(match, prefix, label, value),
   );
   text = text.replace(
     /((?:"([A-Za-z][A-Za-z0-9_-]*)"|([A-Za-z][A-Za-z0-9_-]*))\s*:\s*)("[^"]*"|'[^']*'|[^\s"',}]+)/g,
     (match: string, prefix: string, quotedLabel: string | undefined, bareLabel: string | undefined) =>
-      isSensitiveKey(quotedLabel ?? bareLabel ?? "") ? `${prefix}"${REDACTED}"` : match,
+      isSensitivePreviewKey(quotedLabel ?? bareLabel ?? "") ? `${prefix}"${REDACTED}"` : match,
   );
   return { text, redacted: text !== value };
 }
@@ -64,7 +64,7 @@ export function sanitizePublicJson(value: unknown, maxStringLength = DEFAULT_PRE
 
   const output: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
-    output[key] = isSensitiveKey(key) ? REDACTED : sanitizePublicJson(item, maxStringLength, depth + 1);
+    output[key] = isSensitivePreviewKey(key) ? REDACTED : sanitizePublicJson(item, maxStringLength, depth + 1);
   }
   return output;
 }
@@ -80,9 +80,11 @@ export function sanitizeAgentEventForPublicOutput(event: AgentEvent): AgentEvent
         ...(event.payload === undefined ? {} : { payload: sanitizePublicJson(event.payload) }),
       });
     case "completed":
-      return withSanitizedAgentEventExtras(
-        event.message === undefined ? event : { ...event, message: sanitizedPreviewValue(event.message).preview ?? "" },
-      );
+      return withSanitizedAgentEventExtras({
+        ...event,
+        ...(event.message === undefined ? {} : { message: sanitizedPreviewValue(event.message).preview ?? "" }),
+        ...(event.payload === undefined ? {} : { payload: sanitizePublicJson(event.payload) }),
+      });
     case "failed":
       return withSanitizedAgentEventExtras({ ...event, error: sanitizedPreviewValue(event.error).preview ?? "" });
     case "rate_limits":
@@ -116,11 +118,18 @@ function safeJsonPreview(value: unknown): string {
   }
 }
 
+function redactKeyValueAssignment(match: string, prefix: string, label: string, value: string): string {
+  if (!isSensitivePreviewKey(label)) return match;
+  const quote = value[0] === '"' || value[0] === "'" ? value[0] : "";
+  if (!quote) return `${prefix}${REDACTED}`;
+  return `${prefix}${quote}${REDACTED}${value.endsWith(quote) ? quote : ""}`;
+}
+
 function normalizeSensitiveLabel(value: string): string {
   return value.replace(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
-function isSensitiveKey(key: string): boolean {
+export function isSensitivePreviewKey(key: string): boolean {
   const normalized = normalizeSensitiveLabel(key);
   if (SAFE_NORMALIZED_KEYS.has(normalized)) return false;
   if (SENSITIVE_NORMALIZED_KEYS.has(normalized)) return true;
@@ -128,6 +137,8 @@ function isSensitiveKey(key: string): boolean {
     (normalized.endsWith("token") && !normalized.endsWith("tokens")) ||
     normalized.endsWith("secret") ||
     normalized.endsWith("privatekey") ||
-    normalized.endsWith("apikey")
+    normalized.endsWith("apikey") ||
+    normalized.endsWith("accesskey") ||
+    normalized.endsWith("accesskeyid")
   );
 }

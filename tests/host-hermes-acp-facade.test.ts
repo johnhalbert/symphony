@@ -459,9 +459,10 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     const second = createSpawnedFacade();
     const pending = second.facade.request("session/prompt", { sessionId: "s2" }, { timeoutMs: 1_000 });
     second.facade.kill("test cleanup");
-    second.facade.kill("duplicate cleanup");
+    second.facade.kill("test cleanup replay");
 
     await expect(pending).rejects.toThrow("Host Hermes ACP process killed: test cleanup.");
+    await expect(second.facade.request("session/prompt", { sessionId: "s2" })).rejects.toThrow("Host Hermes ACP facade is closed.");
     expect(second.child.killCalls).toEqual(["SIGTERM"]);
   });
 

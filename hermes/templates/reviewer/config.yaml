@@ -7,6 +7,8 @@ agent:
   disabled_toolsets:
     - tts
     - delegation
+compression:
+  threshold: 0.75
 memory:
   memory_enabled: false
   user_profile_enabled: false

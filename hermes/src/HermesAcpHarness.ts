@@ -110,7 +110,9 @@ export interface HermesAcpRuntimeClient {
 
 interface HermesAcpLease {
   key: string;
+  scopeKey: string;
   reusable: boolean;
+  compatibility: HermesAcpLeaseCompatibility;
   profile: HostHermesAcpProfileLease;
   client: HermesAcpRuntimeClient;
   initialized: boolean;
@@ -123,14 +125,153 @@ interface ActiveHermesAcpRun {
   lease: HermesAcpLease;
   acpSessionId: string | null;
   symphonySessionId: string | null;
+  cancelPromise: Promise<void> | null;
   cancelled: boolean;
   permissionCancellationWaiters: Set<() => void>;
 }
 
+interface HermesAcpLeaseCompatibility {
+  binaryPath: string;
+  cwd: string;
+  sourceProfile: string;
+  profilePrefix: string | null;
+  keepProfiles: string;
+  startupTimeoutMs: number;
+  requestTimeoutMs: number;
+  cliPath: string;
+}
+
+type HermesAcpLeaseReuseDecisionReason =
+  | "compatible_reusable_worker_implementation"
+  | "fresh_worker_session_lifecycle"
+  | "fresh_isolated_role"
+  | "fresh_non_implementation_phase"
+  | "fresh_no_existing_reusable_lease"
+  | "fresh_existing_disposed"
+  | "fresh_previous_process_exited"
+  | "fresh_incompatible_context";
+
+interface HermesAcpLeaseReuseDecision {
+  outcome: "created" | "reused";
+  reuseMode: "reuse_by_issue" | "fresh_per_run";
+  reason: HermesAcpLeaseReuseDecisionReason;
+  key: string;
+  scopeKey: string;
+  compatibility: HermesAcpLeaseCompatibility;
+  existingProfileName?: string;
+  incompatibleFields?: string[];
+}
+
+interface HermesAcpLeaseAcquisition {
+  lease: HermesAcpLease;
+  decision: HermesAcpLeaseReuseDecision;
+}
+
 type TerminalStatus = HostHermesAcpTerminalStatus;
 
+type HermesAcpSessionUpdateDiagnosticCode = "hermes_acp_malformed_session_update" | "hermes_acp_unknown_session_update";
+
+type HermesAcpKnownSessionUpdateKind =
+  | "agent_message_chunk"
+  | "agent_thought_chunk"
+  | "user_message_chunk"
+  | "tool_call"
+  | "tool_call_update"
+  | "plan"
+  | "usage_update"
+  | "session_info_update"
+  | "available_commands_update"
+  | "current_mode_update";
+
+interface HermesAcpSessionUpdateDiagnostic {
+  code: HermesAcpSessionUpdateDiagnosticCode;
+  message: string;
+  reason: string;
+}
+
+interface NormalizedHermesAcpSessionUpdateBase<TCategory extends string, TKind extends string = string> {
+  category: TCategory;
+  kind: TKind;
+  raw: unknown;
+  rawRecord: Record<string, unknown> | null;
+  diagnostics: HermesAcpSessionUpdateDiagnostic[];
+}
+
+type HermesAcpMessageRole = "agent" | "agent_thought" | "user";
+
+interface NormalizedHermesAcpMessageChunk
+  extends NormalizedHermesAcpSessionUpdateBase<"message_chunk", "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk"> {
+  role: HermesAcpMessageRole;
+  text: string;
+  content: unknown;
+}
+
+interface NormalizedHermesAcpUsageUpdate extends NormalizedHermesAcpSessionUpdateBase<"usage", "usage_update"> {
+  size: number | null;
+  used: number | null;
+  tokens: Partial<TokenCounts> | null;
+}
+
+interface NormalizedHermesAcpToolUpdate extends NormalizedHermesAcpSessionUpdateBase<"tool", "tool_call" | "tool_call_update"> {
+  toolCallId: string | null;
+  toolKind: string | null;
+  title: string | null;
+  name: string | null;
+  status: string | null;
+}
+
+interface NormalizedHermesAcpPlanEntry {
+  content: string;
+  status: string | null;
+  priority: string | null;
+  raw: Record<string, unknown>;
+}
+
+interface NormalizedHermesAcpPlanUpdate extends NormalizedHermesAcpSessionUpdateBase<"plan", "plan"> {
+  entries: NormalizedHermesAcpPlanEntry[];
+}
+
+interface NormalizedHermesAcpSessionInfoUpdate extends NormalizedHermesAcpSessionUpdateBase<"session_info", "session_info_update"> {
+  title: string | null;
+  updatedAt: string | null;
+}
+
+interface NormalizedHermesAcpAvailableCommand {
+  name: string;
+  description: string | null;
+  raw: Record<string, unknown>;
+}
+
+interface NormalizedHermesAcpAvailableCommandsUpdate
+  extends NormalizedHermesAcpSessionUpdateBase<"available_commands", "available_commands_update"> {
+  commands: NormalizedHermesAcpAvailableCommand[];
+}
+
+interface NormalizedHermesAcpModeUpdate extends NormalizedHermesAcpSessionUpdateBase<"mode", "current_mode_update"> {
+  currentModeId: string | null;
+}
+
+interface NormalizedHermesAcpUnknownUpdate extends NormalizedHermesAcpSessionUpdateBase<"unknown"> {
+  kind: string;
+}
+
+interface NormalizedHermesAcpMalformedUpdate extends NormalizedHermesAcpSessionUpdateBase<"malformed"> {
+  kind: string;
+}
+
+type NormalizedHermesAcpSessionUpdate =
+  | NormalizedHermesAcpMessageChunk
+  | NormalizedHermesAcpUsageUpdate
+  | NormalizedHermesAcpToolUpdate
+  | NormalizedHermesAcpPlanUpdate
+  | NormalizedHermesAcpSessionInfoUpdate
+  | NormalizedHermesAcpAvailableCommandsUpdate
+  | NormalizedHermesAcpModeUpdate
+  | NormalizedHermesAcpUnknownUpdate
+  | NormalizedHermesAcpMalformedUpdate;
+
 type HermesAcpRuntimeEvent =
-  | { type: "session.update"; sessionId: string | null; update: Record<string, unknown>; raw: Record<string, unknown> }
+  | { type: "session.update"; sessionId: string | null; update: NormalizedHermesAcpSessionUpdate; raw: unknown }
   | { type: "diagnostic"; diagnostic: HostHermesAcpDiagnostic }
   | { type: "permission.resolved"; resolution: HermesAcpPermissionResolution };
 
@@ -162,6 +303,7 @@ export class HermesAcpHarness implements AgentHarness {
   private readonly leases = new Map<string, HermesAcpLease>();
   private readonly activeRuns = new Map<string, ActiveHermesAcpRun>();
   private readonly cancelledRuns = new Set<string>();
+  private readonly retiredReusableLeaseReasons = new Map<string, HermesAcpLeaseReuseDecisionReason>();
   private readonly discoverHostHermes: (options: Parameters<typeof discoverHostHermes>[0]) => Promise<HostHermesDiscoveryResult>;
   private readonly profileLeaseFactory: (options: HostHermesAcpProfileLeaseOptions) => Promise<HostHermesAcpProfileLease>;
   private readonly acpClientFactory: (command: HostHermesAcpProcessCommand, options: HermesAcpRuntimeClientOptions) => HermesAcpRuntimeClient;
@@ -189,11 +331,13 @@ export class HermesAcpHarness implements AgentHarness {
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     await writeInitialHandoffMcpContexts(ctx);
     const runId = `hermes-acp-${randomUUID()}`;
-    const lease = await this.getOrCreateLease(ctx, runId);
+    const leaseAcquisition = await this.getOrCreateLease(ctx, runId);
+    const lease = leaseAcquisition.lease;
     const activeRun: ActiveHermesAcpRun = {
       lease,
       acpSessionId: null,
       symphonySessionId: null,
+      cancelPromise: null,
       cancelled: false,
       permissionCancellationWaiters: new Set(),
     };
@@ -226,13 +370,13 @@ export class HermesAcpHarness implements AgentHarness {
     };
     const onSessionUpdate = (params: unknown): void => {
       const event = hermesAcpSessionUpdateEvent(params);
-      if (!event || !acceptAcpSessionEvent(event, activeRun.acpSessionId)) return;
+      if (!acceptAcpSessionEvent(event, activeRun.acpSessionId)) return;
       const mappedEvents = mapHermesAcpSessionUpdateWithMetadata(event.update).map((mapped) =>
         withAcpSessionUpdateMetadata(mapped, event.sessionId, event.update),
       );
       responseText += hermesAcpAgentMessageDelta(event.update);
       for (const mapped of mappedEvents) {
-        if (mapped.event.type === "tokens" && acpSessionUpdateKind(event.update) === "usage_update") {
+        if (mapped.event.type === "tokens" && event.update.kind === "usage_update") {
           pendingFinalUsageUpdateTokens = mapped.event.tokens;
           continue;
         }
@@ -323,6 +467,7 @@ export class HermesAcpHarness implements AgentHarness {
           },
         },
       );
+      enqueue(hermesAcpLeaseReuseDecisionDiagnostic(leaseAcquisition.decision, lease));
 
       const promptTask = lease.client
         .request<Record<string, unknown> | null>(
@@ -497,16 +642,63 @@ export class HermesAcpHarness implements AgentHarness {
   async dispose(): Promise<void> {
     await Promise.all([...this.leases.values()].map((lease) => this.disposeLease(lease, null, "harness_dispose")));
     this.leases.clear();
+    this.retiredReusableLeaseReasons.clear();
   }
 
-  private async getOrCreateLease(ctx: AgentRunContext, runId: string): Promise<HermesAcpLease> {
-    const reusable = shouldReuseLease(ctx);
-    const key = reusable ? reusableLeaseKey(ctx) : `fresh:${runId}`;
-    const existing = reusable ? this.leases.get(key) : undefined;
-    if (existing && !existing.disposed && !existing.transportExited) return existing;
-
+  private async getOrCreateLease(ctx: AgentRunContext, runId: string): Promise<HermesAcpLeaseAcquisition> {
+    const policy = hermesAcpLeaseReusePolicy(ctx);
+    const scopeKey = reusableLeaseScopeKey(ctx);
+    let key = policy.reusable ? reusableLeaseKey(ctx) : `fresh:${runId}`;
     const binaryPath = await this.resolveBinaryPath(ctx);
     const sourceProfile = await this.resolveSourceProfile(ctx, binaryPath);
+    const compatibility = hermesAcpLeaseCompatibility(ctx, {
+      binaryPath,
+      sourceProfile,
+      cliPath: this.cliPath(),
+    });
+    let reusable = policy.reusable;
+    let reason = policy.reason;
+    const existingLease = reusable ? this.leases.get(key) : undefined;
+    let incompatibleFields: string[] | undefined;
+    let existingProfileName: string | undefined;
+
+    if (existingLease) {
+      existingProfileName = existingLease.profile.profileName;
+      if (existingLease.disposed) {
+        this.leases.delete(existingLease.key);
+        reason = "fresh_existing_disposed";
+      } else if (existingLease.transportExited) {
+        this.retireLeaseAfterTransportExit(existingLease);
+        reason = "fresh_previous_process_exited";
+      } else {
+        incompatibleFields = incompatibleHermesAcpLeaseFields(existingLease.compatibility, compatibility);
+        if (incompatibleFields.length === 0) {
+          return {
+            lease: existingLease,
+            decision: {
+              outcome: "reused",
+              reuseMode: "reuse_by_issue",
+              reason: "compatible_reusable_worker_implementation",
+              key: existingLease.key,
+              scopeKey,
+              compatibility,
+              existingProfileName: existingLease.profile.profileName,
+            },
+          };
+        }
+        reason = "fresh_incompatible_context";
+        if (this.leaseHasActiveRun(existingLease)) {
+          reusable = false;
+          key = `fresh:${runId}`;
+        } else {
+          await this.disposeLease(existingLease, null, "reuse_incompatible");
+        }
+      }
+    } else if (reusable) {
+      reason = this.retiredReusableLeaseReasons.get(key) ?? "fresh_no_existing_reusable_lease";
+    }
+
+    if (reusable) this.retiredReusableLeaseReasons.delete(key);
     const phase = currentRunPhase(ctx);
     const profile = await this.profileLeaseFactory({
       binaryPath,
@@ -514,6 +706,7 @@ export class HermesAcpHarness implements AgentHarness {
       timeoutMs: ctx.config.hermes.startupTimeoutMs,
       sourceProfile,
       keepProfiles: ctx.config.hermes.keepProfiles,
+      reusable,
       nameInput: {
         workspaceKey: ctx.workspace.workspaceKey,
         issueIdentifier: ctx.issue.identifier,
@@ -527,7 +720,9 @@ export class HermesAcpHarness implements AgentHarness {
     const client = this.acpClientFactory(profile.acpCommand, { requestTimeoutMs: ctx.config.hermes.requestTimeoutMs });
     const lease: HermesAcpLease = {
       key,
+      scopeKey,
       reusable,
+      compatibility,
       profile,
       client,
       initialized: false,
@@ -538,7 +733,19 @@ export class HermesAcpHarness implements AgentHarness {
     lease.transportExitListener = (exit) => this.handleLeaseTransportExit(lease, exit);
     lease.client.on("exit", lease.transportExitListener);
     if (reusable) this.leases.set(key, lease);
-    return lease;
+    return {
+      lease,
+      decision: {
+        outcome: "created",
+        reuseMode: reusable ? "reuse_by_issue" : "fresh_per_run",
+        reason,
+        key,
+        scopeKey,
+        compatibility,
+        ...(existingProfileName === undefined ? {} : { existingProfileName }),
+        ...(incompatibleFields === undefined ? {} : { incompatibleFields }),
+      },
+    };
   }
 
   private async resolveBinaryPath(ctx: AgentRunContext): Promise<string> {
@@ -617,6 +824,12 @@ export class HermesAcpHarness implements AgentHarness {
   }
 
   private async interruptActiveRun(activeRun: ActiveHermesAcpRun, reason: string): Promise<void> {
+    if (activeRun.cancelPromise) return activeRun.cancelPromise;
+    activeRun.cancelPromise = this.cancelActiveRunOnce(activeRun, reason);
+    return activeRun.cancelPromise;
+  }
+
+  private async cancelActiveRunOnce(activeRun: ActiveHermesAcpRun, reason: string): Promise<void> {
     const lease = activeRun.lease;
     if (lease.disposed) return;
     const sessionId = activeRun.acpSessionId;
@@ -654,6 +867,11 @@ export class HermesAcpHarness implements AgentHarness {
     lease.transportExited = true;
     lease.initialized = false;
     this.leases.delete(lease.key);
+    if (lease.reusable) this.retiredReusableLeaseReasons.set(lease.key, "fresh_previous_process_exited");
+  }
+
+  private leaseHasActiveRun(lease: HermesAcpLease): boolean {
+    return [...this.activeRuns.values()].some((activeRun) => activeRun.lease === lease);
   }
 
   private cliPath(): string {
@@ -1004,16 +1222,105 @@ function shouldDisposeLeaseAfterRun(lease: HermesAcpLease, terminalStatus: Termi
   return !lease.reusable || terminalStatus !== "succeeded" || lease.transportExited;
 }
 
-function shouldReuseLease(ctx: AgentRunContext): boolean {
-  return (
-    ctx.role === "worker" &&
-    currentRunPhase(ctx) === "implementation" &&
-    ctx.config.hermes.workerSessionLifecycle === "reuse_by_issue"
-  );
+function hermesAcpLeaseReusePolicy(ctx: AgentRunContext): { reusable: boolean; reason: HermesAcpLeaseReuseDecisionReason } {
+  const phase = currentRunPhase(ctx);
+  if (ctx.role !== "worker") return { reusable: false, reason: "fresh_isolated_role" };
+  if (phase !== "implementation") return { reusable: false, reason: "fresh_non_implementation_phase" };
+  if (ctx.config.hermes.workerSessionLifecycle !== "reuse_by_issue") {
+    return { reusable: false, reason: "fresh_worker_session_lifecycle" };
+  }
+  return { reusable: true, reason: "fresh_no_existing_reusable_lease" };
+}
+
+function reusableLeaseScopeKey(ctx: AgentRunContext): string {
+  return `${ctx.role}:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
 }
 
 function reusableLeaseKey(ctx: AgentRunContext): string {
-  return `${ctx.workspace.path}:worker:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
+  return `${ctx.workspace.path}:${reusableLeaseScopeKey(ctx)}`;
+}
+
+function hermesAcpLeaseCompatibility(
+  ctx: AgentRunContext,
+  input: { binaryPath: string; sourceProfile: string; cliPath: string },
+): HermesAcpLeaseCompatibility {
+  return {
+    binaryPath: input.binaryPath,
+    cwd: ctx.workspace.path,
+    sourceProfile: input.sourceProfile,
+    profilePrefix: configuredHermesAcpProfilePrefix(ctx) ?? DEFAULT_PROFILE_PREFIX,
+    keepProfiles: ctx.config.hermes.keepProfiles,
+    startupTimeoutMs: ctx.config.hermes.startupTimeoutMs,
+    requestTimeoutMs: ctx.config.hermes.requestTimeoutMs,
+    cliPath: input.cliPath,
+  };
+}
+
+function incompatibleHermesAcpLeaseFields(
+  existing: HermesAcpLeaseCompatibility,
+  next: HermesAcpLeaseCompatibility,
+): string[] {
+  const fields: Array<keyof HermesAcpLeaseCompatibility> = [
+    "binaryPath",
+    "cwd",
+    "sourceProfile",
+    "profilePrefix",
+    "keepProfiles",
+    "startupTimeoutMs",
+    "requestTimeoutMs",
+    "cliPath",
+  ];
+  return fields.filter((field) => existing[field] !== next[field]);
+}
+
+function hermesAcpLeaseReuseDecisionDiagnostic(
+  decision: HermesAcpLeaseReuseDecision,
+  lease: HermesAcpLease,
+): AgentEvent {
+  const reused = decision.outcome === "reused";
+  const reason = formatHermesAcpLeaseReuseReason(decision.reason);
+  return {
+    type: "run_diagnostic",
+    code: "hermes_acp_lease_reuse_decision",
+    message: reused
+      ? `Host Hermes ACP lease reused for ${lease.profile.profileName}: ${reason}.`
+      : `Host Hermes ACP lease created for ${lease.profile.profileName}: ${reason}.`,
+    payload: {
+      harnessId: "hermes_acp",
+      profileName: lease.profile.profileName,
+      sourceProfile: lease.profile.sourceProfile,
+      reusable: lease.reusable,
+      outcome: decision.outcome,
+      reuseMode: decision.reuseMode,
+      reason: decision.reason,
+      key: decision.key,
+      scopeKey: decision.scopeKey,
+      existingProfileName: decision.existingProfileName ?? null,
+      incompatibleFields: decision.incompatibleFields ?? [],
+      compatibility: decision.compatibility,
+    },
+  };
+}
+
+function formatHermesAcpLeaseReuseReason(reason: HermesAcpLeaseReuseDecisionReason): string {
+  switch (reason) {
+    case "compatible_reusable_worker_implementation":
+      return "existing worker implementation context is compatible";
+    case "fresh_worker_session_lifecycle":
+      return "hermes.worker_session_lifecycle requires a fresh run";
+    case "fresh_isolated_role":
+      return "role requires an isolated fresh lease";
+    case "fresh_non_implementation_phase":
+      return "run phase requires an isolated fresh lease";
+    case "fresh_no_existing_reusable_lease":
+      return "no compatible reusable worker lease exists yet";
+    case "fresh_existing_disposed":
+      return "previous reusable lease was already disposed";
+    case "fresh_previous_process_exited":
+      return "previous reusable ACP process exited before reuse";
+    case "fresh_incompatible_context":
+      return "existing reusable lease context is incompatible";
+  }
 }
 
 function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
@@ -1211,13 +1518,25 @@ function isTerminalAuthMethod(method: Record<string, unknown>): boolean {
   return id === TERMINAL_SETUP_AUTH_METHOD_ID || type === "terminal" || type === "terminalauthmethod";
 }
 
-function hermesAcpSessionUpdateEvent(params: unknown): Extract<HermesAcpRuntimeEvent, { type: "session.update" }> | null {
-  if (!isRecord(params)) return null;
-  const update = isRecord(params.update) ? params.update : {};
+const KNOWN_HERMES_ACP_SESSION_UPDATE_KINDS: ReadonlySet<string> = new Set([
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "user_message_chunk",
+  "tool_call",
+  "tool_call_update",
+  "plan",
+  "usage_update",
+  "session_info_update",
+  "available_commands_update",
+  "current_mode_update",
+]);
+
+function hermesAcpSessionUpdateEvent(params: unknown): Extract<HermesAcpRuntimeEvent, { type: "session.update" }> {
+  const update = isRecord(params) ? params.update : undefined;
   return {
     type: "session.update",
     sessionId: acpSessionIdFromParams(params),
-    update,
+    update: normalizeHermesAcpSessionUpdate(update),
     raw: params,
   };
 }
@@ -1233,16 +1552,255 @@ function acceptAcpSessionEvent(event: Extract<HermesAcpRuntimeEvent, { type: "se
 }
 
 export function mapHermesAcpSessionUpdate(update: Record<string, unknown>): AgentEvent[] {
-  return mapHermesAcpSessionUpdateWithMetadata(update).map((mapped) => mapped.event);
+  return mapHermesAcpSessionUpdateWithMetadata(normalizeHermesAcpSessionUpdate(update)).map((mapped) => mapped.event);
 }
 
-function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>): HermesAcpMappedAgentEvent[] {
-  const kind = acpSessionUpdateKind(update);
+function normalizeHermesAcpSessionUpdate(update: unknown): NormalizedHermesAcpSessionUpdate {
+  if (!isRecord(update)) {
+    return {
+      category: "malformed",
+      kind: "session_update",
+      raw: update,
+      rawRecord: null,
+      diagnostics: [
+        sessionUpdateDiagnostic(
+          "hermes_acp_malformed_session_update",
+          "ACP session/update payload did not include an object update.",
+          "update_not_object",
+        ),
+      ],
+    };
+  }
+
+  const kind = rawAcpSessionUpdateKind(update);
+  if (kind === null) {
+    return {
+      category: "malformed",
+      kind: "session_update",
+      raw: update,
+      rawRecord: update,
+      diagnostics: [
+        sessionUpdateDiagnostic(
+          "hermes_acp_malformed_session_update",
+          "ACP session/update payload did not include a sessionUpdate discriminator.",
+          "missing_session_update_kind",
+        ),
+      ],
+    };
+  }
+
+  if (!isKnownHermesAcpSessionUpdateKind(kind)) {
+    return {
+      category: "unknown",
+      kind,
+      raw: update,
+      rawRecord: update,
+      diagnostics: [
+        sessionUpdateDiagnostic(
+          "hermes_acp_unknown_session_update",
+          `Host Hermes ACP emitted unknown session/update kind ${kind}.`,
+          "unknown_session_update_kind",
+        ),
+      ],
+    };
+  }
+
   switch (kind) {
-    case "agent_message_chunk": {
-      const text = acpAgentMessageText(update);
+    case "agent_message_chunk":
+    case "agent_thought_chunk":
+    case "user_message_chunk":
+      return normalizeMessageChunk(kind, update);
+    case "usage_update":
+      return normalizeUsageUpdate(update);
+    case "tool_call":
+    case "tool_call_update":
+      return normalizeToolUpdate(kind, update);
+    case "plan":
+      return normalizePlanUpdate(update);
+    case "session_info_update":
+      return normalizeSessionInfoUpdate(update);
+    case "available_commands_update":
+      return normalizeAvailableCommandsUpdate(update);
+    case "current_mode_update":
+      return normalizeModeUpdate(update);
+  }
+}
+
+function sessionUpdateDiagnostic(
+  code: HermesAcpSessionUpdateDiagnosticCode,
+  message: string,
+  reason: string,
+): HermesAcpSessionUpdateDiagnostic {
+  return { code, message, reason };
+}
+
+function isKnownHermesAcpSessionUpdateKind(kind: string): kind is HermesAcpKnownSessionUpdateKind {
+  return KNOWN_HERMES_ACP_SESSION_UPDATE_KINDS.has(kind);
+}
+
+function rawAcpSessionUpdateKind(update: Record<string, unknown>): string | null {
+  const raw = nonEmptyString(update.sessionUpdate) ?? nonEmptyString(update.session_update);
+  return raw ? toSnakeCase(raw) : null;
+}
+
+function normalizeMessageChunk(
+  kind: "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk",
+  update: Record<string, unknown>,
+): NormalizedHermesAcpMessageChunk {
+  return {
+    category: "message_chunk",
+    kind,
+    role: messageRoleForSessionUpdateKind(kind),
+    content: update.content,
+    text: acpAgentMessageText(update),
+    raw: update,
+    rawRecord: update,
+    diagnostics: [],
+  };
+}
+
+function messageRoleForSessionUpdateKind(kind: NormalizedHermesAcpMessageChunk["kind"]): HermesAcpMessageRole {
+  if (kind === "agent_message_chunk") return "agent";
+  if (kind === "agent_thought_chunk") return "agent_thought";
+  return "user";
+}
+
+function normalizeUsageUpdate(update: Record<string, unknown>): NormalizedHermesAcpUsageUpdate {
+  const usage = isRecord(update.usage) ? update.usage : {};
+  const used = numberFromUnknown(update.used) ?? numberFromUnknown(usage.used);
+  return {
+    category: "usage",
+    kind: "usage_update",
+    size: numberFromUnknown(update.size) ?? numberFromUnknown(update.limit) ?? numberFromUnknown(usage.size) ?? numberFromUnknown(usage.limit),
+    used,
+    tokens: finalUsageUpdateTokens(update),
+    raw: update,
+    rawRecord: update,
+    diagnostics: [],
+  };
+}
+
+function normalizeToolUpdate(
+  kind: "tool_call" | "tool_call_update",
+  update: Record<string, unknown>,
+): NormalizedHermesAcpToolUpdate {
+  const toolCall = toolCallRecord(update);
+  return {
+    category: "tool",
+    kind,
+    toolCallId:
+      nonEmptyString(update.toolCallId) ??
+      nonEmptyString(update.tool_call_id) ??
+      nonEmptyString(toolCall.id) ??
+      nonEmptyString(toolCall.toolCallId) ??
+      nonEmptyString(toolCall.tool_call_id),
+    toolKind: nonEmptyString(update.kind) ?? nonEmptyString(update.toolKind) ?? nonEmptyString(update.tool_kind) ?? nonEmptyString(toolCall.kind),
+    title: nonEmptyString(update.title) ?? nonEmptyString(toolCall.title),
+    name: nonEmptyString(update.name) ?? nonEmptyString(update.tool) ?? nonEmptyString(toolCall.name) ?? nonEmptyString(toolCall.tool),
+    status: nonEmptyString(update.status) ?? nonEmptyString(toolCall.status),
+    raw: update,
+    rawRecord: update,
+    diagnostics: [],
+  };
+}
+
+function normalizePlanUpdate(update: Record<string, unknown>): NormalizedHermesAcpPlanUpdate {
+  const entries = Array.isArray(update.entries) ? update.entries : [];
+  return {
+    category: "plan",
+    kind: "plan",
+    entries: entries.filter(isRecord).map((entry) => ({
+      content: nonEmptyString(entry.content) ?? nonEmptyString(entry.title) ?? preview(entry, 160),
+      status: nonEmptyString(entry.status),
+      priority: nonEmptyString(entry.priority),
+      raw: entry,
+    })),
+    raw: update,
+    rawRecord: update,
+    diagnostics: [],
+  };
+}
+
+function normalizeSessionInfoUpdate(update: Record<string, unknown>): NormalizedHermesAcpSessionInfoUpdate {
+  return {
+    category: "session_info",
+    kind: "session_info_update",
+    title: nonEmptyString(update.title),
+    updatedAt: nonEmptyString(update.updatedAt) ?? nonEmptyString(update.updated_at),
+    raw: update,
+    rawRecord: update,
+    diagnostics: [],
+  };
+}
+
+function normalizeAvailableCommandsUpdate(update: Record<string, unknown>): NormalizedHermesAcpAvailableCommandsUpdate {
+  const rawCommands = Array.isArray(update.availableCommands)
+    ? update.availableCommands
+    : Array.isArray(update.available_commands)
+      ? update.available_commands
+      : [];
+  return {
+    category: "available_commands",
+    kind: "available_commands_update",
+    commands: rawCommands.filter(isRecord).map((command) => ({
+      name: nonEmptyString(command.name) ?? nonEmptyString(command.title) ?? preview(command, 80),
+      description: nonEmptyString(command.description),
+      raw: command,
+    })),
+    raw: update,
+    rawRecord: update,
+    diagnostics: [],
+  };
+}
+
+function normalizeModeUpdate(update: Record<string, unknown>): NormalizedHermesAcpModeUpdate {
+  return {
+    category: "mode",
+    kind: "current_mode_update",
+    currentModeId:
+      nonEmptyString(update.currentModeId) ??
+      nonEmptyString(update.current_mode_id) ??
+      nonEmptyString(update.currentMode) ??
+      nonEmptyString(update.current_mode) ??
+      nonEmptyString(update.modeId) ??
+      nonEmptyString(update.mode_id),
+    raw: update,
+    rawRecord: update,
+    diagnostics: [],
+  };
+}
+
+function mapHermesAcpSessionUpdateWithMetadata(update: NormalizedHermesAcpSessionUpdate): HermesAcpMappedAgentEvent[] {
+  const diagnostics = mapSessionUpdateDiagnosticsWithMetadata(update);
+  const raw = update.rawRecord;
+  switch (update.category) {
+    case "message_chunk": {
+      const text = update.text;
+      if (update.role === "user") return diagnostics;
+      if (update.role === "agent_thought") {
+        const message = "Hermes ACP thought update";
+        return [
+          ...diagnostics,
+          mappedAgentEvent(
+            { type: "progress", activitySource: "stream", message },
+            {
+              actor: "assistant",
+              channel: "chat",
+              kind: "assistant_reasoning_delta",
+              text: message,
+              payload: {
+                delta: true,
+                reasoning: true,
+                messagePreview: preview(text.length > 0 ? text : message, 1_000),
+                ...acpSessionUpdatePreviewPayload(update),
+              },
+            },
+          ),
+        ];
+      }
       return text.length > 0
         ? [
+            ...diagnostics,
             mappedAgentEvent(
               { type: "progress", activitySource: "delta", message: text },
               {
@@ -1258,35 +1816,15 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
               },
             ),
           ]
-        : [];
+        : diagnostics;
     }
-    case "agent_thought_chunk": {
-      const message = "Hermes ACP thought update";
-      return [
-        mappedAgentEvent(
-          { type: "progress", activitySource: "stream", message },
-          {
-            actor: "assistant",
-            channel: "chat",
-            kind: "assistant_reasoning_delta",
-            text: message,
-            payload: {
-              delta: true,
-              reasoning: true,
-              messagePreview: preview(textFromContent(update.content) ?? update.text ?? message, 1_000),
-              ...acpSessionUpdatePreviewPayload(update),
-            },
-          },
-        ),
-      ];
-    }
-    case "user_message_chunk":
-      return [];
-    case "usage_update": {
-      const finalTokens = finalUsageUpdateTokens(update);
+    case "usage": {
+      if (!raw) return diagnostics;
+      const finalTokens = update.tokens;
       if (finalTokens) {
         const tokens = normalizedTokenCounts(finalTokens);
         return [
+          ...diagnostics,
           mappedAgentEvent(
             { type: "tokens", tokens },
             {
@@ -1299,8 +1837,9 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
           ),
         ];
       }
-      const message = formatUsageUpdate(update);
+      const message = formatUsageUpdate(raw);
       return [
+        ...diagnostics,
         mappedAgentEvent(
           { type: "progress", activitySource: "stream", message },
           {
@@ -1308,22 +1847,31 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
             channel: "diagnostic",
             kind: "runtime_status_update",
             text: message,
-            payload: { status: "usage_update", usagePreview: preview(update.usage ?? update, 1_000), ...acpSessionUpdatePreviewPayload(update) },
+            payload: { status: "usage_update", usagePreview: preview(raw.usage ?? raw, 1_000), ...acpSessionUpdatePreviewPayload(update) },
           },
         ),
       ];
     }
-    case "tool_call": {
-      const message = `Hermes ACP tool started: ${formatToolUpdate(update, "started")}`;
-      return [mappedAgentEvent({ type: "progress", activitySource: "tool", message }, toolRunActivityMetadata(update, message, "running"))];
-    }
-    case "tool_call_update": {
-      const message = `Hermes ACP tool ${formatToolStatus(update)}: ${formatToolUpdate(update)}`;
-      return [mappedAgentEvent({ type: "progress", activitySource: "tool", message }, toolRunActivityMetadata(update, message, null))];
+    case "tool": {
+      if (!raw) return diagnostics;
+      if (update.kind === "tool_call") {
+        const message = `Hermes ACP tool started: ${formatToolUpdate(raw, "started")}`;
+        return [
+          ...diagnostics,
+          mappedAgentEvent({ type: "progress", activitySource: "tool", message }, toolRunActivityMetadata(raw, message, "running", update)),
+        ];
+      }
+      const message = `Hermes ACP tool ${formatToolStatus(raw)}: ${formatToolUpdate(raw)}`;
+      return [
+        ...diagnostics,
+        mappedAgentEvent({ type: "progress", activitySource: "tool", message }, toolRunActivityMetadata(raw, message, null, update)),
+      ];
     }
     case "plan": {
-      const message = formatPlanUpdate(update);
+      if (!raw) return diagnostics;
+      const message = formatPlanUpdate(raw);
       return [
+        ...diagnostics,
         mappedAgentEvent(
           { type: "progress", activitySource: "stream", message },
           {
@@ -1331,14 +1879,16 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
             channel: "chat",
             kind: "plan_update",
             text: message,
-            payload: { entriesPreview: preview(update.entries ?? update, 1_000), ...acpSessionUpdatePreviewPayload(update) },
+            payload: { entriesPreview: preview(raw.entries ?? raw, 1_000), ...acpSessionUpdatePreviewPayload(update) },
           },
         ),
       ];
     }
-    case "current_mode_update": {
-      const message = formatCurrentModeUpdate(update);
+    case "mode": {
+      if (!raw) return diagnostics;
+      const message = formatCurrentModeUpdate(raw);
       return [
+        ...diagnostics,
         mappedAgentEvent(
           { type: "progress", activitySource: "stream", message },
           {
@@ -1348,16 +1898,18 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
             text: message,
             payload: {
               status: "mode_update",
-              mode: nonEmptyString(update.currentMode) ?? nonEmptyString(update.current_mode) ?? nonEmptyString(update.modeId) ?? nonEmptyString(update.mode_id),
+              mode: update.currentModeId,
               ...acpSessionUpdatePreviewPayload(update),
             },
           },
         ),
       ];
     }
-    case "session_info_update": {
-      const message = formatSessionInfoUpdate(update);
+    case "session_info": {
+      if (!raw) return diagnostics;
+      const message = formatSessionInfoUpdate(raw);
       return [
+        ...diagnostics,
         mappedAgentEvent(
           { type: "progress", activitySource: "stream", message },
           {
@@ -1365,14 +1917,16 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
             channel: "diagnostic",
             kind: "runtime_status_update",
             text: message,
-            payload: { status: "session_info_update", title: nonEmptyString(update.title), ...acpSessionUpdatePreviewPayload(update) },
+            payload: { status: "session_info_update", title: update.title, ...acpSessionUpdatePreviewPayload(update) },
           },
         ),
       ];
     }
-    case "available_commands_update": {
-      const message = formatAvailableCommandsUpdate(update);
+    case "available_commands": {
+      if (!raw) return diagnostics;
+      const message = formatAvailableCommandsUpdate(raw);
       return [
+        ...diagnostics,
         mappedAgentEvent(
           { type: "progress", activitySource: "stream", message },
           {
@@ -1380,50 +1934,94 @@ function mapHermesAcpSessionUpdateWithMetadata(update: Record<string, unknown>):
             channel: "diagnostic",
             kind: "available_commands_update",
             text: message,
-            payload: { commands: availableCommandNames(update), ...acpSessionUpdatePreviewPayload(update) },
+            payload: { commands: availableCommandNames(raw), ...acpSessionUpdatePreviewPayload(update) },
           },
         ),
       ];
     }
-    default: {
-      const message = `Host Hermes ACP emitted unmapped session update ${kind}.`;
-      return [
-        mappedAgentEvent(
-          {
-            type: "run_diagnostic",
-            code: "hermes_acp_session_update_unmapped",
-            message,
-            payload: { updateKind: kind, updatePreview: preview(update, 500), redacted: true },
-          },
-          {
-            actor: "runtime",
-            channel: "diagnostic",
-            kind: "runtime_diagnostic",
-            text: message,
-            payload: {
-              code: "hermes_acp_session_update_unmapped",
-              severity: "info",
-              ...acpSessionUpdatePreviewPayload(update),
-            },
-          },
-        ),
-      ];
+    case "unknown": {
+      const text = normalizedUpdateText(update);
+      const progress = raw
+        ? [
+            mappedAgentEvent(
+              {
+                type: "progress",
+                ...(update.kind.includes("tool") ? { activitySource: "tool" as const } : {}),
+                message: update.kind.includes("tool")
+                  ? `Hermes ACP ${formatToolUpdate(raw)}`
+                  : `Hermes ACP ${update.kind}${text.length > 0 ? `: ${text}` : ""}`,
+              },
+              {
+                actor: update.kind.includes("tool") ? "tool" : "runtime",
+                channel: update.kind.includes("tool") ? "tool" : "diagnostic",
+                kind: update.kind.includes("tool") ? "tool_call_progress" : "runtime_status_update",
+                text: update.kind.includes("tool") ? `Hermes ACP ${formatToolUpdate(raw)}` : `Hermes ACP ${update.kind}`,
+                payload: { status: "unknown_session_update", ...acpSessionUpdatePreviewPayload(update) },
+              },
+            ),
+          ]
+        : [];
+      return [...diagnostics, ...progress];
     }
+    case "malformed":
+      return diagnostics;
   }
+}
+
+function mapSessionUpdateDiagnosticsWithMetadata(update: NormalizedHermesAcpSessionUpdate): HermesAcpMappedAgentEvent[] {
+  return update.diagnostics.map((diagnostic) => {
+    const message = diagnostic.message;
+    return mappedAgentEvent(
+      {
+        type: "run_diagnostic",
+        code: diagnostic.code,
+        message,
+        payload: {
+          updateKind: update.kind,
+          updateCategory: update.category,
+          reason: diagnostic.reason,
+          updatePreview: preview(update.raw, 500),
+          redacted: true,
+        },
+      },
+      {
+        actor: "runtime",
+        channel: "diagnostic",
+        kind: "runtime_diagnostic",
+        text: message,
+        payload: {
+          code: diagnostic.code,
+          severity: diagnostic.code === "hermes_acp_unknown_session_update" ? "info" : "warning",
+          reason: diagnostic.reason,
+          ...acpSessionUpdatePreviewPayload(update),
+        },
+      },
+    );
+  });
+}
+
+function normalizedUpdateText(update: NormalizedHermesAcpSessionUpdate): string {
+  if (update.category === "message_chunk") return update.text;
+  if (!update.rawRecord) return "";
+  return acpAgentMessageText(update.rawRecord);
+}
+
+function toolCallRecord(update: Record<string, unknown>): Record<string, unknown> {
+  return isRecord(update.toolCall) ? update.toolCall : isRecord(update.tool_call) ? update.tool_call : update;
 }
 
 function mappedAgentEvent(event: AgentEvent, runActivityMetadata: HermesAcpRunActivityMetadata): HermesAcpMappedAgentEvent {
   return { event, runActivityMetadata };
 }
 
-function acpSessionUpdatePreviewPayload(update: Record<string, unknown>): Record<string, unknown> {
-  return { updateKind: acpSessionUpdateKind(update), updatePreview: preview(update, 1_000), redacted: true };
+function acpSessionUpdatePreviewPayload(update: NormalizedHermesAcpSessionUpdate): Record<string, unknown> {
+  return { updateKind: update.kind, updateCategory: update.category, updatePreview: preview(update.raw, 1_000), redacted: true };
 }
 
 function withAcpSessionUpdateMetadata(
   mapped: HermesAcpMappedAgentEvent,
   sessionId: string | null,
-  update: Record<string, unknown>,
+  update: NormalizedHermesAcpSessionUpdate,
 ): HermesAcpMappedAgentEvent {
   const metadata = mapped.runActivityMetadata ?? runActivityMetadataForAgentEvent(mapped.event);
   return {
@@ -1433,22 +2031,17 @@ function withAcpSessionUpdateMetadata(
       payload: {
         ...metadata.payload,
         acpSessionId: sessionId,
-        updateKind: acpSessionUpdateKind(update),
-        updatePreview: preview(update, 1_000),
+        updateKind: update.kind,
+        updateCategory: update.category,
+        updatePreview: preview(update.raw, 1_000),
         redacted: true,
       },
     },
   };
 }
 
-function hermesAcpAgentMessageDelta(update: Record<string, unknown>): string {
-  if (acpSessionUpdateKind(update) !== "agent_message_chunk") return "";
-  return acpAgentMessageText(update);
-}
-
-function acpSessionUpdateKind(update: Record<string, unknown>): string {
-  const raw = nonEmptyString(update.sessionUpdate) ?? nonEmptyString(update.session_update) ?? "session_update";
-  return toSnakeCase(raw);
+function hermesAcpAgentMessageDelta(update: NormalizedHermesAcpSessionUpdate): string {
+  return update.category === "message_chunk" && update.role === "agent" ? update.text : "";
 }
 
 function acpAgentMessageText(update: Record<string, unknown>): string {
@@ -1529,12 +2122,13 @@ function toolRunActivityMetadata(
   update: Record<string, unknown>,
   message: string,
   fallbackStatus: "running" | null,
+  normalizedUpdate: NormalizedHermesAcpSessionUpdate = normalizeHermesAcpSessionUpdate(update),
 ): HermesAcpRunActivityMetadata {
   const tool = toolDetailsFromUpdate(update);
   const status = normalizedToolStatus(tool.status, fallbackStatus);
   const payload: Record<string, unknown> = {
     status,
-    ...acpSessionUpdatePreviewPayload(update),
+    ...acpSessionUpdatePreviewPayload(normalizedUpdate),
   };
   if (tool.callId) payload.toolCallId = tool.callId;
   if (tool.name) payload.toolName = tool.name;
@@ -1747,13 +2341,17 @@ function mapHermesAcpPromptResult(
       type: "run_diagnostic",
       code: "hermes_acp_refusal",
       message: "Host Hermes ACP refused the prompt.",
-      payload: { stopReason },
+      payload: promptResultPayload(result, stopReason, input.responseText, "failed"),
     });
     events.push({ type: "failed", error: "Host Hermes ACP refused the prompt." });
     return events;
   }
   if (stopReason === null || stopReason === "end_turn" || stopReason === "stop" || stopReason === "max_turn_requests") {
-    const completed: AgentEvent = input.responseText.length > 0 ? { type: "completed", message: input.responseText } : { type: "completed" };
+    const completed: AgentEvent = {
+      type: "completed",
+      ...(input.responseText.trim().length > 0 ? { message: input.responseText } : {}),
+      payload: promptResultPayload(result, stopReason, input.responseText, "succeeded"),
+    };
     events.push(completed);
     return events;
   }
@@ -1761,10 +2359,28 @@ function mapHermesAcpPromptResult(
     type: "run_diagnostic",
     code: "hermes_acp_unexpected_stop_reason",
     message: `Host Hermes ACP stopped with unsupported stop reason ${stopReason}.`,
-    payload: { stopReason },
+    payload: promptResultPayload(result, stopReason, input.responseText, "failed"),
   });
   events.push({ type: "failed", error: `Host Hermes ACP stopped with unsupported stop reason ${stopReason}.` });
   return events;
+}
+
+function promptResultPayload(
+  result: Record<string, unknown> | null,
+  stopReason: string | null,
+  responseText: string,
+  terminalStatus: Exclude<TerminalStatus, null>,
+): Record<string, unknown> {
+  return {
+    acpResponse: {
+      stopReason,
+      terminalStatus,
+      usage: usageTokens(result?.usage),
+      responseTextPreview: preview(responseText, 1_000),
+      resultPreview: preview(result, 1_000),
+      redacted: true,
+    },
+  };
 }
 
 function providerLimitSignalFromHermesAcpPromptResult(
@@ -1855,6 +2471,7 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
       const payload = {
         requestKind: resolution.request.requestKind,
         toolCallId: resolution.request.toolCallId,
+        outcome: resolution.outcome,
         selectedOptionId: resolution.selectedOptionId,
         reason: resolution.reason,
         acpSessionId: resolution.request.sessionId,
@@ -1873,6 +2490,7 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
                   sessionId: resolution.request.sessionId,
                   requestKind: resolution.request.requestKind,
                   toolCallId: resolution.request.toolCallId,
+                  outcome: resolution.outcome,
                   reason: resolution.reason,
                   paramsPreview: preview(resolution.request.params, 500),
                   redacted: true,

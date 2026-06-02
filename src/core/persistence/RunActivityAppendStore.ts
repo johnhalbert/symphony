@@ -44,6 +44,19 @@ export interface RunActivityStoredEvent {
   readonly storage: RequiredRunActivityAppendStorageMetadata;
 }
 
+export interface RunActivityEventsPage {
+  readonly runId: string;
+  readonly offset: number;
+  readonly limit: number;
+  readonly nextOffset: number | null;
+  readonly total: number;
+  readonly events: readonly RunActivityStoredEvent[];
+}
+
+export interface RunActivityEventSourceStore {
+  readRunEvents(runId: string, options?: { offset?: number; limit?: number }): Promise<RunActivityEventsPage>;
+}
+
 export type RunActivityAcceptedAppendResult = {
   readonly status: "accepted";
   readonly event: RunActivityEvent;
@@ -177,6 +190,16 @@ export class InMemoryRunActivityAppendStore implements RunActivityAppendStore {
       .filter((stored) => stored.event.runSessionId === runSessionId)
       .sort((left, right) => compareAppendRevision(left.metadata.appendRevision, right.metadata.appendRevision));
   }
+
+  async readRunEvents(runId: string, options: { offset?: number; limit?: number } = {}): Promise<RunActivityEventsPage> {
+    const page = normalizeRunActivityReadPageOptions(options);
+    const events = this.storedEvents
+      .filter((stored) => stored.metadata.runId === runId)
+      .sort(compareRunActivityTranscriptOrder);
+    const pageEvents = events.slice(page.offset, page.offset + page.limit);
+    const nextOffset = page.offset + pageEvents.length < events.length ? page.offset + pageEvents.length : null;
+    return { runId, offset: page.offset, limit: page.limit, nextOffset, total: events.length, events: pageEvents };
+  }
 }
 
 export class PostgresRunActivityAppendStore implements RunActivityAppendStore {
@@ -209,6 +232,33 @@ export class PostgresRunActivityAppendStore implements RunActivityAppendStore {
         await rollbackRunActivityAppendQuietly(client);
         throw error;
       }
+    } finally {
+      client.release?.();
+    }
+  }
+
+  async readRunEvents(runId: string, options: { offset?: number; limit?: number } = {}): Promise<RunActivityEventsPage> {
+    const page = normalizeRunActivityReadPageOptions(options);
+    const client = await this.connections.connect();
+    try {
+      const rows = await client.query<RunActivityEventRow>(
+        `
+          SELECT ${runActivityEventSelectColumns()}
+          FROM symphony.run_activity_event
+          WHERE run_id = $1
+          ORDER BY sequence ASC, event_at ASC, run_activity_event_id ASC
+          LIMIT $2 OFFSET $3
+        `,
+        [runId, page.limit, page.offset],
+      );
+      const count = await client.query<{ total: string | number | bigint }>(
+        `SELECT count(*)::bigint AS total FROM symphony.run_activity_event WHERE run_id = $1`,
+        [runId],
+      );
+      const total = nullableNumber(count.rows[0]?.total ?? 0) ?? 0;
+      const events = rows.rows.map(storedEventFromPostgresRow);
+      const nextOffset = page.offset + events.length < total ? page.offset + events.length : null;
+      return { runId, offset: page.offset, limit: page.limit, nextOffset, total, events };
     } finally {
       client.release?.();
     }
@@ -693,6 +743,60 @@ async function rollbackRunActivityAppendQuietly(client: PostgresQueryClient): Pr
   } catch {
     // Preserve the original append failure.
   }
+}
+
+function runActivityEventSelectColumns(): string {
+  return [
+    "run_activity_event_id::text AS append_revision",
+    "event_id",
+    "run_id",
+    "session_id",
+    "run_session_id",
+    "sequence",
+    "sequence_source",
+    "event_at",
+    "protocol",
+    "harness_id",
+    "external_event_id",
+    "actor",
+    "channel",
+    "kind",
+    "text",
+    "payload",
+    "payload_schema",
+    "payload_truncated",
+    "payload_byte_length",
+    "raw_payload_ref_id",
+    "metadata",
+    "created_at",
+  ].join(", ");
+}
+
+function normalizeRunActivityReadPageOptions(options: { offset?: number; limit?: number }): { offset: number; limit: number } {
+  return {
+    offset: normalizeInteger(options.offset ?? 0, 0),
+    limit: normalizeInteger(options.limit ?? 100, 1, 1_000),
+  };
+}
+
+function compareRunActivityTranscriptOrder(left: RunActivityStoredEvent, right: RunActivityStoredEvent): number {
+  return (
+    runActivityEventSequence(left.event) - runActivityEventSequence(right.event) ||
+    compareString(left.event.occurredAt, right.event.occurredAt) ||
+    compareAppendRevision(left.metadata.appendRevision, right.metadata.appendRevision) ||
+    compareString(left.event.eventId, right.event.eventId)
+  );
+}
+
+function normalizeInteger(value: number, minimum: number, maximum = Number.MAX_SAFE_INTEGER): number {
+  const integer = Number.isFinite(value) ? Math.trunc(value) : minimum;
+  return Math.min(Math.max(integer, minimum), maximum);
+}
+
+function compareString(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 function sortedUnique(values: readonly string[]): string[] {

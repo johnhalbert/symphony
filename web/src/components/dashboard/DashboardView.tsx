@@ -3,17 +3,8 @@ import { useDataSource } from "../../data/dataSourceContext";
 import type { ChatMessage, DashboardModel, DashboardVariant } from "../../types/symphony";
 import { Icon } from "../common";
 import { AgentRow } from "./AgentRow";
-import { BurndownCommandCenter, BurndownPanel, Sparkline, StatsGridDense, StatsRow } from "./Stats";
+import { BurndownCommandCenter, BurndownPanel, StatsGridDense, StatsRow } from "./Stats";
 import { OrchestratorChat } from "./OrchestratorChat";
-
-function textOr(value: string | null | undefined, fallback: string) {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : fallback;
-}
-
-function metricSeries(series: number[] | null | undefined) {
-  return (series ?? []).filter((value) => Number.isFinite(value)).map((value) => Math.max(value, 0));
-}
 
 export function DashboardView({
   dashboard,
@@ -36,11 +27,6 @@ export function DashboardView({
   const sourceChat = orchestratorChat ?? dashboard.chat;
   const [chat, setChat] = useState(sourceChat);
   const totals = dashboard.totals;
-  const cycleLabel = textOr(dashboard.metrics?.cycle?.label, "Cycle unavailable");
-  const velocity = dashboard.metrics?.velocity;
-  const velocityWindow = textOr(velocity?.windowLabel, "metric unavailable");
-  const velocityDelta = textOr(velocity?.deltaLabel, "—");
-  const velocitySparkline = metricSeries(velocity?.sparkline);
 
   useEffect(() => {
     setChat(sourceChat);
@@ -70,7 +56,7 @@ export function DashboardView({
           </div>
           <div className="dash__actions">
             <button className="btn" type="button">
-              {Icon.filter()}{cycleLabel}
+              {Icon.filter()}Status totals
             </button>
             <button className="btn" type="button">
               {Icon.bolt()}Trigger poll
@@ -100,7 +86,7 @@ export function DashboardView({
           </div>
         ) : null}
 
-        {variant === "grid" ? <StatsGridDense totals={totals} metrics={dashboard.metrics} /> : <StatsRow dashboard={dashboard} />}
+        {variant === "grid" ? <StatsGridDense totals={totals} /> : <StatsRow dashboard={dashboard} />}
 
         {variant === "command-center" ? <BurndownCommandCenter dashboard={dashboard} /> : <BurndownPanel totals={totals} metrics={dashboard.metrics} useModelBurnupTotals={useModelBurnupTotals} />}
 
@@ -135,7 +121,7 @@ export function DashboardView({
                     animation: "pulse 1.6s ease-in-out infinite",
                   }}
                 />
-                live
+                feed
               </span>
             </div>
             <div className="panel__body">
@@ -157,12 +143,10 @@ export function DashboardView({
           {variant === "grid" ? (
             <div className="panel">
               <div className="panel__head">
-                <span>Velocity · {velocityWindow}</span>
-                <span className="count">{velocityDelta}</span>
+                <span>Throughput history</span>
+                <span className="count">unavailable</span>
               </div>
-              <div style={{ padding: "14px 14px 18px" }}>
-                {velocitySparkline.length >= 2 ? <Sparkline points={velocitySparkline} /> : <div className="view-empty">Velocity metric unavailable.</div>}
-              </div>
+              <div className="view-empty">Velocity trend unavailable; no durable throughput history is present.</div>
             </div>
           ) : null}
         </div>

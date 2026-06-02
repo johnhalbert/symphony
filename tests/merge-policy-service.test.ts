@@ -380,7 +380,9 @@ describe("MergePolicyService", () => {
     ]);
     expect(writer.comments[0]?.body).toContain("Mergeability:");
     expect(writer.comments[0]?.body).toContain("GitHub mergeable_state: dirty");
-    expect(writer.comments[0]?.body).toContain("rebase the lifecycle-bound PR branch over origin/main");
+    expect(writer.comments[0]?.body).toContain("reconcile the lifecycle-bound PR changes with origin/main");
+    expect(writer.comments[0]?.body).toContain("leave the final implementation changes uncommitted and unpushed");
+    expect(writer.comments[0]?.body).not.toContain("commit and push the repaired branch");
     await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
       phase: "implementation",
       blockedReason: null,

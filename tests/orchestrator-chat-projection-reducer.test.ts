@@ -344,6 +344,7 @@ class CapturingProjectionTransaction implements ProjectionTransactionRevisionPor
       revision: input.revision,
       sourceRevisions: input.sourceRevisions.map((revision) => ({ ...revision })),
       sourceCursors: cloneJson(input.sourceCursors),
+      sourceFreshness: input.sourceFreshness.map((freshness) => ({ ...freshness })),
       contentSha256: input.contentSha256,
       generatedAt: input.generatedAt,
       expiresAt: input.expiresAt,

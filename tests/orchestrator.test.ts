@@ -129,6 +129,8 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
     expect(harness.runs[0]?.prompt).toContain("address the underlying invariant");
+    expect(harness.runs[0]?.prompt).toContain("derive a conservative checklist");
+    expect(harness.runs[0]?.prompt).toContain("issue-authoring gap");
     expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
     expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
@@ -361,7 +363,7 @@ describe("Orchestrator", () => {
         { kind: "assistant", ts: expect.any(String), text: "hello" },
         { kind: "thinking", ts: expect.any(String), text: "Hermes ACP thought update" },
         expect.objectContaining({ kind: "tool_call", call_id: "call-1", name: "terminal", status: "succeeded", result: "tests passed" }),
-        { kind: "status", state: "token_usage_reported", ts: expect.any(String), text: "Token usage reported" },
+        { kind: "status", state: "token_usage_reported", ts: expect.any(String), text: "Tokens: input 3 · output 5 · total 8" },
         { kind: "status", state: "runtime_diagnostic", ts: expect.any(String), text: "ACP permission denied" },
         { kind: "status", state: "run_succeeded", ts: expect.any(String), text: "Run completed" },
       ]),

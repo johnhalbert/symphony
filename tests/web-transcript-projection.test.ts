@@ -198,6 +198,96 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("SECRET_PROMPT_VALUE");
   });
 
+
+  it("surfaces Hermes grouped tool activity, diagnostics, tokens, and provider/rate limits as public web messages", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hermes ACP terminal (completed)",
+        payload: { type: "progress", activitySource: "tool", message: "Hermes ACP terminal (completed)" },
+      }),
+      event({
+        eventType: "run_diagnostic",
+        source: "harness",
+        message: "Host Hermes ACP refused the prompt.",
+        payload: { type: "run_diagnostic", code: "hermes_acp_refusal", message: "Host Hermes ACP refused the prompt." },
+        sequence: 2,
+      }),
+      event({
+        eventType: "tokens",
+        source: "harness",
+        payload: { type: "tokens", tokens: { input_tokens: 10, output_tokens: 20, total_tokens: 30 } },
+        sequence: 3,
+      }),
+      event({
+        eventType: "provider_limit",
+        source: "harness",
+        payload: {
+          type: "provider_limit",
+          signal: {
+            kind: "windowed_bucket_exhausted",
+            message: "5h bucket exhausted",
+            scope: { providerId: "openai-codex", model: "gpt-5.5" },
+            window: { resumeAt: "2026-01-01T05:00:00.000Z" },
+            raw: { apiKey: "SECRET_PROVIDER_KEY" },
+          },
+        },
+        sequence: 4,
+      }),
+      event({
+        eventType: "rate_limits",
+        source: "harness",
+        payload: {
+          type: "rate_limits",
+          payload: { provider: "cursor", remaining: 0, authorization: "Bearer SECRET_RATE_TOKEN" },
+        },
+        sequence: 5,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      {
+        kind: "tool_call",
+        ts: "2026-01-01T00:00:00.000Z",
+        call_id: "run-1:1",
+        name: "terminal",
+        status: "completed",
+        args: {},
+        result: null,
+      },
+      {
+        kind: "status",
+        state: "hermes_acp_refusal",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Host Hermes ACP refused the prompt.",
+      },
+      {
+        kind: "status",
+        state: "tokens",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Tokens: input 10 · output 20 · total 30",
+      },
+      {
+        kind: "status",
+        state: "windowed_bucket_exhausted",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Provider limit: 5h bucket exhausted (openai-codex · gpt-5.5 · resume 2026-01-01T05:00:00.000Z)",
+      },
+      {
+        kind: "status",
+        state: "rate_limits",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: 'Rate limits: {"provider":"cursor","remaining":0,"authorization":"[redacted]"}',
+      },
+    ]);
+    expect(messages.map((message) => message.kind)).not.toContain("assistant");
+    const serialized = JSON.stringify(messages);
+    expect(serialized).not.toContain("SECRET_PROVIDER_KEY");
+    expect(serialized).not.toContain("SECRET_RATE_TOKEN");
+    expect(serialized).not.toContain("Bearer");
+  });
+
   it("maps reasoning aliases to thinking with public text previews", () => {
     expect(
       projectWebTranscript([
@@ -248,6 +338,168 @@ describe("projectWebTranscript", () => {
       },
     ]);
     expect(messages.map((message) => message.kind)).not.toContain("assistant");
+  });
+
+  it("groups display taxonomy events while surfacing tool/token/rate telemetry and hiding metadata", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "session_started",
+        source: "harness",
+        payload: { type: "session_started", sessionId: "internal-session", runId: "internal-run" },
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hel",
+        payload: { type: "progress", activitySource: "delta", message: "Hel" },
+      }),
+      event({
+        eventType: "tokens",
+        source: "harness",
+        payload: { type: "tokens", tokens: { inputTokens: 7, outputTokens: 3, totalTokens: 10 }, secret: "SECRET_TOKEN_SUMMARY" },
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hermes tool terminal: SECRET_TOOL_ARGUMENT",
+        payload: { type: "progress", activitySource: "tool", message: "Hermes tool terminal: SECRET_TOOL_ARGUMENT" },
+      }),
+      event({
+        eventType: "rate_limits",
+        source: "harness",
+        payload: { type: "rate_limits", payload: { apiKey: "SECRET_RATE_LIMIT" } },
+      }),
+      event({
+        eventType: "run_status",
+        source: "harness",
+        payload: { type: "run_status", runId: "internal-run", sdkStatus: "running", source: "wait" },
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "lo",
+        payload: { type: "progress", activitySource: "delta", message: "lo" },
+        at: "2026-01-01T00:00:01.000Z",
+      }),
+      event({
+        eventType: "tool_start",
+        source: "runtime",
+        message: "Hermes tool terminal started",
+        payload: { toolId: "tool-1", name: "terminal", argsPreview: "cmd=\"npm test\" apiKey=[redacted]" },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 2,
+      }),
+      event({
+        eventType: "tool_complete",
+        source: "runtime",
+        message: "Hermes tool terminal completed",
+        payload: { toolId: "tool-1", name: "terminal", resultPreview: "tests passed" },
+        at: "2026-01-01T00:00:03.000Z",
+        sequence: 3,
+      }),
+      event({
+        eventType: "run_diagnostic",
+        source: "harness",
+        message: "raw SECRET_DIAGNOSTIC_MESSAGE",
+        payload: {
+          type: "run_diagnostic",
+          code: "cursor_stream_error",
+          message: "Public diagnostic message",
+          payload: { token: "SECRET_DIAGNOSTIC_TOKEN" },
+        },
+        at: "2026-01-01T00:00:04.000Z",
+      }),
+      event({
+        eventType: "provider_limit",
+        source: "harness",
+        payload: {
+          type: "provider_limit",
+          signal: {
+            kind: "windowed_bucket_exhausted",
+            message: "Provider paused until quota resets",
+            raw: { apiKey: "SECRET_PROVIDER_LIMIT" },
+          },
+        },
+        at: "2026-01-01T00:00:05.000Z",
+      }),
+      event({
+        eventType: "completed",
+        source: "harness",
+        message: "Worker completed",
+        payload: { type: "completed", message: "Worker completed" },
+        at: "2026-01-01T00:00:06.000Z",
+      }),
+      event({
+        eventType: "failed",
+        source: "harness",
+        payload: { type: "failed", error: "Worker failed" },
+        at: "2026-01-01T00:00:07.000Z",
+      }),
+      event({
+        eventType: "cancelled",
+        source: "harness",
+        payload: { type: "cancelled" },
+        at: "2026-01-01T00:00:08.000Z",
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hel" },
+      {
+        kind: "status",
+        state: "tokens",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Tokens: input 7 · output 3 · total 10",
+      },
+      {
+        kind: "tool_call",
+        ts: "2026-01-01T00:00:00.000Z",
+        call_id: "run-1:1",
+        name: "terminal",
+        status: "running",
+        args: {},
+        result: null,
+      },
+      {
+        kind: "status",
+        state: "rate_limits",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: 'Rate limits: {"apiKey":"[redacted]"}',
+      },
+      { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "lo" },
+      {
+        kind: "tool_call",
+        ts: "2026-01-01T00:00:02.000Z",
+        call_id: "tool-1",
+        name: "terminal",
+        status: "completed",
+        args: { preview: "cmd=\"npm test\" apiKey=[redacted]" },
+        result: "tests passed",
+      },
+      {
+        kind: "status",
+        state: "cursor_stream_error",
+        ts: "2026-01-01T00:00:04.000Z",
+        text: "Public diagnostic message",
+      },
+      {
+        kind: "status",
+        state: "windowed_bucket_exhausted",
+        ts: "2026-01-01T00:00:05.000Z",
+        text: "Provider limit: Provider paused until quota resets",
+      },
+      { kind: "status", state: "completed", ts: "2026-01-01T00:00:06.000Z", text: "Worker completed" },
+      { kind: "status", state: "failed", ts: "2026-01-01T00:00:07.000Z", text: "Worker failed" },
+      { kind: "status", state: "cancelled", ts: "2026-01-01T00:00:08.000Z", text: "Run cancelled" },
+    ]);
+    const serialized = JSON.stringify(messages);
+    expect(serialized).not.toContain("SECRET_");
+    expect(serialized).not.toContain("internal-run");
+    expect(serialized).not.toContain("internal-session");
+    expect(serialized).not.toContain("run_status");
+    expect(serialized).toContain("Tokens: input 7");
+    expect(serialized).toContain("Rate limits:");
+    expect(serialized).not.toContain("Hermes tool terminal: ");
   });
 
   it("projects persisted harness-provided ACP RunActivityEvent taxonomy without falling back to legacy progress", () => {
@@ -337,7 +589,7 @@ describe("projectWebTranscript", () => {
         result: "tests passed",
         output: "tests passed",
       },
-      { kind: "status", state: "token_usage_reported", ts: "2026-01-01T00:00:05.000Z", text: "Token usage reported" },
+      { kind: "status", state: "token_usage_reported", ts: "2026-01-01T00:00:05.000Z", text: "Tokens: input 3 · output 5 · total 8" },
       { kind: "status", state: "runtime_diagnostic", ts: "2026-01-01T00:00:06.000Z", text: "permission denied" },
       { kind: "status", state: "run_cancelled", ts: "2026-01-01T00:00:07.000Z", text: "Run cancelled" },
       { kind: "status", state: "run_failed", ts: "2026-01-01T00:00:08.000Z", text: "Run failed token=[redacted]" },
@@ -390,7 +642,7 @@ describe("projectWebTranscript", () => {
       { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello again" },
       { kind: "status", state: "token_usage_reported", ts: "2026-01-01T00:00:02.000Z", text: "8 total tokens" },
       { kind: "status", state: "provider_rate_limit", ts: "2026-01-01T00:00:03.000Z", text: "rate limit backoff" },
-      { kind: "assistant", ts: "2026-01-01T00:00:04.000Z", text: "legacy harness assistant completion" },
+      { kind: "status", state: "completed", ts: "2026-01-01T00:00:04.000Z", text: "legacy harness assistant completion" },
     ]);
   });
 

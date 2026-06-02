@@ -118,7 +118,8 @@ export async function runCompletionReportMcpServer(options: {
     output: options.output,
     tool: {
       name: COMPLETION_REPORT_TOOL_NAME,
-      description: "Submit a Symphony worker completion report for review handoff.",
+      description:
+        "Submit a Symphony worker completion report for review handoff. For implementation runs, this is the publication handoff; leave changes uncommitted and unpushed so Symphony can perform the service-owned commit, push, and PR creation/reuse.",
       inputSchema: completionReportInputSchema(),
       handler: (input) => submitCompletionReportFromMcp(input, options),
     },

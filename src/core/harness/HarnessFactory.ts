@@ -1,6 +1,7 @@
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError } from "../errors.js";
 import type { RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
+import { createAgentCommandPolicyAcpResolver } from "./AgentCommandPolicyAcpResolver.js";
 import type { AgentHarness } from "./AgentHarness.js";
 import { CursorHarness } from "../../../cursor/src/CursorHarness.js";
 import { HermesAcpHarness } from "../../../hermes/src/HermesAcpHarness.js";
@@ -29,7 +30,7 @@ export const BUILTIN_AGENT_HARNESSES: Readonly<Record<string, AgentHarnessProvid
   hermes: (_config, options) => new HermesHarness(options.runStore === undefined ? {} : { runStore: options.runStore }),
   // The ACP harness emits normalized RunActivityEvent metadata on AgentEvents;
   // the orchestrator is the only durable transcript writer for those events.
-  hermes_acp: () => new HermesAcpHarness(),
+  hermes_acp: () => new HermesAcpHarness({ permissionResolver: createAgentCommandPolicyAcpResolver() }),
 };
 
 export function createAgentHarness(config: ServiceConfig, options: AgentHarnessFactoryOptions = {}): DisposableAgentHarness {
