@@ -91,6 +91,52 @@ describe("StatusServer realtime SSE API", () => {
     expect(serializeSseComment("keepalive\nignored")).toBe(": keepalive ignored\n\n");
   });
 
+  it("streams keepalive comments with SSE headers and cleans up disconnects", async () => {
+    const server = createRealtimeServer({ realtime: { keepAliveIntervalMs: 20 } });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      expect(client.response.status).toBe(200);
+      expect(client.response.headers.get("content-type")).toContain("text/event-stream");
+      expect(client.response.headers.get("cache-control")).toContain("no-cache");
+      expect(client.response.headers.get("cache-control")).toContain("no-transform");
+      expect(client.response.headers.get("x-accel-buffering")).toBe("no");
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      await expect(client.nextRawBlock()).resolves.toBe("retry: 5000");
+      await expect(client.nextRawBlock(500)).resolves.toBe(": keepalive");
+
+      await client.close();
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "SSE subscriber to disconnect");
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("returns a clear JSON error when realtime transport is unavailable", async () => {
+    const server = createRealtimeServer({ realtime: { enabled: false } });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+
+    try {
+      const response = await fetch(`${baseUrl}/api/v1/realtime`);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("content-type")).toContain("application/json");
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          code: "realtime_unavailable",
+          message: "Realtime event stream is unavailable",
+        },
+      });
+      expect(server.activeRealtimeSubscriberCount()).toBe(0);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("streams projection, source, run, and transcript updates, replays known Last-Event-ID, and cleans up disconnects", async () => {
     const runStore = new FileRunTranscriptStore(root);
     const server = createRealtimeServer({ runStore });
@@ -400,6 +446,7 @@ interface ParsedSseEvent {
 
 interface SseTestClient {
   response: Response;
+  nextRawBlock(timeoutMs?: number): Promise<string>;
   nextEvent(timeoutMs?: number): Promise<ParsedSseEvent>;
   nextEventOfType(type: RealtimeProjectionEventType, timeoutMs?: number): Promise<ParsedSseEvent>;
   close(): Promise<void>;
@@ -410,6 +457,7 @@ function createRealtimeServer(
     runStore?: FileRunTranscriptStore;
     tracker?: TrackerClient;
     orchestratorConversationStore?: FileOrchestratorConversationStore;
+    realtime?: StatusServerOptions["realtime"];
   } = {},
 ): StatusServer {
   return new StatusServer({
@@ -426,6 +474,7 @@ function createRealtimeServer(
     openWorkspaceToken: null,
     trackerStateLists: testTrackerStateLists(),
     staleThresholdMs: 300_000,
+    ...(options.realtime ? { realtime: options.realtime } : {}),
   });
 }
 
@@ -539,26 +588,34 @@ async function openSseClient(url: string, headers: Record<string, string> = {}):
   const decoder = new TextDecoder();
   let buffer = "";
 
-  const nextEvent = async (timeoutMs = 2_000): Promise<ParsedSseEvent> => {
+  const nextRawBlock = async (timeoutMs = 2_000, description = "SSE block"): Promise<string> => {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
       const delimiter = buffer.indexOf("\n\n");
       if (delimiter >= 0) {
         const raw = buffer.slice(0, delimiter);
         buffer = buffer.slice(delimiter + 2);
-        const event = parseSseBlock(raw);
-        if (event) return event;
-        continue;
+        return raw;
       }
-      const chunk = await withTimeout(reader.read(), timeoutMs - (Date.now() - startedAt), "SSE event");
-      if (chunk.done) throw new Error("SSE stream closed before an event was available");
+      const chunk = await withTimeout(reader.read(), timeoutMs - (Date.now() - startedAt), description);
+      if (chunk.done) throw new Error(`SSE stream closed before ${description === "SSE event" ? "an event" : "a block"} was available`);
       buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
+    }
+    throw new Error(`Timed out waiting for ${description}`);
+  };
+
+  const nextEvent = async (timeoutMs = 2_000): Promise<ParsedSseEvent> => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const event = parseSseBlock(await nextRawBlock(timeoutMs - (Date.now() - startedAt), "SSE event"));
+      if (event) return event;
     }
     throw new Error("Timed out waiting for SSE event");
   };
 
   return {
     response,
+    nextRawBlock,
     nextEvent,
     async nextEventOfType(type: RealtimeProjectionEventType, timeoutMs = 2_000): Promise<ParsedSseEvent> {
       const startedAt = Date.now();
