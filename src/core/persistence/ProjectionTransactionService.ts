@@ -1,4 +1,13 @@
 import { createHash } from "node:crypto";
+import {
+  mergeProjectionSourceFreshness,
+  normalizeProjectionSourceFreshnessList,
+  projectionSourceFreshnessFromCursors,
+  projectionSourceFreshnessFromRevisions,
+  sourceCursorsWithFreshness,
+  type ProjectionSourceFreshness,
+  type ProjectionSourceFreshnessInput,
+} from "./ProjectionSourceFreshness.js";
 
 export const DURABLE_PROJECTION_NAMES = [
   "dashboard_projection",
@@ -33,6 +42,7 @@ export interface ProjectionRevisionRecord {
   revision: number;
   sourceRevisions: readonly ProjectionSourceRevision[];
   sourceCursors: ProjectionJsonObject;
+  sourceFreshness: readonly ProjectionSourceFreshness[];
   contentSha256: string | null;
   generatedAt: string;
   expiresAt: string | null;
@@ -56,6 +66,7 @@ export interface ProjectionPayloadWriteInput extends ProjectionRevisionSelector 
   payload: unknown;
   sourceRevisions?: readonly (Partial<ProjectionSourceRevision> & Pick<ProjectionSourceRevision, "source" | "revision">)[];
   sourceCursors?: ProjectionJsonObject;
+  sourceFreshness?: readonly ProjectionSourceFreshnessInput[];
   rawPayloadRefs?: readonly unknown[];
   contentSha256?: string | null;
   payloadSha256?: string | null;
@@ -71,6 +82,7 @@ export interface ProjectionRevisionInsertInput {
   revision: number;
   sourceRevisions: readonly ProjectionSourceRevision[];
   sourceCursors: ProjectionJsonObject;
+  sourceFreshness: readonly ProjectionSourceFreshness[];
   contentSha256: string;
   generatedAt: string;
   expiresAt: string | null;
@@ -127,6 +139,7 @@ export interface ProjectionRevisionPublication {
   expiresAt: string | null;
   sourceRevisions: readonly ProjectionSourceRevision[];
   sourceCursors: ProjectionJsonObject;
+  sourceFreshness: readonly ProjectionSourceFreshness[];
 }
 
 export type ProjectionRevisionPublicationListener = (event: ProjectionRevisionPublication) => void;
@@ -198,6 +211,7 @@ interface NormalizedProjectionPayloadWrite extends NormalizedProjectionRevisionS
   payload: unknown;
   sourceRevisions: readonly ProjectionSourceRevision[];
   sourceCursors: ProjectionJsonObject;
+  sourceFreshness: readonly ProjectionSourceFreshness[];
   rawPayloadRefs: readonly unknown[];
   contentSha256: string;
   payloadSha256: string;
@@ -332,6 +346,7 @@ export class ProjectionTransactionService {
         revision: nextRevision,
         sourceRevisions: input.sourceRevisions,
         sourceCursors: input.sourceCursors,
+        sourceFreshness: input.sourceFreshness,
         contentSha256: input.contentSha256,
         generatedAt: input.generatedAt,
         expiresAt: input.expiresAt,
@@ -509,10 +524,11 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
          revision,
          source_revisions,
          source_cursors,
+         source_freshness,
          content_sha256,
          generated_at,
          expires_at
-       ) VALUES ($1, $2, $3, $4::bigint, $5::jsonb, $6::jsonb, $7, $8::timestamptz, $9::timestamptz)
+       ) VALUES ($1, $2, $3, $4::bigint, $5::jsonb, $6::jsonb, $7::jsonb, $8, $9::timestamptz, $10::timestamptz)
        RETURNING ${projectionRevisionSelectColumns()}`,
       [
         input.projectionName,
@@ -521,6 +537,7 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
         input.revision,
         stableJsonStringify(input.sourceRevisions),
         stableJsonStringify(input.sourceCursors),
+        stableJsonStringify(input.sourceFreshness),
         input.contentSha256,
         input.generatedAt,
         input.expiresAt,
@@ -550,6 +567,7 @@ interface ProjectionRevisionRow {
   revision: string | number;
   source_revisions: unknown;
   source_cursors: unknown;
+  source_freshness?: unknown;
   content_sha256: string | null;
   generated_at: string | Date;
   expires_at: string | Date | null;
@@ -593,7 +611,9 @@ function normalizeProjectionPayloadWrite(input: ProjectionPayloadWriteInput, clo
   const contentSha256 = normalizeOptionalSha256(input.contentSha256, "contentSha256") ?? sha256Hex(stableJsonStringify(payload));
   const payloadSha256 = normalizeOptionalSha256(input.payloadSha256, "payloadSha256") ?? contentSha256;
   const sourceRevisions = normalizeSourceRevisions(input.sourceRevisions ?? []);
-  const sourceCursors = normalizeJsonObject(input.sourceCursors ?? {}, "sourceCursors");
+  const baseSourceCursors = normalizeJsonObject(input.sourceCursors ?? {}, "sourceCursors");
+  const sourceFreshness = normalizePayloadSourceFreshness(input.sourceFreshness, baseSourceCursors, sourceRevisions, generatedAt);
+  const sourceCursors = sourceCursorsWithFreshness(baseSourceCursors, sourceFreshness);
   const rawPayloadRefs = normalizeJsonArray(input.rawPayloadRefs ?? [], "rawPayloadRefs");
   const fields = normalizePayloadFields(input.fields ?? {}, selector.projectionName);
   return {
@@ -601,6 +621,7 @@ function normalizeProjectionPayloadWrite(input: ProjectionPayloadWriteInput, clo
     payload,
     sourceRevisions,
     sourceCursors,
+    sourceFreshness,
     rawPayloadRefs,
     contentSha256,
     payloadSha256,
@@ -633,7 +654,8 @@ function isSameProjectionInput(current: ProjectionRevisionRecord, input: Normali
   return (
     current.contentSha256 === input.contentSha256 &&
     stableJsonStringify(current.sourceRevisions) === stableJsonStringify(input.sourceRevisions) &&
-    stableJsonStringify(current.sourceCursors) === stableJsonStringify(input.sourceCursors)
+    stableJsonStringify(current.sourceCursors) === stableJsonStringify(input.sourceCursors) &&
+    stableJsonStringify(current.sourceFreshness) === stableJsonStringify(input.sourceFreshness)
   );
 }
 
@@ -660,6 +682,7 @@ function revisionPublicationFromRecord(record: ProjectionRevisionRecord): Projec
     expiresAt: record.expiresAt,
     sourceRevisions: record.sourceRevisions,
     sourceCursors: record.sourceCursors,
+    sourceFreshness: record.sourceFreshness,
   };
 }
 
@@ -672,6 +695,7 @@ function projectionRevisionSelectColumns(tableAlias?: string): string {
     "revision",
     "source_revisions",
     "source_cursors",
+    "source_freshness",
     "content_sha256",
     "generated_at",
     "expires_at",
@@ -750,6 +774,7 @@ function mapProjectionRevisionRow(row: ProjectionRevisionRow | undefined): Proje
     revision,
     sourceRevisions: normalizeSourceRevisions(jsonFromDb(row.source_revisions, "source_revisions")),
     sourceCursors: normalizeJsonObject(jsonFromDb(row.source_cursors, "source_cursors"), "source_cursors"),
+    sourceFreshness: mapProjectionRevisionSourceFreshness(row),
     contentSha256: row.content_sha256,
     generatedAt: dateLikeToIso(row.generated_at, "generated_at"),
     expiresAt: row.expires_at === null ? null : dateLikeToIso(row.expires_at, "expires_at"),
@@ -770,6 +795,31 @@ function mapProjectionPayloadRow<TPayload = unknown>(row: ProjectionPayloadRow |
     generatedAt: dateLikeToIso(row.payload_generated_at, "payload_generated_at"),
     expiresAt: row.payload_expires_at === null ? null : dateLikeToIso(row.payload_expires_at, "payload_expires_at"),
   };
+}
+
+function mapProjectionRevisionSourceFreshness(row: ProjectionRevisionRow): ProjectionSourceFreshness[] {
+  const generatedAt = dateLikeToIso(row.generated_at, "generated_at");
+  const sourceRevisions = normalizeSourceRevisions(jsonFromDb(row.source_revisions, "source_revisions"));
+  const sourceCursors = normalizeJsonObject(jsonFromDb(row.source_cursors, "source_cursors"), "source_cursors");
+  if (row.source_freshness !== undefined && row.source_freshness !== null) {
+    return normalizeProjectionSourceFreshnessList(jsonFromDb(row.source_freshness, "source_freshness"), { defaultCheckedAt: generatedAt });
+  }
+  return normalizePayloadSourceFreshness(undefined, sourceCursors, sourceRevisions, generatedAt);
+}
+
+function normalizePayloadSourceFreshness(
+  explicit: readonly ProjectionSourceFreshnessInput[] | undefined,
+  sourceCursors: ProjectionJsonObject,
+  sourceRevisions: readonly ProjectionSourceRevision[],
+  generatedAt: string,
+): ProjectionSourceFreshness[] {
+  const defaultCheckedAt = generatedAt;
+  const explicitFreshness = explicit === undefined ? [] : normalizeProjectionSourceFreshnessList(explicit, { defaultCheckedAt });
+  return mergeProjectionSourceFreshness([
+    projectionSourceFreshnessFromRevisions(sourceRevisions, { defaultCheckedAt }),
+    projectionSourceFreshnessFromCursors(sourceCursors, { defaultCheckedAt }),
+    explicitFreshness,
+  ]);
 }
 
 function normalizeSourceRevisions(revisions: unknown): ProjectionSourceRevision[] {

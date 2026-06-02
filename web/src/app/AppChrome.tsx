@@ -18,11 +18,11 @@ export function AppChrome({
   rightSlot,
   tabBadges,
   runningCount = 0,
-  repoLabel = "",
+  repoLabel = "repository unavailable",
   branch = "",
   pollLabel = "poll unavailable",
   agentUsageLabel,
-  dataSourceLabel = "data source unavailable",
+  dataSourceLabel = "source unavailable",
   connectionStatusLabel = "connection unavailable",
   errorStatusLabel = "errors unavailable",
 }: {

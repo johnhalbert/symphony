@@ -16,6 +16,10 @@ import {
   type ProjectionSqlPool,
 } from "./core/persistence/ProjectionTransactionService.js";
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
+import {
+  PostgresRunActivityAppendStore,
+  type PostgresRunActivityAppendClient,
+} from "./core/persistence/RunActivityAppendStore.js";
 import { FileWritebackOutboxStore } from "./core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import {
@@ -32,6 +36,7 @@ import { runMergeConflictResolutionMcpServer } from "./core/harness/MergeConflic
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
 import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcpServer.js";
+import { runAgentCommandPolicyHookStdio } from "./core/harness/AgentCommandPolicyHookRunner.js";
 import { FileOperatorApprovalStore, OperatorApprovalService } from "./core/approval/OperatorApprovalService.js";
 import {
   createRuntimeTrackerClient,
@@ -169,6 +174,22 @@ program
   });
 
 program
+  .command("agent-command-policy-hook")
+  .description("Evaluate a Hermes pre_tool_call payload against the Symphony agent command policy")
+  .option("--role <role>", "agent role for this hook invocation; falls back to SYMPHONY_AGENT_ROLE")
+  .option("--phase <phase>", "agent run phase for this hook invocation; falls back to SYMPHONY_RUN_PHASE")
+  .option("--issue-id <id>", "active issue id; falls back to SYMPHONY_ISSUE_ID")
+  .option("--run-id <id>", "active run id; falls back to SYMPHONY_RUN_ID or Hermes session_id")
+  .action(async (options: { role?: string; phase?: string; issueId?: string; runId?: string }) => {
+    await runAgentCommandPolicyHookStdio({
+      role: options.role ?? process.env.SYMPHONY_AGENT_ROLE,
+      phase: options.phase ?? process.env.SYMPHONY_RUN_PHASE,
+      issueId: options.issueId ?? process.env.SYMPHONY_ISSUE_ID,
+      runId: options.runId ?? process.env.SYMPHONY_RUN_ID,
+    });
+  });
+
+program
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .option("--port <port>", "enable local HTTP status server on this port")
   .option("--host <host>", "HTTP bind host")
@@ -263,7 +284,11 @@ program
             dashboard: statusDashboardConfig(config),
             webAssetsRoot: config.server.webAssetsRoot,
             ...(projectionPersistence
-              ? { projectionWriter: projectionPersistence.writer, projectionReader: projectionPersistence.writer }
+              ? {
+                  projectionWriter: projectionPersistence.writer,
+                  projectionReader: projectionPersistence.writer,
+                  runActivitySourceStore: projectionPersistence.runActivitySourceStore,
+                }
               : {}),
           });
 
@@ -299,6 +324,7 @@ function currentCliPath(): string {
 
 interface RuntimeProjectionPersistence {
   writer: ProjectionTransactionService;
+  runActivitySourceStore: PostgresRunActivityAppendStore;
   close(): Promise<void>;
 }
 
@@ -312,6 +338,9 @@ async function createRuntimeProjectionPersistence(config: ServiceConfig): Promis
   const pool = new Pool({ connectionString, ssl: config.database.postgres.ssl });
   return {
     writer: new ProjectionTransactionService(new PostgresProjectionTransactionStore(pool)),
+    runActivitySourceStore: new PostgresRunActivityAppendStore({
+      connect: async () => (await pool.connect()) as PostgresRunActivityAppendClient,
+    }),
     close: () => pool.end(),
   };
 }

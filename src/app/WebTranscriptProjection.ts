@@ -54,6 +54,7 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
 
   for (const event of events) {
     const projected = projectWebTranscriptEvent(event);
+    if (projected === null) continue;
     if (projected.kind === "tool_call") {
       const existingIndex = toolMessageIndexByCallId.get(projected.call_id);
       if (existingIndex !== undefined) {
@@ -71,7 +72,10 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
       if (pendingAssistantDeltaIndex !== null) {
         const existing = messages[pendingAssistantDeltaIndex];
         if (existing?.kind === "assistant") {
-          messages[pendingAssistantDeltaIndex] = { ...existing, text: combineAssistantDeltaText(existing.text, projected.text) };
+          messages[pendingAssistantDeltaIndex] = {
+            ...existing,
+            text: combineAssistantDeltaText(existing.text, projected.text, shouldConcatenateAssistantDeltaExactly(event)),
+          };
           continue;
         }
       }
@@ -96,14 +100,21 @@ function projectTranscriptEvents(events: readonly TranscriptEvent[]): Transcript
   return messages;
 }
 
-function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
+function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage | null {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
   const payloadKind = normalizedPayloadKind(payload);
+  const activitySource = normalizedActivitySource(payload);
+  if (isToolEvent(eventType, payloadKind, payload)) return projectToolCallMessage(event, payload, eventType);
+  if (isDiagnosticEvent(eventType, payloadKind)) return projectDiagnosticStatusMessage(event, payload, eventType);
+  if (isTokenUsageEvent(eventType, payloadKind)) return projectTokenUsageStatusMessage(event, payload, eventType);
+  if (isProviderLimitEvent(eventType, payloadKind)) return projectProviderLimitStatusMessage(event, payload, eventType);
+  if (isRateLimitEvent(eventType, payloadKind)) return projectRateLimitStatusMessage(event, payload, eventType);
+  if (isHiddenMetadataEvent(eventType, payloadKind, activitySource)) return null;
+  if (isTerminalStatusEvent(eventType)) return projectTerminalStatusMessage(event, payload, eventType);
   if (isLegacyAcpProtocolEvent(eventType)) {
     return { ...projectStatusMessage(event, payload, "runtime_diagnostic"), state: "runtime_diagnostic" };
   }
-  if (isToolEvent(eventType, payloadKind)) return projectToolCallMessage(event, payload, eventType);
   if (isThinkingEvent(eventType, payloadKind)) return { kind: "thinking", ts: event.at, text: eventText(event, payload) };
   if (isTaskEvent(eventType, payloadKind)) return projectTaskMessage(event, payload);
   if (isRequestEvent(eventType, payloadKind)) return projectRequestMessage(event, payload);
@@ -117,6 +128,7 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage {
 }
 
 function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, unknown>, eventType: string): TranscriptMessage {
+  const progressTool = progressToolSummary(event, payload);
   const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.inputPreview, payload.args, payload.arguments, payload.input);
   const resultPreview = firstPublicPreview(payload.resultPreview, payload.result, payload.summary);
   const outputPreview = firstPublicPreview(payload.outputPreview, payload.output);
@@ -125,8 +137,8 @@ function projectToolCallMessage(event: TranscriptEvent, payload: Record<string, 
     kind: "tool_call",
     ts: event.at,
     call_id: firstCleanString(payload.call_id, payload.callId, payload.toolCallId, payload.id, payload.toolId, payload.tool_id) ?? `${event.runId}:${event.sequence}`,
-    name: firstCleanString(payload.name, payload.tool, payload.toolName) ?? event.eventType,
-    status: inferredToolStatus(eventType, payload, errorPreview !== null),
+    name: firstCleanString(payload.name, payload.tool, payload.toolName, progressTool?.name) ?? event.eventType,
+    status: inferredToolStatus(eventType, payload, errorPreview !== null, progressTool?.status),
     args: argsPreview ? { preview: argsPreview.preview } : {},
     result: resultPreview?.preview ?? outputPreview?.preview ?? errorPreview?.preview ?? null,
     ...(outputPreview ? { output: outputPreview.preview } : {}),
@@ -158,9 +170,15 @@ function mergeToolStatus(existingStatus: string, nextStatus: string): string {
   return nextStatus;
 }
 
-function inferredToolStatus(eventType: string, payload: Record<string, unknown>, hasErrorPreview: boolean): string {
+function inferredToolStatus(
+  eventType: string,
+  payload: Record<string, unknown>,
+  hasErrorPreview: boolean,
+  fallbackStatus?: string | null,
+): string {
   const explicit = firstCleanString(payload.status, payload.state);
   if (explicit) return explicit;
+  if (fallbackStatus) return fallbackStatus;
   if (eventType.includes("start") || eventType.includes("progress")) return "running";
   if (eventType.includes("complete") || eventType.includes("completed") || eventType.includes("finish")) {
     return hasErrorPreview ? "failed" : "completed";
@@ -223,6 +241,85 @@ function projectStatusMessage(
   };
 }
 
+function projectDiagnosticStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  return {
+    kind: "status",
+    state: firstCleanString(payload.code, payload.diagnosticCode, payload.state, payload.status) ?? eventType,
+    ts: event.at,
+    text: firstCleanString(payload.message, payload.messagePreview, payload.textPreview, event.message) ?? eventText(event, payload),
+  };
+}
+
+function projectTokenUsageStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const tokens = tokenCountsFrom(payload.tokens) ?? tokenCountsFrom(payload.usage) ?? tokenCountsFrom(payload);
+  const tokenText = tokens ? formatTokenCounts(tokens) : null;
+  return {
+    kind: "status",
+    state: firstCleanString(payload.state, payload.status, payload.kind, payload.type) ?? "tokens",
+    ts: event.at,
+    text: tokenText ? `Tokens: ${tokenText}` : eventText(event, payload) || eventType,
+  };
+}
+
+function projectProviderLimitStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const signal = providerLimitSignal(payload);
+  const scope = recordValue(signal?.scope) ?? recordValue(payload.scope);
+  const window = recordValue(signal?.window) ?? recordValue(payload.window);
+  const kind = firstCleanString(signal?.kind, payload.limitKind, payload.providerLimitKind, payload.state, payload.status) ?? eventType;
+  const message = firstCleanString(signal?.message, payload.message, event.message) ?? eventText(event, payload);
+  const resumeAt = firstCleanString(window?.resumeAt, payload.resumeAt);
+  const details = compactStrings([
+    firstCleanString(scope?.providerId, scope?.provider, payload.providerId, payload.provider),
+    firstCleanString(scope?.model, payload.model),
+    resumeAt ? `resume ${resumeAt}` : null,
+  ]);
+  return {
+    kind: "status",
+    state: kind,
+    ts: event.at,
+    text: `Provider limit: ${message}${details.length > 0 ? ` (${details.join(" · ")})` : ""}`,
+  };
+}
+
+function projectRateLimitStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  const preview = firstPublicPreview(payload.payload, payload.rateLimits, payload.rate_limits, payload.limits);
+  return {
+    kind: "status",
+    state: firstCleanString(payload.state, payload.status, payload.kind, payload.type) ?? "rate_limits",
+    ts: event.at,
+    text: preview?.preview ? `Rate limits: ${preview.preview}` : eventText(event, payload) || eventType,
+  };
+}
+
+function projectTerminalStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+  eventType: string,
+): TranscriptMessage {
+  return {
+    kind: "status",
+    state: eventType,
+    ts: event.at,
+    text: firstCleanString(payload.message, payload.error, payload.reason, event.message) ?? terminalStatusText(eventType),
+  };
+}
+
 function projectRunPreludeMessages(run: RunRecord, existingMessages: readonly TranscriptMessage[]): TranscriptMessage[] {
   const messages: TranscriptMessage[] = [];
   if (!existingMessages.some((message) => message.kind === "system")) messages.push(projectRunSystemMessage(run));
@@ -254,8 +351,8 @@ function projectRunSystemMessage(run: RunRecord): TranscriptMessage {
   };
 }
 
-function isToolEvent(eventType: string, payloadKind: string | null): boolean {
-  return eventType.includes("tool") || payloadKindIncludes(payloadKind, "tool");
+function isToolEvent(eventType: string, payloadKind: string | null, payload: Record<string, unknown>): boolean {
+  return eventType.includes("tool") || payloadKindIncludes(payloadKind, "tool") || normalizedActivitySource(payload) === "tool";
 }
 
 function isThinkingEvent(eventType: string, payloadKind: string | null): boolean {
@@ -316,6 +413,45 @@ function isStatusEvent(eventType: string, payloadKind: string | null, payload: R
   );
 }
 
+function isHiddenMetadataEvent(eventType: string, _payloadKind: string | null, _activitySource: string | null): boolean {
+  return eventType === "session_started" || eventType === "run_status";
+}
+
+function isDiagnosticEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "run_diagnostic" || payloadKindIncludes(payloadKind, "run_diagnostic") || payloadKind === "diagnostic";
+}
+
+function isTokenUsageEvent(eventType: string, payloadKind: string | null): boolean {
+  return (
+    eventType === "tokens" ||
+    eventType === "token_usage" ||
+    eventType === "token_usage_reported" ||
+    eventType === "usage_update" ||
+    payloadKind === "tokens" ||
+    payloadKind === "token_usage" ||
+    payloadKind === "token_usage_reported" ||
+    payloadKind === "usage_update" ||
+    payloadKindIncludes(payloadKind, "token_budget")
+  );
+}
+
+function isProviderLimitEvent(eventType: string, payloadKind: string | null): boolean {
+  return eventType === "provider_limit" || eventType === "provider_limit_updated" || payloadKindIncludes(payloadKind, "provider_limit");
+}
+
+function isRateLimitEvent(eventType: string, payloadKind: string | null): boolean {
+  return (
+    eventType === "rate_limit" ||
+    eventType === "rate_limits" ||
+    eventType === "rate_limit_updated" ||
+    payloadKindIncludes(payloadKind, "rate_limit")
+  );
+}
+
+function isTerminalStatusEvent(eventType: string): boolean {
+  return eventType === "completed" || eventType === "failed" || eventType === "cancelled";
+}
+
 function isLegacyAcpProtocolEvent(eventType: string): boolean {
   return eventType === "acp_session_update" || eventType === "acp_permission_denied" || eventType === "acp_diagnostic" || eventType === "hermes_acp_profile";
 }
@@ -340,7 +476,7 @@ function isAssistantEvent(
   ) {
     return true;
   }
-  return event.source === "harness" && !isStatusLikePayload(payloadKind, payload) && (eventType === "progress" || eventType === "completed");
+  return event.source === "harness" && !isStatusLikePayload(payloadKind, payload) && eventType === "progress";
 }
 
 function isAssistantDeltaEvent(event: TranscriptEvent): boolean {
@@ -367,9 +503,14 @@ function isAssistantCompleteEvent(event: TranscriptEvent): boolean {
   );
 }
 
-function combineAssistantDeltaText(existing: string, next: string): string {
+function shouldConcatenateAssistantDeltaExactly(event: TranscriptEvent): boolean {
+  return normalizeToken(event.eventType) === "progress" && normalizedActivitySource(sanitizedPayloadRecord(event)) === "delta";
+}
+
+function combineAssistantDeltaText(existing: string, next: string, exact = false): string {
   if (existing.length === 0) return next;
   if (next.length === 0) return existing;
+  if (exact) return existing + next;
   if (/\s$/.test(existing) || /^\s/.test(next)) return existing + next;
   return `${existing} ${next}`;
 }
@@ -429,6 +570,19 @@ function eventText(event: TranscriptEvent, payload: Record<string, unknown>): st
   );
 }
 
+function terminalStatusText(eventType: string): string {
+  switch (eventType) {
+    case "completed":
+      return "Run completed";
+    case "failed":
+      return "Run failed";
+    case "cancelled":
+      return "Run cancelled";
+    default:
+      return eventType;
+  }
+}
+
 function actionLabels(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const labels: string[] = [];
@@ -456,6 +610,11 @@ function normalizedPayloadKind(payload: Record<string, unknown>): string | null 
   return kind ? normalizeToken(kind) : null;
 }
 
+function normalizedActivitySource(payload: Record<string, unknown>): string | null {
+  const source = firstCleanString(payload.activitySource, payload.activity_source);
+  return source ? normalizeToken(source) : null;
+}
+
 function payloadKindIncludes(payloadKind: string | null, token: string): boolean {
   return payloadKind?.includes(token) ?? false;
 }
@@ -474,6 +633,91 @@ function publicMultilineText(value: string, maxLength: number): string | null {
   if (redacted.length === 0) return null;
   if (redacted.length <= maxLength) return redacted;
   return `${redacted.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`;
+}
+
+
+function progressToolSummary(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+): { name: string | null; status: string | null } | null {
+  if (normalizedActivitySource(payload) !== "tool") return null;
+  const explicitName = firstCleanString(payload.name, payload.tool, payload.toolName);
+  const message = firstCleanString(payload.message, event.message);
+  const parsed = parseProgressToolMessage(message);
+  return { name: explicitName ?? parsed.name ?? "tool", status: parsed.status ?? "running" };
+}
+
+function parseProgressToolMessage(message: string | null): { name: string | null; status: string | null } {
+  if (!message) return { name: null, status: null };
+  let text = message.replace(/^Hermes\s+(?:ACP\s+)?/i, "").trim();
+  text = text.replace(/^tool\s+/i, "").trim();
+  const statusMatch = text.match(/\(([^()]*)\)\s*$/);
+  const statusText = statusMatch?.[1] ?? null;
+  const status = statusText ? toolStatusFromText(statusText) ?? firstCleanString(statusText) : toolStatusFromText(text);
+  if (statusMatch) text = text.slice(0, statusMatch.index).trim();
+  const colonIndex = text.indexOf(":");
+  if (colonIndex >= 0) {
+    const before = text.slice(0, colonIndex).trim();
+    const after = text.slice(colonIndex + 1).trim();
+    text = toolStatusFromText(before) && after.length > 0 ? after : before;
+  }
+  text = text.replace(/\b(started|starting|running|completed|complete|finished|failed|error|cancelled|canceled)\b$/i, "").trim();
+  return { name: firstCleanString(text), status };
+}
+
+function toolStatusFromText(value: string): string | null {
+  const token = normalizeToken(value);
+  if (token.includes("fail") || token.includes("error")) return "failed";
+  if (token.includes("cancel")) return "cancelled";
+  if (token.includes("complete") || token.includes("finish") || token.includes("succeed")) return "completed";
+  if (token.includes("start") || token.includes("running")) return "running";
+  return null;
+}
+
+interface ProjectedTokenCounts {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+}
+
+function tokenCountsFrom(value: unknown): ProjectedTokenCounts | null {
+  if (!isRecord(value)) return null;
+  const inputTokens = numberFromUnknown(value.inputTokens) ?? numberFromUnknown(value.input_tokens) ?? numberFromUnknown(value.input);
+  const outputTokens = numberFromUnknown(value.outputTokens) ?? numberFromUnknown(value.output_tokens) ?? numberFromUnknown(value.output);
+  const totalTokens = numberFromUnknown(value.totalTokens) ?? numberFromUnknown(value.total_tokens) ?? numberFromUnknown(value.total);
+  if (inputTokens === null && outputTokens === null && totalTokens === null) return null;
+  return {
+    ...(inputTokens === null ? {} : { inputTokens }),
+    ...(outputTokens === null ? {} : { outputTokens }),
+    ...(totalTokens === null ? {} : { totalTokens }),
+  };
+}
+
+function formatTokenCounts(tokens: ProjectedTokenCounts): string {
+  return compactStrings([
+    tokens.inputTokens === undefined ? null : `input ${tokens.inputTokens}`,
+    tokens.outputTokens === undefined ? null : `output ${tokens.outputTokens}`,
+    tokens.totalTokens === undefined ? null : `total ${tokens.totalTokens}`,
+  ]).join(" · ");
+}
+
+function providerLimitSignal(payload: Record<string, unknown>): Record<string, unknown> | null {
+  return recordValue(payload.signal) ?? recordValue(payload.providerLimit) ?? recordValue(payload.provider_limit) ?? null;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return isRecord(value) ? value : null;
+}
+
+function compactStrings(values: Array<string | null | undefined>): string[] {
+  return values.filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function numberFromUnknown(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function firstPublicPreview(...values: unknown[]): { preview: string; truncated: boolean } | null {

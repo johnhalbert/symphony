@@ -6,7 +6,7 @@ import type { SymphonyDataSource } from "../src/data/dataSource";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
 import { toDashboardModel } from "../src/data/adapters";
 import { mockSymphonyData } from "../src/data/mockData";
-import type { DashboardModel, DashboardVariant } from "../src/types/symphony";
+import type { DashboardModel, DashboardTotals, DashboardVariant, ProviderGateModel } from "../src/types/symphony";
 
 const rawMockData = mockSymphonyData as unknown as Parameters<typeof toDashboardModel>[0];
 
@@ -62,6 +62,42 @@ const apiDashboard: DashboardModel = {
   },
 };
 
+const zeroTotals: DashboardTotals = {
+  backlog: 0,
+  todo: 0,
+  progress: 0,
+  review: 0,
+  done: 0,
+  cancelled: 0,
+  open: 0,
+  all: 0,
+  completeness: 0,
+};
+
+const writebackFailureGate: ProviderGateModel = {
+  id: "writeback-failure",
+  provider: "tracker writeback",
+  kind: "failure",
+  message: "writeback failed: tracker rejected the transition",
+  resumeAt: null,
+  resumePolicy: "manual",
+  sourceIssue: "API-5",
+  sourceRunId: "run-writeback-failure",
+  affected: "API-5",
+};
+
+function dashboardFixture(overrides: Partial<DashboardModel> = {}): DashboardModel {
+  return {
+    ...apiDashboard,
+    ...overrides,
+    providerGates: overrides.providerGates ?? apiDashboard.providerGates,
+    runningAgents: overrides.runningAgents ?? apiDashboard.runningAgents,
+    activity: overrides.activity ?? apiDashboard.activity,
+    chat: overrides.chat ?? apiDashboard.chat,
+    totals: overrides.totals ?? apiDashboard.totals,
+  };
+}
+
 function dataSourceForDashboard(dashboard: DashboardModel): SymphonyDataSource {
   return {
     async getReferenceData() {
@@ -105,6 +141,54 @@ function renderDashboard(dashboard: DashboardModel, variant: DashboardVariant = 
   );
 }
 
+function renderChromeForDashboard(dashboard: DashboardModel, dataSourceLabel = "api source · api") {
+  return renderToStaticMarkup(
+    <AppChrome
+      activeTab="dashboard"
+      onTabChange={() => undefined}
+      runningCount={dashboard.runningAgents.length}
+      repoLabel={dashboard.repoLabel}
+      branch={dashboard.branch}
+      pollLabel={dashboard.pollLabel}
+      agentUsageLabel={dashboard.agentUsageLabel}
+      dataSourceLabel={dataSourceLabel}
+    >
+      <div>Dashboard body</div>
+    </AppChrome>,
+  );
+}
+
+function expectNoFabricatedDashboardMetrics(markup: string) {
+  const forbiddenStrings = [
+    "▲ 12% this cycle",
+    "3.2",
+    "PR/day",
+    "ETA: cycle ends",
+    "Cycle 14",
+    "cycle 14",
+    "7 days left",
+    "7 days remaining",
+    "May 15",
+    "May 29",
+    "projected",
+    "96%",
+    "oldest 24m",
+    "nominal",
+    "0 errors",
+    "Velocity · last 14 days",
+    "+24",
+    "Day 7",
+    "Day 14",
+    "target 17",
+    "completed 13",
+    "linear · connected",
+  ];
+
+  for (const forbidden of forbiddenStrings) {
+    expect(markup).not.toContain(forbidden);
+  }
+}
+
 describe("dashboard API presentation", () => {
   it("renders the API DashboardModel totals, agents, activity, and chrome labels without mock substitutions", () => {
     const markup = renderDashboard(apiDashboard);
@@ -117,9 +201,11 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("concurrency cap 9");
     expect(markup).toContain('<div class="stat__value">73<span class="suffix">%</span></div>');
     expect(markup).toContain('<div class="stat__value">11</div>');
+    expect(markup).toContain("8/32 done");
     expect(markup).toContain("8/32 done · schedule unavailable");
+    expect(markup).toContain("done 8");
+    expect(markup).toContain("total 32");
     expect(markup).toContain("Burn-up unavailable");
-    expect(markup).toContain("Trend unavailable");
     expect(markup).toContain("Velocity trend unavailable");
     expect(markup).toContain("ETA unavailable");
     expect(markup).toMatch(/API-1/);
@@ -129,21 +215,14 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("from API activity");
     expect(markup).toContain("API hello");
     expect(markup).toContain("API suggestion");
+    expect(markup).toContain("unavailable: no durable throughput or ETA source");
 
     expect(markup).not.toContain("openai/symphony");
     expect(markup).not.toContain("WORKFLOW.md@main");
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("4/6 agents");
     expect(markup).not.toContain("Restart SYM-42");
-    expect(markup).not.toMatch(/target\s+\d/);
-    expect(markup).not.toMatch(/completed\s+\d/);
-    expect(markup).not.toContain("Cycle 14");
-    expect(markup).not.toContain("3.2");
-    expect(markup).not.toContain("PR/day");
-    expect(markup).not.toContain("7 days left");
-    expect(markup).not.toContain("projected 96%");
-    expect(markup).not.toContain("nominal");
-    expect(markup).not.toContain("0 errors");
+    expectNoFabricatedDashboardMetrics(markup);
   });
 
   it("uses an empty API dashboard chat array as empty initial chat instead of mock suggestions", () => {
@@ -154,45 +233,49 @@ describe("dashboard API presentation", () => {
     expect(markup).not.toContain("API suggestion");
     expect(markup).not.toContain("Restart SYM-42");
     expect(markup).not.toContain("Show SYM-42 transcript");
+    expectNoFabricatedDashboardMetrics(markup);
   });
 
-  it("renders unavailable API grid velocity and burn-up placeholders without mock chart labels", () => {
+  it("uses API totals in the grid progress panel without mock chart or velocity labels", () => {
     const markup = renderDashboard(apiDashboard, "grid");
 
+    expect(markup).toContain("8/32 done");
     expect(markup).toContain("8/32 done · schedule unavailable");
+    expect(markup).toContain("done 8");
+    expect(markup).toContain("total 32");
     expect(markup).toContain("Burn-up unavailable");
-    expect(markup).toContain("cycle unavailable");
-    expect(markup).toContain("Velocity · metric unavailable");
-    expect(markup).toContain("Velocity metric unavailable.");
-    expect(markup).not.toMatch(/target\s+\d/);
-    expect(markup).not.toMatch(/completed\s+\d/);
-    expect(markup).not.toContain("Cycle 14");
-    expect(markup).not.toContain("Velocity · last 14 days");
-    expect(markup).not.toContain("+24");
+    expect(markup).toContain("Throughput history");
+    expect(markup).toContain("Velocity trend unavailable; no durable throughput history is present.");
+    expectNoFabricatedDashboardMetrics(markup);
   });
 
-  it("wires command-center agent and poll text to the API dashboard fields", () => {
+  it("wires command-center agent, poll, and status totals to the API dashboard fields while marking unsupported metrics unavailable", () => {
     const markup = renderDashboard(apiDashboard, "command-center");
 
     expect(markup).toContain("./symphony status --branch api-branch");
+    expect(markup).toContain("current durable dashboard projection");
+    expect(markup).toContain("73%");
+    expect(markup).toContain("8/32");
+    expect(markup).toContain("11 open");
+    expect(markup).toContain("2 todo");
+    expect(markup).toContain("3 in progress");
+    expect(markup).toContain("5 in review");
     expect(markup).toContain("2/9 agents");
     expect(markup).toContain("2 running / 9 cap");
     expect(markup).toContain("poll 5s");
     expect(markup).toContain("cycle unavailable · schedule unavailable ·");
-    expect(markup).toContain("projection <span style=\"color:var(--text-3)\">unavailable</span>");
+    expect(markup).toContain('projection <span style="color:var(--text-3)">unavailable</span>');
     expect(markup).toContain("backend metric unavailable");
     expect(markup).toContain("5 issues in review · queue age unavailable");
     expect(markup).toContain("status unavailable");
     expect(markup).toContain("errors unavailable");
+    expect(markup).toContain("cycle dates, throughput, ETA, health, and error-window metrics need durable source fields");
     expect(markup).not.toContain("4 running");
     expect(markup).not.toContain("last poll 8s ago");
-    expect(markup).not.toContain("3.2 PR/day");
-    expect(markup).not.toContain("oldest 24m");
-    expect(markup).not.toContain("nominal");
-    expect(markup).not.toContain("0 errors");
+    expectNoFabricatedDashboardMetrics(markup);
   });
 
-  it("preserves mock dashboard data when rendering the mock model", () => {
+  it("preserves mock dashboard data when rendering the mock model without fabricating unsupported dashboard metrics", () => {
     const mockDashboard = toDashboardModel(rawMockData);
     const markup = renderDashboard(mockDashboard, "cards", false);
 
@@ -202,46 +285,124 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("poll 22s");
     expect(markup).toContain("4/6 agents");
     expect(markup).toContain("Restart SYM-42");
-    expect(markup).toContain("Cycle 14");
-    expect(markup).toContain("3.2");
-    expect(markup).toContain("PR/day");
-    expect(markup).toContain("ETA: cycle ends ~3 days early");
-    expect(markup).toMatch(/target\s+17/);
-    expect(markup).toMatch(/completed\s+13/);
+    expect(markup).toContain("trend unavailable");
+    expectNoFabricatedDashboardMetrics(markup);
   });
 
   it("lets app chrome consume dashboard labels in API mode instead of fixed mock copy", () => {
-    const markup = renderToStaticMarkup(
-      <AppChrome
-        activeTab="dashboard"
-        onTabChange={() => undefined}
-        runningCount={apiDashboard.runningAgents.length}
-        repoLabel={apiDashboard.repoLabel}
-        branch={apiDashboard.branch}
-        pollLabel={apiDashboard.pollLabel}
-        agentUsageLabel={apiDashboard.agentUsageLabel}
-        dataSourceLabel="api source · api"
-        tabBadges={{ issues: String(apiDashboard.totals.all), history: "2 live" }}
-      >
-        <div>Dashboard body</div>
-      </AppChrome>,
-    );
+    const markup = renderChromeForDashboard(apiDashboard, "api source · api");
 
     expect(markup).toContain("api-branch");
     expect(markup).toContain("2/9 agents");
     expect(markup).toContain("api/repo@api-branch");
     expect(markup).toContain("poll 5s");
     expect(markup).toContain("api source · api");
-    expect(markup).toContain('<span class="badge">32</span>');
-    expect(markup).toContain('<span class="badge">2 live</span>');
     expect(markup).toContain("connection unavailable");
     expect(markup).toContain("errors unavailable");
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("api source · mock");
-    expect(markup).not.toContain('badge">11</span>');
-    expect(markup).not.toContain('badge">4 live</span>');
-    expect(markup).not.toContain("linear · connected");
-    expect(markup).not.toContain("0 errors · 24h");
+    expectNoFabricatedDashboardMetrics(markup);
+  });
+
+  it("uses unavailable AppChrome defaults rather than fabricated tracker or error-window status", () => {
+    const markup = renderToStaticMarkup(
+      <AppChrome activeTab="dashboard" onTabChange={() => undefined}>
+        <div>Dashboard body</div>
+      </AppChrome>,
+    );
+
+    expect(markup).toContain("0 agents running");
+    expect(markup).toContain("repository unavailable");
+    expect(markup).toContain("poll unavailable");
+    expect(markup).toContain("source unavailable");
+    expect(markup).not.toContain("openai/symphony@main");
+    expect(markup).not.toContain("poll 22s");
+    expectNoFabricatedDashboardMetrics(markup);
+  });
+
+  it("keeps unsupported metrics unavailable across empty, active, failed, stale-source, writeback-failure, and healthy dashboard states", () => {
+    const scenarios: Array<{ name: string; dashboard: DashboardModel; expected: string[] }> = [
+      {
+        name: "empty/fallback",
+        dashboard: dashboardFixture({
+          branch: "empty-branch",
+          pollLabel: "poll unavailable",
+          agentUsageLabel: "0/0 agents",
+          concurrencyCap: 0,
+          runningAgents: [],
+          activity: [],
+          chat: [],
+          totals: zeroTotals,
+        }),
+        expected: ["0/0 agents", "0/0 done", "total 0"],
+      },
+      {
+        name: "active runs",
+        dashboard: apiDashboard,
+        expected: ["2/9 agents", "poll 5s"],
+      },
+      {
+        name: "failed run",
+        dashboard: dashboardFixture({
+          branch: "failed-branch",
+          pollLabel: "poll 9s",
+          agentUsageLabel: "0/4 agents",
+          concurrencyCap: 4,
+          runningAgents: [],
+          activity: [{ t: "1m ago", who: "worker", verb: "error", id: "API-FAIL", extra: "durable failed run" }],
+          totals: { backlog: 0, todo: 1, progress: 0, review: 0, done: 0, cancelled: 0, open: 1, all: 1, completeness: 0 },
+        }),
+        expected: ["API-FAIL", "durable failed run", "0/1 done"],
+      },
+      {
+        name: "stale source",
+        dashboard: dashboardFixture({
+          branch: "stale-branch",
+          pollLabel: "source stale · last poll unavailable",
+          agentUsageLabel: "1/4 agents",
+          runningAgents: [apiDashboard.runningAgents[0]],
+        }),
+        expected: ["source stale · last poll unavailable", "1/4 agents"],
+      },
+      {
+        name: "writeback failure",
+        dashboard: dashboardFixture({
+          branch: "writeback-branch",
+          providerGates: [writebackFailureGate],
+          activity: [{ t: "2m ago", who: "writeback", verb: "error", id: "API-5", extra: "tracker rejected the transition" }],
+        }),
+        expected: ["writeback failed: tracker rejected the transition", "tracker rejected the transition"],
+      },
+      {
+        name: "normal healthy state",
+        dashboard: dashboardFixture({
+          branch: "healthy-branch",
+          pollLabel: "poll 3s",
+          agentUsageLabel: "1/4 agents",
+          runningAgents: [apiDashboard.runningAgents[0]],
+          activity: [{ t: "just now", who: "worker", verb: "finished", id: "API-OK", extra: "durable terminal run" }],
+          totals: { backlog: 0, todo: 0, progress: 0, review: 0, done: 4, cancelled: 0, open: 0, all: 4, completeness: 100 },
+        }),
+        expected: ["API-OK", "durable terminal run", "4/4 done"],
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      for (const variant of ["cards", "grid", "command-center"] as DashboardVariant[]) {
+        const markup = renderDashboard(scenario.dashboard, variant);
+        expect(markup, `${scenario.name}/${variant} should render unsupported metrics as unavailable`).toContain("unavailable");
+        for (const expected of scenario.expected) {
+          expect(markup, `${scenario.name}/${variant} should include ${expected}`).toContain(expected);
+        }
+        expectNoFabricatedDashboardMetrics(markup);
+      }
+
+      const chrome = renderChromeForDashboard(scenario.dashboard, `api source · ${scenario.name}`);
+      expect(chrome).toContain(`api source · ${scenario.name}`);
+      expect(chrome).toContain("connection unavailable");
+      expect(chrome).toContain("errors unavailable");
+      expectNoFabricatedDashboardMetrics(chrome);
+    }
   });
 });

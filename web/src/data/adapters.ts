@@ -75,40 +75,6 @@ export function toDashboardModel(raw: RawData): DashboardModel {
     activity: raw.activity,
     chat: raw.dashChat,
     totals: computeTotals(raw.issues),
-    metrics: {
-      cycle: {
-        label: "Cycle 14",
-        dateRange: "May 15 - May 29",
-        remainingLabel: "7 days remaining",
-        completenessDeltaLabel: "▲ 12% this cycle",
-        projectedCompletionLabel: "96%",
-      },
-      velocity: {
-        valueLabel: "3.2",
-        unitLabel: "PR/day",
-        etaLabel: "ETA: cycle ends ~3 days early",
-        windowLabel: "last 14 days",
-        deltaLabel: "+24",
-        trendLabel: "7d avg · 14d trend ↑",
-        sparkline: [1, 3, 2, 4, 3, 5, 4, 6, 5, 7, 6, 3, 8, 5],
-      },
-      burnup: {
-        title: "Burn-up · Cycle 14",
-        remainingLabel: "7 days left",
-        completedSeries: [0, 2, 3, 5, 6, 8, 11, 13],
-        targetSeries: [0, 2.4, 4.8, 7.2, 9.6, 12, 14.4, 16.8],
-        completedEnd: 13,
-        targetEnd: 17,
-        currentIndex: 7,
-        totalPoints: 14,
-      },
-      health: {
-        connectionLabel: "linear · connected",
-        stateLabel: "nominal",
-        errorSummaryLabel: "0 errors in 24h",
-        reviewQueueLabel: "3 issues in In Review agent queue · oldest 24m",
-      },
-    },
   };
 }
 

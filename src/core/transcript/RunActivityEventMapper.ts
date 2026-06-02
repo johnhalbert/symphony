@@ -129,6 +129,26 @@ function assertNever(event: never): never {
   throw new Error(`Unhandled AgentEvent variant: ${JSON.stringify(event)}`);
 }
 
+export function mapRunActivityEventToTranscriptEvent(
+  runActivity: RunActivityEvent,
+  options: { runId: string; source?: TranscriptEvent["source"] },
+): TranscriptEvent {
+  const patch = runActivityPatchFromHarnessMetadata(runActivity);
+  if (!patch) {
+    throw new Error(`Invalid run activity event for transcript projection: ${runActivity.eventId}`);
+  }
+  if (!positiveInteger(runActivity.sequence)) {
+    throw new Error(`Run activity event ${runActivity.eventId} must have a positive sequence for transcript projection`);
+  }
+  return {
+    runId: options.runId,
+    sequence: runActivity.sequence,
+    at: runActivity.occurredAt,
+    source: options.source ?? "harness",
+    ...patch,
+  };
+}
+
 function runActivityPatchFromHarnessMetadata(runActivity: RunActivityEvent | undefined): RunActivityEventPatch | null {
   if (!isValidRunActivityEvent(runActivity)) return null;
 

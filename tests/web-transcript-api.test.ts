@@ -500,6 +500,7 @@ class RecordingProjectionWriter implements StatusServerProjectionWriter {
         revision: this.writes.length,
         sourceRevisions: [],
         sourceCursors: {},
+        sourceFreshness: [],
         contentSha256: "0".repeat(64),
         generatedAt: "2026-01-01T00:00:00.000Z",
         expiresAt: null,

@@ -1,4 +1,5 @@
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
+import type { IssueLifecycleRecord } from "../core/persistence/IssueLifecycleStore.js";
 import type {
   OrchestratorConversationMessage,
   OrchestratorConversationRole,
@@ -387,7 +388,8 @@ export interface DashboardProjectionInput {
   runtime?: RuntimeSnapshot | null;
   board?: IssueBoardResponseProjectionInput | IssueBoardModel | null;
   activity?: ActivityFeedResponseProjectionInput | ActivityModel[] | null;
-  runs?: RunRecord[];
+  runs?: readonly RunRecord[];
+  lifecycleRecords?: readonly IssueLifecycleRecord[];
   chat?: ChatMessage[];
   config?: DashboardRuntimeConfig | null | undefined;
 }
@@ -396,6 +398,8 @@ export interface SidebarProjectionInput {
   runtime?: RuntimeSnapshot | null;
   board?: IssueBoardResponseProjectionInput | IssueBoardModel | null;
   activity?: ActivityFeedResponseProjectionInput | ActivityModel[] | null;
+  runs?: readonly RunRecord[];
+  lifecycleRecords?: readonly IssueLifecycleRecord[];
   history?: WebHistoryModel | null;
   chat?: ChatMessage[] | null;
   config?: DashboardRuntimeConfig | null | undefined;
@@ -568,30 +572,51 @@ export function emptyChatMessages(): ChatMessage[] {
   return [];
 }
 
-export function projectWebOrchestratorChat(messages: readonly OrchestratorConversationMessage[] = []): ChatMessage[] {
+export function projectWebOrchestratorChat(
+  messages: readonly OrchestratorConversationMessage[] | readonly ChatMessage[] = [],
+): ChatMessage[] {
   return messages.map(projectWebOrchestratorChatMessage);
 }
 
 export function projectWebOrchestratorChatPost(
   input: string,
-  messages: readonly OrchestratorConversationMessage[] = [],
+  messages: readonly OrchestratorConversationMessage[] | readonly ChatMessage[] = [],
 ): ChatMessage[] {
-  void input;
-  return projectWebOrchestratorChat(messages);
+  if (messages.length > 0) return projectWebOrchestratorChat(messages);
+  const trimmed = input.trim();
+  return trimmed ? projectWebOrchestratorChat([{ who: "user", text: trimmed }]) : [];
 }
 
-function projectWebOrchestratorChatMessage(message: OrchestratorConversationMessage): ChatMessage {
-  return {
-    id: message.id,
-    conversationId: message.conversationId,
-    who: message.role === "user" ? "user" : "agent",
-    role: message.role,
-    text: sanitizedPreviewValue(message.body, 10_000).preview ?? "",
-    status: message.status,
-    createdAt: message.createdAt,
-    updatedAt: message.updatedAt,
-    metadata: sanitizePublicJson(message.metadata) as Record<string, unknown>,
+function projectWebOrchestratorChatMessage(message: OrchestratorConversationMessage | ChatMessage): ChatMessage {
+  if (isOrchestratorConversationMessage(message)) {
+    return {
+      id: message.id,
+      conversationId: message.conversationId,
+      who: message.role === "user" ? "user" : "agent",
+      role: message.role,
+      text: sanitizedPreviewValue(message.body, 10_000).preview ?? "",
+      status: message.status,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+      metadata: sanitizePublicJson(message.metadata) as Record<string, unknown>,
+    };
+  }
+
+  const projected: ChatMessage = {
+    who: message.who === "user" ? "user" : "agent",
+    text: message.text,
   };
+  const suggestions = Array.isArray(message.suggestions)
+    ? message.suggestions.map((suggestion) => suggestion.trim()).filter((suggestion) => suggestion.length > 0)
+    : [];
+  if (suggestions.length > 0) projected.suggestions = suggestions;
+  return projected;
+}
+
+function isOrchestratorConversationMessage(
+  message: OrchestratorConversationMessage | ChatMessage,
+): message is OrchestratorConversationMessage {
+  return "body" in message && typeof message.body === "string" && "role" in message && typeof message.role === "string";
 }
 
 export function projectIssueModel(
@@ -723,7 +748,12 @@ export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput |
 export function projectWebDashboard(input: DashboardProjectionInput = {}): DashboardModel {
   const board = projectIssueBoardModel(input.board ?? null);
   const runtime = input.runtime ?? null;
-  const runningAgents = projectRunningAgents(runtime, runtime?.generatedAt ?? input.generatedAt ?? board.generatedAt ?? null);
+  const generatedAt =
+    runtime?.generatedAt ?? input.generatedAt ?? board.generatedAt ?? latestDurableActivityAt(input.runs ?? [], input.lifecycleRecords ?? []);
+  const runningAgents = mergeRunningAgents(
+    projectRunningAgents(runtime, generatedAt),
+    projectDurableRunningAgents(input.runs ?? [], generatedAt),
+  );
   const concurrencyCap = normalizeConcurrencyCap(input.config?.concurrencyCap);
   return {
     projectName: "Symphony",
@@ -738,7 +768,7 @@ export function projectWebDashboard(input: DashboardProjectionInput = {}): Dashb
     activity: projectActivityModels(input.activity ?? null),
     // Dashboard chat is intentionally out of scope; ignore any caller-supplied chat payloads.
     chat: emptyChatMessages(),
-    totals: dashboardTotalsFromBoard(board),
+    totals: dashboardTotalsFromDurableState(board, input.runs ?? [], input.lifecycleRecords ?? []),
   };
 }
 
@@ -762,6 +792,8 @@ export function projectSidebarModel(input: SidebarProjectionInput = {}): Sidebar
       runtime: input.runtime ?? null,
       board: input.board ?? null,
       activity: input.activity ?? null,
+      runs: input.runs ?? [],
+      lifecycleRecords: input.lifecycleRecords ?? [],
       config: input.config ?? null,
     }),
     projectWebIssueBoard(input.board ?? null),
@@ -837,6 +869,40 @@ export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefine
       tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
     };
   });
+}
+
+function projectDurableRunningAgents(runs: readonly RunRecord[], generatedAt: string | null | undefined): RunningAgentModel[] {
+  return [...runs]
+    .filter((run) => run.status === "running")
+    .sort((left, right) => compareDashboardRunRecency(right, left))
+    .map((run) => {
+      const id = firstNonEmpty(run.runId, run.issueIdentifier, run.issueId, run.workspaceKey) ?? "";
+      const issue = firstNonEmpty(run.issueIdentifier, run.issueId, run.workspaceKey) ?? "";
+      const totalTokens = run.tokens?.totalTokens ?? 0;
+      return {
+        id,
+        issue,
+        title: firstNonEmpty(run.issueIdentifier, run.issueId, run.runId) ?? "",
+        state: run.status,
+        step: firstNonEmpty(run.runPhase, run.runKind, run.role) ?? "",
+        duration: formatRunDuration(run.startedAt, generatedAt ?? run.updatedAt),
+        tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
+      };
+    });
+}
+
+function mergeRunningAgents(liveAgents: RunningAgentModel[], durableAgents: RunningAgentModel[]): RunningAgentModel[] {
+  const merged: RunningAgentModel[] = [];
+  const representedAliases = new Set<string>();
+  const addAgent = (agent: RunningAgentModel) => {
+    const aliases = normalizedDashboardAliases([agent.id, agent.issue]);
+    if (aliases.some((alias) => representedAliases.has(alias))) return;
+    for (const alias of aliases) representedAliases.add(alias);
+    merged.push(agent);
+  };
+  for (const agent of liveAgents) addAgent(agent);
+  for (const agent of durableAgents) addAgent(agent);
+  return merged;
 }
 
 export function projectProviderGates(snapshot: RuntimeSnapshot | null | undefined): ProviderGateModel[] {
@@ -926,14 +992,157 @@ function emptyDashboardTotals(): DashboardTotals {
 }
 
 function dashboardTotalsFromBoard(board: IssueBoardModel): DashboardTotals {
+  return finalizeDashboardTotals(
+    board.issues.reduce((totals, issue) => {
+      totals[issue.status] += 1;
+      return totals;
+    }, emptyDashboardTotals()),
+  );
+}
+
+function dashboardTotalsFromDurableState(
+  board: IssueBoardModel,
+  runs: readonly RunRecord[],
+  lifecycleRecords: readonly IssueLifecycleRecord[],
+): DashboardTotals {
+  if (runs.length === 0 && lifecycleRecords.length === 0) return dashboardTotalsFromBoard(board);
+
   const totals = emptyDashboardTotals();
+  const representedAliases = new Set<string>();
+  const latestRunByAlias = buildLatestRunByAlias(runs);
+
   for (const issue of board.issues) {
-    totals[issue.status] += 1;
+    addDashboardIssueStatus(totals, representedAliases, issue.status, [issue.id], `board:${issue.id}`);
   }
+
+  for (const lifecycle of lifecycleRecords) {
+    const aliases = dashboardLifecycleAliases(lifecycle);
+    const latestRun = latestRunForAliases(latestRunByAlias, aliases);
+    addDashboardIssueStatus(
+      totals,
+      representedAliases,
+      deriveIssueStatus({ lifecyclePhase: lifecycle.phase, runStatus: latestRun?.status ?? null }),
+      aliases,
+      `lifecycle:${lifecycle.issueId}:${lifecycle.issueIdentifier}`,
+    );
+  }
+
+  for (const run of [...runs].sort((left, right) => compareDashboardRunRecency(right, left))) {
+    addDashboardIssueStatus(
+      totals,
+      representedAliases,
+      deriveIssueStatus({ runStatus: run.status }),
+      dashboardRunAliases(run),
+      `run:${run.runId}`,
+    );
+  }
+
+  return finalizeDashboardTotals(totals);
+}
+
+function addDashboardIssueStatus(
+  totals: DashboardTotals,
+  representedAliases: Set<string>,
+  status: IssueStatus,
+  aliases: readonly (string | null | undefined)[],
+  fallbackAlias: string,
+): void {
+  const normalizedAliases = normalizedDashboardAliases(aliases);
+  if (normalizedAliases.some((alias) => representedAliases.has(alias))) return;
+  const aliasesToRecord = normalizedAliases.length > 0 ? normalizedAliases : normalizedDashboardAliases([fallbackAlias]);
+  for (const alias of aliasesToRecord) representedAliases.add(alias);
+  totals[status] += 1;
+}
+
+function finalizeDashboardTotals(totals: DashboardTotals): DashboardTotals {
   totals.open = totals.backlog + totals.todo + totals.progress + totals.review;
   totals.all = totals.open + totals.done + totals.cancelled;
   totals.completeness = totals.all === 0 ? 0 : Math.round((totals.done / totals.all) * 100);
   return totals;
+}
+
+function buildLatestRunByAlias(runs: readonly RunRecord[]): Map<string, RunRecord> {
+  const latestRunByAlias = new Map<string, RunRecord>();
+  for (const run of runs) {
+    for (const alias of normalizedDashboardAliases(dashboardRunAliases(run))) {
+      const existing = latestRunByAlias.get(alias);
+      if (!existing || compareDashboardRunRecency(run, existing) > 0) latestRunByAlias.set(alias, run);
+    }
+  }
+  return latestRunByAlias;
+}
+
+function latestRunForAliases(latestRunByAlias: ReadonlyMap<string, RunRecord>, aliases: readonly (string | null | undefined)[]): RunRecord | null {
+  let latest: RunRecord | null = null;
+  for (const alias of normalizedDashboardAliases(aliases)) {
+    const candidate = latestRunByAlias.get(alias);
+    if (!candidate) continue;
+    if (!latest || compareDashboardRunRecency(candidate, latest) > 0) latest = candidate;
+  }
+  return latest;
+}
+
+function dashboardLifecycleAliases(lifecycle: IssueLifecycleRecord): string[] {
+  return dashboardAliases(lifecycle.issueId, lifecycle.issueIdentifier, lifecycle.summaryPointers?.workspaceKey);
+}
+
+function dashboardRunAliases(run: RunRecord): string[] {
+  return dashboardAliases(run.issueId, run.issueIdentifier, run.workspaceKey);
+}
+
+function dashboardAliases(...values: readonly (string | null | undefined)[]): string[] {
+  const aliases: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = normalizeDashboardAlias(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    aliases.push(normalized);
+  }
+  return aliases;
+}
+
+function normalizedDashboardAliases(values: readonly (string | null | undefined)[]): string[] {
+  return dashboardAliases(...values);
+}
+
+function normalizeDashboardAlias(value: string | null | undefined): string | null {
+  const normalized = value?.trim().toLowerCase();
+  return normalized && normalized.length > 0 ? normalized : null;
+}
+
+function latestDurableActivityAt(runs: readonly RunRecord[], lifecycleRecords: readonly IssueLifecycleRecord[]): string | null {
+  let latestValue: string | null = null;
+  let latestMs = Number.NEGATIVE_INFINITY;
+  const consider = (value: string | null | undefined) => {
+    const ms = Date.parse(value ?? "");
+    if (!Number.isFinite(ms) || ms <= latestMs) return;
+    latestMs = ms;
+    latestValue = value ?? null;
+  };
+  for (const run of runs) {
+    consider(run.updatedAt);
+    consider(run.completedAt);
+    consider(run.startedAt);
+  }
+  for (const lifecycle of lifecycleRecords) {
+    consider(lifecycle.updatedAt);
+    consider(lifecycle.createdAt);
+  }
+  return latestValue;
+}
+
+function compareDashboardRunRecency(left: RunRecord, right: RunRecord): number {
+  const delta = dashboardRunActivityMs(left) - dashboardRunActivityMs(right);
+  if (delta !== 0) return delta;
+  return left.runId.localeCompare(right.runId);
+}
+
+function dashboardRunActivityMs(run: RunRecord): number {
+  const times = [run.updatedAt, run.completedAt, run.startedAt]
+    .map((value) => Date.parse(value ?? ""))
+    .filter((value) => Number.isFinite(value));
+  return times.length === 0 ? Number.NEGATIVE_INFINITY : Math.max(...times);
 }
 
 function normalizeConcurrencyCap(value: number | null | undefined): number {
