@@ -14,6 +14,7 @@ import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
+import { webRouteContractGetFixtureCases, webRouteContractPaths } from "../web/tests/fixtures/webRouteContractFixtures.js";
 import { testConfig } from "./helpers.js";
 
 describe("/api/v1/web route contracts", () => {
@@ -34,14 +35,14 @@ describe("/api/v1/web route contracts", () => {
     try {
       const routes: Array<{ path: string; assert: (body: unknown, text: string) => void }> = [
         {
-          path: "/api/v1/web/reference-data",
+          path: webRouteContractPaths.referenceData,
           assert: (body) => {
             expectTopLevelKeys(body, ["labels", "users"]);
             expect(body).toMatchObject({ labels: {}, users: { unassigned: { name: "Unassigned" } } });
           },
         },
         {
-          path: "/api/v1/web/dashboard",
+          path: webRouteContractPaths.dashboard,
           assert: (body) => {
             expectTopLevelKeys(body, [
               "activity",
@@ -74,7 +75,7 @@ describe("/api/v1/web route contracts", () => {
           },
         },
         {
-          path: "/api/v1/web/issues",
+          path: webRouteContractPaths.issueBoard,
           assert: (body) => {
             expectTopLevelKeys(body, ["backlog", "cycleDateRange", "cycleLabel", "issues", "lanes", "selectedIssueId"]);
             expect(body).toEqual({
@@ -88,28 +89,28 @@ describe("/api/v1/web route contracts", () => {
           },
         },
         {
-          path: "/api/v1/web/issues/UNKNOWN-1",
+          path: webRouteContractPaths.issueDetail,
           assert: (body, text) => {
             expect(body).toBeNull();
             expect(text.trim()).toBe("null");
           },
         },
         {
-          path: "/api/v1/web/history",
+          path: webRouteContractPaths.history,
           assert: (body) => {
             expectTopLevelKeys(body, ["defaultSessionId", "sessions", "timeline", "transcriptBySession"]);
             expect(body).toEqual({ sessions: [], transcriptBySession: {}, timeline: [], defaultSessionId: "" });
           },
         },
         {
-          path: "/api/v1/web/sessions/missing-session/transcript",
+          path: webRouteContractPaths.transcript,
           assert: (body, text) => {
             expect(body).toEqual([]);
             expect(text.trim()).toBe("[]");
           },
         },
         {
-          path: "/api/v1/web/sidebar",
+          path: webRouteContractPaths.sidebar,
           assert: (body) => {
             expectTopLevelKeys(body, [
               "activity",
@@ -132,13 +133,15 @@ describe("/api/v1/web route contracts", () => {
           },
         },
         {
-          path: "/api/v1/web/orchestrator-chat",
+          path: webRouteContractPaths.orchestratorChat,
           assert: (body, text) => {
             expect(body).toEqual([]);
             expect(text.trim()).toBe("[]");
           },
         },
       ];
+
+      expect(routes.map((route) => route.path)).toEqual(webRouteContractGetFixtureCases.map((testCase) => testCase.path));
 
       for (const route of routes) {
         const { response, body, text } = await getJson(`${baseUrl}${route.path}`);

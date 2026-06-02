@@ -15,8 +15,11 @@ describe("createAgentHarness", () => {
     expect(createAgentHarness(config("hermes"))).toBeInstanceOf(HermesHarness);
   });
 
-  it("creates the Hermes ACP harness from the built-in registry without changing Hermes TUI registration", () => {
-    expect(createAgentHarness(config("hermes_acp"))).toBeInstanceOf(HermesAcpHarness);
+  it("creates the Hermes ACP harness from the built-in registry with a default permission resolver without changing Hermes TUI registration", () => {
+    const harness = createAgentHarness(config("hermes_acp"));
+
+    expect(harness).toBeInstanceOf(HermesAcpHarness);
+    expect((harness as unknown as { options: { permissionResolver?: unknown } }).options.permissionResolver).toEqual(expect.any(Function));
     expect(createAgentHarness(config("hermes"))).toBeInstanceOf(HermesHarness);
   });
 

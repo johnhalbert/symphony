@@ -15,6 +15,7 @@ import {
   hermesLiveRuntimeDoctorCheck,
   hermesRuntimeDoctorChecks,
   hostHermesAcpDoctorChecks,
+  issueContractDoctorCheck,
   reviewLoopDoctorChecks,
   runDoctor,
   runtimeCredentialDoctorCheck,
@@ -22,7 +23,7 @@ import {
   runtimeHarnessDoctorChecks,
   trackerHandoffDoctorCheck,
 } from "../src/doctor.js";
-import { testConfig } from "./helpers.js";
+import { issue, testConfig } from "./helpers.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 import type { HostHermesCommandRunner } from "../hermes/src/HostHermesDiscovery.js";
 
@@ -30,6 +31,78 @@ describe("doctor review-loop checks", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("checks agent-eligible issue authoring sections for promotion readiness", () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.excludeLabels = ["dogfood-blocked"];
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: completeAgentIssueContract(),
+        }),
+      ]),
+    ).toEqual({
+      id: "linear.issue_contract",
+      status: "ok",
+      message:
+        "1 agent-eligible candidate issue(s) include required authoring sections: Problem / Goal, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+    });
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: [
+            "## Problem / Goal",
+            "Do the work.",
+            "",
+            "## Acceptance Criteria",
+            "- Done.",
+            "",
+            "## Out Of Scope",
+            "- Nothing else.",
+          ].join("\n"),
+        }),
+      ]),
+    ).toEqual({
+      id: "linear.issue_contract",
+      status: "warn",
+      message:
+        "Agent-eligible issue(s) are missing required authoring sections: TEST-1 missing Touched Surfaces, Contract Checklist, Validation Requirements, Promotion Readiness",
+    });
+  });
+
+  it("handles empty or excluded issue descriptions without crashing issue-contract doctor checks", () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.excludeLabels = ["dogfood-blocked"];
+
+    expect(
+      issueContractDoctorCheck(config, [issue({ labels: ["dogfood-ready"], description: null })]),
+    ).toMatchObject({
+      id: "linear.issue_contract",
+      status: "warn",
+      message:
+        "Agent-eligible issue(s) are missing required authoring sections: TEST-1 missing Problem / Goal, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+    });
+
+    expect(
+      issueContractDoctorCheck(config, [issue({ labels: ["dogfood-ready", "dogfood-blocked"], description: null })]),
+    ).toEqual({
+      id: "linear.issue_contract",
+      status: "ok",
+      message: "No agent-eligible candidate issues require the authoring contract check",
+    });
+
+    expect(issueContractDoctorCheck(config, [issue({ labels: [], description: null })])).toEqual({
+      id: "linear.issue_contract",
+      status: "ok",
+      message: "No agent-eligible candidate issues require the authoring contract check",
+    });
   });
 
   it("reports bounded Cursor policy and ambient setting-source warnings", () => {
@@ -1022,6 +1095,32 @@ github:
     });
   });
 });
+
+function completeAgentIssueContract(): string {
+  return [
+    "## Problem / Goal",
+    "Do the work.",
+    "",
+    "## Touched Surfaces",
+    "- [X] Docs only",
+    "",
+    "## Acceptance Criteria",
+    "- Done.",
+    "",
+    "## Contract Checklist",
+    "- Happy path: covered.",
+    "- Negative/error path: covered.",
+    "",
+    "## Validation Requirements",
+    "- Run the narrow test.",
+    "",
+    "## Out Of Scope",
+    "- Nothing else.",
+    "",
+    "## Promotion Readiness",
+    "- Ready for `dogfood-ready`: no.",
+  ].join("\n");
+}
 
 function mcpToolsFor(command: string): string[] {
   if (command === "completion-report-mcp") return ["submit_completion_report"];

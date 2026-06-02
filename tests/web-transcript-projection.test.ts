@@ -231,6 +231,96 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("SECRET_PROMPT_VALUE");
   });
 
+
+  it("surfaces Hermes grouped tool activity, diagnostics, tokens, and provider/rate limits as public web messages", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hermes ACP terminal (completed)",
+        payload: { type: "progress", activitySource: "tool", message: "Hermes ACP terminal (completed)" },
+      }),
+      event({
+        eventType: "run_diagnostic",
+        source: "harness",
+        message: "Host Hermes ACP refused the prompt.",
+        payload: { type: "run_diagnostic", code: "hermes_acp_refusal", message: "Host Hermes ACP refused the prompt." },
+        sequence: 2,
+      }),
+      event({
+        eventType: "tokens",
+        source: "harness",
+        payload: { type: "tokens", tokens: { input_tokens: 10, output_tokens: 20, total_tokens: 30 } },
+        sequence: 3,
+      }),
+      event({
+        eventType: "provider_limit",
+        source: "harness",
+        payload: {
+          type: "provider_limit",
+          signal: {
+            kind: "windowed_bucket_exhausted",
+            message: "5h bucket exhausted",
+            scope: { providerId: "openai-codex", model: "gpt-5.5" },
+            window: { resumeAt: "2026-01-01T05:00:00.000Z" },
+            raw: { apiKey: "SECRET_PROVIDER_KEY" },
+          },
+        },
+        sequence: 4,
+      }),
+      event({
+        eventType: "rate_limits",
+        source: "harness",
+        payload: {
+          type: "rate_limits",
+          payload: { provider: "cursor", remaining: 0, authorization: "Bearer SECRET_RATE_TOKEN" },
+        },
+        sequence: 5,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      {
+        kind: "tool_call",
+        ts: "2026-01-01T00:00:00.000Z",
+        call_id: "run-1:1",
+        name: "terminal",
+        status: "completed",
+        args: {},
+        result: null,
+      },
+      {
+        kind: "status",
+        state: "hermes_acp_refusal",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Host Hermes ACP refused the prompt.",
+      },
+      {
+        kind: "status",
+        state: "tokens",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Tokens: input 10 · output 20 · total 30",
+      },
+      {
+        kind: "status",
+        state: "windowed_bucket_exhausted",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Provider limit: 5h bucket exhausted (openai-codex · gpt-5.5 · resume 2026-01-01T05:00:00.000Z)",
+      },
+      {
+        kind: "status",
+        state: "rate_limits",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: 'Rate limits: {"provider":"cursor","remaining":0,"authorization":"[redacted]"}',
+      },
+    ]);
+    expect(messages.map((message) => message.kind)).not.toContain("assistant");
+    const serialized = JSON.stringify(messages);
+    expect(serialized).not.toContain("SECRET_PROVIDER_KEY");
+    expect(serialized).not.toContain("SECRET_RATE_TOKEN");
+    expect(serialized).not.toContain("Bearer");
+  });
+
   it("maps reasoning aliases to thinking with public text previews", () => {
     expect(
       projectWebTranscript([
@@ -283,7 +373,7 @@ describe("projectWebTranscript", () => {
     expect(messages.map((message) => message.kind)).not.toContain("assistant");
   });
 
-  it("groups display taxonomy events while hiding metadata and tool progress spam", () => {
+  it("groups display taxonomy events while surfacing tool/token/rate telemetry and hiding metadata", () => {
     const messages = projectWebTranscript([
       event({
         eventType: "session_started",
@@ -387,7 +477,29 @@ describe("projectWebTranscript", () => {
     ]);
 
     expect(messages).toEqual([
-      { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello" },
+      { kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hel" },
+      {
+        kind: "status",
+        state: "tokens",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Tokens: input 7 · output 3 · total 10",
+      },
+      {
+        kind: "tool_call",
+        ts: "2026-01-01T00:00:00.000Z",
+        call_id: "run-1:1",
+        name: "terminal",
+        status: "running",
+        args: {},
+        result: null,
+      },
+      {
+        kind: "status",
+        state: "rate_limits",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: 'Rate limits: {"apiKey":"[redacted]"}',
+      },
+      { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "lo" },
       {
         kind: "tool_call",
         ts: "2026-01-01T00:00:02.000Z",
@@ -407,7 +519,7 @@ describe("projectWebTranscript", () => {
         kind: "status",
         state: "windowed_bucket_exhausted",
         ts: "2026-01-01T00:00:05.000Z",
-        text: "Provider paused until quota resets",
+        text: "Provider limit: Provider paused until quota resets",
       },
       { kind: "status", state: "completed", ts: "2026-01-01T00:00:06.000Z", text: "Worker completed" },
       { kind: "status", state: "failed", ts: "2026-01-01T00:00:07.000Z", text: "Worker failed" },
@@ -418,12 +530,12 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("internal-run");
     expect(serialized).not.toContain("internal-session");
     expect(serialized).not.toContain("run_status");
-    expect(serialized).not.toContain("rate_limits");
-    expect(serialized).not.toContain("tokens");
+    expect(serialized).toContain("Tokens: input 7");
+    expect(serialized).toContain("Rate limits:");
     expect(serialized).not.toContain("Hermes tool terminal: ");
   });
 
-  it("shows canonical token summaries while preserving raw legacy token telemetry as hidden metadata", () => {
+  it("shows canonical token summaries while preserving raw token telemetry without public counts as hidden metadata", () => {
     const messages = projectWebTranscript([
       event({
         eventType: "tokens",
@@ -442,15 +554,15 @@ describe("projectWebTranscript", () => {
       event({
         eventType: "tokens",
         source: "harness",
-        payload: { type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 }, secret: "SECRET_TOKEN_SUMMARY" },
+        payload: { type: "tokens", secret: "SECRET_TOKEN_SUMMARY" },
         at: "2026-01-01T00:00:02.000Z",
         sequence: 3,
       }),
     ]);
 
     expect(messages).toEqual([
-      { kind: "status", state: "usage", ts: "2026-01-01T00:00:00.000Z", text: "Token usage updated" },
-      { kind: "status", state: "tokens", ts: "2026-01-01T00:00:01.000Z", text: "Fixture token update 12" },
+      { kind: "status", state: "usage", ts: "2026-01-01T00:00:00.000Z", text: "Tokens: input 4 · output 6 · total 10" },
+      { kind: "status", state: "tokens", ts: "2026-01-01T00:00:01.000Z", text: "Tokens: input 5 · output 7 · total 12" },
     ]);
     expect(JSON.stringify(messages)).not.toContain("SECRET_TOKEN_SUMMARY");
   });
@@ -542,7 +654,7 @@ describe("projectWebTranscript", () => {
         result: "tests passed",
         output: "tests passed",
       },
-      { kind: "status", state: "token_usage_reported", ts: "2026-01-01T00:00:05.000Z", text: "Token usage reported" },
+      { kind: "status", state: "token_usage_reported", ts: "2026-01-01T00:00:05.000Z", text: "Tokens: input 3 · output 5 · total 8" },
       { kind: "status", state: "runtime_diagnostic", ts: "2026-01-01T00:00:06.000Z", text: "permission denied" },
       { kind: "status", state: "run_cancelled", ts: "2026-01-01T00:00:07.000Z", text: "Run cancelled" },
       { kind: "status", state: "run_failed", ts: "2026-01-01T00:00:08.000Z", text: "Run failed token=[redacted]" },

@@ -403,16 +403,16 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       at: "2026-01-01T00:00:02.000Z",
       source: "harness",
       eventType: "progress",
-      message: "Hermes ACP tool terminal: SECRET_TOOL_PROGRESS",
-      payload: { type: "progress", activitySource: "tool", message: "Hermes ACP tool terminal: SECRET_TOOL_PROGRESS" },
+      message: "lo",
+      payload: { type: "progress", activitySource: "delta", message: "lo" },
     });
     await runStore.appendEvent({
       runId: "hermes-acp-run",
       at: "2026-01-01T00:00:03.000Z",
       source: "harness",
       eventType: "progress",
-      message: "lo",
-      payload: { type: "progress", activitySource: "delta", message: "lo" },
+      message: "Hermes ACP tool terminal: SECRET_TOOL_PROGRESS",
+      payload: { type: "progress", activitySource: "tool", message: "Hermes ACP tool terminal: SECRET_TOOL_PROGRESS" },
     });
     await runStore.appendEvent({
       runId: "hermes-acp-run",
@@ -431,6 +431,15 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expectRunPrelude(body, { session: "hermes-acp-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
+        {
+          kind: "tool_call",
+          ts: "2026-01-01T00:00:03.000Z",
+          call_id: "hermes-acp-run:3",
+          name: "terminal",
+          status: "running",
+          args: {},
+          result: null,
+        },
         { kind: "status", state: "cancelled", ts: "2026-01-01T00:00:04.000Z", text: "Run cancelled" },
       ]);
       expect(JSON.stringify(body)).not.toContain("SECRET_TOOL_PROGRESS");

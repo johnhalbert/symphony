@@ -11,6 +11,7 @@ export const DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE = [
   "Before any fail verdict, perform a bounded sibling-risk sweep. Do not pass by checking only the happy path, and do not stop at the first valid blocker.",
   "During the sweep, inspect related acceptance criteria, touched files, shared invariants, side-effect paths, and the general scenario matrix. Include every known blocking gap discovered from the current evidence in one well-specified requested-change set.",
   "For each fail finding, include the required behavior, concrete evidence, expected validation, sibling scenarios checked, and any related scenarios intentionally left unverified. Distinguish implementation defects, missing tests, ambiguous contracts, and out-of-scope follow-ups.",
+  "If the issue is missing `Contract Checklist` or `Validation Requirements`, derive conservative expected behavior from the issue text, touched files, repository invariants, and the general scenario matrix. Reviewers may fail missed required behavior or missing validation, but should describe the missing issue contract as an authoring gap rather than the implementation defect itself.",
 ].join("\n\n");
 
 export const DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE = [
@@ -19,6 +20,7 @@ export const DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE = [
   "When fixing review feedback, treat reviewer findings as the minimum required scope and address the underlying invariant, contract, or side-effect path behind the finding, not only the literal failing case.",
   "",
   "Before reporting completion, build a small scenario matrix for the touched behavior and use it to guide implementation and validation. Either fix adjacent cases that share the same invariant or call out why they are unrelated or out of scope.",
+  "If the issue lacks `Contract Checklist` or `Validation Requirements`, derive a conservative checklist from the acceptance criteria, touched surfaces, repository invariants, and the general scenario matrix. Mention the issue-authoring gap in the completion report without reducing validation scope.",
   "",
   "General software change matrix:",
   ...GENERAL_REVIEW_SCENARIO_MATRIX.map((item) => `- ${item}`),

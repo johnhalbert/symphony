@@ -690,7 +690,11 @@ describe("HermesAcpHarness", () => {
       mapHermesAcpSessionUpdate({ sessionUpdate: "available_commands_update", availableCommands: [{ name: "/help" }, { name: "/model" }] }),
     ).toEqual([{ type: "progress", activitySource: "stream", message: "Hermes ACP commands available: /help, /model" }]);
     expect(mapHermesAcpSessionUpdate({ sessionUpdate: "future_update", secret: "redacted" })).toEqual([
-      expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_session_update_unmapped" }),
+      expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_unknown_session_update" }),
+      expect.objectContaining({ type: "progress", message: "Hermes ACP future_update" }),
+    ]);
+    expect(mapHermesAcpSessionUpdate({ content: "missing discriminator" })).toEqual([
+      expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_malformed_session_update" }),
     ]);
   });
 
@@ -735,10 +739,32 @@ describe("HermesAcpHarness", () => {
     expect(activities).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "runtime", channel: "diagnostic", kind: "runtime_ready" }),
-        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "assistant", channel: "chat", kind: "assistant_message_delta", text: "hello" }),
+        expect.objectContaining({
+          protocol: "acp",
+          harness: "hermes_acp",
+          actor: "assistant",
+          channel: "chat",
+          kind: "assistant_message_delta",
+          text: "hello",
+          payload: expect.objectContaining({ updateKind: "agent_message_chunk", updateCategory: "message_chunk" }),
+        }),
         expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "assistant", channel: "chat", kind: "assistant_reasoning_delta" }),
-        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_started" }),
-        expect.objectContaining({ protocol: "acp", harness: "hermes_acp", actor: "tool", channel: "tool", kind: "tool_call_completed" }),
+        expect.objectContaining({
+          protocol: "acp",
+          harness: "hermes_acp",
+          actor: "tool",
+          channel: "tool",
+          kind: "tool_call_started",
+          payload: expect.objectContaining({ updateKind: "tool_call", updateCategory: "tool" }),
+        }),
+        expect.objectContaining({
+          protocol: "acp",
+          harness: "hermes_acp",
+          actor: "tool",
+          channel: "tool",
+          kind: "tool_call_completed",
+          payload: expect.objectContaining({ updateKind: "tool_call_update", updateCategory: "tool" }),
+        }),
         expect.objectContaining({
           protocol: "acp",
           harness: "hermes_acp",
@@ -805,12 +831,13 @@ describe("HermesAcpHarness", () => {
         expect.objectContaining({ type: "progress", activitySource: "stream", message: "Hermes ACP usage update: 9/100 context tokens" }),
         expect.objectContaining({ type: "tokens", tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } }),
         expect.objectContaining({ type: "progress", activitySource: "stream", message: "Hermes ACP commands available: /help" }),
-        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_session_update_unmapped" }),
+        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_unknown_session_update" }),
+        expect.objectContaining({ type: "progress", message: "Hermes ACP future_update" }),
         expect.objectContaining({ type: "completed", message: "hello world" }),
       ]),
     );
     expect(events.flatMap((event) => event.type === "progress" && event.activitySource === "delta" ? [event.message] : [])).toEqual([
-      "hello ",
+      "hello",
       "world",
     ]);
     expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "tokens", tokens: { totalTokens: 9 } })]));
@@ -831,6 +858,7 @@ describe("HermesAcpHarness", () => {
       "runtime_status_update",
       "available_commands_update",
       "runtime_diagnostic",
+      "runtime_status_update",
       "token_usage_reported",
       "run_succeeded",
     ]);
@@ -1436,7 +1464,7 @@ describe("HermesAcpHarness", () => {
       tool_call_completed: 1,
       tool_call_failed: 1,
       assistant_message_delta: 2,
-      runtime_status_update: 1,
+      runtime_status_update: 2,
       available_commands_update: 1,
       runtime_diagnostic: 4,
       token_usage_reported: 1,
@@ -1459,7 +1487,7 @@ describe("HermesAcpHarness", () => {
     expect(transcript.events.filter((event) => event.eventType === "runtime_diagnostic").map((event) => event.payload)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ code: "hermes_acp_lease_reuse_decision" }),
-        expect.objectContaining({ code: "hermes_acp_session_update_unmapped" }),
+        expect.objectContaining({ code: "hermes_acp_unknown_session_update" }),
         expect.objectContaining({ code: "host_hermes_notice", severity: "info" }),
         expect.objectContaining({ code: "hermes_acp_permission_denied", severity: "warning" }),
       ]),
@@ -1508,7 +1536,12 @@ describe("HermesAcpHarness", () => {
     expect(transcriptEvents.map((event) => event.payload)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ kind: "runtime_diagnostic", code: "host_hermes_notice", severity: "info" }),
-        expect.objectContaining({ kind: "runtime_diagnostic", code: "hermes_acp_permission_denied", severity: "warning" }),
+        expect.objectContaining({
+          kind: "runtime_diagnostic",
+          code: "hermes_acp_permission_denied",
+          severity: "warning",
+          outcome: "cancelled",
+        }),
       ]),
     );
     const projectedStates = projectWebTranscript(transcriptEvents).flatMap((message) => message.kind === "status" ? [message.state] : []);
@@ -1559,6 +1592,7 @@ describe("HermesAcpHarness", () => {
           payload: expect.objectContaining({
             kind: "runtime_status_update",
             status: "permission_selected",
+            outcome: "selected",
             selectedOptionId: "allow_once",
             requestKind: "terminal_execute",
           }),

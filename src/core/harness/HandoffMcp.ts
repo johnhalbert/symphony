@@ -84,6 +84,7 @@ export function renderCompletionMcpHandoffPrompt(input: RuntimeHandoffPromptInpu
     `- Repository path: ${input.repoPath ?? "n/a"}`,
     `- Base ref: ${input.baseRef ?? "n/a"}`,
     "- Before ending the run, call the submit_completion_report MCP tool with summary, validationEvidence, acceptanceChecklist, changedFiles, branchName, pullRequest, risks, and idempotencyKey.",
+    "- Leave implementation changes uncommitted and unpushed in the assigned worktree. Do not run git commit, git push, gh pr create, or gh pr edit; Symphony performs service-owned commit, push, and PR creation/reuse after the completion report is accepted.",
     "- The MCP server is scoped to this issue and the current runtime run; Symphony injects runId and issueId for you.",
     "- Do not comment on Linear, transition Linear state, or request broad Linear write credentials. Symphony handles writeback after the tool accepts the report.",
   ].join("\n");
@@ -98,6 +99,9 @@ export function renderIssueBreakdownMcpHandoffPrompt(input: RuntimeHandoffPrompt
     "- Active phase: issue_breakdown",
     "- Before ending the run, call the submit_issue_breakdown_plan MCP tool with summary, proposedIssues, and idempotencyKey.",
     "- Each proposed issue must include title, description, acceptanceCriteria, dependencies, and labels.",
+    "- Each proposed issue description must use the required agent-eligible section headings: `Problem / Goal`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.",
+    "- Use the same section names for docs-only and implementation issue drafts; do not include secrets, tokens, private keys, or credential values.",
+    "- Do not include `dogfood-ready` automatically in proposed labels. Operators add readiness labels only after reviewing the contract checklist and validation plan.",
     "- Do not call submit_completion_report, comment on Linear, transition Linear state, or create child issues.",
     "- Symphony persists the plan locally and injects it into the later implementation prompt after validation.",
   ].join("\n");

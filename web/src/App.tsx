@@ -129,9 +129,9 @@ function AppShell({
           onTabChange={setActiveTab}
           tabBadges={tabBadges}
           runningCount={runningCount}
-          repoLabel={dashboardChrome?.repoLabel ?? ""}
+          repoLabel={dashboardChrome?.repoLabel ?? "repository unavailable"}
           branch={dashboardChrome?.branch ?? ""}
-          pollLabel={dashboardChrome?.pollLabel ?? (apiMode ? "poll pending" : "poll unavailable")}
+          pollLabel={dashboardChrome?.pollLabel ?? "poll unavailable"}
           agentUsageLabel={dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`}
           connectionStatusLabel={dashboardChrome?.metrics?.health?.connectionLabel ?? undefined}
           errorStatusLabel={dashboardChrome?.metrics?.health?.errorSummaryLabel ?? undefined}
@@ -161,7 +161,6 @@ function AppShell({
                   dashboard={data}
                   variant={dashboardVariant}
                   useModelBurnupTotals={apiMode}
-                  orchestratorChatReadOnly={apiMode}
                   orchestratorChat={orchestratorChat.data ?? []}
                   orchestratorChatError={orchestratorChat.error}
                   orchestratorChatLoading={orchestratorChat.loading}
@@ -179,7 +178,6 @@ function AppShell({
                 <SidebarViews
                   sidebar={data}
                   variant={sidebarVariant}
-                  orchestratorChatReadOnly={apiMode}
                   orchestratorChat={orchestratorChat.data ?? []}
                   orchestratorChatError={orchestratorChat.error}
                   orchestratorChatLoading={orchestratorChat.loading}

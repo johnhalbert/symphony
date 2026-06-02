@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { IssueDetailsEnvelope } from "../src/core/types.js";
+import type { IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
 import {
   clampIssuePriority,
@@ -185,6 +186,38 @@ function run(overrides: Partial<RunRecord> = {}): RunRecord {
     cursorModel: "gpt-test",
     ...overrides,
   };
+}
+
+function lifecycle(overrides: Partial<IssueLifecycleRecord> = {}): IssueLifecycleRecord {
+  const issueId = overrides.issueId ?? "issue-1";
+  const issueIdentifier = overrides.issueIdentifier ?? "TEST-1";
+  const updatedAt = overrides.updatedAt ?? "2026-01-01T00:10:00.000Z";
+  const summaryPointers = {
+    workspaceKey: null,
+    workspacePath: null,
+    branchName: null,
+    gitBranchName: null,
+    repoPath: null,
+    baseRef: null,
+    lastRunId: null,
+    prUrl: null,
+    prNumber: null,
+    prHeadSha: null,
+    prBranch: null,
+    ciStatus: null,
+    lastPushedAt: null,
+    lastEvidenceCursor: null,
+    ...(overrides.summaryPointers ?? {}),
+  };
+  return {
+    issueId,
+    issueIdentifier,
+    phase: "implementation",
+    updatedAt,
+    createdAt: overrides.createdAt ?? updatedAt,
+    ...overrides,
+    summaryPointers,
+  } as IssueLifecycleRecord;
 }
 
 describe("web projection foundation", () => {
@@ -698,6 +731,130 @@ describe("web projection foundation", () => {
     });
   });
 
+  it("derives dashboard totals and active agents from durable run and lifecycle state when board/runtime data is incomplete", () => {
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      board: {
+        issues: [
+          webCard("TEST-BOARD", { issueId: "issue-board", lane: "todo", state: "Todo" }),
+          webCard("TEST-RUNNING", { issueId: "issue-running", lane: "progress", state: "In Progress" }),
+        ],
+      },
+      runtime: null,
+      runs: [
+        run({
+          runId: "run-running",
+          issueId: "issue-running",
+          issueIdentifier: "TEST-RUNNING",
+          workspaceKey: "TEST-RUNNING",
+          status: "running",
+          completedAt: null,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:14:00.000Z",
+          tokens: { inputTokens: 10, outputTokens: 15, totalTokens: 25 },
+        }),
+        run({
+          runId: "run-done",
+          issueId: "issue-done",
+          issueIdentifier: "TEST-DONE",
+          workspaceKey: "TEST-DONE",
+          status: "succeeded",
+        }),
+        run({
+          runId: "run-cancelled",
+          issueId: "issue-cancelled",
+          issueIdentifier: "TEST-CANCELLED",
+          workspaceKey: "TEST-CANCELLED",
+          status: "cancelled",
+        }),
+        run({
+          runId: "run-failed",
+          issueId: "issue-failed",
+          issueIdentifier: "TEST-FAILED",
+          workspaceKey: "TEST-FAILED",
+          status: "failed",
+        }),
+      ],
+      lifecycleRecords: [
+        lifecycle({ issueId: "issue-running", issueIdentifier: "TEST-RUNNING", phase: "implementation" }),
+        lifecycle({ issueId: "issue-done", issueIdentifier: "TEST-DONE", phase: "terminal" }),
+        lifecycle({ issueId: "issue-review", issueIdentifier: "TEST-REVIEW", phase: "review" }),
+      ],
+      config: { concurrencyCap: 3 },
+    });
+
+    expect(dashboard.totals).toEqual({
+      backlog: 0,
+      todo: 1,
+      progress: 2,
+      review: 1,
+      done: 1,
+      cancelled: 1,
+      open: 4,
+      all: 6,
+      completeness: 17,
+    });
+    expect(dashboard.runningAgents).toEqual([
+      {
+        id: "run-running",
+        issue: "TEST-RUNNING",
+        title: "TEST-RUNNING",
+        state: "running",
+        step: "implementation",
+        duration: "15m",
+        tokens: "25",
+      },
+    ]);
+    expect(dashboard.agentUsageLabel).toBe("1/3 agents");
+    expect(JSON.stringify(dashboard)).not.toContain("mock");
+  });
+
+  it("prefers live runtime agent rows over matching durable running records without double-counting usage", () => {
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      runtime: {
+        generatedAt: "2026-01-01T00:15:00.000Z",
+        running: [
+          {
+            issueId: "issue-running",
+            issueIdentifier: "TEST-RUNNING",
+            runId: "run-running",
+            startedAt: "2026-01-01T00:05:00.000Z",
+            lastMessage: "runtime heartbeat",
+            state: "running",
+            tokens: { totalTokens: 10 },
+          },
+        ],
+        providerGates: [],
+      } as any,
+      runs: [
+        run({
+          runId: "run-running",
+          issueId: "issue-running",
+          issueIdentifier: "TEST-RUNNING",
+          workspaceKey: "TEST-RUNNING",
+          status: "running",
+          completedAt: null,
+          tokens: { inputTokens: 9, outputTokens: 9, totalTokens: 18 },
+        }),
+      ],
+      config: { concurrencyCap: 2 },
+    });
+
+    expect(dashboard.runningAgents).toEqual([
+      {
+        id: "run-running",
+        issue: "TEST-RUNNING",
+        title: "TEST-RUNNING",
+        state: "running",
+        step: "runtime heartbeat",
+        duration: "10m",
+        tokens: "10",
+      },
+    ]);
+    expect(dashboard.agentUsageLabel).toBe("1/2 agents");
+  });
+
   it("composes the web sidebar model directly from dashboard, issue, history, and chat projections", () => {
     const issues = projectWebIssueBoard({
       issues: [
@@ -967,20 +1124,27 @@ describe("web projection foundation", () => {
     expect(JSON.stringify(legacyDashboard)).not.toContain("assistant suggestion");
   });
 
-  it("projects orchestrator chat as the exact empty default without mock content", () => {
+  it("projects orchestrator chat as an empty default and maps durable messages without mock content", () => {
     const chat = projectWebOrchestratorChat();
     const replay = projectWebOrchestratorChat();
     const postChat = projectWebOrchestratorChatPost("please inspect ENG-94");
+    const durableChat = projectWebOrchestratorChat([
+      { who: "agent", text: "  ready  ", suggestions: [" status ", "", "inspect ENG-123"] },
+      { who: "user", text: "pause ENG-123" },
+    ]);
 
     expect(chat).toEqual([]);
     expect(replay).toEqual([]);
-    expect(postChat).toEqual([]);
+    expect(postChat).toEqual([{ who: "user", text: "please inspect ENG-94" }]);
+    expect(durableChat).toEqual([
+      { who: "agent", text: "  ready  ", suggestions: ["status", "inspect ENG-123"] },
+      { who: "user", text: "pause ENG-123" },
+    ]);
     expect(replay).not.toBe(chat);
     expect(postChat).not.toBe(chat);
+    expect(durableChat).not.toBe(chat);
     expect(JSON.stringify(chat)).not.toContain("assistant");
-    expect(JSON.stringify(postChat)).not.toContain("assistant");
-    expect(JSON.stringify(postChat)).not.toContain("please inspect ENG-94");
-    expect(JSON.stringify(postChat)).not.toContain("suggestion");
-    expect(JSON.stringify(postChat)).not.toContain("command");
+    expect(JSON.stringify(durableChat)).not.toContain("mock");
+    expect(JSON.stringify(durableChat)).not.toContain("assistant");
   });
 });

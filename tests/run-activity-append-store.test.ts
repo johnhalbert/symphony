@@ -204,6 +204,24 @@ describe("RunActivityAppendStore", () => {
     ]);
   });
 
+  it("reads paginated Postgres source-table events by run id for projection rebuilds", async () => {
+    const client = new FakeRunActivityPostgresClient();
+    const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+
+    await store.appendEvents([
+      statusActivityInput({ id: "activity-page-1", runId: "run-postgres", sessionId: "session-postgres", sequence: 1 }),
+      statusActivityInput({ id: "activity-other-run", runId: "run-other", sessionId: "session-other", sequence: 1 }),
+      statusActivityInput({ id: "activity-page-2", runId: "run-postgres", sessionId: "session-postgres", sequence: 2 }),
+    ]);
+
+    const page = await store.readRunEvents("run-postgres", { offset: 0, limit: 1 });
+
+    expect(page).toMatchObject({ runId: "run-postgres", offset: 0, limit: 1, nextOffset: 1, total: 2 });
+    expect(page.events.map((stored) => stored.event.eventId)).toEqual(["activity-page-1"]);
+    expect(client.released).toBe(true);
+    expect(client.normalizedStatements.some((statement) => statement.includes("WHERE run_id = $1"))).toBe(true);
+  });
+
   it("rolls back and releases the Postgres client when a transactional append fails", async () => {
     const client = new FakeRunActivityPostgresClient({ failInserts: true });
     const store = new PostgresRunActivityAppendStore({ connect: async () => client });
@@ -241,7 +259,24 @@ class FakeRunActivityPostgresClient implements PostgresRunActivityAppendClient {
       return { rows: runIds.map((run_id) => ({ run_id }) as unknown as T) };
     }
 
+    if (normalized.startsWith("SELECT count(*)::bigint AS total FROM symphony.run_activity_event")) {
+      const runId = values?.[0];
+      const total = this.rows.filter((row) => row.run_id === runId).length;
+      return { rows: [{ total: String(total) } as unknown as T] };
+    }
+
     if (normalized.startsWith("SELECT run_activity_event_id::text AS append_revision")) {
+      if (normalized.includes("WHERE run_id = $1")) {
+        const runId = values?.[0];
+        const limit = Number(values?.[1] ?? 100);
+        const offset = Number(values?.[2] ?? 0);
+        return {
+          rows: this.rows
+            .filter((row) => row.run_id === runId)
+            .sort((left, right) => Number(left.sequence) - Number(right.sequence))
+            .slice(offset, offset + limit) as T[],
+        };
+      }
       return { rows: this.rows as T[] };
     }
 

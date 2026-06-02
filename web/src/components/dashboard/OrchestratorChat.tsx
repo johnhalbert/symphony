@@ -22,6 +22,7 @@ export function OrchestratorChat({
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
   const hasNoMessages = messages.length === 0;
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this web chat is not supported yet; no orchestrator action will be dispatched.";
@@ -31,9 +32,12 @@ export function OrchestratorChat({
     const trimmed = input.trim();
     if (readOnly || !trimmed || sending) return;
     setSending(true);
+    setSendError(null);
     try {
       await onSend(trimmed);
       setDraft("");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : String(error));
     } finally {
       setSending(false);
     }
@@ -55,6 +59,7 @@ export function OrchestratorChat({
       <div className="chat__body">
         {loading && hasNoMessages ? <div className="view-loading">Loading orchestrator chat...</div> : null}
         {error ? <div className="view-error">Orchestrator chat unavailable: {error}</div> : null}
+        {sendError ? <div className="view-error">Orchestrator command failed: {sendError}</div> : null}
         {!loading && !error && hasNoMessages ? <div className="view-empty">No durable orchestrator chat messages are available yet.</div> : null}
         {messages.map((message, index) => (
           <div className="chat__msg" key={`${message.who}-${index}-${message.text}`}>

@@ -57,6 +57,29 @@ describe("StatusServer realtime SSE API", () => {
     );
     expect(transcript.recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
 
+    for (const chatSource of [
+      "orchestrator_conversations",
+      "orchestrator_conversations:orchestrator-default",
+      "orchestrator_chat:orchestrator-default",
+      "orchestrator-chat",
+    ]) {
+      const chatEvents = bus.publishProjectionRevision({
+        source: chatSource,
+        revision: `revision-for-${chatSource}`,
+        observedAt: "2026-01-01T00:00:00.000Z",
+      });
+      const chatMessage = requireEvent(chatEvents.find((event) => event.type === "orchestrator.message"));
+      expect(chatMessage).toMatchObject({
+        type: "orchestrator.message",
+        source: { source: chatSource },
+        recovery: { strategy: "refetch", reason: "event", lastEventId: null },
+      });
+      expect(chatMessage.resources).toEqual(
+        expect.arrayContaining([{ kind: "orchestrator-chat", href: "/api/v1/web/orchestrator-chat", relation: "refetch" }]),
+      );
+      expect(chatMessage.recovery.endpoints).toContain("/api/v1/web/orchestrator-chat");
+    }
+
     const serialized = serializeSseEvent(projection);
     expect(serialized).toContain("id: 1\n");
     expect(serialized).toContain("event: projection.updated\n");
@@ -234,6 +257,75 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
+  it("publishes store-driven assistant and system conversation writes as orchestrator chat realtime events", async () => {
+    const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state"));
+    const server = createRealtimeServer({ orchestratorConversationStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      const assistant = await orchestratorConversationStore.appendMessage({
+        conversationId: "operator-room",
+        role: "assistant",
+        body: "I can help inspect the queue.",
+        status: "streaming",
+        at: "2026-01-01T00:00:00.000Z",
+      });
+      const assistantAppend = await client.nextEventOfType("orchestrator.message");
+      expect(assistantAppend.data).toMatchObject({
+        type: "orchestrator.message",
+        source: { source: "orchestrator_conversations", revision: 1 },
+        recovery: { strategy: "refetch", reason: "event" },
+      });
+      expect((assistantAppend.data as RealtimeProjectionEvent).resources).toEqual(
+        expect.arrayContaining([{ kind: "orchestrator-chat", href: "/api/v1/web/orchestrator-chat", relation: "refetch" }]),
+      );
+      expect((assistantAppend.data as RealtimeProjectionEvent).recovery.endpoints).toContain(
+        "/api/v1/web/orchestrator-chat",
+      );
+
+      await orchestratorConversationStore.updateMessage({
+        conversationId: assistant.conversationId,
+        messageId: assistant.id,
+        status: "completed",
+        body: "I found the queue summary.",
+        at: "2026-01-01T00:00:01.000Z",
+      });
+      const assistantUpdate = await client.nextEventOfType("orchestrator.message");
+      expect(assistantUpdate.data).toMatchObject({
+        type: "orchestrator.message",
+        source: { source: "orchestrator_conversations", revision: 2 },
+        recovery: { strategy: "refetch", reason: "event" },
+      });
+      expect((assistantUpdate.data as RealtimeProjectionEvent).recovery.endpoints).toContain(
+        "/api/v1/web/orchestrator-chat",
+      );
+
+      await orchestratorConversationStore.appendMessage({
+        conversationId: "operator-room",
+        role: "system",
+        body: "System note: summary persisted.",
+        status: "completed",
+        at: "2026-01-01T00:00:02.000Z",
+      });
+      const systemAppend = await client.nextEventOfType("orchestrator.message");
+      expect(systemAppend.data).toMatchObject({
+        type: "orchestrator.message",
+        source: { source: "orchestrator_conversations", revision: 3 },
+        recovery: { strategy: "refetch", reason: "event" },
+      });
+      expect((systemAppend.data as RealtimeProjectionEvent).resources).toEqual(
+        expect.arrayContaining([{ kind: "orchestrator-chat", href: "/api/v1/web/orchestrator-chat", relation: "refetch" }]),
+      );
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
   it("emits missed-event recovery hints and orchestrator chat message events", async () => {
     const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state"));
     const server = createRealtimeServer({ orchestratorConversationStore });
@@ -267,7 +359,17 @@ describe("StatusServer realtime SSE API", () => {
         expect(chatResponse.status).toBe(202);
         await expect(chatResponse.json()).resolves.toMatchObject([{ text: "hello from the operator" }]);
 
-        const chat = await chatClient.nextEventOfType("orchestrator.message");
+        const storeChat = await chatClient.nextEventOfType("orchestrator.message");
+        expect(storeChat.data).toMatchObject({
+          type: "orchestrator.message",
+          source: { source: "orchestrator_conversations" },
+          recovery: { strategy: "refetch", reason: "event" },
+        });
+        expect((storeChat.data as RealtimeProjectionEvent).recovery.endpoints).toContain(
+          "/api/v1/web/orchestrator-chat",
+        );
+
+        const chat = await nextEventOfTypeFromSource(chatClient, "orchestrator.message", "orchestrator-chat");
         expect(chat.data).toMatchObject({
           type: "orchestrator.message",
           source: { source: "orchestrator-chat" },
@@ -488,6 +590,21 @@ function parseSseBlock(raw: string): ParsedSseEvent | null {
   }
   if (data.length === 0) return null;
   return { id, event, data: JSON.parse(data.join("\n")), raw };
+}
+
+async function nextEventOfTypeFromSource(
+  client: SseTestClient,
+  type: RealtimeProjectionEventType,
+  source: string,
+  timeoutMs = 2_000,
+): Promise<ParsedSseEvent> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const remaining = timeoutMs - (Date.now() - startedAt);
+    const event = await client.nextEventOfType(type, remaining);
+    if ((event.data as RealtimeProjectionEvent).source.source === source) return event;
+  }
+  throw new Error(`Timed out waiting for SSE event type ${type} from source ${source}`);
 }
 
 async function waitFor(predicate: () => boolean, description: string, timeoutMs = 2_000): Promise<void> {

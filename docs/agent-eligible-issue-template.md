@@ -1,0 +1,62 @@
+# Agent-Eligible Linear Issue Template
+
+Use this template before an issue is promoted for Symphony agent dispatch. It applies to docs-only issues and implementation issues; keep the section names exactly as written so prompt guidance, reviewers, and doctor lint all evaluate the same contract.
+
+Do not include secrets, tokens, private keys, credential values, or private customer data. Describe credential boundaries and required credential states without pasting values.
+
+```markdown
+## Problem / Goal
+
+Describe the workflow-visible or user-visible problem and the intended outcome.
+
+## Touched Surfaces
+
+Mark every surface that the issue is expected to touch.
+
+- [ ] API/projection
+- [ ] UI
+- [ ] MCP/tool contract
+- [ ] Runtime harness/transcript mapping
+- [ ] Lifecycle/persistence/replay
+- [ ] Writeback/tracker
+- [ ] Publication/GitHub/merge gate
+- [ ] Credentials/security
+- [ ] Config/workflow prompt
+- [ ] Docs only
+
+## Acceptance Criteria
+
+- A concrete, reviewable behavior or artifact that must exist when the issue is complete.
+- Include externally visible side effects when applicable, not only internal implementation steps.
+
+## Contract Checklist
+
+- Happy path:
+- Negative/error path:
+- Adjacent sibling surface:
+- Empty/missing/stale/fallback state:
+- Replay/restart/idempotency:
+- Credential/security boundary:
+- Side-effect verification:
+
+## Validation Requirements
+
+- Name the smallest meaningful unit or integration tests.
+- Name broader validation when shared orchestration, workflow, tracker, harness, or persistence code is touched.
+- Include manual or API checks needed to verify side effects actually happened.
+
+## Out Of Scope
+
+- List related behavior that should not be implemented in this slice.
+
+## Promotion Readiness
+
+- Ready for `dogfood-ready`: yes/no
+- Remaining blocker:
+```
+
+## Promotion Rules
+
+An issue must not receive `dogfood-ready` until an operator has reviewed the completed contract checklist and validation plan. If the issue is still blocked, leave `dogfood-blocked` in place. Remove `dogfood-blocked` and add `dogfood-ready` only after the operator confirms the required sections are present, the validation plan is concrete, and no open blockers remain.
+
+The template does not authorize automatic label changes. AI issue drafters should propose the contract and readiness recommendation, then leave promotion labels for operator review.

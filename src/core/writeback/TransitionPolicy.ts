@@ -620,12 +620,16 @@ export function planMergeGateRepairWritebacks(
   const conflict = context.mergeability?.status === "conflicted";
   const requiredAction = conflict
     ? [
-        "Fetch the latest upstream changes from origin/main, rebase the lifecycle-bound PR branch over origin/main, resolve merge conflicts, commit and push the repaired branch, validate the requested checks, and submit a new completion report.",
+        "Fetch the latest upstream changes from origin/main, reconcile the lifecycle-bound PR changes with origin/main, resolve merge conflicts, validate the requested checks, leave the final implementation changes uncommitted and unpushed in the assigned worktree, and submit a new completion report.",
+        "Do not run git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned commit, push, and PR publication/reuse after accepting the completion report.",
         hasActionableCheckBlockers(context)
           ? "Also fix the failing or missing required checks before submitting the completion report."
           : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
       ].join(" ")
-    : "Fix the failing required checks, push the repair to the lifecycle-bound PR branch, validate it, and submit a new completion report.";
+    : [
+        "Fix the failing required checks in the assigned worktree, validate the repair, leave the final implementation changes uncommitted and unpushed, and submit a new completion report.",
+        "Do not run git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned commit, push, and PR publication/reuse after accepting the completion report.",
+      ].join(" ");
   return [
     mergeGateCommentOperation(
       context,

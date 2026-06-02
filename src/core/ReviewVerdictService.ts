@@ -275,12 +275,17 @@ export function formatWorkerMergeGatePromptResult(lifecycle: IssueLifecycleRecor
   const conflict = gate.mergeability?.status === "conflicted";
   const requiredAction = conflict
     ? [
-        "Fetch the latest upstream changes from origin/main, rebase the lifecycle-bound PR branch over origin/main, resolve merge conflicts, commit and push the repaired branch, validate the requested checks, and submit a normal completion report.",
+        "Fetch the latest upstream changes from origin/main, reconcile the lifecycle-bound PR changes with origin/main, resolve merge conflicts, validate the requested checks, leave the final implementation changes uncommitted and unpushed in the assigned worktree, and submit a normal completion report.",
+        "Do not run git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned commit, push, and PR publication/reuse after accepting the completion report.",
         actionable.length > 0
           ? "Also fix the failing or missing required checks before submitting the completion report."
           : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
       ].join(" ")
-    : "Fix failing checks or restore missing actionable required checks on the lifecycle-bound PR branch, then submit a completion report. Symphony will re-fetch GitHub checks and PR mergeability before clearing this blocker.";
+    : [
+        "Fix failing checks or restore missing actionable required checks in the assigned worktree, validate the repair, leave the final implementation changes uncommitted and unpushed, and submit a completion report.",
+        "Do not run git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned commit, push, and PR publication/reuse after accepting the completion report.",
+        "Symphony will re-fetch GitHub checks and PR mergeability before clearing this blocker.",
+      ].join(" ");
   return {
     kind: "repair",
     text: [
