@@ -5,6 +5,7 @@ import path from "node:path";
 import type { WorkspaceSourceConfig } from "../config/Config.js";
 import { SymphonyError } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
+import { serviceOwnedGitCommandEnv } from "../harness/AgentCommandPolicy.js";
 
 export interface CreateWorktreeOptions {
   source: WorkspaceSourceConfig;
@@ -231,7 +232,7 @@ function runCommand(
   options: { allowFailure?: boolean } = {},
 ): Promise<GitResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { cwd, env: serviceOwnedGitCommandEnv(), stdio: ["ignore", "pipe", "pipe"] });
     let settled = false;
     let stdout = "";
     let stderr = "";

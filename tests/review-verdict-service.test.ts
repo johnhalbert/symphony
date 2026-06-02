@@ -305,7 +305,7 @@ describe("ReviewVerdictService", () => {
     );
 
     expect(result?.kind).toBe("repair");
-    expect(result?.text).toContain("reconcile the lifecycle-bound PR changes with origin/main");
+    expect(result?.text).toContain("reconcile the lifecycle-bound PR changes with the prepared base");
     expect(result?.text).toContain("leave the final implementation changes uncommitted and unpushed");
     expect(result?.text).toContain("Symphony performs service-owned commit, push, and PR publication/reuse");
     expect(result?.text).not.toContain("commit and push the repaired branch");

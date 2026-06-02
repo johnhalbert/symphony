@@ -34,6 +34,9 @@ import sys
 import time
 import threading
 import unittest
+import shutil
+import subprocess
+import tempfile
 from unittest.mock import patch, MagicMock
 
 from tools.code_execution_tool import (
@@ -151,8 +154,8 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
             def execute(self, command, cwd=None, timeout=None):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
-                    return {"output": "OK\n"}
-                if "python3 script.py" in command:
+                    return {"output": "/usr/bin/python3\n", "returncode": 0}
+                if "/usr/bin/python3 script.py" in command:
                     return {"output": "hello\n", "returncode": 0}
                 return {"output": ""}
 
@@ -167,12 +170,137 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
 
         self.assertEqual(result["status"], "success")
         mkdir_cmd = env.commands[1][0]
-        run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 script.py" in cmd)
+        run_cmd = next(cmd for cmd, _, _ in env.commands if "/usr/bin/python3 script.py" in cmd)
         cleanup_cmd = env.commands[-1][0]
         self.assertIn("mkdir -p /data/data/com.termux/files/usr/tmp/hermes_exec_", mkdir_cmd)
         self.assertIn("HERMES_RPC_DIR=/data/data/com.termux/files/usr/tmp/hermes_exec_", run_cmd)
         self.assertIn("rm -rf /data/data/com.termux/files/usr/tmp/hermes_exec_", cleanup_cmd)
         self.assertNotIn("mkdir -p /tmp/hermes_exec_", mkdir_cmd)
+
+    def test_worker_policy_remote_prefix_preserves_path_expansion(self):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def get_temp_dir(self):
+                return "/tmp/hermes remote"
+
+            def execute(self, command, cwd=None, timeout=None):
+                self.commands.append((command, cwd, timeout))
+                if "command -v python3" in command:
+                    return {"output": "/usr/bin/python3\n", "returncode": 0}
+                if "/usr/bin/python3 script.py" in command:
+                    return {"output": "hello\n", "returncode": 0}
+                return {"output": ""}
+
+        env = FakeEnv()
+        fake_thread = MagicMock()
+
+        with patch.dict(os.environ, {
+            "SYMPHONY_AGENT_COMMAND_POLICY": "worker_reviewer_github_upstream_block",
+            "SYMPHONY_AGENT_ROLE": "worker",
+        }, clear=False), \
+             patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5}), \
+             patch("tools.code_execution_tool._get_or_create_env", return_value=(env, "ssh")), \
+             patch("tools.code_execution_tool._ship_file_to_remote") as ship_mock, \
+             patch("tools.code_execution_tool.threading.Thread", return_value=fake_thread):
+            result = json.loads(_execute_remote("print('hello')", "task-1", ["terminal"]))
+
+        self.assertEqual(result["status"], "success")
+        run_cmd = next(cmd for cmd, _, _ in env.commands if "/usr/bin/python3 script.py" in cmd)
+        self.assertRegex(run_cmd, r"PATH='/tmp/hermes remote/hermes_exec_[^']+/bin':\$PATH")
+        self.assertRegex(run_cmd, r"PYTHONPATH='/tmp/hermes remote/hermes_exec_[^']+':\$\{PYTHONPATH:-\}")
+        self.assertNotIn(":$PATH'", run_cmd)
+        self.assertNotIn(":${PYTHONPATH:-}'", run_cmd)
+        python_shim = next(
+            content
+            for call in ship_mock.call_args_list
+            for remote_path, content in [call.args[1:3]]
+            if remote_path.endswith("/bin/python3")
+        )
+        self.assertIn("exec /usr/bin/python3", python_shim)
+        self.assertIn("/tools/worker_github_policy.py", python_shim)
+        self.assertNotIn("-m tools.worker_github_policy", python_shim)
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX remote execute_code policy behavior uses shell commands")
+    def test_worker_policy_remote_execute_runs_real_python_and_blocks_child_github_subprocesses(self):
+        if shutil.which("python3") is None or shutil.which("base64") is None:
+            self.skipTest("python3 and base64 are required for local POSIX remote simulation")
+
+        class LocalRemoteEnv:
+            def __init__(self, temp_dir):
+                self.temp_dir = temp_dir
+                self.commands = []
+
+            def get_temp_dir(self):
+                return self.temp_dir
+
+            def execute(self, command, cwd=None, timeout=None):
+                self.commands.append((command, cwd, timeout))
+                completed = subprocess.run(
+                    command,
+                    shell=True,
+                    cwd=None if cwd in (None, "/") else cwd,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                return {
+                    "output": (completed.stdout or "") + (completed.stderr or ""),
+                    "returncode": completed.returncode,
+                }
+
+        code = r'''
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+
+fake_bin = tempfile.mkdtemp(prefix="remote-fake-git-", dir=os.getcwd())
+fake_git = os.path.join(fake_bin, "git")
+with open(fake_git, "w", encoding="utf-8") as handle:
+    handle.write("#!/bin/sh\necho FAKE_GIT_RAN >&2\nexit 99\n")
+os.chmod(fake_git, 0o755)
+payload = f"import subprocess; subprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)"
+cases = [
+    [fake_git, "fetch", "origin"],
+    [sys.executable, "-c", payload],
+    ["env", "-i", f"PATH={fake_bin}", "git", "fetch", "origin"],
+    ["sh", "-c", "PYTHONPATH= " + shlex.quote(sys.executable) + " -c " + shlex.quote(payload)],
+]
+blocked = 0
+for argv in cases:
+    try:
+        subprocess.run(argv, check=True)
+    except PermissionError as exc:
+        assert "GitHub command policy" in str(exc)
+        blocked += 1
+    else:
+        raise AssertionError(f"remote policy bypass was not blocked before fake git ran: {argv!r}")
+print(f"REMOTE_POLICY_BLOCKS={blocked}")
+print("REMOTE_OK")
+'''
+
+        with tempfile.TemporaryDirectory(prefix="hermes remote ") as temp_dir:
+            env = LocalRemoteEnv(temp_dir)
+            fake_thread = MagicMock()
+            with patch.dict(os.environ, {
+                "SYMPHONY_AGENT_COMMAND_POLICY": "worker_reviewer_github_upstream_block",
+                "SYMPHONY_AGENT_ROLE": "worker",
+                "HERMES_YOLO_MODE": "1",
+            }, clear=False), \
+                 patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5}), \
+                 patch("tools.code_execution_tool._get_or_create_env", return_value=(env, "ssh")), \
+                 patch("tools.code_execution_tool.threading.Thread", return_value=fake_thread):
+                result = json.loads(_execute_remote(code, "task-remote-policy", ["terminal"]))
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("REMOTE_OK", result["output"])
+        self.assertIn("REMOTE_POLICY_BLOCKS=4", result["output"])
+        self.assertNotIn("FAKE_GIT_RAN", result["output"])
+        run_cmd = next(cmd for cmd, _, _ in env.commands if "script.py" in cmd and "HERMES_RPC_DIR" in cmd)
+        self.assertNotIn("/bin/python3 script.py", run_cmd)
 
 
 @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
@@ -205,6 +333,119 @@ class TestExecuteCode(unittest.TestCase):
         result = self._run('import hermes_constants; print(hermes_constants.__file__)')
         self.assertEqual(result["status"], "success")
         self.assertIn("hermes_constants.py", result["output"])
+
+    def test_worker_reviewer_policy_blocks_direct_subprocess_bypass(self):
+        """execute_code sitecustomize blocks subprocesses that bypass terminal()."""
+        code = """
+import subprocess
+subprocess.run(['/usr/bin/git', 'fetch', 'origin'], check=True)
+"""
+        with patch.dict(os.environ, {
+            "SYMPHONY_AGENT_COMMAND_POLICY": "worker_reviewer_github_upstream_block",
+            "SYMPHONY_AGENT_ROLE": "worker",
+            "HERMES_YOLO_MODE": "1",
+        }, clear=False):
+            result = self._run(code)
+        self.assertEqual(result["status"], "error")
+        combined = result.get("output", "") + result.get("error", "")
+        self.assertIn("BLOCKED by Symphony worker/reviewer GitHub command policy", combined)
+
+    def test_worker_reviewer_policy_blocks_shell_and_env_subprocess_wrappers(self):
+        """execute_code sitecustomize unwraps shell/env argv before fake git can run."""
+        code = r'''
+import os
+import subprocess
+import tempfile
+
+fake_bin = tempfile.mkdtemp(prefix="fake-git-")
+fake_git = os.path.join(fake_bin, "git")
+with open(fake_git, "w", encoding="utf-8") as handle:
+    handle.write("#!/bin/sh\necho FAKE_GIT_RAN >&2\nexit 99\n")
+os.chmod(fake_git, 0o755)
+script_absolute = os.path.join(fake_bin, "absolute-fetch.sh")
+with open(script_absolute, "w", encoding="utf-8") as handle:
+    handle.write(f"#!/bin/sh\n{fake_git} fetch origin\n")
+os.chmod(script_absolute, 0o755)
+script_path_reset = os.path.join(fake_bin, "path-reset-fetch.sh")
+with open(script_path_reset, "w", encoding="utf-8") as handle:
+    handle.write(f"#!/bin/sh\nPATH={fake_bin} git fetch origin\n")
+os.chmod(script_path_reset, 0o755)
+
+cases = [
+    ["bash", "-c", f"{fake_git} fetch origin"],
+    ["sh", "-c", f"PATH={fake_bin} git fetch origin"],
+    ["bash", "-lc", f"{fake_git} fetch origin"],
+    ["env", "-i", f"PATH={fake_bin}", "git", "fetch", "origin"],
+    ["bash", script_absolute],
+    ["bash", script_path_reset],
+    ["env", "-i", f"PATH={fake_bin}", "bash", script_path_reset],
+    [script_absolute],
+]
+for argv in cases:
+    try:
+        subprocess.run(argv, check=True)
+    except PermissionError as exc:
+        print("BLOCKED_WRAPPER", argv[0], "GitHub command policy" in str(exc))
+    else:
+        raise AssertionError(f"wrapper was not blocked before fake git ran: {argv!r}")
+'''
+        with patch.dict(os.environ, {
+            "SYMPHONY_AGENT_COMMAND_POLICY": "worker_reviewer_github_upstream_block",
+            "SYMPHONY_AGENT_ROLE": "worker",
+            "HERMES_YOLO_MODE": "1",
+        }, clear=False):
+            result = self._run(code)
+
+        self.assertEqual(result["status"], "success")
+        combined = result.get("output", "") + result.get("error", "")
+        self.assertEqual(combined.count("BLOCKED_WRAPPER"), 8)
+        self.assertNotIn("FAKE_GIT_RAN", combined)
+
+    def test_worker_reviewer_policy_blocks_python_interpreter_subprocess_suppression(self):
+        """execute_code blocks child Python interpreters that can skip sitecustomize."""
+        code = r'''
+import os
+import subprocess
+import shlex
+import sys
+import tempfile
+
+fake_bin = tempfile.mkdtemp(prefix="fake-git-")
+fake_git = os.path.join(fake_bin, "git")
+with open(fake_git, "w", encoding="utf-8") as handle:
+    handle.write("#!/bin/sh\necho FAKE_GIT_RAN >&2\nexit 99\n")
+os.chmod(fake_git, 0o755)
+child_script = os.path.join(fake_bin, "child_fetch.py")
+with open(child_script, "w", encoding="utf-8") as handle:
+    handle.write(f"import subprocess\nsubprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)\n")
+
+cases = [
+    [sys.executable, "-c", f"import subprocess; subprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)"],
+    [sys.executable, "-S", "-c", f"import subprocess; subprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)"],
+    ["env", "-i", f"PATH={fake_bin}", "PYTHONPATH=", sys.executable, "-S", "-c", f"import subprocess; subprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)"],
+    ["bash", "-c", "PYTHONPATH= " + shlex.quote(sys.executable) + " -c " + shlex.quote(f"import subprocess; subprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)")],
+    ["bash", "-c", "PATH=" + shlex.quote(fake_bin) + " PYTHONPATH= " + shlex.quote(sys.executable) + " -c " + shlex.quote(f"import subprocess; subprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)")],
+    [sys.executable, child_script],
+]
+for argv in cases:
+    try:
+        subprocess.run(argv, check=True)
+    except PermissionError as exc:
+        print("BLOCKED_PYTHON", argv[0], "GitHub command policy" in str(exc))
+    else:
+        raise AssertionError(f"python interpreter bypass was not blocked before fake git ran: {argv!r}")
+'''
+        with patch.dict(os.environ, {
+            "SYMPHONY_AGENT_COMMAND_POLICY": "worker_reviewer_github_upstream_block",
+            "SYMPHONY_AGENT_ROLE": "worker",
+            "HERMES_YOLO_MODE": "1",
+        }, clear=False):
+            result = self._run(code)
+
+        self.assertEqual(result["status"], "success")
+        combined = result.get("output", "") + result.get("error", "")
+        self.assertEqual(combined.count("BLOCKED_PYTHON"), 6)
+        self.assertNotIn("FAKE_GIT_RAN", combined)
 
     def test_single_tool_call(self):
         """Script calls terminal and prints the result."""

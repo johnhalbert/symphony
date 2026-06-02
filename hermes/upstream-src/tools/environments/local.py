@@ -7,8 +7,10 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
+
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -179,8 +181,36 @@ def _inject_context_hermes_home(env: dict) -> None:
         pass
 
 
+def _command_policy_runtime_dir() -> str:
+    """Return a stable writable directory for worker/reviewer command policy shims."""
+
+    try:
+        from hermes_constants import get_hermes_home
+        base = get_hermes_home() / "cache" / "command-policy"
+    except Exception:
+        base = Path(tempfile.gettempdir()) / "hermes_command_policy"
+    base.mkdir(parents=True, exist_ok=True)
+    return str(base)
+
+
+def _apply_worker_reviewer_github_runtime(env: dict) -> None:
+    """Install worker/reviewer GitHub policy runtime shims when policy is active."""
+
+    try:
+        from tools.worker_github_policy import install_worker_reviewer_github_runtime
+        install_worker_reviewer_github_runtime(
+            _command_policy_runtime_dir(),
+            env,
+            python_executable=sys.executable,
+        )
+    except Exception:
+        if env.get("SYMPHONY_AGENT_COMMAND_POLICY") or str(env.get("SYMPHONY_AGENT_ROLE", "")).lower() in {"worker", "reviewer"}:
+            raise
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment."""
+    """Filter Hermes-managed secrets and inject command-policy shims."""
+
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
@@ -209,6 +239,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     if _profile_home:
         sanitized["HOME"] = _profile_home
 
+    _apply_worker_reviewer_github_runtime(sanitized)
     return sanitized
 
 
@@ -349,6 +380,7 @@ def _make_run_env(env: dict) -> dict:
     except Exception:
         pass
 
+    _apply_worker_reviewer_github_runtime(run_env)
     return run_env
 
 

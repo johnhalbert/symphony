@@ -403,7 +403,7 @@ describe("TransitionPolicy review-loop planners", () => {
       config,
     );
 
-    expect(commentBody(operations, 0)).toContain("reconcile the lifecycle-bound PR changes with origin/main");
+    expect(commentBody(operations, 0)).toContain("reconcile the lifecycle-bound PR changes with the prepared base");
     expect(commentBody(operations, 0)).toContain("leave the final implementation changes uncommitted and unpushed");
     expect(commentBody(operations, 0)).toContain("Symphony performs service-owned commit, push, and PR publication/reuse");
     expect(commentBody(operations, 0)).not.toContain("commit and push the repaired branch");

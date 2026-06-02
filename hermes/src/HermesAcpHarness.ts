@@ -12,6 +12,7 @@ import {
   writeActiveHandoffMcpContexts,
   writeInitialHandoffMcpContexts,
 } from "../../src/core/harness/HandoffMcp.js";
+import { workerReviewerGithubCommandPolicyEnv } from "../../src/core/harness/AgentCommandPolicy.js";
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
@@ -598,6 +599,7 @@ export class HermesAcpHarness implements AgentHarness {
     const profile = await this.profileLeaseFactory({
       binaryPath,
       cwd: ctx.workspace.path,
+      env: { ...process.env, ...workerReviewerGithubCommandPolicyEnv(ctx) },
       timeoutMs: ctx.config.hermes.startupTimeoutMs,
       sourceProfile,
       keepProfiles: ctx.config.hermes.keepProfiles,

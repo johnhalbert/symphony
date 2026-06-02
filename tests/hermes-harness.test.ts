@@ -67,9 +67,17 @@ describe("HermesHarness", () => {
     expect(reviewerTwo.map((event) => event.type)).toContain("completed");
     expect(clients).toHaveLength(3);
     expect(clients[0]?.requests.filter((request) => request.method === "session.create")).toHaveLength(1);
-    expect(clients[0]?.env.extraEnv).toMatchObject({ HERMES_API_KEY: "worker-hermes-secret" });
+    expect(clients[0]?.env.extraEnv).toMatchObject({
+      HERMES_API_KEY: "worker-hermes-secret",
+      SYMPHONY_AGENT_COMMAND_POLICY: "worker_reviewer_github_upstream_block",
+      SYMPHONY_AGENT_ROLE: "worker",
+      GIT_TERMINAL_PROMPT: "0",
+      GH_PROMPT_DISABLED: "1",
+    });
     expect(new Set(clients.slice(1).map((client) => client.env.hermesHome)).size).toBe(2);
     expect(clients.slice(1).every((client) => client.env.extraEnv?.HERMES_API_KEY === "reviewer-hermes-secret")).toBe(true);
+    expect(clients.slice(1).every((client) => client.env.extraEnv?.SYMPHONY_AGENT_ROLE === "reviewer")).toBe(true);
+    expect(clients.slice(1).every((client) => client.env.extraEnv?.SYMPHONY_AGENT_COMMAND_POLICY === "worker_reviewer_github_upstream_block")).toBe(true);
 
     const workerProfile = JSON.parse(
       await readFile(path.join(clients[0]!.env.hermesHome, ".symphony-hermes-profile.json"), "utf8"),

@@ -1059,6 +1059,21 @@ def check_all_command_guards(command: str, env_type: str,
     a gateway force=True replay from bypassing one check when only the
     other was shown to the user.
     """
+    # Symphony dogfood floor: worker/reviewer agents must not perform
+    # upstream/auth-risk GitHub operations from terminal-like tools. This
+    # executes before container skips, yolo, approvals.mode=off, or cron
+    # policy so runtime settings cannot bypass the service-owned GitHub
+    # boundary.
+    from tools.worker_github_policy import check_worker_reviewer_github_policy_result
+    github_policy_result = check_worker_reviewer_github_policy_result(command)
+    if github_policy_result is not None:
+        logger.warning(
+            "Worker/reviewer GitHub command policy block: %s (command: %s)",
+            github_policy_result.get("description", "GitHub command"),
+            github_policy_result.get("message", "")[:200],
+        )
+        return github_policy_result
+
     # Skip containers for both checks
     if env_type in {"docker", "singularity", "modal", "daytona"}:
         return {"approved": True, "message": None}
