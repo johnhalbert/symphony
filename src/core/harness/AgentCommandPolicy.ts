@@ -183,6 +183,33 @@ export type AgentCommandPolicyUnsafeGitConfigEffect =
   | "contacts_remote"
   | "ambiguous";
 
+const UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
+  string,
+  AgentCommandPolicyUnsafeGitConfigCategory
+> = new Map([
+  ["GIT_EXTERNAL_DIFF", "external_diff"],
+  ["GIT_PAGER", "pager"],
+  ["PAGER", "pager"],
+  ["GIT_ASKPASS", "credential_helper"],
+  ["SSH_ASKPASS", "credential_helper"],
+  ["GIT_CREDENTIAL_HELPER", "credential_helper"],
+  ["GITHUB_TOKEN", "credential_helper"],
+  ["GH_TOKEN", "credential_helper"],
+  ["GITHUB_PAT", "credential_helper"],
+  ["GITHUB_APP_PRIVATE_KEY", "credential_helper"],
+  ["GITHUB_PRIVATE_KEY", "credential_helper"],
+  ["GITHUB_CREDENTIALS", "credential_helper"],
+  ["GH_HOSTS", "credential_helper"],
+  ["SSH_AUTH_SOCK", "credential_helper"],
+  ["SSH_AGENT_PID", "credential_helper"],
+  ["GIT_SSH", "ssh_command"],
+  ["GIT_SSH_COMMAND", "ssh_command"],
+  ["GIT_PROXY_COMMAND", "transport_helper"],
+  ["GIT_EXEC_PATH", "other"],
+]);
+const GIT_CONFIG_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM)$/u;
+const GIT_CONFIG_KEY_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_KEY_\d+$/u;
+
 export type AgentCommandPolicyPathStyle = "windows" | "posix" | "unc" | "bare" | "unknown";
 
 export type AgentCommandPolicyStructuredRawInput =
@@ -1570,7 +1597,12 @@ function classifyGitCommand(
   }
 
   if (LOCAL_INSPECTION_GIT_SUBCOMMANDS.has(gitSubcommand)) {
-    const unsafeConfigCategories = localGitInspectionUnsafeConfigCategories(tokens, gitSubcommandDetails.index, command);
+    const unsafeConfigCategories = localGitInspectionUnsafeConfigCategories(
+      input,
+      tokens,
+      gitSubcommandDetails.index,
+      command,
+    );
     if (unsafeConfigCategories.length > 0) {
       return denyDecision(
         input,
@@ -1956,6 +1988,7 @@ function isShellControlOperator(token: string): boolean {
 }
 
 function localGitInspectionUnsafeConfigCategories(
+  input: AgentCommandPolicyInput,
   tokens: readonly string[],
   gitSubcommandIndex: number,
   command: string,
@@ -1963,6 +1996,9 @@ function localGitInspectionUnsafeConfigCategories(
   const categories = new Set<AgentCommandPolicyUnsafeGitConfigCategory>();
 
   if (containsInlineUnsafeLocalGitOption(command)) categories.add("external_diff");
+
+  addUnsafeLocalGitEnvironmentCategories(categories, extractInlineEnvironmentAssignments(tokens));
+  addUnsafeLocalGitEnvironmentCategories(categories, inheritedEnvironmentAssignments(input.environment));
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
@@ -1991,6 +2027,81 @@ function localGitInspectionUnsafeConfigCategories(
   }
 
   return sortedUniqueKeys(categories) as AgentCommandPolicyUnsafeGitConfigCategory[];
+}
+
+function addUnsafeLocalGitEnvironmentCategories(
+  categories: Set<AgentCommandPolicyUnsafeGitConfigCategory>,
+  environment: ReadonlyMap<string, string | undefined>,
+): void {
+  let hasGitConfigEnvironment = false;
+  let hasSpecificGitConfigCategory = false;
+
+  for (const [key, value] of environment) {
+    const normalizedKey = normalizeEnvironmentKeyForPolicy(key);
+    const category = UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES.get(normalizedKey);
+    if (category !== undefined) {
+      categories.add(category);
+      continue;
+    }
+
+    if (GIT_CONFIG_KEY_ENVIRONMENT_KEY_PATTERN.test(normalizedKey)) {
+      hasGitConfigEnvironment = true;
+      if (value !== undefined && value.trim().length > 0) {
+        categories.add(unsafeGitConfigCategoryFromConfigText(value));
+        hasSpecificGitConfigCategory = true;
+      }
+      continue;
+    }
+
+    if (normalizedKey === "GIT_CONFIG_PARAMETERS") {
+      hasGitConfigEnvironment = true;
+      if (value !== undefined && value.trim().length > 0) {
+        categories.add(unsafeGitConfigCategoryFromConfigText(value));
+        hasSpecificGitConfigCategory = true;
+      }
+      continue;
+    }
+
+    if (GIT_CONFIG_ENVIRONMENT_KEY_PATTERN.test(normalizedKey)) {
+      hasGitConfigEnvironment = true;
+    }
+  }
+
+  if (hasGitConfigEnvironment && !hasSpecificGitConfigCategory) categories.add("other");
+}
+
+function extractInlineEnvironmentAssignments(tokens: readonly string[]): ReadonlyMap<string, string> {
+  const assignments = new Map<string, string>();
+
+  for (const token of tokens) {
+    const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/u.exec(token);
+    const key = match?.[1];
+    if (key === undefined) break;
+    assignments.set(normalizeEnvironmentKeyForPolicy(key), match?.[2] ?? "");
+  }
+
+  return assignments;
+}
+
+function inheritedEnvironmentAssignments(
+  input?: AgentCommandPolicyEnvironmentInput,
+): ReadonlyMap<string, string | undefined> {
+  const assignments = new Map<string, string | undefined>();
+  if (input === undefined) return assignments;
+
+  for (const key of input.keysOnly ?? []) {
+    assignments.set(normalizeEnvironmentKeyForPolicy(key), undefined);
+  }
+
+  for (const [key, value] of Object.entries(input.inherited ?? {})) {
+    assignments.set(normalizeEnvironmentKeyForPolicy(key), value);
+  }
+
+  return assignments;
+}
+
+function normalizeEnvironmentKeyForPolicy(key: string): string {
+  return key.trim().toUpperCase();
 }
 
 function isHelperFreeLocalGitInspectionInvocation(
@@ -2117,18 +2228,30 @@ function unsafeGitConfigCategoryFromInlineConfigOption(
   optionIndex: number,
 ): AgentCommandPolicyUnsafeGitConfigCategory {
   const token = tokens[optionIndex] ?? "";
-  const configText = inlineGitConfigText(tokens, optionIndex, token).toLowerCase();
-  if (configText.startsWith("alias.")) return "alias";
-  if (configText.includes("pager")) return "pager";
-  if (configText.includes("external") || configText.includes("extcmd") || configText.includes("textconv")) {
+  return unsafeGitConfigCategoryFromConfigText(inlineGitConfigText(tokens, optionIndex, token));
+}
+
+function unsafeGitConfigCategoryFromConfigText(configText: string): AgentCommandPolicyUnsafeGitConfigCategory {
+  const normalizedConfigText = configText.toLowerCase();
+  if (normalizedConfigText.startsWith("alias.")) return "alias";
+  if (normalizedConfigText.includes("pager")) return "pager";
+  if (
+    normalizedConfigText.includes("external") ||
+    normalizedConfigText.includes("extcmd") ||
+    normalizedConfigText.includes("textconv")
+  ) {
     return "external_diff";
   }
-  if (configText.includes("credential")) return "credential_helper";
-  if (configText.includes("hook")) return "hook";
-  if (configText.startsWith("filter.")) return "filter";
-  if (configText.includes("signing") || configText.includes("gpg")) return "signing_program";
-  if (configText.includes("fsmonitor")) return "filesystem_monitor";
-  if (configText.includes("ssh") || configText.includes("insteadOf".toLowerCase()) || configText.includes("pushinsteadOf".toLowerCase())) {
+  if (normalizedConfigText.includes("credential")) return "credential_helper";
+  if (normalizedConfigText.includes("hook")) return "hook";
+  if (normalizedConfigText.startsWith("filter.")) return "filter";
+  if (normalizedConfigText.includes("signing") || normalizedConfigText.includes("gpg")) return "signing_program";
+  if (normalizedConfigText.includes("fsmonitor")) return "filesystem_monitor";
+  if (
+    normalizedConfigText.includes("ssh") ||
+    normalizedConfigText.includes("insteadof") ||
+    normalizedConfigText.includes("pushinsteadof")
+  ) {
     return "transport_helper";
   }
   return "other";

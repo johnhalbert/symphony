@@ -20,6 +20,17 @@ interface LocalGitUnsafeHelperCase {
   readonly unsafeConfigCategories: readonly AgentCommandPolicyUnsafeGitConfigCategory[];
 }
 
+interface LocalGitUnsafeEnvironmentCase {
+  readonly name: string;
+  readonly command: string;
+  readonly gitSubcommand: string;
+  readonly unsafeConfigCategories: readonly AgentCommandPolicyUnsafeGitConfigCategory[];
+  readonly environment?: AgentCommandPolicyInput["environment"];
+  readonly inlineEnvironmentKeys?: readonly string[];
+  readonly inheritedEnvironmentKeys?: readonly string[];
+  readonly redactedValue?: string;
+}
+
 interface LocalGitNonInspectionCase {
   readonly name: string;
   readonly command: string;
@@ -158,6 +169,179 @@ describe("AgentCommandPolicy helper-free local Git inspection allowlist", () => 
     },
   );
 
+  it.each<LocalGitUnsafeEnvironmentCase>([
+    {
+      name: "external diff helper from inline environment",
+      command: "GIT_EXTERNAL_DIFF=./helper git diff -- src/core/harness/AgentCommandPolicy.ts",
+      gitSubcommand: "diff",
+      unsafeConfigCategories: ["external_diff"],
+      inlineEnvironmentKeys: ["GIT_EXTERNAL_DIFF"],
+    },
+    {
+      name: "pager helper from inline environment",
+      command: "GIT_PAGER='sh -c echo blocked' git log -1",
+      gitSubcommand: "log",
+      unsafeConfigCategories: ["pager"],
+      inlineEnvironmentKeys: ["GIT_PAGER"],
+    },
+    {
+      name: "per-command Git config from inline environment",
+      command:
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0='sh -c echo blocked' git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["pager"],
+      inlineEnvironmentKeys: ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"],
+    },
+    {
+      name: "askpass credential helper from inline environment",
+      command: "GIT_ASKPASS=./askpass git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["credential_helper"],
+      inlineEnvironmentKeys: ["GIT_ASKPASS"],
+    },
+    {
+      name: "GitHub token from inline environment",
+      command: "GITHUB_TOKEN=plain-secret git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["credential_helper"],
+      inlineEnvironmentKeys: ["GITHUB_TOKEN"],
+      redactedValue: "plain-secret",
+    },
+    {
+      name: "GitHub CLI token from inline environment",
+      command: "GH_TOKEN=plain-secret git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["credential_helper"],
+      inlineEnvironmentKeys: ["GH_TOKEN"],
+      redactedValue: "plain-secret",
+    },
+    {
+      name: "SSH transport helper from inline environment",
+      command: "GIT_SSH_COMMAND='ssh -o ProxyCommand=helper' git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["ssh_command"],
+      inlineEnvironmentKeys: ["GIT_SSH_COMMAND"],
+    },
+  ])(
+    "denies local inspection with unsafe inline Git environment before execution: $name",
+    ({ command, gitSubcommand, unsafeConfigCategories, inlineEnvironmentKeys, redactedValue }) => {
+      const decision = evaluateAgentCommandPolicy(terminalInput(command));
+
+      expect(decision).toMatchObject({
+        outcome: "deny",
+        reasonKind: "unsafe_git_config",
+        commandClass: "git_local_inspection_with_helper",
+        message:
+          "Blocked worker/reviewer Git command: local Git inspection would execute a configured helper. Use local inspection without helper configuration or rely on Symphony service-owned GitHub workflow actions.",
+        audit: {
+          redacted: true,
+          normalizedExecutable: "git",
+          executableKind: "git",
+          gitSubcommand,
+          commandClass: "git_local_inspection_with_helper",
+          inlineEnvironmentKeys,
+          unsafeConfigCategories,
+          upstreamContactAttempted: false,
+        },
+      });
+      expect(decision.message).not.toContain("policy scaffold");
+      if (redactedValue !== undefined) {
+        expect(JSON.stringify(decision.audit)).not.toContain(redactedValue);
+      }
+    },
+  );
+
+  it.each<LocalGitUnsafeEnvironmentCase>([
+    {
+      name: "external diff helper from inherited key-only environment",
+      command: "git diff -- src/core/harness/AgentCommandPolicy.ts",
+      gitSubcommand: "diff",
+      unsafeConfigCategories: ["external_diff"],
+      environment: { keysOnly: ["HOME", "PATH", "GIT_EXTERNAL_DIFF"] },
+      inheritedEnvironmentKeys: ["GIT_EXTERNAL_DIFF", "HOME", "PATH"],
+    },
+    {
+      name: "pager helper from inherited key-only environment",
+      command: "git log -1",
+      gitSubcommand: "log",
+      unsafeConfigCategories: ["pager"],
+      environment: { keysOnly: ["HOME", "PATH", "GIT_PAGER"] },
+      inheritedEnvironmentKeys: ["GIT_PAGER", "HOME", "PATH"],
+    },
+    {
+      name: "Git config injection from inherited key-only environment",
+      command: "git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["other"],
+      environment: { keysOnly: ["HOME", "PATH", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] },
+      inheritedEnvironmentKeys: ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "HOME", "PATH"],
+    },
+    {
+      name: "credential helper config from inherited environment values",
+      command: "git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["credential_helper"],
+      environment: {
+        inherited: {
+          HOME: "/home/agent",
+          PATH: "/usr/bin",
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "credential.helper",
+          GIT_CONFIG_VALUE_0: "!helper",
+        },
+      },
+      inheritedEnvironmentKeys: ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "HOME", "PATH"],
+    },
+    {
+      name: "GitHub token from inherited key-only environment",
+      command: "git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["credential_helper"],
+      environment: { keysOnly: ["HOME", "PATH", "GITHUB_TOKEN"] },
+      inheritedEnvironmentKeys: ["GITHUB_TOKEN", "HOME", "PATH"],
+    },
+    {
+      name: "GitHub CLI token from inherited key-only environment",
+      command: "git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["credential_helper"],
+      environment: { keysOnly: ["HOME", "PATH", "GH_TOKEN"] },
+      inheritedEnvironmentKeys: ["GH_TOKEN", "HOME", "PATH"],
+    },
+    {
+      name: "SSH command from inherited key-only environment",
+      command: "git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["ssh_command"],
+      environment: { keysOnly: ["HOME", "PATH", "GIT_SSH_COMMAND"] },
+      inheritedEnvironmentKeys: ["GIT_SSH_COMMAND", "HOME", "PATH"],
+    },
+  ])(
+    "denies local inspection with unsafe inherited Git environment before execution: $name",
+    ({ command, gitSubcommand, unsafeConfigCategories, environment, inheritedEnvironmentKeys }) => {
+      const decision = evaluateAgentCommandPolicy(terminalInput(command, "worker", environment));
+
+      expect(decision).toMatchObject({
+        outcome: "deny",
+        reasonKind: "unsafe_git_config",
+        commandClass: "git_local_inspection_with_helper",
+        audit: {
+          redacted: true,
+          normalizedExecutable: "git",
+          executableKind: "git",
+          gitSubcommand,
+          commandClass: "git_local_inspection_with_helper",
+          inlineEnvironmentKeys: [],
+          inheritedEnvironmentKeys,
+          unsafeConfigCategories,
+          upstreamContactAttempted: false,
+        },
+      });
+      expect(decision.message).toContain("local Git inspection would execute a configured helper");
+      expect(decision.message).not.toContain("policy scaffold");
+    },
+  );
+
   it.each<LocalGitNonInspectionCase>([
     {
       name: "delete a branch",
@@ -218,13 +402,17 @@ describe("AgentCommandPolicy helper-free local Git inspection allowlist", () => 
   });
 });
 
-function terminalInput(command: string, role: "worker" | "reviewer" = "worker"): AgentCommandPolicyInput {
+function terminalInput(
+  command: string,
+  role: "worker" | "reviewer" = "worker",
+  environment: AgentCommandPolicyInput["environment"] = { keysOnly: ["HOME", "PATH"] },
+): AgentCommandPolicyInput {
   return {
     role,
     phase: role === "reviewer" ? "review" : "implementation",
     surface: "terminal",
     workingDirectory: "/workspace/project",
     rawInput: { command },
-    environment: { keysOnly: ["HOME", "PATH"] },
+    environment,
   };
 }
