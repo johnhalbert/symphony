@@ -578,8 +578,8 @@ describe("projectWebTranscript", () => {
       event({
         eventType: "assistant_message_delta",
         source: "harness",
-        message: "world",
-        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "message", textPreview: "world", delta: true },
+        message: " world",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "message", textPreview: " world", delta: true },
         at: "2026-01-01T00:00:01.000Z",
         sequence: 2,
       }),
@@ -660,6 +660,52 @@ describe("projectWebTranscript", () => {
       { kind: "status", state: "run_failed", ts: "2026-01-01T00:00:08.000Z", text: "Run failed token=[redacted]" },
     ]);
     expect(JSON.stringify(messages)).not.toContain("SECRET_FAILURE_TOKEN");
+  });
+
+  it("exact-concatenates canonical assistant_message_delta chunks and ignores only empty chunks", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: "H", delta: true },
+        sequence: 20,
+      }),
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: "ello", delta: true },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 21,
+      }),
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: " ", delta: true },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 22,
+      }),
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: "world", delta: true },
+        at: "2026-01-01T00:00:03.000Z",
+        sequence: 23,
+      }),
+      event({
+        eventType: "assistant_message_delta",
+        source: "harness",
+        message: "fallback label",
+        payload: { kind: "assistant_message_delta", actor: "assistant", channel: "chat", textPreview: "", delta: true },
+        at: "2026-01-01T00:00:04.000Z",
+        sequence: 24,
+      }),
+    ]);
+
+    expect(messages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello world" }]);
   });
 
   it("routes progress-shaped token and rate-limit telemetry to status while coalescing assistant progress deltas", () => {

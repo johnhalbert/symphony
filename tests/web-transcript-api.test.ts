@@ -6,6 +6,8 @@ import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileRunTranscriptStore, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import { mapAgentEventToRunActivityEvent } from "../src/core/transcript/RunActivityEventMapper.js";
+import type { RunActivityEvent } from "../src/core/runActivity/RunActivityEvent.js";
 import type { ProjectionPayloadWriteInput, ProjectionWriteResult } from "../src/core/persistence/ProjectionTransactionService.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -443,6 +445,67 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         { kind: "status", state: "cancelled", ts: "2026-01-01T00:00:04.000Z", text: "Run cancelled" },
       ]);
       expect(JSON.stringify(body)).not.toContain("SECRET_TOOL_PROGRESS");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves orchestrator-mapped ACP runActivity deltas with exact whitespace through the durable API", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const runId = "mapped-acp-delta-run";
+    await startRun(runStore, config, { runId, sessionId: "mapped-acp-delta-session", issueIdentifier: "TEST-1" });
+    const appendMappedEvent = async (event: Parameters<typeof mapAgentEventToRunActivityEvent>[0]) => {
+      await runStore.appendEvent({
+        runId,
+        at: event.at ?? "2026-01-01T00:00:01.000Z",
+        source: "harness",
+        ...mapAgentEventToRunActivityEvent(event),
+      });
+    };
+    const acpDeltaActivity = (sequence: number, text: string, at: string): RunActivityEvent => ({
+      eventId: `${runId}:activity:${sequence}`,
+      runSessionId: `profile:acp-session-1:${runId}`,
+      occurredAt: at,
+      sequence,
+      sequenceSource: "harness",
+      externalEventId: `external-${sequence}`,
+      protocol: "acp",
+      harness: "hermes_acp",
+      actor: "assistant",
+      channel: "chat",
+      kind: "assistant_message_delta",
+      text,
+      payload: { runtimeSessionId: "acp-session-1", delta: true, messagePreview: text, redacted: true },
+    });
+    const deltaChunks = ["H", "ello", " ", "world", " token=api-delta-value", ""];
+    for (const [index, text] of deltaChunks.entries()) {
+      const sequence = index + 1;
+      const at = `2026-01-01T00:00:0${sequence}.000Z`;
+      await appendMappedEvent({
+        type: "progress",
+        activitySource: "delta",
+        message: "legacy fallback should not persist",
+        at,
+        runActivity: acpDeltaActivity(sequence, text, at),
+      });
+    }
+    await appendMappedEvent({ type: "failed", error: "Run failed before message.complete", at: "2026-01-01T00:00:07.000Z" });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/${runId}/transcript`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(body, { session: "mapped-acp-delta-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello world token=[redacted]" },
+        { kind: "status", state: "failed", ts: "2026-01-01T00:00:07.000Z", text: "Run failed before message.complete" },
+      ]);
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("api-delta-value");
+      expect(serialized).not.toContain("legacy fallback should not persist");
     } finally {
       await server.stop();
     }

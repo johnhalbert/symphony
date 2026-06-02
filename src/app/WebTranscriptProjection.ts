@@ -584,6 +584,7 @@ type AssistantDeltaJoinMode = "spaced" | "exact" | "token";
 function assistantDeltaJoinMode(event: TranscriptEvent): AssistantDeltaJoinMode {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
+  if (eventType === "assistant_message_delta") return "exact";
   if (eventType === "progress" && normalizedActivitySource(payload) === "delta") return "exact";
   if (eventType === "message_delta" && isHermesRuntimeMessageDelta(event, payload)) return "exact";
   if (eventType === "message_delta") return "token";

@@ -89,6 +89,54 @@ describe("mapAgentEventToRunActivityEvent", () => {
     expect(tool.payload).toMatchObject({ kind: "tool", activitySource: "tool", progressKind: "tool" });
   });
 
+  it("preserves meaningful assistant delta whitespace while redacting secrets in mapped transcript rows", () => {
+    const whitespace = mapAgentEventToRunActivityEvent({ type: "progress", activitySource: "delta", message: " " });
+    const empty = mapAgentEventToRunActivityEvent({ type: "progress", activitySource: "delta", message: "" });
+    const redacted = mapAgentEventToRunActivityEvent({ type: "progress", activitySource: "delta", message: " token=delta-value " });
+    const acpWhitespace = mapAgentEventToRunActivityEvent({
+      type: "progress",
+      activitySource: "delta",
+      message: "legacy fallback should not persist",
+      runActivity: acpRunActivity({
+        text: null,
+        payload: { messagePreview: " ", textPreview: "", deltaPreview: "", message: "", text: "" },
+      }),
+    });
+
+    expect(whitespace).toMatchObject({
+      eventType: "progress",
+      message: " ",
+      payload: { kind: "assistant_delta", activitySource: "delta", progressKind: "assistant_delta", messagePreview: " " },
+    });
+    expect(empty).toMatchObject({
+      eventType: "progress",
+      message: "",
+      payload: { kind: "assistant_delta", activitySource: "delta", progressKind: "assistant_delta", messagePreview: "" },
+    });
+    expect(redacted).toMatchObject({
+      message: " token=[redacted] ",
+      payload: { messagePreview: " token=[redacted] ", redacted: true },
+    });
+    expect(acpWhitespace).toMatchObject({
+      eventType: "assistant_message_delta",
+      message: " ",
+      payload: {
+        kind: "assistant_message_delta",
+        actor: "assistant",
+        channel: "chat",
+        delta: true,
+        messagePreview: " ",
+        textPreview: " ",
+        deltaPreview: "",
+        message: "",
+        text: "",
+      },
+    });
+    const serialized = JSON.stringify([redacted, acpWhitespace]);
+    expect(serialized).not.toContain("delta-value");
+    expect(serialized).not.toContain("legacy fallback should not persist");
+  });
+
   it("prefers valid harness-provided RunActivityEvent metadata for the shared persisted taxonomy", () => {
     const mapped = mapAgentEventToRunActivityEvent({
       type: "progress",
