@@ -34,6 +34,10 @@ const projectionSourceFreshnessMigrationUrl = new URL(
   "../migrations/postgres/0005_projection_source_freshness.sql",
   import.meta.url,
 );
+const projectionBuildModesMigrationUrl = new URL(
+  "../migrations/postgres/0006_projection_build_modes.sql",
+  import.meta.url,
+);
 const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
 const stateOwnershipUrl = new URL("../docs/state-ownership-and-migration.md", import.meta.url);
 const publishedOwnedStateChecksumSha256 = "8e10c03c6cfa34e9672e350c59ff4998459989529a82c98cbd9f714469799298";
@@ -76,6 +80,7 @@ const requiredLookupIndexes = [
 
 const requiredProjectionLookupIndexes = [
   "projection_revision_current_unique_idx",
+  "projection_revision_build_mode_idx",
   "dashboard_projection_scope_revision_idx",
   "dashboard_projection_revision_reads_idx",
   "issue_board_projection_scope_revision_idx",
@@ -122,6 +127,10 @@ async function projectionSourceFreshnessMigrationSql(): Promise<string> {
   return readFile(projectionSourceFreshnessMigrationUrl, "utf8");
 }
 
+async function projectionBuildModesMigrationSql(): Promise<string> {
+  return readFile(projectionBuildModesMigrationUrl, "utf8");
+}
+
 async function configuredMigrationSql(): Promise<string> {
   const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
   return migrations.map((migration) => migration.sql).join("\n");
@@ -153,15 +162,18 @@ describe("Postgres Symphony-owned state migration", () => {
       "0003_projection_freshness_indexes",
       "0004_run_activity_canonical_channels",
       "0005_projection_source_freshness",
+      "0006_projection_build_modes",
     ]);
     const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
     const projectionFreshness = migrations.find((migration) => migration.id === "0003_projection_freshness_indexes");
     const canonicalChannels = migrations.find((migration) => migration.id === "0004_run_activity_canonical_channels");
     const projectionSourceFreshness = migrations.find((migration) => migration.id === "0005_projection_source_freshness");
+    const projectionBuildModes = migrations.find((migration) => migration.id === "0006_projection_build_modes");
     expect(ownedState?.filePath).toBe(fileURLToPath(ownedStateMigrationUrl));
     expect(projectionFreshness?.filePath).toBe(fileURLToPath(projectionFreshnessMigrationUrl));
     expect(canonicalChannels?.filePath).toBe(fileURLToPath(canonicalChannelMigrationUrl));
     expect(projectionSourceFreshness?.filePath).toBe(fileURLToPath(projectionSourceFreshnessMigrationUrl));
+    expect(projectionBuildModes?.filePath).toBe(fileURLToPath(projectionBuildModesMigrationUrl));
     expect(sha256(ownedState?.sql ?? "")).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.checksumSha256).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_session");
@@ -174,6 +186,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(projectionFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(canonicalChannels?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionSourceFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+    expect(projectionBuildModes?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
   });
 
   it("delivers projection updated_at columns and freshness indexes through the follow-up migration", async () => {
@@ -220,6 +233,18 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("create index if not exists projection_revision_source_freshness_gin_idx");
     expect(normalized).toContain("using gin (source_freshness jsonb_path_ops)");
   });
+
+  it("delivers durable projection build mode metadata through a checksum-safe follow-up migration", async () => {
+    const normalized = normalizedSql(await projectionBuildModesMigrationSql());
+
+    expect(normalized).toContain("alter table symphony.projection_revision add column if not exists build_mode text not null default 'incremental'");
+    expect(normalized).toContain("when revision = 1 then 'bootstrap'");
+    expect(normalized).toContain("projection_revision_build_mode_check");
+    expect(normalized).toContain("check (build_mode in ('bootstrap', 'incremental', 'rebuild'))");
+    expect(normalized).toContain("create index if not exists projection_revision_build_mode_idx");
+    expect(normalized).toContain("on symphony.projection_revision (build_mode, projection_name, updated_at desc, generated_at desc)");
+  });
+
 
   it("declares all required operational and projection tables", async () => {
     const normalized = normalizedSql(await configuredMigrationSql());
@@ -324,10 +349,12 @@ describe("Postgres Symphony-owned state migration", () => {
       "migrations/postgres/0003_projection_freshness_indexes.sql",
       "migrations/postgres/0004_run_activity_canonical_channels.sql",
       "migrations/postgres/0005_projection_source_freshness.sql",
+      "migrations/postgres/0006_projection_build_modes.sql",
       "checksum-stable",
       "projection `updated_at` freshness columns",
       "canonical run activity channel names",
       "projection_revision.source_freshness",
+      "projection_revision.build_mode",
     ]) {
       expect(ownership, `missing ownership guide fragment: ${fragment}`).toContain(fragment);
     }
@@ -395,6 +422,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain(
       "alter table symphony.projection_revision add column if not exists updated_at timestamptz not null default now()",
     );
+    expect(normalized).toContain("alter table symphony.projection_revision add column if not exists build_mode text not null default 'incremental'");
 
     for (const table of projectionTables.filter((table) => table !== "projection_revision")) {
       expect(normalized, `missing revision FK for ${table}`).toContain(
@@ -449,6 +477,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0003_projection_freshness_indexes",
           "0004_run_activity_canonical_channels",
           "0005_projection_source_freshness",
+          "0006_projection_build_modes",
         ]);
 
         const tableCount = await psql(
@@ -511,6 +540,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0003_projection_freshness_indexes",
           "0004_run_activity_canonical_channels",
           "0005_projection_source_freshness",
+          "0006_projection_build_modes",
         ]);
         expect(await appliedMigrationIds(containerName)).toEqual([
           "0001_migration_foundation",
@@ -518,6 +548,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0003_projection_freshness_indexes",
           "0004_run_activity_canonical_channels",
           "0005_projection_source_freshness",
+          "0006_projection_build_modes",
         ]);
         expect(await appliedMigrationChecksum(containerName, "0002_symphony_owned_state")).toBe(
           publishedOwnedStateChecksumSha256,

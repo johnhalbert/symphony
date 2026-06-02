@@ -112,10 +112,12 @@ import { RealtimeProjectionEventBus } from "./RealtimeProjectionEvents.js";
 import {
   DURABLE_PROJECTION_NAMES,
   type DurableProjectionName,
+  type ProjectionBuildMode,
   type ProjectionPayloadRecord,
   type ProjectionPayloadWriteInput,
   type ProjectionRevisionSelector,
   type ProjectionSourceRevision,
+  type ProjectionWriteMode,
   type ProjectionWriteResult,
 } from "../core/persistence/ProjectionTransactionService.js";
 import type { ProjectionSourceFreshnessInput } from "../core/persistence/ProjectionSourceFreshness.js";
@@ -174,6 +176,10 @@ export interface StatusServerProjectionRebuildEntry {
   scopeKey: string;
   status: StatusServerProjectionRebuildEntryStatus;
   revision: number | null;
+  /** `rebuild` for explicit rebuild/backfill write inputs; absent for skips before a projection write input exists. */
+  requestedBuildMode?: ProjectionWriteMode | null;
+  /** Durable build mode for the revision returned by the writer; first writes are `bootstrap`. */
+  buildMode?: ProjectionBuildMode | null;
   reason: string | null;
 }
 
@@ -1474,22 +1480,40 @@ export class StatusServer {
     input: ProjectionPayloadWriteInput,
     entries: StatusServerProjectionRebuildEntry[],
   ): Promise<void> {
-    const selector = statusServerProjectionRebuildEntrySelector(input);
+    const requestedBuildMode: ProjectionWriteMode = "rebuild";
+    const rebuildInput: ProjectionPayloadWriteInput = { ...input, buildMode: requestedBuildMode };
+    const selector = statusServerProjectionRebuildEntrySelector(rebuildInput);
     const writer = this.options.projectionWriter;
     if (!writer) {
-      entries.push({ ...selector, status: "skipped", revision: null, reason: "Durable projection writer is not configured" });
+      entries.push({
+        ...selector,
+        status: "skipped",
+        revision: null,
+        requestedBuildMode,
+        buildMode: null,
+        reason: "Durable projection writer is not configured",
+      });
       return;
     }
     try {
-      const result = await writer.writeProjection(input);
+      const result = await writer.writeProjection(rebuildInput);
       entries.push({
         ...selector,
         status: result.status,
         revision: typeof result.revision.revision === "number" ? result.revision.revision : null,
+        requestedBuildMode: result.requestedBuildMode ?? requestedBuildMode,
+        buildMode: result.buildMode ?? result.revision.buildMode ?? null,
         reason: null,
       });
     } catch (error) {
-      entries.push({ ...selector, status: "failed", revision: null, reason: publicDiagnosticText(errorMessage(error)) });
+      entries.push({
+        ...selector,
+        status: "failed",
+        revision: null,
+        requestedBuildMode,
+        buildMode: null,
+        reason: publicDiagnosticText(errorMessage(error)),
+      });
     }
   }
 
@@ -2174,7 +2198,7 @@ export class StatusServer {
     const writer = this.options.projectionWriter;
     if (!writer) return;
     try {
-      await writer.writeProjection(input);
+      await writer.writeProjection({ ...input, buildMode: input.buildMode ?? "incremental" });
     } catch {
       // Durable projection rows are cache/read-model side effects. The status API
       // response is derived from canonical stores during this transition phase,
@@ -3055,6 +3079,7 @@ function durableProjectionReadHeaders(read: DurableProjectionReadResult<unknown>
   if (record.expiresAt ?? record.revision.expiresAt) {
     headers["x-symphony-projection-expires-at"] = record.expiresAt ?? record.revision.expiresAt ?? "";
   }
+  headers["x-symphony-projection-build-mode"] = record.revision.buildMode;
   if (record.revision.contentSha256) headers["x-symphony-projection-content-sha256"] = record.revision.contentSha256;
   if (record.payloadSha256) headers["x-symphony-projection-payload-sha256"] = record.payloadSha256;
   headers["x-symphony-projection-source-revisions"] = headerJsonValue(record.revision.sourceRevisions);

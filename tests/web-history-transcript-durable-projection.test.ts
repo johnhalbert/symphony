@@ -45,12 +45,19 @@ describe("web history/transcript durable projection writes", () => {
       ["transcript_projection", "run-1:offset:0:limit:2", "written"],
       ["transcript_projection", "run-1:offset:2:limit:2", "written"],
     ]);
+    expect(result.entries.map((entry) => [entry.requestedBuildMode, entry.buildMode])).toEqual([
+      ["rebuild", "bootstrap"],
+      ["rebuild", "bootstrap"],
+      ["rebuild", "bootstrap"],
+      ["rebuild", "bootstrap"],
+    ]);
     expect(projectionWriter.writes.map((write) => write.projectionName)).toEqual([
       "history_projection",
       "transcript_projection",
       "transcript_projection",
       "transcript_projection",
     ]);
+    expect(projectionWriter.writes.every((write) => write.buildMode === "rebuild")).toBe(true);
     expect(projectionWriter.writes[0]).toMatchObject({
       projectionName: "history_projection",
       sourceCursors: { sessionLimit: 1, timelineLimit: 5, sessionCount: 1, defaultSessionId: "run-1" },
@@ -98,12 +105,45 @@ describe("web history/transcript durable projection writes", () => {
       expect(valid.response.status).toBe(200);
       expect(valid.body).toMatchObject({ attempted: 1, written: 1, skipped: 0, failed: 0 });
       expect(valid.body.entries).toMatchObject([
-        { projectionName: "history_projection", scopeKey: "global:session:1:timeline:5", status: "written" },
+        {
+          projectionName: "history_projection",
+          scopeKey: "global:session:1:timeline:5",
+          status: "written",
+          requestedBuildMode: "rebuild",
+          buildMode: "bootstrap",
+        },
       ]);
       expect(projectionWriter.writes).toHaveLength(1);
     } finally {
       await server.stop();
     }
+  });
+
+  it("reports rebuild attempts as unchanged when the durable projection row is already current", async () => {
+    const projectionWriter = statefulProjectionWriter();
+    const server = createStatusServer({
+      runStore: runStoreFixture({ runs: [runFixture({ runId: "run-1", sessionId: "session-1" })] }),
+      projectionWriter,
+    });
+
+    const first = await server.rebuildDurableWebProjections({
+      projections: ["history_projection"],
+      historyLimits: { sessionLimit: 1, timelineLimit: 5 },
+    });
+    const repeated = await server.rebuildDurableWebProjections({
+      projections: ["history_projection"],
+      historyLimits: { sessionLimit: 1, timelineLimit: 5 },
+    });
+
+    expect(first).toMatchObject({ attempted: 1, written: 1, unchanged: 0, skipped: 0, failed: 0 });
+    expect(first.entries).toMatchObject([
+      { projectionName: "history_projection", status: "written", requestedBuildMode: "rebuild", buildMode: "bootstrap" },
+    ]);
+    expect(repeated).toMatchObject({ attempted: 1, written: 0, unchanged: 1, skipped: 0, failed: 0 });
+    expect(repeated.entries).toMatchObject([
+      { projectionName: "history_projection", status: "unchanged", requestedBuildMode: "rebuild", buildMode: "bootstrap" },
+    ]);
+    expect(projectionWriter.writes.map((write) => write.buildMode)).toEqual(["rebuild"]);
   });
 
   it("reports skipped rebuild entries when projection writer or transcript source is unavailable", async () => {
@@ -120,6 +160,8 @@ describe("web history/transcript durable projection writes", () => {
         projectionName: "history_projection",
         scopeKey: "global:session:1:timeline:5",
         status: "skipped",
+        requestedBuildMode: "rebuild",
+        buildMode: null,
         reason: "Durable projection writer is not configured",
       },
       {
@@ -152,6 +194,7 @@ describe("web history/transcript durable projection writes", () => {
       expect(projectionWriter.writes).toHaveLength(1);
       expect(projectionWriter.writes[0]).toMatchObject({
         projectionName: "history_projection",
+        buildMode: "incremental",
         scopeKind: "global_collection",
         scopeKey: "global:session:1:timeline:5",
         payload: body,
@@ -206,6 +249,7 @@ describe("web history/transcript durable projection writes", () => {
       expect(projectionWriter.writes).toHaveLength(1);
       expect(projectionWriter.writes[0]).toMatchObject({
         projectionName: "transcript_projection",
+        buildMode: "incremental",
         scopeKind: "run_page",
         scopeKey: "run-1:offset:1:limit:1",
         sourceCursors: {
@@ -332,7 +376,7 @@ describe("web history/transcript durable projection writes", () => {
       expect([...rebuiltRows.keys()].sort()).toEqual([...liveRows.keys()].sort());
       expect(rebuiltRows.has("transcript_projection::run_page::run-parity:offset:700:limit:500")).toBe(true);
       for (const [key, liveRow] of liveRows) {
-        expect(rebuiltRows.get(key)).toEqual(liveRow);
+        expect(rebuiltRows.get(key)).toEqual({ ...liveRow, buildMode: "rebuild" });
       }
     } finally {
       await server.stop();
@@ -458,16 +502,23 @@ function recordingProjectionWriter(options: { fail?: boolean } = {}): StatusServ
   writes: ProjectionPayloadWriteInput[];
 } {
   const writes: ProjectionPayloadWriteInput[] = [];
+  const revisionsByKey = new Map<string, number>();
   return {
     writes,
     async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
       writes.push(JSON.parse(JSON.stringify(input)) as ProjectionPayloadWriteInput);
       if (options.fail) throw new Error("simulated projection persistence failure");
-      const revisionNumber = writes.length;
+      const key = projectionRowKey(input);
+      const revisionNumber = (revisionsByKey.get(key) ?? 0) + 1;
+      revisionsByKey.set(key, revisionNumber);
+      const requestedBuildMode = input.buildMode ?? "incremental";
+      const buildMode = revisionNumber === 1 ? "bootstrap" : requestedBuildMode;
       return {
         status: "written",
-        revision: { revision: revisionNumber } as ProjectionWriteResult["revision"],
+        revision: { revision: revisionNumber, buildMode } as ProjectionWriteResult["revision"],
         previousRevision: null,
+        requestedBuildMode,
+        buildMode,
         contentSha256: "",
         payloadSha256: "",
         event: null,
@@ -485,18 +536,47 @@ type StatefulProjectionWriter = StatusServerProjectionWriter & {
 function statefulProjectionWriter(): StatefulProjectionWriter {
   const writes: ProjectionPayloadWriteInput[] = [];
   const rows = new Map<string, ProjectionPayloadWriteInput>();
+  const revisionsByKey = new Map<string, number>();
+  const buildModesByKey = new Map<string, ProjectionWriteResult["buildMode"]>();
   return {
     writes,
     currentRows: () => [...rows.values()].map(cloneProjectionWriteInput),
-    clearRows: () => rows.clear(),
+    clearRows: () => {
+      rows.clear();
+      revisionsByKey.clear();
+      buildModesByKey.clear();
+    },
     async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
       const stored = cloneProjectionWriteInput(input);
+      const key = projectionRowKey(stored);
+      const existing = rows.get(key);
+      const requestedBuildMode = input.buildMode ?? "incremental";
+      if (existing && projectionRowsEquivalent(existing, stored)) {
+        const revisionNumber = revisionsByKey.get(key) ?? 1;
+        const buildMode = buildModesByKey.get(key) ?? "bootstrap";
+        return {
+          status: "unchanged",
+          revision: { revision: revisionNumber, buildMode } as ProjectionWriteResult["revision"],
+          previousRevision: { revision: revisionNumber, buildMode } as ProjectionWriteResult["revision"],
+          requestedBuildMode,
+          buildMode,
+          contentSha256: "",
+          payloadSha256: "",
+          event: null,
+        };
+      }
       writes.push(stored);
-      rows.set(projectionRowKey(stored), stored);
+      const revisionNumber = (revisionsByKey.get(key) ?? 0) + 1;
+      revisionsByKey.set(key, revisionNumber);
+      const buildMode = revisionNumber === 1 ? "bootstrap" : requestedBuildMode;
+      buildModesByKey.set(key, buildMode);
+      rows.set(key, stored);
       return {
         status: "written",
-        revision: { revision: writes.length } as ProjectionWriteResult["revision"],
+        revision: { revision: revisionNumber, buildMode } as ProjectionWriteResult["revision"],
         previousRevision: null,
+        requestedBuildMode,
+        buildMode,
         contentSha256: "",
         payloadSha256: "",
         event: null,
@@ -515,6 +595,16 @@ function projectionNames(rows: ReadonlyMap<string, ProjectionPayloadWriteInput>)
 
 function projectionRowKey(input: ProjectionPayloadWriteInput): string {
   return [input.projectionName, input.scopeKind ?? "global", input.scopeKey ?? "global"].join("::");
+}
+
+function projectionRowsEquivalent(left: ProjectionPayloadWriteInput, right: ProjectionPayloadWriteInput): boolean {
+  return JSON.stringify(projectionRowWithoutBuildMode(left)) === JSON.stringify(projectionRowWithoutBuildMode(right));
+}
+
+function projectionRowWithoutBuildMode(input: ProjectionPayloadWriteInput): ProjectionPayloadWriteInput {
+  const clone = cloneProjectionWriteInput(input);
+  delete clone.buildMode;
+  return clone;
 }
 
 function cloneProjectionWriteInput(input: ProjectionPayloadWriteInput): ProjectionPayloadWriteInput {
