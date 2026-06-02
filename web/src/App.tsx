@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { AppChrome } from "./app/AppChrome";
 import { resolveAppResourceLoading } from "./app/resourceLoading";
 import { ThemeFrame } from "./app/ThemeFrame";
@@ -7,7 +7,7 @@ import { SidebarViews } from "./components/sidebar/SidebarViews";
 import { ChatHistoryView } from "./components/history/ChatHistoryView";
 import { DashboardView } from "./components/dashboard/DashboardView";
 import { IssuesView } from "./components/issues/IssuesView";
-import { DataSourceProvider, defaultDataSourceConfig, useDataSource } from "./data/dataSourceContext";
+import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
 import { fallbackReferenceData, ReferenceDataProvider } from "./data/referenceDataContext";
 import {
   useDashboard,
@@ -17,6 +17,7 @@ import {
   useReferenceData as useReferenceResource,
   useSidebar,
 } from "./hooks/useSymphonyData";
+import { combineLiveResourceTokens, useLiveResourceTokens, type LiveResourceKey } from "./hooks/useLiveResource";
 import type {
   AppTab,
   DashboardVariant,
@@ -72,20 +73,8 @@ function referenceStatusLabel(reference: { data: ReferenceData | null; loading: 
   return null;
 }
 
-function useProjectionRefreshToken(enabled: boolean): number {
-  const dataSource = useDataSource();
-  const [refreshToken, setRefreshToken] = useState(0);
-
-  useEffect(() => {
-    if (!enabled || !dataSource.subscribeToProjectionChanges) return undefined;
-    return dataSource.subscribeToProjectionChanges((event) => {
-      if (event.type !== "projection_revision") return;
-      dataSource.invalidateCachedReads?.();
-      setRefreshToken((current) => current + 1);
-    });
-  }, [dataSource, enabled]);
-
-  return refreshToken;
+function liveRefreshToken(tokens: ReturnType<typeof useLiveResourceTokens>, keys: readonly LiveResourceKey[]) {
+  return combineLiveResourceTokens(tokens, keys);
 }
 
 function resourceOptions(enabled: boolean, refreshToken: number) {
@@ -106,17 +95,25 @@ function AppShell({
   const [sidebarVariant, setSidebarVariant] = useState<SidebarVariant>("primary");
   const apiMode = defaultDataSourceConfig.mode === "api";
   const resourceLoading = resolveAppResourceLoading(activeTab, apiMode);
-  const projectionRefreshToken = useProjectionRefreshToken(apiMode);
+  const liveTokens = useLiveResourceTokens(apiMode);
+  const referenceRefreshToken = liveRefreshToken(liveTokens, ["referenceData"]);
+  const dashboardRefreshToken = liveRefreshToken(liveTokens, ["dashboard"]);
+  const issueBoardRefreshToken = liveRefreshToken(liveTokens, ["issueBoard"]);
+  const issueDetailRefreshToken = liveRefreshToken(liveTokens, ["issueDetail", "issueBoard"]);
+  const historyRefreshToken = liveRefreshToken(liveTokens, ["history"]);
+  const transcriptRefreshToken = liveRefreshToken(liveTokens, ["sessionTranscript", "history"]);
+  const sidebarRefreshToken = liveRefreshToken(liveTokens, ["sidebar"]);
+  const orchestratorChatRefreshToken = liveRefreshToken(liveTokens, ["orchestratorChat"]);
 
-  const reference = useReferenceResource(resourceOptions(lazyReferenceData && resourceLoading.referenceData, projectionRefreshToken));
+  const reference = useReferenceResource(resourceOptions(lazyReferenceData && resourceLoading.referenceData, referenceRefreshToken));
   const referenceData = lazyReferenceData ? (reference.data ?? initialReferenceData) : initialReferenceData;
   const referenceLabel = lazyReferenceData ? referenceStatusLabel(reference) : null;
-  const dashboard = useDashboard(resourceOptions(resourceLoading.dashboard, projectionRefreshToken));
-  const issueBoard = useIssueBoard(resourceOptions(resourceLoading.issueBoard, projectionRefreshToken));
-  const history = useHistory(resourceOptions(resourceLoading.history, projectionRefreshToken));
+  const dashboard = useDashboard(resourceOptions(resourceLoading.dashboard, dashboardRefreshToken));
+  const issueBoard = useIssueBoard(resourceOptions(resourceLoading.issueBoard, issueBoardRefreshToken));
+  const history = useHistory(resourceOptions(resourceLoading.history, historyRefreshToken));
   const sidebarEnabled = resourceLoading.sidebar || (apiMode && Boolean(dashboard.error));
-  const sidebar = useSidebar(resourceOptions(sidebarEnabled, projectionRefreshToken));
-  const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, projectionRefreshToken));
+  const sidebar = useSidebar(resourceOptions(sidebarEnabled, sidebarRefreshToken));
+  const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, orchestratorChatRefreshToken));
   const dashboardChrome = dashboard.data;
   const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
   const tabBadges = resolveTabBadges(issueBoard.data, history.data);
@@ -168,10 +165,10 @@ function AppShell({
               ))
             : null}
           {activeTab === "issues"
-            ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} refreshToken={projectionRefreshToken} />)
+            ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} refreshToken={issueDetailRefreshToken} />)
             : null}
           {activeTab === "history"
-            ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} refreshToken={projectionRefreshToken} />)
+            ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} refreshToken={transcriptRefreshToken} />)
             : null}
           {activeTab === "sidebar"
             ? renderLoadable(sidebar, (data) => (
