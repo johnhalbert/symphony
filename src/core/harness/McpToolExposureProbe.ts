@@ -31,7 +31,12 @@ import {
 } from "../../../cursor/src/CursorHarness.js";
 import { ScopedGatewayClient, type HermesGatewayClient, type HermesGatewayEnvironment } from "../../../hermes/src/GatewayFacade.js";
 import { hermesOwnedAuthProvidersForRuntime } from "../../../hermes/src/HermesAuthManager.js";
-import { writeHermesMcpConfig } from "../../../hermes/src/HermesMcpConfig.js";
+import {
+  buildHermesAgentCommandPolicyHookConfig,
+  type HermesAgentCommandPolicyHookVerifier,
+  verifyHermesAgentCommandPolicyHookInstallation,
+  writeHermesMcpConfig,
+} from "../../../hermes/src/HermesMcpConfig.js";
 import { HermesProfileManager, safeProfileKey } from "../../../hermes/src/HermesProfileManager.js";
 
 export type McpToolExposureStage = "subprocess" | "sdk" | "hermes_gateway";
@@ -135,6 +140,7 @@ export interface HermesGatewayMcpToolExposureProbeOptions {
   mcpCwd?: string;
   gatewayFactory?: (env: HermesGatewayEnvironment) => HermesGatewayClient;
   profileManager?: HermesProfileManager;
+  commandPolicyHookVerifier?: HermesAgentCommandPolicyHookVerifier;
 }
 
 export interface SdkSystemToolExtraction {
@@ -356,7 +362,25 @@ export async function runHermesGatewayMcpToolExposureProbe(
     try {
       await writeRoleContexts(ctx);
       const servers = symphonyRoleMcpServers(ctx, { cliPath: options.cliPath, mcpCwd });
-      const hermesServers = await writeHermesMcpConfig({ profileDir: profile.profileDir, servers });
+      const commandPolicyHookOptions = {
+        cliPath: options.cliPath,
+        role: target.role,
+        phase: target.runPhase,
+        issueId: ctx.issue.id || ctx.issue.identifier,
+      };
+      const hermesServers = await writeHermesMcpConfig({
+        profileDir: profile.profileDir,
+        servers,
+        hooks: buildHermesAgentCommandPolicyHookConfig(commandPolicyHookOptions),
+        hooksAutoAccept: true,
+      });
+      await (options.commandPolicyHookVerifier ?? verifyHermesAgentCommandPolicyHookInstallation)({
+        ...commandPolicyHookOptions,
+        profileDir: profile.profileDir,
+        upstreamRoot: config.hermes.upstreamRoot,
+        python: config.hermes.python,
+        smokeCwd: cwd,
+      });
       for (const spec of roleSpecs) {
         envKeyNamesByServer.set(spec.serverKey, sortedKeys(hermesServers[spec.serverKey]?.env ?? {}));
       }

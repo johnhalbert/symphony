@@ -313,6 +313,7 @@ github:
     try {
       await writeHermesTemplates(root);
       const clients: DoctorFakeHermesGatewayClient[] = [];
+      const hookVerifications: Array<{ role: string; phase: string; upstreamRoot: string }> = [];
       const config = parseServiceConfig(
         {
           tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -334,6 +335,13 @@ github:
       await expect(
         hermesLiveRuntimeDoctorCheck(config, {
           cliPath: path.join(root, "cli.ts"),
+          commandPolicyHookVerifier: async (verification) => {
+            hookVerifications.push({
+              role: verification.role,
+              phase: verification.phase,
+              upstreamRoot: verification.upstreamRoot,
+            });
+          },
           hermesGatewayFactory: (env) => {
             const client = new DoctorFakeHermesGatewayClient(env);
             clients.push(client);
@@ -346,6 +354,10 @@ github:
         message: "Hermes gateway session exposes required Symphony MCP tools for worker and reviewer profiles",
       });
       expect(clients).toHaveLength(2);
+      expect(hookVerifications).toEqual([
+        { role: "worker", phase: "implementation", upstreamRoot: path.join(root, "upstream") },
+        { role: "reviewer", phase: "review", upstreamRoot: path.join(root, "upstream") },
+      ]);
       expect(clients.flatMap((client) => client.requests.map((request) => request.method))).toContain("tools.list");
       expect(clients.every((client) => client.env.authHome === config.hermes.auth.managedRoot)).toBe(true);
     } finally {

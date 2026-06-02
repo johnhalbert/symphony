@@ -169,9 +169,13 @@ async function runHermesJsonRpcFixture(fixture: HarnessActivityConformanceFixtur
   const workspacePath = path.join(root, "workspace");
   await mkdir(workspacePath, { recursive: true });
   const runStore = new CapturingRunStore();
-  const harness = new HermesHarnessForConformance(protocol.events, runStore);
+  const hookVerifications: CommandPolicyHookVerification[] = [];
+  const harness = new HermesHarnessForConformance(protocol.events, runStore, hookVerifications);
   const config = serviceConfig(root, "hermes");
   const events = await collectEvents(harness.run(runContext(config, workspacePath), "Run JSON-RPC conformance fixture"));
+  expect(hookVerifications).toEqual([
+    { role: "worker", phase: "implementation", upstreamRoot: config.hermes.upstreamRoot },
+  ]);
   await harness.dispose();
   return { events, runtimeTranscriptEvents: runStore.events };
 }
@@ -195,11 +199,28 @@ async function runHermesAcpFixture(fixture: HarnessActivityConformanceFixture): 
   return { events, runtimeTranscriptEvents: runStore.events };
 }
 
+interface CommandPolicyHookVerification {
+  role: string;
+  phase: string;
+  upstreamRoot: string;
+}
+
 class HermesHarnessForConformance extends HermesHarness {
-  constructor(events: readonly GatewayEvent[], runStore: CapturingRunStore) {
+  constructor(
+    events: readonly GatewayEvent[],
+    runStore: CapturingRunStore,
+    hookVerifications: CommandPolicyHookVerification[],
+  ) {
     super({
       cliPath: "/host/bin/hermes",
       runStore: runStore as unknown as RunTranscriptStore,
+      commandPolicyHookVerifier: async (verification) => {
+        hookVerifications.push({
+          role: verification.role,
+          phase: verification.phase,
+          upstreamRoot: verification.upstreamRoot,
+        });
+      },
       gatewayFactory: (env) => new FixtureGatewayClient(env, events, "jsonrpc-session-1"),
     });
   }

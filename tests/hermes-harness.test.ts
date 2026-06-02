@@ -41,6 +41,7 @@ describe("HermesHarness", () => {
     const clients: FakeGatewayClient[] = [];
     const harness = new HermesHarness({
       cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
         clients.push(client);
@@ -128,6 +129,7 @@ describe("HermesHarness", () => {
     const clients: FakeGatewayClient[] = [];
     const harness = new HermesHarness({
       cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
         clients.push(client);
@@ -196,6 +198,7 @@ describe("HermesHarness", () => {
     process.env.HERMES_TEST_TOKEN = leakedSecret;
     const harness = new HermesHarness({
       cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
           exitOnPrompt: clients.length === 0,
@@ -236,6 +239,7 @@ describe("HermesHarness", () => {
     const clients: FakeGatewayClient[] = [];
     const harness = new HermesHarness({
       cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
         clients.push(client);
@@ -268,6 +272,7 @@ describe("HermesHarness", () => {
     const resumeAt = "2026-05-28T18:00:00.000Z";
     const harness = new HermesHarness({
       cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
       authManager: acceptingHermesAuthManager(),
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
@@ -323,6 +328,7 @@ describe("HermesHarness", () => {
     };
     const harness = new HermesHarness({
       cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
       authManager: acceptingHermesAuthManager(),
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
@@ -365,6 +371,7 @@ describe("HermesHarness", () => {
     const clients: FakeGatewayClient[] = [];
     const harness = new HermesHarness({
       cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
       authManager: acceptingHermesAuthManager(),
       gatewayFactory: (env) => {
         const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
@@ -535,6 +542,10 @@ function context(
     abortSignal: new AbortController().signal,
     logger: new StructuredLogger(() => undefined),
   };
+}
+
+function acceptingCommandPolicyHookVerifier(): Promise<void> {
+  return Promise.resolve();
 }
 
 function acceptingHermesAuthManager(): HermesAuthManager {

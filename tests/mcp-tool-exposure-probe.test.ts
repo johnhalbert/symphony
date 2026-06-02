@@ -113,6 +113,7 @@ describe("MCP tool exposure probe helpers", () => {
     try {
       await writeHermesTemplates(root);
       const clients: FakeHermesGatewayClient[] = [];
+      const hookVerifications: unknown[] = [];
       const config = parseServiceConfig(
         {
           tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -137,6 +138,9 @@ describe("MCP tool exposure probe helpers", () => {
           roles: ["worker", "reviewer"],
           enabled: true,
           cwd: path.join(root, "workspace"),
+          commandPolicyHookVerifier: async (verification) => {
+            hookVerifications.push(verification);
+          },
           gatewayFactory: (env) => {
             const client = new FakeHermesGatewayClient(env);
             clients.push(client);
@@ -154,9 +158,58 @@ describe("MCP tool exposure probe helpers", () => {
         ],
       });
       expect(clients).toHaveLength(2);
+      expect(hookVerifications).toHaveLength(2);
       expect(clients.map((client) => client.env.model)).toEqual(["gpt-5-test", "gpt-5-test"]);
       expect(clients.every((client) => client.env.provider === "openai-codex")).toBe(true);
       expect(clients.flatMap((client) => client.requests.map((request) => request.method))).toContain("tools.list");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails Hermes gateway exposure before session/tools when command-policy hook validation fails", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-hermes-mcp-probe-"));
+    try {
+      await writeHermesTemplates(root);
+      const clients: FakeHermesGatewayClient[] = [];
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
+          agent: { harness: "hermes" },
+          hermes: {
+            upstream_root: path.join(root, "upstream"),
+            templates_dir: path.join(root, "templates"),
+            state_dir: path.join(root, "state", "hermes"),
+          },
+        },
+        path.join(root, "WORKFLOW.md"),
+        { LINEAR_API_KEY: "linear-secret" },
+      );
+
+      const result = await runHermesGatewayMcpToolExposureProbe(config, {
+        cliPath: path.join(root, "cli.ts"),
+        roles: ["worker"],
+        enabled: true,
+        cwd: path.join(root, "workspace"),
+        commandPolicyHookVerifier: async () => {
+          throw new Error("hook registration unavailable");
+        },
+        gatewayFactory: (env) => {
+          const client = new FakeHermesGatewayClient(env);
+          clients.push(client);
+          return client;
+        },
+      });
+
+      expect(result).toMatchObject({
+        stage: "hermes_gateway",
+        status: "failure",
+        failureCode: "hermes_gateway_startup_failure",
+        results: [{ status: "failure", failureCode: "hermes_gateway_startup_failure" }],
+      });
+      expect(result.message).toContain("hook registration unavailable");
+      expect(clients).toHaveLength(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
