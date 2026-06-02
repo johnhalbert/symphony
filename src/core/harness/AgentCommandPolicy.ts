@@ -95,6 +95,22 @@ const CLI_AUTH_OPTIONS_WITH_VALUE = new Set([
 const CLI_AUTH_SHORT_OPTIONS_WITH_ATTACHED_VALUE = new Set(["-a", "-b", "-U", "-u"]);
 const SENSITIVE_QUERY_PARAMETER_PATTERN =
   /([?&;](?:access[_-]?token|api[_-]?key|auth(?:entication)?[_-]?token|client[_-]?secret|credential|github[_-]?token|gh[_-]?token|id[_-]?token|jwt|oauth[_-]?token|password|passwd|private[_-]?token|refresh[_-]?token|secret|session|token|user[_-]?session)=)([^\s'"&;|]+)/giu;
+const CODE_EXECUTION_SURFACES = new Set(["execute_code", "code_execution"]);
+const EXECUTE_CODE_SUBPROCESS_CALL_PATTERN =
+  /\b(?:subprocess\.(?:run|call|check_call|check_output|Popen)|pty\.spawn|commands\.get(?:status)?output|child_process\.(?:exec|execSync|spawn|spawnSync)|Runtime\.getRuntime\(\)\.exec|ProcessBuilder)\b/iu;
+const EXECUTE_CODE_SHELL_SPAWN_PATTERN = /\bos\.(?:system|popen|spawn(?:l|le|lp|lpe|v|ve|vp|vpe)?)\s*\(/iu;
+const EXECUTE_CODE_NETWORK_CLIENT_PATTERN =
+  /\b(?:requests|httpx|urllib(?:\.request)?|aiohttp|socket|http\.client|ftplib|websocket|fetch|axios|XMLHttpRequest|https?\.request|net\.connect|curl_cffi)\b|\b(?:urlopen|create_connection)\s*\(/iu;
+const EXECUTE_CODE_CREDENTIAL_KEY_PATTERN =
+  /\b(?:GITHUB_TOKEN|GH_TOKEN|GITHUB_PAT|GITHUB_APP_PRIVATE_KEY|GITHUB_PRIVATE_KEY|GITHUB_CREDENTIALS|GH_HOSTS|GIT_ASKPASS|GIT_CREDENTIAL_HELPER|GIT_SSH|GIT_SSH_COMMAND|SSH_AUTH_SOCK|SSH_AGENT_PID)\b/iu;
+const EXECUTE_CODE_CREDENTIAL_PATH_PATTERN =
+  /(?:\.config[\\/][^'"`\s]*gh[\\/]hosts\.ya?ml|\.config[\\/]gh|gh[\\/]hosts\.ya?ml|\.git-credentials|\.netrc|[\\/]\.ssh[\\/]|git[-_]?credential|credential[_-]?helper)/iu;
+const EXECUTE_CODE_DYNAMIC_ARGUMENT_PATTERN =
+  /\b(?:subprocess\.(?:run|call|check_call|check_output|Popen)|os\.(?:system|popen)|child_process\.(?:exec|execSync|spawn|spawnSync))\s*\(\s*[A-Za-z_$][A-Za-z0-9_$]*/iu;
+const EXECUTE_CODE_STRING_CONCAT_COMMAND_PATTERN =
+  /(?:["'](?:g|gi|git|gh|curl|ssh|https?|github)["']\s*\+|\+\s*["'](?:it|h|fetch|push|pull|clone|github|\.com)["'])/iu;
+const EXECUTE_CODE_AMBIGUOUS_CODE_PATTERN =
+  /\b(?:exec|eval|compile|__import__)\s*\(|\bimportlib\.import_module\s*\(|\bopen\s*\([^)]*\)\.read\s*\(/iu;
 
 export type AgentCommandPolicySurface = string;
 export type AgentCommandPolicyCommandSurface = AgentCommandPolicySurface;
@@ -325,10 +341,10 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
   }
 
   const command = commandExtraction.command;
-  const parsed = parseCommandAttempt(command);
-  const audit = auditForParsedCommand(baseAudit, parsed);
 
   if (!isRestrictedAgentRole(input.role)) {
+    const parsed = parseCommandAttempt(command);
+    const audit = auditForParsedCommand(baseAudit, parsed);
     return allowDecision(input, {
       ...audit,
       commandClass: "role_not_restricted",
@@ -337,18 +353,28 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
   }
 
   if (command.trim().length === 0) {
+    const commandClass = isCodeExecutionSurface(input.surface) ? "empty_execute_code" : "unknown_command";
     return denyDecision(
       input,
       {
-        ...audit,
-        commandClass: "unknown_command",
+        ...baseAudit,
+        commandClass,
         upstreamContactAttempted: false,
       },
       "unknown_command",
-      "unknown_command",
-      "Blocked worker/reviewer command: command-capable hook payload did not include a command string. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
+      commandClass,
+      isCodeExecutionSurface(input.surface)
+        ? "Blocked worker/reviewer execute_code call: code execution payload did not include a code string. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity."
+        : "Blocked worker/reviewer command: command-capable hook payload did not include a command string. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
     );
   }
+
+  if (isCodeExecutionSurface(input.surface)) {
+    return classifyExecuteCodeAttempt(input, baseAudit, command);
+  }
+
+  const parsed = parseCommandAttempt(command);
+  const audit = auditForParsedCommand(baseAudit, parsed);
 
   if (parsed.normalizedExecutable === undefined) {
     return denyDecision(
@@ -488,6 +514,316 @@ function auditForParsedCommand(
     ...(parsed.targetHosts.length === 0 ? {} : { targetHosts: parsed.targetHosts }),
     ...(parsed.hasNestedCommand ? { hasNestedCommand: true } : {}),
   };
+}
+
+interface ExecuteCodeStaticCommandEvidence {
+  readonly parsed: ParsedCommandAttempt;
+  readonly upstreamCommandClassPrefix: string;
+  readonly ambiguousCommandClass: string;
+}
+
+interface ExecuteCodeAuditEvidence {
+  readonly staticCommand?: ExecuteCodeStaticCommandEvidence | null | undefined;
+  readonly targetHosts?: readonly string[] | undefined;
+  readonly unsafeConfigCategories?: readonly AgentCommandPolicyUnsafeGitConfigCategory[] | undefined;
+  readonly hasNestedCommand?: boolean | undefined;
+}
+
+function classifyExecuteCodeAttempt(
+  input: AgentCommandPolicyInput,
+  baseAudit: AgentCommandPolicyAuditPayload,
+  code: string,
+): AgentCommandPolicyDecision {
+  const targetHosts = extractExecuteCodeGithubHosts(code);
+  const staticCommand = extractExecuteCodeStaticCommandEvidence(code);
+  const staticUpstreamClassification =
+    staticCommand === null ? null : classifyUpstreamGithubAttempt(staticCommand.parsed);
+
+  if (staticUpstreamClassification !== null && staticCommand !== null) {
+    const commandClass = `${staticCommand.upstreamCommandClassPrefix}_${staticUpstreamClassification.commandClass}`;
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, {
+        staticCommand,
+        targetHosts: staticUpstreamClassification.targetHosts ?? targetHosts,
+        hasNestedCommand: true,
+      }),
+      "upstream_github",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: code execution would initiate upstream GitHub activity from an agent-owned command surface. Use Symphony service-owned workflow actions for publication, review, writeback, mergeability, and CI checks.",
+    );
+  }
+
+  if (targetHosts.length > 0 && hasExecuteCodeNetworkClientEvidence(code)) {
+    const commandClass = executeCodeGithubNetworkCommandClass(code);
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, { staticCommand, targetHosts }),
+      "upstream_github",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: code execution references a GitHub host from an agent-owned command surface. Use Symphony service-owned workflow actions for GitHub API, publication, review, writeback, mergeability, and CI checks.",
+    );
+  }
+
+  if (hasExecuteCodeCredentialAccess(code)) {
+    const commandClass = "execute_code_credential_backed_path";
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, {
+        staticCommand,
+        unsafeConfigCategories: ["credential_helper"],
+      }),
+      "unsafe_environment",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: code execution could access GitHub credential-backed environment or local credential paths. Use Symphony service-owned GitHub workflow actions instead of agent-owned credentials.",
+    );
+  }
+
+  const visibleUpstreamClassification = classifyVisibleCodeUpstreamGithubAttempt(code);
+  if (visibleUpstreamClassification !== null) {
+    const commandClass = `execute_code_${visibleUpstreamClassification.commandClass}`;
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, {
+        staticCommand,
+        targetHosts: visibleUpstreamClassification.targetHosts ?? targetHosts,
+        hasNestedCommand: staticCommand !== null,
+      }),
+      "upstream_github",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: code execution contains GitHub or upstream Git activity that is disallowed for worker/reviewer agents. Use Symphony service-owned workflow actions for publication, review, writeback, mergeability, and CI checks.",
+    );
+  }
+
+  if (targetHosts.length > 0) {
+    const commandClass = "execute_code_github_host_reference";
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, { staticCommand, targetHosts }),
+      "upstream_github",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: code execution references a GitHub host from an agent-owned command surface. Use Symphony service-owned workflow actions for GitHub API, publication, review, writeback, mergeability, and CI checks.",
+    );
+  }
+
+  if (hasExecuteCodeDynamicCommandEvidence(code)) {
+    const commandClass = "execute_code_dynamic_command";
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, { staticCommand, hasNestedCommand: true }),
+      "ambiguous_command",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: dynamically constructed process execution is not classified as helper-free local inspection. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
+    );
+  }
+
+  if (hasExecuteCodeShellSpawnEvidence(code)) {
+    const commandClass = staticCommand?.ambiguousCommandClass ?? "execute_code_shell_spawn";
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, { staticCommand, hasNestedCommand: true }),
+      "ambiguous_command",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: shell process spawning is not classified as helper-free local inspection. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
+    );
+  }
+
+  if (hasExecuteCodeSubprocessSpawnEvidence(code)) {
+    const commandClass = staticCommand?.ambiguousCommandClass ?? "execute_code_subprocess_spawn";
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, { staticCommand, hasNestedCommand: true }),
+      "ambiguous_command",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: subprocess spawning is not classified as helper-free local inspection. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
+    );
+  }
+
+  if (hasExecuteCodeNetworkClientEvidence(code)) {
+    const commandClass = "execute_code_network_client";
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, { staticCommand }),
+      "ambiguous_command",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: network-capable code is not classified as helper-free local inspection. Use Symphony service-owned GitHub workflow actions for GitHub API and workflow activity.",
+    );
+  }
+
+  if (hasExecuteCodeAmbiguousEvaluationEvidence(code)) {
+    const commandClass = "execute_code_ambiguous_code";
+    return denyDecision(
+      input,
+      auditForExecuteCodeClassification(baseAudit, commandClass, { staticCommand }),
+      "ambiguous_command",
+      commandClass,
+      "Blocked worker/reviewer execute_code call: dynamic code evaluation or script loading cannot be proven local-only and helper-free. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
+    );
+  }
+
+  const commandClass = "execute_code_ambiguous_code";
+  return denyDecision(
+    input,
+    auditForExecuteCodeClassification(baseAudit, commandClass, { staticCommand }),
+    "ambiguous_command",
+    commandClass,
+    "Blocked worker/reviewer execute_code call: arbitrary code execution is not classified as helper-free local inspection by this policy scaffold. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
+  );
+}
+
+function auditForExecuteCodeClassification(
+  baseAudit: AgentCommandPolicyAuditPayload,
+  commandClass: string,
+  evidence: ExecuteCodeAuditEvidence = {},
+): AgentCommandPolicyAuditPayload {
+  const parsedAudit = evidence.staticCommand
+    ? auditForParsedCommand(baseAudit, evidence.staticCommand.parsed)
+    : baseAudit;
+  const targetHosts = sortedUniqueKeys([...(parsedAudit.targetHosts ?? []), ...(evidence.targetHosts ?? [])]);
+  const unsafeConfigCategories = sortedUniqueKeys([
+    ...parsedAudit.unsafeConfigCategories,
+    ...(evidence.unsafeConfigCategories ?? []),
+  ]) as AgentCommandPolicyUnsafeGitConfigCategory[];
+  const hasNestedCommand = evidence.hasNestedCommand || evidence.staticCommand !== null && evidence.staticCommand !== undefined;
+
+  return {
+    ...parsedAudit,
+    commandPreview: baseAudit.commandPreview,
+    commandClass,
+    unsafeConfigCategories,
+    upstreamContactAttempted: false,
+    ...(targetHosts.length === 0 ? {} : { targetHosts }),
+    ...(hasNestedCommand ? { hasNestedCommand: true } : {}),
+  };
+}
+
+function extractExecuteCodeGithubHosts(code: string): string[] {
+  return sortedUniqueKeys([...extractGithubHosts(tokenizeCommandPreview(code)), ...extractGithubHosts(extractQuotedStrings(code))]);
+}
+
+function extractExecuteCodeStaticCommandEvidence(code: string): ExecuteCodeStaticCommandEvidence | null {
+  const shellCommand = firstCapturedCommandLiteral(
+    code,
+    /\bos\.(?:system|popen)\s*\(\s*(["'])([\s\S]{1,800}?)\1/iu,
+  );
+  if (shellCommand !== null) return executeCodeStaticCommandFromText(shellCommand, "execute_code_shell_spawn");
+
+  const subprocessCommand = firstCapturedCommandLiteral(
+    code,
+    /\b(?:subprocess\.(?:run|call|check_call|check_output|Popen)|child_process\.(?:exec|execSync))\s*\(\s*(["'])([\s\S]{1,800}?)\1/iu,
+  );
+  if (subprocessCommand !== null) return executeCodeStaticCommandFromText(subprocessCommand, "execute_code_subprocess");
+
+  const argvListMatch =
+    /\b(?:subprocess\.(?:run|call|check_call|check_output|Popen)|pty\.spawn|child_process\.(?:spawn|spawnSync))\s*\(\s*\[([\s\S]{1,1000}?)\]/iu.exec(
+      code,
+    );
+  const argvListCommand = argvListMatch?.[1] ? commandTextFromExecutableStringSequence(extractQuotedStrings(argvListMatch[1])) : null;
+  if (argvListCommand !== null) return executeCodeStaticCommandFromText(argvListCommand, "execute_code_subprocess");
+
+  if (hasExecuteCodeSubprocessSpawnEvidence(code) || hasExecuteCodeShellSpawnEvidence(code)) {
+    const command = commandTextFromExecutableStringSequence(extractQuotedStrings(code));
+    if (command !== null) {
+      return executeCodeStaticCommandFromText(
+        command,
+        hasExecuteCodeShellSpawnEvidence(code) ? "execute_code_shell_spawn" : "execute_code_subprocess",
+      );
+    }
+  }
+
+  return null;
+}
+
+function executeCodeStaticCommandFromText(
+  command: string,
+  upstreamCommandClassPrefix: string,
+): ExecuteCodeStaticCommandEvidence | null {
+  const parsed = parseCommandAttempt(command);
+  if (parsed.normalizedExecutable === undefined) return null;
+  if (!isDirectlyClassifiableUpstreamExecutable(parsed.normalizedExecutable)) return null;
+  return {
+    parsed,
+    upstreamCommandClassPrefix,
+    ambiguousCommandClass:
+      upstreamCommandClassPrefix === "execute_code_shell_spawn"
+        ? "execute_code_shell_spawn"
+        : "execute_code_subprocess_spawn",
+  };
+}
+
+function firstCapturedCommandLiteral(code: string, pattern: RegExp): string | null {
+  const match = pattern.exec(code);
+  const command = match?.[2];
+  return command && command.trim().length > 0 ? unescapeCodeStringLiteral(command) : null;
+}
+
+function commandTextFromExecutableStringSequence(strings: readonly string[]): string | null {
+  for (let index = 0; index < strings.length; index += 1) {
+    const executable = strings[index];
+    if (executable === undefined) continue;
+    const normalized = normalizeAgentCommandPolicyExecutable(executable).normalizedExecutable;
+    if (normalized === null || !isDirectlyClassifiableUpstreamExecutable(normalized)) continue;
+
+    const commandParts = [executable];
+    for (let partIndex = index + 1; partIndex < strings.length && commandParts.length < 10; partIndex += 1) {
+      const part = strings[partIndex]?.trim();
+      if (!part || part.length > 160) continue;
+      commandParts.push(part);
+    }
+    return commandParts.join(" ");
+  }
+  return null;
+}
+
+function extractQuotedStrings(text: string): string[] {
+  const strings: string[] = [];
+  const pattern = /(["'])([\s\S]*?)\1/gu;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    const value = match[2];
+    if (value !== undefined) strings.push(unescapeCodeStringLiteral(value));
+  }
+  return strings;
+}
+
+function unescapeCodeStringLiteral(value: string): string {
+  return value.replace(/\\([\\"'`])/gu, "$1");
+}
+
+function hasExecuteCodeSubprocessSpawnEvidence(code: string): boolean {
+  return EXECUTE_CODE_SUBPROCESS_CALL_PATTERN.test(code);
+}
+
+function hasExecuteCodeShellSpawnEvidence(code: string): boolean {
+  return EXECUTE_CODE_SHELL_SPAWN_PATTERN.test(code);
+}
+
+function hasExecuteCodeNetworkClientEvidence(code: string): boolean {
+  return EXECUTE_CODE_NETWORK_CLIENT_PATTERN.test(code);
+}
+
+function hasExecuteCodeCredentialAccess(code: string): boolean {
+  const lowerCode = code.toLowerCase();
+  return (
+    EXECUTE_CODE_CREDENTIAL_KEY_PATTERN.test(code) ||
+    EXECUTE_CODE_CREDENTIAL_PATH_PATTERN.test(code) ||
+    (lowerCode.includes(".config") && lowerCode.includes("gh") && /hosts\.ya?ml/iu.test(code))
+  );
+}
+
+function hasExecuteCodeDynamicCommandEvidence(code: string): boolean {
+  if (!hasExecuteCodeSubprocessSpawnEvidence(code) && !hasExecuteCodeShellSpawnEvidence(code)) return false;
+  return EXECUTE_CODE_DYNAMIC_ARGUMENT_PATTERN.test(code) || EXECUTE_CODE_STRING_CONCAT_COMMAND_PATTERN.test(code);
+}
+
+function hasExecuteCodeAmbiguousEvaluationEvidence(code: string): boolean {
+  return EXECUTE_CODE_AMBIGUOUS_CODE_PATTERN.test(code);
+}
+
+function executeCodeGithubNetworkCommandClass(code: string): string {
+  return /\b(?:requests|httpx|urllib(?:\.request)?|aiohttp|socket|http\.client|urlopen)\b/iu.test(code)
+    ? "execute_code_python_network_github_request"
+    : "execute_code_network_github_request";
 }
 
 interface UpstreamGithubClassification {
@@ -1319,6 +1655,14 @@ function isRestrictedAgentRole(role: string): boolean {
   return RESTRICTED_ROLES.has(role);
 }
 
+function isCodeExecutionSurface(surface: string): boolean {
+  return CODE_EXECUTION_SURFACES.has(normalizedAgentCommandPolicySurface(surface));
+}
+
+function normalizedAgentCommandPolicySurface(surface: string): string {
+  return surface.trim().toLowerCase().replace(/[-\s]+/g, "_");
+}
+
 export function extractAgentCommandPolicyCommandText(
   rawInput: Record<string, unknown>,
   surface: string,
@@ -1341,7 +1685,7 @@ export function extractAgentCommandPolicyCommandText(
 }
 
 function expectedCommandTextKeyForSurface(surface: string): AgentCommandPolicyCommandTextKey | null {
-  const normalized = surface.trim().toLowerCase().replace(/[-\s]+/g, "_");
+  const normalized = normalizedAgentCommandPolicySurface(surface);
   if (normalized === "execute_code" || normalized === "code_execution") return "code";
   if (normalized === "terminal" || normalized === "terminal_execute" || normalized === "execute" || normalized === "shell") {
     return "command";

@@ -134,6 +134,40 @@ describe("AgentCommandPolicyHookRunner", () => {
     });
   });
 
+  it("blocks execute_code hook payloads with code before execution", async () => {
+    const code = `import subprocess
+subprocess.run(["gh", "pr", "create", "--fill"])`;
+    const evaluation = await evaluateAgentCommandPolicyHookPayload(
+      JSON.stringify(hermesPayload({ code }, { toolName: "execute_code" })),
+      {
+        role: "worker",
+        phase: "implementation",
+      },
+    );
+
+    expect(evaluation.policyInput).toMatchObject({
+      role: "worker",
+      phase: "implementation",
+      surface: "execute_code",
+      rawInput: { code },
+    });
+    expect(evaluation.decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "upstream_github",
+      commandClass: "execute_code_subprocess_github_cli",
+      audit: {
+        surface: "execute_code",
+        hasNestedCommand: true,
+        upstreamContactAttempted: false,
+      },
+    });
+    expect(evaluation.hookResponse?.action).toBe("block");
+    expect(JSON.parse(evaluation.stdout) as unknown).toMatchObject({
+      action: "block",
+      message: expect.stringContaining("service-owned workflow") as string,
+    });
+  });
+
   it("fails closed with block JSON for malformed hook payloads before policy classification", async () => {
     const evaluation = await evaluateAgentCommandPolicyHookPayload("{not-json", {
       role: "worker",
