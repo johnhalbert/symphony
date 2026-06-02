@@ -6,7 +6,9 @@ This runbook describes how to move the Engineering Linear backlog from planning 
 
 Keep `ENG-*` child issues in `Backlog` until their blockers clear and an operator intentionally promotes them.
 
-All child issues in this epic remain `Backlog` with `dogfood-blocked` until manually promoted. Remove `dogfood-blocked` and add `dogfood-ready` only as part of an intentional operator promotion.
+All child issues in this epic remain `Backlog` with `dogfood-blocked` until manually promoted. Remove `dogfood-blocked` and add `dogfood-ready` only as part of an intentional operator promotion after reviewing the issue's contract checklist and concrete validation plan.
+
+Agent-eligible issue descriptions must use the durable template in [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md) before promotion. The required sections are `Problem / Goal`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`. Use the same section names for docs-only drafting and implementation drafting so workers, reviewers, and doctor lint evaluate one contract.
 
 Roadmap placeholder issues for continuation search or richer summarization stay `Backlog` with `dogfood-blocked`. Do not add `dogfood-ready` to those placeholders until the issue includes a concrete implementation path beyond interfaces, configuration flags, or docs.
 
@@ -125,10 +127,13 @@ Promote through `Backlog -> Todo`. Do not move issues directly to `In Progress` 
 
 Before promotion, verify:
 
+- The issue has the required agent-eligible authoring sections from [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md): `Problem / Goal`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.
+- The issue has a concrete validation plan in `Validation Requirements`, not only generic "add tests" language.
+- The `Contract Checklist` covers the relevant happy path, negative/error path, sibling surfaces, stale/fallback states, replay/idempotency, credential boundary, and side-effect verification cases.
 - The issue has no open blockers.
 - The issue is assigned according to the workflow route.
-- The issue has `dogfood-ready`.
-- `dogfood-blocked` has been removed only after the ACP final live validation checklist passes when the issue depends on `hermes_acp`.
+- The issue has `dogfood-ready` only after an operator reviewed the required sections, contract checklist, and validation plan.
+- `dogfood-blocked` has been removed only after the required issue contract is complete and, when the issue depends on `hermes_acp`, after the ACP final live validation checklist passes.
 - The issue does not have `dogfood-blocked` or `safety-blocked`.
 - The issue does not touch protected paths unless a human is implementing it manually.
 - The issue is not a continuation search or richer summarization placeholder that should remain `Backlog` with `dogfood-blocked`.
@@ -145,6 +150,7 @@ Expected result:
 - A git worktree is created.
 - The run transcript is persisted.
 - The worker calls `submit_completion_report` with summary, validation evidence, acceptance checklist, changed files, branch/PR details, risks, and an idempotency key.
+- The worker does not run `git commit`, `git push`, or create/update GitHub PRs directly; implementation changes remain in the assigned worktree for service-owned publication.
 - Symphony publishes or reuses the lifecycle-bound pull request and moves the issue directly to `In Review` because `github.pr_handoff.enabled` is false.
 - The reviewer records a pass verdict for the tiny smoke.
 - Symphony applies the configured `Ready to Merge` pass destination.
@@ -170,6 +176,7 @@ During the smoke:
 
 - No issue becomes a worker candidate until an operator intentionally moves it to `Todo` with the required label.
 - No issue enters `In Review` until the lifecycle record has an accepted worker completion report and any configured PR publication step has completed.
+- Worker implementation and merge-gate repair prompts instruct workers to submit completion reports instead of committing, pushing, or mutating lifecycle-bound PRs directly.
 - No reviewer dispatch occurs without a last completion report.
 - A fail verdict returns the issue to `In Progress`, increments the review round, and includes a revision-request comment.
 - A pass verdict is recorded before the configured pass destination is applied.

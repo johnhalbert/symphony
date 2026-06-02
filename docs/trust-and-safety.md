@@ -34,6 +34,10 @@ Linear writeback should be idempotent and should re-check current Linear state b
 
 Dogfood dispatch is opt-in. The reference `WORKFLOW.md` requires `dogfood-ready` and excludes `dogfood-blocked` and `safety-blocked`.
 
+Operators must not add `dogfood-ready` or remove `dogfood-blocked` for an agent-eligible issue until the issue uses the required authoring sections from [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md): `Problem / Goal`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`. The `Validation Requirements` section must include a concrete validation plan, and the `Contract Checklist` must be reviewed for the touched surfaces before promotion.
+
+The template explicitly forbids secrets, tokens, private keys, credential values, and private customer data in issue descriptions. Issues should describe credential/security variants without including credential material.
+
 All issues in the dogfood epic remain `Backlog` with `dogfood-blocked` until an operator manually promotes exactly the next issue intended for dispatch.
 
 Continuation search and richer summarization are roadmap placeholders only. Their feature flags default off, doctor warns if an operator enables them before implementation, and their placeholder Linear issues stay `Backlog` with `dogfood-blocked` and without `dogfood-ready`.
@@ -153,7 +157,7 @@ The closed capability inventory is `github.discovery`, `github.publication`, `gi
 
 When `credential_profiles` is absent, current behavior is unchanged. GitHub capabilities fall back to `github.token` or `GITHUB_TOKEN`; both Linear capabilities fall back to `tracker.api_key` or `LINEAR_API_KEY`; `runtime.cursor` and legacy `cursor.runtime` fall back to env-only `CURSOR_API_KEY`; `runtime.hermes` has no legacy fallback and must be assigned explicitly when the Hermes harness needs a runtime API key; and `server.open_workspace` falls back only to `server.open_workspace_token`. The reference workflow points `server.open_workspace_token` at `SYMPHONY_WORKSPACE_TOKEN`. Hermes `openai-codex` uses Hermes-owned OAuth instead of `runtime.hermes`: Symphony bootstraps selected provider state into `hermes.auth.managed_root` and passes it to generated profiles with `HERMES_AUTH_HOME`.
 
-Default role capability sets are intentionally narrow: workers use GitHub discovery, Linear tracker/writeback, runtime harness, and workspace-open credentials; service code uses GitHub publication/merge and Linear writeback credentials; reviewers use GitHub review-evidence read, GitHub review-feedback write, Linear tracker/writeback, and runtime harness credentials. MCP context `token` and `expectedToken` fields in completion-report, review-feedback, and review-verdict handoff files are local handoff authentication, not GitHub, Linear, runtime, or server credentials, and must not be modeled as credential profiles.
+Default role capability sets are intentionally narrow: workers use GitHub discovery, Linear tracker/writeback, runtime harness, and workspace-open credentials; service code uses GitHub publication/merge and Linear writeback credentials; reviewers use GitHub review-evidence read, GitHub review-feedback write, Linear tracker/writeback, and runtime harness credentials. Implementation workers hand off with `submit_completion_report`; they must not commit, push, or mutate lifecycle-bound PRs directly because service-owned publication performs the commit, push, and PR creation/reuse after acceptance. MCP context `token` and `expectedToken` fields in completion-report, review-feedback, and review-verdict handoff files are local handoff authentication, not GitHub, Linear, runtime, or server credentials, and must not be modeled as credential profiles.
 
 ## Runtime Harness
 
