@@ -3,6 +3,8 @@ import path from "node:path";
 import YAML from "yaml";
 import { describe, expect, it } from "vitest";
 import { SYMPHONY_HERMES_AGENT_MAX_TURNS } from "../hermes/src/HermesMcpConfig.js";
+import { HermesProfileManager } from "../hermes/src/HermesProfileManager.js";
+import { parseServiceConfig } from "../src/core/config/Config.js";
 
 describe("Hermes role template policy", () => {
   it("disables subagent delegation only for reviewer profiles", async () => {
@@ -76,6 +78,113 @@ describe("Hermes role template policy", () => {
     expect(skill).toContain("stop and return current findings");
     expect(skill).toContain("Do not perform service-owned publication actions");
   });
+
+  it("keeps ENG-243 command-policy enforcement rooted outside vendored Hermes source", () => {
+    const workflowDir = path.resolve(".");
+    const config = parseServiceConfig(
+      {
+        tracker: {
+          kind: "linear",
+          api_key: "$LINEAR_API_KEY",
+          project_slug: "TEST",
+        },
+        workspace: {
+          root: path.join(workflowDir, "symphony_workspaces"),
+        },
+      },
+      path.join(workflowDir, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const vendoredHermesRoot = path.resolve(workflowDir, "hermes", "upstream-src");
+    const manager = new HermesProfileManager({
+      templatesDir: config.hermes.templatesDir,
+      stateDir: config.hermes.stateDir,
+    });
+    const roleTemplatePaths = Object.entries(config.hermes.roleTemplates).map(([role, template]) => ({
+      label: `generated ${role} profile template`,
+      targetPath: manager.resolveTemplateDir(template),
+    }));
+    const generatedProfileDirs = [
+      manager.resolveProfileDir({
+        workspaceKey: "eng-243",
+        role: "worker",
+        phase: "implementation",
+        profileKey: "command-policy-hook",
+      }),
+      manager.resolveProfileDir({
+        workspaceKey: "eng-243",
+        role: "reviewer",
+        phase: "review",
+        profileKey: "command-policy-hook",
+      }),
+      manager.resolveProfileDir({
+        workspaceKey: "eng-243",
+        role: "worker",
+        phase: "merge_conflict_resolution",
+        profileKey: "command-policy-hook",
+      }),
+    ];
+    const generatedProfilePaths = generatedProfileDirs.flatMap((profileDir) => [
+      { label: `generated profile ${profileDir}`, targetPath: profileDir },
+      { label: `generated profile config ${profileDir}`, targetPath: path.join(profileDir, "config.yaml") },
+    ]);
+    const symphonyOwnedPolicyPaths = [
+      { label: "policy fixture builders", targetPath: path.resolve("tests", "agent-command-policy-fixtures.ts") },
+      { label: "shared policy classifier", targetPath: path.resolve("src", "core", "harness", "AgentCommandPolicy.ts") },
+      {
+        label: "policy hook runner",
+        targetPath: path.resolve("src", "core", "harness", "AgentCommandPolicyHookRunner.ts"),
+      },
+      {
+        label: "ACP policy resolver",
+        targetPath: path.resolve("src", "core", "harness", "AgentCommandPolicyAcpResolver.ts"),
+      },
+      { label: "HarnessFactory injection", targetPath: path.resolve("src", "core", "harness", "HarnessFactory.ts") },
+      { label: "agent-command-policy-hook CLI", targetPath: path.resolve("src", "cli.ts") },
+      { label: "Hermes ACP harness integration", targetPath: path.resolve("hermes", "src", "HermesAcpHarness.ts") },
+      { label: "Hermes gateway harness integration", targetPath: path.resolve("hermes", "src", "HermesHarness.ts") },
+      { label: "Hermes MCP/profile config writer", targetPath: path.resolve("hermes", "src", "HermesMcpConfig.ts") },
+      { label: "Hermes role templates root", targetPath: config.hermes.templatesDir },
+      { label: "worker role config", targetPath: path.resolve("hermes", "templates", "worker", "config.yaml") },
+      { label: "reviewer role config", targetPath: path.resolve("hermes", "templates", "reviewer", "config.yaml") },
+      { label: "planner role config", targetPath: path.resolve("hermes", "templates", "planner", "config.yaml") },
+      { label: "worker policy guidance", targetPath: path.resolve("hermes", "templates", "worker", "SOUL.md") },
+      {
+        label: "worker implementation skill guidance",
+        targetPath: path.resolve(
+          "hermes",
+          "templates",
+          "worker",
+          "skills",
+          "orchestration",
+          "symphony-worker-implementation",
+          "SKILL.md",
+        ),
+      },
+      ...roleTemplatePaths,
+      ...generatedProfilePaths,
+    ];
+
+    expect(config.hermes.upstreamRoot).toBe(vendoredHermesRoot);
+    expect(config.hermes.templatesDir).toBe(path.resolve(workflowDir, "hermes", "templates"));
+    expect(isPathRootedUnder(path.join(vendoredHermesRoot, "hermes_cli", "auth.py"), vendoredHermesRoot)).toBe(true);
+    expect(isPathRootedUnder(path.resolve("hermes", "upstream-src-fake", "hook.ts"), vendoredHermesRoot)).toBe(false);
+    expect(isPathRootedUnder(path.resolve("hermes", "src", "HermesHarness.ts"), vendoredHermesRoot)).toBe(false);
+    expect(isPathRootedUnder("/repo/hermes/upstream-src/hermes_cli/auth.py", "/repo/hermes/upstream-src", path.posix)).toBe(
+      true,
+    );
+    expect(isPathRootedUnder("/repo/hermes/upstream-src-fake/hook.ts", "/repo/hermes/upstream-src", path.posix)).toBe(
+      false,
+    );
+    expect(
+      isPathRootedUnder("C:\\repo\\hermes\\upstream-src\\hermes_cli\\auth.py", "C:\\repo\\hermes\\upstream-src", path.win32),
+    ).toBe(true);
+    expect(
+      isPathRootedUnder("C:\\repo\\hermes\\upstream-src-fake\\hook.ts", "C:\\repo\\hermes\\upstream-src", path.win32),
+    ).toBe(false);
+
+    expect(symphonyOwnedPolicyPaths.filter(({ targetPath }) => isPathRootedUnder(targetPath, vendoredHermesRoot))).toEqual([]);
+  });
 });
 
 async function readTemplateConfig(filePath: string): Promise<Record<string, unknown>> {
@@ -109,4 +218,13 @@ function delegationMaxIterations(config: Record<string, unknown>): number | null
   if (typeof delegation !== "object" || delegation === null || Array.isArray(delegation)) return null;
   const maxIterations = (delegation as Record<string, unknown>).max_iterations;
   return typeof maxIterations === "number" ? maxIterations : null;
+}
+
+type PathOperations = Pick<typeof path, "isAbsolute" | "relative" | "resolve">;
+
+function isPathRootedUnder(targetPath: string, rootPath: string, pathOps: PathOperations = path): boolean {
+  const root = pathOps.resolve(rootPath);
+  const target = pathOps.resolve(targetPath);
+  const relative = pathOps.relative(root, target);
+  return relative === "" || (!relative.startsWith("..") && !pathOps.isAbsolute(relative));
 }
