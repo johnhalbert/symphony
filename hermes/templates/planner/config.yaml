@@ -9,7 +9,7 @@ agent:
 compression:
   threshold: 0.75
 delegation:
-  max_iterations: 999
+  max_iterations: 15
 memory:
   memory_enabled: false
   user_profile_enabled: false

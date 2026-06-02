@@ -6,6 +6,8 @@ import { SYMPHONY_HERMES_AGENT_MAX_TURNS } from "../hermes/src/HermesMcpConfig.j
 import { HermesProfileManager } from "../hermes/src/HermesProfileManager.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 
+const SYMPHONY_HERMES_DELEGATION_MAX_ITERATIONS = 15;
+
 describe("Hermes role template policy", () => {
   it("disables subagent delegation only for reviewer profiles", async () => {
     const templatesDir = path.resolve("hermes", "templates");
@@ -31,7 +33,7 @@ describe("Hermes role template policy", () => {
     expect(agentMaxTurns(planner)).toBe(SYMPHONY_HERMES_AGENT_MAX_TURNS);
   });
 
-  it("gives delegating Symphony profiles the extended child-agent budget", async () => {
+  it("caps delegating Symphony profiles to a bounded child-agent budget", async () => {
     const templatesDir = path.resolve("hermes", "templates");
 
     const worker = await readTemplateConfig(path.join(templatesDir, "worker", "config.yaml"));
@@ -40,8 +42,8 @@ describe("Hermes role template policy", () => {
 
     expect(disabledToolsets(worker)).not.toContain("delegation");
     expect(disabledToolsets(planner)).not.toContain("delegation");
-    expect(delegationMaxIterations(worker)).toBe(SYMPHONY_HERMES_AGENT_MAX_TURNS);
-    expect(delegationMaxIterations(planner)).toBe(SYMPHONY_HERMES_AGENT_MAX_TURNS);
+    expect(delegationMaxIterations(worker)).toBe(SYMPHONY_HERMES_DELEGATION_MAX_ITERATIONS);
+    expect(delegationMaxIterations(planner)).toBe(SYMPHONY_HERMES_DELEGATION_MAX_ITERATIONS);
     expect(disabledToolsets(reviewer)).toContain("delegation");
   });
 
@@ -70,6 +72,10 @@ describe("Hermes role template policy", () => {
     expect(skill).toContain("name: symphony-worker-implementation");
     expect(skill).toContain("delegate_task");
     expect(skill).toContain("bounded read-only research");
+    expect(skill).toContain('toolsets: ["terminal"]');
+    expect(skill).toContain("Do not include the `file` toolset");
+    expect(skill).toContain("context-preservation goal");
+    expect(skill).toContain("Use the `terminal` tool for repo exploration");
     expect(skill).toContain("child research must be leaf-only");
     expect(skill).toContain("capped `terminal` reducer commands");
     expect(skill).toContain("150 lines or 20 KB");
