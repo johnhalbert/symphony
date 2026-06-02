@@ -3,7 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import YAML from "yaml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SYMPHONY_HERMES_AGENT_MAX_TURNS, toHermesMcpServers, writeHermesMcpConfig } from "../hermes/src/HermesMcpConfig.js";
+import {
+  buildHermesAgentCommandPolicyHookConfig,
+  SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
+  SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
+  SYMPHONY_HERMES_AGENT_MAX_TURNS,
+  toHermesMcpServers,
+  writeHermesMcpConfig,
+} from "../hermes/src/HermesMcpConfig.js";
 
 let root: string;
 
@@ -102,5 +109,60 @@ describe("Hermes MCP config", () => {
         show_reasoning: true,
       },
     });
+  });
+
+  it("merges generated command-policy shell hooks into an existing Hermes profile config", async () => {
+    const profileDir = path.join(root, "profile");
+    await mkdir(profileDir, { recursive: true });
+    await writeFile(
+      path.join(profileDir, "config.yaml"),
+      YAML.stringify({
+        hooks_auto_accept: false,
+        hooks: {
+          pre_tool_call: [{ matcher: "write_file", command: "format-hook", timeout: 3 }],
+          post_tool_call: [{ matcher: "patch", command: "post-hook", timeout: 4 }],
+        },
+        display: { show_tool_calls: true },
+      }),
+      "utf8",
+    );
+    const cliPath = path.join(root, "cli with spaces.js");
+
+    const generatedHooks = buildHermesAgentCommandPolicyHookConfig({
+      cliPath,
+      role: "worker",
+      phase: "implementation",
+      issueId: "issue-1",
+    });
+    await writeHermesMcpConfig({
+      profileDir,
+      servers: {},
+      hooks: generatedHooks,
+      hooksAutoAccept: true,
+    });
+    await writeHermesMcpConfig({
+      profileDir,
+      servers: {},
+      hooks: generatedHooks,
+      hooksAutoAccept: true,
+    });
+
+    const parsed = YAML.parse(await readFile(path.join(profileDir, "config.yaml"), "utf8")) as Record<string, any>;
+    expect(parsed.hooks_auto_accept).toBe(true);
+    expect(parsed.display).toEqual({ show_tool_calls: true });
+    expect(parsed.hooks.post_tool_call).toEqual([{ matcher: "patch", command: "post-hook", timeout: 4 }]);
+    expect(parsed.hooks.pre_tool_call).toEqual([
+      { matcher: "write_file", command: "format-hook", timeout: 3 },
+      {
+        matcher: SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
+        command: expect.stringContaining("agent-command-policy-hook") as string,
+        timeout: SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
+      },
+    ]);
+    const policyHook = parsed.hooks.pre_tool_call[1] as { command: string };
+    expect(policyHook.command).toContain("--role worker");
+    expect(policyHook.command).toContain("--phase implementation");
+    expect(policyHook.command).toContain("--issue-id issue-1");
+    expect(policyHook.command).toContain("cli with spaces.js");
   });
 });

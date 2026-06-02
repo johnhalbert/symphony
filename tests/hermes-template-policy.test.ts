@@ -2,7 +2,12 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import YAML from "yaml";
 import { describe, expect, it } from "vitest";
-import { SYMPHONY_HERMES_AGENT_MAX_TURNS } from "../hermes/src/HermesMcpConfig.js";
+import {
+  buildHermesAgentCommandPolicyHookConfig,
+  SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
+  SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
+  SYMPHONY_HERMES_AGENT_MAX_TURNS,
+} from "../hermes/src/HermesMcpConfig.js";
 import { HermesProfileManager } from "../hermes/src/HermesProfileManager.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 
@@ -57,6 +62,38 @@ describe("Hermes role template policy", () => {
     expect(compressionThreshold(worker)).toBe(0.75);
     expect(compressionThreshold(reviewer)).toBe(0.75);
     expect(compressionThreshold(planner)).toBe(0.75);
+  });
+
+  it("defines generated worker/reviewer pre_tool_call hooks for command-capable profile tools", () => {
+    const workerHooks = buildHermesAgentCommandPolicyHookConfig({
+      cliPath: path.resolve("dist", "cli.js"),
+      role: "worker",
+      phase: "implementation",
+      issueId: "issue-1",
+    });
+    const reviewerHooks = buildHermesAgentCommandPolicyHookConfig({
+      cliPath: path.resolve("dist", "cli.js"),
+      role: "reviewer",
+      phase: "review",
+      issueId: "issue-1",
+    });
+
+    const workerPreToolHooks = workerHooks.pre_tool_call ?? [];
+    const reviewerPreToolHooks = reviewerHooks.pre_tool_call ?? [];
+    for (const hooks of [workerPreToolHooks, reviewerPreToolHooks]) {
+      expect(hooks).toHaveLength(1);
+      expect(hooks[0]).toMatchObject({
+        matcher: SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
+        command: expect.stringContaining("agent-command-policy-hook") as string,
+        timeout: SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
+      });
+    }
+    expect(Object.keys(workerHooks)).toEqual(["pre_tool_call"]);
+    expect(Object.keys(reviewerHooks)).toEqual(["pre_tool_call"]);
+    expect(workerPreToolHooks[0]!.command).toContain("--role worker");
+    expect(workerPreToolHooks[0]!.command).toContain("--phase implementation");
+    expect(reviewerPreToolHooks[0]!.command).toContain("--role reviewer");
+    expect(reviewerPreToolHooks[0]!.command).toContain("--phase review");
   });
 
   it("seeds and requires the Symphony worker implementation skill", async () => {
@@ -150,6 +187,7 @@ describe("Hermes role template policy", () => {
       { label: "Hermes ACP harness integration", targetPath: path.resolve("hermes", "src", "HermesAcpHarness.ts") },
       { label: "Hermes gateway harness integration", targetPath: path.resolve("hermes", "src", "HermesHarness.ts") },
       { label: "Hermes MCP/profile config writer", targetPath: path.resolve("hermes", "src", "HermesMcpConfig.ts") },
+      { label: "Hermes gateway profile hook tests", targetPath: path.resolve("tests", "hermes-command-policy-profile.test.ts") },
       { label: "Hermes role templates root", targetPath: config.hermes.templatesDir },
       { label: "worker role config", targetPath: path.resolve("hermes", "templates", "worker", "config.yaml") },
       { label: "reviewer role config", targetPath: path.resolve("hermes", "templates", "reviewer", "config.yaml") },

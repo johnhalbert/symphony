@@ -20,7 +20,12 @@ import {
   isHermesOwnedAuthProvider,
   normalizeHermesAuthProvider,
 } from "./HermesAuthManager.js";
-import { SYMPHONY_HERMES_AGENT_MAX_TURNS, writeHermesMcpConfig } from "./HermesMcpConfig.js";
+import {
+  buildHermesAgentCommandPolicyHookConfig,
+  SYMPHONY_HERMES_AGENT_MAX_TURNS,
+  type HermesShellHooksConfig,
+  writeHermesMcpConfig,
+} from "./HermesMcpConfig.js";
 import { hermesAcpProfileName, HermesProfileManager, type HermesProfile } from "./HermesProfileManager.js";
 
 export interface HermesHarnessOptions {
@@ -246,6 +251,8 @@ export class HermesHarness implements AgentHarness {
 
     const manager = this.effectiveProfileManager(ctx);
     const phase = currentRunPhase(ctx);
+    const cliPath = this.cliPath();
+    const commandPolicyHooks = agentCommandPolicyHooksForRun(ctx, phase, cliPath);
     const profileKey = hermesRunProfileKey(ctx, phase, reusable, freshLeaseId);
     const profile = await manager.materialize({
       workspaceKey: ctx.workspace.workspaceKey,
@@ -257,8 +264,9 @@ export class HermesHarness implements AgentHarness {
     });
     await writeHermesMcpConfig({
       profileDir: profile.profileDir,
-      servers: symphonyRoleMcpServers(ctx, { cliPath: this.cliPath(), mcpCwd: ctx.workspace.path }),
+      servers: symphonyRoleMcpServers(ctx, { cliPath, mcpCwd: ctx.workspace.path }),
       agentMaxTurns: SYMPHONY_HERMES_AGENT_MAX_TURNS,
+      ...(commandPolicyHooks === undefined ? {} : { hooks: commandPolicyHooks, hooksAutoAccept: true }),
     });
 
     const requiredAuthProviders = hermesOwnedAuthProvidersForRuntime(ctx.config.hermes.provider, ctx.config.hermes.auth.providers);
@@ -469,6 +477,25 @@ function templateForRun(ctx: AgentRunContext): string {
 
 function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
   return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
+}
+
+function agentCommandPolicyHooksForRun(
+  ctx: AgentRunContext,
+  phase: AgentRunPhase,
+  cliPath: string,
+): HermesShellHooksConfig | undefined {
+  if (!shouldInstallAgentCommandPolicyHook(ctx, phase)) return undefined;
+  return buildHermesAgentCommandPolicyHookConfig({
+    cliPath,
+    role: ctx.role,
+    phase,
+    issueId: ctx.issue.id || ctx.issue.identifier,
+  });
+}
+
+function shouldInstallAgentCommandPolicyHook(ctx: AgentRunContext, phase: AgentRunPhase): boolean {
+  if (ctx.role === "reviewer") return true;
+  return ctx.role === "worker" && phase !== "issue_breakdown";
 }
 
 function hermesRunProfileKey(ctx: AgentRunContext, phase: AgentRunPhase, reusable: boolean, freshLeaseId: string | null): string {
