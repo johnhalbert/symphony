@@ -83,7 +83,8 @@ export function resolveHermesAcpPermissionDecision(
   if (request.malformedReason) return denyHermesAcpPermission(request, request.malformedReason);
 
   const selectedOptionId = permissionDecisionOptionId(decision);
-  if (!selectedOptionId) return denyHermesAcpPermission(request, "no_permission_policy");
+  const decisionReason = permissionDecisionReason(decision);
+  if (!selectedOptionId) return denyHermesAcpPermission(request, decisionReason ?? "no_permission_policy");
   if (!request.options.some((option) => option.optionId === selectedOptionId)) {
     return denyHermesAcpPermission(request, "permission_option_not_offered");
   }
@@ -91,7 +92,7 @@ export function resolveHermesAcpPermissionDecision(
     return denyHermesAcpPermission(request, "permission_option_not_supported");
   }
 
-  return selectHermesAcpPermissionOption(request, selectedOptionId, "permission_option_selected");
+  return selectHermesAcpPermissionOption(request, selectedOptionId, decisionReason ?? "permission_option_selected");
 }
 
 export function denyHermesAcpPermission(request: HermesAcpPermissionRequest, reason: string): HermesAcpPermissionResolution {
@@ -122,6 +123,11 @@ export function permissionDecisionOptionId(decision: HermesAcpPermissionDecision
   if (typeof decision === "string") return nonEmptyString(decision);
   if (!isRecord(decision)) return null;
   return nonEmptyString(decision.optionId) ?? nonEmptyString(decision.option_id);
+}
+
+export function permissionDecisionReason(decision: HermesAcpPermissionDecision): string | null {
+  if (!isRecord(decision)) return null;
+  return nonEmptyString(decision.reason);
 }
 
 function permissionOptionFromUnknown(value: unknown): HermesAcpPermissionOption | null {
