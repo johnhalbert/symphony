@@ -425,6 +425,54 @@ describe("/api/v1/web route contracts", () => {
     ]);
   });
 
+  it("serves direct run-id transcript payloads from durable projections when the raw run store is unavailable", async () => {
+    const defaultTranscript = [
+      { kind: "assistant" as const, ts: "2026-05-31T00:00:00.000Z", text: "default page from durable transcript" },
+    ];
+    const pagedTranscript = [
+      { kind: "tool" as const, ts: "2026-05-31T00:00:03.000Z", text: "explicit page from durable transcript" },
+    ];
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
+        defaultTranscript,
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:2:limit:3" },
+        pagedTranscript,
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server, calls } = createStatusServer(root, { projectionReader, projectionWriter });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const defaultPage = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript`);
+      expect(defaultPage.body).toEqual(defaultTranscript);
+      expect(defaultPage.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(defaultPage.response.headers.get("x-symphony-projection-cache")).toBe("hit");
+
+      const explicitPage = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?offset=2&limit=3`);
+      expect(explicitPage.body).toEqual(pagedTranscript);
+      expect(explicitPage.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(explicitPage.response.headers.get("x-symphony-projection-cache")).toBe("hit");
+
+      const refreshBypass = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?offset=2&limit=3&refresh=1`);
+      expect(refreshBypass.body).toEqual([]);
+      expect(refreshBypass.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(refreshBypass.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(projectionWriter.writes).toEqual([]);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
+      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:2:limit:3" },
+    ]);
+  });
+
   it("falls back to canonical web projection sources when durable read models are stale", async () => {
     const staleDashboard = {
       projectName: "Stale durable dashboard",
