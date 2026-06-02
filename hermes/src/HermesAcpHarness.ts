@@ -2077,6 +2077,7 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
       const payload = {
         requestKind: resolution.request.requestKind,
         toolCallId: resolution.request.toolCallId,
+        outcome: resolution.outcome,
         selectedOptionId: resolution.selectedOptionId,
         reason: resolution.reason,
         acpSessionId: resolution.request.sessionId,
@@ -2095,6 +2096,7 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
                   sessionId: resolution.request.sessionId,
                   requestKind: resolution.request.requestKind,
                   toolCallId: resolution.request.toolCallId,
+                  outcome: resolution.outcome,
                   reason: resolution.reason,
                   paramsPreview: preview(resolution.request.params, 500),
                   redacted: true,

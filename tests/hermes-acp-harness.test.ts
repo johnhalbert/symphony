@@ -1508,7 +1508,12 @@ describe("HermesAcpHarness", () => {
     expect(transcriptEvents.map((event) => event.payload)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ kind: "runtime_diagnostic", code: "host_hermes_notice", severity: "info" }),
-        expect.objectContaining({ kind: "runtime_diagnostic", code: "hermes_acp_permission_denied", severity: "warning" }),
+        expect.objectContaining({
+          kind: "runtime_diagnostic",
+          code: "hermes_acp_permission_denied",
+          severity: "warning",
+          outcome: "cancelled",
+        }),
       ]),
     );
     const projectedStates = projectWebTranscript(transcriptEvents).flatMap((message) => message.kind === "status" ? [message.state] : []);
@@ -1559,6 +1564,7 @@ describe("HermesAcpHarness", () => {
           payload: expect.objectContaining({
             kind: "runtime_status_update",
             status: "permission_selected",
+            outcome: "selected",
             selectedOptionId: "allow_once",
             requestKind: "terminal_execute",
           }),
