@@ -1042,6 +1042,31 @@ describe("HermesAcpHarness", () => {
     expect(tokenEvents).toEqual([{ inputTokens: 1, outputTokens: 2, totalTokens: 3 }]);
   });
 
+  it("treats missing usage as unknown and continues after recoverable update diagnostics", async () => {
+    const client = new FakeAcpClient();
+    client.promptNotificationParams = [
+      { sessionId: "acp-session-1", update: { sessionUpdate: "usage_update", used: 42, size: 100 } },
+      { sessionId: "acp-session-1", update: { content: "missing discriminator" } },
+      { sessionId: "acp-session-1", update: { sessionUpdate: "agent_message_chunk", content: "done without usage" } },
+    ];
+    client.promptResult = { stopReason: "end_turn" };
+    const { ctx, harness, leases } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+
+    const tokenEvents = events.flatMap((event) => event.type === "tokens" ? [event.tokens] : []);
+    expect(tokenEvents).toEqual([]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "progress", activitySource: "stream", message: "Hermes ACP usage update: 42/100 context tokens" }),
+        expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_malformed_session_update" }),
+        expect.objectContaining({ type: "completed", message: "done without usage" }),
+      ]),
+    );
+    expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "failed" })]));
+    expect(leases[0]?.disposeStatuses).toEqual(["succeeded"]);
+  });
+
   it("rejects unattended setup-only authentication before creating sessions", async () => {
     const client = new FakeAcpClient();
     client.initializeResult = { authMethods: [{ id: "hermes-setup", type: "terminal" }] };
