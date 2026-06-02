@@ -110,11 +110,20 @@ import {
 } from "./WebProjectionContext.js";
 import { RealtimeProjectionEventBus } from "./RealtimeProjectionEvents.js";
 import {
+  createWebProjectionReadRepositories,
+  webHistoryProjectionScopeKey,
+  webOrchestratorChatProjectionScopeKey,
+  webTranscriptProjectionScopeKey,
+  type WebProjectionPayloadReader,
+  type WebProjectionReadRepositories,
+  type WebProjectionReadResult,
+  type WebTranscriptProjectionPageSelector,
+} from "./WebProjectionRepository.js";
+import {
   DURABLE_PROJECTION_NAMES,
   type DurableProjectionName,
   type ProjectionPayloadRecord,
   type ProjectionPayloadWriteInput,
-  type ProjectionRevisionSelector,
   type ProjectionSourceRevision,
   type ProjectionWriteResult,
 } from "../core/persistence/ProjectionTransactionService.js";
@@ -149,9 +158,7 @@ export interface StatusServerProjectionWriter {
   writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult>;
 }
 
-export interface StatusServerProjectionReader {
-  readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null>;
-}
+export interface StatusServerProjectionReader extends WebProjectionPayloadReader {}
 
 export type StatusServerProjectionRebuildEntryStatus = ProjectionWriteResult["status"] | "skipped" | "failed";
 
@@ -216,14 +223,7 @@ interface WebProjectionJsonResponse<TBody> {
   headers?: Record<string, string>;
 }
 
-type DurableProjectionReadStatus = "hit" | "refresh_bypass" | "unavailable" | "missing" | "expired" | "stale" | "error" | "missing_item";
-
-interface DurableProjectionReadResult<TPayload> {
-  status: DurableProjectionReadStatus;
-  selector: ProjectionRevisionSelector;
-  record?: ProjectionPayloadRecord<TPayload>;
-  reason?: string;
-}
+type DurableProjectionReadResult<TPayload> = WebProjectionReadResult<TPayload>;
 
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
@@ -266,6 +266,7 @@ export class StatusServer {
   private readonly pendingWebProjectionContexts = new Map<string, Promise<StatusServerWebProjectionContext>>();
   private readonly webAssetsRoot: string | null;
   private readonly webProjectionRevisionProviders: readonly WebProjectionRevisionProvider[];
+  private readonly webProjectionRepositories: WebProjectionReadRepositories;
   private readonly webProjectionRevisionUnsubscribes: WebProjectionRevisionUnsubscribe[] = [];
   private readonly realtimeEvents = new RealtimeProjectionEventBus();
   private readonly webProjectionEventClients = new Map<number, WebProjectionEventClient>();
@@ -278,6 +279,10 @@ export class StatusServer {
   constructor(private readonly options: StatusServerOptions) {
     this.webAssetsRoot = resolveWebAssetsRootOption(options.webAssetsRoot);
     this.webProjectionRevisionProviders = createStatusServerWebProjectionRevisionProviders(options);
+    this.webProjectionRepositories = createWebProjectionReadRepositories({
+      ...(options.projectionReader ? { reader: options.projectionReader } : {}),
+      isRecordCurrent: (record) => this.isDurableProjectionRecordCurrent(record),
+    });
   }
 
   async start(): Promise<{ host: string; port: number }> {
@@ -527,10 +532,7 @@ export class StatusServer {
 
       if (request.method === "GET" && url.pathname === "/api/v1/web/reference-data") {
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
-        const durableIssues = await this.readDurableWebProjection<WebIssueBoardModel>(
-          { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-          forceRefresh,
-        );
+        const durableIssues = await this.webProjectionRepositories.issueBoard.readDefaultBoard({ forceRefresh });
         if (durableIssues.status === "hit" && durableIssues.record) {
           sendJson(response, 200, projectWebReferenceData(durableIssues.record.payload), durableProjectionReadHeaders(durableIssues));
           return;
@@ -573,10 +575,7 @@ export class StatusServer {
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/issues") {
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
-        const durableIssues = await this.readDurableWebProjection<WebIssueBoardModel>(
-          { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-          forceRefresh,
-        );
+        const durableIssues = await this.webProjectionRepositories.issueBoard.readDefaultBoard({ forceRefresh });
         if (durableIssues.status === "hit" && durableIssues.record) {
           sendJson(response, 200, durableIssues.record.payload, durableProjectionReadHeaders(durableIssues));
           return;
@@ -640,9 +639,9 @@ export class StatusServer {
           return;
         }
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
-        const durableTranscript = await this.readDurableWebProjection<ReturnType<typeof projectWebTranscript>>(
-          { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: transcriptProjectionScopeKeyForRequest(run, url) },
-          forceRefresh,
+        const durableTranscript = await this.webProjectionRepositories.transcript.readRunPage(
+          transcriptProjectionPageSelectorForRequest(run, url),
+          { forceRefresh },
         );
         if (durableTranscript.status === "hit" && durableTranscript.record) {
           sendJson(response, 200, durableTranscript.record.payload, durableProjectionReadHeaders(durableTranscript));
@@ -658,14 +657,9 @@ export class StatusServer {
         const conversationId = parseWebOrchestratorChatConversationId(url.searchParams.get("conversationId"));
         if (request.method === "GET") {
           const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
-          const durableChat = await this.readDurableWebProjection<readonly ChatMessage[]>(
-            {
-              projectionName: "orchestrator_chat_projection",
-              scopeKind: "conversation",
-              scopeKey: orchestratorChatProjectionScopeKey(conversationId),
-            },
+          const durableChat = await this.webProjectionRepositories.orchestratorChat.readConversation(conversationId, {
             forceRefresh,
-          );
+          });
           if (durableChat.status === "hit" && durableChat.record) {
             sendJson(response, 200, durableChat.record.payload, durableProjectionReadHeaders(durableChat));
             return;
@@ -1658,10 +1652,7 @@ export class StatusServer {
     forceRefresh: boolean,
     options: { includeTranscript?: boolean; transcriptUrl?: URL } = {},
   ): Promise<WebProjectionJsonResponse<WebIssueDetailModel | null>> {
-    let durableRead = await this.readDurableWebProjection<WebIssueBoardModel>(
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-      forceRefresh,
-    );
+    let durableRead = await this.webProjectionRepositories.issueBoard.readDefaultBoard({ forceRefresh });
     if (durableRead.status === "hit" && durableRead.record) {
       const durableDetail = await this.buildDurableWebIssueDetailFromIssueBoard(
         durableRead.record.payload,
@@ -1746,10 +1737,7 @@ export class StatusServer {
   }
 
   private async fetchWebDashboard(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebDashboard>>> {
-    const durableDashboard = await this.readDurableWebProjection<ReturnType<typeof projectWebDashboard>>(
-      { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
-      forceRefresh,
-    );
+    const durableDashboard = await this.webProjectionRepositories.dashboard.readCurrent({ forceRefresh });
     if (durableDashboard.status === "hit" && durableDashboard.record) {
       return webProjectionJsonResponse(durableDashboard.record.payload, durableDashboard);
     }
@@ -2023,10 +2011,7 @@ export class StatusServer {
   }
 
   private async fetchWebSidebar(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebSidebar>>> {
-    const durableSidebar = await this.readDurableWebProjection<ReturnType<typeof projectWebSidebar>>(
-      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
-      forceRefresh,
-    );
+    const durableSidebar = await this.webProjectionRepositories.sidebar.readCurrent({ forceRefresh });
     if (durableSidebar.status === "hit" && durableSidebar.record) {
       return webProjectionJsonResponse(durableSidebar.record.payload, durableSidebar);
     }
@@ -2079,10 +2064,7 @@ export class StatusServer {
 
   private async fetchWebHistory(forceRefresh: boolean, url: URL): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebHistory>>> {
     const limits = parseWebHistoryLimits(url);
-    const durableHistory = await this.readDurableWebProjection<ReturnType<typeof projectWebHistory>>(
-      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: historyProjectionScopeKey(limits) },
-      forceRefresh,
-    );
+    const durableHistory = await this.webProjectionRepositories.history.readGlobalCollection(limits, { forceRefresh });
     if (durableHistory.status === "hit" && durableHistory.record) {
       return webProjectionJsonResponse(durableHistory.record.payload, durableHistory);
     }
@@ -2179,27 +2161,6 @@ export class StatusServer {
       // Durable projection rows are cache/read-model side effects. The status API
       // response is derived from canonical stores during this transition phase,
       // so projection persistence failures must not make the UI unavailable.
-    }
-  }
-
-  private async readDurableWebProjection<TPayload>(
-    selector: ProjectionRevisionSelector,
-    forceRefresh: boolean,
-  ): Promise<DurableProjectionReadResult<TPayload>> {
-    if (forceRefresh) return { status: "refresh_bypass", selector };
-    const reader = this.options.projectionReader;
-    if (!reader) return { status: "unavailable", selector };
-    try {
-      const record = await reader.readCurrentPayload<TPayload>(selector);
-      if (!record) return { status: "missing", selector };
-      if (isProjectionPayloadExpired(record)) return { status: "expired", selector, record };
-      if (!(await this.isDurableProjectionRecordCurrent(record))) return { status: "stale", selector, record };
-      return { status: "hit", selector, record };
-    } catch {
-      // Durable read models are an acceleration/read path. If the projection reader
-      // is unavailable, malformed, or stale relative to source revision providers,
-      // preserve existing API availability by rebuilding from canonical sources.
-      return { status: "error", selector };
     }
   }
 
@@ -2652,12 +2613,6 @@ function toProjectionSourceRevision(revision: WebProjectionSourceRevision): Proj
   return { source: revision.source, revision: revision.revision, observedAt: revision.observedAt };
 }
 
-function isProjectionPayloadExpired(record: ProjectionPayloadRecord): boolean {
-  if (record.expiresAt === null) return false;
-  const expiresAtMs = Date.parse(record.expiresAt);
-  return Number.isFinite(expiresAtMs) && expiresAtMs <= Date.now();
-}
-
 function projectionSourceRevisionsCompatible(
   storedRevisions: readonly ProjectionSourceRevision[],
   currentRevisions: readonly WebProjectionSourceRevision[],
@@ -2863,18 +2818,22 @@ function isDurableProjectionName(value: string): value is DurableProjectionName 
 }
 
 function historyProjectionScopeKey(limits: { sessionLimit: number; timelineLimit: number }): string {
-  return `global:session:${limits.sessionLimit}:timeline:${limits.timelineLimit}`;
+  return webHistoryProjectionScopeKey(limits);
 }
 
 function transcriptProjectionScopeKey(run: RunRecord, page: TranscriptPage): string {
-  return `${run.runId}:offset:${page.offset}:limit:${page.limit}`;
+  return webTranscriptProjectionScopeKey({ runId: run.runId, offset: page.offset, limit: page.limit });
 }
 
-function transcriptProjectionScopeKeyForRequest(run: RunRecord, url: URL): string {
+function transcriptProjectionPageSelectorForRequest(run: RunRecord, url: URL): WebTranscriptProjectionPageSelector {
   const requestedPage = parseWebTranscriptPagination(url);
   const offset = requestedPage?.offset ?? Math.max(0, (run.transcriptEventCount ?? 0) - WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT);
   const limit = requestedPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
-  return `${run.runId}:offset:${offset}:limit:${limit}`;
+  return { runId: run.runId, offset, limit };
+}
+
+function orchestratorChatProjectionScopeKey(conversationId?: string | null): string {
+  return webOrchestratorChatProjectionScopeKey(conversationId);
 }
 
 function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage): Record<string, unknown> {
@@ -2892,11 +2851,6 @@ function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage)
     lastSequence: lastEvent?.sequence ?? null,
     lastEventAt: lastEvent?.at ?? null,
   };
-}
-
-function orchestratorChatProjectionScopeKey(conversationId?: string | null): string {
-  const trimmed = conversationId?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_ORCHESTRATOR_CONVERSATION_ID;
 }
 
 function orchestratorChatProjectionSourceCursors(
