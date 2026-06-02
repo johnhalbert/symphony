@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { ChatMessage } from "../../types/symphony";
 import { Icon } from "../common";
 import { formatInlineText } from "../messages/messageFormat";
@@ -6,19 +7,40 @@ export function SidebarChat({
   error = null,
   loading = false,
   messages,
+  onSend,
   readOnly = false,
   subtitle,
 }: {
   error?: string | null;
   loading?: boolean;
   messages: ChatMessage[];
+  onSend: (input: string) => Promise<void>;
   readOnly?: boolean;
   subtitle?: string | null;
 }) {
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
   const recent = messages.slice(-3);
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this compact chat is not supported yet; no orchestrator action will be dispatched.";
-  const contextLabel = readOnly ? "read-only API mode" : (subtitle?.trim() || "agent context unavailable");
+  const contextLabel = readOnly ? "read-only API mode" : sending ? "sending command..." : (subtitle?.trim() || "agent context unavailable");
+
+  async function submit(input = draft) {
+    const trimmed = input.trim();
+    if (readOnly || !trimmed || sending) return;
+    setSending(true);
+    setSendError(null);
+    try {
+      await onSend(trimmed);
+      setDraft("");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSending(false);
+    }
+  }
+
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "40px 1fr auto", background: "var(--panel)" }}>
       <div style={{ display: "flex", alignItems: "center", padding: "0 12px", gap: 10, background: "var(--panel)", borderBottom: "1px solid var(--border)" }}>
@@ -40,6 +62,7 @@ export function SidebarChat({
       <div style={{ overflow: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 14 }}>
         {loading && recent.length === 0 ? <div className="view-loading">Loading orchestrator chat...</div> : null}
         {error ? <div className="view-error">Orchestrator chat unavailable: {error}</div> : null}
+        {sendError ? <div className="view-error">Orchestrator command failed: {sendError}</div> : null}
         {!loading && !error && recent.length === 0 ? <div className="view-empty">No durable orchestrator chat messages are available yet.</div> : null}
         {recent.map((message, index) => (
           <div key={`${message.text}-${index}`} className="chat__msg">
@@ -52,7 +75,14 @@ export function SidebarChat({
               {message.suggestions?.length ? (
                 <div style={{ marginTop: 4 }}>
                   {message.suggestions.map((suggestion, suggestionIndex) => (
-                    <button className="chat__suggestion" disabled={readOnly} key={suggestion} style={{ marginBottom: 4 }} type="button">
+                    <button
+                      className="chat__suggestion"
+                      disabled={readOnly || sending}
+                      key={suggestion}
+                      onClick={() => submit(suggestion)}
+                      style={{ marginBottom: 4 }}
+                      type="button"
+                    >
                       {suggestionIndex === 0 ? Icon.bolt() : null}
                       {suggestion}
                     </button>
@@ -69,9 +99,15 @@ export function SidebarChat({
           <div className="view-empty">{readOnlyNotice}</div>
         </div>
       ) : (
-        <div className="chat__input">
+        <form
+          className="chat__input"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
           <div className="box">
-            <textarea placeholder="Ask or command..." defaultValue="" style={{ minHeight: 34 }} />
+            <textarea placeholder="Ask or command..." value={draft} onChange={(event) => setDraft(event.target.value)} style={{ minHeight: 34 }} />
             <div className="row">
               <button className="btn btn--ghost" type="button" style={{ padding: "1px 6px", fontSize: 10.5 }}>
                 @ context
@@ -80,12 +116,12 @@ export function SidebarChat({
                 /
               </button>
               <div className="grow" />
-              <button className="btn btn--primary" type="button" style={{ padding: "2px 8px" }}>
+              <button className="btn btn--primary" type="submit" style={{ padding: "2px 8px" }} disabled={sending || !draft.trim()}>
                 {Icon.send()}
               </button>
             </div>
           </div>
-        </div>
+        </form>
       )}
     </div>
   );

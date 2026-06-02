@@ -349,7 +349,14 @@ async function runBrowserSmokeAssertions(page) {
     "STALE embedded history transcript should not render",
   ];
   const mockUiMarkers = ["openai/symphony", "Restart SYM-42"];
-  const forbiddenMarkers = [...mockUiMarkers, ...staleChatMarkers];
+  const staleReadOnlyGuardMarkers = [
+    "API mode shows durable chat history only",
+    "Sending commands from this web chat is not supported yet",
+    "Sending commands from this compact chat is not supported yet",
+    "no orchestrator action will be dispatched",
+    "read-only API mode",
+  ];
+  const forbiddenMarkers = [...mockUiMarkers, ...staleChatMarkers, ...staleReadOnlyGuardMarkers];
   const forbiddenSelectedTranscriptMarkers = [...forbiddenMarkers, ...staleTranscriptMarkers];
 
   await waitForBrowserText(page, "dashboard API-mode data", {
@@ -365,19 +372,30 @@ async function runBrowserSmokeAssertions(page) {
     exclude: forbiddenMarkers,
   });
 
-  await waitForBrowserText(page, "dashboard orchestrator chat read-only API-mode guard", {
+  await waitForBrowserText(page, "dashboard orchestrator chat functional API-mode controls", {
     include: [
       "Dedicated smoke suggestion",
-      "API mode shows durable chat history only",
-      "Sending commands from this web chat is not supported yet",
-      "no orchestrator action will be dispatched",
+      "browser-proxy-agent",
     ],
     exclude: forbiddenMarkers,
   });
-  await assertButtonDisabledByText(page, "Dedicated smoke suggestion", "dedicated orchestrator chat suggestion");
-  await clickButtonByText(page, "Dedicated smoke suggestion", "disabled dedicated orchestrator chat suggestion");
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  assertNoObservedEndpoint("POST /api/v1/web/orchestrator-chat");
+  await assertButtonEnabledByText(page, "Dedicated smoke suggestion", "dashboard dedicated orchestrator chat suggestion");
+  const dashboardPostCountBefore = countObservedEndpoint("POST /api/v1/web/orchestrator-chat");
+  await submitTextareaValue(
+    page,
+    "Ask about the project, or issue a command",
+    "Dashboard browser smoke message",
+    "dashboard orchestrator chat",
+  );
+  await waitForBrowserText(page, "dashboard orchestrator chat POST acknowledgement", {
+    include: [
+      "Dashboard browser smoke message",
+      "Dedicated chat POST acknowledgement from API",
+      "POST guard observed",
+    ],
+    exclude: forbiddenMarkers,
+  });
+  assertObservedEndpointCountAtLeast("POST /api/v1/web/orchestrator-chat", dashboardPostCountBefore + 1);
 
   await clickButtonByAriaLabel(page, "Issues", "Issues tab");
   await waitForBrowserText(page, "issues tab issue cards", {
@@ -420,16 +438,26 @@ async function runBrowserSmokeAssertions(page) {
     exclude: forbiddenMarkers,
   });
   await selectOption(page, 'select[aria-label="Sidebar variant"]', "chat", "sidebar chat variant");
-  await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload and read-only guard", {
+  await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload and functional API-mode controls", {
     include: [
       "Dedicated orchestrator chat from API endpoint",
       "Dedicated smoke suggestion",
-      "read-only API mode",
-      "Sending commands from this compact chat is not supported yet",
+      "sidebar-summary-agent · PROXY-1",
     ],
     exclude: forbiddenMarkers,
   });
-  await assertButtonDisabledByText(page, "Dedicated smoke suggestion", "sidebar dedicated orchestrator chat suggestion");
+  await assertButtonEnabledByText(page, "Dedicated smoke suggestion", "sidebar dedicated orchestrator chat suggestion");
+  const sidebarPostCountBefore = countObservedEndpoint("POST /api/v1/web/orchestrator-chat");
+  await submitTextareaValue(page, "Ask or command...", "Sidebar browser smoke message", "sidebar orchestrator chat");
+  await waitForBrowserText(page, "sidebar orchestrator chat POST acknowledgement", {
+    include: [
+      "Sidebar browser smoke message",
+      "Dedicated chat POST acknowledgement from API",
+      "POST guard observed",
+    ],
+    exclude: forbiddenMarkers,
+  });
+  assertObservedEndpointCountAtLeast("POST /api/v1/web/orchestrator-chat", sidebarPostCountBefore + 1);
 
   assertObservedEndpoints([
     "GET /api/v1/web/reference-data",
@@ -440,8 +468,9 @@ async function runBrowserSmokeAssertions(page) {
     "GET /api/v1/web/sessions/smoke-session/transcript",
     "GET /api/v1/web/sidebar",
     "GET /api/v1/web/orchestrator-chat",
+    "POST /api/v1/web/orchestrator-chat",
   ]);
-  assertNoObservedEndpoint("POST /api/v1/web/orchestrator-chat");
+  assertObservedEndpointCountAtLeast("POST /api/v1/web/orchestrator-chat", 2);
 }
 
 async function assertProductionStaticServing(origin) {
@@ -1040,7 +1069,7 @@ async function clickButtonByText(page, text, description) {
   );
 }
 
-async function assertButtonDisabledByText(page, text, description) {
+async function assertButtonEnabledByText(page, text, description) {
   const result = await page.evaluate(`(() => {
     const expected = ${JSON.stringify(text)};
     const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
@@ -1055,8 +1084,77 @@ async function assertButtonDisabledByText(page, text, description) {
   })()`);
   assert(result?.found, `Could not find ${description} in the browser`);
   assert(
-    result.disabled || result.ariaDisabled === "true",
-    `Expected ${description} to be disabled by the API-mode guard, got ${JSON.stringify(result)}`,
+    !result.disabled && result.ariaDisabled !== "true",
+    `Expected ${description} to be enabled for the API-mode send path, got ${JSON.stringify(result)}`,
+  );
+}
+
+async function submitTextareaValue(page, placeholder, value, description) {
+  const targetPlaceholder = JSON.stringify(placeholder);
+  const targetValue = JSON.stringify(value);
+  const setResult = await page.evaluate(`(() => {
+    const targetPlaceholder = ${targetPlaceholder};
+    const isVisible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    };
+    const textarea = Array.from(document.querySelectorAll("textarea")).find((candidate) =>
+      candidate.placeholder.includes(targetPlaceholder) && isVisible(candidate)
+    );
+    if (!textarea) return { found: false };
+    const descriptor = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
+    if (descriptor?.set) descriptor.set.call(textarea, ${targetValue});
+    else textarea.value = ${targetValue};
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    textarea.dispatchEvent(new Event("change", { bubbles: true }));
+    return { found: true, value: textarea.value, placeholder: textarea.placeholder };
+  })()`);
+  assert(setResult?.found, `Could not find ${description} textarea with placeholder ${placeholder}`);
+  assert(setResult.value === value, `Could not set ${description} textarea value, got ${JSON.stringify(setResult)}`);
+
+  let lastSubmitState = null;
+  await waitFor(async () => {
+    const state = await page.evaluate(`(() => {
+      const targetPlaceholder = ${targetPlaceholder};
+      const isVisible = (element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const textarea = Array.from(document.querySelectorAll("textarea")).find((candidate) =>
+        candidate.placeholder.includes(targetPlaceholder) && isVisible(candidate)
+      );
+      const form = textarea?.closest("form");
+      const button = form ? Array.from(form.querySelectorAll('button[type="submit"]')).find((candidate) => isVisible(candidate)) : null;
+      if (!textarea || !form || !button) return { found: false };
+      return {
+        found: true,
+        disabled: Boolean(button.disabled),
+        ariaDisabled: button.getAttribute("aria-disabled"),
+        text: (button.innerText || button.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 160),
+      };
+    })()`);
+    lastSubmitState = state;
+    return state?.found && !state.disabled && state.ariaDisabled !== "true" ? state : null;
+  }, 5_000, 100, `${description} submit button to become enabled`, () => JSON.stringify(lastSubmitState));
+
+  await clickElementFromExpression(
+    page,
+    `(() => {
+      const targetPlaceholder = ${targetPlaceholder};
+      const isVisible = (element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const textarea = Array.from(document.querySelectorAll("textarea")).find((candidate) =>
+        candidate.placeholder.includes(targetPlaceholder) && isVisible(candidate)
+      );
+      const form = textarea?.closest("form");
+      return form ? Array.from(form.querySelectorAll('button[type="submit"]')).find((button) => isVisible(button) && !button.disabled) : null;
+    })()`,
+    `${description} submit button`,
   );
 }
 
@@ -1105,9 +1203,13 @@ function assertObservedEndpoints(endpoints) {
   }
 }
 
-function assertNoObservedEndpoint(endpoint) {
-  const observed = new Set(requestLog.map((entry) => `${entry.method} ${entry.path}`));
-  assert(!observed.has(endpoint), `Expected API-mode read-only guard not to call ${endpoint}`);
+function countObservedEndpoint(endpoint) {
+  return requestLog.filter((entry) => `${entry.method} ${entry.path}` === endpoint).length;
+}
+
+function assertObservedEndpointCountAtLeast(endpoint, minimumCount) {
+  const count = countObservedEndpoint(endpoint);
+  assert(count >= minimumCount, `Expected fake API to receive at least ${minimumCount} ${endpoint} request(s), got ${count}`);
 }
 
 function describeBrowserTextState(state) {

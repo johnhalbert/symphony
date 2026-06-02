@@ -104,14 +104,16 @@ function renderSidebarChat(props: {
   readOnly?: boolean;
 }): string {
   return renderToStaticMarkup(
-    <SidebarViews
-      sidebar={sidebarWithEmbeddedChat}
-      variant="chat"
-      orchestratorChat={props.chat}
-      orchestratorChatError={props.error ?? null}
-      orchestratorChatLoading={props.loading ?? false}
-      orchestratorChatReadOnly={props.readOnly ?? false}
-    />,
+    <DataSourceProvider value={dataSourceForChat(props.chat)}>
+      <SidebarViews
+        sidebar={sidebarWithEmbeddedChat}
+        variant="chat"
+        orchestratorChat={props.chat}
+        orchestratorChatError={props.error ?? null}
+        orchestratorChatLoading={props.loading ?? false}
+        orchestratorChatReadOnly={props.readOnly ?? false}
+      />
+    </DataSourceProvider>,
   );
 }
 

@@ -566,30 +566,51 @@ export function emptyChatMessages(): ChatMessage[] {
   return [];
 }
 
-export function projectWebOrchestratorChat(messages: readonly OrchestratorConversationMessage[] = []): ChatMessage[] {
+export function projectWebOrchestratorChat(
+  messages: readonly OrchestratorConversationMessage[] | readonly ChatMessage[] = [],
+): ChatMessage[] {
   return messages.map(projectWebOrchestratorChatMessage);
 }
 
 export function projectWebOrchestratorChatPost(
   input: string,
-  messages: readonly OrchestratorConversationMessage[] = [],
+  messages: readonly OrchestratorConversationMessage[] | readonly ChatMessage[] = [],
 ): ChatMessage[] {
-  void input;
-  return projectWebOrchestratorChat(messages);
+  if (messages.length > 0) return projectWebOrchestratorChat(messages);
+  const trimmed = input.trim();
+  return trimmed ? projectWebOrchestratorChat([{ who: "user", text: trimmed }]) : [];
 }
 
-function projectWebOrchestratorChatMessage(message: OrchestratorConversationMessage): ChatMessage {
-  return {
-    id: message.id,
-    conversationId: message.conversationId,
-    who: message.role === "user" ? "user" : "agent",
-    role: message.role,
-    text: sanitizedPreviewValue(message.body, 10_000).preview ?? "",
-    status: message.status,
-    createdAt: message.createdAt,
-    updatedAt: message.updatedAt,
-    metadata: sanitizePublicJson(message.metadata) as Record<string, unknown>,
+function projectWebOrchestratorChatMessage(message: OrchestratorConversationMessage | ChatMessage): ChatMessage {
+  if (isOrchestratorConversationMessage(message)) {
+    return {
+      id: message.id,
+      conversationId: message.conversationId,
+      who: message.role === "user" ? "user" : "agent",
+      role: message.role,
+      text: sanitizedPreviewValue(message.body, 10_000).preview ?? "",
+      status: message.status,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+      metadata: sanitizePublicJson(message.metadata) as Record<string, unknown>,
+    };
+  }
+
+  const projected: ChatMessage = {
+    who: message.who === "user" ? "user" : "agent",
+    text: message.text,
   };
+  const suggestions = Array.isArray(message.suggestions)
+    ? message.suggestions.map((suggestion) => suggestion.trim()).filter((suggestion) => suggestion.length > 0)
+    : [];
+  if (suggestions.length > 0) projected.suggestions = suggestions;
+  return projected;
+}
+
+function isOrchestratorConversationMessage(
+  message: OrchestratorConversationMessage | ChatMessage,
+): message is OrchestratorConversationMessage {
+  return "body" in message && typeof message.body === "string" && "role" in message && typeof message.role === "string";
 }
 
 export function projectIssueModel(
