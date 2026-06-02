@@ -188,6 +188,10 @@ describe("Hermes role template policy", () => {
       { label: "Hermes gateway harness integration", targetPath: path.resolve("hermes", "src", "HermesHarness.ts") },
       { label: "Hermes MCP/profile config writer", targetPath: path.resolve("hermes", "src", "HermesMcpConfig.ts") },
       { label: "Hermes gateway profile hook tests", targetPath: path.resolve("tests", "hermes-command-policy-profile.test.ts") },
+      {
+        label: "Hermes delegated command-policy inheritance tests",
+        targetPath: path.resolve("tests", "hermes-delegated-command-policy.test.ts"),
+      },
       { label: "Hermes role templates root", targetPath: config.hermes.templatesDir },
       { label: "worker role config", targetPath: path.resolve("hermes", "templates", "worker", "config.yaml") },
       { label: "reviewer role config", targetPath: path.resolve("hermes", "templates", "reviewer", "config.yaml") },
