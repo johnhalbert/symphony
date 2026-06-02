@@ -11,6 +11,9 @@ import type {
 import type { RealtimeEventListener, RealtimeEventUnsubscribe, RealtimeSubscriptionOptions } from "./realtimeEvents";
 
 export type {
+  RealtimeConnectionStatus,
+  RealtimeConnectionStatusKind,
+  RealtimeConnectionStatusListener,
   RealtimeEventListener,
   RealtimeEventUnsubscribe,
   RealtimeProjectionEvent,

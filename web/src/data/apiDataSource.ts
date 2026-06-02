@@ -8,7 +8,7 @@ import type {
   RealtimeSubscriptionOptions,
   SymphonyDataSource,
 } from "./dataSource";
-import { REALTIME_PROJECTION_EVENT_TYPES, isRealtimeProjectionEvent } from "./realtimeEvents";
+import { REALTIME_PROJECTION_EVENT_TYPES, isRealtimeProjectionEvent, realtimeConnectionStatus } from "./realtimeEvents";
 import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
@@ -205,13 +205,39 @@ function openRealtimeEventSubscription(
   listener: RealtimeEventListener,
   options: RealtimeSubscriptionOptions = {},
 ): RealtimeEventUnsubscribe {
-  if (typeof EventSource === "undefined") return () => undefined;
+  if (typeof EventSource === "undefined") {
+    options.onStatus?.(realtimeConnectionStatus("unavailable"));
+    return () => undefined;
+  }
 
+  options.onStatus?.(realtimeConnectionStatus("connecting"));
   const eventSource = new EventSource(realtimeEventSourceUrl(baseUrl, options.lastEventId ?? null));
+  let sawConnectionError = false;
+  const handleOpen = () => {
+    options.onStatus?.(realtimeConnectionStatus(sawConnectionError ? "recovered" : "open"));
+    sawConnectionError = false;
+  };
+  const handleConnectionError = () => {
+    sawConnectionError = true;
+    const closed = eventSource.readyState === EventSource.CLOSED;
+    options.onStatus?.(realtimeConnectionStatus(closed ? "error" : "reconnecting"));
+  };
   const handleRealtimeEvent = (event: MessageEvent) => {
     const parsed = parseRealtimeProjectionEvent(event);
-    if (parsed) listener(parsed);
+    if (!parsed) return;
+    if (parsed.missedEvents || parsed.recovery.reason === "missed-events") {
+      options.onStatus?.(
+        realtimeConnectionStatus("stale", {
+          lastEventId: parsed.recovery.lastEventId,
+          revision: parsed.revision,
+          missedEvents: true,
+        }),
+      );
+    }
+    listener(parsed);
   };
+  eventSource.addEventListener("open", handleOpen);
+  eventSource.addEventListener("error", handleConnectionError);
   for (const type of REALTIME_PROJECTION_EVENT_TYPES) {
     eventSource.addEventListener(type, handleRealtimeEvent);
   }

@@ -44,12 +44,32 @@ export interface RealtimeProjectionEvent {
   detail: Record<string, unknown> | null;
 }
 
+export type RealtimeConnectionStatusKind = "unavailable" | "connecting" | "open" | "reconnecting" | "recovered" | "stale" | "error";
+
+export interface RealtimeConnectionStatus {
+  kind: RealtimeConnectionStatusKind;
+  label: string;
+  lastEventId?: string | null;
+  revision?: number;
+  missedEvents?: boolean;
+}
+
+export type RealtimeConnectionStatusListener = (status: RealtimeConnectionStatus) => void;
+
 export interface RealtimeSubscriptionOptions {
   lastEventId?: string | null;
+  onStatus?: RealtimeConnectionStatusListener;
 }
 
 export type RealtimeEventListener = (event: RealtimeProjectionEvent) => void;
 export type RealtimeEventUnsubscribe = () => void;
+
+export function realtimeConnectionStatus(
+  kind: RealtimeConnectionStatusKind,
+  details: Omit<Partial<RealtimeConnectionStatus>, "kind" | "label"> = {},
+): RealtimeConnectionStatus {
+  return { kind, label: REALTIME_CONNECTION_STATUS_LABELS[kind], ...details };
+}
 
 export const REALTIME_PROJECTION_EVENT_TYPES: readonly RealtimeProjectionEventType[] = [
   "projection.updated",
@@ -58,6 +78,16 @@ export const REALTIME_PROJECTION_EVENT_TYPES: readonly RealtimeProjectionEventTy
   "orchestrator.message",
   "source.status",
 ] as const;
+
+const REALTIME_CONNECTION_STATUS_LABELS: Record<RealtimeConnectionStatusKind, string> = {
+  unavailable: "realtime unavailable",
+  connecting: "realtime connecting",
+  open: "realtime connected",
+  reconnecting: "realtime reconnecting",
+  recovered: "realtime recovered",
+  stale: "realtime stale · refetching",
+  error: "realtime error",
+};
 
 const REALTIME_PROJECTION_EVENT_TYPE_SET = new Set<string>(REALTIME_PROJECTION_EVENT_TYPES);
 

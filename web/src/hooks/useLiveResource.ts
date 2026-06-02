@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDataSource } from "../data/dataSourceContext";
-import type { RealtimeProjectionEvent, RealtimeProjectionResource, RealtimeResourceKind } from "../data/dataSource";
+import { realtimeConnectionStatus } from "../data/realtimeEvents";
+import type { RealtimeConnectionStatus, RealtimeProjectionEvent, RealtimeProjectionResource, RealtimeResourceKind } from "../data/dataSource";
 
 export const LIVE_RESOURCE_KEYS = [
   "referenceData",
@@ -41,20 +42,43 @@ const LIVE_RESOURCE_PATH_MATCHERS: ReadonlyArray<{ key: LiveResourceKey; matches
   { key: "orchestratorChat", matches: (pathname) => pathname === "/api/v1/web/orchestrator-chat" },
 ];
 
+export interface LiveResourceState {
+  tokens: LiveResourceTokenMap;
+  realtimeStatus: RealtimeConnectionStatus;
+}
+
 export function useLiveResourceTokens(enabled: boolean): LiveResourceTokenMap {
+  return useLiveResourceState(enabled).tokens;
+}
+
+export function useLiveResourceState(enabled: boolean): LiveResourceState {
   const dataSource = useDataSource();
+  const latestRealtimeRevision = useRef<number | null>(null);
   const [tokens, setTokens] = useState<LiveResourceTokenMap>(() => createLiveResourceTokenMap());
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeConnectionStatus>(() => realtimeConnectionStatus(enabled ? "connecting" : "unavailable"));
 
   useEffect(() => {
-    if (!enabled) return undefined;
-    if (dataSource.subscribeToRealtimeEvents) {
-      return dataSource.subscribeToRealtimeEvents((event) => {
-        const keys = liveResourceKeysForRealtimeEvent(event);
-        if (keys.length === 0) return;
-        dataSource.invalidateCachedReads?.({ forceRefreshHrefs: realtimeRefreshHrefsForEvent(event) });
-        setTokens((current) => incrementLiveResourceTokens(current, keys));
-      });
+    latestRealtimeRevision.current = null;
+    if (!enabled) {
+      setRealtimeStatus(realtimeConnectionStatus("unavailable"));
+      return undefined;
     }
+    if (dataSource.subscribeToRealtimeEvents) {
+      setRealtimeStatus(realtimeConnectionStatus("connecting"));
+      return dataSource.subscribeToRealtimeEvents(
+        (event) => {
+          const missedEventsRecovery = isMissedEventsRecovery(event);
+          if (!missedEventsRecovery && latestRealtimeRevision.current !== null && event.revision <= latestRealtimeRevision.current) return;
+          latestRealtimeRevision.current = Math.max(latestRealtimeRevision.current ?? event.revision, event.revision);
+          const keys = liveResourceKeysForRealtimeEvent(event);
+          if (keys.length === 0) return;
+          dataSource.invalidateCachedReads?.({ forceRefreshHrefs: realtimeRefreshHrefsForEvent(event) });
+          setTokens((current) => incrementLiveResourceTokens(current, keys));
+        },
+        { onStatus: setRealtimeStatus },
+      );
+    }
+    setRealtimeStatus(realtimeConnectionStatus("unavailable"));
     if (dataSource.subscribeToProjectionChanges) {
       return dataSource.subscribeToProjectionChanges((event) => {
         if (event.type !== "projection_revision") return;
@@ -65,7 +89,10 @@ export function useLiveResourceTokens(enabled: boolean): LiveResourceTokenMap {
     return undefined;
   }, [dataSource, enabled]);
 
-  return enabled ? tokens : ZERO_LIVE_RESOURCE_TOKENS;
+  return {
+    tokens: enabled ? tokens : ZERO_LIVE_RESOURCE_TOKENS,
+    realtimeStatus: enabled ? realtimeStatus : realtimeConnectionStatus("unavailable"),
+  };
 }
 
 export function createLiveResourceTokenMap(): LiveResourceTokenMap {
@@ -89,7 +116,7 @@ export function liveResourceKeysForRealtimeEvent(event: RealtimeProjectionEvent)
   for (const endpoint of event.recovery.endpoints) {
     addLiveResourceKeysForHref(keys, endpoint);
   }
-  if (keys.size === 0 && (event.missedEvents || event.recovery.reason === "missed-events")) {
+  if (keys.size === 0 && isMissedEventsRecovery(event)) {
     for (const key of ALL_LIVE_RESOURCE_KEYS) keys.add(key);
   }
   return [...keys];
@@ -113,6 +140,10 @@ function incrementLiveResourceTokens(current: LiveResourceTokenMap, keys: readon
     next[key] += 1;
   }
   return next;
+}
+
+function isMissedEventsRecovery(event: RealtimeProjectionEvent): boolean {
+  return event.missedEvents || event.recovery.reason === "missed-events";
 }
 
 function addLiveResourceKeysForResource(keys: Set<LiveResourceKey>, resource: RealtimeProjectionResource): void {

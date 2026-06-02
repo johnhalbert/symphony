@@ -17,7 +17,7 @@ import {
   useReferenceData as useReferenceResource,
   useSidebar,
 } from "./hooks/useSymphonyData";
-import { combineLiveResourceTokens, useLiveResourceTokens, type LiveResourceKey } from "./hooks/useLiveResource";
+import { combineLiveResourceTokens, useLiveResourceState, type LiveResourceKey, type LiveResourceTokenMap } from "./hooks/useLiveResource";
 import type {
   AppTab,
   DashboardVariant,
@@ -73,7 +73,7 @@ function referenceStatusLabel(reference: { data: ReferenceData | null; loading: 
   return null;
 }
 
-function liveRefreshToken(tokens: ReturnType<typeof useLiveResourceTokens>, keys: readonly LiveResourceKey[]) {
+function liveRefreshToken(tokens: LiveResourceTokenMap, keys: readonly LiveResourceKey[]) {
   return combineLiveResourceTokens(tokens, keys);
 }
 
@@ -95,7 +95,8 @@ function AppShell({
   const [sidebarVariant, setSidebarVariant] = useState<SidebarVariant>("primary");
   const apiMode = defaultDataSourceConfig.mode === "api";
   const resourceLoading = resolveAppResourceLoading(activeTab, apiMode);
-  const liveTokens = useLiveResourceTokens(apiMode);
+  const liveState = useLiveResourceState(apiMode);
+  const liveTokens = liveState.tokens;
   const referenceRefreshToken = liveRefreshToken(liveTokens, ["referenceData"]);
   const dashboardRefreshToken = liveRefreshToken(liveTokens, ["dashboard"]);
   const issueBoardRefreshToken = liveRefreshToken(liveTokens, ["issueBoard"]);
@@ -130,7 +131,7 @@ function AppShell({
           branch={dashboardChrome?.branch ?? ""}
           pollLabel={dashboardChrome?.pollLabel ?? "poll unavailable"}
           agentUsageLabel={dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`}
-          connectionStatusLabel={dashboardChrome?.metrics?.health?.connectionLabel ?? undefined}
+          connectionStatusLabel={apiMode ? liveState.realtimeStatus.label : (dashboardChrome?.metrics?.health?.connectionLabel ?? undefined)}
           errorStatusLabel={dashboardChrome?.metrics?.health?.errorSummaryLabel ?? undefined}
           dataSourceLabel={[
             `api source · ${defaultDataSourceConfig.mode}`,

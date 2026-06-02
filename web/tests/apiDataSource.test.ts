@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
-import type { ProjectionChangeEvent, RealtimeProjectionEvent } from "../src/data/dataSource";
+import type { ProjectionChangeEvent, RealtimeConnectionStatus, RealtimeProjectionEvent } from "../src/data/dataSource";
 import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
 import type { ChatMessage, DashboardModel, HistoryModel, IssueBoardModel, TranscriptMessage } from "../src/types/symphony";
 
@@ -42,10 +42,14 @@ function deferred<T>() {
 }
 
 class FakeEventSource {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 2;
   static instances: FakeEventSource[] = [];
 
   readonly url: string;
   closed = false;
+  readyState = FakeEventSource.CONNECTING;
   private readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
 
   constructor(url: string) {
@@ -61,10 +65,11 @@ class FakeEventSource {
 
   close(): void {
     this.closed = true;
+    this.readyState = FakeEventSource.CLOSED;
   }
 
-  emit(type: string, data: string): void {
-    const event = new MessageEvent(type, { data });
+  emit(type: string, data?: string): void {
+    const event = typeof data === "string" ? new MessageEvent(type, { data }) : new Event(type);
     for (const listener of this.listeners.get(type) ?? []) {
       if (typeof listener === "function") {
         listener(event);
@@ -72,6 +77,16 @@ class FakeEventSource {
         listener.handleEvent(event);
       }
     }
+  }
+
+  emitOpen(): void {
+    this.readyState = FakeEventSource.OPEN;
+    this.emit("open");
+  }
+
+  emitError(readyState = FakeEventSource.CONNECTING): void {
+    this.readyState = readyState;
+    this.emit("error");
   }
 }
 
@@ -453,6 +468,45 @@ describe("API data source", () => {
     unsubscribe?.();
 
     expect(events).toEqual([runEvent, projectionEvent]);
+    expect(eventSource?.closed).toBe(true);
+  });
+
+  it("surfaces realtime connect, reconnect, recovery, and stale missed-events status", () => {
+    FakeEventSource.instances = [];
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const events: RealtimeProjectionEvent[] = [];
+    const statuses: RealtimeConnectionStatus[] = [];
+    const dataSource = createApiDataSource("/status-server/");
+
+    const unsubscribe = dataSource.subscribeToRealtimeEvents?.((event) => events.push(event), {
+      onStatus: (status) => statuses.push(status),
+    });
+    const eventSource = FakeEventSource.instances[0];
+
+    expect(statuses.map((status) => status.kind)).toEqual(["connecting"]);
+    eventSource?.emitOpen();
+    eventSource?.emitError();
+    eventSource?.emitOpen();
+    const missedEvent = realtimeEvent({
+      id: "missed-7",
+      revision: 7,
+      missedEvents: true,
+      recovery: { strategy: "refetch", reason: "missed-events", lastEventId: "missed-6", endpoints: [] },
+      resources: [],
+    });
+    eventSource?.emit("projection.updated", JSON.stringify(missedEvent));
+    unsubscribe?.();
+
+    expect(statuses.map((status) => status.kind)).toEqual(["connecting", "open", "reconnecting", "recovered", "stale"]);
+    expect(statuses.map((status) => status.label)).toEqual([
+      "realtime connecting",
+      "realtime connected",
+      "realtime reconnecting",
+      "realtime recovered",
+      "realtime stale · refetching",
+    ]);
+    expect(statuses.at(-1)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
+    expect(events).toEqual([missedEvent]);
     expect(eventSource?.closed).toBe(true);
   });
 
