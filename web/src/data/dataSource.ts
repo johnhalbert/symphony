@@ -17,6 +17,8 @@ export type {
   RealtimeEventListener,
   RealtimeEventUnsubscribe,
   RealtimeProjectionEvent,
+  RealtimeProjectionEventPayload,
+  RealtimeProjectionEventScope,
   RealtimeProjectionEventType,
   RealtimeProjectionRecoveryHint,
   RealtimeProjectionResource,

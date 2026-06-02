@@ -8,7 +8,7 @@ import type {
   RealtimeSubscriptionOptions,
   SymphonyDataSource,
 } from "./dataSource";
-import { REALTIME_PROJECTION_EVENT_TYPES, isRealtimeProjectionEvent, realtimeConnectionStatus } from "./realtimeEvents";
+import { REALTIME_PROJECTION_EVENT_TYPES, parseRealtimeProjectionEventData, realtimeConnectionStatus } from "./realtimeEvents";
 import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
@@ -256,13 +256,7 @@ function realtimeEventSourceUrl(baseUrl: string, lastEventId: string | null): st
 
 function parseRealtimeProjectionEvent(event: MessageEvent) {
   if (typeof event.data !== "string") return null;
-  try {
-    const parsed = JSON.parse(event.data) as unknown;
-    return isRealtimeProjectionEvent(parsed) ? parsed : null;
-  } catch {
-    // Malformed realtime payloads are ignored; the next valid event or browser reconnect can recover with a refetch hint.
-    return null;
-  }
+  return parseRealtimeProjectionEventData(event.data);
 }
 
 function normalizeReferenceRecord(record: Record<string, ApiReferenceEntry | null> | null | undefined) {
