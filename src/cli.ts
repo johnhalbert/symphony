@@ -16,6 +16,10 @@ import {
   type ProjectionSqlPool,
 } from "./core/persistence/ProjectionTransactionService.js";
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
+import {
+  PostgresRunActivityAppendStore,
+  type PostgresRunActivityAppendClient,
+} from "./core/persistence/RunActivityAppendStore.js";
 import { FileWritebackOutboxStore } from "./core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import {
@@ -279,7 +283,12 @@ program
             staleThresholdMs: config.polling.intervalMs,
             dashboard: statusDashboardConfig(config),
             webAssetsRoot: config.server.webAssetsRoot,
-            ...(projectionPersistence ? { projectionWriter: projectionPersistence.writer } : {}),
+            ...(projectionPersistence
+              ? {
+                  projectionWriter: projectionPersistence.writer,
+                  runActivitySourceStore: projectionPersistence.runActivitySourceStore,
+                }
+              : {}),
           });
 
     if (statusServer) {
@@ -314,6 +323,7 @@ function currentCliPath(): string {
 
 interface RuntimeProjectionPersistence {
   writer: ProjectionTransactionService;
+  runActivitySourceStore: PostgresRunActivityAppendStore;
   close(): Promise<void>;
 }
 
@@ -327,6 +337,9 @@ async function createRuntimeProjectionPersistence(config: ServiceConfig): Promis
   const pool = new Pool({ connectionString, ssl: config.database.postgres.ssl });
   return {
     writer: new ProjectionTransactionService(new PostgresProjectionTransactionStore(pool)),
+    runActivitySourceStore: new PostgresRunActivityAppendStore({
+      connect: async () => (await pool.connect()) as PostgresRunActivityAppendClient,
+    }),
     close: () => pool.end(),
   };
 }
