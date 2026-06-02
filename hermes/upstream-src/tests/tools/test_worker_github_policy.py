@@ -165,6 +165,57 @@ def test_policy_allows_shell_and_env_wrapped_local_git_inspection(policy_env, to
     assert policy.check_worker_reviewer_github_argv(tool, args) is None
 
 
+@pytest.mark.parametrize(
+    "tool,args,description",
+    [
+        (sys.executable, ["-S", "-c", "import subprocess; subprocess.run(['/usr/bin/git', 'fetch', 'origin'])"], "Python interpreter policy runtime suppression"),
+        ("python", ["-I", "-c", "print('isolated')"], "Python interpreter policy runtime suppression"),
+        ("python3", ["-E", "-m", "pytest"], "Python interpreter policy runtime suppression"),
+        ("python", ["child.py"], "uninspectable Python script execution"),
+        ("python", ["-"], "uninspectable Python stdin execution"),
+        ("env", ["-i", "PYTHONPATH=", "python", "-m", "pytest"], "Python interpreter execution with policy-suppressing env wrapper"),
+        ("env", ["PATH=/real-bin", "python", "-c", "print('hidden')"], "Python interpreter execution with policy-suppressing env wrapper"),
+        ("env", ["-i", "PATH=/real-bin", "bash", "-c", "python -m pytest"], "Python interpreter execution with policy-suppressing env wrapper"),
+    ],
+)
+def test_policy_blocks_python_interpreter_policy_suppression_argv(policy_env, tool, args, description):
+    decision = policy.check_worker_reviewer_github_argv(tool, args)
+
+    assert decision is not None
+    assert decision["blocked"] is True
+    assert decision["description"] == description
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("python", ["--version"]),
+        ("python", ["-V"]),
+        ("python", ["-c", "print('ok')"]),
+        ("python", ["-m", "pytest", "--version"]),
+    ],
+)
+def test_policy_allows_python_when_policy_runtime_remains_available(policy_env, tool, args):
+    assert policy.check_worker_reviewer_github_argv(tool, args) is None
+
+
+@pytest.mark.parametrize(
+    "command,description",
+    [
+        ("python -S -c 'import subprocess; subprocess.run([\"/usr/bin/git\",\"fetch\",\"origin\"])'", "Python interpreter policy runtime suppression"),
+        ("python ./child.py", "uninspectable Python script execution"),
+        ("env -i PYTHONPATH= python -m pytest", "Python interpreter execution with policy-suppressing env wrapper"),
+        ("env -i PATH=/real-bin bash -c 'python -m pytest'", "Python interpreter execution with policy-suppressing env wrapper"),
+    ],
+)
+def test_policy_blocks_python_interpreter_policy_suppression_command_strings(policy_env, command, description):
+    decision = policy.check_worker_reviewer_github_command(command)
+
+    assert decision is not None
+    assert decision["blocked"] is True
+    assert decision["description"] == description
+
+
 def test_policy_disabled_env_cannot_disable_worker_reviewer_classification(policy_env):
     env = {
         policy.COMMAND_POLICY_ENV: policy.COMMAND_POLICY_VALUE,
@@ -243,6 +294,47 @@ def test_runtime_sitecustomize_blocks_python_subprocess_bypass(policy_env, tmp_p
 
     assert blocked.returncode != 0
     assert "BLOCKED by Symphony worker/reviewer GitHub command policy" in blocked.stderr
+
+
+def test_runtime_sitecustomize_blocks_python_interpreter_suppression_bypasses(policy_env, tmp_path):
+    fake_bin = tmp_path / "real-bin"
+    fake_bin.mkdir()
+    fake_git = _write_fake_tool(fake_bin, "git")
+    runtime_dir = tmp_path / "runtime"
+    env = os.environ.copy()
+    env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+    assert policy.install_worker_reviewer_github_runtime(str(runtime_dir), env, python_executable=sys.executable)
+
+    child_script = tmp_path / "child_fetch.py"
+    child_script.write_text(
+        f"import subprocess\nsubprocess.run([{str(fake_git)!r}, 'fetch', 'origin'], check=True)\n",
+        encoding="utf-8",
+    )
+    fake_git_text = str(fake_git)
+    fake_bin_assignment = "PATH=" + str(fake_bin)
+    child_script_text = str(child_script)
+    script = f"""
+import subprocess
+import sys
+cases = [
+    [sys.executable, "-S", "-c", "import subprocess; subprocess.run([{fake_git_text!r}, 'fetch', 'origin'], check=True)"],
+    [sys.executable, {child_script_text!r}],
+    ["env", "-i", {fake_bin_assignment!r}, "PYTHONPATH=", sys.executable, "-S", "-c", "import subprocess; subprocess.run([{fake_git_text!r}, 'fetch', 'origin'], check=True)"],
+]
+for argv in cases:
+    try:
+        subprocess.run(argv, check=True)
+    except PermissionError as exc:
+        print("BLOCKED_PYTHON", argv[0], "GitHub command policy" in str(exc))
+    else:
+        raise AssertionError(f"python interpreter bypass was not blocked before fake git ran: {{argv!r}}")
+"""
+    blocked = subprocess.run([sys.executable, "-c", script], env=env, text=True, capture_output=True)
+    combined = blocked.stdout + blocked.stderr
+
+    assert blocked.returncode == 0
+    assert combined.count("BLOCKED_PYTHON") == 3
+    assert "FAKE_GIT_RAN" not in combined
 
 
 def test_runtime_sitecustomize_blocks_shell_and_env_wrapper_subprocess_bypasses(policy_env, tmp_path):

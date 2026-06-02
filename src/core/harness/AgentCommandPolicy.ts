@@ -5,7 +5,30 @@ import type { AgentRunContext } from "./AgentHarness.js";
 
 export const SYMPHONY_AGENT_COMMAND_POLICY = "worker_reviewer_github_upstream_block";
 
-const SHIM_TOOLS = ["git", "gh", "ssh", "ssh-keyscan", "ssh-keygen", "ssh-add", "curl", "wget"] as const;
+const SHIM_TOOLS = [
+  "git",
+  "gh",
+  "ssh",
+  "ssh-keyscan",
+  "ssh-keygen",
+  "ssh-add",
+  "curl",
+  "wget",
+  "env",
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "fish",
+  "python",
+  "python3",
+  "pythonw",
+  "py",
+  "pypy",
+  "pypy3",
+] as const;
+const POLICY_SHELL_TOOLS = ["bash", "sh", "zsh", "dash", "ksh", "fish"] as const;
 const REAL_TOOL_ENV_PREFIX = "SYMPHONY_REAL_";
 const WORKER_REVIEWER_POLICY_ENV_KEYS = [
   "SYMPHONY_AGENT_COMMAND_POLICY",
@@ -21,6 +44,7 @@ const WORKER_REVIEWER_POLICY_ENV_KEYS = [
   "GH_PROMPT_DISABLED",
   "GIT_SSH_COMMAND",
   "SSH_ASKPASS_REQUIRE",
+  "SHELL",
 ] as const;
 
 export function workerReviewerGithubCommandPolicyEnv(ctx: Pick<AgentRunContext, "role">): Record<string, string> {
@@ -31,12 +55,13 @@ export function workerReviewerGithubCommandPolicyEnv(ctx: Pick<AgentRunContext, 
 export function workerReviewerGithubCommandPolicyProcessEnv(ctx: AgentRunContext): Record<string, string> {
   if (ctx.role !== "worker" && ctx.role !== "reviewer") return {};
   const env = baseWorkerReviewerGithubCommandPolicyEnv(ctx.role);
-  const shimDir = ensureWorkerReviewerGithubPolicyShims(ctx);
   const existingPath = process.env.PATH ?? process.env.Path ?? "";
+  const shimDir = ensureWorkerReviewerGithubPolicyShims(ctx, existingPath);
   const existingPythonPath = process.env.PYTHONPATH ?? "";
   const upstreamRoot = ctx.config.hermes.upstreamRoot;
   const askpassPath = path.join(shimDir, process.platform === "win32" ? "symphony-deny-askpass.cmd" : "symphony-deny-askpass");
   const realTools = discoverRealToolEnv(existingPath);
+  const policyShell = policyShellShimPath(shimDir, realTools);
 
   return {
     ...env,
@@ -46,6 +71,7 @@ export function workerReviewerGithubCommandPolicyProcessEnv(ctx: AgentRunContext
     SSH_ASKPASS: askpassPath,
     PATH: shimDir + (existingPath ? path.delimiter + existingPath : ""),
     PYTHONPATH: upstreamRoot + (existingPythonPath ? path.delimiter + existingPythonPath : ""),
+    ...(policyShell ? { SHELL: policyShell } : {}),
     ...(process.platform === "win32" ? { PATHEXT: ensurePathextIncludesCmd(process.env.PATHEXT) } : {}),
   };
 }
@@ -126,7 +152,7 @@ function baseWorkerReviewerGithubCommandPolicyEnv(role: "worker" | "reviewer"): 
   };
 }
 
-function ensureWorkerReviewerGithubPolicyShims(ctx: AgentRunContext): string {
+function ensureWorkerReviewerGithubPolicyShims(ctx: AgentRunContext, pathValue: string): string {
   const shimDir = path.join(
     ctx.config.workspace.stateDir || os.tmpdir(),
     "command-policy",
@@ -135,7 +161,8 @@ function ensureWorkerReviewerGithubPolicyShims(ctx: AgentRunContext): string {
     "bin",
   );
   mkdirSync(shimDir, { recursive: true });
-  const python = shellWord(ctx.config.hermes.python ?? "python");
+  const pythonCommand = policyShimPythonCommand(ctx, pathValue);
+  const python = shellWord(pythonCommand);
   for (const tool of SHIM_TOOLS) {
     const posixPath = path.join(shimDir, tool);
     writeExecutable(
@@ -145,7 +172,7 @@ function ensureWorkerReviewerGithubPolicyShims(ctx: AgentRunContext): string {
     const cmdPath = path.join(shimDir, `${tool}.cmd`);
     writeExecutable(
       cmdPath,
-      `@echo off\r\nset "SYMPHONY_COMMAND_POLICY_SHIM_DIR=%~dp0"\r\n${cmdWord(ctx.config.hermes.python ?? "python")} -m tools.worker_github_policy ${tool} %*\r\n`,
+      `@echo off\r\nset "SYMPHONY_COMMAND_POLICY_SHIM_DIR=%~dp0"\r\n${cmdWord(pythonCommand)} -m tools.worker_github_policy ${tool} %*\r\n`,
     );
   }
   writeExecutable(
@@ -180,6 +207,21 @@ function discoverRealToolEnv(pathValue: string): Record<string, string> {
     if (real) result[realToolEnvName(tool)] = real;
   }
   return result;
+}
+
+function policyShimPythonCommand(ctx: AgentRunContext, pathValue: string): string {
+  const configured = ctx.config.hermes.python ?? "python";
+  if (path.isAbsolute(configured) || configured.includes(path.sep) || configured.includes("/")) return configured;
+  return findOnPath(configured, pathValue) ?? configured;
+}
+
+function policyShellShimPath(shimDir: string, realTools: Record<string, string>): string | undefined {
+  for (const shell of POLICY_SHELL_TOOLS) {
+    if (realTools[realToolEnvName(shell)]) {
+      return path.join(shimDir, process.platform === "win32" ? `${shell}.cmd` : shell);
+    }
+  }
+  return undefined;
 }
 
 function realToolEnvName(tool: string): string {

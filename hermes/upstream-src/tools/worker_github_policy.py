@@ -32,7 +32,29 @@ SHIM_DIR_ENV = "SYMPHONY_COMMAND_POLICY_SHIM_DIR"
 
 _POLICY_ROLES = {"worker", "reviewer"}
 _POLICY_VALUES = {COMMAND_POLICY_VALUE, "block_upstream_github", "worker_reviewer_github"}
-_SHIM_TOOLS = ("git", "gh", "ssh", "ssh-keyscan", "ssh-keygen", "ssh-add", "curl", "wget")
+_SHIM_TOOLS = (
+    "git",
+    "gh",
+    "ssh",
+    "ssh-keyscan",
+    "ssh-keygen",
+    "ssh-add",
+    "curl",
+    "wget",
+    "env",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "python",
+    "python3",
+    "pythonw",
+    "py",
+    "pypy",
+    "pypy3",
+)
 
 _TOKEN_REPLACEMENTS = [
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{8,}\b"), "[REDACTED]"),
@@ -154,9 +176,8 @@ def _shell_segments(command: str) -> list[list[str]]:
         if index < len(segment) and segment[index] == "command":
             index += 1
         if index < len(segment) and segment[index] == "env":
-            index += 1
-            while index < len(segment) and (segment[index].startswith("-") or "=" in segment[index]):
-                index += 1
+            normalized_segments.append(segment[index:])
+            continue
         if index < len(segment):
             normalized_segments.append(segment[index:])
     return normalized_segments
@@ -449,6 +470,186 @@ def _env_wrapped_command(args: Sequence[str]) -> tuple[Optional[str], list[str],
     return None, [], None
 
 
+_PYTHON_INTERPRETER_RE = re.compile(r"^(?:pythonw?|python\d+(?:\.\d+)*|pypy\d*(?:\.\d+)*|py)$")
+_PYTHON_HELP_OR_VERSION_ARGS = {"--help", "-h", "-?", "--version"}
+_PYTHON_VERSION_ARGS = {"-V", "-VV"}
+_PYTHON_OPTIONS_WITH_VALUES = {"-c", "-m", "-W", "-X", "--check-hash-based-pycs"}
+_PYTHON_OPTIONS_WITH_ATTACHED_VALUES = ("-W", "-X")
+_PYTHON_LONG_OPTIONS_WITH_ATTACHED_VALUES = ("--check-hash-based-pycs=",)
+_POLICY_RUNTIME_ENV_NAMES = {
+    "PATH",
+    "PYTHONPATH",
+    COMMAND_POLICY_ENV,
+    ROLE_ENV,
+    "SYMPHONY_RUN_ROLE",
+    "HERMES_SYMPHONY_ROLE",
+    POLICY_DISABLED_ENV,
+    SHIM_DIR_ENV,
+}
+
+
+def _is_python_interpreter(canonical: str) -> bool:
+    return bool(_PYTHON_INTERPRETER_RE.match(canonical))
+
+
+def _python_option_suppresses_policy_runtime(arg: str) -> bool:
+    lower = arg.lower()
+    if arg in {"-S", "-E", "-I"} or lower in {"--no-site", "--ignore-environment", "--isolated"}:
+        return True
+    if arg.startswith("-") and not arg.startswith("--") and len(arg) > 2:
+        return any(flag in arg[1:] for flag in ("S", "E", "I"))
+    return False
+
+
+def _python_argv_executes_code(args: Sequence[str]) -> bool:
+    """Return True when Python argv starts code, a module, stdin, or a script file."""
+
+    if not args:
+        return True
+    index = 0
+    while index < len(args):
+        arg = str(args[index])
+        lower = arg.lower()
+        if arg == "--":
+            return True
+        if lower in _PYTHON_HELP_OR_VERSION_ARGS or arg in _PYTHON_VERSION_ARGS:
+            return False
+        if _python_option_suppresses_policy_runtime(arg):
+            return True
+        if arg in {"-c", "-m"}:
+            return True
+        if (arg.startswith("-c") or arg.startswith("-m")) and len(arg) > 2:
+            return True
+        if arg in _PYTHON_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if arg.startswith(_PYTHON_OPTIONS_WITH_ATTACHED_VALUES) and len(arg) > 2:
+            index += 1
+            continue
+        if any(lower.startswith(prefix) for prefix in _PYTHON_LONG_OPTIONS_WITH_ATTACHED_VALUES):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return True
+    return True
+
+
+def _python_interpreter_decision(args: Sequence[str], command: str) -> Optional[PolicyDecision]:
+    """Fail closed on Python entrypoints that can suppress or bypass sitecustomize."""
+
+    if not args:
+        return _decision("uninspectable Python interactive or stdin execution", command)
+    index = 0
+    while index < len(args):
+        arg = str(args[index])
+        lower = arg.lower()
+        if arg == "--":
+            if index + 1 < len(args):
+                return _decision("uninspectable Python script execution", command)
+            return _decision("uninspectable Python interactive or stdin execution", command)
+        if lower in _PYTHON_HELP_OR_VERSION_ARGS or arg in _PYTHON_VERSION_ARGS:
+            return None
+        if _python_option_suppresses_policy_runtime(arg):
+            return _decision("Python interpreter policy runtime suppression", command)
+        if arg in {"-c", "-m"} or ((arg.startswith("-c") or arg.startswith("-m")) and len(arg) > 2):
+            return None
+        if arg in _PYTHON_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if arg.startswith(_PYTHON_OPTIONS_WITH_ATTACHED_VALUES) and len(arg) > 2:
+            index += 1
+            continue
+        if any(lower.startswith(prefix) for prefix in _PYTHON_LONG_OPTIONS_WITH_ATTACHED_VALUES):
+            index += 1
+            continue
+        if arg == "-":
+            return _decision("uninspectable Python stdin execution", command)
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return _decision("uninspectable Python script execution", command)
+    return _decision("uninspectable Python interactive or stdin execution", command)
+
+
+def _env_wrapper_suppresses_policy_runtime(args: Sequence[str]) -> bool:
+    """Return True when env-style options can remove shims/sitecustomize policy state."""
+
+    suppressed = False
+    index = 0
+    while index < len(args):
+        arg = str(args[index])
+        lower = arg.lower()
+        if arg == "--":
+            return suppressed
+        if arg == "-":
+            suppressed = True
+            index += 1
+            continue
+        if _ENV_ASSIGNMENT_RE.match(arg):
+            name = arg.split("=", 1)[0].upper()
+            if name in _POLICY_RUNTIME_ENV_NAMES:
+                suppressed = True
+            index += 1
+            continue
+        if lower in {"-i", "--ignore-environment"}:
+            suppressed = True
+            index += 1
+            continue
+        if lower in {"-u", "--unset"}:
+            if index + 1 < len(args) and str(args[index + 1]).upper() in _POLICY_RUNTIME_ENV_NAMES:
+                suppressed = True
+            index += 2
+            continue
+        if lower.startswith("--unset="):
+            if arg.split("=", 1)[1].upper() in _POLICY_RUNTIME_ENV_NAMES:
+                suppressed = True
+            index += 1
+            continue
+        if lower in {"-c", "--chdir"}:
+            index += 2
+            continue
+        if lower.startswith("--chdir="):
+            index += 1
+            continue
+        if lower in {"-s", "--split-string"} or lower.startswith("--split-string="):
+            return suppressed
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return suppressed
+    return suppressed
+
+
+def _command_runs_python_code(command: str) -> bool:
+    """Best-effort detection of Python code entrypoints inside an inspectable shell string."""
+
+    normalized = _normalized_command(command)
+    for segment in _shell_segments(normalized):
+        if not segment:
+            continue
+        canonical = _strip_windows_suffix(segment[0])
+        args = [str(arg) for arg in segment[1:]]
+        if _is_python_interpreter(canonical) and _python_argv_executes_code(args):
+            return True
+        shell_command = _shell_wrapper_command(canonical, args)
+        if shell_command is not None and _command_runs_python_code(shell_command):
+            return True
+        if canonical == "env":
+            wrapped_tool, wrapped_args, split_command = _env_wrapped_command(args)
+            if split_command is not None and _command_runs_python_code(split_command):
+                return True
+            if wrapped_tool:
+                wrapped_canonical = _strip_windows_suffix(wrapped_tool)
+                if _is_python_interpreter(wrapped_canonical) and _python_argv_executes_code(wrapped_args):
+                    return True
+                wrapped_shell_command = _shell_wrapper_command(wrapped_canonical, wrapped_args)
+                if wrapped_shell_command is not None and _command_runs_python_code(wrapped_shell_command):
+                    return True
+    return False
+
+
 def check_worker_reviewer_github_argv(
     tool: str,
     argv: Sequence[str],
@@ -476,16 +677,29 @@ def check_worker_reviewer_github_argv(
         return _decision("uninspectable shell script execution", command)
 
     if canonical == "env":
+        policy_runtime_suppressed = _env_wrapper_suppresses_policy_runtime(args)
         wrapped_tool, wrapped_args, split_command = _env_wrapped_command(args)
         if split_command is not None:
+            if policy_runtime_suppressed and _command_runs_python_code(split_command):
+                return _decision("Python interpreter execution with policy-suppressing env wrapper", command)
             decision = check_worker_reviewer_github_command(split_command, env=env)
             if decision is not None:
                 return decision
         if wrapped_tool:
+            wrapped_canonical = _strip_windows_suffix(wrapped_tool)
+            wrapped_shell_command = _shell_wrapper_command(wrapped_canonical, wrapped_args)
+            if policy_runtime_suppressed and (
+                (_is_python_interpreter(wrapped_canonical) and _python_argv_executes_code(wrapped_args))
+                or (wrapped_shell_command is not None and _command_runs_python_code(wrapped_shell_command))
+            ):
+                return _decision("Python interpreter execution with policy-suppressing env wrapper", command)
             decision = check_worker_reviewer_github_argv(wrapped_tool, wrapped_args, env=env)
             if decision is not None:
                 return decision
         return None
+
+    if _is_python_interpreter(canonical):
+        return _python_interpreter_decision(args, command)
 
     if canonical == "git":
         subcommand, global_configs = _skip_git_global_options(args)

@@ -309,6 +309,48 @@ for argv in cases:
         self.assertEqual(combined.count("BLOCKED_WRAPPER"), 8)
         self.assertNotIn("FAKE_GIT_RAN", combined)
 
+    def test_worker_reviewer_policy_blocks_python_interpreter_subprocess_suppression(self):
+        """execute_code blocks child Python interpreters that can skip sitecustomize."""
+        code = r'''
+import os
+import subprocess
+import sys
+import tempfile
+
+fake_bin = tempfile.mkdtemp(prefix="fake-git-")
+fake_git = os.path.join(fake_bin, "git")
+with open(fake_git, "w", encoding="utf-8") as handle:
+    handle.write("#!/bin/sh\necho FAKE_GIT_RAN >&2\nexit 99\n")
+os.chmod(fake_git, 0o755)
+child_script = os.path.join(fake_bin, "child_fetch.py")
+with open(child_script, "w", encoding="utf-8") as handle:
+    handle.write(f"import subprocess\nsubprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)\n")
+
+cases = [
+    [sys.executable, "-S", "-c", f"import subprocess; subprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)"],
+    ["env", "-i", f"PATH={fake_bin}", "PYTHONPATH=", sys.executable, "-S", "-c", f"import subprocess; subprocess.run([{fake_git!r}, 'fetch', 'origin'], check=True)"],
+    [sys.executable, child_script],
+]
+for argv in cases:
+    try:
+        subprocess.run(argv, check=True)
+    except PermissionError as exc:
+        print("BLOCKED_PYTHON", argv[0], "GitHub command policy" in str(exc))
+    else:
+        raise AssertionError(f"python interpreter bypass was not blocked before fake git ran: {argv!r}")
+'''
+        with patch.dict(os.environ, {
+            "SYMPHONY_AGENT_COMMAND_POLICY": "worker_reviewer_github_upstream_block",
+            "SYMPHONY_AGENT_ROLE": "worker",
+            "HERMES_YOLO_MODE": "1",
+        }, clear=False):
+            result = self._run(code)
+
+        self.assertEqual(result["status"], "success")
+        combined = result.get("output", "") + result.get("error", "")
+        self.assertEqual(combined.count("BLOCKED_PYTHON"), 3)
+        self.assertNotIn("FAKE_GIT_RAN", combined)
+
     def test_single_tool_call(self):
         """Script calls terminal and prints the result."""
         code = """
