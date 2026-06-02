@@ -209,7 +209,7 @@ describe("AgentCommandPolicy foundation contracts", () => {
     });
   });
 
-  it("fails closed in the initial evaluator while emitting redacted audit evidence", () => {
+  it("denies upstream commands in the evaluator while emitting redacted audit evidence", () => {
     const visibleAuditValue = "audit visible value";
     const inheritedVisibleValue = "inherited visible value";
     const decision = evaluateAgentCommandPolicy(
@@ -228,26 +228,21 @@ describe("AgentCommandPolicy foundation contracts", () => {
     );
 
     expect(decision.outcome).toBe("deny");
-    expect(decision.reasonKind).toBe("unknown_command");
-    expect(decision.commandClass).toBe("unknown_or_malformed");
-    expect(decision.normalizedCommand).toMatchObject({
-      executable: "git",
-      executableKind: "git",
-      hasInlineEnvironment: true,
-    });
+    expect(decision.reasonKind).toBe("upstream_github");
+    expect(decision.commandClass).toBe("git_fetch");
     expect(decision.audit).toMatchObject({
       redacted: true,
       outcome: "deny",
-      reasonKind: "unknown_command",
+      reasonKind: "upstream_github",
       normalizedExecutable: "git",
+      gitSubcommand: "fetch",
       inheritedEnvironmentKeys: ["GITHUB_TOKEN", "PATH"],
       inlineEnvironmentKeys: ["GITHUB_TOKEN"],
-      rawInputPreviewRedacted: true,
       upstreamContactAttempted: false,
     });
-    expect(decision.audit.rawInputPreview).toContain("[redacted]");
-    expect(decision.audit.rawInputPreview).not.toContain(visibleAuditValue);
-    expect(decision.audit.rawInputPreview).not.toContain(inheritedVisibleValue);
-    expect(decision.message).toContain("Symphony service-owned GitHub workflow");
+    expect(decision.audit.commandPreview).toContain("[redacted]");
+    expect(decision.audit.commandPreview).not.toContain(visibleAuditValue);
+    expect(JSON.stringify(decision.audit)).not.toContain(inheritedVisibleValue);
+    expect(decision.message).toContain("Symphony service-owned workflow");
   });
 });

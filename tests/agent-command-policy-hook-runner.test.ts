@@ -290,8 +290,8 @@ describe("AgentCommandPolicyHookRunner", () => {
     expect(JSON.stringify(evaluation.policyInput?.environment)).not.toContain(ambientApiSecret);
     expect(evaluation.decision).toMatchObject({
       outcome: "deny",
-      reasonKind: "github_host_reference",
-      commandClass: "github_host_reference",
+      reasonKind: "upstream_github",
+      commandClass: "git_ls_remote",
     });
     expect(evaluation.hookResponse?.action).toBe("block");
 
@@ -317,12 +317,12 @@ describe("AgentCommandPolicyHookRunner", () => {
       "GITHUB_TOKEN",
       "OPENAI_API_KEY",
     ]);
-    expect(evaluation.decision.audit.commandPreview).toContain("GITHUB_TOKEN=<redacted>");
-    expect(evaluation.decision.audit.commandPreview).toContain("OPENAI_API_KEY=<redacted>");
-    expect(evaluation.decision.audit.commandPreview).toContain("AWS_ACCESS_KEY_ID=<redacted>");
-    expect(evaluation.decision.audit.commandPreview).toContain("'ACCESS_KEY_ID=<redacted>'");
-    expect(evaluation.decision.audit.commandPreview).toContain("https://<redacted>@github.com");
-    expect(evaluation.decision.audit.commandPreview).toContain("<redacted-github-token>");
+    expect(evaluation.decision.audit.commandPreview).toContain("GITHUB_TOKEN=[redacted]");
+    expect(evaluation.decision.audit.commandPreview).toContain("OPENAI_API_KEY=[redacted]");
+    expect(evaluation.decision.audit.commandPreview).toContain("AWS_ACCESS_KEY_ID=[redacted]");
+    expect(evaluation.decision.audit.commandPreview).toContain("ACCESS_KEY_ID=[redacted]");
+    expect(evaluation.decision.audit.commandPreview).toContain("https://[redacted]@github.com");
+    expect(evaluation.decision.audit.commandPreview).toContain("[redacted-github-token]");
   });
 });
 

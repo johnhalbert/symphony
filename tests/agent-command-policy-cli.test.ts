@@ -148,7 +148,7 @@ describe("agent-command-policy-hook CLI", () => {
     expect(result.stderr).toBe("");
     expect(JSON.parse(result.stdout) as unknown).toMatchObject({
       action: "block",
-      message: expect.stringContaining("direct GitHub host") as string,
+      message: expect.stringContaining("upstream GitHub contact") as string,
     });
     for (const secret of [
       ambientSecret,

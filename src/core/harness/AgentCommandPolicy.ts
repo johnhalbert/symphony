@@ -6,7 +6,7 @@ const MAX_POLICY_PREVIEW_REDACTION_DEPTH = 8;
 const WINDOWS_EXECUTABLE_SUFFIXES = [".exe", ".cmd", ".bat", ".com", ".ps1"] as const;
 
 const GIT_EXECUTABLES = new Set(["git", "git-lfs"]);
-const GITHUB_CLI_EXECUTABLES = new Set(["gh", "github"]);
+const GITHUB_CLI_EXECUTABLES = new Set(["gh", "github", "hub"]);
 const SSH_EXECUTABLES = new Set(["ssh", "scp", "sftp", "plink"]);
 const NETWORK_CLIENT_EXECUTABLES = new Set(["curl", "wget", "http", "https", "httpie"]);
 const SHELL_EXECUTABLES = new Set(["bash", "sh", "zsh", "fish", "dash", "cmd", "powershell", "pwsh"]);
@@ -31,7 +31,21 @@ const REDACTED_ASSIGNMENT_VALUE = "[redacted]";
 
 const RESTRICTED_ROLES = new Set(["worker", "reviewer", "merge-conflict-repair-worker", "merge_conflict_repair_worker"]);
 const LOCAL_INSPECTION_GIT_SUBCOMMANDS = new Set(["status", "diff", "log", "show", "branch", "blame"]);
-const UPSTREAM_GIT_SUBCOMMANDS = new Set(["push", "pull", "fetch", "clone", "ls-remote"]);
+const UPSTREAM_GIT_SUBCOMMANDS = new Set([
+  "clone",
+  "fetch",
+  "ls-remote",
+  "pull",
+  "push",
+  "receive-pack",
+  "remote-ext",
+  "remote-fd",
+  "send-pack",
+  "upload-archive",
+  "upload-pack",
+]);
+const GIT_REMOTE_UPSTREAM_SUBCOMMANDS = new Set(["prune", "update"]);
+const GIT_UPSTREAM_CHECKOUT_SUBCOMMANDS = new Set(["checkout", "switch"]);
 const SHELL_OR_WRAPPER_EXECUTABLES = new Set([
   "bash",
   "cmd",
@@ -63,6 +77,35 @@ const CREDENTIAL_ASSIGNMENT_UNQUOTED_VALUE_PATTERN = new RegExp(
   `\\b(${CREDENTIAL_ASSIGNMENT_KEY_PATTERN})=(?!<redacted>)[^\\s]+`,
   "gi",
 );
+const COMMAND_PREVIEW_MAX_LENGTH = 240;
+const REDACTED_VALUE = "[redacted]";
+const REDACTED_GITHUB_TOKEN = "[redacted-github-token]";
+const CLI_AUTH_OPTIONS_WITH_VALUE = new Set([
+  "-a",
+  "-b",
+  "-U",
+  "-u",
+  "--api-key",
+  "--apikey",
+  "--auth",
+  "--auth-token",
+  "--bearer",
+  "--cookie",
+  "--ftp-password",
+  "--ftp-user",
+  "--http-password",
+  "--http-user",
+  "--oauth2-bearer",
+  "--password",
+  "--private-token",
+  "--proxy-user",
+  "--token",
+  "--user",
+  "--user-password",
+]);
+const CLI_AUTH_SHORT_OPTIONS_WITH_ATTACHED_VALUE = new Set(["-a", "-b", "-U", "-u"]);
+const SENSITIVE_QUERY_PARAMETER_PATTERN =
+  /([?&;](?:access[_-]?token|api[_-]?key|auth(?:entication)?[_-]?token|client[_-]?secret|credential|github[_-]?token|gh[_-]?token|id[_-]?token|jwt|oauth[_-]?token|password|passwd|private[_-]?token|refresh[_-]?token|secret|session|token|user[_-]?session)=)([^\s'"&;|]+)/giu;
 
 export type AgentCommandPolicySurface = string;
 export type AgentCommandPolicyCommandSurface = AgentCommandPolicySurface;
@@ -216,6 +259,7 @@ export interface AgentCommandPolicyAuditPayload {
   readonly rawInputPreviewRedacted?: boolean | undefined;
   readonly normalizedExecutable?: string | null | undefined;
   readonly executableKind?: AgentCommandPolicyExecutableKind | undefined;
+  readonly targetHosts?: readonly string[] | undefined;
   readonly inheritedEnvironmentKeys?: readonly string[] | undefined;
   readonly commandPreview?: string | undefined;
   readonly gitSubcommand?: string | null | undefined;
@@ -257,52 +301,7 @@ export type AgentCommandPolicyCommandTextExtraction =
 type AgentCommandPolicyCommandTextFailure = Exclude<AgentCommandPolicyCommandTextExtraction, { status: "ok" }>;
 
 export function evaluateAgentCommandPolicy(input: AgentCommandPolicyInput): AgentCommandPolicyDecision {
-  const rawInputPreview = redactedAgentCommandPolicyPreview(rawInputPreviewValue(input.rawInput));
-  const executableCandidate = extractAgentCommandPolicyExecutableCandidate(input.rawInput);
-  const normalizedExecutable = normalizeAgentCommandPolicyExecutable(executableCandidate);
-  const inlineEnvironmentKeys = extractAgentCommandPolicyInlineEnvironmentKeys(input.rawInput);
-  const inheritedEnvironmentKeys = extractAgentCommandPolicyEnvironmentKeys(input.environment);
-  const normalizedCommand: AgentCommandPolicyNormalizedCommand = {
-    executable: normalizedExecutable.normalizedExecutable,
-    executableKind: normalizedExecutable.executableKind,
-    argumentsPreview: null,
-    gitSubcommand: null,
-    targetHosts: [],
-    hasNestedCommand: false,
-    hasInlineEnvironment: inlineEnvironmentKeys.length > 0,
-    hasUnsafeGitConfig: false,
-  };
-
-  return {
-    attemptId: input.attemptId ?? null,
-    outcome: "deny",
-    reasonKind: "unknown_command",
-    commandClass: "unknown_or_malformed",
-    message:
-      "Blocked worker/reviewer command: this command policy foundation cannot yet prove the command is local-only and helper-free. Use safe local inspection once classified, or rely on Symphony service-owned GitHub workflow actions for publication, review, and writeback.",
-    requiresCodeChange: false,
-    requiresUserOrServiceFix: true,
-    normalizedCommand,
-    audit: {
-      redacted: true,
-      surface: input.surface,
-      role: input.role,
-      phase: input.phase,
-      outcome: "deny",
-      reasonKind: "unknown_command",
-      rawInputPreview: rawInputPreview.preview,
-      rawInputPreviewTruncated: rawInputPreview.truncated,
-      rawInputPreviewRedacted: rawInputPreview.redacted,
-      normalizedExecutable: normalizedExecutable.normalizedExecutable,
-      executableKind: normalizedExecutable.executableKind,
-      gitSubcommand: null,
-      commandClass: "unknown_or_malformed",
-      inheritedEnvironmentKeys,
-      inlineEnvironmentKeys,
-      unsafeConfigCategories: [],
-      upstreamContactAttempted: false,
-    },
-  };
+  return classifyAgentCommand(input);
 }
 
 export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentCommandPolicyDecision {
@@ -312,15 +311,15 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
     commandExtraction.status === "ok" ? commandExtraction.command : undefined,
   );
 
-  if (!isRestrictedAgentRole(input.role)) {
-    return allowDecision(input, {
-      ...baseAudit,
-      commandClass: "role_not_restricted",
-      upstreamContactAttempted: false,
-    }, "role_not_restricted", "role_not_restricted", "Agent command policy is not applied to this role.");
-  }
-
   if (commandExtraction.status !== "ok") {
+    if (!isRestrictedAgentRole(input.role)) {
+      return allowDecision(input, {
+        ...baseAudit,
+        commandClass: "role_not_restricted",
+        upstreamContactAttempted: false,
+      }, "role_not_restricted", "role_not_restricted", "Agent command policy is not applied to this role.");
+    }
+
     const commandClass = commandInputFailureCommandClass(commandExtraction);
     return denyDecision(
       input,
@@ -336,65 +335,65 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
   }
 
   const command = commandExtraction.command;
+  const parsed = parseCommandAttempt(command);
+  const audit = auditForParsedCommand(baseAudit, parsed);
+
+  if (!isRestrictedAgentRole(input.role)) {
+    return allowDecision(input, {
+      ...audit,
+      commandClass: "role_not_restricted",
+      upstreamContactAttempted: false,
+    }, "role_not_restricted", "role_not_restricted", "Agent command policy is not applied to this role.");
+  }
+
   if (command.trim().length === 0) {
     return denyDecision(
       input,
       {
-        ...baseAudit,
-        commandClass: "malformed_command",
+        ...audit,
+        commandClass: "unknown_command",
         upstreamContactAttempted: false,
       },
-      "malformed_command",
-      "malformed_command",
+      "unknown_command",
+      "unknown_command",
       "Blocked worker/reviewer command: command-capable hook payload did not include a command string. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
     );
   }
 
-  const tokens = tokenizeCommandPreview(command);
-  const inlineEnvironmentKeys = extractInlineEnvironmentKeys(tokens);
-  const executableToken = firstExecutableToken(tokens);
-  const normalizedExecutable = executableToken === null ? undefined : normalizeExecutableName(executableToken);
-  const commandPreview = redactedCommandPreview(command);
-  const audit = {
-    ...baseAudit,
-    commandPreview,
-    inlineEnvironmentKeys,
-    ...(normalizedExecutable === undefined ? {} : { normalizedExecutable }),
-  } satisfies AgentCommandPolicyAuditPayload;
-
-  if (referencesGitHubHost(command)) {
+  if (parsed.normalizedExecutable === undefined) {
     return denyDecision(
       input,
       {
         ...audit,
-        commandClass: "github_host_reference",
+        commandClass: "unknown_command",
         upstreamContactAttempted: false,
       },
-      "github_host_reference",
-      "github_host_reference",
-      "Blocked worker/reviewer command: direct GitHub host or API access is disallowed. Use Symphony service-owned GitHub workflow actions for publication, review, writeback, mergeability, and CI checks.",
+      "unknown_command",
+      "unknown_command",
+      "Blocked worker/reviewer command: command content could not be classified before execution. Use local inspection that can be proven safe, or rely on Symphony service-owned GitHub workflow actions.",
     );
   }
 
-  if (normalizedExecutable === "gh") {
+  const upstreamClass = classifyDirectUpstreamGithubAttempt(parsed);
+  if (upstreamClass !== null) {
     return denyDecision(
       input,
       {
         ...audit,
-        commandClass: "github_cli",
+        commandClass: upstreamClass,
         upstreamContactAttempted: false,
       },
-      "github_cli",
-      "github_cli",
-      "Blocked worker/reviewer GitHub CLI command: agent-owned GitHub activity is disallowed. Use Symphony service-owned GitHub workflow actions instead.",
+      "upstream_github",
+      upstreamClass,
+      "Blocked worker/reviewer upstream GitHub contact: direct GitHub activity is disallowed for worker/reviewer agents. Use Symphony service-owned workflow actions for publication, review, writeback, mergeability, and CI checks.",
     );
   }
 
-  if (normalizedExecutable === "git") {
-    return classifyGitCommand(input, audit, tokens, command);
+  if (parsed.normalizedExecutable === "git") {
+    return classifyGitCommand(input, audit, parsed.tokens, command);
   }
 
-  if (normalizedExecutable !== undefined && SHELL_OR_WRAPPER_EXECUTABLES.has(normalizedExecutable)) {
+  if (SHELL_OR_WRAPPER_EXECUTABLES.has(parsed.normalizedExecutable)) {
     return denyDecision(
       input,
       {
@@ -419,6 +418,131 @@ export function classifyAgentCommand(input: AgentCommandPolicyInput): AgentComma
     "ambiguous_command",
     "Blocked worker/reviewer command: command is not classified as helper-free local inspection by this policy scaffold. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
   );
+}
+
+interface ParsedCommandAttempt {
+  readonly command: string;
+  readonly tokens: string[];
+  readonly normalizedExecutable?: string;
+  readonly executableKind?: AgentCommandPolicyExecutableKind;
+  readonly gitSubcommand?: string;
+  readonly targetHosts: readonly string[];
+  readonly inlineEnvironmentKeys: readonly string[];
+  readonly commandPreview: string;
+}
+
+function parseCommandAttempt(command: string): ParsedCommandAttempt {
+  const tokens = tokenizeCommandPreview(command);
+  const inlineEnvironmentKeys = extractInlineEnvironmentKeys(tokens);
+  const executableToken = firstExecutableToken(tokens);
+  const normalizedExecutable = executableToken === null ? undefined : normalizeExecutableName(executableToken);
+  const gitSubcommand = normalizedExecutable === "git" ? extractGitSubcommand(tokens) : null;
+
+  return {
+    command,
+    tokens,
+    ...(normalizedExecutable === undefined ? {} : { normalizedExecutable }),
+    ...(normalizedExecutable === undefined ? {} : { executableKind: classifyExecutableKind(normalizedExecutable) }),
+    ...(gitSubcommand === null ? {} : { gitSubcommand }),
+    targetHosts: extractGithubHosts(tokens),
+    inlineEnvironmentKeys,
+    commandPreview: redactedCommandPreview(command),
+  };
+}
+
+function auditForParsedCommand(
+  baseAudit: AgentCommandPolicyAuditPayload,
+  parsed: ParsedCommandAttempt,
+): AgentCommandPolicyAuditPayload {
+  return {
+    ...baseAudit,
+    commandPreview: parsed.commandPreview,
+    inlineEnvironmentKeys: parsed.inlineEnvironmentKeys,
+    ...(parsed.normalizedExecutable === undefined ? {} : { normalizedExecutable: parsed.normalizedExecutable }),
+    ...(parsed.executableKind === undefined ? {} : { executableKind: parsed.executableKind }),
+    ...(parsed.gitSubcommand === undefined ? {} : { gitSubcommand: parsed.gitSubcommand }),
+    ...(parsed.targetHosts.length === 0 ? {} : { targetHosts: parsed.targetHosts }),
+  };
+}
+
+function classifyDirectUpstreamGithubAttempt(parsed: ParsedCommandAttempt): string | null {
+  const executable = parsed.normalizedExecutable;
+  if (executable === undefined) {
+    return null;
+  }
+
+  if (executable === "git") {
+    if (parsed.gitSubcommand && UPSTREAM_GIT_SUBCOMMANDS.has(parsed.gitSubcommand)) {
+      return `git_${parsed.gitSubcommand.replace(/-/g, "_")}`;
+    }
+
+    const remoteAction = parsed.gitSubcommand === "remote" ? gitRemoteSubcommand(parsed.tokens) : null;
+    if (remoteAction && GIT_REMOTE_UPSTREAM_SUBCOMMANDS.has(remoteAction)) {
+      return `git_remote_${remoteAction}`;
+    }
+
+    if (
+      parsed.gitSubcommand &&
+      GIT_UPSTREAM_CHECKOUT_SUBCOMMANDS.has(parsed.gitSubcommand) &&
+      hasUpstreamCheckoutReference(parsed.tokens)
+    ) {
+      return "git_upstream_checkout";
+    }
+
+    if (parsed.targetHosts.length > 0) {
+      return "git_github_transport";
+    }
+  }
+
+  if (GITHUB_CLI_EXECUTABLES.has(executable)) {
+    return "github_cli";
+  }
+
+  if (SSH_EXECUTABLES.has(executable) && parsed.targetHosts.length > 0) {
+    return `${executable}_github_transport`;
+  }
+
+  if (NETWORK_CLIENT_EXECUTABLES.has(executable) && parsed.targetHosts.length > 0) {
+    return `${executable}_github_request`;
+  }
+
+  if (parsed.targetHosts.length > 0) {
+    return "github_host_reference";
+  }
+
+  return null;
+}
+
+function gitRemoteSubcommand(tokens: readonly string[]): string | null {
+  const remoteIndex = tokens.findIndex((token) => token.toLowerCase() === "remote");
+  if (remoteIndex < 0) return null;
+
+  for (let index = remoteIndex + 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined || token === "--" || isShellControlOperator(token)) return null;
+    if (token.startsWith("-")) continue;
+    return token.toLowerCase();
+  }
+
+  return null;
+}
+
+function hasUpstreamCheckoutReference(tokens: readonly string[]): boolean {
+  const checkoutIndex = tokens.findIndex((token) => {
+    const normalized = token.toLowerCase();
+    return normalized === "checkout" || normalized === "switch";
+  });
+  if (checkoutIndex < 0) return false;
+
+  for (let index = checkoutIndex + 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === undefined || token === "--" || isShellControlOperator(token)) return false;
+    if (token === "--track" || token === "--guess") return true;
+    if (token.startsWith("-")) continue;
+    if (/^(?:origin|upstream|remotes\/origin|remotes\/upstream)\//u.test(token)) return true;
+  }
+
+  return false;
 }
 
 export function buildFailClosedAgentCommandPolicyDecision(input: {
@@ -465,20 +589,98 @@ export function environmentKeysOnly(environment: Record<string, string | undefin
   return Object.keys(environment).sort((left, right) => left.localeCompare(right));
 }
 
-export function redactedCommandPreview(command: string, maxLength = 240): string {
-  const redacted = command
-    .replace(/(https?:\/\/)([^\s/@]+)@github\.com/gi, "$1<redacted>@github.com")
-    .replace(CREDENTIAL_ASSIGNMENT_WHOLE_QUOTED_PATTERN, (_match: string, quote: string, key: string) => {
-      return `${quote}${key}=<redacted>${quote}`;
-    })
-    .replace(CREDENTIAL_ASSIGNMENT_QUOTED_VALUE_PATTERN, (_match: string, key: string) => {
-      return `${key}=<redacted>`;
-    })
-    .replace(CREDENTIAL_ASSIGNMENT_UNQUOTED_VALUE_PATTERN, (_match: string, key: string) => {
-      return `${key}=<redacted>`;
-    })
-    .replace(/\b(?:ghp|github_pat)_[A-Za-z0-9_.-]+/g, "<redacted-github-token>");
-  return redacted.length <= maxLength ? redacted : `${redacted.slice(0, maxLength - 1)}…`;
+export function redactedCommandPreview(command: string, maxLength = COMMAND_PREVIEW_MAX_LENGTH): string {
+  if (command.length === 0) return "";
+
+  const tokens = tokenizeCommandPreview(redactSensitiveCommandText(command));
+  const redacted = redactSensitiveCommandTokens(tokens).join(" ");
+  const preview = redactSensitiveCommandText(redacted);
+  return preview.length <= maxLength ? preview : `${preview.slice(0, maxLength - 3)}...`;
+}
+
+function redactSensitiveCommandTokens(tokens: readonly string[]): string[] {
+  const redacted: string[] = [];
+  let atCommandStart = true;
+  let redactNextAuthValue = false;
+
+  for (const token of tokens) {
+    if (isShellControlOperator(token)) {
+      redacted.push(token);
+      atCommandStart = true;
+      redactNextAuthValue = false;
+      continue;
+    }
+
+    if (redactNextAuthValue) {
+      redacted.push(REDACTED_VALUE);
+      redactNextAuthValue = false;
+      atCommandStart = false;
+      continue;
+    }
+
+    const environmentAssignment = parseEnvironmentAssignment(token);
+    if (environmentAssignment && (atCommandStart || isSensitiveAssignmentKey(environmentAssignment.key))) {
+      redacted.push(`${environmentAssignment.key}=${REDACTED_VALUE}`);
+      continue;
+    }
+
+    const authOption = redactAuthOptionToken(token);
+    redacted.push(authOption.token);
+    redactNextAuthValue = authOption.redactNextValue;
+    atCommandStart = false;
+  }
+
+  return redacted;
+}
+
+function parseEnvironmentAssignment(token: string): { readonly key: string } | null {
+  const match = /^([A-Za-z_][A-Za-z0-9_]*)=.*$/u.exec(token);
+  const key = match?.[1];
+  return key ? { key } : null;
+}
+
+function redactAuthOptionToken(token: string): { readonly token: string; readonly redactNextValue: boolean } {
+  const inlineValueSeparator = token.indexOf("=");
+  if (inlineValueSeparator > 0) {
+    const optionName = token.slice(0, inlineValueSeparator);
+    if (CLI_AUTH_OPTIONS_WITH_VALUE.has(optionName)) {
+      return { token: `${optionName}=${REDACTED_VALUE}`, redactNextValue: false };
+    }
+  }
+
+  if (CLI_AUTH_OPTIONS_WITH_VALUE.has(token)) {
+    return { token, redactNextValue: true };
+  }
+
+  for (const shortOption of CLI_AUTH_SHORT_OPTIONS_WITH_ATTACHED_VALUE) {
+    if (token.startsWith(shortOption) && token.length > shortOption.length && !token.startsWith(`${shortOption}-`)) {
+      return { token: `${shortOption}${REDACTED_VALUE}`, redactNextValue: false };
+    }
+  }
+
+  return { token: redactSensitiveCommandText(token), redactNextValue: false };
+}
+
+function redactSensitiveCommandText(text: string): string {
+  return text
+    .replace(/\b(gh[oprsu]_[A-Za-z0-9_]{8,})\b/gu, REDACTED_GITHUB_TOKEN)
+    .replace(/\b(github_pat_[A-Za-z0-9_]+)\b/gu, REDACTED_GITHUB_TOKEN)
+    .replace(/(https?:\/\/)([^\s/@]+)@/giu, `$1${REDACTED_VALUE}@`)
+    .replace(SENSITIVE_QUERY_PARAMETER_PATTERN, `$1${REDACTED_VALUE}`)
+    .replace(/(Authorization:\s*(?:Basic|Bearer|token)\s+)[^\s'";|&]+/giu, `$1${REDACTED_VALUE}`)
+    .replace(/(['"])(Cookie:\s*)[^'"\r\n]*\1/giu, `$1$2${REDACTED_VALUE}$1`)
+    .replace(/\b(Cookie:\s*)[^\s'";|&]+/giu, `$1${REDACTED_VALUE}`)
+    .replace(
+      /((?:X-GitHub-Token|X-Hub-Signature(?:-256)?|Private-Token|Job-Token):\s*)[^\s'";|&]+/giu,
+      `$1${REDACTED_VALUE}`,
+    );
+}
+
+function isSensitiveAssignmentKey(key: string): boolean {
+  const normalized = key.replace(/[-.]/gu, "_").toLowerCase();
+  return /(?:^|_)(?:api_key|auth(?:orization)?|bearer|client_secret|credential|credentials|password|passwd|pat|private_key|secret|token)(?:_|$)/u.test(
+    normalized,
+  );
 }
 
 export function normalizeExecutableName(executable: string): string {
@@ -572,6 +774,8 @@ function allowDecision(
       role: input.role,
       phase: input.phase,
       surface: input.surface,
+      outcome: "allow",
+      reasonKind,
       commandClass,
     },
   };
@@ -594,12 +798,15 @@ function denyDecision(
       role: input.role,
       phase: input.phase,
       surface: input.surface,
+      outcome: "deny",
+      reasonKind,
       commandClass,
     },
   };
 }
 
 function auditBase(input: AgentCommandPolicyInput, command: string | undefined): AgentCommandPolicyAuditPayload {
+  const inheritedEnvironmentKeys = extractAgentCommandPolicyEnvironmentKeys(input.environment);
   return {
     redacted: true,
     surface: input.surface,
@@ -609,6 +816,7 @@ function auditBase(input: AgentCommandPolicyInput, command: string | undefined):
     inlineEnvironmentKeys: [],
     unsafeConfigCategories: [],
     upstreamContactAttempted: false,
+    ...(inheritedEnvironmentKeys.length === 0 ? {} : { inheritedEnvironmentKeys }),
     ...(command === undefined ? {} : { commandPreview: redactedCommandPreview(command) }),
   };
 }
@@ -680,8 +888,74 @@ function commandInputFailureMessage(failure: AgentCommandPolicyCommandTextFailur
 }
 
 function tokenizeCommandPreview(command: string): string[] {
-  const matches = command.match(/"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S+/g) ?? [];
-  return matches.map(stripMatchingQuotes);
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (char === undefined) continue;
+
+    if (char === "\\" && quote !== "'") {
+      const next = command[index + 1];
+      if (next !== undefined && shouldBackslashEscape(next, quote)) {
+        current += next;
+        index += 1;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (quote !== null) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+
+    if (/\s/u.test(char)) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    if (char === ";" || char === "|" || char === "&") {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = "";
+      }
+      const next = command[index + 1];
+      if ((char === "|" || char === "&") && next === char) {
+        tokens.push(`${char}${next}`);
+        index += 1;
+      } else {
+        tokens.push(char);
+      }
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current.length > 0) tokens.push(current);
+  return tokens;
+}
+
+function shouldBackslashEscape(char: string, quote: "'" | '"' | null): boolean {
+  if (quote === '"') {
+    return char === '"' || char === "\\" || char === "$" || char === "`";
+  }
+  return /\s/u.test(char) || char === "'" || char === '"' || char === ";" || char === "|" || char === "&";
 }
 
 function extractInlineEnvironmentKeys(tokens: string[]): string[] {
@@ -734,8 +1008,55 @@ function isRemoteMutationCommand(tokens: string[], gitSubcommand: string): boole
     : ["add", "remove", "rename", "set-head", "set-url", "update"].includes(remoteAction);
 }
 
-function referencesGitHubHost(command: string): boolean {
-  return /(?:^|[^A-Za-z0-9_.-])(?:https?:\/\/)?(?:api\.)?github\.com(?:[:/\s]|$)/i.test(command);
+function extractGithubHosts(tokens: readonly string[]): string[] {
+  const hosts = new Set<string>();
+  for (const token of tokens) {
+    const host = githubHostFromToken(token);
+    if (host !== null) hosts.add(host);
+  }
+  return [...hosts].sort();
+}
+
+function githubHostFromToken(token: string): string | null {
+  const trimmed = token.trim().replace(/^[<({\[]+|[>)}\],.]+$/gu, "");
+  if (trimmed.length === 0) return null;
+
+  const urlHost = hostFromUrl(trimmed);
+  if (urlHost !== null && isGithubHost(urlHost)) return urlHost;
+
+  const scpLikeMatch = /^(?:[^@\s]+@)?([^:\s]+):[^\s]+$/u.exec(trimmed);
+  const scpLikeHost = scpLikeMatch?.[1]?.toLowerCase();
+  if (scpLikeHost && isGithubHost(scpLikeHost)) return scpLikeHost;
+
+  const hostMatch = /(?:^|[^A-Za-z0-9.-])([A-Za-z0-9.-]*(?:githubusercontent\.com|github\.com))(?:$|[^A-Za-z0-9.-])/iu.exec(
+    trimmed,
+  );
+  const host = hostMatch?.[1]?.toLowerCase();
+  return host && isGithubHost(host) ? host : null;
+}
+
+function hostFromUrl(token: string): string | null {
+  if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(token)) return null;
+
+  try {
+    return new URL(token).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function isGithubHost(host: string): boolean {
+  const normalized = host.toLowerCase().replace(/\.$/u, "");
+  return (
+    normalized === "github.com" ||
+    normalized.endsWith(".github.com") ||
+    normalized === "githubusercontent.com" ||
+    normalized.endsWith(".githubusercontent.com")
+  );
+}
+
+function isShellControlOperator(token: string): boolean {
+  return token === ";" || token === "|" || token === "&" || token === "&&" || token === "||";
 }
 
 function containsInlineUnsafeLocalGitOption(command: string): boolean {
