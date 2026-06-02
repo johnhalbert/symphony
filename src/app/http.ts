@@ -225,6 +225,11 @@ interface WebProjectionJsonResponse<TBody> {
 
 type DurableProjectionReadResult<TPayload> = WebProjectionReadResult<TPayload>;
 
+export interface StatusServerRealtimeOptions {
+  enabled?: boolean;
+  keepAliveIntervalMs?: number;
+}
+
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
   workspaceManager: WorkspaceManager;
@@ -257,6 +262,7 @@ export interface StatusServerOptions {
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
   projectionWriter?: StatusServerProjectionWriter;
   projectionReader?: StatusServerProjectionReader;
+  realtime?: StatusServerRealtimeOptions;
 }
 
 export class StatusServer {
@@ -438,9 +444,21 @@ export class StatusServer {
   }
 
   private handleRealtime(request: IncomingMessage, response: ServerResponse, url: URL): void {
+    if (this.options.realtime?.enabled === false) {
+      sendJson(response, 503, {
+        error: {
+          code: "realtime_unavailable",
+          message: "Realtime event stream is unavailable",
+        },
+      });
+      return;
+    }
+
+    const keepAliveIntervalMs = this.options.realtime?.keepAliveIntervalMs;
     const stream = this.realtimeEvents.openSseStream({
       response,
       lastEventId: realtimeLastEventId(request, url),
+      ...(keepAliveIntervalMs === undefined ? {} : { keepAliveIntervalMs }),
     });
     const close = (): void => stream.close();
     request.on("aborted", close);
