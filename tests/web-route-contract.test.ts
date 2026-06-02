@@ -426,15 +426,20 @@ describe("/api/v1/web route contracts", () => {
   });
 
   it("serves direct run-id transcript payloads from durable projections when the raw run store is unavailable", async () => {
-    const defaultTranscript = [
-      { kind: "assistant" as const, ts: "2026-05-31T00:00:00.000Z", text: "default page from durable transcript" },
-    ];
+    const defaultTranscript = Array.from({ length: 500 }, (_, index) => {
+      const sequence = index + 701;
+      return {
+        kind: "assistant" as const,
+        ts: new Date(Date.UTC(2026, 4, 31, 0, 0, index)).toISOString(),
+        text: `default tail event ${sequence}`,
+      };
+    });
     const pagedTranscript = [
       { kind: "tool" as const, ts: "2026-05-31T00:00:03.000Z", text: "explicit page from durable transcript" },
     ];
     const projectionReader = new RecordingProjectionReader([
       projectionPayloadRecordFixture(
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:700:limit:500" },
         defaultTranscript,
       ),
       projectionPayloadRecordFixture(
@@ -451,11 +456,22 @@ describe("/api/v1/web route contracts", () => {
       expect(defaultPage.body).toEqual(defaultTranscript);
       expect(defaultPage.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(defaultPage.response.headers.get("x-symphony-projection-cache")).toBe("hit");
+      expect(defaultPage.response.headers.get("x-symphony-projection-scope-key")).toBe("run-1:offset:700:limit:500");
+      expect((defaultPage.body as unknown[])[0]).toMatchObject({ text: "default tail event 701" });
+      expect((defaultPage.body as unknown[]).at(-1)).toMatchObject({ text: "default tail event 1200" });
+      expect((defaultPage.body as unknown[])).toHaveLength(500);
 
       const explicitPage = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?offset=2&limit=3`);
       expect(explicitPage.body).toEqual(pagedTranscript);
       expect(explicitPage.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(explicitPage.response.headers.get("x-symphony-projection-cache")).toBe("hit");
+      expect(explicitPage.response.headers.get("x-symphony-projection-scope-key")).toBe("run-1:offset:2:limit:3");
+
+      const refreshDefault = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?refresh=1`);
+      expect(refreshDefault.body).toEqual([]);
+      expect(refreshDefault.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(refreshDefault.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(refreshDefault.response.headers.get("x-symphony-projection-scope-key")).toBe("run-1:tail:limit:500");
 
       const refreshBypass = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?offset=2&limit=3&refresh=1`);
       expect(refreshBypass.body).toEqual([]);
@@ -468,7 +484,7 @@ describe("/api/v1/web route contracts", () => {
     expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(projectionWriter.writes).toEqual([]);
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
+      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:700:limit:500" },
       { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:2:limit:3" },
     ]);
   });
@@ -1072,6 +1088,32 @@ class RecordingProjectionReader implements StatusServerProjectionReader {
     const record = this.records.get(projectionSelectorKey(selector));
     return record ? (cloneJson(record) as ProjectionPayloadRecord<TPayload>) : null;
   }
+
+  async readCurrentTranscriptDefaultPayload<TPayload = unknown>(selector: {
+    runId: string;
+    limit: number;
+  }): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    const record = [...this.records.values()]
+      .filter((candidate) => {
+        const page = transcriptProjectionPageFromScopeKey(candidate.revision.scopeKey);
+        return (
+          candidate.revision.projectionName === "transcript_projection" &&
+          candidate.revision.scopeKind === "run_page" &&
+          page?.runId === selector.runId &&
+          page.limit === selector.limit
+        );
+      })
+      .sort(compareTranscriptDefaultProjectionRecords)[0];
+    if (record) this.selectors.push(projectionRevisionSelector(record.revision));
+    else {
+      this.selectors.push({
+        projectionName: "transcript_projection",
+        scopeKind: "run_page",
+        scopeKey: `${selector.runId}:tail:limit:${selector.limit}`,
+      });
+    }
+    return record ? (cloneJson(record) as ProjectionPayloadRecord<TPayload>) : null;
+  }
 }
 
 class FailingProjectionReader implements StatusServerProjectionReader {
@@ -1140,6 +1182,39 @@ class RecordingRunStore {
 
 function projectionSelectorKey(selector: ProjectionRevisionSelector): string {
   return [selector.projectionName, selector.scopeKind ?? "global", selector.scopeKey ?? "global"].join(":");
+}
+
+function projectionRevisionSelector(revision: ProjectionRevisionRecord): ProjectionRevisionSelector {
+  return { projectionName: revision.projectionName, scopeKind: revision.scopeKind, scopeKey: revision.scopeKey };
+}
+
+function transcriptProjectionPageFromScopeKey(scopeKey: string): { runId: string; offset: number; limit: number } | null {
+  const match = /^(.*):offset:(\d+):limit:(\d+)$/.exec(scopeKey);
+  if (!match) return null;
+  return { runId: match[1] ?? "", offset: Number(match[2]), limit: Number(match[3]) };
+}
+
+function compareTranscriptDefaultProjectionRecords(left: ProjectionPayloadRecord, right: ProjectionPayloadRecord): number {
+  const leftNextOffset = transcriptProjectionRecordNextOffset(left);
+  const rightNextOffset = transcriptProjectionRecordNextOffset(right);
+  const terminalDelta = Number(rightNextOffset === null) - Number(leftNextOffset === null);
+  if (terminalDelta !== 0) return terminalDelta;
+  const messageCountDelta = transcriptProjectionRecordMessageCount(right) - transcriptProjectionRecordMessageCount(left);
+  if (messageCountDelta !== 0) return messageCountDelta;
+  const leftPage = transcriptProjectionPageFromScopeKey(left.revision.scopeKey);
+  const rightPage = transcriptProjectionPageFromScopeKey(right.revision.scopeKey);
+  return (rightPage?.offset ?? 0) - (leftPage?.offset ?? 0);
+}
+
+function transcriptProjectionRecordNextOffset(record: ProjectionPayloadRecord): number | null | undefined {
+  const nextOffset = record.revision.sourceCursors["nextOffset"];
+  return typeof nextOffset === "number" || nextOffset === null ? nextOffset : undefined;
+}
+
+function transcriptProjectionRecordMessageCount(record: ProjectionPayloadRecord): number {
+  const eventCount = record.revision.sourceCursors["eventCount"];
+  if (typeof eventCount === "number") return eventCount;
+  return Array.isArray(record.payload) ? record.payload.length : 0;
 }
 
 function projectionPayloadRecordFixture<TPayload>(

@@ -635,10 +635,16 @@ export class StatusServer {
         }
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
         if (!this.options.runStore) {
-          const durableTranscript = await this.webProjectionRepositories.transcript.readRunPage(
-            transcriptProjectionPageSelectorForRunId(sessionIdOrRunId, url),
-            { forceRefresh },
-          );
+          const requestedPage = parseWebTranscriptPagination(url);
+          const durableTranscript = requestedPage
+            ? await this.webProjectionRepositories.transcript.readRunPage(
+                { runId: sessionIdOrRunId, offset: requestedPage.offset, limit: requestedPage.limit },
+                { forceRefresh },
+              )
+            : await this.webProjectionRepositories.transcript.readRunDefaultPage(
+                { runId: sessionIdOrRunId, limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT },
+                { forceRefresh },
+              );
           if (durableTranscript.status === "hit" && durableTranscript.record) {
             sendJson(response, 200, durableTranscript.record.payload, durableProjectionReadHeaders(durableTranscript));
             return;
@@ -2842,13 +2848,6 @@ function transcriptProjectionPageSelectorForRequest(run: RunRecord, url: URL): W
   const offset = requestedPage?.offset ?? Math.max(0, (run.transcriptEventCount ?? 0) - WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT);
   const limit = requestedPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
   return { runId: run.runId, offset, limit };
-}
-
-function transcriptProjectionPageSelectorForRunId(runId: string, url: URL): WebTranscriptProjectionPageSelector {
-  const requestedPage = parseWebTranscriptPagination(url);
-  const offset = requestedPage?.offset ?? 0;
-  const limit = requestedPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
-  return { runId, offset, limit };
 }
 
 function orchestratorChatProjectionScopeKey(conversationId?: string | null): string {

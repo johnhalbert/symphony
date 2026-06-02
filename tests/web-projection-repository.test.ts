@@ -107,6 +107,20 @@ describe("web projection read repositories", () => {
     });
     expect(missingReader.selectors).toEqual([{ projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" }]);
 
+    const offsetZeroTranscriptReader = new RecordingWebProjectionPayloadReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
+        [{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "first page must not be a default-tail fallback" }],
+      ),
+    ]);
+    await expect(
+      createWebProjectionReadRepositories({ reader: offsetZeroTranscriptReader }).transcript.readRunDefaultPage({ runId: "run-1", limit: 500 }),
+    ).resolves.toMatchObject({
+      status: "missing",
+      selector: { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:tail:limit:500" },
+    });
+    expect(offsetZeroTranscriptReader.selectors).toEqual([]);
+
     const failingReader = new FailingWebProjectionPayloadReader();
     await expect(createWebProjectionReadRepositories({ reader: failingReader }).history.readGlobalCollection({ sessionLimit: 100, timelineLimit: 250 })).resolves.toMatchObject({
       status: "error",
@@ -152,9 +166,12 @@ describe("web projection read repositories", () => {
     ).resolves.toMatchObject({ status: "stale", selector: { projectionName: "transcript_projection", scopeKind: "run_page" } });
 
     await expect(
-      createWebProjectionReadRepositories({ reader: staleReader, isRecordCurrent: () => {
-        throw new Error("source revision read failed");
-      } }).transcript.readRunPage({ runId: "run-1", offset: 0, limit: 500 }),
+      createWebProjectionReadRepositories({
+        reader: staleReader,
+        isRecordCurrent: () => {
+          throw new Error("source revision read failed");
+        },
+      }).transcript.readRunPage({ runId: "run-1", offset: 0, limit: 500 }),
     ).resolves.toMatchObject({ status: "error", selector: { projectionName: "transcript_projection", scopeKind: "run_page" } });
   });
 });
