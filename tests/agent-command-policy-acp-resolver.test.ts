@@ -70,6 +70,45 @@ describe("AgentCommandPolicyAcpResolver", () => {
     ]);
   });
 
+  it("uses the raw input command from real ACP terminal permission payloads with display content", async () => {
+    const input = resolverInput(terminalPermissionRequest("git status --short", { realAcpDisplayContent: true, snakeCase: true }));
+    const resolver = createAgentCommandPolicyAcpResolver({ environment: { PATH: "/usr/bin" } });
+
+    const result = buildAgentCommandPolicyInputForAcpPermission(input, {
+      environment: { PATH: "/usr/bin" },
+    });
+
+    expect(result).toEqual({
+      status: "ok",
+      input: expect.objectContaining({
+        attemptId: "perm-tool-1",
+        surface: "terminal_execute",
+        rawInput: expect.objectContaining({
+          kind: "command",
+          command: "git status --short",
+        }),
+      }),
+    });
+    await expect(resolver(input)).resolves.toEqual({ optionId: "allow_once", reason: "local_only_inspection" });
+  });
+
+  it("fails closed when ACP terminal permission command sources conflict", async () => {
+    const params = terminalPermissionRequest("git status --short", {
+      displayCommand: "git push origin HEAD",
+      realAcpDisplayContent: true,
+    });
+    const input = resolverInput(params);
+    const resolver = createAgentCommandPolicyAcpResolver({ environment: { PATH: "/usr/bin" } });
+
+    expect(buildAgentCommandPolicyInputForAcpPermission(input, { environment: { PATH: "/usr/bin" } })).toEqual({
+      status: "ok",
+      input: expect.objectContaining({
+        rawInput: { command: "git status --short", cmd: "git push origin HEAD" },
+      }),
+    });
+    await expect(resolver(input)).resolves.toEqual({ optionId: null, reason: "ambiguous_command" });
+  });
+
   it("returns cancelled policy decisions for denied upstream terminal commands", async () => {
     const classify = vi.fn((_input: AgentCommandPolicyInput) =>
       denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
@@ -240,28 +279,48 @@ function resolverInput(
 
 function terminalPermissionRequest(
   command: string,
-  options: { field?: "command" | "cmd" | "script" } = {},
+  options: {
+    field?: "command" | "cmd" | "script";
+    displayCommand?: string;
+    realAcpDisplayContent?: boolean;
+    snakeCase?: boolean;
+  } = {},
 ): Record<string, unknown> {
   const field = options.field ?? "command";
-  return {
-    sessionId: "acp-session-1",
-    toolCall: {
-      toolCallId: "perm-tool-1",
-      kind: "execute",
-      title: "terminal command",
-      rawInput: { [field]: command },
+  const toolCall = {
+    toolCallId: "perm-tool-1",
+    kind: "execute",
+    title: "terminal command",
+    [options.snakeCase ? "raw_input" : "rawInput"]: {
+      [field]: command,
+      ...(options.realAcpDisplayContent ? { description: "terminal command" } : {}),
     },
-    options: terminalPermissionOptions(),
+    ...(options.realAcpDisplayContent
+      ? {
+          content: [
+            {
+              type: "text",
+              text: `terminal command\n$ ${options.displayCommand ?? command}`,
+            },
+          ],
+        }
+      : {}),
+  };
+  return {
+    [options.snakeCase ? "session_id" : "sessionId"]: "acp-session-1",
+    [options.snakeCase ? "tool_call" : "toolCall"]: toolCall,
+    [options.snakeCase ? "permission_options" : "options"]: terminalPermissionOptions(options.snakeCase),
   };
 }
 
-function terminalPermissionOptions(): Array<Record<string, unknown>> {
+function terminalPermissionOptions(snakeCase = false): Array<Record<string, unknown>> {
+  const optionIdKey = snakeCase ? "option_id" : "optionId";
   return [
-    { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
-    { optionId: "allow_session", kind: "allow_always", name: "Allow for session" },
-    { optionId: "allow_always", kind: "allow_always", name: "Allow always" },
-    { optionId: "deny", kind: "reject_once", name: "Deny" },
-    { optionId: "deny_always", kind: "reject_always", name: "Deny always" },
+    { [optionIdKey]: "allow_once", kind: "allow_once", name: "Allow once" },
+    { [optionIdKey]: "allow_session", kind: "allow_always", name: "Allow for session" },
+    { [optionIdKey]: "allow_always", kind: "allow_always", name: "Allow always" },
+    { [optionIdKey]: "deny", kind: "reject_once", name: "Deny" },
+    { [optionIdKey]: "deny_always", kind: "reject_always", name: "Deny always" },
   ];
 }
 

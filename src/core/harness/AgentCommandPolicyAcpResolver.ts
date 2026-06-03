@@ -148,14 +148,24 @@ function commandRecordFromAcpToolCall(toolCall: Record<string, unknown> | null):
   const rawInput = recordField(toolCall, "rawInput", "raw_input");
   const commandFields = rawInput ? commandFieldsFromRecord(rawInput) : [];
   const topLevelFields = commandFieldsFromRecord(toolCall);
-  const contentCommand = commandFromStructuredContent(unknownField(toolCall, "content"));
 
   const commandSources = [...commandFields, ...topLevelFields];
+  const contentCommand = commandFromStructuredContent(unknownField(toolCall, "content"), {
+    acceptPlainText: commandSources.length === 0,
+  });
   if (contentCommand !== null) commandSources.push({ key: "content", value: contentCommand });
 
   if (commandSources.length === 0) return { status: "missing" };
-  if (commandSources.length > 1) return { status: "ambiguous", rawInput: ambiguousCommandInput(commandSources) };
+  if (hasConflictingCommandSources(commandSources)) {
+    return { status: "ambiguous", rawInput: ambiguousCommandInput(commandSources) };
+  }
   return { status: "ok", command: commandSources[0]?.value ?? "" };
+}
+
+function hasConflictingCommandSources(fields: Array<{ key: string; value: string }>): boolean {
+  const firstValue = fields[0]?.value;
+  if (firstValue === undefined) return false;
+  return fields.some((field) => field.value !== firstValue);
 }
 
 function commandFieldsFromRecord(record: Record<string, unknown>): Array<{ key: string; value: string }> {
@@ -178,14 +188,37 @@ function ambiguousCommandInput(fields: Array<{ key: string; value: string }>): R
   return rawInput;
 }
 
-function commandFromStructuredContent(value: unknown): string | null {
-  if (typeof value === "string") return nonEmptyString(value);
+function commandFromStructuredContent(value: unknown, options: { acceptPlainText: boolean }): string | null {
+  if (typeof value === "string") return commandFromStructuredContentText(value, options);
   if (Array.isArray(value)) {
-    const commands = value.map(commandFromStructuredContent).filter((command): command is string => command !== null);
+    const commands = value
+      .map((item) => commandFromStructuredContent(item, options))
+      .filter((command): command is string => command !== null);
     return commands.length === 1 ? commands[0] ?? null : null;
   }
   if (!isRecord(value)) return null;
-  return nonEmptyString(unknownField(value, "text", "command", "cmd", "script"));
+  const command = nonEmptyString(unknownField(value, "command", "cmd", "script"));
+  if (command !== null) return command;
+  const text = nonEmptyString(unknownField(value, "text"));
+  return text === null ? null : commandFromStructuredContentText(text, options);
+}
+
+function commandFromStructuredContentText(value: string, options: { acceptPlainText: boolean }): string | null {
+  const promptCommand = commandFromTerminalPromptText(value);
+  if (promptCommand !== null) return promptCommand;
+  return options.acceptPlainText ? nonEmptyString(value) : null;
+}
+
+function commandFromTerminalPromptText(value: string): string | null {
+  const lines = value.split(/\r?\n/u);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]?.trim();
+    if (!line) continue;
+    const match = /^\$\s+(.+)$/u.exec(line);
+    const command = nonEmptyString(match?.[1]);
+    if (command !== null) return command;
+  }
+  return null;
 }
 
 function recordField(record: Record<string, unknown>, ...keys: string[]): Record<string, unknown> | null {
