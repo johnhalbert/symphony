@@ -1,5 +1,5 @@
 import type { SessionModel } from "../../types/symphony";
-import { Icon, SessionStateChip, StatusBadgeDot } from "../common";
+import { Icon, SessionStateChip, StatusBadgeDot, UnavailableButton } from "../common";
 
 export function SidebarHistory({ sessions }: { sessions: SessionModel[] }) {
   return (
@@ -8,23 +8,23 @@ export function SidebarHistory({ sessions }: { sessions: SessionModel[] }) {
         <span style={{ fontSize: 12, fontWeight: 500 }}>Chat history</span>
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>{sessions.length}</span>
         <div style={{ flex: 1 }} />
-        <button className="icon-btn" type="button">
+        <UnavailableButton className="icon-btn" unavailableLabel="Sidebar history search" unavailableReason="history search is unavailable until a backed API command route exists">
           {Icon.search()}
-        </button>
-        <button className="icon-btn" type="button">
+        </UnavailableButton>
+        <UnavailableButton className="icon-btn" unavailableLabel="Sidebar history filter" unavailableReason="history filtering is unavailable until a backed API command route exists">
           {Icon.filter()}
-        </button>
+        </UnavailableButton>
       </div>
       <div style={{ padding: "8px 10px 4px", display: "flex", gap: 5, borderBottom: "1px solid var(--border-subtle)" }}>
-        <button className="pill" data-active="true" type="button" style={{ fontSize: 10.5, padding: "2px 8px", borderRadius: 999, border: "1px solid var(--border-strong)", background: "var(--elevated)" }}>
+        <span className="pill btn--readonly" data-active="true" title="Read-only sidebar history filter state." aria-label="All sidebar sessions selected" style={{ fontSize: 10.5, padding: "2px 8px", borderRadius: 999, border: "1px solid var(--border-strong)", background: "var(--elevated)" }}>
           All
-        </button>
-        <button className="pill" type="button" style={{ fontSize: 10.5, padding: "2px 8px", borderRadius: 999, border: "1px solid var(--border)", background: "var(--panel)", color: "var(--text-3)" }}>
+        </span>
+        <UnavailableButton className="pill" style={{ fontSize: 10.5, padding: "2px 8px", borderRadius: 999, border: "1px solid var(--border)", background: "var(--panel)", color: "var(--text-3)" }} unavailableLabel="Sidebar running sessions filter" unavailableReason="history filtering is unavailable until a backed API command route exists">
           Running
-        </button>
-        <button className="pill" type="button" style={{ fontSize: 10.5, padding: "2px 8px", borderRadius: 999, border: "1px solid var(--border)", background: "var(--panel)", color: "var(--text-3)" }}>
+        </UnavailableButton>
+        <UnavailableButton className="pill" style={{ fontSize: 10.5, padding: "2px 8px", borderRadius: 999, border: "1px solid var(--border)", background: "var(--panel)", color: "var(--text-3)" }} unavailableLabel="Sidebar error sessions filter" unavailableReason="history filtering is unavailable until a backed API command route exists">
           Errors
-        </button>
+        </UnavailableButton>
       </div>
       <div style={{ overflow: "auto" }}>
         {sessions.length ? (

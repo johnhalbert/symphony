@@ -179,6 +179,38 @@ export interface DashboardTotals {
   completeness: number;
 }
 
+export type DashboardSourceStatus = "fresh" | "empty" | "stale" | "error" | "unavailable";
+
+export interface DashboardSourceModel {
+  status: DashboardSourceStatus;
+  label: string;
+  detail: string;
+  generatedAt: string | null;
+  trackerFetchedAt: string | null;
+  issueCount: number;
+  runCount: number;
+  lifecycleCount: number;
+  activityCount: number;
+  writebackCount: number;
+  cached: boolean;
+  error: string | null;
+}
+
+export interface DashboardSourceProjectionInput {
+  status?: DashboardSourceStatus | "ok" | null;
+  label?: string | null;
+  detail?: string | null;
+  generatedAt?: string | null;
+  trackerFetchedAt?: string | null;
+  issueCount?: number | null;
+  runCount?: number | null;
+  lifecycleCount?: number | null;
+  activityCount?: number | null;
+  writebackCount?: number | null;
+  cached?: boolean | null;
+  error?: string | null;
+}
+
 export interface DashboardModel {
   projectName: string;
   repoLabel: string;
@@ -192,6 +224,7 @@ export interface DashboardModel {
   activity: ActivityModel[];
   chat: ChatMessage[];
   totals: DashboardTotals;
+  source: DashboardSourceModel;
 }
 
 export interface IssueDetailModel {
@@ -391,6 +424,7 @@ export interface DashboardProjectionInput {
   runs?: readonly RunRecord[];
   lifecycleRecords?: readonly IssueLifecycleRecord[];
   chat?: ChatMessage[];
+  source?: DashboardSourceProjectionInput | null;
   config?: DashboardRuntimeConfig | null | undefined;
 }
 
@@ -536,6 +570,24 @@ export function emptyDashboardModel(): DashboardModel {
     activity: [],
     chat: [],
     totals: emptyDashboardTotals(),
+    source: emptyDashboardSourceModel(),
+  };
+}
+
+export function emptyDashboardSourceModel(): DashboardSourceModel {
+  return {
+    status: "unavailable",
+    label: "source unavailable",
+    detail: "No dashboard source metadata is available.",
+    generatedAt: null,
+    trackerFetchedAt: null,
+    issueCount: 0,
+    runCount: 0,
+    lifecycleCount: 0,
+    activityCount: 0,
+    writebackCount: 0,
+    cached: false,
+    error: null,
   };
 }
 
@@ -748,11 +800,14 @@ export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput |
 export function projectWebDashboard(input: DashboardProjectionInput = {}): DashboardModel {
   const board = projectIssueBoardModel(input.board ?? null);
   const runtime = input.runtime ?? null;
+  const runs = input.runs ?? [];
+  const lifecycleRecords = input.lifecycleRecords ?? [];
+  const activity = projectActivityModels(input.activity ?? null);
   const generatedAt =
-    runtime?.generatedAt ?? input.generatedAt ?? board.generatedAt ?? latestDurableActivityAt(input.runs ?? [], input.lifecycleRecords ?? []);
+    runtime?.generatedAt ?? input.generatedAt ?? board.generatedAt ?? latestDurableActivityAt(runs, lifecycleRecords);
   const runningAgents = mergeRunningAgents(
     projectRunningAgents(runtime, generatedAt),
-    projectDurableRunningAgents(input.runs ?? [], generatedAt),
+    projectDurableRunningAgents(runs, generatedAt),
   );
   const concurrencyCap = normalizeConcurrencyCap(input.config?.concurrencyCap);
   return {
@@ -765,10 +820,17 @@ export function projectWebDashboard(input: DashboardProjectionInput = {}): Dashb
     concurrencyCap,
     providerGates: projectProviderGates(runtime),
     runningAgents,
-    activity: projectActivityModels(input.activity ?? null),
+    activity,
     // Dashboard chat is intentionally out of scope; ignore any caller-supplied chat payloads.
     chat: emptyChatMessages(),
-    totals: dashboardTotalsFromDurableState(board, input.runs ?? [], input.lifecycleRecords ?? []),
+    totals: dashboardTotalsFromDurableState(board, runs, lifecycleRecords),
+    source: projectDashboardSource(input.source ?? null, {
+      generatedAt,
+      issueCount: board.issues.length,
+      runCount: runs.length,
+      lifecycleCount: lifecycleRecords.length,
+      activityCount: activity.length,
+    }),
   };
 }
 
@@ -989,6 +1051,110 @@ function emptyDashboardTotals(): DashboardTotals {
     all: 0,
     completeness: 0,
   };
+}
+
+function projectDashboardSource(
+  source: DashboardSourceProjectionInput | null,
+  fallback: {
+    generatedAt: string | null;
+    issueCount: number;
+    runCount: number;
+    lifecycleCount: number;
+    activityCount: number;
+  },
+): DashboardSourceModel {
+  if (
+    !source &&
+    !fallback.generatedAt &&
+    fallback.issueCount === 0 &&
+    fallback.runCount === 0 &&
+    fallback.lifecycleCount === 0 &&
+    fallback.activityCount === 0
+  ) {
+    return emptyDashboardSourceModel();
+  }
+  const cached = source?.cached === true;
+  const issueCount = normalizeCount(source?.issueCount, fallback.issueCount);
+  const runCount = normalizeCount(source?.runCount, fallback.runCount);
+  const lifecycleCount = normalizeCount(source?.lifecycleCount, fallback.lifecycleCount);
+  const activityCount = normalizeCount(source?.activityCount, fallback.activityCount);
+  const writebackCount = normalizeCount(source?.writebackCount, 0);
+  const error = firstNonEmpty(source?.error) ?? null;
+  const status = normalizeDashboardSourceStatus(source?.status ?? null, {
+    cached,
+    error,
+    issueCount,
+    hasSourceMetadata: Boolean(source),
+  });
+
+  return {
+    status,
+    label: firstNonEmpty(source?.label) ?? dashboardSourceLabel(status, issueCount),
+    detail: firstNonEmpty(source?.detail) ?? dashboardSourceDetail(status, { runCount, lifecycleCount, activityCount, writebackCount, error }),
+    generatedAt: source?.generatedAt ?? fallback.generatedAt ?? null,
+    trackerFetchedAt: source?.trackerFetchedAt ?? null,
+    issueCount,
+    runCount,
+    lifecycleCount,
+    activityCount,
+    writebackCount,
+    cached,
+    error,
+  };
+}
+
+function normalizeDashboardSourceStatus(
+  status: DashboardSourceProjectionInput["status"] | null,
+  input: { cached: boolean; error: string | null; issueCount: number; hasSourceMetadata: boolean },
+): DashboardSourceStatus {
+  if (status === "fresh" || status === "empty" || status === "stale" || status === "error" || status === "unavailable") {
+    return status;
+  }
+  if (status === "ok") return input.cached ? "stale" : input.issueCount === 0 ? "empty" : "fresh";
+  if (input.error) return "error";
+  if (!input.hasSourceMetadata) return "unavailable";
+  if (input.cached) return "stale";
+  return input.issueCount === 0 ? "empty" : "fresh";
+}
+
+function dashboardSourceLabel(status: DashboardSourceStatus, issueCount: number): string {
+  switch (status) {
+    case "fresh":
+      return `tracker fresh · ${issueCount} issues`;
+    case "empty":
+      return "tracker empty · 0 issues";
+    case "stale":
+      return `tracker stale · ${issueCount} cached issues`;
+    case "error":
+      return "tracker error";
+    case "unavailable":
+      return "tracker unavailable";
+  }
+}
+
+function dashboardSourceDetail(
+  status: DashboardSourceStatus,
+  input: { runCount: number; lifecycleCount: number; activityCount: number; writebackCount: number; error: string | null },
+): string {
+  if (input.error && (status === "error" || status === "unavailable")) return input.error;
+  const durableSummary = `${input.runCount} runs · ${input.lifecycleCount} lifecycle records · ${input.activityCount} activity entries · ${input.writebackCount} writeback operations`;
+  switch (status) {
+    case "fresh":
+      return `Issue board tracker source is current; ${durableSummary}.`;
+    case "empty":
+      return `Issue board tracker source returned no issues; ${durableSummary}.`;
+    case "stale":
+      return `Using a cached tracker source while refresh catches up; ${durableSummary}.`;
+    case "error":
+      return `Issue board tracker source failed; ${durableSummary}.`;
+    case "unavailable":
+      return `Issue board tracker source is unavailable; ${durableSummary}.`;
+  }
+}
+
+function normalizeCount(value: number | null | undefined, fallback: number): number {
+  const count = typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return count > 0 ? Math.floor(count) : 0;
 }
 
 function dashboardTotalsFromBoard(board: IssueBoardModel): DashboardTotals {

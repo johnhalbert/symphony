@@ -154,7 +154,7 @@ function AppShell({
           }
         >
           {activeTab === "dashboard"
-            ? renderLoadable(dashboard, (data) => (
+            ? renderLoadable(dashboard, "dashboard", (data) => (
                 <DashboardView
                   dashboard={data}
                   variant={dashboardVariant}
@@ -166,13 +166,13 @@ function AppShell({
               ))
             : null}
           {activeTab === "issues"
-            ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} refreshToken={issueDetailRefreshToken} />)
+            ? renderLoadable(issueBoard, "issue board", (data) => <IssuesView board={data} variant={issuesVariant} refreshToken={issueDetailRefreshToken} />)
             : null}
           {activeTab === "history"
-            ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} refreshToken={transcriptRefreshToken} />)
+            ? renderLoadable(history, "history", (data) => <ChatHistoryView history={data} variant={historyVariant} refreshToken={transcriptRefreshToken} />)
             : null}
           {activeTab === "sidebar"
-            ? renderLoadable(sidebar, (data) => (
+            ? renderLoadable(sidebar, "sidebar", (data) => (
                 <SidebarViews
                   sidebar={data}
                   variant={sidebarVariant}
@@ -198,12 +198,53 @@ function AppShell({
 
 function renderLoadable<T>(
   resource: { data: T | null; loading: boolean; error: string | null },
+  name: string,
   render: (data: T) => JSX.Element,
 ) {
-  if (resource.loading && !resource.data) return <div className="view-loading">Loading...</div>;
-  if (resource.error) return <div className="view-error">{resource.error}</div>;
-  if (!resource.data) return <div className="view-empty">No data.</div>;
-  return render(resource.data);
+  if (resource.data !== null) {
+    const content = render(resource.data);
+    if (resource.error) {
+      return (
+        <>
+          <ResourceStatusBanner
+            severity="error"
+            title={`Could not refresh ${name}`}
+            detail={`${resource.error} Showing previous ${name} data.`}
+          />
+          {content}
+        </>
+      );
+    }
+    if (resource.loading) {
+      return (
+        <>
+          <ResourceStatusBanner severity="info" title={`Refreshing ${name}`} detail={`Showing previous ${name} data while Symphony reloads.`} />
+          {content}
+        </>
+      );
+    }
+    return content;
+  }
+  if (resource.loading) return <div className="view-loading">Loading {name}...</div>;
+  if (resource.error) return <div className="view-error">Could not load {name}: {resource.error}</div>;
+  return <div className="view-empty">No {name} data.</div>;
+}
+
+function ResourceStatusBanner({
+  severity,
+  title,
+  detail,
+}: {
+  severity: "info" | "error";
+  title: string;
+  detail: string;
+}) {
+  return (
+    <div className="resource-status-banner" data-severity={severity}>
+      <strong>{title}</strong>
+      <span>{detail}</span>
+    </div>
+  );
 }
 
 function ViewControls({
