@@ -15,6 +15,8 @@ import {
 } from "../src/app/RealtimeProjectionEvents.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileOrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
+import { InMemoryRunActivityAppendStore, type RunActivityAppendInput } from "../src/core/persistence/RunActivityAppendStore.js";
+import type { ProjectionPayloadWriteInput, ProjectionRevisionPublication, ProjectionWriteResult } from "../src/core/persistence/ProjectionTransactionService.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue, TrackerStateLists } from "../src/core/types.js";
@@ -89,6 +91,43 @@ describe("StatusServer realtime SSE API", () => {
       expect.arrayContaining(["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/sidebar"]),
     );
     expect(transcript.recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
+
+    const runActivityEvents = bus.publishProjectionRevision({
+      source: "run_activity",
+      revision: 8,
+      observedAt: "2026-01-01T00:00:01.000Z",
+      detail: {
+        source: "run_activity",
+        runId: "run-activity-1",
+        sessionId: "session-activity-1",
+        afterSequence: 2,
+        eventCount: 3,
+        status: "running",
+        resourcesChanged: ["history", "session-transcript"],
+      },
+    });
+    expect(requireEvent(runActivityEvents.find((event) => event.type === "run.updated"))).toMatchObject({
+      type: "run.updated",
+      scope: "run",
+      key: "run-activity-1",
+      payload: { source: "run_activity", sourceRevision: 8, runId: "run-activity-1", status: "running" },
+    });
+    expect(requireEvent(runActivityEvents.find((event) => event.type === "transcript.delta"))).toMatchObject({
+      type: "transcript.delta",
+      scope: "session",
+      key: "session-activity-1",
+      payload: {
+        source: "run_activity",
+        sourceRevision: 8,
+        runId: "run-activity-1",
+        sessionId: "session-activity-1",
+        afterSequence: 2,
+        eventCount: 3,
+      },
+    });
+    expect(requireEvent(runActivityEvents.find((event) => event.type === "projection.updated"))).toMatchObject({
+      payload: { resourcesChanged: ["history", "session-transcript"] },
+    });
 
     for (const chatSource of [
       "orchestrator_conversations",
@@ -229,6 +268,118 @@ describe("StatusServer realtime SSE API", () => {
       }
     } finally {
       await client.close();
+      await server.stop();
+    }
+  });
+
+  it("streams run and transcript realtime events from accepted run activity appends", async () => {
+    const runActivitySourceStore = new InMemoryRunActivityAppendStore();
+    const server = createRealtimeServer({ runActivitySourceStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      await runActivitySourceStore.appendEvents([
+        runActivityInput({ id: "activity-realtime-1", sequence: 1 }),
+        runActivityInput({ id: "activity-realtime-2", sequence: 2 }),
+      ]);
+
+      const projection = await client.nextEventOfType("projection.updated");
+      const source = await client.nextEventOfType("source.status");
+      const run = await client.nextEventOfType("run.updated");
+      const transcript = await client.nextEventOfType("transcript.delta");
+
+      expect(projection.data).toMatchObject({
+        type: "projection.updated",
+        source: { source: "run_activity", revision: 1 },
+        payload: { resourcesChanged: ["history", "session-transcript", "dashboard", "sidebar"] },
+      });
+      expect(source.data).toMatchObject({
+        type: "source.status",
+        scope: "source",
+        key: "run_activity",
+        source: { source: "run_activity", revision: 1 },
+      });
+      expect(run.data).toMatchObject({
+        type: "run.updated",
+        scope: "run",
+        key: "run-realtime-activity",
+        source: { source: "run_activity", revision: 1 },
+        payload: { runId: "run-realtime-activity", status: null },
+      });
+      expect(transcript.data).toMatchObject({
+        type: "transcript.delta",
+        scope: "session",
+        key: "session-realtime-activity",
+        source: { source: "run_activity", revision: 1 },
+        payload: {
+          runId: "run-realtime-activity",
+          sessionId: "session-realtime-activity",
+          afterSequence: 0,
+          eventCount: 2,
+        },
+      });
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("streams realtime and legacy SSE events from durable projection publications", async () => {
+    const projectionWriter = fakeProjectionWriter();
+    const server = createRealtimeServer({ projectionWriter });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const realtimeClient = await openSseClient(`${baseUrl}/api/v1/realtime`);
+    const legacyClient = await openSseClient(`${baseUrl}/api/v1/web/events`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+      await expect(legacyClient.nextEvent()).resolves.toMatchObject({ event: "projection_ready" });
+
+      projectionWriter.publish({
+        projectionName: "history_projection",
+        scopeKind: "global",
+        scopeKey: "global",
+        projectionRevisionId: "projection-revision-1",
+        revision: 3,
+        contentSha256: "history-sha",
+        generatedAt: "2026-01-01T00:00:02.000Z",
+        expiresAt: null,
+        sourceRevisions: [],
+        sourceCursors: {},
+        sourceFreshness: [],
+      });
+
+      const realtime = await realtimeClient.nextEventOfType("projection.updated");
+      expect(realtime.data).toMatchObject({
+        type: "projection.updated",
+        source: { source: "history_projection:global:global", revision: 3, observedAt: "2026-01-01T00:00:02.000Z" },
+        detail: {
+          source: "projection",
+          projectionName: "history_projection",
+          scopeKind: "global",
+          scopeKey: "global",
+          resourcesChanged: ["history"],
+        },
+        payload: { resourcesChanged: ["history"] },
+      });
+      await expect(legacyClient.nextEvent()).resolves.toMatchObject({
+        event: "projection_revision",
+        data: {
+          type: "projection_revision",
+          generation: 1,
+          source: "history_projection:global:global",
+          revision: 3,
+          observedAt: "2026-01-01T00:00:02.000Z",
+        },
+      });
+    } finally {
+      await realtimeClient.close();
+      await legacyClient.close();
       await server.stop();
     }
   });
@@ -514,8 +665,10 @@ interface SseTestClient {
 function createRealtimeServer(
   options: {
     runStore?: FileRunTranscriptStore;
+    runActivitySourceStore?: InMemoryRunActivityAppendStore;
     tracker?: TrackerClient;
     orchestratorConversationStore?: FileOrchestratorConversationStore;
+    projectionWriter?: StatusServerOptions["projectionWriter"];
     realtime?: StatusServerOptions["realtime"];
   } = {},
 ): StatusServer {
@@ -524,10 +677,12 @@ function createRealtimeServer(
     workspaceManager: {} as StatusServerOptions["workspaceManager"],
     workspaceOpener: {} as StatusServerOptions["workspaceOpener"],
     ...(options.runStore ? { runStore: options.runStore } : {}),
+    ...(options.runActivitySourceStore ? { runActivitySourceStore: options.runActivitySourceStore } : {}),
     ...(options.tracker ? { tracker: options.tracker } : {}),
     ...(options.orchestratorConversationStore
       ? { orchestratorConversationStore: options.orchestratorConversationStore }
       : {}),
+    ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
     host: "127.0.0.1",
     port: 0,
     openWorkspaceToken: null,
@@ -535,6 +690,28 @@ function createRealtimeServer(
     staleThresholdMs: 300_000,
     ...(options.realtime ? { realtime: options.realtime } : {}),
   });
+}
+
+interface FakeProjectionWriter extends NonNullable<StatusServerOptions["projectionWriter"]> {
+  publish(publication: ProjectionRevisionPublication): void;
+}
+
+function fakeProjectionWriter(): FakeProjectionWriter {
+  const listeners = new Set<(event: ProjectionRevisionPublication) => void>();
+  return {
+    async writeProjection(_input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
+      throw new Error("fake projection writer is only used for publication events in realtime tests");
+    },
+    onProjectionChanged(listener: (event: ProjectionRevisionPublication) => void): () => void {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    publish(publication: ProjectionRevisionPublication): void {
+      for (const listener of Array.from(listeners)) listener(publication);
+    },
+  };
 }
 
 function fakeOrchestrator(): Orchestrator {
@@ -636,6 +813,23 @@ function testIssue(overrides: Partial<Issue> = {}): Issue {
     updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   };
+}
+
+function runActivityInput(overrides: Record<string, unknown> = {}): RunActivityAppendInput {
+  return {
+    id: "activity-realtime",
+    runId: "run-realtime-activity",
+    sessionId: "session-realtime-activity",
+    at: "2026-01-01T00:00:00.000Z",
+    harnessId: "runtime-adapter",
+    actor: "runtime",
+    channel: "status",
+    kind: "runtime_log",
+    text: "runtime activity",
+    payload: {},
+    protocol: "json_rpc",
+    ...overrides,
+  } as RunActivityAppendInput;
 }
 
 async function openSseClient(url: string, headers: Record<string, string> = {}): Promise<SseTestClient> {

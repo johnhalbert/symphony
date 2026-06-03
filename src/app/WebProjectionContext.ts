@@ -44,6 +44,7 @@ export interface WebProjectionSourceRevision {
   source: string;
   revision: string | number;
   observedAt: string | null;
+  detail?: Readonly<Record<string, unknown>> | null;
 }
 
 export type WebProjectionRevisionListener = (revision: WebProjectionSourceRevision) => void;

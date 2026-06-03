@@ -108,7 +108,7 @@ import {
   type WebProjectionRevisionUnsubscribe,
   type WebProjectionSourceRevision,
 } from "./WebProjectionContext.js";
-import { RealtimeProjectionEventBus } from "./RealtimeProjectionEvents.js";
+import { RealtimeProjectionEventBus, type RealtimeResourceKind } from "./RealtimeProjectionEvents.js";
 import {
   createWebProjectionReadRepositories,
   webHistoryProjectionScopeKey,
@@ -124,6 +124,7 @@ import {
   type DurableProjectionName,
   type ProjectionPayloadRecord,
   type ProjectionPayloadWriteInput,
+  type ProjectionRevisionPublication,
   type ProjectionSourceRevision,
   type ProjectionWriteResult,
 } from "../core/persistence/ProjectionTransactionService.js";
@@ -151,11 +152,12 @@ type StatusServerWritebackOutbox = Pick<FileWritebackOutboxStore, "list"> &
 
 interface StatusServerProjectionRevisionStore {
   projectionRevision(): number;
-  onProjectionChanged(listener: (event: { source: string; revision: number }) => void): () => void;
+  onProjectionChanged(listener: (event: { source: string; revision: number; detail?: Readonly<Record<string, unknown>> | null }) => void): () => void;
 }
 
 export interface StatusServerProjectionWriter {
   writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult>;
+  onProjectionChanged?(listener: (event: ProjectionRevisionPublication) => void): () => void;
 }
 
 export interface StatusServerProjectionReader extends WebProjectionPayloadReader {}
@@ -335,6 +337,8 @@ export class StatusServer {
 
   private registerWebProjectionRevisionListeners(): void {
     if (this.webProjectionRevisionUnsubscribes.length > 0) return;
+    const projectionPublicationUnsubscribe = this.subscribeProjectionPublicationEvents();
+    if (projectionPublicationUnsubscribe) this.webProjectionRevisionUnsubscribes.push(projectionPublicationUnsubscribe);
     for (const provider of this.webProjectionRevisionProviders) {
       if (!provider.subscribe) continue;
       const unsubscribe = provider.subscribe((revision) => {
@@ -343,6 +347,16 @@ export class StatusServer {
       });
       this.webProjectionRevisionUnsubscribes.push(unsubscribe);
     }
+  }
+
+  private subscribeProjectionPublicationEvents(): WebProjectionRevisionUnsubscribe | null {
+    const writer = this.options.projectionWriter;
+    if (!writer || typeof writer.onProjectionChanged !== "function") return null;
+    return writer.onProjectionChanged((publication) => {
+      const revision = webProjectionSourceRevisionFromProjectionPublication(publication);
+      this.publishWebProjectionRevision(revision);
+      this.realtimeEvents.publishProjectionRevision(revision);
+    });
   }
 
   private unsubscribeWebProjectionRevisionListeners(): void {
@@ -357,8 +371,12 @@ export class StatusServer {
   }
 
   private markCompletedWebProjectionContextDirty(revision: WebProjectionSourceRevision): void {
-    this.webProjectionDirtyGeneration += 1;
     this.completedWebProjectionContext = null;
+    this.publishWebProjectionRevision(revision);
+  }
+
+  private publishWebProjectionRevision(revision: WebProjectionSourceRevision): void {
+    this.webProjectionDirtyGeneration += 1;
     this.broadcastWebProjectionRevision(revision);
   }
 
@@ -2499,12 +2517,48 @@ export class StatusServer {
   }
 }
 
+function webProjectionSourceRevisionFromProjectionPublication(
+  publication: ProjectionRevisionPublication,
+): WebProjectionSourceRevision {
+  return {
+    source: `${publication.projectionName}:${publication.scopeKind}:${publication.scopeKey}`,
+    revision: publication.revision,
+    observedAt: publication.generatedAt,
+    detail: {
+      source: "projection",
+      projectionName: publication.projectionName,
+      scopeKind: publication.scopeKind,
+      scopeKey: publication.scopeKey,
+      resourcesChanged: realtimeResourceKindsForDurableProjection(publication.projectionName),
+    },
+  };
+}
+
+function realtimeResourceKindsForDurableProjection(projectionName: DurableProjectionName): readonly RealtimeResourceKind[] {
+  switch (projectionName) {
+    case "dashboard_projection":
+      return ["dashboard"];
+    case "issue_board_projection":
+      return ["issue-board", "issue-detail"];
+    case "sidebar_projection":
+      return ["sidebar"];
+    case "history_projection":
+      return ["history"];
+    case "transcript_projection":
+      return ["session-transcript", "history"];
+    case "orchestrator_chat_projection":
+      return ["orchestrator-chat", "sidebar", "dashboard"];
+  }
+}
+
 function createStatusServerWebProjectionRevisionProviders(
   options: StatusServerOptions,
 ): readonly WebProjectionRevisionProvider[] {
   const providers: WebProjectionRevisionProvider[] = [...(options.webProjectionRevisionProviders ?? [])];
   const runStoreProvider = createStatusServerStoreRevisionProvider("runStore", options.runStore);
   if (runStoreProvider) providers.push(runStoreProvider);
+  const runActivityProvider = createStatusServerStoreRevisionProvider("run_activity", options.runActivitySourceStore);
+  if (runActivityProvider) providers.push(runActivityProvider);
   const lifecycleStoreProvider = createStatusServerStoreRevisionProvider("lifecycleStore", options.lifecycleStore);
   if (lifecycleStoreProvider) providers.push(lifecycleStoreProvider);
   const writebackOutboxProvider = createStatusServerStoreRevisionProvider("writebackOutbox", options.writebackOutbox);
@@ -2527,7 +2581,7 @@ function createStatusServerStoreRevisionProvider(
     getRevision: () => ({ source, revision: store.projectionRevision(), observedAt: null }),
     subscribe: (listener: WebProjectionRevisionListener) =>
       store.onProjectionChanged((event) => {
-        listener({ source: event.source || source, revision: event.revision, observedAt: null });
+        listener({ source: event.source || source, revision: event.revision, observedAt: null, detail: event.detail ?? null });
       }),
   };
 }
@@ -2576,11 +2630,12 @@ function runActivityEventsPageToTranscriptPage(sourcePage: RunActivityEventsPage
 
 function statusServerProjectionSourceRevisions(
   sourceIndex: BuiltWebProjectionSourceIndex | null,
-  options: Pick<StatusServerOptions, "runStore" | "lifecycleStore" | "writebackOutbox">,
+  options: Pick<StatusServerOptions, "runStore" | "runActivitySourceStore" | "lifecycleStore" | "writebackOutbox">,
 ): ProjectionSourceRevision[] {
   if (sourceIndex) return sourceIndex.durableSourceRevisions.map(toProjectionSourceRevision);
   return [
     statusServerStoreProjectionSourceRevision("runStore", options.runStore),
+    statusServerStoreProjectionSourceRevision("run_activity", options.runActivitySourceStore),
     statusServerStoreProjectionSourceRevision("lifecycleStore", options.lifecycleStore),
     statusServerStoreProjectionSourceRevision("writebackOutbox", options.writebackOutbox),
   ].filter((revision): revision is ProjectionSourceRevision => revision !== null);

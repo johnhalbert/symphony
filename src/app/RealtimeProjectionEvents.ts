@@ -190,6 +190,7 @@ export class RealtimeProjectionEventBus {
         type,
         source: revision,
         resources: realtimeResourcesForEventType(type),
+        detail: revision.detail ?? null,
       }),
     );
   }
@@ -514,7 +515,7 @@ function readErrorDetail(detail: RealtimeProjectionEventDetail | null, key: stri
 function realtimeEventTypesForSourceRevision(revision: WebProjectionSourceRevision): readonly RealtimeProjectionEventType[] {
   const source = revision.source.trim().toLowerCase();
   const types: RealtimeProjectionEventType[] = ["projection.updated", "source.status"];
-  if (source === "runs" || source === "runstore" || source === "transcript") {
+  if (source === "runs" || source === "runstore" || source === "transcript" || source === "run_activity" || source === "run-activity") {
     types.push("run.updated", "transcript.delta");
   }
   if (isOrchestratorChatRealtimeSource(source)) {
