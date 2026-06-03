@@ -6,6 +6,7 @@ import { AgentStateCard } from "./components/sidebar/AgentStateCard";
 import { SidebarViews } from "./components/sidebar/SidebarViews";
 import { ChatHistoryView } from "./components/history/ChatHistoryView";
 import { DashboardView } from "./components/dashboard/DashboardView";
+import { resolveDashboardFreshnessCue } from "./components/dashboard/freshness";
 import { IssuesView } from "./components/issues/IssuesView";
 import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
 import { fallbackReferenceData, ReferenceDataProvider } from "./data/referenceDataContext";
@@ -20,7 +21,6 @@ import {
 import { combineLiveResourceTokens, useLiveResourceState, type LiveResourceKey, type LiveResourceTokenMap } from "./hooks/useLiveResource";
 import type {
   AppTab,
-  DashboardModel,
   DashboardVariant,
   HistoryModel,
   HistoryVariant,
@@ -98,30 +98,6 @@ function resolveSidebarAgentUsageLabel(sidebar: Loadable<SidebarModel>): string 
   return `sidebar projection · ${runningLabel}`;
 }
 
-function fallbackDashboardAgentUsageLabel(dashboard: DashboardModel): string {
-  const label = dashboard.agentUsageLabel?.trim();
-  if (label) return label;
-  const count = dashboard.runningAgents.length;
-  const agentNoun = count === 1 ? "agent" : "agents";
-  return `${count} running ${agentNoun}`;
-}
-
-function resolveDashboardAgentChrome(dashboard: Loadable<DashboardModel>): { runningCount: number; agentUsageLabel: string } | null {
-  if (!dashboard.data) return null;
-
-  const usageLabel = fallbackDashboardAgentUsageLabel(dashboard.data);
-  const sourceStatus = dashboard.data.source?.status;
-  const isFreshCurrentData = sourceStatus === "fresh" && !dashboard.loading && !dashboard.error;
-  if (isFreshCurrentData) {
-    return { runningCount: dashboard.data.runningAgents.length, agentUsageLabel: usageLabel };
-  }
-
-  if (dashboard.error) return { runningCount: 0, agentUsageLabel: `previous dashboard projection · ${usageLabel}` };
-  if (dashboard.loading) return { runningCount: 0, agentUsageLabel: `refreshing dashboard projection · ${usageLabel}` };
-  if (!sourceStatus) return { runningCount: 0, agentUsageLabel: `dashboard projection freshness unknown · ${usageLabel}` };
-  return { runningCount: 0, agentUsageLabel: `${sourceStatus} dashboard projection · ${usageLabel}` };
-}
-
 function AppShell({
   initialReferenceData,
   lazyReferenceData = false,
@@ -157,9 +133,9 @@ function AppShell({
   const sidebar = useSidebar(resourceOptions(sidebarEnabled, sidebarRefreshToken));
   const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, orchestratorChatRefreshToken));
   const dashboardChrome = dashboard.data;
-  const dashboardAgentChrome = resolveDashboardAgentChrome(dashboard);
-  const statusbarRunningCount = dashboardAgentChrome?.runningCount ?? 0;
-  const agentUsageLabel = dashboardAgentChrome?.agentUsageLabel ?? resolveSidebarAgentUsageLabel(sidebar);
+  const dashboardFreshnessCue = dashboard.data ? resolveDashboardFreshnessCue(dashboard.data, dashboard) : null;
+  const statusbarRunningCount = dashboardFreshnessCue?.runningCount ?? 0;
+  const agentUsageLabel = dashboardFreshnessCue?.agentUsageLabel ?? resolveSidebarAgentUsageLabel(sidebar);
   const tabBadges = resolveTabBadges(issueBoard.data, history.data);
 
   return (
@@ -197,9 +173,10 @@ function AppShell({
           }
         >
           {activeTab === "dashboard"
-            ? renderLoadable(dashboard, "dashboard", (data) => (
+            ? renderLoadable(dashboard, "dashboard", (data, state) => (
                 <DashboardView
                   dashboard={data}
+                  freshnessCue={resolveDashboardFreshnessCue(data, state)}
                   variant={dashboardVariant}
                   useModelBurnupTotals={apiMode}
                   orchestratorChat={orchestratorChat.data ?? []}

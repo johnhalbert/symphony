@@ -524,6 +524,25 @@ function expectUnavailableButton(markup: string, label: string) {
   expect(candidates.every(buttonIsUnavailable)).toBe(true);
 }
 
+function expectFreshDashboardBodyLiveIndicators(markup: string) {
+  expect(markup).toContain("2 active · concurrency cap 9");
+  expect(markup).toContain("Active sessions");
+  expect(markup).toContain('class="spinner"');
+  expect(markup).toContain("animation:pulse");
+  expect(markup).toContain("1 event");
+}
+
+function expectNoDashboardBodyLiveIndicators(markup: string, expectedProjectionLabel: string) {
+  expect(markup).toContain(expectedProjectionLabel);
+  expect(markup).toContain("2 projected · concurrency cap 9");
+  expect(markup).toContain("Projected running sessions");
+  expect(markup).toContain("1 projected event");
+  expect(markup).not.toContain("2 active · concurrency cap 9");
+  expect(markup).not.toContain("Active sessions");
+  expect(markup).not.toContain('class="spinner"');
+  expect(markup).not.toContain("animation:pulse");
+}
+
 afterEach(() => {
   vi.doUnmock("react");
   vi.doUnmock("../src/data/dataSourceContext");
@@ -615,6 +634,7 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("poll 5s");
     expect(markup).toContain("2/9 agents");
     expect(markup).toContain('class="pulse"');
+    expectFreshDashboardBodyLiveIndicators(markup);
     expect(markup).toContain("concurrency cap 9");
     expect(markup).toContain("8/32 done");
     expect(markup).toContain("8/32 done · schedule unavailable");
@@ -731,6 +751,7 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("Refreshing dashboard");
     expect(markup).toContain("Showing previous dashboard data while Symphony reloads.");
     expect(markup).toContain("refreshing dashboard projection · 2/9 agents");
+    expectNoDashboardBodyLiveIndicators(markup, "refreshing dashboard projection · 2/9 agents");
     expect(markup).toContain("api/repo@api-branch");
     expect(markup).not.toContain("Could not load dashboard");
     expect(markup).not.toContain('class="pulse"');
@@ -744,6 +765,7 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("Could not refresh dashboard");
     expect(markup).toContain("Symphony API returned HTTP 503 Showing previous dashboard data.");
     expect(markup).toContain("previous dashboard projection · 2/9 agents");
+    expectNoDashboardBodyLiveIndicators(markup, "previous dashboard projection · 2/9 agents");
     expect(markup).toContain("api/repo@api-branch");
     expect(markup).toContain("tracker fresh · 4 issues");
     expect(markup).not.toContain("Could not load dashboard");
@@ -768,12 +790,14 @@ describe("App API-mode rendering", () => {
     expect(stale.markup).toContain("tracker stale · 4 cached issues");
     expect(stale.markup).toContain("Issue tracker source is stale; showing a cached dashboard projection.");
     expect(stale.markup).toContain("stale dashboard projection · 2/9 agents");
+    expectNoDashboardBodyLiveIndicators(stale.markup, "stale dashboard projection · 2/9 agents");
     expect(stale.markup).not.toContain('class="pulse"');
 
     const sourceMissing = await renderAppWithMocks({ hooks: appHookState({ dashboard: loaded(sourceMissingDashboard) }) });
     expect(sourceMissing.markup).toContain("source unavailable");
     expect(sourceMissing.markup).toContain("Dashboard payload did not include freshness metadata; treating projection age as unknown.");
     expect(sourceMissing.markup).toContain("dashboard projection freshness unknown · 2/9 agents");
+    expectNoDashboardBodyLiveIndicators(sourceMissing.markup, "dashboard projection freshness unknown · 2/9 agents");
     expect(sourceMissing.markup).not.toContain('class="pulse"');
   });
 
