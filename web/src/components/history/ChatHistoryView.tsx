@@ -1,9 +1,18 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { HistoryModel, HistoryVariant } from "../../types/symphony";
 import { useTranscript } from "../../hooks/useSymphonyData";
 import { SessionsList } from "./SessionsList";
 import { Timeline } from "./Timeline";
 import { TranscriptPane } from "./TranscriptPane";
+
+export function resolveSelectedSessionId(
+  currentSelectedId: string,
+  history: Pick<HistoryModel, "sessions" | "defaultSessionId">,
+): string {
+  if (currentSelectedId && history.sessions.some((session) => session.id === currentSelectedId)) return currentSelectedId;
+  if (history.defaultSessionId && history.sessions.some((session) => session.id === history.defaultSessionId)) return history.defaultSessionId;
+  return history.sessions[0]?.id ?? "";
+}
 
 export function ChatHistoryView({
   history,
@@ -14,10 +23,13 @@ export function ChatHistoryView({
   variant?: HistoryVariant;
   refreshToken?: unknown;
 }) {
-  const [selectedSessionId, setSelectedSessionId] = useState(history.defaultSessionId);
-  const selectedSession = history.sessions.find((candidate) => candidate.id === selectedSessionId);
-  const defaultSession = history.sessions.find((candidate) => candidate.id === history.defaultSessionId) ?? history.sessions[0];
-  const session = selectedSession ?? defaultSession;
+  const [selectedSessionId, setSelectedSessionId] = useState(() => resolveSelectedSessionId(history.defaultSessionId, history));
+  useEffect(() => {
+    setSelectedSessionId((currentSelectedId) => resolveSelectedSessionId(currentSelectedId, history));
+  }, [history.sessions, history.defaultSessionId]);
+
+  const effectiveSelectedSessionId = resolveSelectedSessionId(selectedSessionId, history);
+  const session = history.sessions.find((candidate) => candidate.id === effectiveSelectedSessionId);
 
   if (variant === "timeline") {
     return <Timeline events={history.timeline} sessions={history.sessions} />;
@@ -29,7 +41,7 @@ export function ChatHistoryView({
 
   return (
     <div className="history">
-      {variant !== "focused" ? <SessionsList sessions={history.sessions} selectedId={session.id} onSelect={setSelectedSessionId} /> : null}
+      {variant !== "focused" ? <SessionsList sessions={history.sessions} selectedId={effectiveSelectedSessionId} onSelect={setSelectedSessionId} /> : null}
       <SelectedTranscript history={history} session={session} refreshToken={refreshToken} />
     </div>
   );

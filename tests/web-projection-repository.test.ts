@@ -210,6 +210,7 @@ function projectionRevisionRecordFixture(
     scopeKind: selector.scopeKind,
     scopeKey: selector.scopeKey,
     revision,
+    buildMode: revision === 1 ? "bootstrap" : "incremental",
     sourceRevisions,
     sourceCursors: {},
     sourceFreshness: [],

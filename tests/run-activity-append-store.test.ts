@@ -120,6 +120,44 @@ describe("RunActivityAppendStore", () => {
     });
   });
 
+  it("notifies run-activity projection listeners once per accepted in-memory run-session batch", async () => {
+    const store = new InMemoryRunActivityAppendStore();
+    const notifications: unknown[] = [];
+    store.onProjectionChanged((event) => notifications.push(event));
+
+    const batch = await store.appendEvents([
+      statusActivityInput({ id: "activity-notify-1", sequence: 1 }),
+      statusActivityInput({ id: "activity-notify-2", sequence: 2 }),
+    ]);
+    const duplicate = await store.appendEvent(statusActivityInput({ id: "activity-notify-1", sequence: 3 }));
+
+    expect(batch.accepted).toHaveLength(2);
+    expect(duplicate.status).toBe("duplicate");
+    expect(store.projectionRevision()).toBe(1);
+    expect(notifications).toEqual([
+      {
+        source: "run_activity",
+        revision: 1,
+        detail: {
+          source: "run_activity",
+          runId: "run-append",
+          sessionId: "session-append",
+          runSessionId: "run-append:session-append",
+          afterSequence: 0,
+          firstSequence: 1,
+          lastSequence: 2,
+          eventCount: 2,
+          appendRevisionStart: "1",
+          appendRevisionEnd: "2",
+          status: null,
+          channels: ["diagnostic"],
+          kinds: ["runtime_log"],
+          resourcesChanged: ["history", "session-transcript", "dashboard", "sidebar"],
+        },
+      },
+    ]);
+  });
+
   it("preserves out-of-order explicit sequences and assigns later missing events after the high-water mark", async () => {
     const store = new InMemoryRunActivityAppendStore();
 
@@ -159,6 +197,8 @@ describe("RunActivityAppendStore", () => {
   it("wraps Postgres appends in one transaction and persists normalized ordering metadata", async () => {
     const client = new FakeRunActivityPostgresClient();
     const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+    const notifications: { event: unknown; lastStatement: string | undefined }[] = [];
+    store.onProjectionChanged((event) => notifications.push({ event, lastStatement: client.normalizedStatements.at(-1) }));
 
     const result = await store.appendEvent(
       statusActivityInput({
@@ -190,6 +230,24 @@ describe("RunActivityAppendStore", () => {
     expect(client.normalizedStatements[0]).toBe("BEGIN");
     expect(client.normalizedStatements.at(-1)).toBe("COMMIT");
     expect(client.normalizedStatements).not.toContain("ROLLBACK");
+    expect(store.projectionRevision()).toBe(1);
+    expect(notifications).toEqual([
+      {
+        lastStatement: "COMMIT",
+        event: expect.objectContaining({
+          source: "run_activity",
+          revision: 1,
+          detail: expect.objectContaining({
+            runId: "run-postgres",
+            sessionId: "session-postgres",
+            runSessionId: "run-postgres:custom-scope",
+            eventCount: 1,
+            appendRevisionStart: "1",
+            appendRevisionEnd: "1",
+          }),
+        }),
+      },
+    ]);
     expect(client.insertValues[0]?.slice(0, 10)).toEqual([
       "activity-postgres",
       "run-postgres",
@@ -225,6 +283,8 @@ describe("RunActivityAppendStore", () => {
   it("rolls back and releases the Postgres client when a transactional append fails", async () => {
     const client = new FakeRunActivityPostgresClient({ failInserts: true });
     const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+    const notifications: unknown[] = [];
+    store.onProjectionChanged((event) => notifications.push(event));
 
     await expect(store.appendEvent(statusActivityInput({ id: "activity-fails" }))).rejects.toThrow("insert failed");
 
@@ -232,6 +292,8 @@ describe("RunActivityAppendStore", () => {
     expect(client.normalizedStatements).toContain("BEGIN");
     expect(client.normalizedStatements).toContain("ROLLBACK");
     expect(client.normalizedStatements).not.toContain("COMMIT");
+    expect(store.projectionRevision()).toBe(0);
+    expect(notifications).toEqual([]);
   });
 });
 

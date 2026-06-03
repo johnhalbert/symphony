@@ -590,6 +590,7 @@ function durableProjectionRevisionReader(revision: () => number, generatedAt: st
         scopeKind: selector.scopeKind ?? "global",
         scopeKey: selector.scopeKey ?? "global",
         revision: currentRevision,
+        buildMode: currentRevision === 1 ? "bootstrap" : "incremental",
         sourceRevisions: [],
         sourceCursors: {},
         sourceFreshness: [],

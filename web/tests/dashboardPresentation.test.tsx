@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { AppChrome } from "../src/app/AppChrome";
 import { DashboardView } from "../src/components/dashboard/DashboardView";
 import type { SymphonyDataSource } from "../src/data/dataSource";
+import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
 import { toDashboardModel } from "../src/data/adapters";
 import { mockSymphonyData } from "../src/data/mockData";
@@ -140,7 +141,7 @@ function dataSourceForDashboard(dashboard: DashboardModel): SymphonyDataSource {
       return { providerGates: [], runningAgents: dashboard.runningAgents, reviewIssues: [], activity: dashboard.activity, sessions: [], chat: dashboard.chat, totals: dashboard.totals };
     },
     async getOrchestratorChat() {
-      return dashboard.chat;
+      return orchestratorChatModelFromMessages(dashboard.chat);
     },
     async sendOrchestratorMessage(input: string) {
       return [...dashboard.chat, { who: "user", text: input }];

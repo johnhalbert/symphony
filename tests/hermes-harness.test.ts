@@ -168,6 +168,16 @@ describe("HermesHarness", () => {
           keep_profiles: "always",
           auth: { bootstrap_from: bootstrapFrom },
         },
+        hermes_acp: {
+          binary_path: path.join(root, "host", "bin", "hermes"),
+          source_profile: "host-dogfood",
+          profile_prefix: "host-acp",
+          worker_session_lifecycle: "fresh_per_run",
+          keep_profiles: "never",
+          startup_timeout_ms: 1234,
+          request_timeout_ms: 2345,
+          permission_timeout_ms: 3456,
+        },
       },
       path.join(root, "WORKFLOW.md"),
       { LINEAR_API_KEY: "linear-secret" },
@@ -178,6 +188,16 @@ describe("HermesHarness", () => {
     const events = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "codex prompt"));
 
     expect(events.map((event) => event.type)).toContain("completed");
+    expect(config.hermesAcp).toMatchObject({
+      binaryPath: path.join(root, "host", "bin", "hermes"),
+      sourceProfile: "host-dogfood",
+      profilePrefix: "host-acp",
+      workerSessionLifecycle: "fresh_per_run",
+      keepProfiles: "never",
+      startupTimeoutMs: 1234,
+      requestTimeoutMs: 2345,
+      permissionTimeoutMs: 3456,
+    });
     expect(clients[0]?.env.authHome).toBe(config.hermes.auth.managedRoot);
     expect(clients[0]?.env.hermesHome).not.toBe(config.hermes.auth.managedRoot);
     expect(clients[0]?.env.cwd).toBe(workspacePath);

@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useDataSource } from "../../data/dataSourceContext";
-import type { ChatMessage, DashboardModel, DashboardVariant } from "../../types/symphony";
+import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../../data/orchestratorChat";
+import type { ChatMessage, DashboardModel, DashboardVariant, OrchestratorChatModel } from "../../types/symphony";
 import { Icon, UnavailableButton } from "../common";
 import { AgentRow } from "./AgentRow";
 import { resolveDashboardFreshnessCue, type DashboardFreshnessCue } from "./freshness";
@@ -18,7 +19,7 @@ export function DashboardView({
   freshnessCue,
 }: {
   dashboard: DashboardModel;
-  orchestratorChat?: ChatMessage[];
+  orchestratorChat?: OrchestratorChatModel | ChatMessage[];
   orchestratorChatError?: string | null;
   orchestratorChatLoading?: boolean;
   orchestratorChatReadOnly?: boolean;
@@ -27,7 +28,7 @@ export function DashboardView({
   freshnessCue?: DashboardFreshnessCue;
 }) {
   const dataSource = useDataSource();
-  const sourceChat = orchestratorChat ?? dashboard.chat;
+  const sourceChat = useMemo(() => normalizeOrchestratorChatModel(orchestratorChat ?? dashboard.chat), [orchestratorChat, dashboard.chat]);
   const [chat, setChat] = useState(sourceChat);
   const totals = dashboard.totals;
   const visibleActivity = dashboard.activity.slice(0, variant === "grid" ? 10 : 8);
@@ -50,7 +51,7 @@ export function DashboardView({
   async function sendChat(input: string) {
     if (orchestratorChatReadOnly) return;
     const nextMessages = await dataSource.sendOrchestratorMessage(input);
-    setChat(nextMessages);
+    setChat(orchestratorChatModelFromMessages(nextMessages, { conversationId: chat.conversation.id }));
   }
 
   return (
@@ -181,7 +182,8 @@ export function DashboardView({
       </div>
 
       <OrchestratorChat
-        messages={chat}
+        projection={chat}
+        messages={chat.chat}
         onSend={sendChat}
         agentLabel={chatAgentLabel(dashboard)}
         subtitle={chatSubtitle(dashboard)}

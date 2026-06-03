@@ -1,14 +1,8 @@
 import type { AgentActivitySource, AgentEvent } from "../harness/AgentHarness.js";
 import type { TranscriptEvent } from "../persistence/RunTranscriptStore.js";
 import {
-  RUN_ACTIVITY_PROTOCOLS,
-  RUN_ACTIVITY_SEQUENCE_SOURCES,
-  isRunActivityActorForChannel,
-  isRunActivityChannel,
-  isRunActivityKindForChannel,
+  isRunActivityEvent,
   type RunActivityEvent,
-  type RunActivityProtocol,
-  type RunActivitySequenceSource,
 } from "../runActivity/RunActivityEvent.js";
 import type { TokenCounts } from "../types.js";
 import { sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "./TranscriptProjection.js";
@@ -44,6 +38,8 @@ export function mapAgentEventToRunActivityEvent(event: AgentEvent): RunActivityE
         sessionId: event.sessionId,
         ...(event.threadId === undefined ? {} : { threadId: event.threadId }),
         ...(event.runId === undefined ? {} : { runId: event.runId }),
+        ...(event.providerId === undefined ? {} : { providerId: event.providerId }),
+        ...(event.model === undefined ? {} : { model: event.model }),
       });
     case "progress": {
       const message = event.activitySource === "delta" ? deltaPreviewText(event.message, 500) : previewText(event.message, 500);
@@ -209,35 +205,7 @@ function isAssistantDeltaRunActivity(runActivity: RunActivityEvent): boolean {
 }
 
 function isValidRunActivityEvent(value: unknown): value is RunActivityEvent {
-  if (!isRecord(value)) return false;
-  const channel = value.channel;
-  if (!isRunActivityChannel(channel)) return false;
-  if (!isRunActivityKindForChannel(channel, value.kind)) return false;
-  if (!isRunActivityActorForChannel(channel, value.actor)) return false;
-  return (
-    nonEmptyString(value.eventId) &&
-    nonEmptyString(value.runSessionId) &&
-    nonEmptyString(value.occurredAt) &&
-    (value.sequence === undefined || value.sequence === null || positiveInteger(value.sequence)) &&
-    (value.sequenceSource === undefined || value.sequenceSource === null || isRunActivitySequenceSource(value.sequenceSource)) &&
-    (value.externalEventId === undefined || value.externalEventId === null || nonEmptyString(value.externalEventId)) &&
-    (value.protocol === undefined || value.protocol === null || isRunActivityProtocol(value.protocol)) &&
-    nonEmptyString(value.harness) &&
-    (value.text === null || typeof value.text === "string") &&
-    isRecord(value.payload)
-  );
-}
-
-function isRunActivityProtocol(value: unknown): value is RunActivityProtocol {
-  return typeof value === "string" && (RUN_ACTIVITY_PROTOCOLS as readonly string[]).includes(value);
-}
-
-function isRunActivitySequenceSource(value: unknown): value is RunActivitySequenceSource {
-  return typeof value === "string" && (RUN_ACTIVITY_SEQUENCE_SOURCES as readonly string[]).includes(value);
-}
-
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+  return isRunActivityEvent(value);
 }
 
 function positiveInteger(value: unknown): value is number {

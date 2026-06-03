@@ -1079,6 +1079,19 @@ describe("projectWebTranscript", () => {
     );
   });
 
+  it("does not use stale Cursor metadata in run prelude system messages for explicit Hermes ACP runs", () => {
+    const hermesAcpMessages = projectWebTranscript([], {
+      run: runRecord({ harnessId: "hermes_acp", runtimeModel: null, cursorModel: "stale-cursor-model" }),
+    });
+
+    expect(hermesAcpMessages[0]).toMatchObject({ kind: "system", model: "" });
+
+    const cursorMessages = projectWebTranscript([], {
+      run: runRecord({ harnessId: "cursor", runtimeModel: null, cursorModel: "cursor-model" }),
+    });
+    expect(cursorMessages[0]).toMatchObject({ kind: "system", model: "cursor-model" });
+  });
+
 });
 
 function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {

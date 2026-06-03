@@ -22,6 +22,7 @@ describe("HostHermesDiscovery", () => {
       cwd,
       env: { PATH: "/usr/bin", HERMES_HOME: "/vendored/hermes", HERMES_MODEL: "vendored-model" },
       runner,
+      accessFile: async (candidatePath) => candidatePath === path.resolve(cwd, "./bin/hermes"),
     });
 
     expect(result).toMatchObject({
@@ -112,6 +113,34 @@ describe("HostHermesDiscovery", () => {
         code: "host_hermes_binary_missing",
         severity: "error",
         message: expect.stringContaining("Host Hermes executable was not found"),
+      }),
+    ]);
+  });
+
+  it("fails configured path-like binaries before running host commands when the path is not executable", async () => {
+    const cwd = path.join(path.sep, "workspace");
+    const missingBinary = path.resolve(cwd, "bin", "missing-hermes");
+    let runnerCalled = false;
+    const result = await discoverHostHermes({
+      binaryPath: "./bin/missing-hermes",
+      sourceProfile: "dogfood",
+      cwd,
+      accessFile: async () => false,
+      runner: async () => {
+        runnerCalled = true;
+        return { stdout: "", stderr: "" };
+      },
+    });
+
+    expect(runnerCalled).toBe(false);
+    expect(result.ok).toBe(false);
+    expect(result.binary).toBeNull();
+    expect(result.sourceProfile).toEqual({ name: "dogfood", source: "config" });
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({
+        code: "host_hermes_binary_missing",
+        severity: "error",
+        message: expect.stringContaining(`Configured host Hermes ACP binary ${missingBinary} does not exist or is not executable`),
       }),
     ]);
   });

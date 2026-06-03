@@ -14,7 +14,7 @@ import type {
 describe("AgentCommandPolicyHookRunner", () => {
   it("maps Hermes pre_tool_call payloads to policy input and emits block JSON for denied decisions", async () => {
     const seenInputs: AgentCommandPolicyInput[] = [];
-    const payload = hermesPayload({ command: "git push origin main" });
+    const payload = hermesPayload({ command: "git push origin main" }, { cwd: "/repo/worktree" });
 
     const evaluation = await evaluateAgentCommandPolicyHookPayload(JSON.stringify(payload), {
       role: "worker",
@@ -367,7 +367,10 @@ subprocess.run(["gh", "pr", "create", "--fill"])`;
       environment: { HOME: "/tmp/home", PATH: "/bin", GIT_PAGER: pagerValue },
     });
 
-    expect(evaluation.policyInput?.environment).toEqual({ keysOnly: ["GIT_PAGER", "HOME", "PATH"] });
+    expect(evaluation.policyInput?.environment).toEqual({
+      keysOnly: ["GIT_PAGER", "HOME", "PATH"],
+      inherited: { HOME: "/tmp/home" },
+    });
     expect(evaluation.decision).toMatchObject({
       outcome: "deny",
       reasonKind: "unsafe_git_config",
@@ -388,13 +391,13 @@ subprocess.run(["gh", "pr", "create", "--fill"])`;
   });
 });
 
-function hermesPayload(toolInput: Record<string, unknown>, options: { toolName?: string } = {}) {
+function hermesPayload(toolInput: Record<string, unknown>, options: { toolName?: string; cwd?: string } = {}) {
   return {
     hook_event_name: "pre_tool_call",
     tool_name: options.toolName ?? "terminal",
     tool_input: toolInput,
     session_id: "test-session",
-    cwd: "/repo/worktree",
+    cwd: options.cwd ?? process.cwd(),
     extra: { task_id: "task-1", tool_call_id: "tool-call-1" },
   };
 }

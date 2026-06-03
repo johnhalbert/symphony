@@ -82,6 +82,14 @@ import {
   type OrchestratorConversationStore,
 } from "../core/persistence/OrchestratorConversationStore.js";
 import {
+  ORCHESTRATOR_CHAT_PROJECTION_SCHEMA_VERSION,
+  ORCHESTRATOR_CHAT_PROJECTION_SOURCE,
+  projectOrchestratorChatProjectionPayload,
+  type OrchestratorChatProjectionPayload,
+  type OrchestratorChatProjectionState,
+  type OrchestratorChatProjectionStatusCounts,
+} from "../core/persistence/OrchestratorChatProjectionReducer.js";
+import {
   ORCHESTRATOR_CHAT_POST_ACTION,
   type OrchestratorChatCommandDispatcher,
   type OrchestratorChatCommandResult,
@@ -109,7 +117,7 @@ import {
   type WebProjectionRevisionUnsubscribe,
   type WebProjectionSourceRevision,
 } from "./WebProjectionContext.js";
-import { RealtimeProjectionEventBus } from "./RealtimeProjectionEvents.js";
+import { RealtimeProjectionEventBus, type RealtimeResourceKind } from "./RealtimeProjectionEvents.js";
 import {
   createWebProjectionReadRepositories,
   webHistoryProjectionScopeKey,
@@ -123,15 +131,17 @@ import {
 import {
   DURABLE_PROJECTION_NAMES,
   type DurableProjectionName,
+  type ProjectionBuildMode,
   type ProjectionPayloadRecord,
   type ProjectionPayloadWriteInput,
+  type ProjectionRevisionPublication,
   type ProjectionRevisionRecord,
   type ProjectionRevisionSelector,
   type ProjectionSourceRevision,
+  type ProjectionWriteMode,
   type ProjectionWriteResult,
 } from "../core/persistence/ProjectionTransactionService.js";
-import type { ProjectionSourceFreshnessInput } from "../core/persistence/ProjectionSourceFreshness.js";
-
+import type { ProjectionSourceFreshness, ProjectionSourceFreshnessInput } from "../core/persistence/ProjectionSourceFreshness.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -155,11 +165,12 @@ type StatusServerWritebackOutbox = Pick<FileWritebackOutboxStore, "list"> &
 
 interface StatusServerProjectionRevisionStore {
   projectionRevision(): number;
-  onProjectionChanged(listener: (event: { source: string; revision: number }) => void): () => void;
+  onProjectionChanged(listener: (event: { source: string; revision: number; detail?: Readonly<Record<string, unknown>> | null }) => void): () => void;
 }
 
 export interface StatusServerProjectionWriter {
   writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult>;
+  onProjectionChanged?(listener: (event: ProjectionRevisionPublication) => void): () => void;
 }
 
 export interface StatusServerProjectionReader extends WebProjectionPayloadReader {
@@ -187,6 +198,10 @@ export interface StatusServerProjectionRebuildEntry {
   scopeKey: string;
   status: StatusServerProjectionRebuildEntryStatus;
   revision: number | null;
+  /** `rebuild` for explicit rebuild/backfill write inputs; absent for skips before a projection write input exists. */
+  requestedBuildMode?: ProjectionWriteMode | null;
+  /** Durable build mode for the revision returned by the writer; first writes are `bootstrap`. */
+  buildMode?: ProjectionBuildMode | null;
   reason: string | null;
 }
 
@@ -341,6 +356,8 @@ export class StatusServer {
 
   private registerWebProjectionRevisionListeners(): void {
     if (this.webProjectionRevisionUnsubscribes.length > 0) return;
+    const projectionPublicationUnsubscribe = this.subscribeProjectionPublicationEvents();
+    if (projectionPublicationUnsubscribe) this.webProjectionRevisionUnsubscribes.push(projectionPublicationUnsubscribe);
     for (const provider of this.webProjectionRevisionProviders) {
       if (!provider.subscribe) continue;
       const unsubscribe = provider.subscribe((revision) => {
@@ -349,6 +366,16 @@ export class StatusServer {
       });
       this.webProjectionRevisionUnsubscribes.push(unsubscribe);
     }
+  }
+
+  private subscribeProjectionPublicationEvents(): WebProjectionRevisionUnsubscribe | null {
+    const writer = this.options.projectionWriter;
+    if (!writer || typeof writer.onProjectionChanged !== "function") return null;
+    return writer.onProjectionChanged((publication) => {
+      const revision = webProjectionSourceRevisionFromProjectionPublication(publication);
+      this.publishWebProjectionRevision(revision);
+      this.realtimeEvents.publishProjectionRevision(revision);
+    });
   }
 
   private unsubscribeWebProjectionRevisionListeners(): void {
@@ -363,8 +390,12 @@ export class StatusServer {
   }
 
   private markCompletedWebProjectionContextDirty(revision: WebProjectionSourceRevision): void {
-    this.webProjectionDirtyGeneration += 1;
     this.completedWebProjectionContext = null;
+    this.publishWebProjectionRevision(revision);
+  }
+
+  private publishWebProjectionRevision(revision: WebProjectionSourceRevision): void {
+    this.webProjectionDirtyGeneration += 1;
     this.broadcastWebProjectionRevision(revision);
   }
 
@@ -720,11 +751,29 @@ export class StatusServer {
             forceRefresh,
           });
           if (durableChat.status === "hit" && durableChat.record) {
-            sendJson(response, 200, durableChat.record.payload, durableProjectionReadHeaders(durableChat));
+            const chat = webOrchestratorChatProjectionFromResponseBody(durableChat.record.payload, conversationId);
+            if (chat) {
+              sendJson(response, 200, chat, durableProjectionReadHeaders(durableChat));
+              return;
+            }
+            sendJson(
+              response,
+              200,
+              webOrchestratorChatUnavailableProjection(conversationId, "orchestrator_chat_projection_payload_missing_chat_array"),
+              durableProjectionReadHeaders({
+                ...durableChat,
+                status: "missing_item",
+                reason: "orchestrator_chat_projection_payload_missing_chat_array",
+              }),
+            );
             return;
           }
-          const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages(conversationId));
-          await this.persistWebOrchestratorChatProjection(chat, conversationId);
+          if (this.shouldReturnDurableOrchestratorChatFallback(durableChat, forceRefresh)) {
+            sendJson(response, 200, webOrchestratorChatReadFallbackProjection(conversationId, durableChat), durableProjectionReadHeaders(durableChat));
+            return;
+          }
+          const chat = await this.fetchWebOrchestratorChatProjection(conversationId);
+          await this.persistWebOrchestratorChatProjection(chat);
           sendJson(response, 200, chat, durableProjectionReadHeaders(durableChat));
           return;
         }
@@ -764,13 +813,15 @@ export class StatusServer {
             ...(postConversationId === undefined ? {} : { conversationId: postConversationId }),
             ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
           });
-          const chat = webOrchestratorChatProjectionFromResponseBody(result.body);
-          if (chat) {
-            await this.persistWebOrchestratorChatProjection(chat, postConversationId);
-            if (chat.length > 0 && result.status !== 200) {
+          const chatProjection = webOrchestratorChatProjectionFromResponseBody(result.body, postConversationId);
+          if (chatProjection) {
+            if (this.options.orchestratorConversationStore) {
+              await this.persistWebOrchestratorChatProjection(await this.fetchWebOrchestratorChatProjection(postConversationId));
+            }
+            if (chatProjection.chat.length > 0 && result.status !== 200) {
               this.realtimeEvents.publishOrchestratorMessage({
                 inputLength: input.input.length,
-                messageCount: chat.length,
+                messageCount: chatProjection.chat.length,
                 conversationId: postConversationId ?? DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
                 status: result.status,
               });
@@ -1379,9 +1430,9 @@ export class StatusServer {
 
     if (projectionNames.has("orchestrator_chat_projection")) {
       for (const conversationId of normalizeStatusServerProjectionRebuildConversationIds(options.conversationIds)) {
-        const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages(conversationId));
+        const chat = await this.fetchWebOrchestratorChatProjection(conversationId);
         await this.recordProjectionRebuildEntry(
-          this.webOrchestratorChatProjectionWriteInput(chat, conversationId),
+          this.webOrchestratorChatProjectionWriteInput(chat),
           entries,
         );
       }
@@ -1528,22 +1579,40 @@ export class StatusServer {
     input: ProjectionPayloadWriteInput,
     entries: StatusServerProjectionRebuildEntry[],
   ): Promise<void> {
-    const selector = statusServerProjectionRebuildEntrySelector(input);
+    const requestedBuildMode: ProjectionWriteMode = "rebuild";
+    const rebuildInput: ProjectionPayloadWriteInput = { ...input, buildMode: requestedBuildMode };
+    const selector = statusServerProjectionRebuildEntrySelector(rebuildInput);
     const writer = this.options.projectionWriter;
     if (!writer) {
-      entries.push({ ...selector, status: "skipped", revision: null, reason: "Durable projection writer is not configured" });
+      entries.push({
+        ...selector,
+        status: "skipped",
+        revision: null,
+        requestedBuildMode,
+        buildMode: null,
+        reason: "Durable projection writer is not configured",
+      });
       return;
     }
     try {
-      const result = await writer.writeProjection(input);
+      const result = await writer.writeProjection(rebuildInput);
       entries.push({
         ...selector,
         status: result.status,
         revision: typeof result.revision.revision === "number" ? result.revision.revision : null,
+        requestedBuildMode: result.requestedBuildMode ?? requestedBuildMode,
+        buildMode: result.buildMode ?? result.revision.buildMode ?? null,
         reason: null,
       });
     } catch (error) {
-      entries.push({ ...selector, status: "failed", revision: null, reason: publicDiagnosticText(errorMessage(error)) });
+      entries.push({
+        ...selector,
+        status: "failed",
+        revision: null,
+        requestedBuildMode,
+        buildMode: null,
+        reason: publicDiagnosticText(errorMessage(error)),
+      });
     }
   }
 
@@ -1684,25 +1753,26 @@ export class StatusServer {
   }
 
   private webOrchestratorChatProjectionWriteInput(
-    chat: readonly ChatMessage[],
-    conversationId?: string | null,
+    chat: OrchestratorChatProjectionPayload,
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "orchestrator_chat_projection",
       scopeKind: "conversation",
-      scopeKey: orchestratorChatProjectionScopeKey(conversationId),
+      scopeKey: orchestratorChatProjectionScopeKey(chat.conversation.id),
       payload: chat,
-      sourceRevisions: statusServerOrchestratorChatProjectionSourceRevisions(
-        this.options.orchestratorConversationStore,
-        chat,
-        conversationId,
-      ),
-      sourceCursors: orchestratorChatProjectionSourceCursors(chat, conversationId),
+      sourceRevisions: [
+        {
+          source: `${ORCHESTRATOR_CHAT_PROJECTION_SOURCE}:${orchestratorChatProjectionScopeKey(chat.conversation.id)}`,
+          revision: chat.source.revision,
+          observedAt: chat.source.observedAt,
+        },
+      ],
+      sourceCursors: orchestratorChatProjectionSourceCursors(chat),
       fields: {
-        conversationKey: orchestratorChatProjectionScopeKey(conversationId),
-        issueKey: firstChatMetadataString(chat, "issueKey", "issueIdentifier"),
-        runId: firstChatMetadataString(chat, "runId"),
-        messageCount: chat.length,
+        conversationKey: orchestratorChatProjectionScopeKey(chat.conversation.id),
+        issueKey: firstChatMetadataString(chat.chat, "issueKey", "issueIdentifier"),
+        runId: firstChatMetadataString(chat.chat, "runId"),
+        messageCount: chat.chat.length,
       },
     };
   }
@@ -1856,6 +1926,13 @@ export class StatusServer {
     conversationId?: string | null,
   ): Promise<OrchestratorConversationMessage[]> {
     return (await this.options.orchestratorConversationStore?.listMessages(conversationId)) ?? [];
+  }
+
+  private async fetchWebOrchestratorChatProjection(
+    conversationId?: string | null,
+  ): Promise<OrchestratorChatProjectionPayload> {
+    const record = await this.options.orchestratorConversationStore?.getConversation(conversationId);
+    return projectOrchestratorChatProjectionPayload(record ?? null, conversationId);
   }
 
   private async acceptWebOrchestratorChatPost(input: {
@@ -2219,17 +2296,16 @@ export class StatusServer {
   }
 
   private async persistWebOrchestratorChatProjection(
-    chat: readonly ChatMessage[],
-    conversationId?: string | null,
+    chat: OrchestratorChatProjectionPayload,
   ): Promise<void> {
-    await this.persistProjection(this.webOrchestratorChatProjectionWriteInput(chat, conversationId));
+    await this.persistProjection(this.webOrchestratorChatProjectionWriteInput(chat));
   }
 
   private async persistProjection(input: ProjectionPayloadWriteInput): Promise<void> {
     const writer = this.options.projectionWriter;
     if (!writer) return;
     try {
-      await writer.writeProjection(input);
+      await writer.writeProjection({ ...input, buildMode: input.buildMode ?? "incremental" });
     } catch {
       // Durable projection rows are cache/read-model side effects. The status API
       // response is derived from canonical stores during this transition phase,
@@ -2249,6 +2325,16 @@ export class StatusServer {
     return this.hasDurableProjectionReader() && (!forceRefresh || !this.hasDurableProjectionWriter());
   }
 
+  private shouldReturnDurableOrchestratorChatFallback(
+    read: DurableProjectionReadResult<unknown>,
+    forceRefresh: boolean,
+  ): boolean {
+    if (!this.hasDurableProjectionReader()) return false;
+    if (forceRefresh && this.hasDurableProjectionWriter()) return false;
+    if (read.status === "expired" && this.hasDurableProjectionWriter()) return false;
+    return true;
+  }
+
   private buildProjectionFallbackDashboard(): ReturnType<typeof projectWebDashboard> {
     return projectWebDashboard({
       config: this.options.dashboard ?? null,
@@ -2265,11 +2351,28 @@ export class StatusServer {
   }
 
   private async isDurableProjectionRecordCurrent(record: ProjectionPayloadRecord): Promise<boolean> {
+    const orchestratorChatRecordCurrent = await this.isDurableOrchestratorChatProjectionRecordCurrent(record);
+    if (orchestratorChatRecordCurrent !== null) return orchestratorChatRecordCurrent;
+
     const currentRevisions = projectionCurrentSourceRevisionsForRead(
       record.revision.projectionName,
       await this.resolveWebProjectionSourceRevisions(),
     );
     return projectionSourceRevisionsCompatible(record.revision.sourceRevisions, currentRevisions);
+  }
+
+  private async isDurableOrchestratorChatProjectionRecordCurrent(
+    record: ProjectionPayloadRecord,
+  ): Promise<boolean | null> {
+    if (record.revision.projectionName !== "orchestrator_chat_projection") return null;
+    const store = this.options.orchestratorConversationStore;
+    if (!store) return null;
+    const conversationSource = `${ORCHESTRATOR_CHAT_PROJECTION_SOURCE}:${record.revision.scopeKey}`;
+    const storedRevision = record.revision.sourceRevisions.find((revision) => revision.source === conversationSource);
+    if (!storedRevision) return null;
+    const conversation = await store.getConversation(record.revision.scopeKey);
+    const currentProjection = projectOrchestratorChatProjectionPayload(conversation, record.revision.scopeKey);
+    return String(storedRevision.revision) === currentProjection.source.revision;
   }
 
   private async fetchOptionalWebProjectionSourceIndex(forceRefresh: boolean): Promise<{
@@ -2563,12 +2666,171 @@ export class StatusServer {
   }
 }
 
+function webProjectionSourceRevisionFromProjectionPublication(
+  publication: ProjectionRevisionPublication,
+): WebProjectionSourceRevision {
+  return {
+    source: durableProjectionRealtimeSource(publication),
+    revision: publication.revision,
+    observedAt: publication.generatedAt,
+    detail: realtimeDetailFromProjectionPublication(publication),
+  };
+}
+
+function durableProjectionRealtimeSource(publication: ProjectionRevisionPublication): string {
+  return `${publication.projectionName}:${publication.scopeKind}:${publication.scopeKey}`;
+}
+
+function realtimeDetailFromProjectionPublication(publication: ProjectionRevisionPublication): Readonly<Record<string, unknown>> {
+  const sourceCursors = realtimeSafeRecord(publication.sourceCursors);
+  const sourceFreshness = publication.sourceFreshness.map(realtimeSourceFreshnessDetail);
+  const primaryFreshness = sourceFreshness[0] ?? null;
+  const detail: Record<string, unknown> = {
+    source: "projection",
+    projectionName: publication.projectionName,
+    scopeKind: publication.scopeKind,
+    scopeKey: publication.scopeKey,
+    projectionRevisionId: publication.projectionRevisionId,
+    contentSha256: publication.contentSha256,
+    expiresAt: publication.expiresAt,
+    resourcesChanged: realtimeResourceKindsForDurableProjection(publication.projectionName),
+    sourceRevisions: publication.sourceRevisions.map(realtimeProjectionSourceRevisionDetail),
+    sourceCursors,
+    sourceFreshness,
+  };
+
+  if (primaryFreshness) {
+    detail.checkedAt = recordStringValue(primaryFreshness, "checkedAt");
+    detail.fetchedAt = recordStringValue(primaryFreshness, "checkedAt");
+  }
+
+  return {
+    ...detail,
+    ...durableProjectionSpecificRealtimeDetail(publication, sourceCursors),
+  };
+}
+
+function realtimeProjectionSourceRevisionDetail(revision: ProjectionSourceRevision): Record<string, unknown> {
+  return { source: revision.source, revision: revision.revision, observedAt: revision.observedAt };
+}
+
+function realtimeSourceFreshnessDetail(freshness: ProjectionSourceFreshness): Record<string, unknown> {
+  return realtimeSafeRecord({
+    source: freshness.source,
+    status: freshness.status,
+    checkedAt: freshness.checkedAt,
+    revision: freshness.revision,
+    lastSuccessAt: freshness.lastSuccessAt,
+    lastErrorAt: freshness.lastErrorAt,
+    staleMs: freshness.staleMs,
+    detail: freshness.detail,
+  });
+}
+
+function durableProjectionSpecificRealtimeDetail(
+  publication: ProjectionRevisionPublication,
+  sourceCursors: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  switch (publication.projectionName) {
+    case "transcript_projection":
+      return transcriptProjectionRealtimeDetail(sourceCursors);
+    case "orchestrator_chat_projection":
+      return orchestratorChatProjectionRealtimeDetail(publication, sourceCursors);
+    case "dashboard_projection":
+    case "issue_board_projection":
+    case "sidebar_projection":
+    case "history_projection":
+      return {};
+  }
+}
+
+function transcriptProjectionRealtimeDetail(sourceCursors: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const firstSequence = recordNumberValue(sourceCursors, "firstSequence");
+  const afterSequence =
+    recordNumberValue(sourceCursors, "afterSequence") ??
+    (firstSequence === null ? recordNumberValue(sourceCursors, "offset") : Math.max(0, firstSequence - 1));
+  const detail: Record<string, unknown> = {};
+  copyStringRecordField(detail, sourceCursors, "runId");
+  copyStringRecordField(detail, sourceCursors, "sessionId");
+  copyStringRecordField(detail, sourceCursors, "issueKey");
+  if (typeof detail.issueKey === "string") detail.issueIdentifier = detail.issueKey;
+  copyNumberRecordField(detail, sourceCursors, "offset");
+  copyNumberRecordField(detail, sourceCursors, "limit");
+  copyNumberRecordField(detail, sourceCursors, "nextOffset");
+  copyNumberRecordField(detail, sourceCursors, "eventCount");
+  copyNumberRecordField(detail, sourceCursors, "firstSequence");
+  copyNumberRecordField(detail, sourceCursors, "lastSequence");
+  copyStringRecordField(detail, sourceCursors, "lastEventAt");
+  if (afterSequence !== null) detail.afterSequence = afterSequence;
+  return detail;
+}
+
+function orchestratorChatProjectionRealtimeDetail(
+  publication: ProjectionRevisionPublication,
+  sourceCursors: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const conversationId =
+    recordStringValue(sourceCursors, "conversationId") ?? recordStringValue(sourceCursors, "conversationKey") ?? publication.scopeKey;
+  const detail: Record<string, unknown> = { conversationId, conversationKey: conversationId };
+  copyNumberRecordField(detail, sourceCursors, "messageCount");
+  copyStringRecordField(detail, sourceCursors, "lastMessageId");
+  copyStringRecordField(detail, sourceCursors, "lastMessageStatus");
+  copyStringRecordField(detail, sourceCursors, "lastMessageAt");
+  return detail;
+}
+
+function realtimeSafeRecord(value: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const sanitized = sanitizePublicJson(value, 1_000);
+  return isRecord(sanitized) ? sanitized : {};
+}
+
+function copyStringRecordField(output: Record<string, unknown>, input: Readonly<Record<string, unknown>>, key: string): void {
+  const value = recordStringValue(input, key);
+  if (value !== null) output[key] = value;
+}
+
+function copyNumberRecordField(output: Record<string, unknown>, input: Readonly<Record<string, unknown>>, key: string): void {
+  const value = recordNumberValue(input, key);
+  if (value !== null) output[key] = value;
+}
+
+function recordStringValue(record: Readonly<Record<string, unknown>>, key: string): string | null {
+  const value = record[key];
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function recordNumberValue(record: Readonly<Record<string, unknown>>, key: string): number | null {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function realtimeResourceKindsForDurableProjection(projectionName: DurableProjectionName): readonly RealtimeResourceKind[] {
+  switch (projectionName) {
+    case "dashboard_projection":
+      return ["dashboard"];
+    case "issue_board_projection":
+      return ["issue-board", "issue-detail"];
+    case "sidebar_projection":
+      return ["sidebar"];
+    case "history_projection":
+      return ["history"];
+    case "transcript_projection":
+      return ["session-transcript", "history"];
+    case "orchestrator_chat_projection":
+      return ["orchestrator-chat", "sidebar", "dashboard"];
+  }
+}
+
 function createStatusServerWebProjectionRevisionProviders(
   options: StatusServerOptions,
 ): readonly WebProjectionRevisionProvider[] {
   const providers: WebProjectionRevisionProvider[] = [...(options.webProjectionRevisionProviders ?? [])];
   const runStoreProvider = createStatusServerStoreRevisionProvider("runStore", options.runStore);
   if (runStoreProvider) providers.push(runStoreProvider);
+  const runActivityProvider = createStatusServerStoreRevisionProvider("run_activity", options.runActivitySourceStore);
+  if (runActivityProvider) providers.push(runActivityProvider);
   const lifecycleStoreProvider = createStatusServerStoreRevisionProvider("lifecycleStore", options.lifecycleStore);
   if (lifecycleStoreProvider) providers.push(lifecycleStoreProvider);
   const writebackOutboxProvider = createStatusServerStoreRevisionProvider("writebackOutbox", options.writebackOutbox);
@@ -2591,7 +2853,7 @@ function createStatusServerStoreRevisionProvider(
     getRevision: () => ({ source, revision: store.projectionRevision(), observedAt: null }),
     subscribe: (listener: WebProjectionRevisionListener) =>
       store.onProjectionChanged((event) => {
-        listener({ source: event.source || source, revision: event.revision, observedAt: null });
+        listener({ source: event.source || source, revision: event.revision, observedAt: null, detail: event.detail ?? null });
       }),
   };
 }
@@ -2672,11 +2934,12 @@ function runActivityEventsPageToTranscriptPage(sourcePage: RunActivityEventsPage
 
 function statusServerProjectionSourceRevisions(
   sourceIndex: BuiltWebProjectionSourceIndex | null,
-  options: Pick<StatusServerOptions, "runStore" | "lifecycleStore" | "writebackOutbox">,
+  options: Pick<StatusServerOptions, "runStore" | "runActivitySourceStore" | "lifecycleStore" | "writebackOutbox">,
 ): ProjectionSourceRevision[] {
   if (sourceIndex) return sourceIndex.durableSourceRevisions.map(toProjectionSourceRevision);
   return [
     statusServerStoreProjectionSourceRevision("runStore", options.runStore),
+    statusServerStoreProjectionSourceRevision("run_activity", options.runActivitySourceStore),
     statusServerStoreProjectionSourceRevision("lifecycleStore", options.lifecycleStore),
     statusServerStoreProjectionSourceRevision("writebackOutbox", options.writebackOutbox),
   ].filter((revision): revision is ProjectionSourceRevision => revision !== null);
@@ -2770,22 +3033,6 @@ function statusServerTranscriptProjectionSourceRevisions(
       observedAt: lastEvent?.at ?? run.updatedAt,
     },
   ];
-}
-
-function statusServerOrchestratorChatProjectionSourceRevisions(
-  store: OrchestratorConversationStore | undefined,
-  chat: readonly ChatMessage[],
-  conversationId?: string | null,
-): ProjectionSourceRevision[] {
-  const storeRevision = statusServerStoreProjectionSourceRevision("orchestrator_conversations", store);
-  const lastMessage = chat.at(-1) ?? null;
-  const conversationKey = orchestratorChatProjectionScopeKey(conversationId);
-  const chatRevision: ProjectionSourceRevision = {
-    source: `orchestrator_chat:${conversationKey}`,
-    revision: [chat.length, lastMessage?.id ?? "none", lastMessage?.updatedAt ?? lastMessage?.createdAt ?? "unknown"].join(":"),
-    observedAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null,
-  };
-  return storeRevision ? [storeRevision, chatRevision] : [chatRevision];
 }
 
 function statusServerStoreProjectionSourceRevision(source: string, store: unknown): ProjectionSourceRevision | null {
@@ -3037,31 +3284,297 @@ function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage)
   };
 }
 
+type WebOrchestratorChatProjectionResponse = {
+  readonly schemaVersion: number;
+  readonly conversation: OrchestratorChatProjectionPayload["conversation"];
+  readonly state: OrchestratorChatProjectionPayload["state"];
+  readonly status: OrchestratorChatProjectionPayload["status"];
+  readonly chat: ChatMessage[];
+  readonly source: OrchestratorChatProjectionPayload["source"];
+  readonly compatibility?: {
+    readonly responseShape: "orchestrator_chat_projection";
+    readonly sourceShape: "reducer_envelope" | "legacy_chat_array" | "fallback";
+  };
+};
+
+const ORCHESTRATOR_CHAT_CONVERSATION_STATUSES: readonly OrchestratorConversationStatus[] = [
+  "pending",
+  "streaming",
+  "completed",
+  "failed",
+  "disabled",
+  "unavailable",
+];
+
 function orchestratorChatProjectionSourceCursors(
-  chat: readonly ChatMessage[],
-  conversationId?: string | null,
+  projection: OrchestratorChatProjectionPayload,
 ): Record<string, unknown> {
-  const lastMessage = chat.at(-1) ?? null;
+  const lastMessage = projection.chat.at(-1) ?? null;
   return {
-    conversationKey: orchestratorChatProjectionScopeKey(conversationId),
-    messageCount: chat.length,
+    conversationKey: orchestratorChatProjectionScopeKey(projection.conversation.id),
+    conversationStatus: projection.conversation.status,
+    state: projection.state,
+    messageCount: projection.chat.length,
+    latestMessageSequence: projection.source.latestMessageSequence,
+    latestMessageUpdatedAt: projection.source.latestMessageUpdatedAt,
+    sourceRevision: projection.source.revision,
     lastMessageId: lastMessage?.id ?? null,
     lastMessageStatus: lastMessage?.status ?? null,
     lastMessageAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null,
   };
 }
 
-function webOrchestratorChatProjectionFromResponseBody(body: unknown): ChatMessage[] | null {
-  if (isWebOrchestratorChatProjection(body)) return body;
+function webOrchestratorChatProjectionFromResponseBody(
+  body: unknown,
+  conversationId?: string | null,
+): WebOrchestratorChatProjectionResponse | null {
+  if (isWebOrchestratorChatProjectionEnvelope(body)) return body;
+  if (isWebOrchestratorChatProjection(body)) {
+    return webOrchestratorChatLegacyProjection(body, conversationId);
+  }
   if (body && typeof body === "object" && !Array.isArray(body)) {
-    const chat = (body as { chat?: unknown }).chat;
-    if (isWebOrchestratorChatProjection(chat)) return chat;
+    const record = body as Record<string, unknown>;
+    if (isWebOrchestratorChatProjection(record.chat)) {
+      return webOrchestratorChatObjectProjection(record, record.chat, conversationId);
+    }
   }
   return null;
 }
 
+function webOrchestratorChatReadFallbackProjection(
+  conversationId: string | null | undefined,
+  read: DurableProjectionReadResult<unknown>,
+): WebOrchestratorChatProjectionResponse {
+  return webOrchestratorChatUnavailableProjection(conversationId, read.reason ?? read.status, read.status);
+}
+
+function webOrchestratorChatUnavailableProjection(
+  conversationId?: string | null,
+  reason = "orchestrator_chat_projection_unavailable",
+  projectionStatus?: string,
+): WebOrchestratorChatProjectionResponse {
+  const conversationKey = orchestratorChatProjectionScopeKey(conversationId);
+  const status = webOrchestratorChatStatusSummary([], "unavailable", "unavailable");
+  return {
+    schemaVersion: ORCHESTRATOR_CHAT_PROJECTION_SCHEMA_VERSION,
+    conversation: {
+      id: conversationKey,
+      status: "unavailable",
+      createdAt: null,
+      updatedAt: null,
+      messageCount: 0,
+      metadata: { reason, ...(projectionStatus ? { projectionStatus } : {}) },
+    },
+    state: "unavailable",
+    status,
+    chat: [],
+    source: {
+      source: ORCHESTRATOR_CHAT_PROJECTION_SOURCE,
+      revision: `unavailable:${reason}`,
+      observedAt: null,
+      conversationId: conversationKey,
+      latestMessageSequence: null,
+      latestMessageUpdatedAt: null,
+    },
+    compatibility: {
+      responseShape: "orchestrator_chat_projection",
+      sourceShape: "fallback",
+    },
+  };
+}
+
+function webOrchestratorChatLegacyProjection(
+  chat: ChatMessage[],
+  conversationId?: string | null,
+): WebOrchestratorChatProjectionResponse {
+  return webOrchestratorChatObjectProjection({ chat }, chat, conversationId, "legacy_chat_array");
+}
+
+function webOrchestratorChatObjectProjection(
+  body: Record<string, unknown>,
+  chat: ChatMessage[],
+  conversationId?: string | null,
+  sourceShape: "legacy_chat_array" | "reducer_envelope" = "reducer_envelope",
+): WebOrchestratorChatProjectionResponse {
+  const fallbackConversationId = orchestratorChatProjectionScopeKey(conversationId);
+  const rawConversation = objectRecord(body.conversation);
+  const rawStatus = objectRecord(body.status);
+  const rawSource = objectRecord(body.source);
+  const bodyState = normalizeWebOrchestratorChatProjectionState(body.state);
+  const statusState = normalizeWebOrchestratorChatProjectionState(rawStatus?.state);
+  const conversationStatus =
+    normalizeOrchestratorConversationStatus(rawConversation?.status) ??
+    normalizeOrchestratorConversationStatus(rawStatus?.conversationStatus) ??
+    webOrchestratorConversationStatusFromState(bodyState ?? statusState) ??
+    "completed";
+  const summarizedStatus = webOrchestratorChatStatusSummary(chat, conversationStatus, bodyState ?? statusState ?? undefined);
+  const status = {
+    ...summarizedStatus,
+    ...(statusState ? { state: statusState } : {}),
+    conversationStatus:
+      normalizeOrchestratorConversationStatus(rawStatus?.conversationStatus) ?? summarizedStatus.conversationStatus,
+    latestMessageStatus:
+      normalizeOrchestratorConversationStatus(rawStatus?.latestMessageStatus) ?? summarizedStatus.latestMessageStatus,
+    active: typeof rawStatus?.active === "boolean" ? rawStatus.active : summarizedStatus.active,
+    terminal: typeof rawStatus?.terminal === "boolean" ? rawStatus.terminal : summarizedStatus.terminal,
+    empty: typeof rawStatus?.empty === "boolean" ? rawStatus.empty : summarizedStatus.empty,
+    messageCount: normalizeNonNegativeInteger(rawStatus?.messageCount) ?? summarizedStatus.messageCount,
+    statusCounts: normalizeOrchestratorChatStatusCounts(rawStatus?.statusCounts) ?? summarizedStatus.statusCounts,
+  };
+  const state = bodyState ?? status.state;
+  const conversationKey = stringValue(rawConversation?.id) ?? fallbackConversationId;
+  const latestMessage = chat.at(-1) ?? null;
+  return {
+    schemaVersion: normalizeNonNegativeInteger(body.schemaVersion) ?? ORCHESTRATOR_CHAT_PROJECTION_SCHEMA_VERSION,
+    conversation: {
+      id: conversationKey,
+      status: conversationStatus,
+      createdAt: nullableStringValue(rawConversation?.createdAt),
+      updatedAt: nullableStringValue(rawConversation?.updatedAt),
+      messageCount: normalizeNonNegativeInteger(rawConversation?.messageCount) ?? chat.length,
+      metadata: sanitizeRecord(rawConversation?.metadata),
+    },
+    state,
+    status: { ...status, state },
+    chat,
+    source: {
+      source: stringValue(rawSource?.source) ?? (sourceShape === "legacy_chat_array" ? "legacy_chat_array" : ORCHESTRATOR_CHAT_PROJECTION_SOURCE),
+      revision: stringValue(rawSource?.revision) ?? webOrchestratorChatLegacyRevision(chat, conversationKey),
+      observedAt: nullableStringValue(rawSource?.observedAt),
+      conversationId: stringValue(rawSource?.conversationId) ?? conversationKey,
+      latestMessageSequence: normalizeNonNegativeInteger(rawSource?.latestMessageSequence),
+      latestMessageUpdatedAt: nullableStringValue(rawSource?.latestMessageUpdatedAt) ?? latestMessage?.updatedAt ?? latestMessage?.createdAt ?? null,
+    },
+    compatibility: {
+      responseShape: "orchestrator_chat_projection",
+      sourceShape,
+    },
+  };
+}
+
+function isWebOrchestratorChatProjectionEnvelope(value: unknown): value is WebOrchestratorChatProjectionResponse {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Boolean(
+    isWebOrchestratorChatProjection(record.chat) &&
+      normalizeWebOrchestratorChatProjectionState(record.state) &&
+      objectRecord(record.conversation) &&
+      objectRecord(record.status) &&
+      objectRecord(record.source),
+  );
+}
+
 function isWebOrchestratorChatProjection(value: unknown): value is ChatMessage[] {
   return Array.isArray(value) && value.every((item) => item && typeof item === "object" && typeof (item as ChatMessage).text === "string");
+}
+
+function webOrchestratorChatStatusSummary(
+  chat: readonly ChatMessage[],
+  conversationStatus: OrchestratorConversationStatus,
+  stateOverride?: OrchestratorChatProjectionState,
+): OrchestratorChatProjectionPayload["status"] {
+  const statusCounts = emptyWebOrchestratorChatStatusCounts();
+  for (const message of chat) statusCounts[webOrchestratorChatMessageStatus(message)] += 1;
+  const latestMessageStatus = chat.length > 0 ? webOrchestratorChatMessageStatus(chat[chat.length - 1]!) : null;
+  const noMessages = chat.length === 0;
+  const state = stateOverride ?? (noMessages && conversationStatus === "completed" ? "empty" : deriveWebOrchestratorChatState(conversationStatus, latestMessageStatus, statusCounts));
+  const active = state === "pending" || state === "streaming";
+  return {
+    state,
+    conversationStatus,
+    latestMessageStatus,
+    active,
+    terminal: !active && state !== "empty",
+    empty: noMessages,
+    messageCount: chat.length,
+    statusCounts,
+  };
+}
+
+function deriveWebOrchestratorChatState(
+  conversationStatus: OrchestratorConversationStatus,
+  latestMessageStatus: OrchestratorConversationStatus | null,
+  statusCounts: OrchestratorChatProjectionStatusCounts,
+): OrchestratorChatProjectionState {
+  if (latestMessageStatus === "pending" || latestMessageStatus === "streaming") return latestMessageStatus;
+  if (conversationStatus === "pending" || conversationStatus === "streaming") return conversationStatus;
+  if (latestMessageStatus === "failed" || latestMessageStatus === "unavailable" || latestMessageStatus === "disabled") return latestMessageStatus;
+  if (conversationStatus === "failed" || conversationStatus === "unavailable" || conversationStatus === "disabled") return conversationStatus;
+  if (statusCounts.streaming > 0) return "streaming";
+  if (statusCounts.pending > 0) return "pending";
+  if (statusCounts.failed > 0) return "failed";
+  if (statusCounts.unavailable > 0) return "unavailable";
+  if (statusCounts.disabled > 0) return "disabled";
+  return "completed";
+}
+
+function emptyWebOrchestratorChatStatusCounts(): OrchestratorChatProjectionStatusCounts {
+  return {
+    pending: 0,
+    streaming: 0,
+    completed: 0,
+    failed: 0,
+    disabled: 0,
+    unavailable: 0,
+  };
+}
+
+function webOrchestratorChatMessageStatus(message: ChatMessage): OrchestratorConversationStatus {
+  return normalizeOrchestratorConversationStatus(message.status) ?? "completed";
+}
+
+function normalizeWebOrchestratorChatProjectionState(value: unknown): OrchestratorChatProjectionState | null {
+  if (value === "empty") return "empty";
+  return normalizeOrchestratorConversationStatus(value);
+}
+
+function webOrchestratorConversationStatusFromState(
+  state: OrchestratorChatProjectionState | null,
+): OrchestratorConversationStatus | null {
+  if (!state) return null;
+  return state === "empty" ? "completed" : state;
+}
+
+function normalizeOrchestratorConversationStatus(value: unknown): OrchestratorConversationStatus | null {
+  return typeof value === "string" && ORCHESTRATOR_CHAT_CONVERSATION_STATUSES.includes(value as OrchestratorConversationStatus)
+    ? (value as OrchestratorConversationStatus)
+    : null;
+}
+
+function normalizeOrchestratorChatStatusCounts(value: unknown): OrchestratorChatProjectionStatusCounts | null {
+  const record = objectRecord(value);
+  if (!record) return null;
+  const counts = emptyWebOrchestratorChatStatusCounts();
+  for (const status of ORCHESTRATOR_CHAT_CONVERSATION_STATUSES) {
+    counts[status] = normalizeNonNegativeInteger(record[status]) ?? 0;
+  }
+  return counts;
+}
+
+function webOrchestratorChatLegacyRevision(chat: readonly ChatMessage[], conversationId: string): string {
+  const lastMessage = chat.at(-1) ?? null;
+  return [conversationId, chat.length, lastMessage?.id ?? "none", lastMessage?.updatedAt ?? lastMessage?.createdAt ?? "unknown"].join(":");
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function nullableStringValue(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function normalizeNonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function sanitizeRecord(value: unknown): Record<string, unknown> {
+  const sanitized = sanitizePublicJson(value ?? {});
+  return sanitized && typeof sanitized === "object" && !Array.isArray(sanitized) ? (sanitized as Record<string, unknown>) : {};
 }
 
 function firstChatMetadataString(chat: readonly ChatMessage[], ...keys: readonly string[]): string | null {
@@ -3193,6 +3706,7 @@ function durableProjectionReadHeaders(read: DurableProjectionReadResult<unknown>
   if (record.expiresAt ?? record.revision.expiresAt) {
     headers["x-symphony-projection-expires-at"] = record.expiresAt ?? record.revision.expiresAt ?? "";
   }
+  headers["x-symphony-projection-build-mode"] = record.revision.buildMode;
   if (record.revision.contentSha256) headers["x-symphony-projection-content-sha256"] = record.revision.contentSha256;
   if (record.payloadSha256) headers["x-symphony-projection-payload-sha256"] = record.payloadSha256;
   headers["x-symphony-projection-source-revisions"] = headerJsonValue(record.revision.sourceRevisions);

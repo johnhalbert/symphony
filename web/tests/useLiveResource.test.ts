@@ -133,6 +133,43 @@ describe("live resource realtime mapping", () => {
     ]);
   });
 
+  it("maps run updates to history, sidebar, and dashboard refreshes without issue-board blocking", () => {
+    const event = eventFor(
+      [
+        { kind: "history", href: "/api/v1/web/history", relation: "refetch" },
+        { kind: "sidebar", href: "/api/v1/web/sidebar", relation: "refetch" },
+        { kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" },
+      ],
+      { type: "run.updated" },
+    );
+
+    expect(liveResourceKeysForRealtimeEvent(event)).toEqual(["history", "sidebar", "dashboard"]);
+    expect(realtimeRefreshHrefsForEvent(event)).toEqual(["/api/v1/web/history", "/api/v1/web/sidebar", "/api/v1/web/dashboard"]);
+  });
+
+  it("routes issue projection updates to dashboard, issue board, and sidebar without refreshing history", () => {
+    const event = eventFor(
+      [
+        { kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" },
+        { kind: "issue-board", href: "/api/v1/web/issues", relation: "refetch" },
+        { kind: "sidebar", href: "/api/v1/web/sidebar", relation: "refetch" },
+        { kind: "history", href: "/api/v1/web/history", relation: "refetch" },
+      ],
+      {
+        payload: {
+          source: "trackerIssues",
+          sourceRevision: 9,
+          detail: null,
+          resourceKinds: ["dashboard", "issue-board", "sidebar", "history"],
+          resourcesChanged: ["dashboard", "issue-board", "sidebar"],
+        },
+      },
+    );
+
+    expect(liveResourceKeysForRealtimeEvent(event)).toEqual(["dashboard", "issueBoard", "sidebar"]);
+    expect(realtimeRefreshHrefsForEvent(event)).toEqual(["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/sidebar"]);
+  });
+
   it("maps transcript template events to history and selected transcript refresh tokens", () => {
     const event = eventFor(
       [

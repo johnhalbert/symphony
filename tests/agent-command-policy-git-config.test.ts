@@ -194,6 +194,12 @@ describe("AgentCommandPolicy unsafe inline environment and per-command Git confi
       unsafeConfigCategories: ["credential_helper"],
     },
     {
+      name: "core askPass helper config",
+      command: "git -c core.askPass=./askpass status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["credential_helper"],
+    },
+    {
       name: "hooks path config",
       command: "git -c core.hooksPath=.githooks status --short",
       gitSubcommand: "status",
