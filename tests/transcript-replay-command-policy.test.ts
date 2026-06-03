@@ -186,8 +186,16 @@ describe("command policy transcript replay and persistence", () => {
     expect(policyEvidence(replayed.commandPolicy)).toEqual(policyEvidence(afterAppend?.commandPolicy));
     expect(replayed.messages).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ kind: "status", state: "command_policy_decision", text: expect.stringContaining("Allowed helper-free") }),
-        expect.objectContaining({ kind: "status", state: "command_policy_decision", text: expect.stringContaining("Blocked worker/reviewer") }),
+        expect.objectContaining({
+          kind: "status",
+          state: "command_policy_decision",
+          text: "Command policy allow: local_only_inspection (worker · implementation · terminal_execute)",
+        }),
+        expect.objectContaining({
+          kind: "status",
+          state: "command_policy_decision",
+          text: "Command policy deny: upstream_github (worker · implementation · terminal_execute)",
+        }),
       ]),
     );
   });

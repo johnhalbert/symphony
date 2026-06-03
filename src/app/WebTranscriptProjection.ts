@@ -284,7 +284,7 @@ function projectCommandPolicyStatusMessage(
     kind: "status",
     state: "command_policy_decision",
     ts: event.at,
-    text: firstCleanString(payload.message, payload.textPreview, payload.messagePreview, event.message) ?? commandPolicyStatusFallbackText(policy),
+    text: commandPolicyStatusFallbackText(policy),
     policy,
   };
 }
@@ -549,11 +549,12 @@ function isCommandPolicyDecisionEvent(
   payloadKind: string | null,
   payload: Record<string, unknown>,
 ): boolean {
+  const reasonKind = payload.reasonKind ?? payload.reason_kind;
   return (
     eventType === "command_policy_decision" ||
     payloadKind === "command_policy_decision" ||
     (typeof payload.outcome === "string" &&
-      typeof payload.reasonKind === "string" &&
+      typeof reasonKind === "string" &&
       typeof payload.role === "string" &&
       typeof payload.phase === "string" &&
       typeof payload.surface === "string")

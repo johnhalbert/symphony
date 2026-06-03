@@ -162,7 +162,7 @@ describe("projectWebTranscript", () => {
         kind: "status",
         state: "command_policy_decision",
         ts: "2026-01-01T00:00:00.000Z",
-        text: "Blocked command containing [redacted] for https://[redacted]@github.com/owner/repo.git",
+        text: "Command policy deny: upstream_github (worker · implementation · terminal_execute)",
         policy: {
           outcome: "deny",
           reasonKind: "upstream_github",

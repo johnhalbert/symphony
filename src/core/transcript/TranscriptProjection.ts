@@ -88,6 +88,16 @@ const COMMAND_POLICY_HELPER_PATH_KEYS = new Set([
   "sshaskpass",
   "sshcommand",
 ]);
+const COMMAND_POLICY_DISPLAY_TEXT_FIELDS = ["message", "messagePreview", "text", "textPreview"] as const;
+const COMMAND_POLICY_DISPLAY_TEXT_KEYS = new Set([
+  "message",
+  "messagepreview",
+  "statustext",
+  "statusmessage",
+  "statusmessagepreview",
+  "text",
+  "textpreview",
+]);
 
 export interface RedactedPreview {
   preview: string | null;
@@ -176,14 +186,19 @@ export function sanitizeCommandPolicyReplayStateForPublicOutput(
     decisions: value.decisions.map(
       (decision) => sanitizeCommandPolicyPayloadForPublicOutput(decision, 1_000) as PersistedCommandPolicyDecisionRecord,
     ),
-    malformedEvents: sanitizePublicJson(value.malformedEvents, 1_000) as PersistedCommandPolicyReplayState["malformedEvents"],
+    malformedEvents: value.malformedEvents.map(
+      (event) => sanitizeCommandPolicyPayloadForPublicOutput(event, 1_000) as PersistedCommandPolicyReplayState["malformedEvents"][number],
+    ),
   };
 }
 
 export function sanitizeAgentEventForPublicOutput(event: AgentEvent): AgentEvent {
   switch (event.type) {
     case "progress":
-      return withSanitizedAgentEventExtras({ ...event, message: sanitizedProgressMessage(event) });
+      return withSanitizedAgentEventExtras({
+        ...event,
+        message: isCommandPolicyRunActivity(event.runActivity) ? REDACTED_COMMAND_PAYLOAD : sanitizedProgressMessage(event),
+      });
     case "run_diagnostic":
       return withSanitizedAgentEventExtras({
         ...event,
@@ -224,8 +239,9 @@ function sanitizeRunActivityForPublicOutput(runActivity: unknown): unknown {
     if (!isRecord(runActivity) || !isRecord(sanitized)) return sanitized;
     const output: Record<string, unknown> = { ...sanitized };
     output.payload = sanitizeCommandPolicyPayloadForPublicOutput(runActivity.payload, 1_000);
-    const text = sanitizedPreviewValue(runActivity.text, 1_000);
-    if (text.preview !== null) output.text = text.preview;
+    for (const field of COMMAND_POLICY_DISPLAY_TEXT_FIELDS) {
+      if (runActivity[field] !== undefined) output[field] = REDACTED_COMMAND_PAYLOAD;
+    }
     return output;
   }
 
@@ -270,10 +286,11 @@ function isCommandPolicyTranscriptEvent(event: TranscriptEvent): boolean {
 function isCommandPolicyPayload(value: unknown): boolean {
   if (!isRecord(value)) return false;
   const kind = normalizePublicToken(value.kind) ?? normalizePublicToken(value.type);
+  const reasonKind = value.reasonKind ?? value.reason_kind;
   return (
     kind === "command_policy_decision" ||
     (typeof value.outcome === "string" &&
-      typeof value.reasonKind === "string" &&
+      typeof reasonKind === "string" &&
       typeof value.role === "string" &&
       typeof value.phase === "string" &&
       typeof value.surface === "string")
@@ -282,16 +299,43 @@ function isCommandPolicyPayload(value: unknown): boolean {
 
 export function projectTranscriptEventForPublicRead(event: TranscriptEvent): TranscriptEvent {
   const assistantDelta = isTranscriptAssistantDeltaEvent(event);
+  const commandPolicyEvent = isCommandPolicyTranscriptEvent(event);
   return {
     ...event,
-    ...(event.message === undefined ? {} : { message: sanitizedEventMessageForPublicRead(event.message, assistantDelta) }),
+    ...(event.message === undefined
+      ? {}
+      : { message: sanitizedEventMessageForPublicRead(event.message, assistantDelta, commandPolicyEvent, event) }),
     ...(event.payload === undefined ? {} : { payload: sanitizedEventPayloadForPublicRead(event.payload, assistantDelta, event) }),
   };
 }
 
-function sanitizedEventMessageForPublicRead(message: string, assistantDelta: boolean): string {
+function sanitizedEventMessageForPublicRead(
+  message: string,
+  assistantDelta: boolean,
+  commandPolicyEvent: boolean,
+  event: TranscriptEvent,
+): string {
+  if (commandPolicyEvent) return commandPolicyFallbackTextForPublicRead(event);
   const preview = assistantDelta ? sanitizedDeltaTextValue(message) : sanitizedPreviewValue(message);
   return preview.preview ?? "";
+}
+
+function commandPolicyFallbackTextForPublicRead(event: TranscriptEvent): string {
+  const payload = isRecord(event.payload) ? event.payload : {};
+  const outcome = safeCommandPolicyMetadataLabel(payload.outcome) ?? "decision";
+  const reason = safeCommandPolicyMetadataLabel(payload.reasonKind) ?? safeCommandPolicyMetadataLabel(payload.reason_kind);
+  const scope = [payload.role, payload.phase, payload.surface]
+    .map((value) => safeCommandPolicyMetadataLabel(value))
+    .filter((value): value is string => value !== null)
+    .join(" · ");
+  return `Command policy ${outcome}${reason ? `: ${reason}` : ""}${scope ? ` (${scope})` : ""}`;
+}
+
+function safeCommandPolicyMetadataLabel(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const preview = sanitizedPreviewValue(value, 80).preview?.trim();
+  if (!preview || !/^[a-z0-9_.:-]+$/i.test(preview)) return null;
+  return preview;
 }
 
 function sanitizedEventPayloadForPublicRead(payload: unknown, assistantDelta: boolean, event: TranscriptEvent): unknown {
@@ -340,6 +384,7 @@ function sanitizeCommandPolicyPublicValue(value: unknown, key: string | null, de
     if (COMMAND_POLICY_COMMAND_VALUE_KEYS.has(normalizedKey)) return value === null ? null : REDACTED_COMMAND_PAYLOAD;
     if (COMMAND_POLICY_ENVIRONMENT_VALUE_KEYS.has(normalizedKey)) return value === null ? null : REDACTED_ENVIRONMENT_VALUES;
     if (COMMAND_POLICY_HELPER_PATH_KEYS.has(normalizedKey)) return value === null ? null : REDACTED_HELPER_PATH;
+    if (COMMAND_POLICY_DISPLAY_TEXT_KEYS.has(normalizedKey)) return value === null ? null : REDACTED_COMMAND_PAYLOAD;
   }
 
   if (typeof value === "string") return sanitizedPreviewValue(value).preview ?? "";
