@@ -144,10 +144,30 @@ function realtimePayloadForTestEvent(
     return { ...base, runId: null, sessionId: null, afterSequence: null, eventCount: null };
   }
   if (type === "orchestrator.message") {
-    return { ...base, conversationId: null, messageCount: null, inputLength: null, status: null };
+    return {
+      ...base,
+      conversationId: null,
+      messageCount: null,
+      inputLength: null,
+      status: null,
+      lastMessageId: null,
+      lastMessageStatus: null,
+      lastMessageAt: null,
+    };
   }
   if (type === "source.status") {
-    return { ...base, status: null, fetchedStates: [], fetchedAt: null, cached: null, error: null, issueCount: null };
+    return {
+      ...base,
+      status: null,
+      fetchedStates: [],
+      fetchedAt: null,
+      cached: null,
+      error: null,
+      issueCount: null,
+      sourceRevisions: [],
+      sourceCursors: null,
+      sourceFreshness: [],
+    };
   }
   return {
     ...base,

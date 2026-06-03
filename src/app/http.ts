@@ -128,7 +128,7 @@ import {
   type ProjectionSourceRevision,
   type ProjectionWriteResult,
 } from "../core/persistence/ProjectionTransactionService.js";
-import type { ProjectionSourceFreshnessInput } from "../core/persistence/ProjectionSourceFreshness.js";
+import type { ProjectionSourceFreshness, ProjectionSourceFreshnessInput } from "../core/persistence/ProjectionSourceFreshness.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -2521,17 +2521,140 @@ function webProjectionSourceRevisionFromProjectionPublication(
   publication: ProjectionRevisionPublication,
 ): WebProjectionSourceRevision {
   return {
-    source: `${publication.projectionName}:${publication.scopeKind}:${publication.scopeKey}`,
+    source: durableProjectionRealtimeSource(publication),
     revision: publication.revision,
     observedAt: publication.generatedAt,
-    detail: {
-      source: "projection",
-      projectionName: publication.projectionName,
-      scopeKind: publication.scopeKind,
-      scopeKey: publication.scopeKey,
-      resourcesChanged: realtimeResourceKindsForDurableProjection(publication.projectionName),
-    },
+    detail: realtimeDetailFromProjectionPublication(publication),
   };
+}
+
+function durableProjectionRealtimeSource(publication: ProjectionRevisionPublication): string {
+  return `${publication.projectionName}:${publication.scopeKind}:${publication.scopeKey}`;
+}
+
+function realtimeDetailFromProjectionPublication(publication: ProjectionRevisionPublication): Readonly<Record<string, unknown>> {
+  const sourceCursors = realtimeSafeRecord(publication.sourceCursors);
+  const sourceFreshness = publication.sourceFreshness.map(realtimeSourceFreshnessDetail);
+  const primaryFreshness = sourceFreshness[0] ?? null;
+  const detail: Record<string, unknown> = {
+    source: "projection",
+    projectionName: publication.projectionName,
+    scopeKind: publication.scopeKind,
+    scopeKey: publication.scopeKey,
+    projectionRevisionId: publication.projectionRevisionId,
+    contentSha256: publication.contentSha256,
+    expiresAt: publication.expiresAt,
+    resourcesChanged: realtimeResourceKindsForDurableProjection(publication.projectionName),
+    sourceRevisions: publication.sourceRevisions.map(realtimeProjectionSourceRevisionDetail),
+    sourceCursors,
+    sourceFreshness,
+  };
+
+  if (primaryFreshness) {
+    detail.checkedAt = recordStringValue(primaryFreshness, "checkedAt");
+    detail.fetchedAt = recordStringValue(primaryFreshness, "checkedAt");
+  }
+
+  return {
+    ...detail,
+    ...durableProjectionSpecificRealtimeDetail(publication, sourceCursors),
+  };
+}
+
+function realtimeProjectionSourceRevisionDetail(revision: ProjectionSourceRevision): Record<string, unknown> {
+  return { source: revision.source, revision: revision.revision, observedAt: revision.observedAt };
+}
+
+function realtimeSourceFreshnessDetail(freshness: ProjectionSourceFreshness): Record<string, unknown> {
+  return realtimeSafeRecord({
+    source: freshness.source,
+    status: freshness.status,
+    checkedAt: freshness.checkedAt,
+    revision: freshness.revision,
+    lastSuccessAt: freshness.lastSuccessAt,
+    lastErrorAt: freshness.lastErrorAt,
+    staleMs: freshness.staleMs,
+    detail: freshness.detail,
+  });
+}
+
+function durableProjectionSpecificRealtimeDetail(
+  publication: ProjectionRevisionPublication,
+  sourceCursors: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  switch (publication.projectionName) {
+    case "transcript_projection":
+      return transcriptProjectionRealtimeDetail(sourceCursors);
+    case "orchestrator_chat_projection":
+      return orchestratorChatProjectionRealtimeDetail(publication, sourceCursors);
+    case "dashboard_projection":
+    case "issue_board_projection":
+    case "sidebar_projection":
+    case "history_projection":
+      return {};
+  }
+}
+
+function transcriptProjectionRealtimeDetail(sourceCursors: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const firstSequence = recordNumberValue(sourceCursors, "firstSequence");
+  const afterSequence =
+    recordNumberValue(sourceCursors, "afterSequence") ??
+    (firstSequence === null ? recordNumberValue(sourceCursors, "offset") : Math.max(0, firstSequence - 1));
+  const detail: Record<string, unknown> = {};
+  copyStringRecordField(detail, sourceCursors, "runId");
+  copyStringRecordField(detail, sourceCursors, "sessionId");
+  copyStringRecordField(detail, sourceCursors, "issueKey");
+  if (typeof detail.issueKey === "string") detail.issueIdentifier = detail.issueKey;
+  copyNumberRecordField(detail, sourceCursors, "offset");
+  copyNumberRecordField(detail, sourceCursors, "limit");
+  copyNumberRecordField(detail, sourceCursors, "nextOffset");
+  copyNumberRecordField(detail, sourceCursors, "eventCount");
+  copyNumberRecordField(detail, sourceCursors, "firstSequence");
+  copyNumberRecordField(detail, sourceCursors, "lastSequence");
+  copyStringRecordField(detail, sourceCursors, "lastEventAt");
+  if (afterSequence !== null) detail.afterSequence = afterSequence;
+  return detail;
+}
+
+function orchestratorChatProjectionRealtimeDetail(
+  publication: ProjectionRevisionPublication,
+  sourceCursors: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const conversationId =
+    recordStringValue(sourceCursors, "conversationId") ?? recordStringValue(sourceCursors, "conversationKey") ?? publication.scopeKey;
+  const detail: Record<string, unknown> = { conversationId, conversationKey: conversationId };
+  copyNumberRecordField(detail, sourceCursors, "messageCount");
+  copyStringRecordField(detail, sourceCursors, "lastMessageId");
+  copyStringRecordField(detail, sourceCursors, "lastMessageStatus");
+  copyStringRecordField(detail, sourceCursors, "lastMessageAt");
+  return detail;
+}
+
+function realtimeSafeRecord(value: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const sanitized = sanitizePublicJson(value, 1_000);
+  return isRecord(sanitized) ? sanitized : {};
+}
+
+function copyStringRecordField(output: Record<string, unknown>, input: Readonly<Record<string, unknown>>, key: string): void {
+  const value = recordStringValue(input, key);
+  if (value !== null) output[key] = value;
+}
+
+function copyNumberRecordField(output: Record<string, unknown>, input: Readonly<Record<string, unknown>>, key: string): void {
+  const value = recordNumberValue(input, key);
+  if (value !== null) output[key] = value;
+}
+
+function recordStringValue(record: Readonly<Record<string, unknown>>, key: string): string | null {
+  const value = record[key];
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function recordNumberValue(record: Readonly<Record<string, unknown>>, key: string): number | null {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function realtimeResourceKindsForDurableProjection(projectionName: DurableProjectionName): readonly RealtimeResourceKind[] {

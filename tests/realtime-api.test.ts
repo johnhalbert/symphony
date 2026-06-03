@@ -328,33 +328,42 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
-  it("streams realtime and legacy SSE events from durable projection publications", async () => {
+  it("streams realtime and legacy SSE events from durable projection publications to multiple subscribers", async () => {
     const projectionWriter = fakeProjectionWriter();
     const server = createRealtimeServer({ projectionWriter });
     const address = await server.start();
     const baseUrl = `http://${address.host}:${address.port}`;
     const realtimeClient = await openSseClient(`${baseUrl}/api/v1/realtime`);
+    const secondRealtimeClient = await openSseClient(`${baseUrl}/api/v1/realtime`);
     const legacyClient = await openSseClient(`${baseUrl}/api/v1/web/events`);
 
     try {
-      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 2, "both SSE subscribers to register");
       await expect(legacyClient.nextEvent()).resolves.toMatchObject({ event: "projection_ready" });
 
-      projectionWriter.publish({
-        projectionName: "history_projection",
-        scopeKind: "global",
-        scopeKey: "global",
-        projectionRevisionId: "projection-revision-1",
-        revision: 3,
-        contentSha256: "history-sha",
-        generatedAt: "2026-01-01T00:00:02.000Z",
-        expiresAt: null,
-        sourceRevisions: [],
-        sourceCursors: {},
-        sourceFreshness: [],
-      });
+      const firstRealtimeProjection = realtimeClient.nextEventOfType("projection.updated");
+      const secondRealtimeProjection = secondRealtimeClient.nextEventOfType("projection.updated");
+      projectionWriter.publish(
+        projectionPublication({
+          projectionName: "history_projection",
+          scopeKind: "global",
+          scopeKey: "global",
+          projectionRevisionId: "projection-revision-1",
+          revision: 3,
+          contentSha256: "history-sha",
+          generatedAt: "2026-01-01T00:00:02.000Z",
+        }),
+      );
 
-      const realtime = await realtimeClient.nextEventOfType("projection.updated");
+      const [realtime, secondRealtime] = await Promise.all([firstRealtimeProjection, secondRealtimeProjection]);
+      expect(secondRealtime.event).toBe(realtime.event);
+      expect(secondRealtime.id).toBe(realtime.id);
+      expect(secondRealtime.data).toEqual(realtime.data);
+      const [sourceStatus, secondSourceStatus] = await Promise.all([realtimeClient.nextEvent(), secondRealtimeClient.nextEvent()]);
+      expect(sourceStatus.event).toBe("source.status");
+      expect(secondSourceStatus.event).toBe(sourceStatus.event);
+      expect(secondSourceStatus.id).toBe(sourceStatus.id);
+      expect(secondSourceStatus.data).toEqual(sourceStatus.data);
       expect(realtime.data).toMatchObject({
         type: "projection.updated",
         source: { source: "history_projection:global:global", revision: 3, observedAt: "2026-01-01T00:00:02.000Z" },
@@ -379,7 +388,206 @@ describe("StatusServer realtime SSE API", () => {
       });
     } finally {
       await realtimeClient.close();
+      await secondRealtimeClient.close();
       await legacyClient.close();
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "both SSE subscribers to disconnect");
+      await server.stop();
+    }
+  });
+
+  it("emits typed realtime events and freshness payloads from durable transcript and orchestrator projection publications", async () => {
+    const projectionWriter = fakeProjectionWriter();
+    const server = createRealtimeServer({ projectionWriter });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      projectionWriter.publish(
+        projectionPublication({
+          projectionName: "transcript_projection",
+          scopeKind: "run_page",
+          scopeKey: "run-durable-transcript:0:50",
+          projectionRevisionId: "projection-revision-transcript",
+          revision: 11,
+          contentSha256: "transcript-sha",
+          generatedAt: "2026-01-01T00:00:03.000Z",
+          sourceRevisions: [
+            { source: "runs", revision: 10, observedAt: "2026-01-01T00:00:02.000Z" },
+            {
+              source: "transcript:run-durable-transcript",
+              revision: "2:5:2026-01-01T00:00:02.500Z",
+              observedAt: "2026-01-01T00:00:02.500Z",
+            },
+          ],
+          sourceCursors: {
+            runId: "run-durable-transcript",
+            sessionId: "session-durable-transcript",
+            issueKey: "ENG-214",
+            offset: 0,
+            limit: 50,
+            nextOffset: 2,
+            eventCount: 2,
+            firstSequence: 4,
+            lastSequence: 5,
+            lastEventAt: "2026-01-01T00:00:02.500Z",
+          },
+          sourceFreshness: [
+            {
+              source: "run_activity",
+              status: "fresh",
+              checkedAt: "2026-01-01T00:00:03.000Z",
+              revision: 10,
+              lastSuccessAt: "2026-01-01T00:00:03.000Z",
+              lastErrorAt: null,
+              staleMs: null,
+              detail: "durable transcript projection is current",
+            },
+          ],
+        }),
+      );
+
+      const transcriptProjection = await client.nextEventOfType("projection.updated");
+      const transcriptSource = await client.nextEventOfType("source.status");
+      const run = await client.nextEventOfType("run.updated");
+      const transcript = await client.nextEventOfType("transcript.delta");
+
+      expect(transcriptProjection.data).toMatchObject({
+        type: "projection.updated",
+        source: {
+          source: "transcript_projection:run_page:run-durable-transcript:0:50",
+          revision: 11,
+          observedAt: "2026-01-01T00:00:03.000Z",
+        },
+        payload: { resourcesChanged: ["session-transcript", "history"] },
+      });
+      expect(transcriptSource.data).toMatchObject({
+        type: "source.status",
+        scope: "source",
+        key: "projection",
+        source: { source: "transcript_projection:run_page:run-durable-transcript:0:50", revision: 11 },
+        detail: {
+          projectionName: "transcript_projection",
+          sourceRevisions: expect.arrayContaining([
+            { source: "runs", revision: 10, observedAt: "2026-01-01T00:00:02.000Z" },
+          ]),
+          sourceCursors: {
+            runId: "run-durable-transcript",
+            sessionId: "session-durable-transcript",
+            eventCount: 2,
+            firstSequence: 4,
+            lastSequence: 5,
+          },
+          sourceFreshness: expect.arrayContaining([
+            expect.objectContaining({ source: "run_activity", status: "fresh", revision: 10 }),
+          ]),
+        },
+        payload: {
+          status: "fresh",
+          fetchedAt: "2026-01-01T00:00:03.000Z",
+          sourceCursors: { runId: "run-durable-transcript", sessionId: "session-durable-transcript" },
+          sourceFreshness: expect.arrayContaining([
+            expect.objectContaining({ source: "run_activity", status: "fresh", checkedAt: "2026-01-01T00:00:03.000Z" }),
+          ]),
+        },
+      });
+      expect(run.data).toMatchObject({
+        type: "run.updated",
+        scope: "run",
+        key: "run-durable-transcript",
+        payload: { runId: "run-durable-transcript", issueIdentifier: "ENG-214", status: null },
+      });
+      expect(transcript.data).toMatchObject({
+        type: "transcript.delta",
+        scope: "session",
+        key: "session-durable-transcript",
+        payload: {
+          runId: "run-durable-transcript",
+          sessionId: "session-durable-transcript",
+          afterSequence: 3,
+          eventCount: 2,
+        },
+      });
+
+      projectionWriter.publish(
+        projectionPublication({
+          projectionName: "orchestrator_chat_projection",
+          scopeKind: "conversation",
+          scopeKey: "operator-room",
+          projectionRevisionId: "projection-revision-orchestrator",
+          revision: 12,
+          contentSha256: "orchestrator-sha",
+          generatedAt: "2026-01-01T00:00:04.000Z",
+          sourceRevisions: [
+            { source: "orchestrator_conversations", revision: 8, observedAt: null },
+            { source: "orchestrator_chat:operator-room", revision: "3:message-3:2026-01-01T00:00:03.500Z", observedAt: "2026-01-01T00:00:03.500Z" },
+          ],
+          sourceCursors: {
+            conversationKey: "operator-room",
+            messageCount: 3,
+            lastMessageId: "message-3",
+            lastMessageStatus: "completed",
+            lastMessageAt: "2026-01-01T00:00:03.500Z",
+          },
+          sourceFreshness: [
+            {
+              source: "orchestrator_chat:operator-room",
+              status: "fresh",
+              checkedAt: "2026-01-01T00:00:04.000Z",
+              revision: "3:message-3:2026-01-01T00:00:03.500Z",
+              lastSuccessAt: "2026-01-01T00:00:04.000Z",
+              lastErrorAt: null,
+              staleMs: null,
+              detail: "durable orchestrator chat projection is current",
+            },
+          ],
+        }),
+      );
+
+      const chatProjection = await client.nextEventOfType("projection.updated");
+      const chatSource = await client.nextEventOfType("source.status");
+      const chat = await client.nextEventOfType("orchestrator.message");
+
+      expect(chatProjection.data).toMatchObject({
+        type: "projection.updated",
+        source: { source: "orchestrator_chat_projection:conversation:operator-room", revision: 12 },
+        payload: { resourcesChanged: ["orchestrator-chat", "sidebar", "dashboard"] },
+      });
+      expect(chatSource.data).toMatchObject({
+        type: "source.status",
+        source: { source: "orchestrator_chat_projection:conversation:operator-room", revision: 12 },
+        payload: {
+          status: "fresh",
+          fetchedAt: "2026-01-01T00:00:04.000Z",
+          sourceCursors: {
+            conversationKey: "operator-room",
+            messageCount: 3,
+            lastMessageId: "message-3",
+            lastMessageStatus: "completed",
+          },
+          sourceFreshness: expect.arrayContaining([
+            expect.objectContaining({ source: "orchestrator_chat:operator-room", status: "fresh" }),
+          ]),
+        },
+      });
+      expect(chat.data).toMatchObject({
+        type: "orchestrator.message",
+        scope: "orchestrator",
+        key: "operator-room",
+        source: { source: "orchestrator_chat_projection:conversation:operator-room", revision: 12 },
+        payload: {
+          conversationId: "operator-room",
+          messageCount: 3,
+          lastMessageId: "message-3",
+          lastMessageStatus: "completed",
+          lastMessageAt: "2026-01-01T00:00:03.500Z",
+        },
+      });
+    } finally {
+      await client.close();
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "SSE subscriber to disconnect");
       await server.stop();
     }
   });
@@ -694,6 +902,23 @@ function createRealtimeServer(
 
 interface FakeProjectionWriter extends NonNullable<StatusServerOptions["projectionWriter"]> {
   publish(publication: ProjectionRevisionPublication): void;
+}
+
+function projectionPublication(overrides: Partial<ProjectionRevisionPublication> = {}): ProjectionRevisionPublication {
+  return {
+    projectionName: "history_projection",
+    scopeKind: "global",
+    scopeKey: "global",
+    projectionRevisionId: "projection-revision-default",
+    revision: 1,
+    contentSha256: "projection-sha",
+    generatedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: null,
+    sourceRevisions: [],
+    sourceCursors: {},
+    sourceFreshness: [],
+    ...overrides,
+  };
 }
 
 function fakeProjectionWriter(): FakeProjectionWriter {
