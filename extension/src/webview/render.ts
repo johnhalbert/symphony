@@ -252,7 +252,7 @@ function renderOpenWorkspaceAction(issueKey: string | null, workspace: Workspace
     </div>`;
   }
   return `<div class="row-actions">
-    <button type="button" data-action="openWorkspace" data-issue-key="${escapeHtml(issueKey ?? "")}">Open workspace</button>
+    <button type="button" data-action="openWorkspace" data-issue="${escapeHtml(issueKey ?? "")}">Open workspace</button>
   </div>`;
 }
 

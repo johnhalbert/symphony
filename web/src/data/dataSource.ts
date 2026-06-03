@@ -43,6 +43,13 @@ export interface CacheInvalidationOptions {
   forceRefreshHrefs?: readonly string[];
 }
 
+export interface TriggerPollResult {
+  queued: boolean;
+  coalesced?: boolean;
+  requested_at?: string;
+  operations?: readonly string[];
+}
+
 export interface SymphonyDataSource {
   getReferenceData(signal?: AbortSignal): Promise<ReferenceData>;
   getDashboard(signal?: AbortSignal): Promise<DashboardModel>;
@@ -54,7 +61,9 @@ export interface SymphonyDataSource {
   getSidebar(signal?: AbortSignal): Promise<SidebarModel>;
   getOrchestratorChat(signal?: AbortSignal): Promise<OrchestratorChatModel>;
   sendOrchestratorMessage(input: string): Promise<ChatMessage[]>;
+  triggerPoll?(): Promise<TriggerPollResult>;
   invalidateCachedReads?(options?: CacheInvalidationOptions): void;
   subscribeToProjectionChanges?(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe;
   subscribeToRealtimeEvents?(listener: RealtimeEventListener, options?: RealtimeSubscriptionOptions): RealtimeEventUnsubscribe;
 }
+

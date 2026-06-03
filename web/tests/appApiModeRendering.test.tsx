@@ -389,7 +389,15 @@ async function renderAppWithMocks({
     async sendOrchestratorMessage(input: string) {
       return [...apiChat, { who: "user", text: input } satisfies ChatMessage];
     },
-  } as SymphonyDataSource;
+    async triggerPoll() {
+      return {
+        queued: true,
+        coalesced: false,
+        requested_at: "2026-06-03T13:30:00.000Z",
+        operations: ["poll", "reconcile"],
+      };
+    },
+  } as unknown as SymphonyDataSource;
 
   vi.doMock("../src/data/dataSourceContext", () => ({
     defaultDataSourceConfig: { mode, apiBaseUrl: "" },
@@ -533,6 +541,12 @@ function expectUnavailableButton(markup: string, label: string) {
   expect(candidates.every(buttonIsUnavailable)).toBe(true);
 }
 
+function expectAvailableButton(markup: string, label: string) {
+  const candidates = renderedButtons(markup).filter((button) => buttonMatchesLabel(button, label));
+  expect(candidates.length).toBeGreaterThan(0);
+  expect(candidates.some((button) => !buttonIsUnavailable(button))).toBe(true);
+}
+
 function expectFreshDashboardBodyLiveIndicators(markup: string) {
   expect(markup).toContain("2 active · concurrency cap 9");
   expect(markup).toContain("Active sessions");
@@ -669,9 +683,11 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("API mode shows durable chat history only");
     expect(markup).not.toContain("Sending commands from this web chat is not supported yet");
     expectUnavailableButton(markup, "Status totals");
-    expectUnavailableButton(markup, "Trigger poll");
+    expectAvailableButton(markup, "Trigger poll");
     expectUnavailableButton(markup, "New issue");
     expectUnavailableButton(markup, "Orchestrator chat menu");
+    expectUnavailableButton(markup, "Search");
+    expectUnavailableButton(markup, "More");
 
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
@@ -900,6 +916,11 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("Sidebar refresh failed; showing previous sidebar projection. Symphony API returned HTTP 503");
     expect(markup).toContain("previous projection · 1 running");
     expect(markup).toContain("Sidebar fallback agent count");
+    expectUnavailableButton(markup, "Compact dashboard navigation");
+    expectUnavailableButton(markup, "Compact issue-board navigation");
+    expectUnavailableButton(markup, "Compact agent-status navigation");
+    expectUnavailableButton(markup, "Compact history navigation");
+    expectUnavailableButton(markup, "Compact chat navigation");
     expect(markup).not.toContain("1 live");
     expect(markup).not.toContain("animation:pulse");
     expect(markup).not.toContain("spinner");

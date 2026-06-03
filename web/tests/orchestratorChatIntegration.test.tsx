@@ -1,5 +1,9 @@
+// @vitest-environment happy-dom
+
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DashboardView } from "../src/components/dashboard/DashboardView";
 import { SidebarViews } from "../src/components/sidebar/SidebarViews";
 import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
@@ -8,6 +12,9 @@ import { DataSourceProvider } from "../src/data/dataSourceContext";
 import type { ChatMessage, DashboardModel, OrchestratorChatModel, OrchestratorChatState, SidebarModel } from "../src/types/symphony";
 
 const emptyChatCopy = "No durable orchestrator chat messages are available yet.";
+const mountedRoots: Root[] = [];
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const dashboardWithEmbeddedChat: DashboardModel = {
   projectName: "Symphony",
@@ -129,6 +136,46 @@ function chatModelForState(state: OrchestratorChatState, chat: ChatMessage[] = [
   });
 }
 
+async function renderInteractiveDashboardChat(input: {
+  chat: OrchestratorChatModel | ChatMessage[];
+  sendOrchestratorMessage: SymphonyDataSource["sendOrchestratorMessage"];
+}): Promise<HTMLElement> {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  mountedRoots.push(root);
+  const dataSource = {
+    ...dataSourceForChat(input.chat),
+    sendOrchestratorMessage: input.sendOrchestratorMessage,
+  };
+
+  await act(async () => {
+    root.render(
+      <DataSourceProvider value={dataSource}>
+        <DashboardView dashboard={dashboardWithEmbeddedChat} orchestratorChat={input.chat} />
+      </DataSourceProvider>,
+    );
+  });
+
+  return container;
+}
+
+function buttonByText(container: HTMLElement, text: string): HTMLButtonElement {
+  const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes(text));
+  if (!button) throw new Error(`Could not find button with text ${text}`);
+  return button as HTMLButtonElement;
+}
+
+afterEach(() => {
+  for (const root of mountedRoots.splice(0)) {
+    act(() => {
+      root.unmount();
+    });
+  }
+  document.body.innerHTML = "";
+  vi.clearAllMocks();
+});
+
 describe("dashboard orchestrator chat integration", () => {
   it("renders the dedicated orchestrator chat payload instead of embedded dashboard chat", () => {
     const markup = renderDashboardChat({
@@ -170,6 +217,13 @@ describe("dashboard orchestrator chat integration", () => {
       expect(markup).toContain(testCase.expected);
       expect(markup).toContain(`data-orchestrator-chat-state=\"${testCase.state}\"`);
       if (chat.length > 0) expect(markup).toContain(`durable ${testCase.state} message`);
+      if (testCase.state === "disabled" || testCase.state === "unavailable") {
+        expect(markup).toContain("no orchestrator action will be dispatched");
+        expect(markup).not.toContain("Ask about the project, or issue a command");
+        expect(markup).not.toContain("type=\"submit\"");
+      } else {
+        expect(markup).toContain("type=\"submit\"");
+      }
       expect(markup).not.toContain("dashboard embedded chat should not render");
       expect(markup).not.toContain("dashboard stale suggestion");
       expect(markup).not.toMatch(/fake message|placeholder message|mock message/i);
@@ -224,6 +278,41 @@ describe("dashboard orchestrator chat integration", () => {
     expect(markup).toContain("type=\"submit\"");
     expect(markup).not.toContain("API mode shows durable chat history only");
   });
+
+  it("dispatches enabled dashboard chat suggestions through the configured command endpoint", async () => {
+    const chat: ChatMessage[] = [{ who: "agent", text: "Ready for commands", suggestions: ["Show stalled agents"] }];
+    const sendOrchestratorMessage = vi.fn(async (input: string) => [
+      ...chat,
+      { who: "user", text: input } satisfies ChatMessage,
+      { who: "agent", text: "Command accepted by orchestrator" } satisfies ChatMessage,
+    ]);
+    const container = await renderInteractiveDashboardChat({ chat, sendOrchestratorMessage });
+
+    await act(async () => {
+      buttonByText(container, "Show stalled agents").click();
+      await Promise.resolve();
+    });
+
+    expect(sendOrchestratorMessage).toHaveBeenCalledWith("Show stalled agents");
+    expect(container.textContent).toContain("Command accepted by orchestrator");
+  });
+
+  it("surfaces dashboard chat command failures without rendering a fake success", async () => {
+    const chat: ChatMessage[] = [{ who: "agent", text: "Ready for commands", suggestions: ["Show stalled agents"] }];
+    const sendOrchestratorMessage = vi.fn(async () => {
+      throw new Error("Symphony API returned HTTP 503");
+    });
+    const container = await renderInteractiveDashboardChat({ chat, sendOrchestratorMessage });
+
+    await act(async () => {
+      buttonByText(container, "Show stalled agents").click();
+      await Promise.resolve();
+    });
+
+    expect(sendOrchestratorMessage).toHaveBeenCalledWith("Show stalled agents");
+    expect(container.textContent).toContain("Orchestrator command failed: Symphony API returned HTTP 503");
+    expect(container.textContent).not.toContain("Command accepted by orchestrator");
+  });
 });
 
 describe("sidebar orchestrator chat integration", () => {
@@ -266,6 +355,13 @@ describe("sidebar orchestrator chat integration", () => {
       expect(markup).toContain(testCase.expected);
       expect(markup).toContain(`data-orchestrator-chat-state=\"${testCase.state}\"`);
       if (chat.length > 0) expect(markup).toContain(`compact durable ${testCase.state} message`);
+      if (testCase.state === "disabled" || testCase.state === "unavailable") {
+        expect(markup).toContain("no orchestrator action will be dispatched");
+        expect(markup).toContain("chat commands unavailable");
+        expect(markup).not.toContain("Ask or command");
+      } else {
+        expect(markup).toContain("Ask or command");
+      }
       expect(markup).not.toContain("sidebar embedded chat should not render");
       expect(markup).not.toContain("sidebar stale suggestion");
       expect(markup).not.toMatch(/fake message|placeholder message|mock message/i);
