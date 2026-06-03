@@ -68,7 +68,7 @@ hermes profile
 hermes acp --check
 ```
 
-Configure `hermes.acp_binary_path` when the intended host `hermes` is not first on `PATH`. Configure `hermes.acp_source_profile` when the source profile should be a specific host profile rather than the active profile, and optionally configure `hermes.acp_profile_prefix` to identify Symphony-created clones. The source profile must already be authenticated for the configured provider/model, must pass `hermes acp --check` without interactive terminal setup, and must be safe to clone with `hermes profile create <disposable> --clone --clone-from <source> --no-alias`.
+Configure `hermes_acp.binary_path` when the intended host `hermes` is not first on `PATH`. Configure `hermes_acp.source_profile` when the source profile should be a specific host profile rather than the active profile, and optionally configure `hermes_acp.profile_prefix` to identify Symphony-created clones. The older `hermes.acp_binary_path`, `hermes.acp_source_profile`, and `hermes.acp_profile_prefix` aliases remain accepted for compatibility, but new workflows should use the `hermes_acp` section. The source profile must already be authenticated for the configured provider/model, must pass `hermes acp --check` without interactive terminal setup, and must be safe to clone with `hermes profile create <disposable> --clone --clone-from <source> --no-alias`.
 
 Run the opt-in ACP smoke only when host Hermes credentials are available:
 
@@ -80,7 +80,7 @@ The smoke strips vendored/managed Hermes environment overrides (`HERMES_HOME`, `
 
 Troubleshooting:
 
-- Missing binary: install host Hermes or set `hermes.acp_binary_path`/`--binary-path`; do not point this at `hermes/upstream-src`.
+- Missing binary: install host Hermes or set `hermes_acp.binary_path`/`--binary-path`; legacy `hermes.acp_binary_path` remains accepted. Do not point this at `hermes/upstream-src`.
 - Missing ACP dependencies: run `hermes acp --check` in the host profile and fix the host Hermes installation until it passes.
 - Auth failures or only terminal auth methods: refresh provider auth in the host source profile with the normal host Hermes auth flow, then rerun `hermes acp --check`; do not expect `HERMES_AUTH_HOME` or Symphony managed auth bootstrap to satisfy ACP.
 - Clone/create failures: choose a fresh `--profile-name` or remove stale smoke profiles with `hermes profile delete <name> --yes`.
