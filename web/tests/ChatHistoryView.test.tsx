@@ -1,7 +1,15 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// @vitest-environment happy-dom
+
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ChatHistoryView } from "../src/components/history/ChatHistoryView";
+import { ChatHistoryView, resolveSelectedSessionId } from "../src/components/history/ChatHistoryView";
 import type { HistoryModel, Loadable, SessionModel, TranscriptMessage } from "../src/types/symphony";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const mountedRoots: Root[] = [];
 
 const { useTranscriptMock } = vi.hoisted(() => ({
   useTranscriptMock: vi.fn<(sessionId: string | null, refreshToken?: unknown) => Loadable<TranscriptMessage[]>>(),
@@ -92,10 +100,46 @@ function transcriptState(overrides: Partial<Loadable<TranscriptMessage[]>> = {})
   };
 }
 
+function mountHistoryView(initialHistory: HistoryModel, refreshToken?: unknown) {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  mountedRoots.push(root);
+
+  act(() => {
+    root.render(<ChatHistoryView history={initialHistory} refreshToken={refreshToken} />);
+  });
+
+  return {
+    container,
+    rerender(nextHistory: HistoryModel, nextRefreshToken?: unknown) {
+      act(() => {
+        root.render(<ChatHistoryView history={nextHistory} refreshToken={nextRefreshToken} />);
+      });
+    },
+  };
+}
+
+afterEach(() => {
+  for (const root of mountedRoots.splice(0)) {
+    act(() => {
+      root.unmount();
+    });
+  }
+  document.body.innerHTML = "";
+});
+
 describe("ChatHistoryView", () => {
   beforeEach(() => {
     useTranscriptMock.mockReset();
     useTranscriptMock.mockReturnValue(transcriptState());
+  });
+
+  it("resolves selected sessions across refreshed history boundaries", () => {
+    expect(resolveSelectedSessionId("run-one", history())).toBe("run-one");
+    expect(resolveSelectedSessionId("missing", history())).toBe("run-two");
+    expect(resolveSelectedSessionId("", history({ defaultSessionId: "missing" }))).toBe("run-one");
+    expect(resolveSelectedSessionId("missing", history({ sessions: [], defaultSessionId: "" }))).toBe("");
   });
 
   it("requests and renders the default selected session transcript from the dedicated session endpoint", () => {
@@ -108,6 +152,48 @@ describe("ChatHistoryView", () => {
     expect(markup).toContain("Dedicated session transcript loaded from the API.");
     expect(markup).toContain("terminal");
     expect(markup).not.toContain("No transcript messages for this session.");
+  });
+
+  it("keeps selected session and scroll context while refreshed history adds and updates sessions", () => {
+    const view = mountHistoryView(history(), "initial-token");
+    const earlierButton = Array.from(view.container.querySelectorAll<HTMLButtonElement>(".session-row")).find((button) =>
+      button.textContent?.includes("Earlier session"),
+    );
+    expect(earlierButton).toBeTruthy();
+
+    act(() => {
+      earlierButton?.click();
+    });
+    expect(useTranscriptMock).toHaveBeenLastCalledWith("run-one", "initial-token");
+
+    const list = view.container.querySelector<HTMLDivElement>(".sessions__list");
+    if (!list) throw new Error("expected sessions list to render");
+    Object.defineProperties(list, {
+      clientHeight: { configurable: true, value: 300 },
+      scrollHeight: { configurable: true, value: 2400 },
+    });
+    act(() => {
+      list.scrollTop = 180;
+      list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+
+    const refreshedSessions: SessionModel[] = [
+      {
+        ...sessions[1],
+        id: "run-three",
+        issue: "ENG-120",
+        title: "New live session",
+        updatedAt: "2026-05-29T00:20:00.000Z",
+      },
+      { ...sessions[0], title: "Earlier session refreshed", msgCount: 5, lastEvent: "Realtime refresh applied" },
+      sessions[1],
+    ];
+    view.rerender(history({ sessions: refreshedSessions, defaultSessionId: "run-three" }), "refresh-token");
+
+    expect(view.container.textContent).toContain("New live session");
+    expect(view.container.querySelector('[data-selected="true"]')?.textContent).toContain("Earlier session refreshed");
+    expect(list?.scrollTop).toBe(180);
+    expect(useTranscriptMock).toHaveBeenLastCalledWith("run-one", "refresh-token");
   });
 
   it("renders dedicated selected-session transcript data even when embedded history data is present or omitted", () => {

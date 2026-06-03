@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import type { SessionModel } from "../../types/symphony";
 import { Icon, SessionStateChip, StatusBadgeDot, UnavailableButton } from "../common";
 
@@ -10,6 +11,23 @@ export function SessionsList({
   selectedId: string;
   onSelect: (sessionId: string) => void;
 }) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const scrollTopRef = useRef(0);
+
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    const maxScrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+    const nextScrollTop = Math.min(scrollTopRef.current, maxScrollTop);
+    list.scrollTop = nextScrollTop;
+    scrollTopRef.current = nextScrollTop;
+  }, [sessions]);
+
+  function rememberScrollPosition() {
+    const list = listRef.current;
+    if (list) scrollTopRef.current = list.scrollTop;
+  }
+
   return (
     <div className="history__sessions">
       <div className="colhead">
@@ -38,7 +56,7 @@ export function SessionsList({
           Errors
         </UnavailableButton>
       </div>
-      <div className="sessions__list">
+      <div className="sessions__list" ref={listRef} onScroll={rememberScrollPosition}>
         {sessions.map((session) => (
           <button
             className="session-row"
