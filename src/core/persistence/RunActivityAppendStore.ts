@@ -2,6 +2,7 @@ import type { QueryResultRow } from "pg";
 import type { PostgresQueryClient } from "../database/PostgresMigrations.js";
 import { SymphonyError } from "../errors.js";
 import { reduceRunActivityChatMessagesWithPostgresClient } from "./RunActivityChatMessageReducer.js";
+import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 import {
   applyRunActivityOrdering,
   createRunActivityOrderingState,
@@ -30,6 +31,7 @@ export type RunActivityAppendInput = RunActivityEventInput & {
 export interface RunActivityAppendMetadata {
   readonly eventId: string;
   readonly runId: string;
+  readonly sessionId?: string | null;
   readonly runSessionId: string;
   readonly sequence: number;
   readonly sequenceSource: RunActivityEvent["sequenceSource"];
@@ -55,6 +57,8 @@ export interface RunActivityEventsPage {
 
 export interface RunActivityEventSourceStore {
   readRunEvents(runId: string, options?: { offset?: number; limit?: number }): Promise<RunActivityEventsPage>;
+  projectionRevision?(): number;
+  onProjectionChanged?(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe;
 }
 
 export type RunActivityAcceptedAppendResult = {
@@ -94,6 +98,8 @@ export interface RunActivityAppendBatchResult {
 export interface RunActivityAppendStore {
   appendEvent(input: RunActivityAppendInput): Promise<RunActivityAppendResult>;
   appendEvents(inputs: readonly RunActivityAppendInput[]): Promise<RunActivityAppendBatchResult>;
+  projectionRevision(): number;
+  onProjectionChanged(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe;
 }
 
 export interface PostgresRunActivityAppendClient extends PostgresQueryClient {
@@ -160,7 +166,16 @@ interface RunActivityEventRow extends QueryResultRow {
 
 export class InMemoryRunActivityAppendStore implements RunActivityAppendStore {
   private revision = 0;
+  private readonly projectionNotifier = new ProjectionRevisionNotifier();
   private readonly storedEvents: RunActivityStoredEvent[] = [];
+
+  projectionRevision(): number {
+    return this.projectionNotifier.currentRevision();
+  }
+
+  onProjectionChanged(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe {
+    return this.projectionNotifier.subscribe(listener);
+  }
 
   async appendEvent(input: RunActivityAppendInput): Promise<RunActivityAppendResult> {
     const batch = await this.appendEvents([input]);
@@ -182,6 +197,7 @@ export class InMemoryRunActivityAppendStore implements RunActivityAppendStore {
       this.storedEvents.push(stored);
       return stored;
     });
+    notifyAcceptedRunActivityProjectionChanges(this.projectionNotifier, result.accepted);
     return result;
   }
 
@@ -203,10 +219,20 @@ export class InMemoryRunActivityAppendStore implements RunActivityAppendStore {
 }
 
 export class PostgresRunActivityAppendStore implements RunActivityAppendStore {
+  private readonly projectionNotifier = new ProjectionRevisionNotifier();
+
   constructor(
     private readonly connections: PostgresRunActivityAppendConnectionProvider,
     private readonly options: PostgresRunActivityAppendStoreOptions = {},
   ) {}
+
+  projectionRevision(): number {
+    return this.projectionNotifier.currentRevision();
+  }
+
+  onProjectionChanged(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe {
+    return this.projectionNotifier.subscribe(listener);
+  }
 
   async appendEvent(input: RunActivityAppendInput): Promise<RunActivityAppendResult> {
     const batch = await this.appendEvents([input]);
@@ -227,6 +253,7 @@ export class PostgresRunActivityAppendStore implements RunActivityAppendStore {
           await reduceAcceptedRunActivityMessageEventsWithPostgresClient(client, result.accepted);
         }
         await client.query("COMMIT");
+        notifyAcceptedRunActivityProjectionChanges(this.projectionNotifier, result.accepted);
         return result;
       } catch (error) {
         await rollbackRunActivityAppendQuietly(client);
@@ -669,6 +696,7 @@ function storedEventFromAcceptedEvent(
     metadata: {
       eventId: event.eventId,
       runId: metadata.runId,
+      sessionId: metadata.sessionId,
       runSessionId: event.runSessionId,
       sequence: runActivityEventSequence(event),
       sequenceSource: event.sequenceSource,
@@ -701,6 +729,7 @@ function storedEventFromPostgresRow(row: RunActivityEventRow): RunActivityStored
     metadata: {
       eventId: event.eventId,
       runId: row.run_id,
+      sessionId: normalizeOptionalString(row.session_id),
       runSessionId: event.runSessionId,
       sequence: runActivityEventSequence(event),
       sequenceSource: event.sequenceSource,
@@ -731,6 +760,71 @@ function normalizeStorageMetadata(
     rawPayloadRefId: storage?.rawPayloadRefId === null || storage?.rawPayloadRefId === undefined ? null : String(storage.rawPayloadRefId),
     metadata,
   };
+}
+
+function notifyAcceptedRunActivityProjectionChanges(
+  notifier: ProjectionRevisionNotifier,
+  accepted: readonly RunActivityAcceptedAppendResult[],
+): void {
+  if (accepted.length === 0) return;
+  for (const group of groupAcceptedRunActivityChanges(accepted)) {
+    notifier.notify("run_activity", runActivityProjectionChangeDetail(group));
+  }
+}
+
+function groupAcceptedRunActivityChanges(
+  accepted: readonly RunActivityAcceptedAppendResult[],
+): RunActivityAcceptedAppendResult[][] {
+  const groups = new Map<string, RunActivityAcceptedAppendResult[]>();
+  for (const result of accepted) {
+    const key = `${result.metadata.runId}\u0000${result.metadata.runSessionId}`;
+    const group = groups.get(key);
+    if (group) {
+      group.push(result);
+    } else {
+      groups.set(key, [result]);
+    }
+  }
+  return Array.from(groups.values());
+}
+
+function runActivityProjectionChangeDetail(
+  accepted: readonly RunActivityAcceptedAppendResult[],
+): Readonly<Record<string, unknown>> {
+  const first = accepted[0];
+  if (!first) return { source: "run_activity", eventCount: 0 };
+  const last = accepted[accepted.length - 1] ?? first;
+  const sequences = accepted.map((result) => result.metadata.sequence).filter((sequence) => Number.isFinite(sequence));
+  const firstSequence = sequences.length > 0 ? Math.min(...sequences) : null;
+  const lastSequence = sequences.length > 0 ? Math.max(...sequences) : null;
+  return {
+    source: "run_activity",
+    runId: first.metadata.runId,
+    sessionId: first.metadata.sessionId ?? null,
+    runSessionId: first.metadata.runSessionId,
+    afterSequence: firstSequence === null ? null : Math.max(0, firstSequence - 1),
+    firstSequence,
+    lastSequence,
+    eventCount: accepted.length,
+    appendRevisionStart: first.metadata.appendRevision,
+    appendRevisionEnd: last.metadata.appendRevision,
+    status: runStatusForActivityProjectionChange(accepted.map((result) => result.event)),
+    channels: sortedUnique(accepted.map((result) => result.event.channel)),
+    kinds: sortedUnique(accepted.map((result) => String(result.event.kind))),
+    resourcesChanged: ["history", "session-transcript", "dashboard", "sidebar"],
+  };
+}
+
+function runStatusForActivityProjectionChange(events: readonly RunActivityEvent[]): string | null {
+  for (const event of [...events].reverse()) {
+    if (event.channel === "terminal") {
+      if (event.kind === "run_succeeded") return "succeeded";
+      if (event.kind === "run_cancelled" || event.kind === "run_interrupted" || event.kind === "run_aborted") return "cancelled";
+      return "failed";
+    }
+    if (event.kind === "run_started" || event.kind === "session_started" || event.kind === "session_ready") return "running";
+  }
+  return null;
 }
 
 function emptyAppendBatchResult(): RunActivityAppendBatchResult {

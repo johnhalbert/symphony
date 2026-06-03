@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDataSource } from "../data/dataSourceContext";
+import { normalizeOrchestratorChatModel } from "../data/orchestratorChat";
 import { useAsyncResource } from "./useAsyncResource";
 import {
   DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
   applyOrchestratorMessageEvent,
   applyTranscriptDeltaEvent,
 } from "../data/realtimePatches";
-import type { ChatMessage, IssueDetailModel, Loadable, TranscriptMessage } from "../types/symphony";
+import type { ChatMessage, IssueDetailModel, Loadable, OrchestratorChatModel, TranscriptMessage } from "../types/symphony";
 
 interface SymphonyResourceOptions {
   enabled?: boolean;
@@ -217,12 +218,12 @@ export function useSidebar(options: SymphonyResourceOptions = {}) {
   );
 }
 
-export function useOrchestratorChat(options: SymphonyResourceOptions = {}): Loadable<ChatMessage[]> {
+export function useOrchestratorChat(options: SymphonyResourceOptions = {}): Loadable<OrchestratorChatModel> {
   const dataSource = useDataSource();
   const enabled = options.enabled ?? true;
   const [patchRefreshToken, setPatchRefreshToken] = useState(0);
   const lastRevision = useRef<number | null>(null);
-  const [state, setState] = useState<Loadable<ChatMessage[]> & { enabled: boolean }>({ data: null, loading: enabled, error: null, enabled });
+  const [state, setState] = useState<Loadable<OrchestratorChatModel> & { enabled: boolean }>({ data: null, loading: enabled, error: null, enabled });
   const stateRef = useRef(state);
 
   useEffect(() => {
@@ -276,7 +277,7 @@ export function useOrchestratorChat(options: SymphonyResourceOptions = {}): Load
       const outcome = applyOrchestratorMessageEvent({
         event,
         conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
-        current: stateRef.current.enabled ? stateRef.current.data : null,
+        current: stateRef.current.enabled ? (stateRef.current.data?.chat ?? null) : null,
         lastRevision: lastRevision.current,
       });
       if (outcome.action === "ignored") return;
@@ -286,7 +287,12 @@ export function useOrchestratorChat(options: SymphonyResourceOptions = {}): Load
         setPatchRefreshToken((current) => current + 1);
         return;
       }
-      const nextState = { data: outcome.data, loading: false, error: null, enabled: true };
+      const nextState = {
+        data: mergeOrchestratorChatPatchModel(stateRef.current.data, outcome.data, outcome.lastRevision),
+        loading: false,
+        error: null,
+        enabled: true,
+      };
       stateRef.current = nextState;
       setState(nextState);
     });
@@ -294,4 +300,29 @@ export function useOrchestratorChat(options: SymphonyResourceOptions = {}): Load
 
   if (enabled && !state.enabled) return { data: state.data, loading: true, error: null };
   return { data: state.data, loading: state.loading, error: state.error };
+}
+
+function mergeOrchestratorChatPatchModel(
+  current: OrchestratorChatModel | null,
+  chat: ChatMessage[],
+  revision: number,
+): OrchestratorChatModel {
+  if (!current) return normalizeOrchestratorChatModel(chat);
+  const latestMessage = chat.at(-1) ?? null;
+  const latestMessageUpdatedAt = latestMessage?.updatedAt ?? latestMessage?.createdAt ?? current.source.latestMessageUpdatedAt;
+  return normalizeOrchestratorChatModel({
+    schemaVersion: current.schemaVersion,
+    conversation: {
+      ...current.conversation,
+      updatedAt: latestMessageUpdatedAt ?? current.conversation.updatedAt,
+      messageCount: Math.max(current.conversation.messageCount, chat.length),
+    },
+    chat,
+    source: {
+      ...current.source,
+      revision: `${current.source.revision}:live:${revision}`,
+      latestMessageUpdatedAt,
+    },
+    compatibility: current.compatibility,
+  });
 }

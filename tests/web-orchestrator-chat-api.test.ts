@@ -30,18 +30,25 @@ describe("web orchestrator chat API", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("serves GET HTTP 200 with the exact empty chat array and no mock response text", async () => {
+  it("serves GET HTTP 200 with an honest empty chat projection envelope and no mock response text", async () => {
     const { server } = createStatusServer(root);
     const address = await server.start();
     try {
       const response = await fetch(chatUrl(address));
       const text = await response.text();
+      const body = JSON.parse(text) as Record<string, unknown>;
 
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toContain("application/json");
-      expect(JSON.parse(text)).toEqual([]);
-      expect(Array.isArray(JSON.parse(text))).toBe(true);
-      expect(text.trim()).toBe("[]");
+      expect(Array.isArray(body)).toBe(false);
+      expect(body).toMatchObject({
+        conversation: { id: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, status: "completed", messageCount: 0 },
+        state: "empty",
+        status: { state: "empty", empty: true, messageCount: 0 },
+        chat: [],
+        source: { source: "orchestrator_conversations", conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID },
+      });
+      expect(text.trim()).not.toBe("[]");
       expect(text).not.toMatch(/assistant|suggestion|mock|command|transcript/i);
     } finally {
       await server.stop();
@@ -121,7 +128,13 @@ describe("web orchestrator chat API", () => {
 
       const getResponse = await fetch(chatUrl(address));
       expect(getResponse.status).toBe(200);
-      expect(await getResponse.json()).toEqual(posted);
+      const getBody = (await getResponse.json()) as Record<string, unknown>;
+      expect(getBody).toMatchObject({
+        conversation: { id: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, status: "pending", messageCount: 1 },
+        state: "pending",
+        status: { state: "pending", latestMessageStatus: "pending", messageCount: 1, empty: false },
+      });
+      expect(getBody.chat).toMatchObject(posted);
 
       const replayResponse = await fetch(chatUrl(address), {
         method: "POST",
@@ -159,8 +172,12 @@ describe("web orchestrator chat API", () => {
         },
       ]);
       expect(commands.at(-1)).toMatchObject({ conversationId: "alpha", input: "alpha scoped message" });
-      expect(await (await fetch(alphaUrl)).json()).toEqual(alphaPosted);
-      expect(await (await fetch(chatUrl(address))).json()).toEqual(posted);
+      const alphaGet = (await (await fetch(alphaUrl)).json()) as Record<string, unknown>;
+      expect(alphaGet).toMatchObject({ conversation: { id: "alpha", status: "pending", messageCount: 1 }, state: "pending" });
+      expect(alphaGet.chat).toMatchObject(alphaPosted);
+      const defaultGet = (await (await fetch(chatUrl(address))).json()) as Record<string, unknown>;
+      expect(defaultGet).toMatchObject({ conversation: { id: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, messageCount: 1 }, state: "pending" });
+      expect(defaultGet.chat).toMatchObject(posted);
       expect(calls).toEqual({ ...zeroCallCounts(), dispatchOrchestratorChatCommand: 2 });
     } finally {
       await server.stop();
@@ -174,6 +191,7 @@ describe("web orchestrator chat API", () => {
       dispatchDelayMs: 50,
     });
     const address = await server.start();
+
     try {
       const request = {
         method: "POST",
@@ -236,9 +254,10 @@ describe("web orchestrator chat API", () => {
     };
     const readMessages = async (conversationId: string) => {
       const response = await fetch(scopedUrl(conversationId));
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = (await response.json()) as { chat?: Array<Record<string, unknown>> } & Record<string, unknown>;
       expect(response.status).toBe(200);
-      return body;
+      expect(body).toMatchObject({ conversation: { id: conversationId, messageCount: body.chat?.length ?? 0 } });
+      return body.chat ?? [];
     };
 
     try {
@@ -251,7 +270,12 @@ describe("web orchestrator chat API", () => {
       expect(await readMessages("a_b")).toMatchObject([{ conversationId: "a_b", text: "underscore scoped" }]);
       expect(await readMessages("CaseOnly")).toMatchObject([{ conversationId: "CaseOnly", text: "upper case scoped" }]);
       expect(await readMessages("caseonly")).toMatchObject([{ conversationId: "caseonly", text: "lower case scoped" }]);
-      expect(await (await fetch(chatUrl(address))).json()).toEqual([]);
+      expect(await (await fetch(chatUrl(address))).json()).toMatchObject({
+        conversation: { id: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, status: "completed", messageCount: 0 },
+        state: "empty",
+        status: { state: "empty", empty: true, messageCount: 0 },
+        chat: [],
+      });
       expect((await store.listMessages("a/b")).map((message) => message.body)).toEqual(["slash scoped"]);
       expect((await store.listMessages("a_b")).map((message) => message.body)).toEqual(["underscore scoped"]);
 
@@ -308,12 +332,13 @@ describe("web orchestrator chat API", () => {
     const address = await server.start();
     try {
       const getResponse = await fetch(chatUrl(address));
-      const getBody = (await getResponse.json()) as Array<Record<string, unknown>>;
+      const getBody = (await getResponse.json()) as { chat?: Array<Record<string, unknown>>; source?: Record<string, unknown> };
       expect(getResponse.status).toBe(200);
-      expect(getBody).toHaveLength(100);
-      expect(getBody[0]).toMatchObject({ text: "history 6", metadata: { historyIndex: 6 } });
-      expect(getBody.at(-1)).toMatchObject({ text: "history 105", metadata: { historyIndex: 105 } });
-      expect(getBody.map((message) => message.text)).not.toContain("history 1");
+      expect(getBody.chat).toHaveLength(100);
+      expect(getBody.chat?.[0]).toMatchObject({ text: "history 6", metadata: { historyIndex: 6 } });
+      expect(getBody.chat?.at(-1)).toMatchObject({ text: "history 105", metadata: { historyIndex: 105 } });
+      expect(getBody.chat?.map((message) => message.text)).not.toContain("history 1");
+      expect(getBody.source).toMatchObject({ conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID });
 
       const sidebarResponse = await fetch("http://" + address.host + ":" + String(address.port) + "/api/v1/web/sidebar");
       const sidebarBody = (await sidebarResponse.json()) as { chat?: Array<Record<string, unknown>> };

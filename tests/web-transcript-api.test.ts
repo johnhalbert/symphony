@@ -886,6 +886,7 @@ function projectionPayloadRecord<TPayload>(
       scopeKind: selector.scopeKind ?? "global",
       scopeKey: selector.scopeKey ?? "global",
       revision: 1,
+      buildMode: "bootstrap",
       sourceRevisions,
       sourceCursors: {},
       sourceFreshness: [],
@@ -908,6 +909,8 @@ class RecordingProjectionWriter implements StatusServerProjectionWriter {
 
   async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
     this.writes.push(JSON.parse(JSON.stringify(input)) as ProjectionPayloadWriteInput);
+    const requestedBuildMode = input.buildMode ?? "incremental";
+    const buildMode = this.writes.length === 1 ? "bootstrap" : requestedBuildMode;
     return {
       status: "written",
       revision: {
@@ -916,6 +919,7 @@ class RecordingProjectionWriter implements StatusServerProjectionWriter {
         scopeKind: input.scopeKind ?? "global",
         scopeKey: input.scopeKey ?? "global",
         revision: this.writes.length,
+        buildMode,
         sourceRevisions: [],
         sourceCursors: {},
         sourceFreshness: [],
@@ -926,6 +930,8 @@ class RecordingProjectionWriter implements StatusServerProjectionWriter {
         createdAt: "2026-01-01T00:00:00.000Z",
       },
       previousRevision: null,
+      requestedBuildMode,
+      buildMode,
       contentSha256: "0".repeat(64),
       payloadSha256: "1".repeat(64),
       event: null,

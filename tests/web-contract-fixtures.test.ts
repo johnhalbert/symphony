@@ -56,7 +56,7 @@ describe("web route contract fixtures", () => {
     expect(fixtures.sidebar.reviewIssues).toEqual(fixtures.issueBoard.lanes.review.slice(0, 3));
     expect(fixtures.sidebar.activity).toEqual(fixtures.dashboard.activity);
     expect(fixtures.sidebar.sessions).toEqual(fixtures.history.sessions);
-    expect(fixtures.sidebar.chat).toEqual(fixtures.orchestratorChat);
+    expect(fixtures.sidebar.chat).toEqual(fixtures.orchestratorChat.chat);
     expect(fixtures.sidebar.totals).toEqual(fixtures.dashboard.totals);
   });
 

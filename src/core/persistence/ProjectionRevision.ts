@@ -1,9 +1,17 @@
-export type ProjectionChangeSource = "runs" | "workspaces" | "lifecycle" | "writeback" | "orchestrator_conversations";
+export type ProjectionChangeSource =
+  | "runs"
+  | "workspaces"
+  | "lifecycle"
+  | "writeback"
+  | "orchestrator_conversations"
+  | "run_activity";
+
+export type ProjectionChangeDetail = Readonly<Record<string, unknown>>;
 
 export interface ProjectionChangeEvent {
   source: ProjectionChangeSource;
   revision: number;
-  detail?: Record<string, unknown> | null;
+  detail?: ProjectionChangeDetail | null;
 }
 
 export type ProjectionChangeListener = (event: ProjectionChangeEvent) => void;
@@ -24,9 +32,9 @@ export class ProjectionRevisionNotifier {
     };
   }
 
-  notify(source: ProjectionChangeSource, detail: Record<string, unknown> | null = null): void {
+  notify(source: ProjectionChangeSource, detail: ProjectionChangeDetail | null = null): void {
     this.revision += 1;
-    const event: ProjectionChangeEvent = detail ? { source, revision: this.revision, detail } : { source, revision: this.revision };
+    const event: ProjectionChangeEvent = detail === null ? { source, revision: this.revision } : { source, revision: this.revision, detail };
     for (const listener of Array.from(this.listeners)) {
       try {
         listener(event);

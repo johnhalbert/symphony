@@ -2,9 +2,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { DashboardView } from "../src/components/dashboard/DashboardView";
 import { SidebarViews } from "../src/components/sidebar/SidebarViews";
+import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
 import type { SymphonyDataSource } from "../src/data/dataSource";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
-import type { ChatMessage, DashboardModel, SidebarModel } from "../src/types/symphony";
+import type { ChatMessage, DashboardModel, OrchestratorChatModel, OrchestratorChatState, SidebarModel } from "../src/types/symphony";
 
 const emptyChatCopy = "No durable orchestrator chat messages are available yet.";
 
@@ -43,7 +44,9 @@ const sidebarWithEmbeddedChat: SidebarModel = {
   totals: dashboardWithEmbeddedChat.totals,
 };
 
-function dataSourceForChat(chat: ChatMessage[]): SymphonyDataSource {
+function dataSourceForChat(chat: OrchestratorChatModel | ChatMessage[]): SymphonyDataSource {
+  const chatModel = normalizeOrchestratorChatModel(chat);
+  const chatMessages = chatModel.chat;
   return {
     async getReferenceData() {
       return { users: {}, labels: {} };
@@ -67,19 +70,19 @@ function dataSourceForChat(chat: ChatMessage[]): SymphonyDataSource {
       return [];
     },
     async getSidebar() {
-      return { providerGates: [], runningAgents: [], reviewIssues: [], activity: [], sessions: [], chat, totals: dashboardWithEmbeddedChat.totals };
+      return { providerGates: [], runningAgents: [], reviewIssues: [], activity: [], sessions: [], chat: chatMessages, totals: dashboardWithEmbeddedChat.totals };
     },
     async getOrchestratorChat() {
-      return chat;
+      return chatModel;
     },
     async sendOrchestratorMessage(input: string) {
-      return [...chat, { who: "user", text: input }];
+      return [...chatMessages, { who: "user", text: input }];
     },
   };
 }
 
 function renderDashboardChat(props: {
-  chat: ChatMessage[];
+  chat: OrchestratorChatModel | ChatMessage[];
   loading?: boolean;
   error?: string | null;
   readOnly?: boolean;
@@ -98,7 +101,7 @@ function renderDashboardChat(props: {
 }
 
 function renderSidebarChat(props: {
-  chat: ChatMessage[];
+  chat: OrchestratorChatModel | ChatMessage[];
   loading?: boolean;
   error?: string | null;
   readOnly?: boolean;
@@ -115,6 +118,15 @@ function renderSidebarChat(props: {
       />
     </DataSourceProvider>,
   );
+}
+
+function chatModelForState(state: OrchestratorChatState, chat: ChatMessage[] = []): OrchestratorChatModel {
+  return orchestratorChatModelFromMessages(chat, {
+    conversationId: `${state}-room`,
+    state,
+    conversationStatus: state === "empty" ? "completed" : state,
+    sourceShape: "reducer_envelope",
+  });
 }
 
 describe("dashboard orchestrator chat integration", () => {
@@ -136,6 +148,32 @@ describe("dashboard orchestrator chat integration", () => {
     expect(markup).toContain(emptyChatCopy);
     expect(markup).not.toContain("dashboard embedded chat should not render");
     expect(markup).not.toContain("dashboard stale suggestion");
+  });
+
+  it("renders reducer state metadata for empty, active, failed, disabled, and unavailable dashboard chat without fake messages", () => {
+    const cases = [
+      { state: "empty" as const, expected: "is empty" },
+      { state: "pending" as const, expected: "is pending" },
+      { state: "streaming" as const, expected: "is streaming" },
+      { state: "failed" as const, expected: "failed" },
+      { state: "disabled" as const, expected: "is disabled" },
+      { state: "unavailable" as const, expected: "is unavailable" },
+    ];
+
+    for (const testCase of cases) {
+      const chat =
+        testCase.state === "pending" || testCase.state === "streaming" || testCase.state === "failed"
+          ? [{ who: "agent" as const, text: `durable ${testCase.state} message`, status: testCase.state }]
+          : [];
+      const markup = renderDashboardChat({ chat: chatModelForState(testCase.state, chat) });
+
+      expect(markup).toContain(testCase.expected);
+      expect(markup).toContain(`data-orchestrator-chat-state=\"${testCase.state}\"`);
+      if (chat.length > 0) expect(markup).toContain(`durable ${testCase.state} message`);
+      expect(markup).not.toContain("dashboard embedded chat should not render");
+      expect(markup).not.toContain("dashboard stale suggestion");
+      expect(markup).not.toMatch(/fake message|placeholder message|mock message/i);
+    }
   });
 
   it("surfaces loading and error states without substituting dashboard chat", () => {
@@ -192,6 +230,32 @@ describe("sidebar orchestrator chat integration", () => {
     expect(markup).toContain(emptyChatCopy);
     expect(markup).not.toContain("sidebar embedded chat should not render");
     expect(markup).not.toContain("sidebar stale suggestion");
+  });
+
+  it("renders reducer state metadata for empty, active, failed, disabled, and unavailable sidebar chat without fake messages", () => {
+    const cases = [
+      { state: "empty" as const, expected: "is empty" },
+      { state: "pending" as const, expected: "is pending" },
+      { state: "streaming" as const, expected: "is streaming" },
+      { state: "failed" as const, expected: "failed" },
+      { state: "disabled" as const, expected: "is disabled" },
+      { state: "unavailable" as const, expected: "is unavailable" },
+    ];
+
+    for (const testCase of cases) {
+      const chat =
+        testCase.state === "pending" || testCase.state === "streaming" || testCase.state === "failed"
+          ? [{ who: "agent" as const, text: `compact durable ${testCase.state} message`, status: testCase.state }]
+          : [];
+      const markup = renderSidebarChat({ chat: chatModelForState(testCase.state, chat) });
+
+      expect(markup).toContain(testCase.expected);
+      expect(markup).toContain(`data-orchestrator-chat-state=\"${testCase.state}\"`);
+      if (chat.length > 0) expect(markup).toContain(`compact durable ${testCase.state} message`);
+      expect(markup).not.toContain("sidebar embedded chat should not render");
+      expect(markup).not.toContain("sidebar stale suggestion");
+      expect(markup).not.toMatch(/fake message|placeholder message|mock message/i);
+    }
   });
 
   it("surfaces sidebar loading and error states without substituting embedded chat", () => {

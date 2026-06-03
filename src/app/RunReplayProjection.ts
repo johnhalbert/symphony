@@ -1,10 +1,13 @@
 import { projectWebTranscript, type TranscriptMessage } from "./WebTranscriptProjection.js";
-import type {
-  PersistedSdkRunStatus,
-  PersistedSdkRunStatusSource,
-  RunRecord,
-  RunStatus,
-  TranscriptEvent,
+import {
+  emptyCommandPolicyReplayState,
+  reduceCommandPolicyReplayState,
+  type PersistedCommandPolicyReplayState,
+  type PersistedSdkRunStatus,
+  type PersistedSdkRunStatusSource,
+  type RunRecord,
+  type RunStatus,
+  type TranscriptEvent,
 } from "../core/persistence/RunTranscriptStore.js";
 import type { TokenCounts } from "../core/types.js";
 
@@ -23,6 +26,7 @@ export interface ReplayedRunSessionState {
   sdkRunStatus: PersistedSdkRunStatus | null;
   sdkRunStatusObservedAt: string | null;
   sdkRunStatusSource: PersistedSdkRunStatusSource | null;
+  commandPolicy: PersistedCommandPolicyReplayState;
   messages: TranscriptMessage[];
 }
 
@@ -85,6 +89,7 @@ export function initialRunSessionReplayState(run: RunRecord): ReplayedRunSession
     sdkRunStatus: null,
     sdkRunStatusObservedAt: null,
     sdkRunStatusSource: null,
+    commandPolicy: emptyCommandPolicyReplayState(),
     messages: [],
   };
 }
@@ -124,6 +129,13 @@ export function reduceRunSessionReplayEvent(state: ReplayedRunSessionState, even
     }
   }
 
+  if (eventType === "command_policy_decision") {
+    next = {
+      ...next,
+      commandPolicy: reduceCommandPolicyReplayState(next.commandPolicy, event),
+    };
+  }
+
   const terminalStatus = terminalStatusForEventType(eventType);
   if (terminalStatus && next.status === "running") {
     next = {
@@ -150,6 +162,7 @@ function runRecordForReplayProjection(run: RunRecord, state: ReplayedRunSessionS
     sdkRunStatus: state.sdkRunStatus,
     sdkRunStatusObservedAt: state.sdkRunStatusObservedAt,
     sdkRunStatusSource: state.sdkRunStatusSource,
+    commandPolicy: state.commandPolicy,
   };
 }
 

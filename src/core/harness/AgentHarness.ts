@@ -40,6 +40,8 @@ export type AgentEvent = AgentEventBase &
         sessionId: string;
         threadId?: string;
         runId?: string;
+        providerId?: string | null;
+        model?: string | null;
         at?: string;
       }
     | {

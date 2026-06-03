@@ -36,6 +36,24 @@ npm test -- tests/hermes-acp-harness.test.ts tests/hermes-mcp-config.test.ts tes
 
 This Checkpoint A subset validates direct and disguised upstream denials, `execute_code`, ACP permission resolution, Hermes hook/CLI behavior, gateway/TUI profile hook installation, delegated subagent and command reducer inheritance, and broader ACP harness wiring. Later US2 local-inspection/config, US3 service-boundary, and US4 audit/replay suites remain separate subissue validation until those files exist.
 
+For the Checkpoint B / Issue 15 / T041 US2 local-inspection targeted validation subissue, run the present US2 command-policy suite:
+
+```powershell
+npm run typecheck
+npm test -- tests/agent-command-policy-local-inspection.test.ts tests/agent-command-policy-git-config.test.ts tests/agent-command-policy-fake-helper.test.ts tests/agent-command-policy-hook-runner-local.test.ts
+```
+
+This Checkpoint B subset validates helper-free local status/diff/log/show/branch/blame allow decisions, unsafe inline and inherited environment denial, per-command Git config denial, persisted repo/user fake-helper fail-closed behavior, selected worktree config inspection, hook-runner working-directory resolution, and redacted hook environment propagation.
+
+For the Checkpoint C / Issue 19 / T051 US3 service-owned workflow boundary targeted validation subissue, run the present US3 command-policy suite:
+
+```powershell
+npm run typecheck
+npm test -- tests/mcp-subprocess-environment-command-policy.test.ts tests/completion-report-mcp-command-policy.test.ts tests/review-feedback-mcp-command-policy.test.ts tests/github-service-boundary-command-policy.test.ts
+```
+
+This Checkpoint C subset validates service MCP credential slicing, completion-report publication boundaries, review-feedback writeback boundaries, mergeability and CI service-owned paths, and equivalent worker/reviewer terminal or `execute_code` direct-deny behavior.
+
 For final targeted validation after the later user-story test files exist, run the full policy-facing suite:
 
 ```powershell

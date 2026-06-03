@@ -28,6 +28,9 @@ export interface ProjectionSourceRevision {
   observedAt: string | null;
 }
 
+export type ProjectionBuildMode = "bootstrap" | "incremental" | "rebuild";
+export type ProjectionWriteMode = Exclude<ProjectionBuildMode, "bootstrap">;
+
 export interface ProjectionRevisionSelector {
   projectionName: DurableProjectionName;
   scopeKind?: string | null;
@@ -40,6 +43,7 @@ export interface ProjectionRevisionRecord {
   scopeKind: string;
   scopeKey: string;
   revision: number;
+  buildMode: ProjectionBuildMode;
   sourceRevisions: readonly ProjectionSourceRevision[];
   sourceCursors: ProjectionJsonObject;
   sourceFreshness: readonly ProjectionSourceFreshness[];
@@ -64,6 +68,12 @@ export interface ProjectionPayloadFields {
 
 export interface ProjectionPayloadWriteInput extends ProjectionRevisionSelector {
   payload: unknown;
+  /**
+   * Identifies whether this write was requested by on-demand/read-repair maintenance
+   * or by an explicit rebuild/backfill. The service derives `bootstrap` for the
+   * first durable revision of a projection scope, regardless of the requested mode.
+   */
+  buildMode?: ProjectionWriteMode;
   sourceRevisions?: readonly (Partial<ProjectionSourceRevision> & Pick<ProjectionSourceRevision, "source" | "revision">)[];
   sourceCursors?: ProjectionJsonObject;
   sourceFreshness?: readonly ProjectionSourceFreshnessInput[];
@@ -80,6 +90,7 @@ export interface ProjectionRevisionInsertInput {
   scopeKind: string;
   scopeKey: string;
   revision: number;
+  buildMode: ProjectionBuildMode;
   sourceRevisions: readonly ProjectionSourceRevision[];
   sourceCursors: ProjectionJsonObject;
   sourceFreshness: readonly ProjectionSourceFreshness[];
@@ -145,6 +156,7 @@ export interface ProjectionRevisionPublication {
   scopeKey: string;
   projectionRevisionId: string | number;
   revision: number;
+  buildMode: ProjectionBuildMode;
   contentSha256: string;
   generatedAt: string;
   expiresAt: string | null;
@@ -174,6 +186,10 @@ export interface ProjectionWriteResult {
   status: ProjectionWriteStatus;
   revision: ProjectionRevisionRecord;
   previousRevision: ProjectionRevisionRecord | null;
+  /** The caller-requested write mode. Rebuild attempts can still be `unchanged`. */
+  requestedBuildMode: ProjectionWriteMode;
+  /** The durable revision's actual build mode; first writes are reported as `bootstrap`. */
+  buildMode: ProjectionBuildMode;
   contentSha256: string;
   payloadSha256: string;
   event: ProjectionRevisionPublication | null;
@@ -225,6 +241,7 @@ export interface NormalizedProjectionPayloadFields {
 
 interface NormalizedProjectionPayloadWrite extends NormalizedProjectionRevisionSelector {
   payload: unknown;
+  buildMode: ProjectionWriteMode;
   sourceRevisions: readonly ProjectionSourceRevision[];
   sourceCursors: ProjectionJsonObject;
   sourceFreshness: readonly ProjectionSourceFreshness[];
@@ -342,6 +359,8 @@ export class ProjectionTransactionService {
           status: "unchanged",
           revision: current,
           previousRevision: current,
+          requestedBuildMode: input.buildMode,
+          buildMode: current.buildMode,
           contentSha256: input.contentSha256,
           payloadSha256: input.payloadSha256,
           event: null,
@@ -354,12 +373,15 @@ export class ProjectionTransactionService {
           status: "unchanged",
           revision: latest,
           previousRevision: latest,
+          requestedBuildMode: input.buildMode,
+          buildMode: latest.buildMode,
           contentSha256: input.contentSha256,
           payloadSha256: input.payloadSha256,
           event: null,
         } satisfies ProjectionWriteResult;
       }
       const nextRevision = (latest?.revision ?? 0) + 1;
+      const buildMode: ProjectionBuildMode = latest ? input.buildMode : "bootstrap";
 
       await transaction.supersedeCurrentRevision(selector, input.generatedAt);
       const revision = await transaction.insertProjectionRevision({
@@ -367,6 +389,7 @@ export class ProjectionTransactionService {
         scopeKind: input.scopeKind,
         scopeKey: input.scopeKey,
         revision: nextRevision,
+        buildMode,
         sourceRevisions: input.sourceRevisions,
         sourceCursors: input.sourceCursors,
         sourceFreshness: input.sourceFreshness,
@@ -392,6 +415,8 @@ export class ProjectionTransactionService {
         status: "written",
         revision,
         previousRevision: current,
+        requestedBuildMode: input.buildMode,
+        buildMode: revision.buildMode,
         contentSha256: input.contentSha256,
         payloadSha256: input.payloadSha256,
         event,
@@ -584,19 +609,21 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
          scope_kind,
          scope_key,
          revision,
+         build_mode,
          source_revisions,
          source_cursors,
          source_freshness,
          content_sha256,
          generated_at,
          expires_at
-       ) VALUES ($1, $2, $3, $4::bigint, $5::jsonb, $6::jsonb, $7::jsonb, $8, $9::timestamptz, $10::timestamptz)
+       ) VALUES ($1, $2, $3, $4::bigint, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10::timestamptz, $11::timestamptz)
        RETURNING ${projectionRevisionSelectColumns()}`,
       [
         input.projectionName,
         input.scopeKind,
         input.scopeKey,
         input.revision,
+        input.buildMode,
         stableJsonStringify(input.sourceRevisions),
         stableJsonStringify(input.sourceCursors),
         stableJsonStringify(input.sourceFreshness),
@@ -627,6 +654,7 @@ interface ProjectionRevisionRow {
   scope_kind: string;
   scope_key: string;
   revision: string | number;
+  build_mode?: string | null;
   source_revisions: unknown;
   source_cursors: unknown;
   source_freshness?: unknown;
@@ -679,6 +707,7 @@ function normalizeProjectionPayloadWrite(input: ProjectionPayloadWriteInput, clo
   const generatedAt = dateLikeToIso(input.generatedAt ?? clock(), "generatedAt");
   const expiresAt = input.expiresAt === undefined || input.expiresAt === null ? null : dateLikeToIso(input.expiresAt, "expiresAt");
   const payload = canonicalJsonValue(input.payload);
+  const buildMode = normalizeProjectionWriteMode(input.buildMode);
   const contentSha256 = normalizeOptionalSha256(input.contentSha256, "contentSha256") ?? sha256Hex(stableJsonStringify(payload));
   const payloadSha256 = normalizeOptionalSha256(input.payloadSha256, "payloadSha256") ?? contentSha256;
   const sourceRevisions = normalizeSourceRevisions(input.sourceRevisions ?? []);
@@ -690,6 +719,7 @@ function normalizeProjectionPayloadWrite(input: ProjectionPayloadWriteInput, clo
   return {
     ...selector,
     payload,
+    buildMode,
     sourceRevisions,
     sourceCursors,
     sourceFreshness,
@@ -748,6 +778,7 @@ function revisionPublicationFromRecord(record: ProjectionRevisionRecord): Projec
     scopeKey: record.scopeKey,
     projectionRevisionId: record.projectionRevisionId,
     revision: record.revision,
+    buildMode: record.buildMode,
     contentSha256: record.contentSha256 ?? "",
     generatedAt: record.generatedAt,
     expiresAt: record.expiresAt,
@@ -764,6 +795,7 @@ function projectionRevisionSelectColumns(tableAlias?: string): string {
     "scope_kind",
     "scope_key",
     "revision",
+    "build_mode",
     "source_revisions",
     "source_cursors",
     "source_freshness",
@@ -843,6 +875,7 @@ function mapProjectionRevisionRow(row: ProjectionRevisionRow | undefined): Proje
     scopeKind: row.scope_kind,
     scopeKey: row.scope_key,
     revision,
+    buildMode: projectionBuildModeFromDb(row.build_mode, revision),
     sourceRevisions: normalizeSourceRevisions(jsonFromDb(row.source_revisions, "source_revisions")),
     sourceCursors: normalizeJsonObject(jsonFromDb(row.source_cursors, "source_cursors"), "source_cursors"),
     sourceFreshness: mapProjectionRevisionSourceFreshness(row),
@@ -938,6 +971,21 @@ function normalizeOptionalSha256(value: string | null | undefined, name: string)
   const normalized = value.trim().toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(normalized)) throw new Error(`${name} must be a lowercase or uppercase SHA-256 hex digest`);
   return normalized;
+}
+
+function normalizeProjectionWriteMode(value: ProjectionWriteMode | null | undefined): ProjectionWriteMode {
+  if (value === undefined || value === null) return "incremental";
+  if (value === "incremental" || value === "rebuild") return value;
+  throw new Error("buildMode must be incremental or rebuild");
+}
+
+function projectionBuildModeFromDb(value: string | null | undefined, revision: number): ProjectionBuildMode {
+  if (value === undefined || value === null || value.trim().length === 0) {
+    return revision === 1 ? "bootstrap" : "incremental";
+  }
+  const normalized = value.trim();
+  if (normalized === "bootstrap" || normalized === "incremental" || normalized === "rebuild") return normalized;
+  throw new Error(`Unsupported projection build mode: ${value}`);
 }
 
 function normalizeNullableString(value: string | null | undefined, name: string): string | null {

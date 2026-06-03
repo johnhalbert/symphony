@@ -337,7 +337,41 @@ export const webRouteContractFixtures = {
       truncated: false,
     },
   ],
-  orchestratorChat: [],
+  orchestratorChat: {
+    schemaVersion: 1,
+    conversation: {
+      id: "orchestrator-default",
+      status: "completed",
+      createdAt: null,
+      updatedAt: null,
+      messageCount: 0,
+      metadata: {},
+    },
+    state: "empty",
+    status: {
+      state: "empty",
+      conversationStatus: "completed",
+      latestMessageStatus: null,
+      active: false,
+      terminal: false,
+      empty: true,
+      messageCount: 0,
+      statusCounts: { pending: 0, streaming: 0, completed: 0, failed: 0, disabled: 0, unavailable: 0 },
+    },
+    chat: [],
+    source: {
+      source: "orchestrator_conversations",
+      revision: "orchestrator-default:0:none:unknown",
+      observedAt: null,
+      conversationId: "orchestrator-default",
+      latestMessageSequence: null,
+      latestMessageUpdatedAt: null,
+    },
+    compatibility: {
+      responseShape: "orchestrator_chat_projection",
+      sourceShape: "legacy_chat_array",
+    },
+  },
 } as const;
 
 export const webRouteContractFixturesWithIssueDetail = {
@@ -354,7 +388,7 @@ export const webRouteContractFixturesWithIssueDetail = {
     reviewIssues: webRouteContractFixtures.issueBoard.lanes.review,
     activity: webRouteContractFixtures.dashboard.activity,
     sessions: webRouteContractFixtures.history.sessions,
-    chat: webRouteContractFixtures.orchestratorChat,
+    chat: webRouteContractFixtures.orchestratorChat.chat,
     totals: webRouteContractFixtures.dashboard.totals,
   },
 } as const;
@@ -430,6 +464,6 @@ export const webRouteContractGetFixtureCases = [
     name: "orchestrator chat",
     path: webRouteContractPaths.orchestratorChat,
     fixture: webRouteContractFixturesWithIssueDetail.orchestratorChat,
-    topLevelKeys: null,
+    topLevelKeys: ["chat", "compatibility", "conversation", "schemaVersion", "source", "state", "status"],
   },
 ] as const;

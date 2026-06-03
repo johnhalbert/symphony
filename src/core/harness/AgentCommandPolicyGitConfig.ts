@@ -333,7 +333,9 @@ function unsafePersistedGitConfigCategory(
   if (key.startsWith("difftool.") && (key.endsWith(".cmd") || key.endsWith(".path") || key.endsWith(".trustexitcode"))) {
     return "external_diff";
   }
-  if (key === "credential.helper" || key.startsWith("credential.")) return "credential_helper";
+  if (key === "core.askpass" || key === "credential.helper" || key.startsWith("credential.")) {
+    return "credential_helper";
+  }
   if (key === "core.hookspath" || key.startsWith("hook.")) return "hook";
   if (key.startsWith("filter.")) return "filter";
   if (key === "gpg.program" || key === "gpg.ssh.program") return "signing_program";

@@ -8,6 +8,7 @@ import {
   toSidebarModel,
 } from "./adapters";
 import type { SymphonyDataSource } from "./dataSource";
+import { orchestratorChatModelFromMessages } from "./orchestratorChat";
 import type { ChatMessage } from "../types/symphony";
 import type { RawData } from "./adapters";
 
@@ -66,7 +67,7 @@ export const mockDataSource: SymphonyDataSource = {
     return delay({ ...toSidebarModel(rawData), chat: chatMessages });
   },
   getOrchestratorChat() {
-    return delay(chatMessages);
+    return delay(orchestratorChatModelFromMessages(chatMessages));
   },
   sendOrchestratorMessage(input) {
     const trimmed = input.trim();

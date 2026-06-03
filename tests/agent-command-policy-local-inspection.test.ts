@@ -352,6 +352,22 @@ describe("AgentCommandPolicy helper-free local Git inspection allowlist", () => 
       environment: { keysOnly: ["HOME", "PATH", "GIT_SSH_COMMAND"] },
       inheritedEnvironmentKeys: ["GIT_SSH_COMMAND", "HOME", "PATH"],
     },
+    {
+      name: "Bash startup hook from inherited key-only environment",
+      command: "git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["shell_environment"],
+      environment: { keysOnly: ["BASH_ENV", "HOME", "PATH"] },
+      inheritedEnvironmentKeys: ["BASH_ENV", "HOME", "PATH"],
+    },
+    {
+      name: "POSIX shell startup hook from inherited key-only environment",
+      command: "git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["shell_environment"],
+      environment: { keysOnly: ["ENV", "HOME", "PATH"] },
+      inheritedEnvironmentKeys: ["ENV", "HOME", "PATH"],
+    },
   ])(
     "denies local inspection with unsafe inherited Git environment before execution: $name",
     ({ command, gitSubcommand, unsafeConfigCategories, environment, inheritedEnvironmentKeys }) => {

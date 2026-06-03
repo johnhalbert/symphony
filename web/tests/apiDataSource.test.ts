@@ -3,12 +3,13 @@ import { createApiDataSource, normalizeReferenceData } from "../src/data/apiData
 import type { ProjectionChangeEvent, RealtimeConnectionStatus, RealtimeProjectionEvent } from "../src/data/dataSource";
 import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
-import type { ChatMessage, DashboardModel, HistoryModel, IssueBoardModel, TranscriptMessage } from "../src/types/symphony";
+import type { ChatMessage, DashboardModel, HistoryModel, IssueBoardModel, OrchestratorChatModel, TranscriptMessage } from "../src/types/symphony";
 
 const originalFetch = globalThis.fetch;
 const originalEventSource = globalThis.EventSource;
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   globalThis.fetch = originalFetch;
   if (originalEventSource) {
@@ -144,10 +145,30 @@ function realtimePayloadForTestEvent(
     return { ...base, runId: null, sessionId: null, afterSequence: null, eventCount: null };
   }
   if (type === "orchestrator.message") {
-    return { ...base, conversationId: null, messageCount: null, inputLength: null, status: null };
+    return {
+      ...base,
+      conversationId: null,
+      messageCount: null,
+      inputLength: null,
+      status: null,
+      lastMessageId: null,
+      lastMessageStatus: null,
+      lastMessageAt: null,
+    };
   }
   if (type === "source.status") {
-    return { ...base, status: null, fetchedStates: [], fetchedAt: null, cached: null, error: null, issueCount: null };
+    return {
+      ...base,
+      status: null,
+      fetchedStates: [],
+      fetchedAt: null,
+      cached: null,
+      error: null,
+      issueCount: null,
+      sourceRevisions: [],
+      sourceCursors: null,
+      sourceFreshness: [],
+    };
   }
   return {
     ...base,
@@ -579,7 +600,8 @@ describe("API data source", () => {
     expect(eventSource?.closed).toBe(true);
   });
 
-  it("surfaces realtime connect, reconnect, recovery, stale, and closed-error status", () => {
+  it("surfaces realtime connect, reconnect, recovery, stale, and closed-stream resume status", () => {
+    vi.useFakeTimers();
     FakeEventSource.instances = [];
     globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
     const events: RealtimeProjectionEvent[] = [];
@@ -605,19 +627,56 @@ describe("API data source", () => {
     eventSource?.emit("projection.updated", JSON.stringify(missedEvent));
     expect(statuses.at(-1)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
     eventSource?.emitError(FakeEventSource.CLOSED);
+    expect(eventSource?.closed).toBe(true);
+    expect(FakeEventSource.instances).toHaveLength(1);
+
+    vi.advanceTimersByTime(4_999);
+    expect(FakeEventSource.instances).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    const resumedEventSource = FakeEventSource.instances[1];
+    expect(resumedEventSource?.url).toBe("/status-server/api/v1/realtime?lastEventId=missed-7");
+    resumedEventSource?.emitOpen();
     unsubscribe?.();
 
-    expect(statuses.map((status) => status.kind)).toEqual(["connecting", "open", "reconnecting", "recovered", "stale", "error"]);
+    expect(statuses.map((status) => status.kind)).toEqual([
+      "connecting",
+      "open",
+      "reconnecting",
+      "recovered",
+      "stale",
+      "reconnecting",
+      "connecting",
+      "recovered",
+    ]);
     expect(statuses.map((status) => status.label)).toEqual([
       "realtime connecting",
       "realtime connected",
       "realtime reconnecting",
       "realtime recovered",
       "realtime stale · refetching",
-      "realtime error",
+      "realtime reconnecting",
+      "realtime connecting",
+      "realtime recovered",
     ]);
-    expect(statuses.at(-2)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
+    expect(statuses.at(4)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
     expect(events).toEqual([missedEvent]);
+    expect(resumedEventSource?.closed).toBe(true);
+  });
+
+  it("cancels pending realtime reconnect when the final subscriber unsubscribes", () => {
+    vi.useFakeTimers();
+    FakeEventSource.instances = [];
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const dataSource = createApiDataSource("/status-server/");
+
+    const unsubscribe = dataSource.subscribeToRealtimeEvents?.(() => undefined);
+    const eventSource = FakeEventSource.instances[0];
+    eventSource?.emitError(FakeEventSource.CLOSED);
+    unsubscribe?.();
+
+    vi.advanceTimersByTime(5_000);
+    expect(FakeEventSource.instances).toHaveLength(1);
     expect(eventSource?.closed).toBe(true);
   });
 
@@ -857,13 +916,63 @@ describe("API data source", () => {
     ];
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(chat));
 
-    await expect(createApiDataSource("https://symphony.example///").getOrchestratorChat()).resolves.toEqual(chat);
+    const result = await createApiDataSource("https://symphony.example///").getOrchestratorChat();
+    expect(result).toMatchObject({ state: "completed", chat });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith("https://symphony.example/api/v1/web/orchestrator-chat", {
       headers: { Accept: "application/json" },
       signal: undefined,
     });
+  });
+
+  it("preserves reducer envelope metadata from GET /api/v1/web/orchestrator-chat", async () => {
+    const reducerEnvelope: OrchestratorChatModel = {
+      schemaVersion: 1,
+      conversation: {
+        id: "operator-room",
+        status: "streaming",
+        createdAt: "2026-06-03T00:00:00.000Z",
+        updatedAt: "2026-06-03T00:00:05.000Z",
+        messageCount: 1,
+        metadata: { issueKey: "ENG-228" },
+      },
+      state: "streaming",
+      status: {
+        state: "streaming",
+        conversationStatus: "streaming",
+        latestMessageStatus: "streaming",
+        active: true,
+        terminal: false,
+        empty: false,
+        messageCount: 1,
+        statusCounts: { pending: 0, streaming: 1, completed: 0, failed: 0, disabled: 0, unavailable: 0 },
+      },
+      chat: [
+        {
+          id: "chat-1",
+          conversationId: "operator-room",
+          who: "agent",
+          role: "assistant",
+          text: "Streaming durable response",
+          status: "streaming",
+          createdAt: "2026-06-03T00:00:01.000Z",
+          updatedAt: "2026-06-03T00:00:05.000Z",
+          metadata: { runId: "run-228" },
+        },
+      ],
+      source: {
+        source: "orchestrator_conversations",
+        revision: "chat-revision-228",
+        observedAt: "2026-06-03T00:00:05.000Z",
+        conversationId: "operator-room",
+        latestMessageSequence: 1,
+        latestMessageUpdatedAt: "2026-06-03T00:00:05.000Z",
+      },
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(reducerEnvelope));
+
+    await expect(createApiDataSource("").getOrchestratorChat()).resolves.toEqual(reducerEnvelope);
   });
 
   it("posts orchestrator chat input to the same relative API boundary and returns the response chat", async () => {

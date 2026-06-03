@@ -66,6 +66,7 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
   authenticateResult: unknown = {};
   authenticateError: unknown = null;
   sessionId = "acp-session-1";
+  sessionNewResult: Record<string, unknown> | null = null;
   promptResult: Record<string, unknown> | null = { stopReason: "end_turn", usage: { input: 1, output: 2, total: 3 } };
   sessionNewError: Error | null = null;
   promptNotificationParams: unknown | unknown[] | null = {
@@ -90,7 +91,7 @@ class FakeAcpClient extends EventEmitter implements HermesAcpRuntimeClient {
       case "session/new":
         if (this.sessionNewError) throw this.sessionNewError;
         this.emitSessionUpdateNotifications(this.sessionNewNotificationParams);
-        return { sessionId: this.sessionId } as T;
+        return { sessionId: this.sessionId, ...(this.sessionNewResult ?? {}) } as T;
       case "session/prompt":
         this.promptStarted?.resolve();
         this.emitSessionUpdateNotifications(this.promptNotificationParams);
@@ -310,6 +311,40 @@ describe("HermesAcpHarness", () => {
     expect(activeContext.activeRunId).toMatch(/^hermes-acp-/);
     expect(activeContext.sessionId).toContain("acp-session-1");
     expect(activeContext.workspacePath).toBe(ctx.workspace.path);
+  });
+
+  it("emits runtime provider and model metadata sourced from ACP initialize/auth/session responses", async () => {
+    const client = new FakeAcpClient();
+    client.initializeResult = {
+      runtimeMetadata: { provider_id: "openai-codex", model: "initialize-model" },
+      authMethods: [{ id: "openai-codex", name: "OpenAI Codex", type: "provider", model: "method-model" }],
+    };
+    client.authenticateResult = { runtime: { model: "auth-model" } };
+    client.sessionNewResult = { metadata: { model: "session-model" } };
+    const { ctx, harness } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const sessionStarted = events.find((event): event is Extract<AgentEvent, { type: "session_started" }> => event.type === "session_started");
+
+    expect(sessionStarted).toMatchObject({
+      type: "session_started",
+      providerId: "openai-codex",
+      model: "session-model",
+    });
+    expect(sessionStarted?.runActivity).toMatchObject({
+      payload: { providerId: "openai-codex", model: "session-model" },
+    });
+  });
+
+  it("leaves runtime provider and model metadata unknown when ACP does not report them", async () => {
+    const client = new FakeAcpClient();
+    const { ctx, harness } = await fixture({ client });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const sessionStarted = events.find((event): event is Extract<AgentEvent, { type: "session_started" }> => event.type === "session_started");
+
+    expect(sessionStarted).toMatchObject({ type: "session_started", providerId: null, model: null });
+    expect(sessionStarted?.runActivity).toMatchObject({ payload: { providerId: null, model: null } });
   });
 
   it("selects the expected provider auth method even when it is not advertised first", async () => {
@@ -1157,7 +1192,7 @@ describe("HermesAcpHarness", () => {
           signal: expect.objectContaining({
             kind: "windowed_bucket_exhausted",
             message: "Usage limit reached for the selected provider.",
-            scope: { harnessId: "hermes_acp", providerId: "openai-codex", model: "gpt-5.5", accountScopeKey: null },
+            scope: { harnessId: "hermes_acp", providerId: "openai-codex", model: null, accountScopeKey: null },
           }),
         }),
         expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_provider_limit" }),
@@ -1182,7 +1217,7 @@ describe("HermesAcpHarness", () => {
           signal: expect.objectContaining({
             kind: "transient_rate_limit",
             message: "429 rate limit from provider",
-            scope: { harnessId: "hermes_acp", providerId: "openai-codex", model: "gpt-5.5", accountScopeKey: null },
+            scope: { harnessId: "hermes_acp", providerId: "openai-codex", model: null, accountScopeKey: null },
           }),
         }),
         expect.objectContaining({ type: "failed", error: "429 rate limit from provider" }),
@@ -1219,7 +1254,7 @@ describe("HermesAcpHarness", () => {
           signal: expect.objectContaining({
             kind: "transient_rate_limit",
             message: "Provider returned a rate limit",
-            scope: { harnessId: "hermes_acp", providerId: "openai-codex", model: "gpt-5.5", accountScopeKey: null },
+            scope: { harnessId: "hermes_acp", providerId: "openai-codex", model: null, accountScopeKey: null },
           }),
         }),
         expect.objectContaining({ type: "run_diagnostic", code: "hermes_acp_run_error" }),
@@ -1625,7 +1660,7 @@ describe("HermesAcpHarness", () => {
       tool_call_failed: 1,
       plan_update: 1,
       assistant_message_delta: 2,
-      runtime_status_update: 2,
+      runtime_status_update: 3,
       available_commands_update: 1,
       runtime_diagnostic: 4,
       token_usage_reported: 1,
@@ -2174,7 +2209,7 @@ describe("HermesAcpHarness", () => {
       name: "resolver timeout",
       resolver: () => new Promise<string>(() => undefined),
       params: () => terminalPermissionRequest(),
-      reason: "permission_bridge_error",
+      reason: "permission_request_timeout",
       requestedOptionIds: ["allow_once", "allow_session", "allow_always", "deny", "deny_always"],
       timeoutMs: 5,
     },
@@ -2231,6 +2266,72 @@ describe("HermesAcpHarness", () => {
     );
   });
 
+  it("ignores approvals that arrive after the permission request timeout", async () => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    const permissionDecision = deferred<string>();
+    const permissionResolver = vi.fn(() => permissionDecision.promise);
+    const { ctx, harness } = await fixture({ client, permissionResolver, permissionRequestTimeoutMs: 5 });
+    const { runPromise } = await startPendingRun({ client, ctx, harness });
+    const requestId = "permission-timeout-late-approval";
+
+    const responses = await client.invokeClientRequest("session/request_permission", terminalPermissionRequest(), requestId);
+    permissionDecision.resolve("allow_always");
+    client.promptDeferred.resolve({ stopReason: "end_turn" });
+    const events = await runPromise;
+    const transcriptEvents = transcriptEventsFromAgentEvents(events);
+
+    expect(permissionResolver).toHaveBeenCalledTimes(1);
+    expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "progress",
+          activitySource: "tool",
+          message: "Host Hermes ACP permission requested for terminal_execute",
+        }),
+        expect.objectContaining({
+          type: "run_diagnostic",
+          code: "hermes_acp_permission_denied",
+          payload: expect.objectContaining({
+            acpJsonRpcRequestId: requestId,
+            reason: "permission_request_timeout",
+            selectedOptionId: null,
+          }),
+        }),
+      ]),
+    );
+    expect(transcriptEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "runtime_status_update",
+          payload: expect.objectContaining({
+            status: "permission_requested",
+            acpJsonRpcRequestId: requestId,
+          }),
+        }),
+        expect.objectContaining({
+          eventType: "runtime_diagnostic",
+          payload: expect.objectContaining({
+            code: "hermes_acp_permission_denied",
+            reason: "permission_request_timeout",
+            acpJsonRpcRequestId: requestId,
+          }),
+        }),
+      ]),
+    );
+    expect(transcriptEvents).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "runtime_status_update",
+          payload: expect.objectContaining({ status: "permission_selected" }),
+        }),
+      ]),
+    );
+  });
+
   it("fails closed when a run is cancelled while the permission resolver is pending", async () => {
     const client = new FakeAcpClient();
     client.promptDeferred = deferred<Record<string, unknown> | null>();
@@ -2257,12 +2358,12 @@ describe("HermesAcpHarness", () => {
     expect(client.cancelledParams).toEqual([{ sessionId: "acp-session-1" }]);
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
     expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "cancelled" })]));
-    expect(events).not.toEqual(
+    expect(events).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          type: "progress",
-          activitySource: "tool",
-          message: expect.stringContaining("Host Hermes ACP permission"),
+          type: "run_diagnostic",
+          code: "hermes_acp_permission_denied",
+          payload: expect.objectContaining({ reason: "run_cancelled", selectedOptionId: null }),
         }),
       ]),
     );
@@ -2276,6 +2377,67 @@ describe("HermesAcpHarness", () => {
     );
     expect(transcriptEvents.map((event) => event.eventType)).not.toEqual(
       expect.arrayContaining(["acp_permission_selected", "acp_permission_denied"]),
+    );
+  });
+
+  it("fails closed when the ACP child exits while a permission resolver is pending", async () => {
+    const client = new FakeAcpClient();
+    client.promptDeferred = deferred<Record<string, unknown> | null>();
+    client.promptStarted = deferred<void>();
+    client.promptNotificationParams = null;
+    const resolverStarted = deferred<void>();
+    const permissionDecision = deferred<string>();
+    const permissionResolver = vi.fn(() => {
+      resolverStarted.resolve();
+      return permissionDecision.promise;
+    });
+    const { ctx, harness } = await fixture({ client, permissionResolver });
+    const { runPromise } = await startPendingRun({ client, ctx, harness });
+    const requestId = "permission-child-exit";
+
+    const responsePromise = client.invokeClientRequest("session/request_permission", terminalPermissionRequest(), requestId);
+    await resolverStarted.promise;
+    client.emitExit({ code: 1, signal: null });
+    const responses = await responsePromise;
+    permissionDecision.resolve("allow_always");
+    const events = await runPromise;
+    const transcriptEvents = transcriptEventsFromAgentEvents(events);
+
+    expect(permissionResolver).toHaveBeenCalledTimes(1);
+    expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "run_diagnostic",
+          code: "hermes_acp_permission_denied",
+          payload: expect.objectContaining({
+            acpJsonRpcRequestId: requestId,
+            reason: "acp_process_exited",
+            selectedOptionId: null,
+          }),
+        }),
+        expect.objectContaining({ type: "failed", error: expect.stringContaining("Host Hermes ACP process exited") }),
+      ]),
+    );
+    expect(transcriptEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "runtime_diagnostic",
+          payload: expect.objectContaining({
+            code: "hermes_acp_permission_denied",
+            reason: "acp_process_exited",
+            acpJsonRpcRequestId: requestId,
+          }),
+        }),
+      ]),
+    );
+    expect(transcriptEvents).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "runtime_status_update",
+          payload: expect.objectContaining({ status: "permission_selected" }),
+        }),
+      ]),
     );
   });
 });

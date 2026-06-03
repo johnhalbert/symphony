@@ -346,6 +346,32 @@ describe("projectWebHistory", () => {
     ]);
     expect(model.timeline.map((event) => event.text).join("\n")).not.toContain("mock");
   });
+
+  it("does not use stale Cursor fields as the session model for explicit Hermes ACP runs", () => {
+    const hermesAcpHistory = projectWebHistory([
+      run({
+        harnessId: "hermes_acp",
+        runtimeModel: null,
+        runtimeModelParams: [],
+        runtimeSettingSources: ["host_hermes:PATH:hermes"],
+        runtimeMode: null,
+        cursorModel: "stale-cursor-model",
+        cursorMode: "agent",
+      }),
+    ]);
+
+    expect(hermesAcpHistory.sessions[0]).toMatchObject({
+      model: "",
+      runSession: {
+        harnessId: "hermes_acp",
+        runtime: { model: null, mode: null },
+        cursor: { model: "stale-cursor-model", mode: "agent" },
+      },
+    });
+
+    const cursorHistory = projectWebHistory([run({ harnessId: "cursor", cursorModel: "cursor-model" })]);
+    expect(cursorHistory.sessions[0]?.model).toBe("cursor-model");
+  });
 });
 
 function run(overrides: Partial<TestRunRecord> = {}): TestRunRecord {

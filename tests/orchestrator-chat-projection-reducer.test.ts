@@ -342,6 +342,7 @@ class CapturingProjectionTransaction implements ProjectionTransactionRevisionPor
       scopeKind: input.scopeKind,
       scopeKey: input.scopeKey,
       revision: input.revision,
+      buildMode: input.buildMode,
       sourceRevisions: input.sourceRevisions.map((revision) => ({ ...revision })),
       sourceCursors: cloneJson(input.sourceCursors),
       sourceFreshness: input.sourceFreshness.map((freshness) => ({ ...freshness })),

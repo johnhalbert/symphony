@@ -255,6 +255,7 @@ export class HostHermesAcpStdioJsonRpcFacade extends EventEmitter {
   readonly #requestTimeoutMs: number;
   readonly #idFactory: () => HostHermesAcpJsonRpcId;
   readonly #pending = new Map<string, PendingHostHermesAcpRequest>();
+  readonly #inFlightClientRequests = new Map<string, InFlightHostHermesAcpClientRequest>();
   readonly #notificationHandlers = new Map<string, Set<HostHermesAcpNotificationHandler>>();
   readonly #clientRequestHandlers = new Map<string, HostHermesAcpClientRequestHandler>();
   #nextRequestId = 1;
@@ -365,6 +366,7 @@ export class HostHermesAcpStdioJsonRpcFacade extends EventEmitter {
     if (this.#closed) return;
     this.#closed = true;
     this.#rejectAllPending(new Error(`Host Hermes ACP process killed${reason ? `: ${reason}` : ""}.`));
+    this.#inFlightClientRequests.clear();
     this.#transport.kill(reason);
   }
 
@@ -429,20 +431,38 @@ export class HostHermesAcpStdioJsonRpcFacade extends EventEmitter {
 
   async #handleClientRequest(request: HostHermesAcpJsonRpcRequest): Promise<void> {
     this.emit("client_request", request);
-    const handler = this.#clientRequestHandlers.get(request.method);
-    if (!handler) {
+    const key = jsonRpcIdKey(request.id);
+    if (this.#inFlightClientRequests.has(key)) {
       this.emit("diagnostic", {
-        code: "host_hermes_acp_unknown_client_request",
-        message: `No Host Hermes ACP client request handler registered for ${request.method}.`,
+        code: "host_hermes_acp_duplicate_client_request_id",
+        message: `Duplicate Host Hermes ACP client request id ${String(request.id)} for ${request.method}.`,
         details: { id: request.id, method: request.method },
       });
-      this.#sendClientResponse({ jsonrpc: "2.0", id: request.id, error: jsonRpcError(-32601, `Method not found: ${request.method}`) });
+      this.#sendClientResponse({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: jsonRpcError(-32600, `Duplicate request id: ${String(request.id)}`),
+      });
       return;
     }
+    const inFlight: InFlightHostHermesAcpClientRequest = { method: request.method };
+    this.#inFlightClientRequests.set(key, inFlight);
+    const handler = this.#clientRequestHandlers.get(request.method);
     try {
+      if (!handler) {
+        this.emit("diagnostic", {
+          code: "host_hermes_acp_unknown_client_request",
+          message: `No Host Hermes ACP client request handler registered for ${request.method}.`,
+          details: { id: request.id, method: request.method },
+        });
+        this.#sendClientResponse({ jsonrpc: "2.0", id: request.id, error: jsonRpcError(-32601, `Method not found: ${request.method}`) });
+        return;
+      }
       const result = await handler(request.params, request);
+      if (this.#closed || !this.#inFlightClientRequests.has(key)) return;
       this.#sendClientResponse({ jsonrpc: "2.0", id: request.id, result: result ?? null });
     } catch (error) {
+      if (this.#closed || !this.#inFlightClientRequests.has(key)) return;
       this.emit("diagnostic", {
         code: "host_hermes_acp_client_request_handler_error",
         message: `Host Hermes ACP client request handler for ${request.method} failed: ${errorMessage(error)}`,
@@ -453,10 +473,13 @@ export class HostHermesAcpStdioJsonRpcFacade extends EventEmitter {
         id: request.id,
         error: jsonRpcError(-32603, `Handler failed: ${errorMessage(error)}`),
       });
+    } finally {
+      this.#inFlightClientRequests.delete(key);
     }
   }
 
   #sendClientResponse(response: HostHermesAcpJsonRpcResponse): void {
+    if (this.#closed) return;
     try {
       this.#transport.send(response);
     } catch (error) {
@@ -477,6 +500,7 @@ export class HostHermesAcpStdioJsonRpcFacade extends EventEmitter {
         stderrTail.length > 0 ? `\nStderr tail:\n${stderrTail}` : ""
       }`;
       this.#rejectAllPending(new Error(message));
+      this.#inFlightClientRequests.clear();
     }
     this.emit("exit", exit);
   }
@@ -507,6 +531,10 @@ interface PendingHostHermesAcpRequest {
   resolve(value: unknown): void;
   reject(error: Error): void;
   timeout: NodeJS.Timeout;
+}
+
+interface InFlightHostHermesAcpClientRequest {
+  method: string;
 }
 
 function requireJsonRpcMethod(method: string): string {

@@ -8,6 +8,7 @@ import {
   renderCompletionMcpHandoffPrompt,
   renderIssueBreakdownMcpHandoffPrompt,
   renderMergeConflictResolutionMcpHandoffPrompt,
+  renderReviewMcpHandoffPrompt,
 } from "../harness/HandoffMcp.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
@@ -1430,6 +1431,14 @@ export class Orchestrator {
           reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
           workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
         }),
+        {
+          issue: entry.issue,
+          role: "reviewer",
+          workspacePath: workspace.path,
+          branchName: workspace.gitBranchName ?? entry.issue.branchName ?? null,
+          repoPath: workspace.repoPath ?? null,
+          baseRef: workspace.baseRef ?? null,
+        },
       );
       await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
         workspace,
@@ -1476,7 +1485,7 @@ export class Orchestrator {
         entry.runId = event.runId ?? event.sessionId;
         entry.activeRunId = entry.runId;
         entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-        const runtimeMetadata = runtimeMetadataForEntry(this.options.harness.id, entry, this.config);
+        const runtimeMetadata = runtimeMetadataForEntry(this.options.harness.id, entry, this.config, event);
         await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
         await this.options.runStore?.startRun({
           runId: entry.runId,
@@ -2755,16 +2764,20 @@ export class Orchestrator {
     return DEFAULT_REVIEWER_PROMPT_TEMPLATE;
   }
 
-  private formatRenderedReviewerPrompt(prompt: string): string {
+  private formatRenderedReviewerPrompt(
+    prompt: string,
+    mcpHandoff: Parameters<typeof renderReviewMcpHandoffPrompt>[0],
+  ): string {
     const configured = this.config.reviewLoop.reviewerPromptTemplate;
     if (configured !== null && configured.trim().length > 0) return prompt;
-    return prompt
+    const rendered = prompt
       .replace(
         PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER,
         formatPromptExtensions("Project-specific reviewer extensions:", this.config.reviewLoop.reviewerPromptExtensions) ??
           "",
       )
       .trim();
+    return [rendered, renderReviewMcpHandoffPrompt(mcpHandoff)].join("\n").trim();
   }
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
@@ -3309,13 +3322,13 @@ function effectiveRuntimeModeForEntry(entry: RunningEntry, config: ServiceConfig
 
 function runtimeProviderForHarness(harnessId: string, config: ServiceConfig): string | null {
   if (harnessId === "hermes") return config.hermes.provider;
-  if (harnessId === "hermes_acp") return config.hermes.provider ?? "host_hermes";
+  if (harnessId === "hermes_acp") return config.hermes.provider;
   return harnessId;
 }
 
 function runtimeModelForHarness(harnessId: string, config: ServiceConfig): string | null {
   if (harnessId === "hermes") return config.hermes.model;
-  if (harnessId === "hermes_acp") return config.hermes.model;
+  if (harnessId === "hermes_acp") return null;
   if (harnessId === "cursor") return config.cursor.model;
   return null;
 }
@@ -3332,6 +3345,7 @@ function runtimeMetadataForEntry(
   harnessId: string,
   entry: RunningEntry,
   config: ServiceConfig,
+  sessionStartedEvent?: Extract<AgentEvent, { type: "session_started" }>,
 ): Partial<
   Pick<
     StartRunInput,
@@ -3366,17 +3380,19 @@ function runtimeMetadataForEntry(
     };
   }
   if (harnessId === "hermes_acp") {
+    const runtimeProviderId = cleanRuntimeMetadataString(sessionStartedEvent?.providerId);
+    const runtimeModel = cleanRuntimeMetadataString(sessionStartedEvent?.model);
     return {
-      runtimeModel: config.hermes.model,
+      runtimeModel,
       runtimeModelParams: [],
       runtimeSettingSources: [
-        `host_hermes:${config.hermes.acpBinaryPath ?? "PATH:hermes"}`,
-        `source_profile:${config.hermes.acpSourceProfile ?? "active"}`,
-        `profile_prefix:${config.hermes.acpProfilePrefix ?? "symphony"}`,
-        ...(config.hermes.provider === null ? [] : [`provider:${config.hermes.provider}`]),
+        `host_hermes:${config.hermesAcp.binaryPath ?? "PATH:hermes"}`,
+        `source_profile:${config.hermesAcp.sourceProfile ?? "active"}`,
+        `profile_prefix:${config.hermesAcp.profilePrefix}`,
+        ...(runtimeProviderId === null ? [] : [`provider:${runtimeProviderId}`]),
       ],
-      runtimeMode: effectiveRuntimeModeForEntry(entry, config),
-      runtimeAgentLifecycle: config.hermes.workerSessionLifecycle,
+      runtimeMode: null,
+      runtimeAgentLifecycle: config.hermesAcp.workerSessionLifecycle,
     };
   }
   return {
@@ -3385,6 +3401,12 @@ function runtimeMetadataForEntry(
     runtimeSettingSources: [],
     runtimeMode: effectiveRuntimeModeForEntry(entry, config),
   };
+}
+
+function cleanRuntimeMetadataString(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function hermesTemplateForEntry(entry: RunningEntry, config: ServiceConfig): string {

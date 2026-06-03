@@ -191,6 +191,52 @@ export interface ChatMessage {
   suggestions?: string[];
 }
 
+export type OrchestratorChatConversationStatus = NonNullable<ChatMessage["status"]>;
+export type OrchestratorChatState = "empty" | OrchestratorChatConversationStatus;
+export type OrchestratorChatStatusCounts = Record<OrchestratorChatConversationStatus, number>;
+
+export interface OrchestratorChatStatusSummary {
+  state: OrchestratorChatState;
+  conversationStatus: OrchestratorChatConversationStatus;
+  latestMessageStatus: OrchestratorChatConversationStatus | null;
+  active: boolean;
+  terminal: boolean;
+  empty: boolean;
+  messageCount: number;
+  statusCounts: OrchestratorChatStatusCounts;
+}
+
+export interface OrchestratorChatConversationSummary {
+  id: string;
+  status: OrchestratorChatConversationStatus;
+  createdAt: string | null;
+  updatedAt: string | null;
+  messageCount: number;
+  metadata: Record<string, unknown>;
+}
+
+export interface OrchestratorChatSourceSummary {
+  source: string;
+  revision: string;
+  observedAt: string | null;
+  conversationId: string;
+  latestMessageSequence: number | null;
+  latestMessageUpdatedAt: string | null;
+}
+
+export interface OrchestratorChatModel {
+  schemaVersion: number;
+  conversation: OrchestratorChatConversationSummary;
+  state: OrchestratorChatState;
+  status: OrchestratorChatStatusSummary;
+  chat: ChatMessage[];
+  source: OrchestratorChatSourceSummary;
+  compatibility?: {
+    responseShape: "orchestrator_chat_projection";
+    sourceShape: "reducer_envelope" | "legacy_chat_array" | "fallback";
+  };
+}
+
 export type TranscriptMessage =
   | {
       kind: "system";

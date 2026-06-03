@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { SidebarChrome } from "../../app/SidebarChrome";
 import { useDataSource } from "../../data/dataSourceContext";
-import type { ChatMessage, SidebarModel, SidebarVariant } from "../../types/symphony";
+import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../../data/orchestratorChat";
+import type { ChatMessage, OrchestratorChatModel, SidebarModel, SidebarVariant } from "../../types/symphony";
 import { SidebarChat } from "./SidebarChat";
 import { SidebarHistory } from "./SidebarHistory";
 import { SidebarPrimary } from "./SidebarPrimary";
@@ -14,7 +15,7 @@ export function SidebarViews({
   sidebar,
   variant,
 }: {
-  orchestratorChat?: ChatMessage[];
+  orchestratorChat?: OrchestratorChatModel | ChatMessage[];
   orchestratorChatError?: string | null;
   orchestratorChatLoading?: boolean;
   orchestratorChatReadOnly?: boolean;
@@ -22,7 +23,7 @@ export function SidebarViews({
   variant: SidebarVariant;
 }) {
   const dataSource = useDataSource();
-  const sourceChat = orchestratorChat ?? sidebar.chat;
+  const sourceChat = useMemo(() => normalizeOrchestratorChatModel(orchestratorChat ?? sidebar.chat), [orchestratorChat, sidebar.chat]);
   const [chatMessages, setChatMessages] = useState(sourceChat);
 
   useEffect(() => {
@@ -32,7 +33,7 @@ export function SidebarViews({
   async function sendChat(input: string) {
     if (orchestratorChatReadOnly) return;
     const nextMessages = await dataSource.sendOrchestratorMessage(input);
-    setChatMessages(nextMessages);
+    setChatMessages(orchestratorChatModelFromMessages(nextMessages, { conversationId: chatMessages.conversation.id }));
   }
 
   const sidebarChatSubtitle = sidebar.runningAgents[0]
@@ -41,7 +42,8 @@ export function SidebarViews({
   const child =
     variant === "chat" ? (
       <SidebarChat
-        messages={chatMessages}
+        projection={chatMessages}
+        messages={chatMessages.chat}
         onSend={sendChat}
         loading={orchestratorChatLoading}
         error={orchestratorChatError}

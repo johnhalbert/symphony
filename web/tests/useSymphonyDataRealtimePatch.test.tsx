@@ -5,9 +5,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RealtimeEventListener, RealtimeProjectionEvent, SymphonyDataSource } from "../src/data/dataSource";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
+import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
 import { useOrchestratorChat, useTranscript } from "../src/hooks/useSymphonyData";
-import type { ChatMessage, Loadable, TranscriptMessage } from "../src/types/symphony";
+import type { ChatMessage, Loadable, OrchestratorChatModel, TranscriptMessage } from "../src/types/symphony";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -116,7 +117,7 @@ function renderTranscriptProbe(dataSource: SymphonyDataSource) {
 }
 
 function renderChatProbe(dataSource: SymphonyDataSource) {
-  let latest: Loadable<ChatMessage[]> | null = null;
+  let latest: Loadable<OrchestratorChatModel> | null = null;
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
@@ -229,9 +230,9 @@ describe("useSymphonyData realtime direct patching", () => {
     const invalidateCachedReads = vi.fn();
     const initial: ChatMessage[] = [{ id: "msg-1", conversationId: "orchestrator-default", who: "user", text: "status" }];
     const refetched: ChatMessage[] = [{ id: "msg-refetch", conversationId: "orchestrator-default", who: "agent", text: "refetched" }];
-    const getOrchestratorChat = vi.fn<(_: AbortSignal | undefined) => Promise<ChatMessage[]>>()
-      .mockResolvedValueOnce(initial)
-      .mockResolvedValueOnce(refetched);
+    const getOrchestratorChat = vi.fn<(_: AbortSignal | undefined) => Promise<OrchestratorChatModel>>()
+      .mockResolvedValueOnce(orchestratorChatModelFromMessages(initial))
+      .mockResolvedValueOnce(orchestratorChatModelFromMessages(refetched));
     const dataSource = testDataSource({
       getOrchestratorChat,
       invalidateCachedReads,
@@ -243,17 +244,18 @@ describe("useSymphonyData realtime direct patching", () => {
     const probe = renderChatProbe(dataSource);
     await flushPromises();
 
-    expect(probe.result()).toMatchObject({ data: initial, loading: false, error: null });
+    expect(probe.result().data?.chat).toEqual(initial);
+    expect(probe.result()).toMatchObject({ loading: false, error: null });
     expect(getOrchestratorChat).toHaveBeenCalledTimes(1);
 
     const serverMessage: ChatMessage = { id: "msg-2", conversationId: "orchestrator-default", who: "agent", text: "server message" };
     act(() => listener?.(chatEvent(2, serverMessage, 2)));
 
-    expect(probe.result().data).toEqual([...initial, serverMessage]);
+    expect(probe.result().data?.chat).toEqual([...initial, serverMessage]);
     expect(getOrchestratorChat).toHaveBeenCalledTimes(1);
 
     act(() => listener?.(chatEvent(2, serverMessage, 2, { id: "chat-2-replay" })));
-    expect(probe.result().data).toHaveLength(2);
+    expect(probe.result().data?.chat).toHaveLength(2);
     expect(getOrchestratorChat).toHaveBeenCalledTimes(1);
 
     act(() =>
@@ -267,7 +269,7 @@ describe("useSymphonyData realtime direct patching", () => {
 
     expect(invalidateCachedReads).toHaveBeenCalledWith({ forceRefreshHrefs: ["/api/v1/web/orchestrator-chat?refresh=1"] });
     expect(getOrchestratorChat).toHaveBeenCalledTimes(2);
-    expect(probe.result().data).toEqual(refetched);
+    expect(probe.result().data?.chat).toEqual(refetched);
   });
 
   it("refetches orchestrator chat instead of appending updates for ids outside the active bounded tail", async () => {
@@ -278,9 +280,9 @@ describe("useSymphonyData realtime direct patching", () => {
       { id: "msg-3", conversationId: "orchestrator-default", who: "agent", text: "visible-3" },
     ];
     const refetched: ChatMessage[] = [...initial];
-    const getOrchestratorChat = vi.fn<(_: AbortSignal | undefined) => Promise<ChatMessage[]>>()
-      .mockResolvedValueOnce(initial)
-      .mockResolvedValueOnce(refetched);
+    const getOrchestratorChat = vi.fn<(_: AbortSignal | undefined) => Promise<OrchestratorChatModel>>()
+      .mockResolvedValueOnce(orchestratorChatModelFromMessages(initial))
+      .mockResolvedValueOnce(orchestratorChatModelFromMessages(refetched));
     const dataSource = testDataSource({
       getOrchestratorChat,
       invalidateCachedReads,
@@ -304,6 +306,6 @@ describe("useSymphonyData realtime direct patching", () => {
 
     expect(invalidateCachedReads).toHaveBeenCalledWith({ forceRefreshHrefs: ["/api/v1/web/orchestrator-chat?refresh=1"] });
     expect(getOrchestratorChat).toHaveBeenCalledTimes(2);
-    expect(probe.result().data).toEqual(refetched);
+    expect(probe.result().data?.chat).toEqual(refetched);
   });
 });

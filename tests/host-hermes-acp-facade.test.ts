@@ -319,6 +319,57 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
     });
   });
 
+  it("rejects duplicate in-flight client request ids without invoking the handler twice", async () => {
+    const { child, facade, writes } = createSpawnedFacade();
+    const diagnostics: HostHermesAcpDiagnostic[] = [];
+    let resolveFirst: (value: unknown) => void = () => undefined;
+    const firstResult = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+    let handlerCalls = 0;
+    facade.on("diagnostic", (diagnostic) => diagnostics.push(diagnostic));
+    facade.onClientRequest("session/request_permission", () => {
+      handlerCalls += 1;
+      return firstResult;
+    });
+
+    writeJsonRpc(child, { jsonrpc: "2.0", id: "perm-duplicate", method: "session/request_permission", params: { order: 1 } });
+    await flushAsyncHandlers();
+    writeJsonRpc(child, { jsonrpc: "2.0", id: "perm-duplicate", method: "session/request_permission", params: { order: 2 } });
+    await flushAsyncHandlers();
+
+    expect(handlerCalls).toBe(1);
+    expect(writes).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: "perm-duplicate",
+        error: { code: -32600, message: "Duplicate request id: perm-duplicate" },
+      },
+    ]);
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        code: "host_hermes_acp_duplicate_client_request_id",
+        details: { id: "perm-duplicate", method: "session/request_permission" },
+      }),
+    ]);
+
+    resolveFirst({ outcome: "selected", optionId: "allow_once" });
+    await flushAsyncHandlers();
+
+    expect(writes).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: "perm-duplicate",
+        error: { code: -32600, message: "Duplicate request id: perm-duplicate" },
+      },
+      {
+        jsonrpc: "2.0",
+        id: "perm-duplicate",
+        result: { outcome: "selected", optionId: "allow_once" },
+      },
+    ]);
+  });
+
   it("turns server request handler failures into a single JSON-RPC error response and diagnostic", async () => {
     const { child, facade, writes } = createSpawnedFacade();
     const diagnostics: HostHermesAcpDiagnostic[] = [];
@@ -348,6 +399,24 @@ describe("HostHermesAcpStdioJsonRpcFacade", () => {
         details: { id: "perm-fail-1", method: "session/request_permission" },
       }),
     ]);
+  });
+
+  it("does not send stale client request responses after the ACP process exits", async () => {
+    const { child, facade, writes } = createSpawnedFacade();
+    let resolvePermission: (value: unknown) => void = () => undefined;
+    const permissionResult = new Promise((resolve) => {
+      resolvePermission = resolve;
+    });
+    facade.onClientRequest("session/request_permission", () => permissionResult);
+
+    writeJsonRpc(child, { jsonrpc: "2.0", id: "perm-exit", method: "session/request_permission", params: { sessionId: "s1" } });
+    await flushAsyncHandlers();
+    child.exit(1);
+    child.close(1);
+    resolvePermission({ outcome: "selected", optionId: "allow_once" });
+    await flushAsyncHandlers();
+
+    expect(writes).toEqual([]);
   });
 
   it("captures malformed stdout diagnostics and bounded stderr log tails without crashing", () => {

@@ -907,13 +907,29 @@ export function projectSessionModel(run: RunRecord): SessionModel {
     issue: run.issueIdentifier,
     title: run.issueIdentifier,
     state: run.status,
-    model: run.cursorModel ?? null,
+    model: firstNonEmpty(run.runtimeModel, legacyCursorRuntimeFallbackModel(run)),
     startedAt: run.startedAt ?? null,
     updatedAt: run.updatedAt ?? null,
     msgCount: run.transcriptEventCount ?? 0,
     lastEvent: run.error ?? null,
     toolCount: 0,
   };
+}
+
+function legacyCursorRuntimeFallbackModel(run: RunRecord): string | null {
+  return shouldUseCursorRuntimeFallback(run) ? firstNonEmpty(run.cursorModel) : null;
+}
+
+function shouldUseCursorRuntimeFallback(run: RunRecord): boolean {
+  const harnessId = firstNonEmpty(run.harnessId);
+  if (harnessId === "cursor") return true;
+  if (harnessId) return false;
+  return (
+    run.cursorModel !== undefined ||
+    run.cursorModelParams !== undefined ||
+    run.cursorMode !== undefined ||
+    run.cursorSettingSources !== undefined
+  );
 }
 
 export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefined, generatedAt: string | null | undefined = snapshot?.generatedAt ?? null): RunningAgentModel[] {
