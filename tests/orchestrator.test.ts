@@ -140,7 +140,7 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.agent.harness = "hermes_acp";
     config.hermes.provider = "openrouter";
-    config.hermes.model = "anthropic/claude-sonnet-test";
+    config.hermes.model = "config-model-should-not-leak";
     config.hermesAcp.binaryPath = "/opt/hermes/bin/hermes";
     config.hermesAcp.sourceProfile = "dogfood";
     config.hermesAcp.profilePrefix = "sym-test";
@@ -165,7 +165,12 @@ describe("Orchestrator", () => {
       runs: [],
       async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
         this.runs.push({ ctx, prompt });
-        yield { type: "session_started", sessionId: `hermes-acp-${ctx.issue.id}-${ctx.turnNumber}` };
+        yield {
+          type: "session_started",
+          sessionId: `hermes-acp-${ctx.issue.id}-${ctx.turnNumber}`,
+          providerId: "openrouter",
+          model: "anthropic/claude-sonnet-test",
+        };
         yield { type: "completed", message: "hermes acp completed" };
       },
     };
@@ -204,7 +209,7 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.agent.harness = "hermes_acp";
     config.hermes.provider = null;
-    config.hermes.model = "host-hermes-model";
+    config.hermes.model = "config-model-should-not-leak";
     config.hermesAcp.binaryPath = null;
     config.hermesAcp.sourceProfile = null;
     const candidate = issue({ state: "Todo" });
@@ -232,6 +237,8 @@ describe("Orchestrator", () => {
           sessionId: "symphony-profile:acp-session-1:hermes-acp-run-1",
           threadId: "acp-session-1",
           runId: "hermes-acp-run-1",
+          providerId: null,
+          model: null,
         };
         yield { type: "completed", message: "hermes acp completed" };
       },
@@ -257,7 +264,7 @@ describe("Orchestrator", () => {
       sessionId: "symphony-profile:acp-session-1:hermes-acp-run-1",
       agentId: "acp-session-1",
       harnessId: "hermes_acp",
-      runtimeModel: "host-hermes-model",
+      runtimeModel: null,
       runtimeModelParams: [],
       runtimeSettingSources: ["host_hermes:PATH:hermes", "source_profile:active", "profile_prefix:symphony"],
       runtimeMode: null,
@@ -542,6 +549,70 @@ describe("Orchestrator", () => {
     }
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 2, "dispatch after provider window closes");
+    await orchestrator.stop();
+  });
+
+  it("keeps ACP-sourced Hermes ACP provider-limit gates active when the configured provider is unknown", async () => {
+    const config = testConfig(root);
+    config.agent.harness = "hermes_acp";
+    config.hermes.provider = null;
+    config.hermes.model = "config-model-should-not-leak";
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new ProviderLimitThenCompleteHarness(
+      { providerId: "openrouter", model: "anthropic/claude-sonnet-acp" },
+      "hermes_acp",
+      { providerId: "openrouter", model: "anthropic/claude-sonnet-acp" },
+    );
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "Hermes ACP provider-limit run dispatched");
+    await waitFor(() => orchestrator.snapshot().providerGates.length === 1, "Hermes ACP provider gate recorded");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "Hermes ACP provider-limit run exited");
+
+    expect(orchestrator.snapshot().providerGates[0]).toMatchObject({
+      scope: { harnessId: "hermes_acp", providerId: "openrouter", model: "anthropic/claude-sonnet-acp" },
+      resumePolicy: "manual",
+    });
+    await expect(runStore.latestRunForIssue(candidate.id)).resolves.toMatchObject({
+      harnessId: "hermes_acp",
+      status: "failed",
+      runtimeModel: "anthropic/claude-sonnet-acp",
+      runtimeSettingSources: ["host_hermes:PATH:hermes", "source_profile:active", "profile_prefix:symphony", "provider:openrouter"],
+      providerLimit: {
+        scope: { harnessId: "hermes_acp", providerId: "openrouter", model: "anthropic/claude-sonnet-acp" },
+      },
+      failureKind: "provider_limit",
+    });
+
+    await orchestrator.refreshNow();
+    expect(harness.runs).toHaveLength(1);
+    const gateId = orchestrator.snapshot().providerGates[0]!.id;
+    await expect(orchestrator.clearProviderGate(gateId)).resolves.toMatchObject({ id: gateId });
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "Hermes ACP dispatch after provider gate clear");
     await orchestrator.stop();
   });
 
@@ -7040,21 +7111,30 @@ class NonMcpHarness implements AgentHarness {
 }
 
 class ProviderLimitThenCompleteHarness implements AgentHarness {
-  readonly id = "hermes";
   readonly capabilities = { continuation: true, mcpHandoff: true };
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
 
-  constructor(private readonly limit: { providerId: string; model?: string | null; resumeAt?: string | null }) {}
+  constructor(
+    private readonly limit: { providerId: string; model?: string | null; resumeAt?: string | null },
+    readonly id = "hermes",
+    private readonly sessionRuntimeMetadata: { providerId?: string | null; model?: string | null } = {},
+  ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.runs.push({ ctx, prompt });
-    yield { type: "session_started", sessionId: `provider-limit-${this.runs.length}`, runId: `provider-limit-run-${this.runs.length}` };
+    yield {
+      type: "session_started",
+      sessionId: `provider-limit-${this.runs.length}`,
+      runId: `provider-limit-run-${this.runs.length}`,
+      ...(this.sessionRuntimeMetadata.providerId === undefined ? {} : { providerId: this.sessionRuntimeMetadata.providerId }),
+      ...(this.sessionRuntimeMetadata.model === undefined ? {} : { model: this.sessionRuntimeMetadata.model }),
+    };
     if (this.runs.length === 1) {
       yield {
         type: "provider_limit",
         signal: {
           scope: {
-            harnessId: "hermes",
+            harnessId: this.id,
             providerId: this.limit.providerId,
             model: this.limit.model ?? null,
           },

@@ -181,6 +181,60 @@ describe("FileRunTranscriptStore", () => {
     expect(run).not.toHaveProperty("runtimeAgentLifecycle");
   });
 
+  it("replays ACP session_started runtime metadata into durable run records", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await store.startRun({
+      runId: "run-hermes-acp-runtime-replay",
+      sessionId: "session-before-replay",
+      agentId: "agent-before-replay",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      harnessId: "hermes_acp",
+      runtimeModel: null,
+      runtimeModelParams: [],
+      runtimeSettingSources: ["host_hermes:PATH:hermes", "source_profile:active", "profile_prefix:symphony"],
+      runtimeMode: null,
+      cursorModel: "cursor-model-should-not-leak",
+      cursorMode: "agent",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+    await store.appendEvent({
+      runId: "run-hermes-acp-runtime-replay",
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "session_started",
+      payload: {
+        type: "session_started",
+        sessionId: "profile:acp-session:run-hermes-acp-runtime-replay",
+        threadId: "acp-session",
+        providerId: "openrouter",
+        model: "anthropic/claude-sonnet-acp",
+      },
+    });
+
+    const metaPath = path.join(root, "runs", "run-hermes-acp-runtime-replay", "meta.json");
+    const staleMeta = JSON.parse(await readFile(metaPath, "utf8")) as Record<string, unknown>;
+    staleMeta.runtimeModel = null;
+    staleMeta.runtimeSettingSources = ["host_hermes:PATH:hermes", "source_profile:active", "profile_prefix:symphony"];
+    await writeFile(metaPath, `${JSON.stringify(staleMeta, null, 2)}\n`, "utf8");
+
+    await expect(store.rebuildRunFromTranscript("run-hermes-acp-runtime-replay")).resolves.toMatchObject({
+      harnessId: "hermes_acp",
+      sessionId: "profile:acp-session:run-hermes-acp-runtime-replay",
+      agentId: "acp-session",
+      runtimeModel: "anthropic/claude-sonnet-acp",
+      runtimeSettingSources: ["host_hermes:PATH:hermes", "source_profile:active", "profile_prefix:symphony", "provider:openrouter"],
+      runtimeMode: null,
+      cursorModel: "cursor-model-should-not-leak",
+      cursorMode: "agent",
+    });
+  });
+
   it("reads bounded file-backed transcript tails without parsing the whole JSONL body", async () => {
     const store = new FileRunTranscriptStore(root);
     await store.startRun({

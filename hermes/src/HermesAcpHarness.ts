@@ -117,6 +117,7 @@ interface HermesAcpLease {
   profile: HostHermesAcpProfileLease;
   client: HermesAcpRuntimeClient;
   initialized: boolean;
+  runtimeMetadata: HermesAcpRuntimeMetadata;
   disposed: boolean;
   transportExited: boolean;
   transportExitListener: ((exit: HostHermesAcpProcessExit) => void) | undefined;
@@ -177,6 +178,16 @@ interface HermesAcpLeaseAcquisition {
 }
 
 type TerminalStatus = HostHermesAcpTerminalStatus;
+
+interface HermesAcpRuntimeMetadata {
+  providerId: string | null;
+  model: string | null;
+}
+
+interface HermesAcpSessionStart {
+  sessionId: string;
+  runtimeMetadata: HermesAcpRuntimeMetadata;
+}
 
 type HermesAcpSessionUpdateDiagnosticCode = "hermes_acp_malformed_session_update" | "hermes_acp_unknown_session_update";
 
@@ -316,6 +327,7 @@ interface SelectedAuthMethod {
   id: string;
   display: string;
   diagnostics: string;
+  method: Record<string, unknown>;
 }
 
 interface AuthMethodSelectionContext {
@@ -382,6 +394,7 @@ export class HermesAcpHarness implements AgentHarness {
     let responseText = "";
     let pendingFinalUsageUpdateTokens: Partial<TokenCounts> | null = null;
     let activitySequence = 0;
+    let runRuntimeMetadata = unknownHermesAcpRuntimeMetadata();
     const toolIdentities = new Map<string, HermesAcpToolIdentity>();
 
     const runActivityContext = (at: string, sequence: number, idScope?: string): HermesAcpRunActivityContext => ({
@@ -498,12 +511,22 @@ export class HermesAcpHarness implements AgentHarness {
     if (ctx.abortSignal.aborted) abort();
 
     try {
-      await this.ensureAcpInitialized(ctx, lease);
-      const acpSessionId = await this.createAcpSession(ctx, lease);
+      runRuntimeMetadata = await this.ensureAcpInitialized(ctx, lease);
+      const acpSession = await this.createAcpSession(ctx, lease);
+      const acpSessionId = acpSession.sessionId;
+      runRuntimeMetadata = acpSession.runtimeMetadata;
       activeRun.acpSessionId = acpSessionId;
       activeRun.symphonySessionId = `${lease.profile.profileName}:${acpSessionId}:${runId}`;
       await writeActiveHandoffMcpContexts(ctx, { activeRunId: runId, sessionId: activeRun.symphonySessionId });
-      yield withRunActivity({ type: "session_started", sessionId: activeRun.symphonySessionId, threadId: acpSessionId, runId });
+      yield withRunActivity({
+        type: "session_started",
+        sessionId: activeRun.symphonySessionId,
+        threadId: acpSessionId,
+        runId,
+        providerId: runRuntimeMetadata.providerId,
+        model: runRuntimeMetadata.model,
+      });
+
       enqueue(
         { type: "progress", activitySource: "stream", message: `Host Hermes ACP profile ${lease.profile.profileName}` },
         {
@@ -534,20 +557,17 @@ export class HermesAcpHarness implements AgentHarness {
             cancelled: this.isRunCancelling(ctx, runId, activeRun),
             responseText,
             fallbackUsageTokens: pendingFinalUsageUpdateTokens,
-            providerId: ctx.config.hermes.provider,
-            model: ctx.config.hermes.model,
-            harnessId: this.id,
+            ...hermesAcpLimitMappingDefaults(ctx, this.id, runRuntimeMetadata),
           });
           terminalStatus = terminalStatusFromEvents(events);
           for (const event of events) enqueue(event);
           queue.close();
         })
         .catch((error: unknown) => {
-          const providerLimit = providerLimitSignalFromHermesError(error, {
-            providerId: ctx.config.hermes.provider,
-            model: ctx.config.hermes.model,
-            harnessId: this.id,
-          });
+          const providerLimit = providerLimitSignalFromHermesError(
+            error,
+            hermesAcpLimitMappingDefaults(ctx, this.id, runRuntimeMetadata),
+          );
           if (providerLimit) enqueue({ type: "provider_limit", signal: providerLimit });
           failRun(`Host Hermes ACP run failed: ${errorMessage(error)}`, {
             runId,
@@ -572,11 +592,10 @@ export class HermesAcpHarness implements AgentHarness {
         yield withRunActivity({ type: "cancelled" });
       } else {
         terminalStatus = "failed";
-        const providerLimit = providerLimitSignalFromHermesError(error, {
-          providerId: ctx.config.hermes.provider,
-          model: ctx.config.hermes.model,
-          harnessId: this.id,
-        });
+        const providerLimit = providerLimitSignalFromHermesError(
+          error,
+          hermesAcpLimitMappingDefaults(ctx, this.id, runRuntimeMetadata),
+        );
         if (providerLimit) yield withRunActivity({ type: "provider_limit", signal: providerLimit });
         yield withRunActivity({
           type: "run_diagnostic",
@@ -795,6 +814,7 @@ export class HermesAcpHarness implements AgentHarness {
       profile,
       client,
       initialized: false,
+      runtimeMetadata: unknownHermesAcpRuntimeMetadata(),
       disposed: false,
       transportExited: false,
       transportExitListener: undefined,
@@ -845,8 +865,8 @@ export class HermesAcpHarness implements AgentHarness {
     throw new SymphonyError("config_validation_error", hostHermesDiscoveryErrorMessage(discovery));
   }
 
-  private async ensureAcpInitialized(ctx: AgentRunContext, lease: HermesAcpLease): Promise<void> {
-    if (lease.initialized) return;
+  private async ensureAcpInitialized(ctx: AgentRunContext, lease: HermesAcpLease): Promise<HermesAcpRuntimeMetadata> {
+    if (lease.initialized) return lease.runtimeMetadata;
     const initializeResult = await lease.client.request<Record<string, unknown>>(
       "initialize",
       {
@@ -875,10 +895,15 @@ export class HermesAcpHarness implements AgentHarness {
       );
     }
     validateAcpAuthenticateResult(authenticateResult, method);
+    lease.runtimeMetadata = mergeHermesAcpRuntimeMetadata(
+      hermesAcpRuntimeMetadataFromInitializeResult(initializeResult, method),
+      hermesAcpRuntimeMetadataFromRecord(authenticateResult),
+    );
     lease.initialized = true;
+    return lease.runtimeMetadata;
   }
 
-  private async createAcpSession(ctx: AgentRunContext, lease: HermesAcpLease): Promise<string> {
+  private async createAcpSession(ctx: AgentRunContext, lease: HermesAcpLease): Promise<HermesAcpSessionStart> {
     const response = await lease.client.request<Record<string, unknown>>(
       "session/new",
       {
@@ -889,7 +914,8 @@ export class HermesAcpHarness implements AgentHarness {
     );
     const sessionId = nonEmptyString(response.sessionId) ?? nonEmptyString(response.session_id);
     if (!sessionId) throw new SymphonyError("agent_error", "Host Hermes ACP session/new did not return a sessionId.");
-    return sessionId;
+    const runtimeMetadata = mergeHermesAcpRuntimeMetadata(lease.runtimeMetadata, hermesAcpRuntimeMetadataFromRecord(response));
+    return { sessionId, runtimeMetadata };
   }
 
   private async interruptActiveRun(activeRun: ActiveHermesAcpRun, reason: string): Promise<void> {
@@ -935,6 +961,7 @@ export class HermesAcpHarness implements AgentHarness {
     if (lease.disposed) return;
     lease.transportExited = true;
     lease.initialized = false;
+    lease.runtimeMetadata = unknownHermesAcpRuntimeMetadata();
     this.leases.delete(lease.key);
     if (lease.reusable) this.retiredReusableLeaseReasons.set(lease.key, "fresh_previous_process_exited");
   }
@@ -1048,7 +1075,13 @@ function runActivityMetadataForAgentEvent(event: AgentEvent): HermesAcpRunActivi
         channel: "lifecycle",
         kind: "session_started",
         text: "ACP session started",
-        payload: { sessionId: event.sessionId, threadId: event.threadId ?? null, runId: event.runId ?? null },
+        payload: {
+          sessionId: event.sessionId,
+          threadId: event.threadId ?? null,
+          runId: event.runId ?? null,
+          providerId: event.providerId ?? null,
+          model: event.model ?? null,
+        },
       };
     case "progress":
       return progressRunActivityMetadata(event);
@@ -1463,7 +1496,7 @@ function selectedAuthMethod(
   if (!id) {
     throw new SymphonyError("agent_error", `Host Hermes ACP selected auth method did not include an id. ${diagnostics}`);
   }
-  return { id, display: selectedAuthMethodDisplay(method, id), diagnostics };
+  return { id, display: selectedAuthMethodDisplay(method, id), diagnostics, method };
 }
 
 function selectedAuthMethodDisplay(method: Record<string, unknown>, id: string): string {
@@ -1485,6 +1518,95 @@ function validateAcpAuthenticateResult(result: unknown, method: SelectedAuthMeth
       `Host Hermes ACP authenticate returned an invalid response for auth method ${method.display}. ${method.diagnostics}`,
     );
   }
+}
+
+function unknownHermesAcpRuntimeMetadata(): HermesAcpRuntimeMetadata {
+  return { providerId: null, model: null };
+}
+
+function hermesAcpRuntimeMetadataFromInitializeResult(
+  initializeResult: Record<string, unknown>,
+  method: SelectedAuthMethod,
+): HermesAcpRuntimeMetadata {
+  return mergeHermesAcpRuntimeMetadata(
+    hermesAcpRuntimeMetadataFromRecord(initializeResult),
+    hermesAcpRuntimeMetadataFromRecord(method.method),
+  );
+}
+
+function hermesAcpRuntimeMetadataFromRecord(value: unknown): HermesAcpRuntimeMetadata {
+  if (!isRecord(value)) return unknownHermesAcpRuntimeMetadata();
+  const records = runtimeMetadataCandidateRecords(value);
+  const provider = runtimeMetadataStringFromRecords(records, [
+    "providerId",
+    "provider_id",
+    "provider",
+    "activeProvider",
+    "active_provider",
+    "runtimeProvider",
+    "runtime_provider",
+    "providerName",
+    "provider_name",
+  ]);
+  return {
+    providerId: provider ? normalizeHermesAuthProvider(provider) : null,
+    model: runtimeMetadataStringFromRecords(records, [
+      "model",
+      "modelId",
+      "model_id",
+      "modelName",
+      "model_name",
+      "activeModel",
+      "active_model",
+      "currentModel",
+      "current_model",
+      "runtimeModel",
+      "runtime_model",
+    ]),
+  };
+}
+
+function runtimeMetadataCandidateRecords(record: Record<string, unknown>): Record<string, unknown>[] {
+  return [
+    record,
+    record.runtime,
+    record.runtimeMetadata,
+    record.runtime_metadata,
+    record.metadata,
+    record.session,
+    record.auth,
+  ].filter(isRecord);
+}
+
+function runtimeMetadataStringFromRecords(records: Record<string, unknown>[], keys: string[]): string | null {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = nonEmptyString(record[key]);
+      if (value) return value;
+    }
+  }
+  return null;
+}
+
+function mergeHermesAcpRuntimeMetadata(...items: HermesAcpRuntimeMetadata[]): HermesAcpRuntimeMetadata {
+  const merged = unknownHermesAcpRuntimeMetadata();
+  for (const item of items) {
+    if (item.providerId) merged.providerId = item.providerId;
+    if (item.model) merged.model = item.model;
+  }
+  return merged;
+}
+
+function hermesAcpLimitMappingDefaults(
+  ctx: AgentRunContext,
+  harnessId: string,
+  runtimeMetadata: HermesAcpRuntimeMetadata,
+): HermesLimitMappingDefaults {
+  return {
+    harnessId,
+    providerId: runtimeMetadata.providerId ?? ctx.config.hermes.provider,
+    model: runtimeMetadata.model,
+  };
 }
 
 function authMethodsFromInitializeResult(initializeResult: Record<string, unknown>): Record<string, unknown>[] {

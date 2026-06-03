@@ -360,13 +360,29 @@ function projectRunSystemMessage(run: RunRecord): TranscriptMessage {
   return {
     kind: "system",
     ts: run.startedAt,
-    model: firstCleanString(run.runtimeModel, run.cursorModel) ?? "",
+    model: firstCleanString(run.runtimeModel, cursorRuntimeFallbackModel(run)) ?? "",
     cwd: firstCleanString(run.workspacePath) ?? "",
     workspace: firstCleanString(run.workspaceKey) ?? "",
     session: firstCleanString(run.sessionId, run.runId) ?? run.runId,
     tools: [],
     note: firstCleanString(note) ?? note,
   };
+}
+
+function cursorRuntimeFallbackModel(run: RunRecord): string | null {
+  return shouldUseCursorRuntimeFallback(run) ? firstCleanString(run.cursorModel) : null;
+}
+
+function shouldUseCursorRuntimeFallback(run: RunRecord): boolean {
+  const harnessId = firstCleanString(run.harnessId);
+  if (harnessId === "cursor") return true;
+  if (harnessId) return false;
+  return (
+    run.cursorModel !== undefined ||
+    run.cursorModelParams !== undefined ||
+    run.cursorMode !== undefined ||
+    run.cursorSettingSources !== undefined
+  );
 }
 
 function isToolEvent(eventType: string, payloadKind: string | null, payload: Record<string, unknown>): boolean {

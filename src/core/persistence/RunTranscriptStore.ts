@@ -795,16 +795,33 @@ function applyRunMetadataPayload(record: RunRecord, payload: UnknownRecord): Run
 function reduceSessionStarted(record: RunRecord, event: TranscriptEvent, payload: UnknownRecord | null): RunRecord {
   const sessionId = stringField(payload, "sessionId");
   const agentId = stringField(payload, "threadId");
+  const runtimeMetadataPatch = sessionStartedRuntimeMetadataPatch(record, payload);
   const runningPatch: Partial<RunRecord> = isTerminalRunStatus(record.status)
     ? {}
     : { status: "running", completedAt: null, error: null };
   return {
     ...record,
     ...runningPatch,
+    ...runtimeMetadataPatch,
     startedAt: event.at,
     ...(sessionId === undefined ? {} : { sessionId }),
     ...(agentId === undefined ? {} : { agentId }),
   };
+}
+
+function sessionStartedRuntimeMetadataPatch(record: RunRecord, payload: UnknownRecord | null): Partial<RunRecord> {
+  const runtimeModel = cleanStringField(payload, "model");
+  const providerId = cleanStringField(payload, "providerId");
+  const patch: Partial<RunRecord> = {};
+  if (runtimeModel !== undefined) patch.runtimeModel = runtimeModel;
+  if (providerId !== undefined) {
+    patch.runtimeSettingSources = runtimeSettingSourcesWithProvider(record.runtimeSettingSources, providerId);
+  }
+  return patch;
+}
+
+function runtimeSettingSourcesWithProvider(sources: string[] | undefined, providerId: string): string[] {
+  return [...(sources ?? []).filter((source) => !source.startsWith("provider:")), `provider:${providerId}`];
 }
 
 function reduceRunStatus(record: RunRecord, event: TranscriptEvent, payload: UnknownRecord | null): RunRecord {
@@ -1034,6 +1051,11 @@ function terminalStatusField(value: string | undefined): Exclude<RunStatus, "run
 function stringField(record: UnknownRecord | null | undefined, key: string): string | undefined {
   const value = record?.[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function cleanStringField(record: UnknownRecord | null | undefined, key: string): string | undefined {
+  const value = stringField(record, key)?.trim();
+  return value && value.length > 0 ? value : undefined;
 }
 
 function finiteNumber(value: unknown): number | undefined {
