@@ -433,6 +433,46 @@ describe("/api/v1/web route contracts", () => {
     ]);
   });
 
+  it("rebuilds route durable projections on force-refresh when a reader and writer are configured", async () => {
+    const projectionReader = new RecordingProjectionReader([]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, { projectionReader, projectionWriter });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const dashboard = await getJson(`${baseUrl}/api/v1/web/dashboard?refresh=true`);
+      expect(dashboard.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(dashboard.body).toMatchObject({ projectName: "Symphony" });
+
+      const issues = await getJson(`${baseUrl}/api/v1/web/issues?refresh=true`);
+      expect(issues.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(issues.body).toMatchObject({ issues: [], lanes: { todo: [], progress: [], review: [] } });
+
+      const history = await getJson(`${baseUrl}/api/v1/web/history?refresh=true`);
+      expect(history.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(history.body).toMatchObject({ sessions: [], timeline: [] });
+
+      const sidebar = await getJson(`${baseUrl}/api/v1/web/sidebar?refresh=true`);
+      expect(sidebar.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(sidebar.body).toMatchObject({ runningAgents: [], reviewIssues: [], sessions: [] });
+
+      const chat = await getJson(`${baseUrl}/api/v1/web/orchestrator-chat?refresh=true&conversationId=operator-room`);
+      expect(chat.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(chat.body).toEqual([]);
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionReader.selectors).toEqual([]);
+    expect(projectionWriter.writes.map(({ projectionName }) => projectionName)).toEqual([
+      "dashboard_projection",
+      "issue_board_projection",
+      "history_projection",
+      "sidebar_projection",
+      "orchestrator_chat_projection",
+    ]);
+  });
+
   it("serves issue detail and transcript payloads from durable projections with route-specific freshness checks", async () => {
     const durableIssue = issueModelFixture();
     const issueBoard = {
