@@ -421,6 +421,29 @@ describe("API data source", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("invalidates only cached GET responses whose API paths are affected by realtime resource hints", async () => {
+    const refreshedDashboard = { ...dashboardModel, pollLabel: "poll selective realtime" };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(dashboardModel))
+      .mockResolvedValueOnce(jsonResponse(issueBoardModel))
+      .mockResolvedValueOnce(jsonResponse(refreshedDashboard));
+    const dataSource = createApiDataSource("/status-server/");
+
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    await expect(dataSource.getIssueBoard()).resolves.toEqual(issueBoardModel);
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    await expect(dataSource.getIssueBoard()).resolves.toEqual(issueBoardModel);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    dataSource.invalidateCachedReads?.({ forceRefreshHrefs: ["/api/v1/web/dashboard"] });
+
+    await expect(dataSource.getIssueBoard()).resolves.toEqual(issueBoardModel);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(dataSource.getDashboard()).resolves.toEqual(refreshedDashboard);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("fences in-flight cacheable GETs when realtime projection invalidation arrives", async () => {
     const staleDashboard = { ...dashboardModel, pollLabel: "poll stale in-flight" };
     const refreshedDashboard = { ...dashboardModel, pollLabel: "poll post-invalidation" };
