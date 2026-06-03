@@ -32,6 +32,8 @@ import { HostHermesAcpStdioJsonRpcFacade, type HostHermesAcpDiagnostic } from ".
 const DEFAULT_EXPECTED_TEXT = "Symphony Hermes ACP smoke OK";
 const DEFAULT_PROFILE_PREFIX = "symphony-smoke";
 const TERMINAL_SETUP_AUTH_METHOD_ID = "hermes-setup";
+const COMMAND_OUTPUT_TAIL_LINES = 24;
+const COMMAND_OUTPUT_TAIL_CHARS = 4_000;
 
 export interface RawOptions {
   binaryPath?: string;
@@ -72,9 +74,51 @@ export interface HermesAcpPromptSmokeResult {
 }
 
 export interface HermesAcpSmokeHostSettings {
+  status: "ready";
   binaryPath: string;
   sourceProfile: string;
   discovery: HostHermesDiscoveryResult;
+}
+
+export interface HermesAcpSmokeSkipReport {
+  status: "skipped";
+  phase: string;
+  message: string;
+  hostHermesBinary: string;
+  hostHermesBinarySource: string;
+  sourceProfile: string | null;
+  sourceProfileSource: string;
+  cloneProfile: null;
+  cloneProfileState: "not_yet_allocated";
+  stderrTail: string;
+  diagnostics: Array<{ code: string; severity: string; message: string }>;
+}
+
+export type HermesAcpSmokeHostResolution = HermesAcpSmokeHostSettings | HermesAcpSmokeSkipReport;
+
+export interface HermesAcpSmokeFailureContext {
+  phase: string;
+  hostHermesBinary?: string | null;
+  hostHermesBinarySource?: string | null;
+  sourceProfile?: string | null;
+  sourceProfileSource?: string | null;
+  cloneProfile?: string | null;
+  stderrTail?: string | null;
+}
+
+export interface HermesAcpSmokeHostResolutionOptions {
+  discoverHost?: typeof discoverHostHermes;
+  env?: NodeJS.ProcessEnv;
+}
+
+export class HermesAcpSmokeFailure extends Error {
+  readonly context: HermesAcpSmokeFailureContext;
+
+  constructor(message: string, context: HermesAcpSmokeFailureContext) {
+    super(`${message}\n${formatHermesAcpSmokeFailureContext(context)}`);
+    this.name = "HermesAcpSmokeFailure";
+    this.context = context;
+  }
 }
 
 const program = new Command()
@@ -86,7 +130,7 @@ const program = new Command()
   .option("--binary-path <path>", "explicit host Hermes executable to use instead of hermes_acp.binary_path or PATH")
   .option("--source-profile <name>", "host Hermes source profile to clone instead of hermes_acp.source_profile or the active profile")
   .option("--profile-name <name>", "explicit disposable smoke profile name; must not already exist")
-  .option("--profile-prefix <prefix>", "prefix for generated disposable smoke profile names", DEFAULT_PROFILE_PREFIX)
+  .option("--profile-prefix <prefix>", "prefix for generated disposable smoke profile names; defaults to hermes_acp.profile_prefix")
   .option("--expect <text>", "text that must appear in the ACP prompt response", DEFAULT_EXPECTED_TEXT)
   .option("--timeout-ms <ms>", "per-command and ACP request timeout", "120000")
   .option("--keep-profile", "leave the disposable cloned profile on disk for troubleshooting", false)
@@ -103,10 +147,23 @@ export async function main(workflow: string, rawOptions: RawOptions): Promise<vo
   let cleanupError: unknown = null;
   let plan: HermesAcpSmokeCommandPlan | null = null;
   let primaryError: unknown = null;
+  let config: ServiceConfig | null = null;
+  let host: HermesAcpSmokeHostSettings | null = null;
+  let profileName: string | null = null;
+  let phase = "workflow load";
+  const currentContext = (overrides: Partial<HermesAcpSmokeFailureContext> = {}): HermesAcpSmokeFailureContext => ({
+    phase,
+    hostHermesBinary: host?.binaryPath ?? null,
+    hostHermesBinarySource: host?.discovery.binary?.source ?? null,
+    sourceProfile: host?.sourceProfile ?? null,
+    sourceProfileSource: host?.discovery.sourceProfile?.source ?? null,
+    cloneProfile: profileName,
+    ...overrides,
+  });
 
   try {
     const loaded = await loader.load();
-    const config = loaded.serviceConfig;
+    config = loaded.serviceConfig;
     tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-smoke-"));
     const smokeWorkspace = path.join(tempRoot, "workspace");
     await fs.mkdir(smokeWorkspace, { recursive: true });
@@ -117,8 +174,14 @@ export async function main(workflow: string, rawOptions: RawOptions): Promise<vo
       );
     }
 
-    const host = await resolveHermesAcpSmokeHostSettings(config, smokeWorkspace, timeoutMs, rawOptions);
-    const profileName = smokeProfileName(config, rawOptions, host.sourceProfile);
+    phase = "host Hermes discovery";
+    const hostResolution = await resolveHermesAcpSmokeHostSettings(config, smokeWorkspace, timeoutMs, rawOptions);
+    if (hostResolution.status === "skipped") {
+      emitHermesAcpSmokeSkip(hostResolution);
+      return;
+    }
+    host = hostResolution;
+    profileName = resolveHermesAcpSmokeProfileName(config, rawOptions, host.sourceProfile);
     plan = buildHermesAcpSmokeCommandPlan({
       binaryPath: host.binaryPath,
       sourceProfile: host.sourceProfile,
@@ -127,46 +190,69 @@ export async function main(workflow: string, rawOptions: RawOptions): Promise<vo
       env: process.env,
     });
 
+    phase = plan.version.label;
     console.log("[smoke:hermes-acp] checking host Hermes version");
-    await runRequiredSmokeCommand(plan.version, defaultHermesAcpSmokeCommandRunner, timeoutMs);
+    await runRequiredSmokeCommand(plan.version, defaultHermesAcpSmokeCommandRunner, timeoutMs, currentContext({ phase }));
 
+    phase = plan.activeProfile.label;
     console.log("[smoke:hermes-acp] recording active host Hermes profile before smoke");
-    const activeProfileBefore = await probeActiveHostHermesProfile(plan.activeProfile, defaultHermesAcpSmokeCommandRunner, timeoutMs);
+    const activeProfileBefore = await probeActiveHostHermesProfile(
+      plan.activeProfile,
+      defaultHermesAcpSmokeCommandRunner,
+      timeoutMs,
+      currentContext({ phase }),
+    );
 
+    phase = plan.hostAcpCheck.label;
     console.log("[smoke:hermes-acp] checking active host Hermes ACP readiness");
-    await runRequiredSmokeCommand(plan.hostAcpCheck, defaultHermesAcpSmokeCommandRunner, timeoutMs);
+    await runRequiredSmokeCommand(plan.hostAcpCheck, defaultHermesAcpSmokeCommandRunner, timeoutMs, currentContext({ phase }));
 
+    phase = plan.sourceProfileAcpCheck.label;
     console.log("[smoke:hermes-acp] checking source profile Hermes ACP readiness");
-    await runRequiredSmokeCommand(plan.sourceProfileAcpCheck, defaultHermesAcpSmokeCommandRunner, timeoutMs);
+    await runRequiredSmokeCommand(plan.sourceProfileAcpCheck, defaultHermesAcpSmokeCommandRunner, timeoutMs, currentContext({ phase }));
 
+    phase = plan.createProfile.label;
     console.log(`[smoke:hermes-acp] cloning source profile ${host.sourceProfile} into disposable profile ${profileName}`);
-    await runRequiredSmokeCommand(plan.createProfile, defaultHermesAcpSmokeCommandRunner, timeoutMs);
+    await runRequiredSmokeCommand(plan.createProfile, defaultHermesAcpSmokeCommandRunner, timeoutMs, currentContext({ phase }));
     profileCreated = true;
 
+    phase = plan.clonedAcpCheck.label;
     console.log("[smoke:hermes-acp] checking disposable profile ACP readiness");
-    await runRequiredSmokeCommand(plan.clonedAcpCheck, defaultHermesAcpSmokeCommandRunner, timeoutMs);
+    await runRequiredSmokeCommand(plan.clonedAcpCheck, defaultHermesAcpSmokeCommandRunner, timeoutMs, currentContext({ phase }));
 
+    phase = "host Hermes ACP launch/session/prompt";
     console.log("[smoke:hermes-acp] starting ACP prompt smoke on disposable profile");
     const promptResult = await runHermesAcpPromptSmoke({
       command: plan.launch,
       cwd: smokeWorkspace,
       expectedText,
       timeoutMs,
+      failureContext: currentContext({ phase }),
     });
 
     if (!rawOptions.keepProfile) {
+      phase = plan.deleteProfile.label;
       console.log("[smoke:hermes-acp] deleting disposable profile");
-      await runRequiredSmokeCommand(plan.deleteProfile, defaultHermesAcpSmokeCommandRunner, timeoutMs);
+      await runRequiredSmokeCommand(plan.deleteProfile, defaultHermesAcpSmokeCommandRunner, timeoutMs, currentContext({ phase }));
       profileDeleted = true;
     } else {
       console.warn(`[smoke:hermes-acp] keeping disposable profile ${profileName} because --keep-profile was set`);
     }
 
+    phase = "host Hermes active profile stability verification";
     console.log("[smoke:hermes-acp] verifying active/source host Hermes profile selection was not changed");
-    const activeProfileAfter = await probeActiveHostHermesProfile(plan.activeProfile, defaultHermesAcpSmokeCommandRunner, timeoutMs);
+    const activeProfileAfter = await probeActiveHostHermesProfile(
+      plan.activeProfile,
+      defaultHermesAcpSmokeCommandRunner,
+      timeoutMs,
+      currentContext({ phase }),
+    );
     if (activeProfileAfter !== activeProfileBefore) {
-      throw new Error(
-        `Host Hermes active profile changed during smoke: before=${activeProfileBefore}, after=${activeProfileAfter}. The smoke must not mutate the source profile selection.`,
+      throw contextualizeHermesAcpSmokeError(
+        new Error(
+          `Host Hermes active profile changed during smoke: before=${activeProfileBefore}, after=${activeProfileAfter}. The smoke must not mutate the source profile selection.`,
+        ),
+        currentContext({ phase }),
       );
     }
 
@@ -195,12 +281,17 @@ export async function main(workflow: string, rawOptions: RawOptions): Promise<vo
     );
   } catch (error) {
     primaryError = error;
-    throw error;
+    throw contextualizeHermesAcpSmokeError(error, currentContext());
   } finally {
     await loader.close();
     if (profileCreated && !profileDeleted && !rawOptions.keepProfile && plan) {
       try {
-        await runRequiredSmokeCommand(plan.deleteProfile, defaultHermesAcpSmokeCommandRunner, timeoutMs);
+        await runRequiredSmokeCommand(
+          plan.deleteProfile,
+          defaultHermesAcpSmokeCommandRunner,
+          timeoutMs,
+          currentContext({ phase: "host Hermes disposable ACP profile cleanup", cloneProfile: profileName }),
+        );
       } catch (error) {
         cleanupError = error;
         console.error(`[smoke:hermes-acp] cleanup failed: ${redactForLog(errorMessage(error))}`);
@@ -218,21 +309,104 @@ export async function resolveHermesAcpSmokeHostSettings(
   cwd: string,
   timeoutMs: number,
   rawOptions: Pick<RawOptions, "binaryPath" | "sourceProfile">,
-): Promise<HermesAcpSmokeHostSettings> {
+  options: HermesAcpSmokeHostResolutionOptions = {},
+): Promise<HermesAcpSmokeHostResolution> {
   const configuredBinary = nonEmptyString(rawOptions.binaryPath) ?? config.hermesAcp.binaryPath;
   const configuredSource = nonEmptyString(rawOptions.sourceProfile) ?? config.hermesAcp.sourceProfile;
-  const discovery = await discoverHostHermes({
+  const discover = options.discoverHost ?? discoverHostHermes;
+  const discovery = await discover({
     ...(configuredBinary === null ? {} : { binaryPath: configuredBinary }),
     ...(configuredSource === null ? {} : { sourceProfile: configuredSource }),
     cwd,
-    env: hostHermesCommandEnvironment(process.env),
+    env: hostHermesCommandEnvironment(options.env ?? process.env),
     timeoutMs,
   });
   if (!discovery.ok || !discovery.binary?.path || !discovery.sourceProfile?.name) {
-    const diagnostics = discovery.diagnostics.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`).join("; ");
-    throw new Error(diagnostics || "Host Hermes ACP discovery failed.");
+    return buildHermesAcpSmokeSkipReport(discovery, { configuredBinary, configuredSource });
   }
-  return { binaryPath: discovery.binary.path, sourceProfile: discovery.sourceProfile.name, discovery };
+  return { status: "ready", binaryPath: discovery.binary.path, sourceProfile: discovery.sourceProfile.name, discovery };
+}
+
+export function buildHermesAcpSmokeSkipReport(
+  discovery: HostHermesDiscoveryResult,
+  input: { configuredBinary: string | null; configuredSource: string | null },
+): HermesAcpSmokeSkipReport {
+  const diagnostics = discovery.diagnostics.map((diagnostic) => ({
+    code: diagnostic.code,
+    severity: diagnostic.severity,
+    message: diagnostic.message,
+  }));
+  const diagnosticSummary = diagnostics.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`).join("; ");
+  return {
+    status: "skipped",
+    phase: "host Hermes discovery",
+    message:
+      "Host Hermes ACP smoke skipped because host Hermes binary/profile prerequisites are unavailable. " +
+      (diagnosticSummary ||
+        "Install host Hermes, configure `hermes_acp.binary_path`, or configure `hermes_acp.source_profile` before treating this live ACP smoke as validated."),
+    hostHermesBinary: discovery.binary?.path ?? input.configuredBinary ?? "hermes (PATH lookup)",
+    hostHermesBinarySource: discovery.binary?.source ?? (input.configuredBinary ? "config" : "path"),
+    sourceProfile: discovery.sourceProfile?.name ?? input.configuredSource,
+    sourceProfileSource: discovery.sourceProfile?.source ?? (input.configuredSource ? "config" : "active"),
+    cloneProfile: null,
+    cloneProfileState: "not_yet_allocated",
+    stderrTail: "not captured; host Hermes command plan was not created",
+    diagnostics,
+  };
+}
+
+export function formatHermesAcpSmokeSkipReport(report: HermesAcpSmokeSkipReport): string {
+  return [
+    `[smoke:hermes-acp] SKIPPED: ${report.message}`,
+    `ACP phase: ${report.phase}`,
+    `host Hermes binary: ${report.hostHermesBinary}`,
+    `host Hermes binary source: ${report.hostHermesBinarySource}`,
+    `source profile: ${report.sourceProfile ?? "not discovered"}`,
+    `source profile source: ${report.sourceProfileSource}`,
+    "clone profile: not yet allocated",
+    `stderr tail: ${report.stderrTail}`,
+    JSON.stringify(report, null, 2),
+  ].join("\n");
+}
+
+function emitHermesAcpSmokeSkip(report: HermesAcpSmokeSkipReport): void {
+  console.log(formatHermesAcpSmokeSkipReport(report));
+}
+
+export function contextualizeHermesAcpSmokeError(
+  error: unknown,
+  context: Partial<HermesAcpSmokeFailureContext>,
+): HermesAcpSmokeFailure {
+  if (error instanceof HermesAcpSmokeFailure) return error;
+  return new HermesAcpSmokeFailure(redactForLog(errorMessage(error)), normalizeHermesAcpSmokeFailureContext(context));
+}
+
+export function formatHermesAcpSmokeFailureContext(context: Partial<HermesAcpSmokeFailureContext>): string {
+  const normalized = normalizeHermesAcpSmokeFailureContext(context);
+  return [
+    "Host Hermes ACP smoke context:",
+    `- ACP phase: ${normalized.phase}`,
+    `- host Hermes binary: ${normalized.hostHermesBinary ?? "not discovered"}`,
+    `- host Hermes binary source: ${normalized.hostHermesBinarySource ?? "unknown"}`,
+    `- source profile: ${normalized.sourceProfile ?? "not discovered"}`,
+    `- source profile source: ${normalized.sourceProfileSource ?? "unknown"}`,
+    `- clone profile: ${normalized.cloneProfile ?? "not yet allocated"}`,
+    `- stderr tail: ${normalized.stderrTail ?? "not captured for this phase"}`,
+  ].join("\n");
+}
+
+function normalizeHermesAcpSmokeFailureContext(
+  context: Partial<HermesAcpSmokeFailureContext>,
+): HermesAcpSmokeFailureContext {
+  return {
+    phase: nonEmptyString(context.phase) ?? "unknown",
+    hostHermesBinary: nonEmptyString(context.hostHermesBinary) ?? null,
+    hostHermesBinarySource: nonEmptyString(context.hostHermesBinarySource) ?? null,
+    sourceProfile: nonEmptyString(context.sourceProfile) ?? null,
+    sourceProfileSource: nonEmptyString(context.sourceProfileSource) ?? null,
+    cloneProfile: nonEmptyString(context.cloneProfile) ?? null,
+    stderrTail: nonEmptyString(context.stderrTail) ?? null,
+  };
 }
 
 export function buildHermesAcpSmokeCommandPlan(input: {
@@ -297,6 +471,7 @@ export async function runHermesAcpPromptSmoke(input: {
   cwd: string;
   expectedText: string;
   timeoutMs: number;
+  failureContext?: HermesAcpSmokeFailureContext;
 }): Promise<HermesAcpPromptSmokeResult> {
   const client = HostHermesAcpStdioJsonRpcFacade.spawn(input.command, { requestTimeoutMs: input.timeoutMs });
   const diagnostics: HostHermesAcpDiagnostic[] = [];
@@ -366,8 +541,18 @@ export async function runHermesAcpPromptSmoke(input: {
     };
   } catch (error) {
     const diagnosticSummary = diagnostics.map((diagnostic) => `${diagnostic.code}: ${diagnostic.message}`).join("; ");
-    throw new Error(
-      `Host Hermes ACP prompt smoke failed: ${redactForLog(errorMessage(error))}${diagnosticSummary ? `; diagnostics: ${redactForLog(diagnosticSummary)}` : ""}`,
+    const stderrTail = boundedOutputTail(client.getLogTail());
+    throw contextualizeHermesAcpSmokeError(
+      new Error(
+        `Host Hermes ACP prompt smoke failed: ${redactForLog(errorMessage(error))}${diagnosticSummary ? `; diagnostics: ${redactForLog(diagnosticSummary)}` : ""}`,
+      ),
+      {
+        ...input.failureContext,
+        phase: input.failureContext?.phase ?? "host Hermes ACP launch/session/prompt",
+        hostHermesBinary: input.failureContext?.hostHermesBinary ?? input.command.file,
+        cloneProfile: input.failureContext?.cloneProfile ?? profileFromLaunchCommand(input.command),
+        stderrTail,
+      },
     );
   } finally {
     removeSessionUpdateHandler();
@@ -381,11 +566,19 @@ export async function runRequiredSmokeCommand(
   entry: HermesAcpSmokeCommandPlanEntry,
   runner: HostHermesAcpCommandRunner,
   timeoutMs: number,
+  failureContext: Partial<HermesAcpSmokeFailureContext> = {},
 ): Promise<HostHermesAcpCommandResult> {
   const result = await runner(entry.file, entry.args, { cwd: entry.cwd, env: entry.env, timeoutMs });
   if (result.exitCode !== 0) {
-    throw new Error(
-      `${entry.label} failed with exit code ${result.exitCode ?? "unknown"}: ${formatCommand(entry)}${formatCommandOutput(result)}`,
+    const stderrTail = boundedOutputTail(result.stderr);
+    throw contextualizeHermesAcpSmokeError(
+      new Error(`${entry.label} failed with exit code ${result.exitCode ?? "unknown"}: ${formatCommand(entry)}${formatCommandOutput(result)}`),
+      {
+        ...failureContext,
+        phase: failureContext.phase ?? entry.label,
+        hostHermesBinary: failureContext.hostHermesBinary ?? entry.file,
+        stderrTail,
+      },
     );
   }
   return result;
@@ -428,14 +621,29 @@ export async function probeActiveHostHermesProfile(
   entry: HermesAcpSmokeCommandPlanEntry,
   runner: HostHermesAcpCommandRunner,
   timeoutMs: number,
+  failureContext: Partial<HermesAcpSmokeFailureContext> = {},
 ): Promise<string> {
-  const result = await runRequiredSmokeCommand(entry, runner, timeoutMs);
+  const result = await runRequiredSmokeCommand(entry, runner, timeoutMs, failureContext);
   const activeProfile = parseHostHermesActiveProfile(`${result.stdout}\n${result.stderr}`);
-  if (!activeProfile) throw new Error("Host Hermes active profile probe did not include a `Profile:` or `Active profile:` line.");
+  if (!activeProfile) {
+    throw contextualizeHermesAcpSmokeError(
+      new Error("Host Hermes active profile probe did not include a `Profile:` or `Active profile:` line."),
+      {
+        ...failureContext,
+        phase: failureContext.phase ?? entry.label,
+        hostHermesBinary: failureContext.hostHermesBinary ?? entry.file,
+        stderrTail: boundedOutputTail(result.stderr),
+      },
+    );
+  }
   return activeProfile;
 }
 
-function smokeProfileName(config: ServiceConfig, rawOptions: RawOptions, sourceProfile: string): string {
+export function resolveHermesAcpSmokeProfileName(
+  config: Pick<ServiceConfig, "hermesAcp">,
+  rawOptions: Pick<RawOptions, "profileName" | "profilePrefix">,
+  sourceProfile: string,
+): string {
   const configured = nonEmptyString(rawOptions.profileName);
   const profileName = configured ?? buildHermesAcpSmokeProfileName({
     prefix: nonEmptyString(rawOptions.profilePrefix) ?? config.hermesAcp.profilePrefix,
@@ -528,11 +736,29 @@ function formatCommand(entry: HermesAcpSmokeCommandPlanEntry): string {
 }
 
 function formatCommandOutput(result: HostHermesAcpCommandResult): string {
-  const output = [result.stdout, result.stderr]
-    .map((part) => redactForLog(part).trim())
-    .filter((part) => part.length > 0)
-    .join("\n");
-  return output ? `\n${output}` : "";
+  const stdoutTail = boundedOutputTail(result.stdout);
+  const stderrTail = boundedOutputTail(result.stderr);
+  const sections = [
+    stdoutTail ? `stdout tail:\n${stdoutTail}` : null,
+    `stderr tail:\n${stderrTail ?? "<empty>"}`,
+  ].filter((section): section is string => section !== null);
+  return `\n${sections.join("\n")}`;
+}
+
+function boundedOutputTail(value: string | null | undefined): string | null {
+  const redacted = redactForLog(value ?? "").replace(/\r/g, "").trim();
+  if (!redacted) return null;
+  const lines = redacted.split("\n");
+  const lineTail = lines.slice(Math.max(0, lines.length - COMMAND_OUTPUT_TAIL_LINES)).join("\n");
+  return lineTail.length <= COMMAND_OUTPUT_TAIL_CHARS ? lineTail : lineTail.slice(lineTail.length - COMMAND_OUTPUT_TAIL_CHARS);
+}
+
+function profileFromLaunchCommand(command: HostHermesAcpProcessCommand): string | null {
+  const profileFlagIndex = command.args.indexOf("-p");
+  if (profileFlagIndex >= 0) return nonEmptyString(command.args[profileFlagIndex + 1]);
+  const profileLongIndex = command.args.indexOf("--profile");
+  if (profileLongIndex >= 0) return nonEmptyString(command.args[profileLongIndex + 1]);
+  return null;
 }
 
 function shellishQuote(value: string): string {
