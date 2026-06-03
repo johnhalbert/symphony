@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { AgentCommandPolicyDecision } from "../src/core/harness/AgentCommandPolicy.js";
 import {
   RUN_ACTIVITY_KIND_BY_CHANNEL,
+  applyRunActivityOrdering,
   isRunActivityEvent,
   type RunActivityCommandPolicyDecisionPayload,
+  type RunActivityEventInput,
   type RunCommandPolicyDecisionActivityEvent,
 } from "../src/core/runActivity/RunActivityEvent.js";
 import { agentCommandPolicyAuditPayload, allowPolicyDecision, denyPolicyDecision } from "./agent-command-policy-fixtures.js";
@@ -240,4 +242,108 @@ describe("command policy run activity schema", () => {
     expect(serialized).not.toContain("ghp_");
     expect(serialized).not.toContain("askpass-helper-value");
   });
+
+  it("accepts ambiguous fail-closed decisions as structured denied command-policy audit events", () => {
+    const decision = denyPolicyDecision({
+      decisionId: "decision-deny-ambiguous-1",
+      attemptId: "tool-call-terminal-4",
+      reasonKind: "ambiguous_command",
+      commandClass: "ambiguous_command",
+      message: "Blocked worker/reviewer command because the command payload was ambiguous.",
+      normalizedCommand: {
+        executable: null,
+        executableKind: "unknown",
+        argumentsPreview: "command/code keys both present",
+        gitSubcommand: null,
+        targetHosts: [],
+        hasNestedCommand: true,
+        hasInlineEnvironment: false,
+        hasUnsafeGitConfig: false,
+      },
+      audit: agentCommandPolicyAuditPayload({
+        outcome: "deny",
+        reasonKind: "ambiguous_command",
+        commandClass: "ambiguous_command",
+        rawInputPreview: "{ command: \"git status\", code: \"git push\" }",
+        rawInputPreviewRedacted: true,
+        normalizedExecutable: null,
+        executableKind: "unknown",
+        gitSubcommand: null,
+        commandPreview: "[ambiguous command payload]",
+        targetHosts: [],
+        upstreamContactAttempted: false,
+        hasNestedCommand: true,
+      }),
+    });
+
+    const event = commandPolicyEvent(decision);
+
+    expect(isRunActivityEvent(event)).toBe(true);
+    expect(event.payload).toMatchObject({
+      outcome: "deny",
+      reasonKind: "ambiguous_command",
+      commandClass: "ambiguous_command",
+      upstreamContactAttempted: false,
+      audit: {
+        redacted: true,
+        outcome: "deny",
+        reasonKind: "ambiguous_command",
+        commandClass: "ambiguous_command",
+        upstreamContactAttempted: false,
+      },
+    });
+  });
+
+  it("rejects command-policy decisions missing required structured audit fields before acceptance", () => {
+    const decision = denyPolicyDecision({
+      decisionId: "decision-deny-required-fields-1",
+      attemptId: "tool-call-terminal-5",
+      commandClass: "direct_upstream_git_operation",
+      audit: agentCommandPolicyAuditPayload({
+        outcome: "deny",
+        reasonKind: "upstream_github",
+        commandClass: "direct_upstream_git_operation",
+        targetHosts: ["github.com"],
+        upstreamContactAttempted: false,
+      }),
+    });
+    const validPayload = commandPolicyPayload(decision);
+    const invalidPayloads: Array<readonly [string, Record<string, unknown>]> = [
+      ["empty payload", {}],
+      ["missing surface", withoutKey(validPayload, "surface")],
+      ["missing role", withoutKey(validPayload, "role")],
+      ["missing phase", withoutKey(validPayload, "phase")],
+      ["missing commandClass", withoutKey(validPayload, "commandClass")],
+      ["missing outcome", withoutKey(validPayload, "outcome")],
+      ["invalid outcome", { ...validPayload, outcome: "blocked" }],
+      ["missing reasonKind", withoutKey(validPayload, "reasonKind")],
+      ["invalid reasonKind", { ...validPayload, reasonKind: "freeform_reason" }],
+      ["missing message", withoutKey(validPayload, "message")],
+      ["missing upstreamContactAttempted", withoutKey(validPayload, "upstreamContactAttempted")],
+      ["missing redacted marker", withoutKey(validPayload, "redacted")],
+      ["unredacted payload", { ...validPayload, redacted: false }],
+      ["missing audit", withoutKey(validPayload, "audit")],
+      ["unredacted audit", { ...validPayload, audit: { ...validPayload.audit, redacted: false } }],
+      ["audit mismatch", { ...validPayload, audit: { ...validPayload.audit, commandClass: "different_class" } }],
+      ["audit missing evidence arrays", { ...validPayload, audit: withoutKey(validPayload.audit, "inlineEnvironmentKeys") }],
+    ];
+
+    for (const [label, payload] of invalidPayloads) {
+      const event = {
+        ...commandPolicyEvent(decision),
+        eventId: `command-policy:invalid:${label.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`,
+        payload,
+      } as unknown as RunCommandPolicyDecisionActivityEvent;
+
+      expect({ label, valid: isRunActivityEvent(event) }).toEqual({ label, valid: false });
+      expect(applyRunActivityOrdering(event as unknown as RunActivityEventInput)).toMatchObject({
+        status: "rejected",
+        reason: "invalid_event",
+      });
+    }
+  });
 });
+
+function withoutKey(value: object, key: string): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).filter(([entryKey]) => entryKey !== key));
+}

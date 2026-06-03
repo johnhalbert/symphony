@@ -339,6 +339,25 @@ describe("mapAgentEventToRunActivityEvent", () => {
     expect(mapped.payload).toMatchObject({ kind: "assistant_delta", activitySource: "delta", progressKind: "assistant_delta" });
   });
 
+  it("rejects malformed command-policy metadata instead of schema-tagging incomplete audit events", () => {
+    const malformedActivity = { ...commandPolicyRunActivity(), payload: {} } as unknown as RunActivityEvent;
+
+    const mapped = mapAgentEventToRunActivityEvent({
+      type: "progress",
+      activitySource: "tool",
+      message: "legacy command policy fallback",
+      runActivity: malformedActivity,
+    });
+
+    expect(mapped.eventType).toBe("progress");
+    expect(mapped.payloadSchema).toBe(`${RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX}.progress.v1`);
+    expect(mapped.payload).toMatchObject({ kind: "tool", activitySource: "tool", progressKind: "tool" });
+    expect(mapped.payload).not.toMatchObject({ kind: "command_policy_decision" });
+    expect(() => mapRunActivityEventToTranscriptEvent(malformedActivity, { runId: "run-1", source: "harness" })).toThrow(
+      /Invalid run activity event for transcript projection: run-1:policy:1/,
+    );
+  });
+
   it("redacts secrets, marks truncated previews, and omits raw protocol fields from frontend payloads", () => {
     const longSecret = `${"x".repeat(560)} SECRET_LONG_TOKEN`;
     const diagnostic = mapAgentEventToRunActivityEvent({

@@ -9,6 +9,26 @@ import type {
   AgentCommandPolicySurface,
 } from "../harness/AgentCommandPolicy.js";
 
+const RUN_ACTIVITY_COMMAND_POLICY_REASON_KINDS = [
+  "safe_local_inspection",
+  "upstream_github",
+  "unsafe_git_config",
+  "unsafe_environment",
+  "unknown_command",
+  "service_owned_not_applicable",
+  "local_only_inspection",
+  "role_not_restricted",
+  "direct_upstream_github",
+  "github_cli",
+  "github_host_reference",
+  "ambiguous_command",
+  "malformed_command",
+  "malformed_hook_payload",
+  "oversized_hook_payload",
+  "missing_hook_context",
+  "classifier_error",
+] as const satisfies readonly AgentCommandPolicyReasonKind[];
+
 /**
  * Symphony-owned, harness-neutral run activity taxonomy.
  *
@@ -107,6 +127,7 @@ export const RUN_ACTIVITY_DIAGNOSTIC_KINDS = [
 ] as const;
 
 export type RunActivityDiagnosticKind = (typeof RUN_ACTIVITY_DIAGNOSTIC_KINDS)[number];
+export type RunActivityGenericDiagnosticKind = Exclude<RunActivityDiagnosticKind, "command_policy_decision">;
 
 /** @deprecated Use RUN_ACTIVITY_DIAGNOSTIC_KINDS with the canonical `diagnostic` channel. */
 export const RUN_ACTIVITY_STATUS_KINDS = RUN_ACTIVITY_DIAGNOSTIC_KINDS;
@@ -420,7 +441,7 @@ export type RunToolActivityEvent = RunActivityEventBase<
 
 export type RunDiagnosticActivityEvent = RunActivityEventBase<
   "diagnostic",
-  RunActivityDiagnosticKind,
+  RunActivityGenericDiagnosticKind,
   RunActivityActorForChannel<"diagnostic">,
   RunActivityDiagnosticPayload
 >;
@@ -461,6 +482,7 @@ export type RunActivityEvent =
   | RunChatActivityEvent
   | RunToolActivityEvent
   | RunDiagnosticActivityEvent
+  | RunCommandPolicyDecisionActivityEvent
   | RunTokenActivityEvent
   | RunRateLimitActivityEvent
   | RunTerminalActivityEvent;
@@ -534,6 +556,7 @@ export interface RunActivityOrderingState {
 export type RunActivityDuplicateReason = "event_id" | "external_event_id" | "sequence";
 
 export type RunActivityRejectReason =
+  | "invalid_event"
   | "run_session_scope_mismatch"
   | "terminal_already_accepted"
   | "terminal_sequence_precedes_accepted_event";
@@ -659,6 +682,8 @@ export function applyRunActivityOrdering(input: RunActivityEventInput, state?: R
     harness,
     channel,
   } as RunActivityEvent;
+  if (!isRunActivityEvent(event)) return { status: "rejected", reason: "invalid_event", state: current };
+
   const nextState: RunActivityOrderingState = {
     runSessionId,
     highWatermark: Math.max(current.highWatermark, sequence),
@@ -778,7 +803,102 @@ export function isRunActivityEvent(value: unknown): value is RunActivityEvent {
 
   const channel = value.channel;
   if (!isRunActivityChannel(channel)) return false;
-  return isRunActivityActorForChannel(channel, value.actor) && isRunActivityKindForChannel(channel, value.kind);
+  if (!isRunActivityActorForChannel(channel, value.actor) || !isRunActivityKindForChannel(channel, value.kind)) return false;
+  if (channel === "diagnostic" && value.kind === "command_policy_decision") {
+    return isRunActivityCommandPolicyDecisionPayload(value.payload);
+  }
+  return true;
+}
+
+export function isRunActivityCommandPolicyDecisionPayload(value: unknown): value is RunActivityCommandPolicyDecisionPayload {
+  if (!isRunActivityRecord(value)) return false;
+  if (value.redacted !== true) return false;
+  if (!isNonEmptyRunActivityString(value.surface)) return false;
+  if (!isNonEmptyRunActivityString(value.role)) return false;
+  if (!isNonEmptyRunActivityString(value.phase)) return false;
+  if (!isRunActivityCommandPolicyOutcome(value.outcome)) return false;
+  if (!isRunActivityCommandPolicyReasonKind(value.reasonKind)) return false;
+  if (!isNonEmptyRunActivityString(value.commandClass)) return false;
+  if (!isNonEmptyRunActivityString(value.message)) return false;
+  if (typeof value.upstreamContactAttempted !== "boolean") return false;
+  if (!isRunActivityCommandPolicyAuditPayload(value.audit, value)) return false;
+
+  if (value.decisionId !== undefined && value.decisionId !== null && !isNonEmptyRunActivityString(value.decisionId)) return false;
+  if (value.attemptId !== undefined && value.attemptId !== null && !isNonEmptyRunActivityString(value.attemptId)) return false;
+  if (value.runId !== undefined && value.runId !== null && !isNonEmptyRunActivityString(value.runId)) return false;
+  if (value.issueId !== undefined && value.issueId !== null && !isNonEmptyRunActivityString(value.issueId)) return false;
+  if (value.requestKind !== undefined && value.requestKind !== null && !isNonEmptyRunActivityString(value.requestKind)) return false;
+  if (value.toolCallId !== undefined && value.toolCallId !== null && !isNonEmptyRunActivityString(value.toolCallId)) return false;
+  if (value.selectedOptionId !== undefined && value.selectedOptionId !== null && !isNonEmptyRunActivityString(value.selectedOptionId)) return false;
+  if (value.permissionOutcome !== undefined && value.permissionOutcome !== null && !isNonEmptyRunActivityString(value.permissionOutcome)) return false;
+  if (value.hookAction !== undefined && value.hookAction !== null && !isNonEmptyRunActivityString(value.hookAction)) return false;
+  if (value.requiresCodeChange !== undefined && typeof value.requiresCodeChange !== "boolean") return false;
+  if (value.requiresUserOrServiceFix !== undefined && typeof value.requiresUserOrServiceFix !== "boolean") return false;
+  if (value.normalizedCommand !== undefined && !isRunActivityCommandPolicyNormalizedCommand(value.normalizedCommand)) return false;
+
+  return true;
+}
+
+function isRunActivityCommandPolicyAuditPayload(
+  value: unknown,
+  decision: Readonly<Record<string, unknown>>,
+): value is AgentCommandPolicyAuditPayload {
+  if (!isRunActivityRecord(value)) return false;
+  if (value.redacted !== true) return false;
+  if (value.surface !== decision.surface) return false;
+  if (value.role !== decision.role) return false;
+  if (value.phase !== decision.phase) return false;
+  if (value.outcome !== decision.outcome) return false;
+  if (value.reasonKind !== decision.reasonKind) return false;
+  if (value.commandClass !== decision.commandClass) return false;
+  if (value.upstreamContactAttempted !== decision.upstreamContactAttempted) return false;
+  if (!isReadonlyStringArray(value.inlineEnvironmentKeys)) return false;
+  if (!isReadonlyStringArray(value.unsafeConfigCategories)) return false;
+  if (value.unsafeConfigFindings !== undefined && !isReadonlyRecordArray(value.unsafeConfigFindings)) return false;
+  if (value.rawInputPreview !== undefined && value.rawInputPreview !== null && typeof value.rawInputPreview !== "string") return false;
+  if (value.rawInputPreviewTruncated !== undefined && typeof value.rawInputPreviewTruncated !== "boolean") return false;
+  if (value.rawInputPreviewRedacted !== undefined && typeof value.rawInputPreviewRedacted !== "boolean") return false;
+  if (value.normalizedExecutable !== undefined && value.normalizedExecutable !== null && typeof value.normalizedExecutable !== "string") return false;
+  if (value.executableKind !== undefined && !isNonEmptyRunActivityString(value.executableKind)) return false;
+  if (value.targetHosts !== undefined && !isReadonlyStringArray(value.targetHosts)) return false;
+  if (value.inheritedEnvironmentKeys !== undefined && !isReadonlyStringArray(value.inheritedEnvironmentKeys)) return false;
+  if (value.commandPreview !== undefined && typeof value.commandPreview !== "string") return false;
+  if (value.gitSubcommand !== undefined && value.gitSubcommand !== null && typeof value.gitSubcommand !== "string") return false;
+  if (value.hasNestedCommand !== undefined && typeof value.hasNestedCommand !== "boolean") return false;
+  return true;
+}
+
+function isRunActivityCommandPolicyOutcome(value: unknown): value is AgentCommandPolicyOutcome {
+  return value === "allow" || value === "deny";
+}
+
+function isRunActivityCommandPolicyReasonKind(value: unknown): value is AgentCommandPolicyReasonKind {
+  return typeof value === "string" && (RUN_ACTIVITY_COMMAND_POLICY_REASON_KINDS as readonly string[]).includes(value);
+}
+
+function isRunActivityCommandPolicyNormalizedCommand(value: unknown): value is AgentCommandPolicyNormalizedCommand {
+  if (!isRunActivityRecord(value)) return false;
+  if (value.executable !== null && !isNonEmptyRunActivityString(value.executable)) return false;
+  if (!isNonEmptyRunActivityString(value.executableKind)) return false;
+  if (value.argumentsPreview === undefined || (value.argumentsPreview !== null && typeof value.argumentsPreview !== "string")) return false;
+  if (value.gitSubcommand === undefined || (value.gitSubcommand !== null && typeof value.gitSubcommand !== "string")) return false;
+  if (!isReadonlyStringArray(value.targetHosts)) return false;
+  if (typeof value.hasNestedCommand !== "boolean") return false;
+  if (typeof value.hasInlineEnvironment !== "boolean") return false;
+  if (typeof value.hasUnsafeGitConfig !== "boolean") return false;
+  return true;
+}
+
+function isReadonlyStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isReadonlyRecordArray(value: unknown): value is readonly Readonly<Record<string, unknown>>[] {
+  return Array.isArray(value) && value.every(isRunActivityRecord);
+}
+
+function isNonEmptyRunActivityString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function normalizedRunActivitySequence(sequence: unknown): number | null {

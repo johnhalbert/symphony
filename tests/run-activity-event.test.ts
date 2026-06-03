@@ -208,6 +208,20 @@ const invalidActorChannelEvent: RunActivityEvent = {
 };
 void invalidActorChannelEvent;
 
+// @ts-expect-error Command-policy diagnostics require the structured audit payload, not a generic diagnostic payload.
+const invalidCommandPolicyPayloadEvent: RunActivityEvent = {
+  eventId: "activity-invalid-command-policy-payload",
+  runSessionId: "run-session-1",
+  occurredAt: "2026-05-31T00:00:05.500Z",
+  harness: "runtime-adapter",
+  actor: "harness",
+  channel: "diagnostic",
+  kind: "command_policy_decision",
+  text: null,
+  payload: {},
+};
+void invalidCommandPolicyPayloadEvent;
+
 type HermesGatewayEventFixture =
   | { payload?: { rendered?: string; text?: string }; session_id?: string; type: "message.delta" }
   | { payload: { args_text?: string; name?: string; tool_id: string }; session_id?: string; type: "tool.start" }
@@ -598,6 +612,9 @@ describe("RunActivityEvent taxonomy", () => {
     expect(isRunActivityActorForChannel("rate_limit", "assistant")).toBe(false);
     expect(isRunActivityEvent(typedChatActivity)).toBe(true);
     expect(isRunActivityEvent(typedCommandPolicyDecisionActivity)).toBe(true);
+    expect(isRunActivityEvent({ ...typedCommandPolicyDecisionActivity, payload: {} })).toBe(false);
+    expect(isRunActivityEvent({ ...typedCommandPolicyDecisionActivity, payload: { ...typedCommandPolicyDecisionActivity.payload, audit: undefined } })).toBe(false);
+    expect(isRunActivityEvent({ ...typedCommandPolicyDecisionActivity, payload: { ...typedCommandPolicyDecisionActivity.payload, upstreamContactAttempted: undefined } })).toBe(false);
     expect(isRunActivityEvent({ ...typedChatActivity, id: typedChatActivity.eventId, eventId: undefined })).toBe(false);
     expect(isRunActivityEvent({ ...typedChatActivity, channel: "message" })).toBe(false);
   });
