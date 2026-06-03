@@ -313,6 +313,7 @@ describe("/api/v1/web route contracts", () => {
       expect(durableDashboard.response.headers.get("x-symphony-projection-cache")).toBe("hit");
       expect(durableDashboard.response.headers.get("x-symphony-projection-name")).toBe("dashboard_projection");
       expect(durableDashboard.response.headers.get("x-symphony-projection-revision")).toBe("1");
+      expect(durableDashboard.response.headers.get("x-symphony-projection-build-mode")).toBe("bootstrap");
       expect(headerJson(durableDashboard.response, "x-symphony-projection-source-revisions")).toEqual([]);
       expect(headerJson(durableDashboard.response, "x-symphony-projection-source-freshness")).toEqual(sourceFreshness);
       const durableIssues = await getJson(`${baseUrl}/api/v1/web/issues`);
@@ -1762,10 +1763,13 @@ class RecordingProjectionWriter implements StatusServerProjectionWriter {
   async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
     this.writes.push(JSON.parse(JSON.stringify(input)) as ProjectionPayloadWriteInput);
     const revision = projectionRevisionRecordFixture(input, this.writes.length);
+    const requestedBuildMode = input.buildMode ?? "incremental";
     return {
       status: "written",
       revision,
       previousRevision: null,
+      requestedBuildMode,
+      buildMode: revision.buildMode,
       contentSha256: "0".repeat(64),
       payloadSha256: "1".repeat(64),
       event: null,
@@ -1963,6 +1967,7 @@ function projectionPayloadRecordFixture<TPayload>(
       scopeKind: selector.scopeKind,
       scopeKey: selector.scopeKey,
       revision,
+      buildMode: options.revision === undefined || revision === 1 ? "bootstrap" : "incremental",
       sourceRevisions: options.sourceRevisions ?? [],
       sourceCursors: options.sourceCursors ?? {},
       sourceFreshness: options.sourceFreshness ?? [],
@@ -2036,6 +2041,7 @@ function projectionRevisionRecordFixture(input: ProjectionPayloadWriteInput, rev
     scopeKind: input.scopeKind ?? "global",
     scopeKey: input.scopeKey ?? "global",
     revision,
+    buildMode: revision === 1 ? "bootstrap" : input.buildMode ?? "incremental",
     sourceRevisions: [],
     sourceCursors: {},
     sourceFreshness: [],

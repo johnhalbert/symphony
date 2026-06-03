@@ -79,8 +79,13 @@ describe("ProjectionTransactionService", () => {
 
     expect(first.status).toBe("written");
     expect(first.revision.revision).toBe(1);
+    expect(first.requestedBuildMode).toBe("incremental");
+    expect(first.buildMode).toBe("bootstrap");
+    expect(first.revision.buildMode).toBe("bootstrap");
     expect(repeated.status).toBe("unchanged");
     expect(repeated.revision.revision).toBe(1);
+    expect(repeated.requestedBuildMode).toBe("incremental");
+    expect(repeated.buildMode).toBe("bootstrap");
     expect(repeated.revision.projectionRevisionId).toBe(first.revision.projectionRevisionId);
     expect(repeated.revision.contentSha256).toBe(first.revision.contentSha256);
     expect(store.revisions()).toHaveLength(1);
@@ -123,6 +128,49 @@ describe("ProjectionTransactionService", () => {
     });
 
     unsubscribe();
+  });
+
+  it("records bootstrap, incremental, and rebuild modes without treating mode-only changes as new content", async () => {
+    const store = new InMemoryProjectionTransactionStore();
+    const service = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });
+    const publications: unknown[] = [];
+    service.onProjectionChanged((event) => publications.push(event));
+
+    const bootstrap = await service.writeProjection({
+      projectionName: "history_projection",
+      payload: { sessions: [] },
+      buildMode: "rebuild",
+    });
+    const unchangedRebuild = await service.writeProjection({
+      projectionName: "history_projection",
+      payload: { sessions: [] },
+      buildMode: "rebuild",
+    });
+    const incremental = await service.writeProjection({
+      projectionName: "history_projection",
+      payload: { sessions: [{ id: "session-1" }] },
+      buildMode: "incremental",
+    });
+    const rebuild = await service.writeProjection({
+      projectionName: "history_projection",
+      payload: { sessions: [{ id: "session-1" }, { id: "session-2" }] },
+      buildMode: "rebuild",
+    });
+
+    expect(bootstrap).toMatchObject({ status: "written", requestedBuildMode: "rebuild", buildMode: "bootstrap" });
+    expect(unchangedRebuild).toMatchObject({ status: "unchanged", requestedBuildMode: "rebuild", buildMode: "bootstrap" });
+    expect(incremental).toMatchObject({ status: "written", requestedBuildMode: "incremental", buildMode: "incremental" });
+    expect(rebuild).toMatchObject({ status: "written", requestedBuildMode: "rebuild", buildMode: "rebuild" });
+    expect(store.revisions().map((revision) => [revision.revision, revision.buildMode])).toEqual([
+      [1, "bootstrap"],
+      [2, "incremental"],
+      [3, "rebuild"],
+    ]);
+    expect(publications.map((event) => (event as { buildMode?: string }).buildMode)).toEqual([
+      "bootstrap",
+      "incremental",
+      "rebuild",
+    ]);
   });
 
   it("derives non-success freshness from tracker failure source revisions without misclassifying run statuses", async () => {
@@ -451,6 +499,7 @@ describe("ProjectionTransactionService", () => {
         scope_kind: "global",
         scope_key: "global",
         revision: 3,
+        build_mode: "rebuild",
         source_revisions: [{ source: "runs", revision: "run-revision-3", observedAt: null }],
         source_cursors: { runCount: 2 },
         content_sha256: "a".repeat(64),
@@ -476,6 +525,7 @@ describe("ProjectionTransactionService", () => {
         scopeKind: "global",
         scopeKey: "global",
         revision: 3,
+        buildMode: "rebuild",
         sourceRevisions: [{ source: "runs", revision: "run-revision-3", observedAt: null }],
         sourceCursors: { runCount: 2 },
         sourceFreshness: [
@@ -674,6 +724,7 @@ class InMemoryProjectionTransaction implements ProjectionTransactionRevisionPort
       scopeKind: input.scopeKind,
       scopeKey: input.scopeKey,
       revision: input.revision,
+      buildMode: input.buildMode,
       sourceRevisions: input.sourceRevisions.map((revision) => ({ ...revision })),
       sourceCursors: cloneJson(input.sourceCursors),
       sourceFreshness: input.sourceFreshness.map((freshness) => ({ ...freshness })),
@@ -728,14 +779,15 @@ class RecordingProjectionSqlRunner implements ProjectionSqlQueryRunner {
         scope_kind: values[1],
         scope_key: values[2],
         revision: values[3],
-        source_revisions: JSON.parse(String(values[4])) as unknown,
-        source_cursors: JSON.parse(String(values[5])) as unknown,
-        source_freshness: JSON.parse(String(values[6])) as unknown,
-        content_sha256: values[7],
-        generated_at: values[8],
-        expires_at: values[9] ?? null,
+        build_mode: values[4],
+        source_revisions: JSON.parse(String(values[5])) as unknown,
+        source_cursors: JSON.parse(String(values[6])) as unknown,
+        source_freshness: JSON.parse(String(values[7])) as unknown,
+        content_sha256: values[8],
+        generated_at: values[9],
+        expires_at: values[10] ?? null,
         superseded_at: null,
-        created_at: values[8],
+        created_at: values[9],
       };
       this.nextProjectionRevisionId += 1;
       return { rows: [row as TRow] };

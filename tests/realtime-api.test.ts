@@ -1244,6 +1244,7 @@ function projectionPublication(overrides: Partial<ProjectionRevisionPublication>
     scopeKey: "global",
     projectionRevisionId: "projection-revision-default",
     revision: 1,
+    buildMode: "bootstrap",
     contentSha256: "projection-sha",
     generatedAt: "2026-01-01T00:00:00.000Z",
     expiresAt: null,
