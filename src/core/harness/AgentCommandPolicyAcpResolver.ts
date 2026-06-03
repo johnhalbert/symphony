@@ -30,6 +30,7 @@ export type AgentCommandPolicyAcpOutcomeMapper = (
 ) => HermesAcpPermissionDecision;
 
 export const DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID: AgentCommandPolicyAcpAllowOptionId = "allow_once";
+export const DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON = "file_edit_permission_allowed";
 
 const AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_IDS = new Set<string>([
   "allow_once",
@@ -54,6 +55,10 @@ export function createAgentCommandPolicyAcpResolver(
   const mapPolicyDecisionToAcpPermission =
     options.mapPolicyDecisionToAcpPermission ?? mapAgentCommandPolicyDecisionToAcpPermissionDecision;
   return async (input) => {
+    if (input.request.requestKind === "file_edit") {
+      return { optionId: "allow_once", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON };
+    }
+
     if (input.request.requestKind !== "terminal_execute") {
       return { optionId: null, reason: "unsupported_agent_command_policy_permission_kind" };
     }

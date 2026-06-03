@@ -9,6 +9,7 @@ import type { AgentCommandPolicyInput } from "../src/core/harness/AgentCommandPo
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import {
   DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
+  DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON,
   buildAgentCommandPolicyInputForAcpPermission,
   createAgentCommandPolicyAcpResolver,
   isAgentCommandPolicyAcpAllowOptionId,
@@ -90,6 +91,44 @@ describe("AgentCommandPolicyAcpResolver", () => {
       }),
     });
     await expect(resolver(input)).resolves.toEqual({ optionId: "allow_once", reason: "local_only_inspection" });
+  });
+
+  it("selects allow_once for ACP file-edit permission requests without command classification", async () => {
+    const classify = vi.fn((_input: AgentCommandPolicyInput) =>
+      denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
+    );
+    const resolver = createAgentCommandPolicyAcpResolver({
+      classify,
+      environment: { GITHUB_TOKEN: "secret-token", PATH: "/usr/bin" },
+    });
+    const input = resolverInput(editPermissionRequest({ snakeCase: true }));
+
+    const decision = await resolver(input);
+
+    expect(decision).toEqual({ optionId: "allow_once", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON });
+    expect(classify).not.toHaveBeenCalled();
+    expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
+      response: { outcome: { outcome: "selected", optionId: "allow_once" } },
+      outcome: "selected",
+      selectedOptionId: "allow_once",
+      reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON,
+    });
+  });
+
+  it("fails closed for unsupported ACP permission kinds without command classification", async () => {
+    const classify = vi.fn((_input: AgentCommandPolicyInput) =>
+      allowPolicyDecision({ reasonKind: "local_only_inspection", commandClass: "local_git_inspection" }),
+    );
+    const resolver = createAgentCommandPolicyAcpResolver({ classify, environment: { PATH: "/usr/bin" } });
+    const baseInput = resolverInput(terminalPermissionRequest("git status --short"));
+
+    await expect(
+      resolver({
+        ...baseInput,
+        request: { ...baseInput.request, requestKind: "unknown" },
+      }),
+    ).resolves.toEqual({ optionId: null, reason: "unsupported_agent_command_policy_permission_kind" });
+    expect(classify).not.toHaveBeenCalled();
   });
 
   it("fails closed when ACP terminal permission command sources conflict", async () => {
@@ -321,6 +360,32 @@ function terminalPermissionOptions(snakeCase = false): Array<Record<string, unkn
     { [optionIdKey]: "allow_always", kind: "allow_always", name: "Allow always" },
     { [optionIdKey]: "deny", kind: "reject_once", name: "Deny" },
     { [optionIdKey]: "deny_always", kind: "reject_always", name: "Deny always" },
+  ];
+}
+
+function editPermissionRequest(options: { snakeCase?: boolean } = {}): Record<string, unknown> {
+  const toolCall = {
+    [options.snakeCase ? "tool_call_id" : "toolCallId"]: "edit-tool-1",
+    kind: "edit",
+    title: "Approve edit: README.md",
+    [options.snakeCase ? "raw_input" : "rawInput"]: {
+      tool: "write_file",
+      arguments: { path: "README.md", content: "updated README" },
+    },
+    content: [{ path: "README.md", old_text: "old README", new_text: "updated README" }],
+  };
+  return {
+    [options.snakeCase ? "session_id" : "sessionId"]: "acp-session-1",
+    [options.snakeCase ? "tool_call" : "toolCall"]: toolCall,
+    [options.snakeCase ? "permission_options" : "options"]: editPermissionOptions(options.snakeCase),
+  };
+}
+
+function editPermissionOptions(snakeCase = false): Array<Record<string, unknown>> {
+  const optionIdKey = snakeCase ? "option_id" : "optionId";
+  return [
+    { [optionIdKey]: "allow_once", kind: "allow_once", name: "Allow edit" },
+    { [optionIdKey]: "deny", kind: "reject_once", name: "Deny" },
   ];
 }
 
