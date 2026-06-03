@@ -451,7 +451,13 @@ export class FileRunTranscriptStore {
       if (reduced) {
         await this.writeRun(reduced);
       }
-      this.notifyProjectionChanged("runs");
+      this.notifyProjectionChanged("runs", {
+        runId: event.runId,
+        sessionId: (reduced ?? record)?.sessionId ?? event.runId,
+        afterSequence: count,
+        eventCount: 1,
+        events: [projectTranscriptEventForPublicRead(event)],
+      });
       return event;
     });
   }
@@ -572,8 +578,8 @@ export class FileRunTranscriptStore {
     return count;
   }
 
-  private notifyProjectionChanged(source: "runs" | "workspaces"): void {
-    this.projectionNotifier.notify(source);
+  private notifyProjectionChanged(source: "runs" | "workspaces", detail: Record<string, unknown> | null = null): void {
+    this.projectionNotifier.notify(source, detail);
   }
 
   private workspacesDir(): string {

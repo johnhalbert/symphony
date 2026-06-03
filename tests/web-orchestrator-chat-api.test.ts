@@ -318,6 +318,62 @@ describe("web orchestrator chat API", () => {
     }
   });
 
+  it("serves GET, sidebar, and POST responses from the recent orchestrator chat tail", async () => {
+    const store = new FileOrchestratorConversationStore(path.join(root, "state"));
+    for (let index = 1; index <= 105; index += 1) {
+      await store.appendMessage({
+        role: "assistant",
+        body: `history ${index}`,
+        status: "completed",
+        metadata: { historyIndex: index },
+      });
+    }
+    const { server, calls, commands } = createStatusServer(root, { orchestratorConversationStore: store });
+    const address = await server.start();
+    try {
+      const getResponse = await fetch(chatUrl(address));
+      const getBody = (await getResponse.json()) as { chat?: Array<Record<string, unknown>>; source?: Record<string, unknown> };
+      expect(getResponse.status).toBe(200);
+      expect(getBody.chat).toHaveLength(100);
+      expect(getBody.chat?.[0]).toMatchObject({ text: "history 6", metadata: { historyIndex: 6 } });
+      expect(getBody.chat?.at(-1)).toMatchObject({ text: "history 105", metadata: { historyIndex: 105 } });
+      expect(getBody.chat?.map((message) => message.text)).not.toContain("history 1");
+      expect(getBody.source).toMatchObject({ conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID });
+
+      const sidebarResponse = await fetch("http://" + address.host + ":" + String(address.port) + "/api/v1/web/sidebar");
+      const sidebarBody = (await sidebarResponse.json()) as { chat?: Array<Record<string, unknown>> };
+      expect(sidebarResponse.status).toBe(200);
+      expect(sidebarBody.chat).toHaveLength(100);
+      expect(sidebarBody.chat?.[0]).toMatchObject({ text: "history 6" });
+      expect(sidebarBody.chat?.at(-1)).toMatchObject({ text: "history 105" });
+
+      const postResponse = await fetch(chatUrl(address), {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input: "tail this command", messageId: "client-message-tail" }),
+      });
+      const posted = (await postResponse.json()) as Array<Record<string, unknown>>;
+      expect(postResponse.status).toBe(202);
+      expect(posted).toHaveLength(100);
+      expect(posted[0]).toMatchObject({ text: "history 7" });
+      expect(posted.at(-1)).toMatchObject({
+        id: "client-message-tail",
+        who: "user",
+        text: "tail this command",
+        status: "pending",
+        metadata: { actionDispatched: true, commandStatus: "accepted" },
+      });
+      expect(await store.listMessages()).toHaveLength(106);
+      expect(commands).toHaveLength(1);
+      expect(calls.dispatchOrchestratorChatCommand).toBe(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("persists an unavailable response when the orchestrator command boundary is unavailable", async () => {
     const store = new FileOrchestratorConversationStore(path.join(root, "state"));
     const { server, calls, commands } = createStatusServer(root, {

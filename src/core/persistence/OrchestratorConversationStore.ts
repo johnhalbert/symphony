@@ -165,7 +165,13 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
         messages: [...record.messages, message],
       };
       await this.writeConversation(nextRecord);
-      this.notifyProjectionChanged();
+      this.notifyProjectionChanged({
+        conversationId,
+        operation: "append",
+        message,
+        messages: [message],
+        messageCount: nextRecord.messages.length,
+      });
       return message;
     });
   }
@@ -201,7 +207,13 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
         messages,
       };
       await this.writeConversation(nextRecord);
-      this.notifyProjectionChanged();
+      this.notifyProjectionChanged({
+        conversationId,
+        operation: "update",
+        message: updated,
+        messages: [updated],
+        messageCount: nextRecord.messages.length,
+      });
       return updated;
     });
   }
@@ -238,8 +250,8 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
     await writeJson(filePath, normalizeConversationRecordForConversation(record, conversationId, filePath));
   }
 
-  private notifyProjectionChanged(): void {
-    this.projectionNotifier.notify("orchestrator_conversations");
+  private notifyProjectionChanged(detail: Record<string, unknown> | null = null): void {
+    this.projectionNotifier.notify("orchestrator_conversations", detail);
   }
 }
 

@@ -729,13 +729,17 @@ export class StatusServer {
           sendJson(response, 200, []);
           return;
         }
-        const durableTranscript = await this.webProjectionRepositories.transcript.readRunPage(
-          transcriptProjectionPageSelectorForRequest(run, url),
-          { forceRefresh },
-        );
-        if (durableTranscript.status === "hit" && durableTranscript.record) {
-          sendJson(response, 200, durableTranscript.record.payload, durableProjectionReadHeaders(durableTranscript));
-          return;
+        const requestedTranscriptPage = parseWebTranscriptPagination(url);
+        let durableTranscript: DurableProjectionReadResult<ReturnType<typeof projectWebTranscript>> | undefined;
+        if (!shouldBypassDurableWebTranscriptForActiveTail(run, requestedTranscriptPage)) {
+          durableTranscript = await this.webProjectionRepositories.transcript.readRunPage(
+            transcriptProjectionPageSelectorForRequest(run, requestedTranscriptPage),
+            { forceRefresh },
+          );
+          if (durableTranscript.status === "hit" && durableTranscript.record) {
+            sendJson(response, 200, durableTranscript.record.payload, durableProjectionReadHeaders(durableTranscript));
+            return;
+          }
         }
         const transcriptPage = await readBoundedWebTranscriptPage(this.options.runStore, run.runId, url);
         const transcript = projectWebTranscript(transcriptPage.events, { run });
@@ -774,7 +778,12 @@ export class StatusServer {
           }
           const chat = await this.fetchWebOrchestratorChatProjection(conversationId);
           await this.persistWebOrchestratorChatProjection(chat);
-          sendJson(response, 200, chat, durableProjectionReadHeaders(durableChat));
+          sendJson(
+            response,
+            200,
+            webOrchestratorChatProjectionFromResponseBody(chat, conversationId) ?? chat,
+            durableProjectionReadHeaders(durableChat),
+          );
           return;
         }
         if (request.method === "POST") {
@@ -824,6 +833,11 @@ export class StatusServer {
                 messageCount: chatProjection.chat.length,
                 conversationId: postConversationId ?? DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
                 status: result.status,
+                lastMessageId: chatProjection.chat.at(-1)?.id ?? null,
+                lastMessageStatus: chatProjection.chat.at(-1)?.status ?? null,
+                lastMessageAt: chatProjection.chat.at(-1)?.updatedAt ?? chatProjection.chat.at(-1)?.createdAt ?? null,
+                messages: chatProjection.chat,
+                message: chatProjection.chat.at(-1) ?? null,
               });
             }
           }
@@ -1925,7 +1939,9 @@ export class StatusServer {
   private async fetchWebOrchestratorChatMessages(
     conversationId?: string | null,
   ): Promise<OrchestratorConversationMessage[]> {
-    return (await this.options.orchestratorConversationStore?.listMessages(conversationId)) ?? [];
+    return selectOrchestratorConversationMessageTail(
+      (await this.options.orchestratorConversationStore?.listMessages(conversationId)) ?? [],
+    );
   }
 
   private async fetchWebOrchestratorChatProjection(
@@ -2030,7 +2046,9 @@ export class StatusServer {
     if (!webOrchestratorChatMessageMatchesClaim(message, commandClaimId)) {
       let messages: OrchestratorConversationMessage[];
       try {
-        messages = await store.listMessages(message.conversationId);
+        messages = selectOrchestratorConversationMessageTail(await store.listMessages(message.conversationId), {
+          includeMessageId: message.id,
+        });
       } catch {
         messages = [message];
       }
@@ -2112,7 +2130,9 @@ export class StatusServer {
         status: webOrchestratorChatMessageStatusFromCommandResult(input.result.status),
         metadata: webOrchestratorChatCommandMetadata(input.result, input.actionDispatched),
       });
-      messages = await input.store.listMessages(message.conversationId);
+      messages = selectOrchestratorConversationMessageTail(await input.store.listMessages(message.conversationId), {
+        includeMessageId: message.id,
+      });
     } catch {
       let recoveryMessage = message;
       if (input.actionDispatched) {
@@ -2133,7 +2153,9 @@ export class StatusServer {
         }
       }
       try {
-        messages = await input.store.listMessages(message.conversationId);
+        messages = selectOrchestratorConversationMessageTail(await input.store.listMessages(message.conversationId), {
+          includeMessageId: message.id,
+        });
       } catch {
         messages = [recoveryMessage];
       }
@@ -3256,11 +3278,20 @@ function transcriptProjectionScopeKey(run: RunRecord, page: TranscriptPage): str
   return webTranscriptProjectionScopeKey({ runId: run.runId, offset: page.offset, limit: page.limit });
 }
 
-function transcriptProjectionPageSelectorForRequest(run: RunRecord, url: URL): WebTranscriptProjectionPageSelector {
-  const requestedPage = parseWebTranscriptPagination(url);
+function transcriptProjectionPageSelectorForRequest(
+  run: RunRecord,
+  requestedPage: { offset: number; limit: number } | null,
+): WebTranscriptProjectionPageSelector {
   const offset = requestedPage?.offset ?? Math.max(0, (run.transcriptEventCount ?? 0) - WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT);
   const limit = requestedPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
   return { runId: run.runId, offset, limit };
+}
+
+function shouldBypassDurableWebTranscriptForActiveTail(
+  run: RunRecord,
+  requestedPage: { offset: number; limit: number } | null,
+): boolean {
+  return requestedPage === null && run.status === "running";
 }
 
 function orchestratorChatProjectionScopeKey(conversationId?: string | null): string {
@@ -3315,6 +3346,7 @@ function orchestratorChatProjectionSourceCursors(
     conversationStatus: projection.conversation.status,
     state: projection.state,
     messageCount: projection.chat.length,
+    tailLimit: WEB_ORCHESTRATOR_CHAT_DEFAULT_MESSAGE_LIMIT,
     latestMessageSequence: projection.source.latestMessageSequence,
     latestMessageUpdatedAt: projection.source.latestMessageUpdatedAt,
     sourceRevision: projection.source.revision,
@@ -3328,14 +3360,16 @@ function webOrchestratorChatProjectionFromResponseBody(
   body: unknown,
   conversationId?: string | null,
 ): WebOrchestratorChatProjectionResponse | null {
-  if (isWebOrchestratorChatProjectionEnvelope(body)) return body;
+  if (isWebOrchestratorChatProjectionEnvelope(body)) {
+    return webOrchestratorChatObjectProjection(body, selectChatMessageTail(body.chat), conversationId);
+  }
   if (isWebOrchestratorChatProjection(body)) {
     return webOrchestratorChatLegacyProjection(body, conversationId);
   }
   if (body && typeof body === "object" && !Array.isArray(body)) {
     const record = body as Record<string, unknown>;
     if (isWebOrchestratorChatProjection(record.chat)) {
-      return webOrchestratorChatObjectProjection(record, record.chat, conversationId);
+      return webOrchestratorChatObjectProjection(record, selectChatMessageTail(record.chat), conversationId);
     }
   }
   return null;
@@ -3387,7 +3421,8 @@ function webOrchestratorChatLegacyProjection(
   chat: ChatMessage[],
   conversationId?: string | null,
 ): WebOrchestratorChatProjectionResponse {
-  return webOrchestratorChatObjectProjection({ chat }, chat, conversationId, "legacy_chat_array");
+  const tail = selectChatMessageTail(chat);
+  return webOrchestratorChatObjectProjection({ chat: tail }, tail, conversationId, "legacy_chat_array");
 }
 
 function webOrchestratorChatObjectProjection(
@@ -3445,10 +3480,14 @@ function webOrchestratorChatObjectProjection(
       latestMessageSequence: normalizeNonNegativeInteger(rawSource?.latestMessageSequence),
       latestMessageUpdatedAt: nullableStringValue(rawSource?.latestMessageUpdatedAt) ?? latestMessage?.updatedAt ?? latestMessage?.createdAt ?? null,
     },
-    compatibility: {
-      responseShape: "orchestrator_chat_projection",
-      sourceShape,
-    },
+    ...(sourceShape === "reducer_envelope"
+      ? {}
+      : {
+          compatibility: {
+            responseShape: "orchestrator_chat_projection" as const,
+            sourceShape,
+          },
+        }),
   };
 }
 
@@ -3466,6 +3505,34 @@ function isWebOrchestratorChatProjectionEnvelope(value: unknown): value is WebOr
 
 function isWebOrchestratorChatProjection(value: unknown): value is ChatMessage[] {
   return Array.isArray(value) && value.every((item) => item && typeof item === "object" && typeof (item as ChatMessage).text === "string");
+}
+
+function selectChatMessageTail(messages: readonly ChatMessage[]): ChatMessage[] {
+  return selectRecentTail(messages, WEB_ORCHESTRATOR_CHAT_DEFAULT_MESSAGE_LIMIT);
+}
+
+function selectOrchestratorConversationMessageTail(
+  messages: readonly OrchestratorConversationMessage[],
+  options: { includeMessageId?: string | null } = {},
+): OrchestratorConversationMessage[] {
+  const tail = selectRecentTail(messages, WEB_ORCHESTRATOR_CHAT_DEFAULT_MESSAGE_LIMIT);
+  const includeMessageId = options.includeMessageId ?? null;
+  if (!includeMessageId || tail.some((message) => message.id === includeMessageId)) return tail;
+  const included = messages.find((message) => message.id === includeMessageId);
+  if (!included) return tail;
+  return [...tail.slice(1), included].sort(compareOrchestratorConversationMessageSequence);
+}
+
+function selectRecentTail<T>(items: readonly T[], limit: number): T[] {
+  if (limit <= 0) return [];
+  return items.slice(-limit);
+}
+
+function compareOrchestratorConversationMessageSequence(
+  left: OrchestratorConversationMessage,
+  right: OrchestratorConversationMessage,
+): number {
+  return left.sequence - right.sequence || compareString(left.id, right.id);
 }
 
 function webOrchestratorChatStatusSummary(
@@ -4107,7 +4174,10 @@ function webOrchestratorChatReplayResponse(
 ): { status: number; body: unknown } {
   return {
     status: webOrchestratorChatReplayStatus(message),
-    body: projectWebOrchestratorChatPost(input, messages),
+    body: projectWebOrchestratorChatPost(
+      input,
+      selectOrchestratorConversationMessageTail(messages, { includeMessageId: message.id }),
+    ),
   };
 }
 
@@ -4680,6 +4750,7 @@ const WEB_SIDEBAR_HISTORY_TIMELINE_LIMIT = 50;
 const WEB_ISSUE_DETAIL_RUN_LIMIT = 25;
 const WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT = 500;
 const WEB_TRANSCRIPT_PAGE_LIMIT = 1_000;
+const WEB_ORCHESTRATOR_CHAT_DEFAULT_MESSAGE_LIMIT = 100;
 const ACTIVITY_TRANSCRIPT_TAIL_PER_RUN = 500;
 const TERMINAL_ACTIVITY_TRANSCRIPT_TAIL = 256;
 

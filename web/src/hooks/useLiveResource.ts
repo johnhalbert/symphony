@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useDataSource } from "../data/dataSourceContext";
 import { realtimeConnectionStatus } from "../data/realtimeEvents";
+import { realtimeEventHasDirectPatchPayload } from "../data/realtimePatches";
 import type { RealtimeConnectionStatus, RealtimeProjectionEvent, RealtimeProjectionResource, RealtimeResourceKind } from "../data/dataSource";
 
 export const LIVE_RESOURCE_KEYS = [
@@ -87,7 +88,8 @@ export function useLiveResourceState(enabled: boolean): LiveResourceState {
           } else if (shouldBroadlyInvalidateRealtimeEvent(event)) {
             dataSource.invalidateCachedReads?.();
           }
-          setTokens((current) => incrementLiveResourceTokens(current, keys));
+          const tokenKeys = liveResourceTokenKeysForRealtimeEvent(event, keys);
+          if (tokenKeys.length > 0) setTokens((current) => incrementLiveResourceTokens(current, tokenKeys));
         },
         { onStatus: setRealtimeStatus },
       );
@@ -229,6 +231,24 @@ function hasRealtimeRoutingHints(event: RealtimeProjectionEvent): boolean {
 
 export function combineLiveResourceTokens(tokens: LiveResourceTokenMap, keys: readonly LiveResourceKey[]): number {
   return keys.reduce((total, key) => total + tokens[key], 0);
+}
+
+function liveResourceTokenKeysForRealtimeEvent(event: RealtimeProjectionEvent, keys: readonly LiveResourceKey[]): readonly LiveResourceKey[] {
+  if (!realtimeEventHasDirectPatchPayload(event)) return keys;
+  const directPatchKeys = directPatchLiveResourceKeysForEvent(event);
+  if (directPatchKeys.length === 0) return keys;
+  return keys.filter((key) => !directPatchKeys.includes(key));
+}
+
+function directPatchLiveResourceKeysForEvent(event: RealtimeProjectionEvent): readonly LiveResourceKey[] {
+  switch (event.type) {
+    case "transcript.delta":
+      return ["sessionTranscript"];
+    case "orchestrator.message":
+      return ["orchestratorChat"];
+    default:
+      return [];
+  }
 }
 
 function incrementLiveResourceTokens(current: LiveResourceTokenMap, keys: readonly LiveResourceKey[]): LiveResourceTokenMap {
