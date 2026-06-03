@@ -707,9 +707,12 @@ describe("Orchestrator", () => {
     );
     await settleOrchestratorExit();
     expect(writer.transitions).toEqual([]);
-    await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "implementation dispatch after accepted plan", 5_000);
+    await waitForAsync(async () => {
+      await orchestrator.refreshNow();
+      return harness.runs.length === 2;
+    }, "implementation dispatch after accepted plan", 5_000);
     await waitFor(() => orchestrator.snapshot().counts.running === 0);
+
     await orchestrator.refreshNow();
     await settleOrchestratorExit();
     await orchestrator.stop();
