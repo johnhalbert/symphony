@@ -256,7 +256,18 @@ function realtimeEventSourceUrl(baseUrl: string, lastEventId: string | null): st
 
 function parseRealtimeProjectionEvent(event: MessageEvent) {
   if (typeof event.data !== "string") return null;
-  return parseRealtimeProjectionEventData(event.data);
+  const parsed = parseRealtimeProjectionEventData(event.data);
+  if (!parsed) return null;
+
+  if (event.type !== parsed.type) return null;
+
+  const lastEventId = typeof event.lastEventId === "string" ? event.lastEventId : "";
+  if (lastEventId !== "" && lastEventId !== parsed.id) return null;
+
+  const transportId = (event as { id?: unknown }).id;
+  if (typeof transportId === "string" && transportId !== "" && transportId !== parsed.id) return null;
+
+  return parsed;
 }
 
 function normalizeReferenceRecord(record: Record<string, ApiReferenceEntry | null> | null | undefined) {

@@ -69,8 +69,8 @@ class FakeEventSource {
     this.readyState = FakeEventSource.CLOSED;
   }
 
-  emit(type: string, data?: string): void {
-    const event = typeof data === "string" ? new MessageEvent(type, { data }) : new Event(type);
+  emit(type: string, data?: string, init: MessageEventInit = {}): void {
+    const event = typeof data === "string" ? new MessageEvent(type, { ...init, data }) : new Event(type);
     for (const listener of this.listeners.get(type) ?? []) {
       if (typeof listener === "function") {
         listener(event);
@@ -504,12 +504,15 @@ describe("API data source", () => {
       resources: [{ kind: "history", href: "/api/v1/web/history", relation: "refetch" }],
     });
     const projectionEvent = realtimeEvent({ id: "6", revision: 6, type: "projection.updated" });
-    eventSource?.emit("run.updated", JSON.stringify(runEvent));
+    eventSource?.emit("run.updated", JSON.stringify(runEvent), { lastEventId: "not-5" });
+    eventSource?.emit("run.updated", JSON.stringify(projectionEvent));
+    eventSource?.emit("message", JSON.stringify(projectionEvent));
+    eventSource?.emit("run.updated", JSON.stringify(runEvent), { lastEventId: "5" });
     eventSource?.emit("run.updated", "not-json");
     eventSource?.emit("run.updated", JSON.stringify({ type: "run.updated" }));
     eventSource?.emit("run.updated", JSON.stringify({ ...runEvent, scope: "global" }));
     eventSource?.emit("run.updated", JSON.stringify({ ...runEvent, payload: projectionEvent.payload }));
-    eventSource?.emit("message", JSON.stringify(projectionEvent));
+    eventSource?.emit("projection.updated", JSON.stringify(projectionEvent));
     unsubscribe?.();
 
     expect(events).toEqual([runEvent, projectionEvent]);

@@ -176,5 +176,7 @@ Each resource has an `href` and a relation of `refetch` (direct route) or
 The web client mirrors this contract in `web/src/data/realtimeEvents.ts`. It
 accepts only `schema: "symphony.realtime.v1"`, `schemaVersion: 1`, known event
 types, known scopes, valid resource/recovery shapes, and the payload shape for
-the event type. Malformed frames are ignored; browser reconnection or the next
+the event type. SSE consumers must also reject frames whose transport event name
+or available `lastEventId`/`id` metadata disagrees with the JSON envelope's
+`type` and `id`. Malformed frames are ignored; browser reconnection or the next
 valid missed-event recovery frame should trigger refetch behavior.
