@@ -607,10 +607,11 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
     expect(markup).toContain("Full-app suggestion");
-    expect(markup).toContain("API mode shows durable chat history only");
-    expect(markup).toContain("Sending commands from this web chat is not supported yet");
-    expect(markup).not.toContain("Ask about the project, or issue a command");
-    expect(markup).not.toContain("/ commands");
+    expect(markup).toContain("Ask about the project, or issue a command");
+    expect(markup).toContain("/ commands");
+    expect(markup).toContain("run-api-1");
+    expect(markup).not.toContain("API mode shows durable chat history only");
+    expect(markup).not.toContain("Sending commands from this web chat is not supported yet");
     expectUnavailableButton(markup, "Status totals");
     expectUnavailableButton(markup, "Trigger poll");
     expectUnavailableButton(markup, "New issue");
