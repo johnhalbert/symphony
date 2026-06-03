@@ -62,9 +62,11 @@ function Swimlane({
         </UnavailableButton>
       </div>
       <div className="swim__body">
-        {items.map((issue) => (
-          <IssueCard key={issue.id} issue={issue} selected={issue.id === selectedId} onSelect={onSelect} />
-        ))}
+        {items.length ? (
+          items.map((issue) => <IssueCard key={issue.id} issue={issue} selected={issue.id === selectedId} onSelect={onSelect} />)
+        ) : (
+          <div className="view-empty">No {title.toLowerCase()} issues in this projection.</div>
+        )}
       </div>
     </div>
   );

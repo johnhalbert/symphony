@@ -146,6 +146,20 @@ describe("dashboard orchestrator chat integration", () => {
     expect(markup).not.toContain("dashboard embedded chat should not render");
   });
 
+  it("keeps stale dashboard chat messages visible while refreshes load or fail", () => {
+    const markup = renderDashboardChat({
+      chat: [{ who: "agent", text: "previous dashboard chat from API" }],
+      loading: true,
+      error: "Symphony API returned HTTP 503",
+    });
+
+    expect(markup).toContain("Refreshing orchestrator chat... showing previous messages.");
+    expect(markup).toContain("Could not refresh orchestrator chat: Symphony API returned HTTP 503. Showing previous messages.");
+    expect(markup).toContain("previous dashboard chat from API");
+    expect(markup).not.toContain("Orchestrator chat unavailable: Symphony API returned HTTP 503");
+    expect(markup).not.toContain("dashboard embedded chat should not render");
+  });
+
   it("renders API-mode dashboard chat as read-only for the exact empty API response", () => {
     const markup = renderDashboardChat({ chat: [], readOnly: true });
 
@@ -201,6 +215,20 @@ describe("sidebar orchestrator chat integration", () => {
     expect(markup).toContain("Orchestrator chat unavailable: Symphony API returned HTTP 503");
     expect(markup).not.toContain("sidebar embedded chat should not render");
     expect(markup).not.toContain("sidebar stale suggestion");
+  });
+
+  it("keeps stale compact sidebar chat messages visible while refreshes load or fail", () => {
+    const markup = renderSidebarChat({
+      chat: [{ who: "agent", text: "previous compact sidebar chat from API" }],
+      loading: true,
+      error: "Symphony API returned HTTP 503",
+    });
+
+    expect(markup).toContain("Refreshing orchestrator chat... showing previous messages.");
+    expect(markup).toContain("Could not refresh orchestrator chat: Symphony API returned HTTP 503. Showing previous messages.");
+    expect(markup).toContain("previous compact sidebar chat from API");
+    expect(markup).not.toContain("Orchestrator chat unavailable: Symphony API returned HTTP 503");
+    expect(markup).not.toContain("sidebar embedded chat should not render");
   });
 
   it("renders API-mode compact sidebar chat as read-only for the exact empty API response", () => {

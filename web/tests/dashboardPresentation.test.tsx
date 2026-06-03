@@ -254,6 +254,15 @@ describe("dashboard API presentation", () => {
     expectNoFabricatedDashboardMetrics(markup);
   });
 
+  it("renders unknown freshness explicitly when dashboard source metadata is absent", () => {
+    const markup = renderDashboard({ ...apiDashboard, source: null });
+
+    expect(markup).toContain("source unavailable");
+    expect(markup).toContain("Dashboard payload did not include freshness metadata");
+    expect(markup).not.toContain("tracker fresh");
+    expectNoFabricatedDashboardMetrics(markup);
+  });
+
   it("uses API totals in the grid progress panel without mock chart or velocity labels", () => {
     const markup = renderDashboard(apiDashboard, "grid");
 
@@ -353,7 +362,7 @@ describe("dashboard API presentation", () => {
           chat: [],
           totals: zeroTotals,
         }),
-        expected: ["0/0 agents", "0/0 done", "total 0"],
+        expected: ["0/0 agents", "0/0 done", "total 0", "0 events", "No activity entries are available from the current dashboard projection."],
       },
       {
         name: "active runs",

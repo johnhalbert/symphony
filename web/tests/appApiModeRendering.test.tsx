@@ -832,7 +832,12 @@ describe("App API-mode rendering", () => {
     expect(emptyBoard.markup).toContain("Todo");
     expect(emptyBoard.markup).toContain("In Progress");
     expect(emptyBoard.markup).toContain("In Review");
-    expect(emptyBoard.markup).toContain("Select an issue to inspect details.");
+    expect(emptyBoard.markup).toContain("No backlog issues in this projection.");
+    expect(emptyBoard.markup).toContain("No todo issues in this projection.");
+    expect(emptyBoard.markup).toContain("No in progress issues in this projection.");
+    expect(emptyBoard.markup).toContain("No in review issues in this projection.");
+    expect(emptyBoard.markup).toContain("No issue detail is available because the current issue projection is empty.");
+    expect(emptyBoard.markup).not.toContain("Select an issue to inspect details.");
     expect(emptyBoard.markup).not.toContain("SYM-12");
     expect(emptyBoard.markup).not.toContain("Add exponential backoff to retry queue with jitter");
 
@@ -886,6 +891,12 @@ describe("App API-mode rendering", () => {
     const timelineMarkup = await renderHistoryView(apiHistory, "timeline");
     expect(timelineMarkup).toContain("API timeline event rendered from history endpoint.");
     expect(timelineMarkup).toContain("run-api-transcript");
+    expect(timelineMarkup).toContain("1 event");
+    expect(timelineMarkup).toContain("2 sessions");
+    expect(timelineMarkup).toContain("0 running · 2 finished");
+    expect(timelineMarkup).toContain("durable history projection");
+    expect(timelineMarkup).not.toContain("4 running · 7 finished");
+    expect(timelineMarkup).not.toContain("last 1h");
     expectUnavailableButton(timelineMarkup, "Timeline filter");
     expectUnavailableButton(timelineMarkup, "Group timeline by session");
     expect(timelineMarkup).toContain("open unavailable");

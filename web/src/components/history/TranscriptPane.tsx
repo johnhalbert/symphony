@@ -16,6 +16,7 @@ export function TranscriptPane({
 }) {
   const initialOpenSet = useMemo(() => new Set([5, 9, 10]), []);
   const [openSet, setOpenSet] = useState(initialOpenSet);
+  const hasMessages = messages.length > 0;
 
   function toggle(index: number) {
     setOpenSet((current) => {
@@ -59,9 +60,17 @@ export function TranscriptPane({
         </div>
       </div>
       <div className="transcript">
-        {loading ? <div className="transcript-status">Loading transcript...</div> : null}
-        {error ? <div className="transcript-status">Transcript unavailable: {error}</div> : null}
-        {!loading && !error && messages.length === 0 ? <div className="transcript-status">No transcript messages for this session.</div> : null}
+        {loading ? (
+          <div className="transcript-status">
+            {hasMessages ? "Refreshing transcript... showing previous messages." : "Loading transcript..."}
+          </div>
+        ) : null}
+        {error ? (
+          <div className="transcript-status">
+            {hasMessages ? `Could not refresh transcript: ${error}. Showing previous messages.` : `Transcript unavailable: ${error}`}
+          </div>
+        ) : null}
+        {!loading && !error && !hasMessages ? <div className="transcript-status">No transcript messages for this session.</div> : null}
         {messages.map((message, index) => (
           <Message key={`${message.kind}-${index}`} message={message} open={openSet.has(index)} onToggle={() => toggle(index)} />
         ))}

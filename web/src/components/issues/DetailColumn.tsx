@@ -27,7 +27,7 @@ export function DetailColumn({
 }: DetailColumnProps) {
   const { users } = useReferenceData();
 
-  if (loading || error || !issue) {
+  if (!issue) {
     const hasSelection = Boolean(issueId);
     return (
       <div className="issues__col">
@@ -67,6 +67,8 @@ export function DetailColumn({
         </button>
       </div>
       <div className="detail">
+        {loading ? <div className="transcript-status">Refreshing issue detail… showing previous details.</div> : null}
+        {error ? <div className="transcript-status">Could not refresh issue detail: {error}. Showing previous details.</div> : null}
         <div className="detail__head">
           <div className="detail__crumbs">
             <span>Symphony</span>

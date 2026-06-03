@@ -27,6 +27,7 @@ export function DashboardView({
   const sourceChat = orchestratorChat ?? dashboard.chat;
   const [chat, setChat] = useState(sourceChat);
   const totals = dashboard.totals;
+  const visibleActivity = dashboard.activity.slice(0, variant === "grid" ? 10 : 8);
 
   useEffect(() => {
     setChat(sourceChat);
@@ -53,7 +54,7 @@ export function DashboardView({
               <span className="sep">·</span>
               <span style={{ color: "var(--accent)" }}>● {dashboard.agentUsageLabel}</span>
             </div>
-            {dashboard.source ? <DashboardSourceStatus source={dashboard.source} /> : null}
+            {dashboard.source ? <DashboardSourceStatus source={dashboard.source} /> : <DashboardSourceUnavailable />}
           </div>
           <div className="dash__actions">
             <UnavailableButton className="btn" unavailableLabel="Status totals" unavailableReason="status-total filtering is read-only until an API command route exists">
@@ -113,31 +114,37 @@ export function DashboardView({
             <div className="panel__head">
               <span>Activity feed</span>
               <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>
-                <span
-                  style={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: 999,
-                    background: "var(--accent)",
-                    animation: "pulse 1.6s ease-in-out infinite",
-                  }}
-                />
-                feed
+                {dashboard.activity.length ? (
+                  <span
+                    style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: 999,
+                      background: "var(--accent)",
+                      animation: "pulse 1.6s ease-in-out infinite",
+                    }}
+                  />
+                ) : null}
+                {dashboard.activity.length} {dashboard.activity.length === 1 ? "event" : "events"}
               </span>
             </div>
             <div className="panel__body">
-              {dashboard.activity.slice(0, variant === "grid" ? 10 : 8).map((activityItem, index) => (
-                <div className="activity-row" key={`${activityItem.t}-${activityItem.id}-${index}`}>
-                  <span className="dot" style={{ background: dotColorForVerb(activityItem.verb) }} />
-                  <span className="text">
-                    <span className="id">{activityItem.who}</span>{" "}
-                    <span className="verb">{activityItem.verb}</span>{" "}
-                    <span className="id">{activityItem.id}</span>{" "}
-                    <span className="verb">{activityItem.extra}</span>
-                  </span>
-                  <span className="time">{activityItem.t}</span>
-                </div>
-              ))}
+              {visibleActivity.length ? (
+                visibleActivity.map((activityItem, index) => (
+                  <div className="activity-row" key={`${activityItem.t}-${activityItem.id}-${index}`}>
+                    <span className="dot" style={{ background: dotColorForVerb(activityItem.verb) }} />
+                    <span className="text">
+                      <span className="id">{activityItem.who}</span>{" "}
+                      <span className="verb">{activityItem.verb}</span>{" "}
+                      <span className="id">{activityItem.id}</span>{" "}
+                      <span className="verb">{activityItem.extra}</span>
+                    </span>
+                    <span className="time">{activityItem.t}</span>
+                  </div>
+                ))
+              ) : (
+                <div className="view-empty">No activity entries are available from the current dashboard projection.</div>
+              )}
             </div>
           </div>
 
@@ -182,6 +189,16 @@ function DashboardSourceStatus({ source }: { source: NonNullable<DashboardModel[
           <span>{timestamps.join(" · ")}</span>
         </>
       ) : null}
+    </div>
+  );
+}
+
+function DashboardSourceUnavailable() {
+  return (
+    <div className="dash__source" data-status="unavailable">
+      <span className="dash__source-label">source unavailable</span>
+      <span className="sep">·</span>
+      <span>Dashboard payload did not include freshness metadata; treating projection age as unknown.</span>
     </div>
   );
 }

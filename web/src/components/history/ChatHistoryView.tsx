@@ -20,7 +20,7 @@ export function ChatHistoryView({
   const session = selectedSession ?? defaultSession;
 
   if (variant === "timeline") {
-    return <Timeline events={history.timeline} />;
+    return <Timeline events={history.timeline} sessions={history.sessions} />;
   }
 
   if (!session) {
@@ -46,14 +46,14 @@ function SelectedTranscript({
 }) {
   const transcript = useTranscript(session.id, refreshToken);
   const embeddedMessages = history.transcriptBySession?.[session.id] ?? [];
-  const messages = transcript.error ? [] : (transcript.data ?? embeddedMessages);
+  const messages = transcript.data ?? embeddedMessages;
 
   return (
     <TranscriptPane
       key={session.id}
       session={session}
       messages={messages}
-      loading={transcript.loading && messages.length === 0}
+      loading={transcript.loading}
       error={transcript.error}
     />
   );
