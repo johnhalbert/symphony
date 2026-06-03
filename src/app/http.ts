@@ -82,6 +82,10 @@ import {
   type OrchestratorConversationStore,
 } from "../core/persistence/OrchestratorConversationStore.js";
 import {
+  ORCHESTRATOR_CHAT_PROJECTION_SOURCE,
+  projectOrchestratorChatProjectionPayload,
+} from "../core/persistence/OrchestratorChatProjectionReducer.js";
+import {
   ORCHESTRATOR_CHAT_POST_ACTION,
   type OrchestratorChatCommandDispatcher,
   type OrchestratorChatCommandResult,
@@ -706,7 +710,25 @@ export class StatusServer {
             forceRefresh,
           });
           if (durableChat.status === "hit" && durableChat.record) {
-            sendJson(response, 200, durableChat.record.payload, durableProjectionReadHeaders(durableChat));
+            const chat = webOrchestratorChatProjectionFromResponseBody(durableChat.record.payload);
+            if (chat) {
+              sendJson(response, 200, chat, durableProjectionReadHeaders(durableChat));
+              return;
+            }
+            sendJson(
+              response,
+              200,
+              [],
+              durableProjectionReadHeaders({
+                ...durableChat,
+                status: "missing_item",
+                reason: "orchestrator_chat_projection_payload_missing_chat_array",
+              }),
+            );
+            return;
+          }
+          if (this.hasDurableProjectionReader()) {
+            sendJson(response, 200, [], durableProjectionReadHeaders(durableChat));
             return;
           }
           const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages(conversationId));
@@ -2243,11 +2265,28 @@ export class StatusServer {
   }
 
   private async isDurableProjectionRecordCurrent(record: ProjectionPayloadRecord): Promise<boolean> {
+    const orchestratorChatRecordCurrent = await this.isDurableOrchestratorChatProjectionRecordCurrent(record);
+    if (orchestratorChatRecordCurrent !== null) return orchestratorChatRecordCurrent;
+
     const currentRevisions = projectionCurrentSourceRevisionsForRead(
       record.revision.projectionName,
       await this.resolveWebProjectionSourceRevisions(),
     );
     return projectionSourceRevisionsCompatible(record.revision.sourceRevisions, currentRevisions);
+  }
+
+  private async isDurableOrchestratorChatProjectionRecordCurrent(
+    record: ProjectionPayloadRecord,
+  ): Promise<boolean | null> {
+    if (record.revision.projectionName !== "orchestrator_chat_projection") return null;
+    const store = this.options.orchestratorConversationStore;
+    if (!store) return null;
+    const conversationSource = `${ORCHESTRATOR_CHAT_PROJECTION_SOURCE}:${record.revision.scopeKey}`;
+    const storedRevision = record.revision.sourceRevisions.find((revision) => revision.source === conversationSource);
+    if (!storedRevision) return null;
+    const conversation = await store.getConversation(record.revision.scopeKey);
+    const currentProjection = projectOrchestratorChatProjectionPayload(conversation, record.revision.scopeKey);
+    return String(storedRevision.revision) === currentProjection.source.revision;
   }
 
   private async fetchOptionalWebProjectionSourceIndex(forceRefresh: boolean): Promise<{

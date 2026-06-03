@@ -69,6 +69,8 @@ export interface WebProjectionReadRepositories {
   readonly orchestratorChat: WebOrchestratorChatProjectionRepository;
 }
 
+export type WebOrchestratorChatProjectionReadPayload = readonly ChatMessage[] | { readonly chat?: unknown };
+
 export class WebProjectionReadRepository {
   private readonly reader: WebProjectionPayloadReader | null;
   private readonly isRecordCurrent: WebProjectionRecordCurrentChecker;
@@ -189,7 +191,7 @@ export class WebOrchestratorChatProjectionRepository {
   readConversation(
     conversationId?: string | null,
     options: WebProjectionReadOptions = {},
-  ): Promise<WebProjectionReadResult<readonly ChatMessage[]>> {
+  ): Promise<WebProjectionReadResult<WebOrchestratorChatProjectionReadPayload>> {
     return this.reads.read(
       {
         projectionName: "orchestrator_chat_projection",

@@ -26,6 +26,11 @@ import type { TrackerStateLists } from "../src/core/types.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { webRouteContractGetFixtureCases, webRouteContractPaths } from "../web/tests/fixtures/webRouteContractFixtures.js";
+import {
+  FileOrchestratorConversationStore,
+  type OrchestratorConversationStore,
+} from "../src/core/persistence/OrchestratorConversationStore.js";
+import { projectOrchestratorChatProjectionPayload } from "../src/core/persistence/OrchestratorChatProjectionReducer.js";
 import { testConfig } from "./helpers.js";
 
 describe("/api/v1/web route contracts", () => {
@@ -265,6 +270,38 @@ describe("/api/v1/web route contracts", () => {
       totals: dashboard.totals,
     };
     const chat = [{ id: "chat-1", who: "agent", text: "served from durable projection", createdAt: "2026-05-31T00:00:00.000Z" }];
+    const legacyChat = [{ id: "legacy-chat-1", who: "agent", text: "served from legacy durable array", createdAt: "2026-05-31T00:01:00.000Z" }];
+    const chatProjection = {
+      schemaVersion: 1,
+      conversation: {
+        id: "operator-room",
+        status: "completed",
+        createdAt: "2026-05-31T00:00:00.000Z",
+        updatedAt: "2026-05-31T00:00:00.000Z",
+        messageCount: chat.length,
+        metadata: {},
+      },
+      state: "completed",
+      status: {
+        state: "completed",
+        conversationStatus: "completed",
+        latestMessageStatus: "completed",
+        active: false,
+        terminal: true,
+        empty: false,
+        messageCount: chat.length,
+        statusCounts: { pending: 0, streaming: 0, completed: 1, failed: 0, disabled: 0, unavailable: 0 },
+      },
+      chat,
+      source: {
+        source: "orchestrator_conversations",
+        revision: "durable-chat-revision",
+        observedAt: "2026-05-31T00:00:00.000Z",
+        conversationId: "operator-room",
+        latestMessageSequence: 1,
+        latestMessageUpdatedAt: "2026-05-31T00:00:00.000Z",
+      },
+    };
     const sourceFreshness: ProjectionRevisionRecord["sourceFreshness"] = [
       {
         source: "trackerIssues",
@@ -299,7 +336,11 @@ describe("/api/v1/web route contracts", () => {
       ),
       projectionPayloadRecordFixture(
         { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
-        chat,
+        chatProjection,
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "legacy-room" },
+        legacyChat,
       ),
     ]);
     const projectionWriter = new RecordingProjectionWriter();
@@ -330,6 +371,7 @@ describe("/api/v1/web route contracts", () => {
       expect(durableSidebar.response.headers.get("x-symphony-projection-name")).toBe("sidebar_projection");
       expect(headerJson(durableSidebar.response, "x-symphony-projection-source-freshness")).toEqual(sourceFreshness);
       await expect(getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=operator-room`)).resolves.toMatchObject({ body: chat });
+      await expect(getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=legacy-room`)).resolves.toMatchObject({ body: legacyChat });
       const referenceData = await getJson(`${baseUrl}/api/v1/web/reference-data`);
       expect(referenceData.body).toMatchObject({
         labels: { durable: { name: "durable" } },
@@ -348,7 +390,83 @@ describe("/api/v1/web route contracts", () => {
       { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
       { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
       { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+      { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "legacy-room" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    ]);
+  });
+
+  it("serves reducer-shaped orchestrator chat projections with per-conversation freshness checks", async () => {
+    const conversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state"));
+    await conversationStore.appendMessage({
+      id: "chat-1",
+      conversationId: "operator-room",
+      role: "assistant",
+      body: "served from reducer projection",
+      status: "completed",
+      at: "2026-05-31T00:00:00.000Z",
+    });
+    const projectionPayload = projectOrchestratorChatProjectionPayload(
+      await conversationStore.getConversation("operator-room"),
+      "operator-room",
+    );
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+        projectionPayload,
+        {
+          sourceRevisions: [
+            {
+              source: "orchestrator_conversations:operator-room",
+              revision: projectionPayload.source.revision,
+              observedAt: projectionPayload.source.observedAt,
+            },
+          ],
+        },
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, {
+      orchestratorConversationStore: conversationStore,
+      projectionReader,
+      projectionWriter,
+    });
+    const address = await server.start();
+    const url = `${baseUrlFor(address)}/api/v1/web/orchestrator-chat?conversationId=operator-room`;
+
+    try {
+      const current = await getJson(url);
+      expect(current.response.status).toBe(200);
+      expect(current.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(current.body).toEqual(projectionPayload.chat);
+      expect(headerJson(current.response, "x-symphony-projection-source-revisions")).toEqual([
+        {
+          source: "orchestrator_conversations:operator-room",
+          revision: projectionPayload.source.revision,
+          observedAt: projectionPayload.source.observedAt,
+        },
+      ]);
+
+      await conversationStore.appendMessage({
+        id: "chat-2",
+        conversationId: "operator-room",
+        role: "assistant",
+        body: "newer chat not in the stale durable projection",
+        status: "completed",
+        at: "2026-05-31T00:01:00.000Z",
+      });
+      const stale = await getJson(url);
+      expect(stale.response.status).toBe(200);
+      expect(stale.response.headers.get("x-symphony-projection-status")).toBe("stale");
+      expect(stale.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(stale.body).toEqual([]);
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionWriter.writes).toEqual([]);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+      { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
     ]);
   });
 
@@ -401,6 +519,11 @@ describe("/api/v1/web route contracts", () => {
         sessions: [],
         chat: [],
       });
+
+      const chat = await getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=operator-room`);
+      expect(chat.response.status).toBe(200);
+      expect(chat.response.headers.get("x-symphony-projection-status")).toBe("missing");
+      expect(chat.body).toEqual([]);
     } finally {
       await server.stop();
     }
@@ -413,6 +536,7 @@ describe("/api/v1/web route contracts", () => {
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
       { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+      { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
     ]);
   });
 
@@ -1265,6 +1389,7 @@ interface CreateStatusServerOptions {
   tracker?: TrackerClient;
   webProjectionContextClock?: () => Date;
   webProjectionContextBuilder?: StatusServerWebProjectionContextBuilder;
+  orchestratorConversationStore?: OrchestratorConversationStore;
 }
 
 class RecordingProjectionWriter implements StatusServerProjectionWriter {
@@ -1573,6 +1698,9 @@ function createStatusServer(
       ...(options.projectionReader ? { projectionReader: options.projectionReader } : {}),
       ...(options.webProjectionRevisionProviders
         ? { webProjectionRevisionProviders: options.webProjectionRevisionProviders }
+        : {}),
+      ...(options.orchestratorConversationStore
+        ? { orchestratorConversationStore: options.orchestratorConversationStore }
         : {}),
     }),
   };
