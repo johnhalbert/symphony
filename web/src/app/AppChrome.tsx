@@ -86,7 +86,7 @@ export function AppChrome({
       {children}
       <div className="statusbar">
         <span className="statusbar__seg">
-          <span className="pulse" />
+          {runningCount > 0 ? <span className="pulse" /> : null}
           {runningLabel}
         </span>
         <span className="statusbar__sep">·</span>

@@ -25,6 +25,11 @@ export function SidebarChat({
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const recent = messages.slice(-3);
+  const chatError = error
+    ? recent.length === 0
+      ? `Orchestrator chat unavailable: ${error}`
+      : `Could not refresh orchestrator chat: ${error}. Showing previous messages.`
+    : null;
   const stateNotice = projection ? orchestratorChatStateNotice(projection, true) : null;
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this compact chat is not supported yet; no orchestrator action will be dispatched.";
@@ -65,7 +70,8 @@ export function SidebarChat({
 
       <div style={{ overflow: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 14 }}>
         {loading && recent.length === 0 ? <div className="view-loading">Loading orchestrator chat...</div> : null}
-        {error ? <div className="view-error">Orchestrator chat unavailable: {error}</div> : null}
+        {loading && recent.length > 0 ? <div className="transcript-status">Refreshing orchestrator chat... showing previous messages.</div> : null}
+        {chatError ? <div className="view-error">{chatError}</div> : null}
         {sendError ? <div className="view-error">Orchestrator command failed: {sendError}</div> : null}
         {!loading && !error && stateNotice ? (
           <div className="view-empty" data-orchestrator-chat-state={projection?.state}>{stateNotice}</div>

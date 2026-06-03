@@ -865,11 +865,19 @@ export class CompletionReportService {
   ): Promise<WritebackOperation[]> {
     if (!isTerminalApprovalStatus(approval.status)) return [];
     await this.recordPublicationApprovalTerminalRun(approval);
+    const terminalReason = `publication approval ${approval.status}`;
+    const latestLifecycle =
+      (await this.options.lifecycleStore.get(context.issue.id)) ??
+      (context.issue.identifier ? await this.options.lifecycleStore.get(context.issue.identifier) : null);
+    if (latestLifecycle?.phase === "blocked" && latestLifecycle.blockedReason === terminalReason) {
+      return [];
+    }
     const issue = {
       ...context.issue,
       state: this.options.config.reviewLoop.blockedStates[0] ?? context.issue.state,
     };
     const enqueued: WritebackOperation[] = [];
+
     for (const operation of planCompletionReportPublicationApprovalTerminalWritebacks(
       runWritebackContext({ ...context, issue }, report.runId),
       this.options.config,

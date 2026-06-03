@@ -13,6 +13,8 @@ export function SidebarViews({
   orchestratorChatLoading = false,
   orchestratorChatReadOnly = false,
   sidebar,
+  sidebarError = null,
+  sidebarLoading = false,
   variant,
 }: {
   orchestratorChat?: OrchestratorChatModel | ChatMessage[];
@@ -20,6 +22,8 @@ export function SidebarViews({
   orchestratorChatLoading?: boolean;
   orchestratorChatReadOnly?: boolean;
   sidebar: SidebarModel;
+  sidebarError?: string | null;
+  sidebarLoading?: boolean;
   variant: SidebarVariant;
 }) {
   const dataSource = useDataSource();
@@ -53,7 +57,7 @@ export function SidebarViews({
     ) : variant === "history" ? (
       <SidebarHistory sessions={sidebar.sessions} />
     ) : (
-      <SidebarPrimary sidebar={sidebar} />
+      <SidebarPrimary sidebar={sidebar} error={sidebarError} loading={sidebarLoading} />
     );
 
   return (

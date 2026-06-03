@@ -1,10 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { BacklogColumn } from "../src/components/issues/BacklogColumn";
 import { IssueCard } from "../src/components/issues/IssueCard";
 import { DetailColumn } from "../src/components/issues/DetailColumn";
 import { resolveSelectedIssueId } from "../src/components/issues/IssuesView";
+import { Swimlanes } from "../src/components/issues/Swimlanes";
 import { ReferenceDataProvider } from "../src/data/referenceDataContext";
-import type { IssueModel } from "../src/types/symphony";
+import type { IssueBoardModel, IssueModel } from "../src/types/symphony";
 
 function makeIssue(overrides: Partial<IssueModel> = {}): IssueModel {
   return {
@@ -45,6 +47,13 @@ describe("issues components", () => {
     expect(resolveSelectedIssueId("ENG-104", { issues: [fallback], selectedIssueId: "ENG-105" })).toBe("ENG-105");
   });
 
+  it("does not select an unavailable API-selected issue for empty or mismatched boards", () => {
+    const fallback = makeIssue({ id: "ENG-106" });
+
+    expect(resolveSelectedIssueId("ENG-104", { issues: [fallback], selectedIssueId: "ENG-MISSING" })).toBe("ENG-106");
+    expect(resolveSelectedIssueId("ENG-104", { issues: [], selectedIssueId: "ENG-MISSING" })).toBe("");
+  });
+
   it("falls back to the assignee id when API reference data is missing or blank", () => {
     const missingHtml = renderToStaticMarkup(
       <ReferenceDataProvider value={{ users: {}, labels: {} }}>
@@ -80,5 +89,49 @@ describe("issues components", () => {
     );
 
     expect(html).toContain("Select an issue to inspect details.");
+  });
+
+  it("keeps stale issue detail visible while refreshes load or fail", () => {
+    const loadingHtml = renderToStaticMarkup(
+      <ReferenceDataProvider value={{ users: {}, labels: {} }}>
+        <DetailColumn issue={makeIssue()} loading onClose={() => {}} />
+      </ReferenceDataProvider>,
+    );
+    const errorHtml = renderToStaticMarkup(
+      <ReferenceDataProvider value={{ users: {}, labels: {} }}>
+        <DetailColumn issue={makeIssue()} error="Symphony API returned HTTP 503" onClose={() => {}} />
+      </ReferenceDataProvider>,
+    );
+
+    expect(loadingHtml).toContain("Refreshing issue detail… showing previous details.");
+    expect(loadingHtml).toContain("Integrate GET /api/v1/web/issues");
+    expect(errorHtml).toContain("Could not refresh issue detail: Symphony API returned HTTP 503. Showing previous details.");
+    expect(errorHtml).toContain("Wire the issues board to live API data.");
+  });
+
+  it("renders explicit empty states for empty backlog and swimlanes", () => {
+    const emptyBoard: IssueBoardModel = {
+      issues: [],
+      backlog: [],
+      lanes: { todo: [], progress: [], review: [] },
+      cycleLabel: "Empty cycle",
+      cycleDateRange: "no active issues",
+      selectedIssueId: "",
+    };
+    const backlogHtml = renderToStaticMarkup(
+      <ReferenceDataProvider value={{ users: {}, labels: {} }}>
+        <BacklogColumn backlog={[]} selectedId="" onSelect={() => {}} />
+      </ReferenceDataProvider>,
+    );
+    const swimlanesHtml = renderToStaticMarkup(
+      <ReferenceDataProvider value={{ users: {}, labels: {} }}>
+        <Swimlanes board={emptyBoard} selectedId="" onSelect={() => {}} />
+      </ReferenceDataProvider>,
+    );
+
+    expect(backlogHtml).toContain("No backlog issues in this projection.");
+    expect(swimlanesHtml).toContain("No todo issues in this projection.");
+    expect(swimlanesHtml).toContain("No in progress issues in this projection.");
+    expect(swimlanesHtml).toContain("No in review issues in this projection.");
   });
 });

@@ -231,6 +231,7 @@ describe("ChatHistoryView", () => {
 
     expect(useTranscriptMock).toHaveBeenCalledWith("run-two", undefined);
     expect(markup).toContain("Mock transcript remains embedded.");
+    expect(markup).toContain("Refreshing transcript... showing previous messages.");
     expect(markup).not.toContain("Loading transcript...");
   });
 
@@ -246,11 +247,31 @@ describe("ChatHistoryView", () => {
     expect(errorMarkup).not.toContain("Dedicated session transcript loaded from the API.");
   });
 
+  it("keeps stale dedicated transcript messages visible when refresh fails", () => {
+    useTranscriptMock.mockReturnValue(transcriptState({ data: apiTranscript, error: "Symphony API returned HTTP 503" }));
+
+    const markup = renderToStaticMarkup(<ChatHistoryView history={history()} />);
+
+    expect(markup).toContain("Could not refresh transcript: Symphony API returned HTTP 503. Showing previous messages.");
+    expect(markup).toContain("Dedicated session transcript loaded from the API.");
+    expect(markup).not.toContain("Transcript unavailable: Symphony API returned HTTP 503");
+  });
+
   it("renders timeline and empty-session variants without fetching a selected-session transcript", () => {
     const timelineMarkup = renderToStaticMarkup(<ChatHistoryView history={history()} variant="timeline" />);
     expect(timelineMarkup).toContain("Activity timeline");
+    expect(timelineMarkup).toContain("1 event");
+    expect(timelineMarkup).toContain("2 sessions");
+    expect(timelineMarkup).toContain("1 running · 1 finished");
+    expect(timelineMarkup).toContain("durable history projection");
     expect(timelineMarkup).toContain("History API loaded");
+    expect(timelineMarkup).not.toContain("4 running · 7 finished");
+    expect(timelineMarkup).not.toContain("last 1h");
+    expect(timelineMarkup).not.toContain(">live<");
     expect(useTranscriptMock).not.toHaveBeenCalled();
+
+    const emptyTimelineMarkup = renderToStaticMarkup(<ChatHistoryView history={history({ timeline: [] })} variant="timeline" />);
+    expect(emptyTimelineMarkup).toContain("No timeline events are available from the current history projection.");
 
     const emptyMarkup = renderToStaticMarkup(<ChatHistoryView history={history({ sessions: [], defaultSessionId: "", timeline: [] })} />);
     expect(emptyMarkup).toContain("No sessions in history.");

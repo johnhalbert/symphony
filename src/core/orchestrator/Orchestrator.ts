@@ -608,8 +608,11 @@ export class Orchestrator {
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
       ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
     }).recordPublicationApprovalTerminal({ approval: request, issue });
-    if (result.length === 0) return false;
-    return true;
+    if (result.length > 0) return true;
+    const lifecycle =
+      (await this.options.lifecycleStore.get(request.issueId)) ??
+      (request.issueIdentifier ? await this.options.lifecycleStore.get(request.issueIdentifier) : null);
+    return lifecycle?.phase === "blocked" && lifecycle.blockedReason === `publication approval ${request.status}`;
   }
 
   async createContinuationSummary(

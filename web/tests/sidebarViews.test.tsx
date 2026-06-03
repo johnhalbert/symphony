@@ -79,13 +79,23 @@ const emptySidebar: SidebarModel = {
   totals: { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 },
 };
 
+function expectNoPrimaryLiveSignals(html: string) {
+  expect(html).not.toContain(" live");
+  expect(html).not.toContain("animation:pulse");
+  expect(html).not.toContain("spinner");
+}
+
 describe("sidebar views", () => {
-  it("renders primary sidebar fields from the API SidebarModel", () => {
+  it("renders primary sidebar fields from the API SidebarModel as a durable projection", () => {
     const html = renderToStaticMarkup(<SidebarViews sidebar={representativeSidebar} variant="primary" />);
 
+    expect(html).toContain("durable projection");
+    expect(html).toContain("1 running");
+    expect(html).toContain("7 open");
     expect(html).toContain("openai-codex");
     expect(html).toContain("ENG-7");
     expect(html).toContain("Wire sidebar API payload");
+    expect(html).toContain("projected step");
     expect(html).toContain("Rendering /api/v1/web/sidebar");
     expect(html).toContain("ENG-8");
     expect(html).toContain("Review enriched issue fields");
@@ -96,7 +106,9 @@ describe("sidebar views", () => {
     expect(html).toContain("session session-8");
     expect(html).toContain("orchestrator");
     expect(html).toContain("accepted");
+    expect(html).toContain("Durable sidebar projection");
     expect(html).toContain("11 total issues");
+    expectNoPrimaryLiveSignals(html);
     expect(html).not.toContain("Velocity");
     expect(html).not.toContain("poll in 8s");
   });
@@ -120,17 +132,38 @@ describe("sidebar views", () => {
     expect(html).toContain("Show history");
   });
 
-  it("renders empty API sidebar arrays without mock fallback content", () => {
+  it("renders empty API sidebar arrays without mock fallback or live indicators", () => {
     const primary = renderToStaticMarkup(<SidebarViews sidebar={emptySidebar} variant="primary" />);
     const history = renderToStaticMarkup(<SidebarViews sidebar={emptySidebar} variant="history" />);
     const chat = renderToStaticMarkup(<SidebarViews sidebar={emptySidebar} variant="chat" />);
 
+    expect(primary).toContain("empty projection");
+    expect(primary).toContain("no running");
+    expect(primary).toContain("0 open");
     expect(primary).toContain("No running agents.");
     expect(primary).toContain("No review issues.");
     expect(primary).toContain("No recent activity.");
+    expectNoPrimaryLiveSignals(primary);
     expect(history).toContain("No sidebar sessions yet.");
     expect(chat).toContain("No durable orchestrator chat messages are available yet.");
     expect(chat).not.toContain("chat__suggestion");
     expect(chat).not.toContain("Show running agents");
+  });
+
+  it("labels stale and failed primary sidebar refreshes without live or pulsing indicators", () => {
+    const refreshing = renderToStaticMarkup(<SidebarViews sidebar={representativeSidebar} sidebarLoading variant="primary" />);
+    const failed = renderToStaticMarkup(
+      <SidebarViews sidebar={representativeSidebar} sidebarError="Symphony API returned HTTP 503" variant="primary" />,
+    );
+
+    expect(refreshing).toContain("Refreshing sidebar projection; showing previous sidebar data.");
+    expect(refreshing).toContain("refreshing projection");
+    expect(refreshing).toContain("Wire sidebar API payload");
+    expectNoPrimaryLiveSignals(refreshing);
+
+    expect(failed).toContain("Sidebar refresh failed; showing previous sidebar projection. Symphony API returned HTTP 503");
+    expect(failed).toContain("previous projection");
+    expect(failed).toContain("Wire sidebar API payload");
+    expectNoPrimaryLiveSignals(failed);
   });
 });

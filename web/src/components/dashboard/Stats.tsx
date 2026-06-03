@@ -4,6 +4,7 @@ import type {
   DashboardModel,
   DashboardTotals,
 } from "../../types/symphony";
+import type { DashboardFreshnessCue } from "./freshness";
 
 function textOr(value: string | null | undefined, fallback: string) {
   const trimmed = value?.trim();
@@ -33,10 +34,13 @@ function PanelUnavailable({ children }: { children: string }) {
 
 const unavailableValue = "—";
 
-export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
+export function StatsRow({ dashboard, freshnessCue }: { dashboard: DashboardModel; freshnessCue?: DashboardFreshnessCue }) {
   const totals = dashboard.totals;
   const runningCount = dashboard.runningAgents.length;
   const agentSlotCount = Math.max(dashboard.concurrencyCap, runningCount, 0);
+  const liveIndicatorsEnabled = freshnessCue?.liveIndicatorsEnabled ?? dashboard.source?.status === "fresh";
+  const agentUsageLabel = freshnessCue?.agentUsageLabel ?? dashboard.agentUsageLabel;
+  const occupiedAgentSlotColor = liveIndicatorsEnabled ? "var(--accent)" : "var(--text-4)";
   const cycleMetrics = dashboard.metrics?.cycle;
   const velocityMetrics = dashboard.metrics?.velocity;
   const velocityValue = textOrNull(velocityMetrics?.valueLabel);
@@ -59,7 +63,7 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
         <div className={completenessDelta ? "stat__delta stat__delta--up" : "stat__delta"}>{completenessDelta ?? "derived from stored issue/run state"}</div>
       </div>
       <div className="stat">
-        <div className="stat__label">Running agents</div>
+        <div className="stat__label">{liveIndicatorsEnabled ? "Running agents" : "Projected agents"}</div>
         <div className="stat__value">
           {runningCount}<span className="suffix">/ {dashboard.concurrencyCap}</span>
         </div>
@@ -71,12 +75,12 @@ export function StatsRow({ dashboard }: { dashboard: DashboardModel }) {
                 flex: 1,
                 height: 4,
                 borderRadius: 2,
-                background: index < runningCount ? "var(--accent)" : "var(--elevated)",
+                background: index < runningCount ? occupiedAgentSlotColor : "var(--elevated)",
               }}
             />
           ))}
         </div>
-        <div className="stat__delta">{dashboard.agentUsageLabel}</div>
+        <div className="stat__delta">{agentUsageLabel}</div>
       </div>
       <div className="stat">
         <div className="stat__label">Open issues</div>
@@ -185,7 +189,7 @@ export function BurndownPanel({
   );
 }
 
-export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel }) {
+export function BurndownCommandCenter({ dashboard, freshnessCue }: { dashboard: DashboardModel; freshnessCue?: DashboardFreshnessCue }) {
   const totals = dashboard.totals;
   const cycle = dashboard.metrics?.cycle;
   const velocity = dashboard.metrics?.velocity;
@@ -199,6 +203,13 @@ export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel
   const reviewQueue = textOr(health?.reviewQueueLabel, `${totals.review} issues in review · queue age unavailable`);
   const healthState = textOr(health?.stateLabel, "status unavailable");
   const errorSummary = textOr(health?.errorSummaryLabel, "errors unavailable");
+  const liveIndicatorsEnabled = freshnessCue?.liveIndicatorsEnabled ?? dashboard.source?.status === "fresh";
+  const agentUsageLabel = freshnessCue?.agentUsageLabel ?? dashboard.agentUsageLabel;
+  const agentUsageColor = liveIndicatorsEnabled ? "var(--accent)" : "var(--text-3)";
+  const agentCountLabel = liveIndicatorsEnabled
+    ? `${dashboard.runningAgents.length} running / ${dashboard.concurrencyCap} cap`
+    : `${dashboard.runningAgents.length} projected / ${dashboard.concurrencyCap} cap`;
+  const scopeLabel = liveIndicatorsEnabled ? "current fresh dashboard projection" : "non-live dashboard projection";
 
   return (
     <div className="panel" style={{ borderRadius: 6, background: "#0a0a0c" }}>
@@ -210,7 +221,7 @@ export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel
       </div>
       <div style={{ padding: "12px 16px 14px", fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--text-2)", lineHeight: 1.65 }}>
         <div>
-          <span style={{ color: "var(--text-3)" }}>scope      </span> current durable dashboard projection
+          <span style={{ color: "var(--text-3)" }}>scope      </span> {scopeLabel}
         </div>
         <div>
           <span style={{ color: "var(--text-3)" }}>cycle      </span> {cycleLabel} · {dateRange} · <span style={{ color: "var(--text)" }}>{remainingLabel}</span>
@@ -225,7 +236,7 @@ export function BurndownCommandCenter({ dashboard }: { dashboard: DashboardModel
           <span style={{ color: "var(--text-3)" }}>velocity   </span> <span style={{ color: velocity?.valueLabel ? "var(--accent)" : "var(--text-3)" }}>{velocityLabel}</span> · {velocityTrend}
         </div>
         <div>
-          <span style={{ color: "var(--text-3)" }}>agents     </span> <span style={{ color: "var(--accent)" }}>{dashboard.agentUsageLabel}</span> · {dashboard.runningAgents.length} running / {dashboard.concurrencyCap} cap
+          <span style={{ color: "var(--text-3)" }}>agents     </span> <span style={{ color: agentUsageColor }}>{agentUsageLabel}</span> · {agentCountLabel}
         </div>
         <div>
           <span style={{ color: "var(--text-3)" }}>review     </span> {reviewQueue}

@@ -6,6 +6,7 @@ import { AgentStateCard } from "./components/sidebar/AgentStateCard";
 import { SidebarViews } from "./components/sidebar/SidebarViews";
 import { ChatHistoryView } from "./components/history/ChatHistoryView";
 import { DashboardView } from "./components/dashboard/DashboardView";
+import { resolveDashboardFreshnessCue } from "./components/dashboard/freshness";
 import { IssuesView } from "./components/issues/IssuesView";
 import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
 import { fallbackReferenceData, ReferenceDataProvider } from "./data/referenceDataContext";
@@ -25,10 +26,12 @@ import type {
   HistoryVariant,
   IssueBoardModel,
   IssuesVariant,
+  Loadable,
   ReferenceData,
   RunningAgentModel,
   RunState,
   SessionModel,
+  SidebarModel,
   SidebarVariant,
 } from "./types/symphony";
 
@@ -81,6 +84,20 @@ function resourceOptions(enabled: boolean, refreshToken: number) {
   return refreshToken > 0 ? { enabled, refreshToken } : { enabled };
 }
 
+function resolveSidebarAgentUsageLabel(sidebar: Loadable<SidebarModel>): string {
+  if (!sidebar.data) {
+    if (sidebar.loading) return "agent usage loading";
+    return "agent usage unavailable";
+  }
+
+  const count = sidebar.data.runningAgents.length;
+  const agentNoun = count === 1 ? "agent" : "agents";
+  const runningLabel = `${count} running ${agentNoun}`;
+  if (sidebar.error) return `previous sidebar projection · ${runningLabel}`;
+  if (sidebar.loading) return `refreshing sidebar projection · ${runningLabel}`;
+  return `sidebar projection · ${runningLabel}`;
+}
+
 function AppShell({
   initialReferenceData,
   lazyReferenceData = false,
@@ -116,7 +133,9 @@ function AppShell({
   const sidebar = useSidebar(resourceOptions(sidebarEnabled, sidebarRefreshToken));
   const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, orchestratorChatRefreshToken));
   const dashboardChrome = dashboard.data;
-  const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
+  const dashboardFreshnessCue = dashboard.data ? resolveDashboardFreshnessCue(dashboard.data, dashboard) : null;
+  const statusbarRunningCount = dashboardFreshnessCue?.runningCount ?? 0;
+  const agentUsageLabel = dashboardFreshnessCue?.agentUsageLabel ?? resolveSidebarAgentUsageLabel(sidebar);
   const tabBadges = resolveTabBadges(issueBoard.data, history.data);
 
   return (
@@ -126,11 +145,11 @@ function AppShell({
           activeTab={activeTab}
           onTabChange={setActiveTab}
           tabBadges={tabBadges}
-          runningCount={runningCount}
+          runningCount={statusbarRunningCount}
           repoLabel={dashboardChrome?.repoLabel ?? "repository unavailable"}
           branch={dashboardChrome?.branch ?? ""}
           pollLabel={dashboardChrome?.pollLabel ?? "poll unavailable"}
-          agentUsageLabel={dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`}
+          agentUsageLabel={agentUsageLabel}
           connectionStatusLabel={apiMode ? liveState.realtimeStatus.label : (dashboardChrome?.metrics?.health?.connectionLabel ?? undefined)}
           errorStatusLabel={dashboardChrome?.metrics?.health?.errorSummaryLabel ?? undefined}
           dataSourceLabel={[
@@ -154,9 +173,10 @@ function AppShell({
           }
         >
           {activeTab === "dashboard"
-            ? renderLoadable(dashboard, "dashboard", (data) => (
+            ? renderLoadable(dashboard, "dashboard", (data, state) => (
                 <DashboardView
                   dashboard={data}
+                  freshnessCue={resolveDashboardFreshnessCue(data, state)}
                   variant={dashboardVariant}
                   useModelBurnupTotals={apiMode}
                   orchestratorChat={orchestratorChat.data ?? []}
@@ -172,9 +192,11 @@ function AppShell({
             ? renderLoadable(history, "history", (data) => <ChatHistoryView history={data} variant={historyVariant} refreshToken={transcriptRefreshToken} />)
             : null}
           {activeTab === "sidebar"
-            ? renderLoadable(sidebar, "sidebar", (data) => (
+            ? renderLoadable(sidebar, "sidebar", (data, state) => (
                 <SidebarViews
                   sidebar={data}
+                  sidebarError={state.error}
+                  sidebarLoading={state.loading}
                   variant={sidebarVariant}
                   orchestratorChat={orchestratorChat.data ?? []}
                   orchestratorChatError={orchestratorChat.error}
@@ -197,12 +219,12 @@ function AppShell({
 }
 
 function renderLoadable<T>(
-  resource: { data: T | null; loading: boolean; error: string | null },
+  resource: Loadable<T>,
   name: string,
-  render: (data: T) => JSX.Element,
+  render: (data: T, resource: Loadable<T>) => JSX.Element,
 ) {
   if (resource.data !== null) {
-    const content = render(resource.data);
+    const content = render(resource.data, resource);
     if (resource.error) {
       return (
         <>
@@ -315,10 +337,10 @@ function ViewControls({
 }
 
 function resolveTabBadges(issueBoard: IssueBoardModel | null, history: HistoryModel | null): Partial<Record<AppTab, string>> {
-  const liveSessions = history?.sessions.filter((session) => session.state === "running").length ?? null;
+  const runningSessions = history?.sessions.filter((session) => session.state === "running").length ?? null;
   return {
     issues: issueBoard ? String(issueBoard.issues.length) : undefined,
-    history: history ? (liveSessions ? `${liveSessions} live` : String(history.sessions.length)) : undefined,
+    history: history ? (runningSessions ? `${runningSessions} running` : String(history.sessions.length)) : undefined,
   };
 }
 
