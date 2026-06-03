@@ -1257,6 +1257,225 @@ describe("StatusServer realtime SSE API", () => {
       await server.stop();
     }
   });
+
+  it.each(["pending", "dispatching"] as const)(
+    "does not publish orchestrator.message for idempotent %s web chat POST replays",
+    async (commandStatus) => {
+      const orchestratorConversationStore = new FileOrchestratorConversationStore(
+        path.join(root, `chat-state-replay-${commandStatus}`),
+      );
+      const messageId = `operator-replay-${commandStatus}`;
+      await orchestratorConversationStore.appendMessage({
+        conversationId: "operator-room",
+        id: messageId,
+        role: "user",
+        body: "please retry safely",
+        status: "pending",
+        at: "2026-01-01T00:00:00.000Z",
+        metadata: {
+          source: "web_orchestrator_chat",
+          action: "orchestrator.chat.post",
+          actionDispatched: commandStatus === "dispatching",
+          commandStatus,
+        },
+      });
+
+      let dispatchCalls = 0;
+      const orchestrator = fakeOrchestrator();
+      orchestrator.dispatchOrchestratorChatCommand = async () => {
+        dispatchCalls += 1;
+        return { status: "accepted", reason: "accepted", acceptedAt: "2026-01-01T00:00:00.000Z" };
+      };
+      const server = createRealtimeServer({ orchestratorConversationStore, orchestrator });
+      const address = await server.start();
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+      try {
+        await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+        const replayResponse = await fetch(`${baseUrl}/api/v1/web/orchestrator-chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            conversationId: "operator-room",
+            messageId,
+            input: "please retry safely",
+          }),
+        });
+        expect(replayResponse.status).toBe(202);
+        await expect(replayResponse.json()).resolves.toMatchObject([
+          {
+            id: messageId,
+            conversationId: "operator-room",
+            role: "user",
+            text: "please retry safely",
+            status: "pending",
+          },
+        ]);
+        expect(dispatchCalls).toBe(0);
+        await expect(client.nextEventOfType("orchestrator.message", 200)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
+      } finally {
+        await client.close();
+        await server.stop();
+      }
+    },
+  );
+
+  it("replays orchestrator chat events after Last-Event-ID without duplicating the cursor event", async () => {
+    const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state-replay-cursor"));
+    const server = createRealtimeServer({ orchestratorConversationStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      await orchestratorConversationStore.appendMessage({
+        conversationId: "operator-room",
+        role: "assistant",
+        body: "First chat event",
+        status: "streaming",
+        at: "2026-01-01T00:00:00.000Z",
+      });
+      const first = await client.nextEventOfType("orchestrator.message");
+      await orchestratorConversationStore.appendMessage({
+        conversationId: "operator-room",
+        role: "assistant",
+        body: "Second chat event",
+        status: "completed",
+        at: "2026-01-01T00:00:01.000Z",
+      });
+      const second = await client.nextEventOfType("orchestrator.message");
+
+      const replayClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": first.id });
+      try {
+        const replayed = await replayClient.nextEventOfType("orchestrator.message");
+        expect(replayed.id).toBe(second.id);
+        expect(replayed.data).toMatchObject({
+          type: "orchestrator.message",
+          source: { source: "orchestrator_conversations" },
+          payload: {
+            conversationId: "operator-room",
+            messageCount: 2,
+            chat: [
+              expect.objectContaining({ text: "First chat event" }),
+              expect.objectContaining({ text: "Second chat event", status: "completed" }),
+            ],
+          },
+        });
+        await expect(replayClient.nextEventOfType("orchestrator.message", 200)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
+      } finally {
+        await replayClient.close();
+      }
+
+      const cursorClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": second.id });
+      try {
+        await expect(cursorClient.nextEventOfType("orchestrator.message", 200)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
+      } finally {
+        await cursorClient.close();
+      }
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it.each([
+    { resultStatus: "failed" as const, httpStatus: 500 },
+    { resultStatus: "unavailable" as const, httpStatus: 503 },
+  ])(
+    "publishes $resultStatus orchestrator chat POST results as orchestrator.message SSE status events",
+    async ({ resultStatus, httpStatus }) => {
+      const orchestratorConversationStore = new FileOrchestratorConversationStore(
+        path.join(root, `chat-state-${resultStatus}`),
+      );
+      const orchestrator = fakeOrchestrator();
+      orchestrator.dispatchOrchestratorChatCommand = async () => ({
+        status: resultStatus,
+        reason: `test_${resultStatus}`,
+      });
+      const server = createRealtimeServer({ orchestratorConversationStore, orchestrator });
+      const address = await server.start();
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+      try {
+        await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+        const response = await fetch(`${baseUrl}/api/v1/web/orchestrator-chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ input: `trigger ${resultStatus}` }),
+        });
+        expect(response.status).toBe(httpStatus);
+        await expect(response.json()).resolves.toMatchObject({
+          error: {
+            code: resultStatus === "failed" ? "orchestrator_chat_dispatch_failed" : "orchestrator_chat_unavailable",
+          },
+          chat: [
+            expect.objectContaining({
+              conversationId: "orchestrator-default",
+              role: "user",
+              text: `trigger ${resultStatus}`,
+              status: resultStatus,
+            }),
+          ],
+        });
+
+        const chat = await nextEventOfTypeFromSource(client, "orchestrator.message", "orchestrator-chat");
+        expect(chat.data).toMatchObject({
+          type: "orchestrator.message",
+          scope: "orchestrator",
+          key: "orchestrator-default",
+          source: { source: "orchestrator-chat" },
+          detail: {
+            inputLength: `trigger ${resultStatus}`.length,
+            messageCount: 1,
+            conversationId: "orchestrator-default",
+            status: httpStatus,
+            state: resultStatus,
+            conversationStatus: resultStatus,
+            active: false,
+            terminal: true,
+            lastMessageStatus: resultStatus,
+          },
+          payload: {
+            source: "orchestrator-chat",
+            conversationId: "orchestrator-default",
+            inputLength: `trigger ${resultStatus}`.length,
+            messageCount: 1,
+            status: httpStatus,
+            state: resultStatus,
+            conversationStatus: resultStatus,
+            active: false,
+            terminal: true,
+            lastMessageStatus: resultStatus,
+            chat: [
+              expect.objectContaining({
+                conversationId: "orchestrator-default",
+                role: "user",
+                text: `trigger ${resultStatus}`,
+                status: resultStatus,
+              }),
+            ],
+          },
+          recovery: { strategy: "refetch", reason: "event" },
+        });
+        expect((chat.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/orchestrator-chat");
+      } finally {
+        await client.close();
+        await server.stop();
+      }
+    },
+  );
 });
 
 interface ParsedSseEvent {

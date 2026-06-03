@@ -244,6 +244,12 @@ interface WebProjectionJsonResponse<TBody> {
   headers?: Record<string, string>;
 }
 
+type WebOrchestratorChatPostResult = {
+  status: number;
+  body: unknown;
+  stateChanged: boolean;
+};
+
 type DurableProjectionReadResult<TPayload> = WebProjectionReadResult<TPayload>;
 
 export interface StatusServerRealtimeOptions {
@@ -822,7 +828,7 @@ export class StatusServer {
               await this.persistWebOrchestratorChatProjection(durableChatProjection);
               currentChatProjection = durableChatProjection;
             }
-            if (currentChatProjection.chat.length > 0 && result.status !== 200) {
+            if (result.stateChanged && currentChatProjection.chat.length > 0 && result.status !== 200) {
               this.realtimeEvents.publishOrchestratorMessage(
                 orchestratorChatRealtimeDetailFromProjection(currentChatProjection, {
                   inputLength: input.input.length,
@@ -1944,15 +1950,18 @@ export class StatusServer {
     conversationId?: string | null;
     messageId?: string;
     input: string;
-  }): Promise<{ status: number; body: unknown }> {
+  }): Promise<WebOrchestratorChatPostResult> {
     const store = this.options.orchestratorConversationStore;
     if (!store) {
-      return webOrchestratorChatErrorResponse(
-        503,
-        "orchestrator_chat_unavailable",
-        "Web orchestrator chat is unavailable because durable conversation storage is not configured",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          503,
+          "orchestrator_chat_unavailable",
+          "Web orchestrator chat is unavailable because durable conversation storage is not configured",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
 
     if (input.messageId !== undefined) {
@@ -1985,17 +1994,20 @@ export class StatusServer {
   private async acceptWebOrchestratorChatPostWithStore(
     store: OrchestratorConversationStore,
     input: { conversationId?: string | null; messageId?: string; input: string },
-  ): Promise<{ status: number; body: unknown }> {
+  ): Promise<WebOrchestratorChatPostResult> {
     let existingMessages: OrchestratorConversationMessage[] = [];
     try {
       existingMessages = input.messageId === undefined ? [] : await store.listMessages(input.conversationId);
     } catch {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not inspect existing messages",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not inspect existing messages",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
     const existingMessage =
       input.messageId === undefined ? undefined : existingMessages.find((message) => message.id === input.messageId);
@@ -2024,12 +2036,15 @@ export class StatusServer {
         },
       });
     } catch {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the user message",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the user message",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
 
     if (!webOrchestratorChatMessageMatchesClaim(message, commandClaimId)) {
@@ -2061,12 +2076,15 @@ export class StatusServer {
         metadata: webOrchestratorChatCommandDispatchingMetadata(commandClaimId, new Date().toISOString()),
       });
     } catch {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the command dispatch claim",
-        projectWebOrchestratorChatPost(input.input, [message]),
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the command dispatch claim",
+          projectWebOrchestratorChatPost(input.input, [message]),
+        ),
+        stateChanged: true,
+      };
     }
 
     let result: OrchestratorChatCommandResult;
@@ -2099,15 +2117,18 @@ export class StatusServer {
     input: { conversationId?: string | null; input: string };
     actionDispatched: boolean;
     result: OrchestratorChatCommandResult;
-  }): Promise<{ status: number; body: unknown }> {
+  }): Promise<WebOrchestratorChatPostResult> {
     const message = input.message;
     if (!message) {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the user message",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the user message",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
     let messages: OrchestratorConversationMessage[];
     try {
@@ -2142,23 +2163,29 @@ export class StatusServer {
       } catch {
         messages = [recoveryMessage];
       }
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the command state update",
-        projectWebOrchestratorChatPost(input.input.input, messages),
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the command state update",
+          projectWebOrchestratorChatPost(input.input.input, messages),
+        ),
+        stateChanged: true,
+      };
     }
 
     if (input.result.status === "accepted") {
-      return { status: 202, body: projectWebOrchestratorChatPost(input.input.input, messages) };
+      return { status: 202, body: projectWebOrchestratorChatPost(input.input.input, messages), stateChanged: true };
     }
-    return webOrchestratorChatErrorResponse(
-      webOrchestratorChatHttpStatusFromCommandResult(input.result.status),
-      webOrchestratorChatErrorCodeFromCommandResult(input.result.status),
-      webOrchestratorChatErrorMessageFromCommandResult(input.result.status),
-      projectWebOrchestratorChatPost(input.input.input, messages),
-    );
+    return {
+      ...webOrchestratorChatErrorResponse(
+        webOrchestratorChatHttpStatusFromCommandResult(input.result.status),
+        webOrchestratorChatErrorCodeFromCommandResult(input.result.status),
+        webOrchestratorChatErrorMessageFromCommandResult(input.result.status),
+        projectWebOrchestratorChatPost(input.input.input, messages),
+      ),
+      stateChanged: true,
+    };
   }
 
   private async fetchWebSidebar(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebSidebar>>> {
@@ -4143,10 +4170,11 @@ function webOrchestratorChatReplayResponse(
   input: string,
   message: OrchestratorConversationMessage,
   messages: readonly OrchestratorConversationMessage[],
-): { status: number; body: unknown } {
+): WebOrchestratorChatPostResult {
   return {
     status: webOrchestratorChatReplayStatus(message),
     body: projectWebOrchestratorChatPost(input, messages),
+    stateChanged: false,
   };
 }
 
