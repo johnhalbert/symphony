@@ -86,13 +86,27 @@ export async function discoverHostHermes(options: HostHermesDiscoveryOptions = {
   const env = hostHermesCommandEnvironment(options.env ?? process.env);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const runner = options.runner ?? defaultHostHermesCommandRunner;
+  const accessFile = options.accessFile ?? defaultFileAccess;
   const diagnostics: HostHermesDiagnostic[] = [];
+
+  const configuredBinaryPath = configuredPathLikeHostHermesBinary(options.binaryPath, cwd);
+  if (configuredBinaryPath && !(await accessFile(configuredBinaryPath))) {
+    diagnostics.push({
+      code: "host_hermes_binary_missing",
+      severity: "error",
+      message:
+        `Configured host Hermes ACP binary ${configuredBinaryPath} does not exist or is not executable. ` +
+        "Install host Hermes, update `hermes_acp.binary_path`, or leave it unset to resolve `hermes` from PATH; do not point this at Symphony's vendored `hermes/upstream-src` checkout.",
+      details: { binaryPath: configuredBinaryPath },
+    });
+    return { ok: false, binary: null, sourceProfile: configuredSourceProfile(options.sourceProfile), diagnostics };
+  }
 
   const binaryChoice = await resolveHostHermesBinary({
     configuredBinary: options.binaryPath,
     cwd,
     env,
-    accessFile: options.accessFile ?? defaultFileAccess,
+    accessFile,
     platform: options.platform ?? process.platform,
   });
 
@@ -101,7 +115,7 @@ export async function discoverHostHermes(options: HostHermesDiscoveryOptions = {
       code: "host_hermes_binary_missing",
       severity: "error",
       message:
-        "Host Hermes executable was not found. Configure a Hermes ACP binary path or add `hermes` to PATH before enabling the Hermes ACP harness.",
+        "Host Hermes executable was not found on PATH. Configure `hermes_acp.binary_path` with the host Hermes binary path or add `hermes` to PATH before enabling the Hermes ACP harness; do not point this at Symphony's vendored `hermes/upstream-src` checkout.",
       details: { path: pathEnvironmentValue(env) ?? "" },
     });
     return { ok: false, binary: null, sourceProfile: configuredSourceProfile(options.sourceProfile), diagnostics };
@@ -113,7 +127,9 @@ export async function discoverHostHermes(options: HostHermesDiscoveryOptions = {
     diagnostics.push({
       code: "host_hermes_version_probe_failed",
       severity: "error",
-      message: `Host Hermes executable was found at ${binaryChoice.path}, but \`${DEFAULT_HOST_HERMES_COMMAND} --version\` failed: ${versionProbe.message}`,
+      message:
+        `Host Hermes executable was found at ${binaryChoice.path}, but \`${binaryChoice.path} --version\` failed: ${versionProbe.message}. ` +
+        "Install or upgrade the host Hermes binary, or update `hermes_acp.binary_path` to a working host Hermes executable.",
       details: compactDetails({ binaryPath: binaryChoice.path, output: versionText, exitCode: versionProbe.exitCode }),
     });
   }
@@ -207,7 +223,9 @@ async function discoverActiveSourceProfile(input: {
     input.diagnostics.push({
       code: "host_hermes_active_profile_probe_failed",
       severity: "error",
-      message: `Host Hermes active profile probe failed: ${profileProbe.message}`,
+      message:
+        `Host Hermes active profile probe failed for ${input.binaryPath} profile: ${profileProbe.message}. ` +
+        "Configure `hermes_acp.source_profile` explicitly or fix the host Hermes profile store so `hermes profile` reports an active profile.",
       details: compactDetails({ binaryPath: input.binaryPath, output, exitCode: profileProbe.exitCode }),
     });
     return null;
@@ -218,7 +236,9 @@ async function discoverActiveSourceProfile(input: {
     input.diagnostics.push({
       code: "host_hermes_active_profile_unparseable",
       severity: "error",
-      message: "Host Hermes active profile probe did not include a `Profile:` or `Active profile:` line.",
+      message:
+        `Host Hermes active profile probe for ${input.binaryPath} did not include a \`Profile:\` or \`Active profile:\` line. ` +
+        "Configure `hermes_acp.source_profile` explicitly or update host Hermes so `hermes profile` reports the active source profile.",
       details: compactDetails({ binaryPath: input.binaryPath, output }),
     });
     return null;
@@ -230,6 +250,12 @@ async function discoverActiveSourceProfile(input: {
 function configuredSourceProfile(sourceProfile: string | null | undefined): HostHermesSourceProfileDiscovery | null {
   const normalized = normalizeOptionalString(sourceProfile);
   return normalized ? { name: normalized, source: "config" } : null;
+}
+
+function configuredPathLikeHostHermesBinary(binaryPath: string | null | undefined, cwd: string): string | null {
+  const normalized = normalizeOptionalString(binaryPath);
+  if (!normalized || !isPathLike(normalized)) return null;
+  return normalizeConfiguredBinaryPath(normalized, cwd);
 }
 
 async function runHostHermesCommand(

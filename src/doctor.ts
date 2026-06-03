@@ -404,7 +404,9 @@ export async function hostHermesAcpDoctorChecks(
   checks.push(
     await hostHermesAcpCommandDoctorCheck({
       id: "hermes_acp.acp_check",
-      successMessage: "Host Hermes `hermes acp --check` completed successfully",
+      successMessage: `Host Hermes ACP check passed: ${discovery.binary.path} acp --check`,
+      failureRemediation:
+        "Install or upgrade host Hermes until the host command `hermes acp --check` passes without interactive setup; this check uses the host Hermes profile store and strips Symphony-managed HERMES_HOME/HERMES_AUTH_HOME overrides.",
       file: discovery.binary.path,
       args: ["acp", "--check"],
       cwd,
@@ -431,7 +433,10 @@ export async function hostHermesAcpDoctorChecks(
   checks.push(
     await hostHermesAcpCommandDoctorCheck({
       id: "hermes_acp.source_profile_check",
-      successMessage: `Host Hermes ACP source profile ${discovery.sourceProfile.name} passed \`hermes -p ${discovery.sourceProfile.name} acp --check\``,
+      successMessage: `Host Hermes ACP source profile ${discovery.sourceProfile.name} passed: ${discovery.binary.path} -p ${discovery.sourceProfile.name} acp --check`,
+      failureRemediation:
+        `Authenticate or repair host Hermes source profile ${discovery.sourceProfile.name}, then rerun ` +
+        `\`${discovery.binary.path} -p ${discovery.sourceProfile.name} acp --check\`; Symphony-managed HERMES_HOME/HERMES_AUTH_HOME are not used for host ACP profile credentials.`,
       file: discovery.binary.path,
       args: ["-p", discovery.sourceProfile.name, "acp", "--check"],
       cwd,
@@ -446,6 +451,7 @@ export async function hostHermesAcpDoctorChecks(
 async function hostHermesAcpCommandDoctorCheck(input: {
   id: string;
   successMessage: string;
+  failureRemediation?: string | undefined;
   file: string;
   args: readonly string[];
   cwd: string;
@@ -467,21 +473,57 @@ async function hostHermesAcpCommandDoctorCheck(input: {
       id: input.id,
       status: "error",
       message: redactDoctorDiagnosticMessage(
-        `Host Hermes ACP command failed with exit code ${exitCode}: ${input.file} ${input.args.join(" ")}${hostHermesCommandOutputSummary(result.stdout, result.stderr)}`,
+        `Host Hermes ACP command failed with exit code ${exitCode}: ${input.file} ${input.args.join(" ")}${hostHermesCommandOutputSummary(
+          result.stdout,
+          result.stderr,
+        )}${hostHermesAcpCommandFailureRemediation(input, result.stdout, result.stderr)}`,
       ),
     };
   } catch (error) {
+    const errorText = errorMessage(error);
     return {
       id: input.id,
       status: "error",
       message: redactDoctorDiagnosticMessage(
-        `Host Hermes ACP command failed: ${input.file} ${input.args.join(" ")}: ${errorMessage(error)}${hostHermesCommandOutputSummary(
+        `Host Hermes ACP command failed: ${input.file} ${input.args.join(" ")}: ${errorText}${hostHermesCommandOutputSummary(
           commandErrorOutput(error, "stdout"),
           commandErrorOutput(error, "stderr"),
+        )}${hostHermesAcpCommandFailureRemediation(
+          input,
+          commandErrorOutput(error, "stdout"),
+          commandErrorOutput(error, "stderr"),
+          errorText,
         )}`,
       ),
     };
   }
+}
+
+function hostHermesAcpCommandFailureRemediation(
+  input: { args: readonly string[]; failureRemediation?: string | undefined },
+  stdout: string,
+  stderr: string,
+  errorText = "",
+): string {
+  const command = `hermes ${input.args.join(" ")}`;
+  const remediation = hostHermesAcpUnsupportedCheckCommand(stdout, stderr, errorText)
+    ? `Host Hermes does not appear to support \`${command}\`; upgrade the host Hermes installation to an ACP-capable version that supports \`acp --check\`, or disable the \`hermes_acp\` harness until that preflight passes.`
+    : input.failureRemediation;
+  return remediation ? `\nRemediation: ${remediation}` : "";
+}
+
+function hostHermesAcpUnsupportedCheckCommand(stdout: string, stderr: string, errorText: string): boolean {
+  const text = `${stdout}\n${stderr}\n${errorText}`.toLowerCase();
+  return (
+    text.includes("unknown command") ||
+    text.includes("unknown option") ||
+    text.includes("unrecognized option") ||
+    text.includes("unrecognized arguments") ||
+    text.includes("no such option") ||
+    text.includes("invalid choice") ||
+    text.includes("does not support") ||
+    ((text.includes("acp") || text.includes("--check")) && text.includes("unsupported"))
+  );
 }
 
 async function defaultHostHermesDoctorCommandRunner(
