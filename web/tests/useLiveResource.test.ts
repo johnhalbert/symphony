@@ -11,6 +11,7 @@ import type {
   SymphonyDataSource,
 } from "../src/data/dataSource";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
+import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
 import {
   LIVE_RESOURCE_KEYS,
   combineLiveResourceTokens,
@@ -26,12 +27,18 @@ import {
 const mountedRoots: Root[] = [];
 
 function eventFor(resources: readonly RealtimeProjectionResource[], overrides: Partial<RealtimeProjectionEvent> = {}): RealtimeProjectionEvent {
+  const source = overrides.source ?? { source: "runs", revision: 1, observedAt: "2026-06-02T00:00:00.000Z" };
+  const detail = overrides.detail ?? null;
   return {
+    schema: REALTIME_EVENT_SCHEMA,
+    schemaVersion: REALTIME_EVENT_SCHEMA_VERSION,
     id: "1",
     type: "projection.updated",
     revision: 1,
     createdAt: "2026-06-02T00:00:00.000Z",
-    source: { source: "runs", revision: 1, observedAt: "2026-06-02T00:00:00.000Z" },
+    scope: "global",
+    key: null,
+    source,
     resources,
     recovery: {
       strategy: "refetch",
@@ -40,7 +47,14 @@ function eventFor(resources: readonly RealtimeProjectionResource[], overrides: P
       endpoints: resources.map((resource) => resource.href),
     },
     missedEvents: false,
-    detail: null,
+    payload: {
+      source: source.source,
+      sourceRevision: source.revision,
+      detail,
+      resourceKinds: resources.map((resource) => resource.kind),
+      resourcesChanged: resources.map((resource) => resource.kind),
+    },
+    detail,
     ...overrides,
   };
 }

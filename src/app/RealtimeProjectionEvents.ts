@@ -1,23 +1,40 @@
 import type { ServerResponse } from "node:http";
 import type { WebProjectionSourceRevision } from "./WebProjectionContext.js";
 
-export type RealtimeProjectionEventType =
-  | "projection.updated"
-  | "run.updated"
-  | "transcript.delta"
-  | "orchestrator.message"
-  | "source.status";
+export const REALTIME_EVENT_SCHEMA = "symphony.realtime.v1" as const;
+export const REALTIME_EVENT_SCHEMA_VERSION = 1 as const;
+
+export const REALTIME_PROJECTION_EVENT_TYPES = [
+  "projection.updated",
+  "run.updated",
+  "transcript.delta",
+  "orchestrator.message",
+  "source.status",
+] as const;
+
+export type RealtimeProjectionEventType = (typeof REALTIME_PROJECTION_EVENT_TYPES)[number];
+
+export const REALTIME_RESOURCE_KINDS = [
+  "dashboard",
+  "issue-board",
+  "issue-detail",
+  "history",
+  "sidebar",
+  "session-transcript",
+  "orchestrator-chat",
+  "source",
+] as const;
+
+export type RealtimeResourceKind = (typeof REALTIME_RESOURCE_KINDS)[number];
+
+export const REALTIME_EVENT_SCOPES = ["global", "source", "run", "session", "orchestrator"] as const;
+
+export type RealtimeProjectionEventScope = (typeof REALTIME_EVENT_SCOPES)[number];
+
+export type RealtimeProjectionEventDetail = Record<string, unknown>;
 
 export interface RealtimeProjectionResource {
-  kind:
-    | "dashboard"
-    | "issue-board"
-    | "issue-detail"
-    | "history"
-    | "sidebar"
-    | "session-transcript"
-    | "orchestrator-chat"
-    | "source";
+  kind: RealtimeResourceKind;
   href: string;
   relation: "refetch" | "template";
 }
@@ -29,26 +46,83 @@ export interface RealtimeProjectionRecoveryHint {
   endpoints: readonly string[];
 }
 
-export interface RealtimeProjectionEvent {
+interface RealtimePayloadBase {
+  source: string;
+  sourceRevision: string | number;
+  detail: RealtimeProjectionEventDetail | null;
+}
+
+export interface RealtimeProjectionUpdatedPayload extends RealtimePayloadBase {
+  resourceKinds: readonly RealtimeResourceKind[];
+  resourcesChanged: readonly RealtimeResourceKind[];
+}
+
+export interface RealtimeRunUpdatedPayload extends RealtimePayloadBase {
+  runId: string | null;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  status: string | null;
+}
+
+export interface RealtimeTranscriptDeltaPayload extends RealtimePayloadBase {
+  runId: string | null;
+  sessionId: string | null;
+  afterSequence: number | null;
+  eventCount: number | null;
+}
+
+export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase {
+  conversationId: string | null;
+  messageCount: number | null;
+  inputLength: number | null;
+  status: number | null;
+}
+
+export interface RealtimeSourceStatusPayload extends RealtimePayloadBase {
+  status: string | null;
+  fetchedStates: readonly string[];
+  fetchedAt: string | null;
+  cached: boolean | null;
+  error: { code: string; message: string } | null;
+  issueCount: number | null;
+}
+
+export interface RealtimeProjectionEventPayloadByType {
+  "projection.updated": RealtimeProjectionUpdatedPayload;
+  "run.updated": RealtimeRunUpdatedPayload;
+  "transcript.delta": RealtimeTranscriptDeltaPayload;
+  "orchestrator.message": RealtimeOrchestratorMessagePayload;
+  "source.status": RealtimeSourceStatusPayload;
+}
+
+export type RealtimeProjectionEventPayload = RealtimeProjectionEventPayloadByType[RealtimeProjectionEventType];
+
+export interface RealtimeProjectionEvent<TType extends RealtimeProjectionEventType = RealtimeProjectionEventType> {
+  schema: typeof REALTIME_EVENT_SCHEMA;
+  schemaVersion: typeof REALTIME_EVENT_SCHEMA_VERSION;
   id: string;
-  type: RealtimeProjectionEventType;
+  type: TType;
   revision: number;
   createdAt: string;
+  scope: RealtimeProjectionEventScope;
+  key: string | null;
   source: WebProjectionSourceRevision;
   resources: readonly RealtimeProjectionResource[];
   recovery: RealtimeProjectionRecoveryHint;
   missedEvents: boolean;
-  detail: Record<string, unknown> | null;
+  payload: RealtimeProjectionEventPayloadByType[TType];
+  /** @deprecated Use the typed payload field. Kept for current web invalidation/detail consumers. */
+  detail: RealtimeProjectionEventDetail | null;
 }
 
-export interface RealtimeProjectionEventInput {
-  type: RealtimeProjectionEventType;
+export interface RealtimeProjectionEventInput<TType extends RealtimeProjectionEventType = RealtimeProjectionEventType> {
+  type: TType;
   source: WebProjectionSourceRevision;
   resources?: readonly RealtimeProjectionResource[];
   recoveryReason?: RealtimeProjectionRecoveryHint["reason"];
   lastEventId?: string | null;
   missedEvents?: boolean;
-  detail?: Record<string, unknown> | null;
+  detail?: RealtimeProjectionEventDetail | null;
 }
 
 export interface RealtimeProjectionEventBusOptions {
@@ -96,7 +170,7 @@ export class RealtimeProjectionEventBus {
     for (const close of [...this.streamClosers]) close();
   }
 
-  publish(input: RealtimeProjectionEventInput): RealtimeProjectionEvent {
+  publish<TType extends RealtimeProjectionEventType>(input: RealtimeProjectionEventInput<TType>): RealtimeProjectionEvent<TType> {
     const event = this.createEvent(input);
     this.history.push(event);
     while (this.history.length > this.historyLimit) this.history.shift();
@@ -120,7 +194,7 @@ export class RealtimeProjectionEventBus {
     );
   }
 
-  publishOrchestratorMessage(detail: Record<string, unknown> | null = null): RealtimeProjectionEvent[] {
+  publishOrchestratorMessage(detail: RealtimeProjectionEventDetail | null = null): RealtimeProjectionEvent[] {
     const source = this.realtimeSourceRevision("orchestrator-chat");
     return [
       this.publish({
@@ -218,15 +292,22 @@ export class RealtimeProjectionEventBus {
     };
   }
 
-  private createEvent(input: RealtimeProjectionEventInput): RealtimeProjectionEvent {
+  private createEvent<TType extends RealtimeProjectionEventType>(input: RealtimeProjectionEventInput<TType>): RealtimeProjectionEvent<TType> {
     const revision = ++this.nextRevision;
     const resources = input.resources ?? realtimeResourcesForEventType(input.type);
+    const source = normalizeRealtimeSourceRevision(input.source);
+    const detail = normalizeRealtimeDetail(input.detail ?? null);
+    const scope = realtimeScopeForEvent(input.type, source, detail);
     return {
+      schema: REALTIME_EVENT_SCHEMA,
+      schemaVersion: REALTIME_EVENT_SCHEMA_VERSION,
       id: String(revision),
       type: input.type,
       revision,
       createdAt: this.clock().toISOString(),
-      source: normalizeRealtimeSourceRevision(input.source),
+      scope: scope.scope,
+      key: scope.key,
+      source,
       resources,
       recovery: {
         strategy: "refetch",
@@ -235,15 +316,35 @@ export class RealtimeProjectionEventBus {
         endpoints: resources.map((resource) => resource.href),
       },
       missedEvents: input.missedEvents ?? false,
-      detail: input.detail ?? null,
+      payload: realtimePayloadForEvent(input.type, source, resources, detail),
+      detail,
     };
   }
+}
+
+export function serializeRealtimeEventData(event: RealtimeProjectionEvent): string {
+  return JSON.stringify({
+    schema: event.schema,
+    schemaVersion: event.schemaVersion,
+    id: event.id,
+    type: event.type,
+    revision: event.revision,
+    createdAt: event.createdAt,
+    scope: event.scope,
+    key: event.key,
+    source: event.source,
+    resources: event.resources,
+    recovery: event.recovery,
+    missedEvents: event.missedEvents,
+    payload: event.payload,
+    detail: event.detail,
+  });
 }
 
 export function serializeSseEvent(event: RealtimeProjectionEvent): string {
   const id = sanitizeSseField(event.id);
   const type = sanitizeSseField(event.type);
-  const data = JSON.stringify(event);
+  const data = serializeRealtimeEventData(event);
   return [`id: ${id}`, `event: ${type}`, ...data.split(/\r?\n/).map((line) => `data: ${line}`), "", ""].join("\n");
 }
 
@@ -287,6 +388,129 @@ export function realtimeResourcesForEventType(type: RealtimeProjectionEventType)
   }
 }
 
+function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
+  type: TType,
+  source: WebProjectionSourceRevision,
+  resources: readonly RealtimeProjectionResource[],
+  detail: RealtimeProjectionEventDetail | null,
+): RealtimeProjectionEventPayloadByType[TType] {
+  const base = realtimePayloadBase(source, detail);
+  switch (type) {
+    case "projection.updated": {
+      const resourceKinds = realtimeResourceKinds(resources);
+      return {
+        ...base,
+        resourceKinds,
+        resourcesChanged: readResourceKinds(detail, "resourcesChanged") ?? resourceKinds,
+      } as RealtimeProjectionEventPayloadByType[TType];
+    }
+    case "run.updated":
+      return {
+        ...base,
+        runId: readStringDetail(detail, "runId") ?? readStringDetail(detail, "id"),
+        issueId: readStringDetail(detail, "issueId"),
+        issueIdentifier: readStringDetail(detail, "issueIdentifier"),
+        status: readStringDetail(detail, "status"),
+      } as RealtimeProjectionEventPayloadByType[TType];
+    case "transcript.delta":
+      return {
+        ...base,
+        runId: readStringDetail(detail, "runId"),
+        sessionId: readStringDetail(detail, "sessionId"),
+        afterSequence: readNumberDetail(detail, "afterSequence"),
+        eventCount: readNumberDetail(detail, "eventCount"),
+      } as RealtimeProjectionEventPayloadByType[TType];
+    case "orchestrator.message":
+      return {
+        ...base,
+        conversationId: readStringDetail(detail, "conversationId"),
+        messageCount: readNumberDetail(detail, "messageCount"),
+        inputLength: readNumberDetail(detail, "inputLength"),
+        status: readNumberDetail(detail, "status"),
+      } as RealtimeProjectionEventPayloadByType[TType];
+    case "source.status":
+      return {
+        ...base,
+        status: readStringDetail(detail, "status"),
+        fetchedStates: readStringArrayDetail(detail, "fetchedStates"),
+        fetchedAt: readStringDetail(detail, "fetchedAt"),
+        cached: readBooleanDetail(detail, "cached"),
+        error: readErrorDetail(detail, "error"),
+        issueCount: readNumberDetail(detail, "issueCount"),
+      } as RealtimeProjectionEventPayloadByType[TType];
+  }
+}
+
+function realtimePayloadBase(
+  source: WebProjectionSourceRevision,
+  detail: RealtimeProjectionEventDetail | null,
+): RealtimePayloadBase {
+  return { source: source.source, sourceRevision: source.revision, detail };
+}
+
+function realtimeScopeForEvent(
+  type: RealtimeProjectionEventType,
+  source: WebProjectionSourceRevision,
+  detail: RealtimeProjectionEventDetail | null,
+): { scope: RealtimeProjectionEventScope; key: string | null } {
+  switch (type) {
+    case "run.updated":
+      return { scope: "run", key: readStringDetail(detail, "runId") ?? readStringDetail(detail, "id") };
+    case "transcript.delta":
+      return { scope: "session", key: readStringDetail(detail, "sessionId") ?? readStringDetail(detail, "runId") };
+    case "orchestrator.message":
+      return { scope: "orchestrator", key: readStringDetail(detail, "conversationId") };
+    case "source.status":
+      return { scope: "source", key: readStringDetail(detail, "source") ?? source.source };
+    case "projection.updated":
+    default:
+      return { scope: "global", key: null };
+  }
+}
+
+function realtimeResourceKinds(resources: readonly RealtimeProjectionResource[]): readonly RealtimeResourceKind[] {
+  return [...new Set(resources.map((resource) => resource.kind))];
+}
+
+function readResourceKinds(detail: RealtimeProjectionEventDetail | null, key: string): readonly RealtimeResourceKind[] | null {
+  const value = detail?.[key];
+  if (!Array.isArray(value)) return null;
+  const kinds = value.filter((item): item is RealtimeResourceKind => typeof item === "string" && isRealtimeResourceKind(item));
+  return kinds.length > 0 ? [...new Set(kinds)] : null;
+}
+
+function readStringDetail(detail: RealtimeProjectionEventDetail | null, key: string): string | null {
+  const value = detail?.[key];
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function readStringArrayDetail(detail: RealtimeProjectionEventDetail | null, key: string): readonly string[] {
+  const value = detail?.[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function readNumberDetail(detail: RealtimeProjectionEventDetail | null, key: string): number | null {
+  const value = detail?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readBooleanDetail(detail: RealtimeProjectionEventDetail | null, key: string): boolean | null {
+  const value = detail?.[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+function readErrorDetail(detail: RealtimeProjectionEventDetail | null, key: string): { code: string; message: string } | null {
+  const value = detail?.[key];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as { code?: unknown; message?: unknown };
+  return typeof candidate.code === "string" && typeof candidate.message === "string"
+    ? { code: candidate.code, message: candidate.message }
+    : null;
+}
+
 function realtimeEventTypesForSourceRevision(revision: WebProjectionSourceRevision): readonly RealtimeProjectionEventType[] {
   const source = revision.source.trim().toLowerCase();
   const types: RealtimeProjectionEventType[] = ["projection.updated", "source.status"];
@@ -317,6 +541,10 @@ function normalizeRealtimeSourceRevision(revision: WebProjectionSourceRevision):
   };
 }
 
+function normalizeRealtimeDetail(detail: RealtimeProjectionEventDetail | null): RealtimeProjectionEventDetail | null {
+  return detail && typeof detail === "object" && !Array.isArray(detail) ? detail : null;
+}
+
 function normalizeSseId(value: string | null | undefined): string | null {
   const normalized = value?.trim();
   return normalized && normalized.length > 0 ? sanitizeSseField(normalized) : null;
@@ -324,4 +552,8 @@ function normalizeSseId(value: string | null | undefined): string | null {
 
 function sanitizeSseField(value: string): string {
   return value.replace(/[\r\n]/g, " ");
+}
+
+function isRealtimeResourceKind(kind: string): kind is RealtimeResourceKind {
+  return REALTIME_RESOURCE_KINDS.some((candidate) => candidate === kind);
 }

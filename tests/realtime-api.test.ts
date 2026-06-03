@@ -4,7 +4,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer, type StatusServerOptions } from "../src/app/http.js";
 import {
+  REALTIME_EVENT_SCHEMA,
+  REALTIME_EVENT_SCHEMA_VERSION,
   RealtimeProjectionEventBus,
+  serializeRealtimeEventData,
   serializeSseComment,
   serializeSseEvent,
   type RealtimeProjectionEvent,
@@ -46,11 +49,41 @@ describe("StatusServer realtime SSE API", () => {
     expect(bus.subscriberCount()).toBe(0);
     expect([projection.revision, source.revision, run.revision, transcript.revision]).toEqual([1, 2, 3, 4]);
     expect(projection).toMatchObject({
+      schema: REALTIME_EVENT_SCHEMA,
+      schemaVersion: REALTIME_EVENT_SCHEMA_VERSION,
       id: "1",
       type: "projection.updated",
+      scope: "global",
+      key: null,
       source: { source: "runs", revision: 7, observedAt: "2026-01-01T00:00:00.000Z" },
       recovery: { strategy: "refetch", reason: "event", lastEventId: null },
       missedEvents: false,
+      payload: {
+        source: "runs",
+        sourceRevision: 7,
+        resourceKinds: ["dashboard", "issue-board", "sidebar", "history"],
+        resourcesChanged: ["dashboard", "issue-board", "sidebar", "history"],
+        detail: null,
+      },
+      detail: null,
+    });
+    expect(source).toMatchObject({
+      type: "source.status",
+      scope: "source",
+      key: "runs",
+      payload: { source: "runs", sourceRevision: 7, status: null, fetchedStates: [], cached: null, issueCount: null },
+    });
+    expect(run).toMatchObject({
+      type: "run.updated",
+      scope: "run",
+      key: null,
+      payload: { source: "runs", sourceRevision: 7, runId: null, issueId: null, status: null },
+    });
+    expect(transcript).toMatchObject({
+      type: "transcript.delta",
+      scope: "session",
+      key: null,
+      payload: { source: "runs", sourceRevision: 7, runId: null, sessionId: null, afterSequence: null },
     });
     expect(projection.recovery.endpoints).toEqual(
       expect.arrayContaining(["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/sidebar"]),
@@ -83,10 +116,16 @@ describe("StatusServer realtime SSE API", () => {
     const serialized = serializeSseEvent(projection);
     expect(serialized).toContain("id: 1\n");
     expect(serialized).toContain("event: projection.updated\n");
+    expect(requireDataLine(serialized)).toBe(serializeRealtimeEventData(projection));
     expect(JSON.parse(requireDataLine(serialized))).toMatchObject({
+      schema: REALTIME_EVENT_SCHEMA,
+      schemaVersion: REALTIME_EVENT_SCHEMA_VERSION,
       type: "projection.updated",
       revision: 1,
+      scope: "global",
+      key: null,
       source: { source: "runs", revision: 7 },
+      payload: { source: "runs", sourceRevision: 7, resourcesChanged: ["dashboard", "issue-board", "sidebar", "history"] },
     });
     expect(serializeSseComment("keepalive\nignored")).toBe(": keepalive ignored\n\n");
   });
@@ -210,10 +249,21 @@ describe("StatusServer realtime SSE API", () => {
       const fresh = await client.nextEventOfType("source.status");
       expect(fresh.data).toMatchObject({
         type: "source.status",
+        scope: "source",
+        key: "trackerIssues",
         source: { source: "trackerIssues", revision: 1 },
         detail: {
           source: "trackerIssues",
           status: "ok",
+          cached: false,
+          error: null,
+          issueCount: 1,
+        },
+        payload: {
+          source: "trackerIssues",
+          sourceRevision: 1,
+          status: "ok",
+          fetchedStates: expect.arrayContaining(["Todo", "In Progress"]),
           cached: false,
           error: null,
           issueCount: 1,
@@ -418,11 +468,20 @@ describe("StatusServer realtime SSE API", () => {
         const chat = await nextEventOfTypeFromSource(chatClient, "orchestrator.message", "orchestrator-chat");
         expect(chat.data).toMatchObject({
           type: "orchestrator.message",
+          scope: "orchestrator",
+          key: "orchestrator-default",
           source: { source: "orchestrator-chat" },
           detail: {
             inputLength: "hello from the operator".length,
             messageCount: 1,
             conversationId: "orchestrator-default",
+            status: 202,
+          },
+          payload: {
+            source: "orchestrator-chat",
+            conversationId: "orchestrator-default",
+            inputLength: "hello from the operator".length,
+            messageCount: 1,
             status: 202,
           },
           recovery: { strategy: "refetch", reason: "event" },
