@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
 import type { ProjectionChangeEvent, RealtimeConnectionStatus, RealtimeProjectionEvent } from "../src/data/dataSource";
 import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
+import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
 import type { ChatMessage, DashboardModel, HistoryModel, IssueBoardModel, TranscriptMessage } from "../src/types/symphony";
 
 const originalFetch = globalThis.fetch;
@@ -68,8 +69,8 @@ class FakeEventSource {
     this.readyState = FakeEventSource.CLOSED;
   }
 
-  emit(type: string, data?: string): void {
-    const event = typeof data === "string" ? new MessageEvent(type, { data }) : new Event(type);
+  emit(type: string, data?: string, init: MessageEventInit = {}): void {
+    const event = typeof data === "string" ? new MessageEvent(type, { ...init, data }) : new Event(type);
     for (const listener of this.listeners.get(type) ?? []) {
       if (typeof listener === "function") {
         listener(event);
@@ -94,12 +95,19 @@ const chatResponse: ChatMessage[] = [{ who: "agent", text: "Chat loaded from the
 
 function realtimeEvent(overrides: Partial<RealtimeProjectionEvent> = {}): RealtimeProjectionEvent {
   const resources = overrides.resources ?? [{ kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" }];
+  const source = overrides.source ?? { source: "runs", revision: 1, observedAt: "2026-06-02T00:00:00.000Z" };
+  const detail = overrides.detail ?? null;
+  const type = overrides.type ?? "projection.updated";
   return {
+    schema: REALTIME_EVENT_SCHEMA,
+    schemaVersion: REALTIME_EVENT_SCHEMA_VERSION,
     id: "1",
-    type: "projection.updated",
+    type,
     revision: 1,
     createdAt: "2026-06-02T00:00:00.000Z",
-    source: { source: "runs", revision: 1, observedAt: "2026-06-02T00:00:00.000Z" },
+    scope: realtimeScopeForTestEvent(type),
+    key: null,
+    source,
     resources,
     recovery: {
       strategy: "refetch",
@@ -108,8 +116,43 @@ function realtimeEvent(overrides: Partial<RealtimeProjectionEvent> = {}): Realti
       endpoints: resources.map((resource) => resource.href),
     },
     missedEvents: false,
-    detail: null,
+    payload: realtimePayloadForTestEvent(type, source, resources, detail),
+    detail,
     ...overrides,
+  };
+}
+
+function realtimeScopeForTestEvent(type: RealtimeProjectionEvent["type"]): RealtimeProjectionEvent["scope"] {
+  if (type === "source.status") return "source";
+  if (type === "run.updated") return "run";
+  if (type === "transcript.delta") return "session";
+  if (type === "orchestrator.message") return "orchestrator";
+  return "global";
+}
+
+function realtimePayloadForTestEvent(
+  type: RealtimeProjectionEvent["type"],
+  source: RealtimeProjectionEvent["source"],
+  resources: RealtimeProjectionEvent["resources"],
+  detail: RealtimeProjectionEvent["detail"],
+): RealtimeProjectionEvent["payload"] {
+  const base = { source: source.source, sourceRevision: source.revision, detail };
+  if (type === "run.updated") {
+    return { ...base, runId: null, issueId: null, issueIdentifier: null, status: null };
+  }
+  if (type === "transcript.delta") {
+    return { ...base, runId: null, sessionId: null, afterSequence: null, eventCount: null };
+  }
+  if (type === "orchestrator.message") {
+    return { ...base, conversationId: null, messageCount: null, inputLength: null, status: null };
+  }
+  if (type === "source.status") {
+    return { ...base, status: null, fetchedStates: [], fetchedAt: null, cached: null, error: null, issueCount: null };
+  }
+  return {
+    ...base,
+    resourceKinds: resources.map((resource) => resource.kind),
+    resourcesChanged: resources.map((resource) => resource.kind),
   };
 }
 
@@ -461,10 +504,15 @@ describe("API data source", () => {
       resources: [{ kind: "history", href: "/api/v1/web/history", relation: "refetch" }],
     });
     const projectionEvent = realtimeEvent({ id: "6", revision: 6, type: "projection.updated" });
-    eventSource?.emit("run.updated", JSON.stringify(runEvent));
+    eventSource?.emit("run.updated", JSON.stringify(runEvent), { lastEventId: "not-5" });
+    eventSource?.emit("run.updated", JSON.stringify(projectionEvent));
+    eventSource?.emit("message", JSON.stringify(projectionEvent));
+    eventSource?.emit("run.updated", JSON.stringify(runEvent), { lastEventId: "5" });
     eventSource?.emit("run.updated", "not-json");
     eventSource?.emit("run.updated", JSON.stringify({ type: "run.updated" }));
-    eventSource?.emit("message", JSON.stringify(projectionEvent));
+    eventSource?.emit("run.updated", JSON.stringify({ ...runEvent, scope: "global" }));
+    eventSource?.emit("run.updated", JSON.stringify({ ...runEvent, payload: projectionEvent.payload }));
+    eventSource?.emit("projection.updated", JSON.stringify(projectionEvent));
     unsubscribe?.();
 
     expect(events).toEqual([runEvent, projectionEvent]);
