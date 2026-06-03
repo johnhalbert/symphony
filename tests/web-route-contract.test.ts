@@ -154,9 +154,15 @@ describe("/api/v1/web route contracts", () => {
         },
         {
           path: webRouteContractPaths.orchestratorChat,
-          assert: (body, text) => {
-            expect(body).toEqual([]);
-            expect(text.trim()).toBe("[]");
+          assert: (body) => {
+            expectTopLevelKeys(body, ["chat", "conversation", "schemaVersion", "source", "state", "status"]);
+            expect(body).toMatchObject({
+              schemaVersion: 1,
+              conversation: { id: "orchestrator-default", status: "completed", messageCount: 0 },
+              state: "empty",
+              status: { state: "empty", empty: true, messageCount: 0 },
+              chat: [],
+            });
           },
         },
       ];
@@ -370,8 +376,16 @@ describe("/api/v1/web route contracts", () => {
       expect(durableSidebar.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(durableSidebar.response.headers.get("x-symphony-projection-name")).toBe("sidebar_projection");
       expect(headerJson(durableSidebar.response, "x-symphony-projection-source-freshness")).toEqual(sourceFreshness);
-      await expect(getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=operator-room`)).resolves.toMatchObject({ body: chat });
-      await expect(getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=legacy-room`)).resolves.toMatchObject({ body: legacyChat });
+      await expect(getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=operator-room`)).resolves.toMatchObject({ body: chatProjection });
+      await expect(getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=legacy-room`)).resolves.toMatchObject({
+        body: {
+          conversation: { id: "legacy-room", messageCount: legacyChat.length },
+          state: "completed",
+          status: { state: "completed", messageCount: legacyChat.length },
+          chat: legacyChat,
+          compatibility: { responseShape: "orchestrator_chat_projection", sourceShape: "legacy_chat_array" },
+        },
+      });
       const referenceData = await getJson(`${baseUrl}/api/v1/web/reference-data`);
       expect(referenceData.body).toMatchObject({
         labels: { durable: { name: "durable" } },
@@ -679,7 +693,7 @@ describe("/api/v1/web route contracts", () => {
       const current = await getJson(url);
       expect(current.response.status).toBe(200);
       expect(current.response.headers.get("x-symphony-projection-status")).toBe("hit");
-      expect(current.body).toEqual(projectionPayload.chat);
+      expect(current.body).toEqual(projectionPayload);
       expect(headerJson(current.response, "x-symphony-projection-source-revisions")).toEqual([
         {
           source: "orchestrator_conversations:operator-room",
@@ -700,7 +714,13 @@ describe("/api/v1/web route contracts", () => {
       expect(stale.response.status).toBe(200);
       expect(stale.response.headers.get("x-symphony-projection-status")).toBe("stale");
       expect(stale.response.headers.get("x-symphony-projection-cache")).toBe("miss");
-      expect(stale.body).toEqual([]);
+      expect(stale.body).toMatchObject({
+        conversation: { id: "operator-room", status: "unavailable", messageCount: 0 },
+        state: "unavailable",
+        status: { state: "unavailable", empty: true, messageCount: 0 },
+        chat: [],
+        compatibility: { responseShape: "orchestrator_chat_projection", sourceShape: "fallback" },
+      });
     } finally {
       await server.stop();
     }
@@ -710,6 +730,92 @@ describe("/api/v1/web route contracts", () => {
       { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
       { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
     ]);
+  });
+
+  it("preserves reducer state metadata for empty, active, failed, disabled, unavailable, and restart readback GET projections", async () => {
+    const stateDir = path.join(root, "chat-state-matrix");
+    const writerStore = new FileOrchestratorConversationStore(stateDir);
+    await writerStore.createConversation({ conversationId: "empty-room", status: "completed", at: "2026-06-03T00:00:00.000Z" });
+    await writerStore.createConversation({ conversationId: "pending-room", status: "pending", at: "2026-06-03T00:01:00.000Z" });
+    await writerStore.createConversation({ conversationId: "streaming-room", status: "streaming", at: "2026-06-03T00:02:00.000Z" });
+    await writerStore.createConversation({ conversationId: "failed-room", status: "failed", at: "2026-06-03T00:03:00.000Z" });
+    await writerStore.createConversation({ conversationId: "disabled-room", status: "disabled", at: "2026-06-03T00:04:00.000Z" });
+    await writerStore.createConversation({ conversationId: "unavailable-room", status: "unavailable", at: "2026-06-03T00:05:00.000Z" });
+    await writerStore.appendMessage({
+      id: "restart-chat-1",
+      conversationId: "restart-room",
+      role: "assistant",
+      body: "durable chat survives restart",
+      status: "completed",
+      at: "2026-06-03T00:06:00.000Z",
+    });
+    const cases = [
+      { conversationId: "empty-room", state: "empty", messageCount: 0, latestMessageStatus: null },
+      { conversationId: "pending-room", state: "pending", messageCount: 0, latestMessageStatus: null },
+      { conversationId: "streaming-room", state: "streaming", messageCount: 0, latestMessageStatus: null },
+      { conversationId: "failed-room", state: "failed", messageCount: 0, latestMessageStatus: null },
+      { conversationId: "disabled-room", state: "disabled", messageCount: 0, latestMessageStatus: null },
+      { conversationId: "unavailable-room", state: "unavailable", messageCount: 0, latestMessageStatus: null },
+      { conversationId: "restart-room", state: "completed", messageCount: 1, latestMessageStatus: "completed" },
+    ] as const;
+    const projectionPayloads = await Promise.all(
+      cases.map(async ({ conversationId }) =>
+        projectOrchestratorChatProjectionPayload(await writerStore.getConversation(conversationId), conversationId),
+      ),
+    );
+    const restartedStore = new FileOrchestratorConversationStore(stateDir);
+    const projectionReader = new RecordingProjectionReader(
+      projectionPayloads.map((payload) =>
+        projectionPayloadRecordFixture(
+          { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: payload.conversation.id },
+          payload,
+          {
+            sourceRevisions: [
+              {
+                source: `orchestrator_conversations:${payload.conversation.id}`,
+                revision: payload.source.revision,
+                observedAt: payload.source.observedAt,
+              },
+            ],
+          },
+        ),
+      ),
+    );
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, {
+      orchestratorConversationStore: restartedStore,
+      projectionReader,
+      projectionWriter,
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+
+    try {
+      for (const [index, testCase] of cases.entries()) {
+        const payload = projectionPayloads[index]!;
+        const result = await getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=${testCase.conversationId}`);
+        expect(result.response.headers.get("x-symphony-projection-status")).toBe("hit");
+        expect(result.body).toEqual(payload);
+        const body = result.body as typeof payload;
+        expect(body).toMatchObject({
+          conversation: { id: testCase.conversationId, messageCount: testCase.messageCount },
+          state: testCase.state,
+          status: {
+            state: testCase.state,
+            latestMessageStatus: testCase.latestMessageStatus,
+            messageCount: testCase.messageCount,
+            empty: testCase.messageCount === 0,
+          },
+        });
+        if (testCase.messageCount === 0) expect(body.chat).toEqual([]);
+        expect(JSON.stringify(body.chat)).not.toMatch(/fake|placeholder|mock/i);
+      }
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionWriter.writes).toEqual([]);
+    expect(projectionReader.selectors.map(({ scopeKey }) => scopeKey)).toEqual(cases.map(({ conversationId }) => conversationId));
   });
 
   it("returns explicit durable miss responses without broad source-index rebuilds when projection rows are absent", async () => {
@@ -765,7 +871,13 @@ describe("/api/v1/web route contracts", () => {
       const chat = await getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=operator-room`);
       expect(chat.response.status).toBe(200);
       expect(chat.response.headers.get("x-symphony-projection-status")).toBe("missing");
-      expect(chat.body).toEqual([]);
+      expect(chat.body).toMatchObject({
+        conversation: { id: "operator-room", status: "unavailable", messageCount: 0 },
+        state: "unavailable",
+        status: { state: "unavailable", empty: true, messageCount: 0 },
+        chat: [],
+        compatibility: { responseShape: "orchestrator_chat_projection", sourceShape: "fallback" },
+      });
     } finally {
       await server.stop();
     }
@@ -828,7 +940,12 @@ describe("/api/v1/web route contracts", () => {
 
       const chat = await getJson(`${baseUrl}/api/v1/web/orchestrator-chat?refresh=true&conversationId=operator-room`);
       expect(chat.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
-      expect(chat.body).toEqual([]);
+      expect(chat.body).toMatchObject({
+        conversation: { id: "operator-room", status: "completed", messageCount: 0 },
+        state: "empty",
+        status: { state: "empty", empty: true, messageCount: 0 },
+        chat: [],
+      });
     } finally {
       await server.stop();
     }
@@ -1286,7 +1403,12 @@ describe("/api/v1/web route contracts", () => {
       expect(history.response.headers.get("x-symphony-projection-revision")).toBe("11");
 
       const chat = await getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=operator-room`);
-      expect(chat.body).toEqual([]);
+      expect(chat.body).toMatchObject({
+        conversation: { id: "operator-room", status: "completed", messageCount: 0 },
+        state: "empty",
+        status: { state: "empty", empty: true, messageCount: 0 },
+        chat: [],
+      });
       expect(chat.body).not.toEqual(expiredChat);
       expect(chat.response.headers.get("x-symphony-projection-status")).toBe("expired");
       expect(chat.response.headers.get("x-symphony-projection-scope-key")).toBe("operator-room");
@@ -1312,7 +1434,12 @@ describe("/api/v1/web route contracts", () => {
       timeline: [],
       defaultSessionId: "",
     });
-    expect(projectionWriter.writeFor("orchestrator_chat_projection").payload).toEqual([]);
+    expect(projectionWriter.writeFor("orchestrator_chat_projection").payload).toMatchObject({
+      conversation: { id: "operator-room", status: "completed", messageCount: 0 },
+      state: "empty",
+      status: { state: "empty", empty: true, messageCount: 0 },
+      chat: [],
+    });
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
       { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
@@ -1351,7 +1478,13 @@ describe("/api/v1/web route contracts", () => {
     const address = await server.start();
     try {
       const response = await getJson(`${baseUrlFor(address)}/api/v1/web/orchestrator-chat?conversationId=operator-room`);
-      expect(response.body).toEqual(chat);
+      expect(response.body).toMatchObject({
+        conversation: { id: "operator-room", messageCount: chat.length },
+        state: "completed",
+        status: { state: "completed", messageCount: chat.length },
+        chat,
+        compatibility: { responseShape: "orchestrator_chat_projection", sourceShape: "legacy_chat_array" },
+      });
       expect(response.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(response.response.headers.get("x-symphony-projection-cache")).toBe("hit");
       expect(response.response.headers.get("x-symphony-projection-scope-key")).toBe("operator-room");
@@ -1379,7 +1512,13 @@ describe("/api/v1/web route contracts", () => {
     const staleAddress = await staleServer.start();
     try {
       const stale = await getJson(`${baseUrlFor(staleAddress)}/api/v1/web/orchestrator-chat?conversationId=operator-room`);
-      expect(stale.body).toEqual([]);
+      expect(stale.body).toMatchObject({
+        conversation: { id: "operator-room", status: "unavailable", messageCount: 0 },
+        state: "unavailable",
+        status: { state: "unavailable", empty: true, messageCount: 0 },
+        chat: [],
+        compatibility: { responseShape: "orchestrator_chat_projection", sourceShape: "fallback" },
+      });
       expect(stale.body).not.toEqual(staleChat);
       expect(stale.response.headers.get("x-symphony-projection-status")).toBe("stale");
       expect(stale.response.headers.get("x-symphony-projection-cache")).toBe("miss");

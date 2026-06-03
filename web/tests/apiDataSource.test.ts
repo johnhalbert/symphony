@@ -3,7 +3,7 @@ import { createApiDataSource, normalizeReferenceData } from "../src/data/apiData
 import type { ProjectionChangeEvent, RealtimeConnectionStatus, RealtimeProjectionEvent } from "../src/data/dataSource";
 import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
-import type { ChatMessage, DashboardModel, HistoryModel, IssueBoardModel, TranscriptMessage } from "../src/types/symphony";
+import type { ChatMessage, DashboardModel, HistoryModel, IssueBoardModel, OrchestratorChatModel, TranscriptMessage } from "../src/types/symphony";
 
 const originalFetch = globalThis.fetch;
 const originalEventSource = globalThis.EventSource;
@@ -857,13 +857,63 @@ describe("API data source", () => {
     ];
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(chat));
 
-    await expect(createApiDataSource("https://symphony.example///").getOrchestratorChat()).resolves.toEqual(chat);
+    const result = await createApiDataSource("https://symphony.example///").getOrchestratorChat();
+    expect(result).toMatchObject({ state: "completed", chat });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith("https://symphony.example/api/v1/web/orchestrator-chat", {
       headers: { Accept: "application/json" },
       signal: undefined,
     });
+  });
+
+  it("preserves reducer envelope metadata from GET /api/v1/web/orchestrator-chat", async () => {
+    const reducerEnvelope: OrchestratorChatModel = {
+      schemaVersion: 1,
+      conversation: {
+        id: "operator-room",
+        status: "streaming",
+        createdAt: "2026-06-03T00:00:00.000Z",
+        updatedAt: "2026-06-03T00:00:05.000Z",
+        messageCount: 1,
+        metadata: { issueKey: "ENG-228" },
+      },
+      state: "streaming",
+      status: {
+        state: "streaming",
+        conversationStatus: "streaming",
+        latestMessageStatus: "streaming",
+        active: true,
+        terminal: false,
+        empty: false,
+        messageCount: 1,
+        statusCounts: { pending: 0, streaming: 1, completed: 0, failed: 0, disabled: 0, unavailable: 0 },
+      },
+      chat: [
+        {
+          id: "chat-1",
+          conversationId: "operator-room",
+          who: "agent",
+          role: "assistant",
+          text: "Streaming durable response",
+          status: "streaming",
+          createdAt: "2026-06-03T00:00:01.000Z",
+          updatedAt: "2026-06-03T00:00:05.000Z",
+          metadata: { runId: "run-228" },
+        },
+      ],
+      source: {
+        source: "orchestrator_conversations",
+        revision: "chat-revision-228",
+        observedAt: "2026-06-03T00:00:05.000Z",
+        conversationId: "operator-room",
+        latestMessageSequence: 1,
+        latestMessageUpdatedAt: "2026-06-03T00:00:05.000Z",
+      },
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(reducerEnvelope));
+
+    await expect(createApiDataSource("").getOrchestratorChat()).resolves.toEqual(reducerEnvelope);
   });
 
   it("posts orchestrator chat input to the same relative API boundary and returns the response chat", async () => {

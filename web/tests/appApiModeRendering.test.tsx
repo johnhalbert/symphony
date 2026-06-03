@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveAppResourceLoading } from "../src/app/resourceLoading";
 import type { RealtimeConnectionStatus, SymphonyDataSource } from "../src/data/dataSource";
+import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
 import type { LiveResourceState, LiveResourceTokenMap } from "../src/hooks/useLiveResource";
 import { fallbackReferenceData } from "../src/data/referenceDataContext";
 import type {
@@ -14,6 +15,7 @@ import type {
   IssueBoardModel,
   IssueModel,
   Loadable,
+  OrchestratorChatModel,
   ReferenceData,
   SidebarModel,
   SessionModel,
@@ -280,7 +282,7 @@ type AppHookState = {
   issueBoard: Loadable<IssueBoardModel>;
   history: Loadable<HistoryModel>;
   sidebar: Loadable<SidebarModel>;
-  orchestratorChat: Loadable<ChatMessage[]>;
+  orchestratorChat: Loadable<OrchestratorChatModel>;
 };
 
 type HookOptions = { enabled?: boolean };
@@ -347,7 +349,7 @@ function appHookState(overrides: Partial<AppHookState> = {}): AppHookState {
     issueBoard: loaded(emptyIssueBoard),
     history: loaded(emptyHistory),
     sidebar: loaded(emptySidebar),
-    orchestratorChat: loaded(apiChat),
+    orchestratorChat: loaded(orchestratorChatModelFromMessages(apiChat)),
     ...overrides,
   };
 }
@@ -605,6 +607,10 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
     expect(markup).toContain("Full-app suggestion");
+    expect(markup).toContain("API mode shows durable chat history only");
+    expect(markup).toContain("Sending commands from this web chat is not supported yet");
+    expect(markup).not.toContain("Ask about the project, or issue a command");
+    expect(markup).not.toContain("/ commands");
     expectUnavailableButton(markup, "Status totals");
     expectUnavailableButton(markup, "Trigger poll");
     expectUnavailableButton(markup, "New issue");
@@ -678,7 +684,7 @@ describe("App API-mode rendering", () => {
       hooks: appHookState({
         dashboard: failed("Symphony API returned HTTP 503"),
         sidebar: loaded(sidebarWithOneAgent),
-        orchestratorChat: loaded([]),
+        orchestratorChat: loaded(orchestratorChatModelFromMessages([])),
       }),
     });
 

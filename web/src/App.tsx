@@ -162,6 +162,7 @@ function AppShell({
                   orchestratorChat={orchestratorChat.data ?? []}
                   orchestratorChatError={orchestratorChat.error}
                   orchestratorChatLoading={orchestratorChat.loading}
+                  orchestratorChatReadOnly={apiMode}
                 />
               ))
             : null}
@@ -179,6 +180,7 @@ function AppShell({
                   orchestratorChat={orchestratorChat.data ?? []}
                   orchestratorChatError={orchestratorChat.error}
                   orchestratorChatLoading={orchestratorChat.loading}
+                  orchestratorChatReadOnly={apiMode}
                 />
               ))
             : null}

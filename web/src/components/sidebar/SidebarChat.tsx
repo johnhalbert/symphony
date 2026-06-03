@@ -1,5 +1,6 @@
 import { useState } from "react";
-import type { ChatMessage } from "../../types/symphony";
+import { orchestratorChatStateNotice } from "../../data/orchestratorChat";
+import type { ChatMessage, OrchestratorChatModel } from "../../types/symphony";
 import { Icon, UnavailableButton } from "../common";
 import { formatInlineText } from "../messages/messageFormat";
 
@@ -7,6 +8,7 @@ export function SidebarChat({
   error = null,
   loading = false,
   messages,
+  projection,
   onSend,
   readOnly = false,
   subtitle,
@@ -14,6 +16,7 @@ export function SidebarChat({
   error?: string | null;
   loading?: boolean;
   messages: ChatMessage[];
+  projection?: OrchestratorChatModel | null;
   onSend: (input: string) => Promise<void>;
   readOnly?: boolean;
   subtitle?: string | null;
@@ -22,6 +25,7 @@ export function SidebarChat({
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const recent = messages.slice(-3);
+  const stateNotice = projection ? orchestratorChatStateNotice(projection, true) : null;
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this compact chat is not supported yet; no orchestrator action will be dispatched.";
   const contextLabel = readOnly ? "read-only API mode" : sending ? "sending command..." : (subtitle?.trim() || "agent context unavailable");
@@ -63,7 +67,10 @@ export function SidebarChat({
         {loading && recent.length === 0 ? <div className="view-loading">Loading orchestrator chat...</div> : null}
         {error ? <div className="view-error">Orchestrator chat unavailable: {error}</div> : null}
         {sendError ? <div className="view-error">Orchestrator command failed: {sendError}</div> : null}
-        {!loading && !error && recent.length === 0 ? <div className="view-empty">No durable orchestrator chat messages are available yet.</div> : null}
+        {!loading && !error && stateNotice ? (
+          <div className="view-empty" data-orchestrator-chat-state={projection?.state}>{stateNotice}</div>
+        ) : null}
+        {!loading && !error && !stateNotice && recent.length === 0 ? <div className="view-empty">No durable orchestrator chat messages are available yet.</div> : null}
         {recent.map((message, index) => (
           <div key={`${message.text}-${index}`} className="chat__msg">
             <div className={`who ${message.who === "user" ? "who--user" : ""}`}>
