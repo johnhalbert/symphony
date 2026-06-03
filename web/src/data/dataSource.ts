@@ -8,6 +8,21 @@ import type {
   SidebarModel,
   TranscriptMessage,
 } from "../types/symphony";
+import type { RealtimeEventListener, RealtimeEventUnsubscribe, RealtimeSubscriptionOptions } from "./realtimeEvents";
+
+export type {
+  RealtimeConnectionStatus,
+  RealtimeConnectionStatusKind,
+  RealtimeConnectionStatusListener,
+  RealtimeEventListener,
+  RealtimeEventUnsubscribe,
+  RealtimeProjectionEvent,
+  RealtimeProjectionEventType,
+  RealtimeProjectionRecoveryHint,
+  RealtimeProjectionResource,
+  RealtimeResourceKind,
+  RealtimeSubscriptionOptions,
+} from "./realtimeEvents";
 
 export interface ProjectionChangeEvent {
   type: string;
@@ -20,6 +35,10 @@ export interface ProjectionChangeEvent {
 export type ProjectionChangeListener = (event: ProjectionChangeEvent) => void;
 export type ProjectionChangeUnsubscribe = () => void;
 
+export interface CacheInvalidationOptions {
+  forceRefreshHrefs?: readonly string[];
+}
+
 export interface SymphonyDataSource {
   getReferenceData(signal?: AbortSignal): Promise<ReferenceData>;
   getDashboard(signal?: AbortSignal): Promise<DashboardModel>;
@@ -31,6 +50,7 @@ export interface SymphonyDataSource {
   getSidebar(signal?: AbortSignal): Promise<SidebarModel>;
   getOrchestratorChat(signal?: AbortSignal): Promise<ChatMessage[]>;
   sendOrchestratorMessage(input: string): Promise<ChatMessage[]>;
-  invalidateCachedReads?(): void;
+  invalidateCachedReads?(options?: CacheInvalidationOptions): void;
   subscribeToProjectionChanges?(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe;
+  subscribeToRealtimeEvents?(listener: RealtimeEventListener, options?: RealtimeSubscriptionOptions): RealtimeEventUnsubscribe;
 }

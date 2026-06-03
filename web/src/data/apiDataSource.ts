@@ -1,4 +1,14 @@
-import type { ProjectionChangeEvent, ProjectionChangeListener, ProjectionChangeUnsubscribe, SymphonyDataSource } from "./dataSource";
+import type {
+  CacheInvalidationOptions,
+  ProjectionChangeEvent,
+  ProjectionChangeListener,
+  ProjectionChangeUnsubscribe,
+  RealtimeEventListener,
+  RealtimeEventUnsubscribe,
+  RealtimeSubscriptionOptions,
+  SymphonyDataSource,
+} from "./dataSource";
+import { REALTIME_PROJECTION_EVENT_TYPES, isRealtimeProjectionEvent, realtimeConnectionStatus } from "./realtimeEvents";
 import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
@@ -31,37 +41,40 @@ interface FetchJsonOptions {
 
 interface GetJsonFetcher {
   fetchJson<T>(baseUrl: string, path: string, options?: FetchJsonOptions): Promise<T>;
-  invalidateCache(): void;
+  invalidateCache(options?: CacheInvalidationOptions): void;
 }
 
 function createGetJsonFetcher(): GetJsonFetcher {
   const inFlight = new Map<string, InFlightGetResponse>();
   const successCache = new Map<string, CachedGetResponse>();
+  const forceRefreshPaths = new Set<string>();
   let invalidationGeneration = 0;
 
   async function fetchJson<T>(baseUrl: string, path: string, options: FetchJsonOptions = {}): Promise<T> {
-    const url = `${baseUrl}${path}`;
+    const cacheKey = `${baseUrl}${path}`;
+    const requestPath = consumeForceRefreshPath(forceRefreshPaths, path);
+    const requestUrl = `${baseUrl}${requestPath}`;
     const { signal, cacheable = true } = options;
-    if (!cacheable) return fetchJsonOnce<T>(url, signal);
+    if (!cacheable) return fetchJsonOnce<T>(requestUrl, signal);
 
-    const cached = successCache.get(url);
+    const cached = successCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return resolveCachedGet(cached.data as T, signal);
 
-    const pending = inFlight.get(url);
+    const pending = inFlight.get(cacheKey);
     if (pending && pending.generation === invalidationGeneration) return resolveSharedGet(pending.promise as Promise<T>, signal);
 
     const requestGeneration = invalidationGeneration;
-    const requestToken = Symbol(url);
-    const promise = fetchJsonOnce<T>(url).then((data) => {
-      const current = inFlight.get(url);
+    const requestToken = Symbol(cacheKey);
+    const promise = fetchJsonOnce<T>(requestUrl).then((data) => {
+      const current = inFlight.get(cacheKey);
       if (current?.token === requestToken && requestGeneration === invalidationGeneration) {
-        successCache.set(url, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS });
+        successCache.set(cacheKey, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS });
       }
       return data;
     });
-    inFlight.set(url, { generation: requestGeneration, promise, token: requestToken });
+    inFlight.set(cacheKey, { generation: requestGeneration, promise, token: requestToken });
     const clearIfCurrent = () => {
-      if (inFlight.get(url)?.token === requestToken) inFlight.delete(url);
+      if (inFlight.get(cacheKey)?.token === requestToken) inFlight.delete(cacheKey);
     };
     void promise.then(clearIfCurrent, clearIfCurrent);
     return resolveSharedGet(promise, signal);
@@ -69,12 +82,50 @@ function createGetJsonFetcher(): GetJsonFetcher {
 
   return {
     fetchJson,
-    invalidateCache() {
+    invalidateCache(options) {
       invalidationGeneration += 1;
       successCache.clear();
       inFlight.clear();
+      rememberForceRefreshHrefs(forceRefreshPaths, options?.forceRefreshHrefs ?? []);
     },
   };
+}
+
+function rememberForceRefreshHrefs(forceRefreshPaths: Set<string>, hrefs: readonly string[]): void {
+  for (const href of hrefs) {
+    const parsed = parseApiHref(href);
+    if (!parsed?.hasRefreshHint) continue;
+    forceRefreshPaths.add(parsed.pathname);
+  }
+}
+
+function consumeForceRefreshPath(forceRefreshPaths: Set<string>, path: string): string {
+  const parsed = parseApiHref(path);
+  if (!parsed || !forceRefreshPaths.delete(parsed.pathname)) return path;
+  return pathWithRefresh(path);
+}
+
+function parseApiHref(href: string): { pathname: string; hasRefreshHint: boolean } | null {
+  const trimmed = href.trim();
+  if (!trimmed) return null;
+  try {
+    const url = new URL(trimmed, "http://symphony.local");
+    if (!url.pathname.startsWith("/api/v1/web/")) return null;
+    return { pathname: url.pathname.replace(/\/+$/, ""), hasRefreshHint: isTruthyRefreshParam(url.searchParams.get("refresh")) };
+  } catch {
+    return null;
+  }
+}
+
+function pathWithRefresh(path: string): string {
+  const parsed = parseApiHref(path);
+  if (parsed?.hasRefreshHint) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}refresh=1`;
+}
+
+function isTruthyRefreshParam(value: string | null): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "force";
 }
 
 function resolveCachedGet<T>(data: T, signal?: AbortSignal): Promise<T> {
@@ -149,6 +200,71 @@ function parseProjectionChangeEvent(event: MessageEvent): ProjectionChangeEvent 
   return { type: event.type };
 }
 
+function openRealtimeEventSubscription(
+  baseUrl: string,
+  listener: RealtimeEventListener,
+  options: RealtimeSubscriptionOptions = {},
+): RealtimeEventUnsubscribe {
+  if (typeof EventSource === "undefined") {
+    options.onStatus?.(realtimeConnectionStatus("unavailable"));
+    return () => undefined;
+  }
+
+  options.onStatus?.(realtimeConnectionStatus("connecting"));
+  const eventSource = new EventSource(realtimeEventSourceUrl(baseUrl, options.lastEventId ?? null));
+  let sawConnectionError = false;
+  const handleOpen = () => {
+    options.onStatus?.(realtimeConnectionStatus(sawConnectionError ? "recovered" : "open"));
+    sawConnectionError = false;
+  };
+  const handleConnectionError = () => {
+    sawConnectionError = true;
+    const closed = eventSource.readyState === EventSource.CLOSED;
+    options.onStatus?.(realtimeConnectionStatus(closed ? "error" : "reconnecting"));
+  };
+  const handleRealtimeEvent = (event: MessageEvent) => {
+    const parsed = parseRealtimeProjectionEvent(event);
+    if (!parsed) return;
+    if (parsed.missedEvents || parsed.recovery.reason === "missed-events") {
+      options.onStatus?.(
+        realtimeConnectionStatus("stale", {
+          lastEventId: parsed.recovery.lastEventId,
+          revision: parsed.revision,
+          missedEvents: true,
+        }),
+      );
+    }
+    listener(parsed);
+  };
+  eventSource.addEventListener("open", handleOpen);
+  eventSource.addEventListener("error", handleConnectionError);
+  for (const type of REALTIME_PROJECTION_EVENT_TYPES) {
+    eventSource.addEventListener(type, handleRealtimeEvent);
+  }
+  eventSource.addEventListener("message", handleRealtimeEvent);
+  return () => {
+    eventSource.close();
+  };
+}
+
+function realtimeEventSourceUrl(baseUrl: string, lastEventId: string | null): string {
+  const endpoint = `${baseUrl}/api/v1/realtime`;
+  const normalizedLastEventId = lastEventId?.trim();
+  if (!normalizedLastEventId) return endpoint;
+  return `${endpoint}?lastEventId=${encodeURIComponent(normalizedLastEventId)}`;
+}
+
+function parseRealtimeProjectionEvent(event: MessageEvent) {
+  if (typeof event.data !== "string") return null;
+  try {
+    const parsed = JSON.parse(event.data) as unknown;
+    return isRealtimeProjectionEvent(parsed) ? parsed : null;
+  } catch {
+    // Malformed realtime payloads are ignored; the next valid event or browser reconnect can recover with a refetch hint.
+    return null;
+  }
+}
+
 function normalizeReferenceRecord(record: Record<string, ApiReferenceEntry | null> | null | undefined) {
   return Object.fromEntries(
     Object.entries(record ?? {}).map(([key, entry]) => [
@@ -214,11 +330,14 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       if (!response.ok) throw new Error(`Symphony API returned HTTP ${response.status}`);
       return response.json() as Promise<ChatMessage[]>;
     },
-    invalidateCachedReads() {
-      getJsonFetcher.invalidateCache();
+    invalidateCachedReads(options) {
+      getJsonFetcher.invalidateCache(options);
     },
     subscribeToProjectionChanges(listener) {
       return openProjectionChangeSubscription(normalizedBaseUrl, listener);
+    },
+    subscribeToRealtimeEvents(listener, options) {
+      return openRealtimeEventSubscription(normalizedBaseUrl, listener, options);
     },
   };
 }

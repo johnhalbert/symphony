@@ -225,6 +225,11 @@ interface WebProjectionJsonResponse<TBody> {
 
 type DurableProjectionReadResult<TPayload> = WebProjectionReadResult<TPayload>;
 
+export interface StatusServerRealtimeOptions {
+  enabled?: boolean;
+  keepAliveIntervalMs?: number;
+}
+
 export interface StatusServerOptions {
   orchestrator: Orchestrator;
   workspaceManager: WorkspaceManager;
@@ -257,6 +262,7 @@ export interface StatusServerOptions {
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
   projectionWriter?: StatusServerProjectionWriter;
   projectionReader?: StatusServerProjectionReader;
+  realtime?: StatusServerRealtimeOptions;
 }
 
 export class StatusServer {
@@ -438,9 +444,21 @@ export class StatusServer {
   }
 
   private handleRealtime(request: IncomingMessage, response: ServerResponse, url: URL): void {
+    if (this.options.realtime?.enabled === false) {
+      sendJson(response, 503, {
+        error: {
+          code: "realtime_unavailable",
+          message: "Realtime event stream is unavailable",
+        },
+      });
+      return;
+    }
+
+    const keepAliveIntervalMs = this.options.realtime?.keepAliveIntervalMs;
     const stream = this.realtimeEvents.openSseStream({
       response,
       lastEventId: realtimeLastEventId(request, url),
+      ...(keepAliveIntervalMs === undefined ? {} : { keepAliveIntervalMs }),
     });
     const close = (): void => stream.close();
     request.on("aborted", close);
@@ -537,6 +555,10 @@ export class StatusServer {
           sendJson(response, 200, projectWebReferenceData(durableIssues.record.payload), durableProjectionReadHeaders(durableIssues));
           return;
         }
+        if (this.hasDurableProjectionReader()) {
+          sendJson(response, 200, projectWebReferenceData(null), durableProjectionReadHeaders(durableIssues));
+          return;
+        }
         let board: IssueBoardResponse | null = null;
         try {
           board = await this.fetchIssueBoard(forceRefresh);
@@ -578,6 +600,10 @@ export class StatusServer {
         const durableIssues = await this.webProjectionRepositories.issueBoard.readDefaultBoard({ forceRefresh });
         if (durableIssues.status === "hit" && durableIssues.record) {
           sendJson(response, 200, durableIssues.record.payload, durableProjectionReadHeaders(durableIssues));
+          return;
+        }
+        if (this.hasDurableProjectionReader()) {
+          sendJson(response, 200, projectWebIssueBoard(null), durableProjectionReadHeaders(durableIssues));
           return;
         }
         const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
@@ -1686,6 +1712,10 @@ export class StatusServer {
       };
     }
 
+    if (this.hasDurableProjectionReader()) {
+      return webProjectionJsonResponse(null, durableRead);
+    }
+
     try {
       const detail = await this.fetchBoardIssueDetail(issueId, forceRefresh);
       const issueActivityKey =
@@ -1758,6 +1788,10 @@ export class StatusServer {
     const durableDashboard = await this.webProjectionRepositories.dashboard.readCurrent({ forceRefresh });
     if (durableDashboard.status === "hit" && durableDashboard.record) {
       return webProjectionJsonResponse(durableDashboard.record.payload, durableDashboard);
+    }
+
+    if (this.hasDurableProjectionReader()) {
+      return webProjectionJsonResponse(this.buildProjectionFallbackDashboard(), durableDashboard);
     }
 
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
@@ -2034,6 +2068,10 @@ export class StatusServer {
       return webProjectionJsonResponse(durableSidebar.record.payload, durableSidebar);
     }
 
+    if (this.hasDurableProjectionReader()) {
+      return webProjectionJsonResponse(this.buildProjectionFallbackSidebar(), durableSidebar);
+    }
+
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
     const snapshot = sourceIndex?.runtime.snapshot ?? this.options.orchestrator.snapshot();
@@ -2180,6 +2218,25 @@ export class StatusServer {
       // response is derived from canonical stores during this transition phase,
       // so projection persistence failures must not make the UI unavailable.
     }
+  }
+
+  private hasDurableProjectionReader(): boolean {
+    return Boolean(this.options.projectionReader);
+  }
+
+  private buildProjectionFallbackDashboard(): ReturnType<typeof projectWebDashboard> {
+    return projectWebDashboard({
+      config: this.options.dashboard ?? null,
+    });
+  }
+
+  private buildProjectionFallbackSidebar(): ReturnType<typeof projectWebSidebar> {
+    return projectWebSidebar(
+      this.buildProjectionFallbackDashboard(),
+      projectWebIssueBoard(null),
+      projectWebHistory([], []),
+      [],
+    );
   }
 
   private async isDurableProjectionRecordCurrent(record: ProjectionPayloadRecord): Promise<boolean> {
@@ -3031,6 +3088,7 @@ function durableProjectionReadHeaders(read: DurableProjectionReadResult<unknown>
   if (record.payloadSha256) headers["x-symphony-projection-payload-sha256"] = record.payloadSha256;
   headers["x-symphony-projection-source-revisions"] = headerJsonValue(record.revision.sourceRevisions);
   headers["x-symphony-projection-source-cursors"] = headerJsonValue(record.revision.sourceCursors);
+  headers["x-symphony-projection-source-freshness"] = headerJsonValue(record.revision.sourceFreshness);
   return headers;
 }
 
