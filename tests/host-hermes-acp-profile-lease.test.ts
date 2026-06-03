@@ -3,6 +3,7 @@ import {
   buildHostHermesAcpCreateProfileArgs,
   buildHostHermesAcpDeleteProfileArgs,
   buildHostHermesAcpLaunchArgs,
+  buildHostHermesAcpProfileCheckArgs,
   buildHostHermesAcpProfileName,
   createHostHermesAcpProfileLease,
   HostHermesAcpLeaseManager,
@@ -77,6 +78,7 @@ describe("HostHermesAcpProfileLease", () => {
       "--no-alias",
     ]);
     expect(buildHostHermesAcpLaunchArgs("run-profile")).toEqual(["-p", "run-profile", "acp"]);
+    expect(buildHostHermesAcpProfileCheckArgs("run-profile")).toEqual(["-p", "run-profile", "acp", "--check"]);
     expect(buildHostHermesAcpDeleteProfileArgs("run-profile")).toEqual(["profile", "delete", "run-profile", "--yes"]);
   });
 
@@ -133,9 +135,12 @@ describe("HostHermesAcpProfileLease", () => {
       runner,
     });
 
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     expect(calls[0]?.file).toBe("/usr/local/bin/hermes");
-    expect(calls[0]?.args).toEqual([
+    expect(calls[0]?.args).toEqual(["-p", "operator", "acp", "--check"]);
+    expect(calls[0]?.options.env.HERMES_HOME).toBeUndefined();
+    expect(calls[1]?.file).toBe("/usr/local/bin/hermes");
+    expect(calls[1]?.args).toEqual([
       "profile",
       "create",
       lease.profileName,
@@ -144,7 +149,7 @@ describe("HostHermesAcpProfileLease", () => {
       "operator",
       "--no-alias",
     ]);
-    expect(calls[0]?.options.env.HERMES_HOME).toBeUndefined();
+    expect(calls[1]?.options.env.HERMES_HOME).toBeUndefined();
     expect(lease.acpCommand).toMatchObject({
       file: "/usr/local/bin/hermes",
       args: ["-p", lease.profileName, "acp"],
@@ -157,7 +162,7 @@ describe("HostHermesAcpProfileLease", () => {
       reason: "deleted",
       deleted: true,
     });
-    expect(calls[1]?.args).toEqual(["profile", "delete", lease.profileName, "--yes"]);
+    expect(calls[2]?.args).toEqual(["profile", "delete", lease.profileName, "--yes"]);
   });
 
   it("defaults source profile to active host Hermes profile and preserves failed-run profiles by default", async () => {
@@ -175,7 +180,8 @@ describe("HostHermesAcpProfileLease", () => {
 
     expect(lease.sourceProfile).toBe("host-default");
     expect(calls[0]?.args).toEqual(["profile"]);
-    expect(calls[1]?.args).toEqual([
+    expect(calls[1]?.args).toEqual(["-p", "host-default", "acp", "--check"]);
+    expect(calls[2]?.args).toEqual([
       "profile",
       "create",
       lease.profileName,
@@ -189,12 +195,58 @@ describe("HostHermesAcpProfileLease", () => {
       reason: "retained",
       deleted: false,
     });
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(3);
+  });
+
+  it("fails closed when the source profile ACP check fails before disposable profile creation", async () => {
+    const { calls, runner } = commandRecorder([{ stdout: "", stderr: "auth missing", exitCode: 2 }]);
+
+    await expect(
+      createHostHermesAcpProfileLease({
+        binaryPath: "hermes",
+        cwd: "/workspace",
+        profileName: "worker-run",
+        sourceProfile: "operator",
+        runner,
+      }),
+    ).rejects.toThrow(/source profile operator failed safety verification.*-p operator acp --check.*auth missing/s);
+    expect(calls.map((call) => call.args)).toEqual([["-p", "operator", "acp", "--check"]]);
+  });
+
+  it("reserves the source profile for generated lease names so clones never launch from the source profile", async () => {
+    const nameInput = {
+      workspaceKey: "workspace-1",
+      issueIdentifier: "ENG-170",
+      role: "worker",
+      phase: "implementation",
+    };
+    const sourceProfile = buildHostHermesAcpProfileName(nameInput);
+    const { calls, runner } = commandRecorder([
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "", exitCode: 0 },
+    ]);
+
+    const lease = await createHostHermesAcpProfileLease({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      sourceProfile,
+      nameInput,
+      runner,
+    });
+
+    expect(lease.sourceProfile).toBe(sourceProfile);
+    expect(lease.profileName).not.toBe(sourceProfile);
+    expect(lease.acpCommand.args).toEqual(["-p", lease.profileName, "acp"]);
+    expect(calls.map((call) => call.args)).toEqual([
+      ["-p", sourceProfile, "acp", "--check"],
+      ["profile", "create", lease.profileName, "--clone", "--clone-from", sourceProfile, "--no-alias"],
+    ]);
   });
 
   it("reuses an expected already-existing profile without deleting it as a disposable clone", async () => {
     const expectedProfileName = normalizeHostHermesAcpProfileName("worker-run");
     const { calls, runner } = commandRecorder([
+      { stdout: "", stderr: "", exitCode: 0 },
       { stdout: "", stderr: `Profile '${expectedProfileName}' already exists.`, exitCode: 2 },
     ]);
 
@@ -209,6 +261,7 @@ describe("HostHermesAcpProfileLease", () => {
 
     expect(lease.profileName).toBe(expectedProfileName);
     expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
       ["profile", "create", expectedProfileName, "--clone", "--clone-from", "operator", "--no-alias"],
     ]);
     await expect(lease.dispose("succeeded")).resolves.toEqual({
@@ -221,12 +274,13 @@ describe("HostHermesAcpProfileLease", () => {
       reason: "already_disposed",
       deleted: false,
     });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
   });
 
   it("rejects non-reusable profile create failures with command, exit code, and stderr diagnostics", async () => {
     const expectedProfileName = normalizeHostHermesAcpProfileName("worker-run");
     const { runner } = commandRecorder([
+      { stdout: "", stderr: "", exitCode: 0 },
       { stdout: "", stderr: "Profile 'someone-else' already exists.", exitCode: 17 },
     ]);
 
@@ -246,52 +300,38 @@ describe("HostHermesAcpProfileLease", () => {
     );
   });
 
-  it("protects a configured source profile that matches the resolved lease profile from create and delete", async () => {
+  it("rejects a configured source profile that matches the resolved explicit lease profile", async () => {
     const expectedProfileName = normalizeHostHermesAcpProfileName("worker-run");
     const { calls, runner } = commandRecorder([]);
 
-    const lease = await createHostHermesAcpProfileLease({
-      binaryPath: "hermes",
-      cwd: "/workspace",
-      profileName: "worker-run",
-      sourceProfile: expectedProfileName,
-      keepProfiles: "never",
-      runner,
-    });
-
-    expect(lease.profileName).toBe(expectedProfileName);
-    expect(lease.sourceProfile).toBe(expectedProfileName);
-    expect(calls).toHaveLength(0);
-    await expect(lease.dispose("succeeded")).resolves.toEqual({
-      profileName: expectedProfileName,
-      reason: "retained",
-      deleted: false,
-    });
+    await expect(
+      createHostHermesAcpProfileLease({
+        binaryPath: "hermes",
+        cwd: "/workspace",
+        profileName: "worker-run",
+        sourceProfile: expectedProfileName,
+        keepProfiles: "never",
+        runner,
+      }),
+    ).rejects.toThrow(/resolves to the source profile/);
     expect(calls).toHaveLength(0);
   });
 
-  it("protects an active source profile that matches the resolved lease profile from clone and delete", async () => {
+  it("rejects an active source profile that matches the resolved explicit lease profile before clone or launch", async () => {
     const expectedProfileName = normalizeHostHermesAcpProfileName("active-worker-run");
     const { calls, runner } = commandRecorder([
       { stdout: `\nActive profile: ${expectedProfileName}\nPath: /home/me/.hermes\n`, stderr: "", exitCode: 0 },
     ]);
 
-    const lease = await createHostHermesAcpProfileLease({
-      binaryPath: "hermes",
-      cwd: "/workspace",
-      profileName: "active-worker-run",
-      keepProfiles: "never",
-      runner,
-    });
-
-    expect(lease.profileName).toBe(expectedProfileName);
-    expect(lease.sourceProfile).toBe(expectedProfileName);
-    expect(calls.map((call) => call.args)).toEqual([["profile"]]);
-    await expect(lease.dispose("succeeded")).resolves.toEqual({
-      profileName: expectedProfileName,
-      reason: "retained",
-      deleted: false,
-    });
+    await expect(
+      createHostHermesAcpProfileLease({
+        binaryPath: "hermes",
+        cwd: "/workspace",
+        profileName: "active-worker-run",
+        keepProfiles: "never",
+        runner,
+      }),
+    ).rejects.toThrow(/resolves to the source profile/);
     expect(calls.map((call) => call.args)).toEqual([["profile"]]);
   });
 
@@ -317,6 +357,7 @@ describe("HostHermesAcpProfileLease", () => {
       deleted: false,
     });
     expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
       ["profile", "create", lease.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
       ["profile", "delete", lease.profileName, "--yes"],
     ]);
@@ -324,6 +365,7 @@ describe("HostHermesAcpProfileLease", () => {
 
   it("keeps failed profile deletion retryable until cleanup succeeds", async () => {
     const { calls, runner } = commandRecorder([
+      { stdout: "", stderr: "", exitCode: 0 },
       { stdout: "", stderr: "", exitCode: 0 },
       { stdout: "", stderr: "delete failed", exitCode: 23 },
       { stdout: "", stderr: "", exitCode: 0 },
@@ -350,6 +392,7 @@ describe("HostHermesAcpProfileLease", () => {
       deleted: false,
     });
     expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
       ["profile", "create", lease.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
       ["profile", "delete", lease.profileName, "--yes"],
       ["profile", "delete", lease.profileName, "--yes"],
@@ -357,7 +400,10 @@ describe("HostHermesAcpProfileLease", () => {
   });
 
   it("treats interrupted profile create commands as failures", async () => {
-    const { runner } = commandRecorder([{ stdout: "", stderr: "terminated", exitCode: null }]);
+    const { runner } = commandRecorder([
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "terminated", exitCode: null },
+    ]);
 
     await expect(
       createHostHermesAcpProfileLease({
@@ -412,6 +458,7 @@ describe("HostHermesAcpProfileLease", () => {
     expect(first.disposed).toBe(false);
     expect(manager.activeLeaseCount).toBe(1);
     expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
       ["profile", "create", first.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
     ]);
 
@@ -422,7 +469,7 @@ describe("HostHermesAcpProfileLease", () => {
     });
     expect(first.disposed).toBe(false);
     expect(manager.activeLeaseCount).toBe(1);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
 
     await expect(manager.dispose("succeeded")).resolves.toEqual([
       { profileName: first.profileName, reason: "deleted", deleted: true },
@@ -430,6 +477,7 @@ describe("HostHermesAcpProfileLease", () => {
     expect(first.disposed).toBe(true);
     expect(manager.activeLeaseCount).toBe(0);
     expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
       ["profile", "create", first.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
       ["profile", "delete", first.profileName, "--yes"],
     ]);
@@ -472,6 +520,7 @@ describe("HostHermesAcpProfileLease", () => {
       expect(lease.disposed).toBe(true);
       expect(manager.activeLeaseCount).toBe(0);
       expect(calls.map((call) => call.args)).toEqual([
+        ["-p", "operator", "acp", "--check"],
         ["profile", "create", lease.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
       ]);
     }
@@ -506,7 +555,9 @@ describe("HostHermesAcpProfileLease", () => {
     await expect(first.afterRunFinished("succeeded")).resolves.toEqual({ profileName: first.profileName, reason: "deleted", deleted: true });
     await expect(second.afterRunFinished("succeeded")).resolves.toEqual({ profileName: second.profileName, reason: "deleted", deleted: true });
     expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
       ["profile", "create", first.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
+      ["-p", "operator", "acp", "--check"],
       ["profile", "create", second.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
       ["profile", "delete", first.profileName, "--yes"],
       ["profile", "delete", second.profileName, "--yes"],
@@ -546,6 +597,7 @@ describe("HostHermesAcpProfileLease", () => {
     expect(lease.acpSessionId).toBeNull();
     expect(lease.disposed).toBe(true);
     expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
       ["profile", "create", lease.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
       ["profile", "delete", lease.profileName, "--yes"],
     ]);
@@ -577,6 +629,7 @@ describe("HostHermesAcpProfileLease", () => {
     expect(lease.processHandle).toBeNull();
     expect(lease.acpSessionId).toBeNull();
     expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
       ["profile", "create", lease.profileName, "--clone", "--clone-from", "operator", "--no-alias"],
     ]);
   });
