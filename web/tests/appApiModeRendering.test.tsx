@@ -305,12 +305,23 @@ const zeroLiveResourceTokens: LiveResourceTokenMap = {
   orchestratorChat: 0,
 };
 
+const zeroLiveResourceRevisions: LiveResourceState["revisions"] = {
+  referenceData: null,
+  dashboard: null,
+  issueBoard: null,
+  issueDetail: null,
+  history: null,
+  sidebar: null,
+  sessionTranscript: null,
+  orchestratorChat: null,
+};
+
 function realtimeStatus(kind: RealtimeConnectionStatus["kind"], label: string): RealtimeConnectionStatus {
   return { kind, label };
 }
 
 function liveResourceState(status = realtimeStatus("connecting", "realtime connecting")): LiveResourceState {
-  return { tokens: { ...zeroLiveResourceTokens }, realtimeStatus: status };
+  return { tokens: { ...zeroLiveResourceTokens }, revisions: { ...zeroLiveResourceRevisions }, realtimeStatus: status };
 }
 
 function loaded<T>(data: T): Loadable<T> {
@@ -613,6 +624,23 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("PR/day");
     expect(markup).not.toContain("linear · connected");
     expect(markup).not.toContain("0 errors");
+  });
+
+  it("keeps inactive API-mode resources disabled when realtime tokens change outside the active dashboard view", async () => {
+    const liveState = liveResourceState();
+    liveState.tokens.dashboard = 5;
+    liveState.tokens.issueBoard = 2;
+    liveState.tokens.history = 3;
+    liveState.tokens.sidebar = 4;
+    liveState.tokens.orchestratorChat = 6;
+
+    const { hookCalls } = await renderAppWithMocks({ liveState });
+
+    expect(hookCalls.dashboard).toEqual([{ enabled: true, refreshToken: 5 }]);
+    expect(hookCalls.issueBoard).toEqual([{ enabled: false, refreshToken: 2 }]);
+    expect(hookCalls.history).toEqual([{ enabled: false, refreshToken: 3 }]);
+    expect(hookCalls.sidebar).toEqual([{ enabled: false, refreshToken: 4 }]);
+    expect(hookCalls.orchestratorChat).toEqual([{ enabled: true, refreshToken: 6 }]);
   });
 
   it("renders non-blocking realtime connection, reconnect, recovered, and stale status in API chrome", async () => {

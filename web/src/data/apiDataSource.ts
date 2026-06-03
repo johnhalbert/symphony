@@ -3,12 +3,9 @@ import type {
   ProjectionChangeEvent,
   ProjectionChangeListener,
   ProjectionChangeUnsubscribe,
-  RealtimeEventListener,
-  RealtimeEventUnsubscribe,
-  RealtimeSubscriptionOptions,
   SymphonyDataSource,
 } from "./dataSource";
-import { REALTIME_PROJECTION_EVENT_TYPES, parseRealtimeProjectionEventData, realtimeConnectionStatus } from "./realtimeEvents";
+import { createRealtimeEventSourceClient } from "./eventSourceClient";
 import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
@@ -26,12 +23,14 @@ const GET_SUCCESS_CACHE_MS = 5_000;
 interface CachedGetResponse {
   data: unknown;
   expiresAt: number;
+  path: string;
 }
 
 interface InFlightGetResponse {
   generation: number;
   promise: Promise<unknown>;
   token: symbol;
+  path: string;
 }
 
 interface FetchJsonOptions {
@@ -48,10 +47,17 @@ function createGetJsonFetcher(): GetJsonFetcher {
   const inFlight = new Map<string, InFlightGetResponse>();
   const successCache = new Map<string, CachedGetResponse>();
   const forceRefreshPaths = new Set<string>();
-  let invalidationGeneration = 0;
+  const pathInvalidationGenerations = new Map<string, number>();
+  let broadInvalidationGeneration = 0;
+  let nextInvalidationGeneration = 0;
+
+  function invalidationGenerationForPath(path: string): number {
+    return Math.max(broadInvalidationGeneration, pathInvalidationGenerations.get(path) ?? 0);
+  }
 
   async function fetchJson<T>(baseUrl: string, path: string, options: FetchJsonOptions = {}): Promise<T> {
-    const cacheKey = `${baseUrl}${path}`;
+    const cachePath = normalizeApiCachePath(path);
+    const cacheKey = `${baseUrl}${cachePath}`;
     const requestPath = consumeForceRefreshPath(forceRefreshPaths, path);
     const requestUrl = `${baseUrl}${requestPath}`;
     const { signal, cacheable = true } = options;
@@ -61,18 +67,18 @@ function createGetJsonFetcher(): GetJsonFetcher {
     if (cached && cached.expiresAt > Date.now()) return resolveCachedGet(cached.data as T, signal);
 
     const pending = inFlight.get(cacheKey);
-    if (pending && pending.generation === invalidationGeneration) return resolveSharedGet(pending.promise as Promise<T>, signal);
+    if (pending && pending.generation === invalidationGenerationForPath(cachePath)) return resolveSharedGet(pending.promise as Promise<T>, signal);
 
-    const requestGeneration = invalidationGeneration;
+    const requestGeneration = invalidationGenerationForPath(cachePath);
     const requestToken = Symbol(cacheKey);
     const promise = fetchJsonOnce<T>(requestUrl).then((data) => {
       const current = inFlight.get(cacheKey);
-      if (current?.token === requestToken && requestGeneration === invalidationGeneration) {
-        successCache.set(cacheKey, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS });
+      if (current?.token === requestToken && requestGeneration === invalidationGenerationForPath(cachePath)) {
+        successCache.set(cacheKey, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS, path: cachePath });
       }
       return data;
     });
-    inFlight.set(cacheKey, { generation: requestGeneration, promise, token: requestToken });
+    inFlight.set(cacheKey, { generation: requestGeneration, promise, token: requestToken, path: cachePath });
     const clearIfCurrent = () => {
       if (inFlight.get(cacheKey)?.token === requestToken) inFlight.delete(cacheKey);
     };
@@ -83,12 +89,37 @@ function createGetJsonFetcher(): GetJsonFetcher {
   return {
     fetchJson,
     invalidateCache(options) {
-      invalidationGeneration += 1;
-      successCache.clear();
-      inFlight.clear();
+      const invalidatePaths = new Set(normalizedApiPaths(options?.forceRefreshHrefs ?? []));
       rememberForceRefreshHrefs(forceRefreshPaths, options?.forceRefreshHrefs ?? []);
+      if (invalidatePaths.size === 0) {
+        broadInvalidationGeneration = ++nextInvalidationGeneration;
+        successCache.clear();
+        inFlight.clear();
+        return;
+      }
+      const invalidationGeneration = ++nextInvalidationGeneration;
+      for (const path of invalidatePaths) pathInvalidationGenerations.set(path, invalidationGeneration);
+      for (const [cacheKey, cached] of successCache) {
+        if (invalidatePaths.has(cached.path)) successCache.delete(cacheKey);
+      }
+      for (const [cacheKey, pending] of inFlight) {
+        if (invalidatePaths.has(pending.path)) inFlight.delete(cacheKey);
+      }
     },
   };
+}
+
+function normalizeApiCachePath(path: string): string {
+  return parseApiHref(path)?.pathname ?? path;
+}
+
+function normalizedApiPaths(hrefs: readonly string[]): readonly string[] {
+  const paths = new Set<string>();
+  for (const href of hrefs) {
+    const parsed = parseApiHref(href);
+    if (parsed) paths.add(parsed.pathname);
+  }
+  return [...paths];
 }
 
 function rememberForceRefreshHrefs(forceRefreshPaths: Set<string>, hrefs: readonly string[]): void {
@@ -200,74 +231,11 @@ function parseProjectionChangeEvent(event: MessageEvent): ProjectionChangeEvent 
   return { type: event.type };
 }
 
-function openRealtimeEventSubscription(
-  baseUrl: string,
-  listener: RealtimeEventListener,
-  options: RealtimeSubscriptionOptions = {},
-): RealtimeEventUnsubscribe {
-  if (typeof EventSource === "undefined") {
-    options.onStatus?.(realtimeConnectionStatus("unavailable"));
-    return () => undefined;
-  }
-
-  options.onStatus?.(realtimeConnectionStatus("connecting"));
-  const eventSource = new EventSource(realtimeEventSourceUrl(baseUrl, options.lastEventId ?? null));
-  let sawConnectionError = false;
-  const handleOpen = () => {
-    options.onStatus?.(realtimeConnectionStatus(sawConnectionError ? "recovered" : "open"));
-    sawConnectionError = false;
-  };
-  const handleConnectionError = () => {
-    sawConnectionError = true;
-    const closed = eventSource.readyState === EventSource.CLOSED;
-    options.onStatus?.(realtimeConnectionStatus(closed ? "error" : "reconnecting"));
-  };
-  const handleRealtimeEvent = (event: MessageEvent) => {
-    const parsed = parseRealtimeProjectionEvent(event);
-    if (!parsed) return;
-    if (parsed.missedEvents || parsed.recovery.reason === "missed-events") {
-      options.onStatus?.(
-        realtimeConnectionStatus("stale", {
-          lastEventId: parsed.recovery.lastEventId,
-          revision: parsed.revision,
-          missedEvents: true,
-        }),
-      );
-    }
-    listener(parsed);
-  };
-  eventSource.addEventListener("open", handleOpen);
-  eventSource.addEventListener("error", handleConnectionError);
-  for (const type of REALTIME_PROJECTION_EVENT_TYPES) {
-    eventSource.addEventListener(type, handleRealtimeEvent);
-  }
-  eventSource.addEventListener("message", handleRealtimeEvent);
-  return () => {
-    eventSource.close();
-  };
-}
-
 function realtimeEventSourceUrl(baseUrl: string, lastEventId: string | null): string {
   const endpoint = `${baseUrl}/api/v1/realtime`;
   const normalizedLastEventId = lastEventId?.trim();
   if (!normalizedLastEventId) return endpoint;
   return `${endpoint}?lastEventId=${encodeURIComponent(normalizedLastEventId)}`;
-}
-
-function parseRealtimeProjectionEvent(event: MessageEvent) {
-  if (typeof event.data !== "string") return null;
-  const parsed = parseRealtimeProjectionEventData(event.data);
-  if (!parsed) return null;
-
-  if (event.type !== parsed.type) return null;
-
-  const lastEventId = typeof event.lastEventId === "string" ? event.lastEventId : "";
-  if (lastEventId !== "" && lastEventId !== parsed.id) return null;
-
-  const transportId = (event as { id?: unknown }).id;
-  if (typeof transportId === "string" && transportId !== "" && transportId !== parsed.id) return null;
-
-  return parsed;
 }
 
 function normalizeReferenceRecord(record: Record<string, ApiReferenceEntry | null> | null | undefined) {
@@ -293,6 +261,9 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
   const getJsonFetcher = createGetJsonFetcher();
   const { fetchJson } = getJsonFetcher;
+  const realtimeEventSourceClient = createRealtimeEventSourceClient({
+    urlForLastEventId: (lastEventId) => realtimeEventSourceUrl(normalizedBaseUrl, lastEventId),
+  });
 
   return {
     async getReferenceData(signal) {
@@ -342,7 +313,7 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       return openProjectionChangeSubscription(normalizedBaseUrl, listener);
     },
     subscribeToRealtimeEvents(listener, options) {
-      return openRealtimeEventSubscription(normalizedBaseUrl, listener, options);
+      return realtimeEventSourceClient.subscribe(listener, options);
     },
   };
 }

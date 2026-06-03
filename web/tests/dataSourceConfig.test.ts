@@ -154,4 +154,13 @@ describe("web data-source configuration", () => {
     await expect(dataSource.getReferenceData()).resolves.toEqual({ labels: {}, users: {} });
     expect(loadMockDataSource).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps explicit mock/local mode isolated from API-mode SSE subscriptions", () => {
+    const loadMockDataSource = vi.fn(async () => demoDataSource);
+    const dataSource = createDataSource({ mode: "mock", apiBaseUrl: "https://symphony.test" }, { loadMockDataSource });
+
+    expect(dataSource.subscribeToRealtimeEvents).toBeUndefined();
+    expect(dataSource.subscribeToProjectionChanges).toBeUndefined();
+    expect(loadMockDataSource).not.toHaveBeenCalled();
+  });
 });

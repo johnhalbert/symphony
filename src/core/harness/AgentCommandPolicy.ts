@@ -1,8 +1,12 @@
+import path from "node:path";
+
 import type { RedactedPreview } from "../transcript/TranscriptProjection.js";
 import { isSensitivePreviewKey, sanitizedPreviewValue } from "../transcript/TranscriptProjection.js";
+import { inspectPersistedGitConfigForUnsafeEntries } from "./AgentCommandPolicyGitConfig.js";
 
 const DEFAULT_POLICY_PREVIEW_LENGTH = 500;
 const MAX_POLICY_PREVIEW_REDACTION_DEPTH = 8;
+
 const WINDOWS_EXECUTABLE_SUFFIXES = [".exe", ".cmd", ".bat", ".com", ".ps1"] as const;
 
 const GIT_EXECUTABLES = new Set(["git", "git-lfs"]);
@@ -175,6 +179,10 @@ export type AgentCommandPolicyUnsafeGitConfigCategory =
   | "filesystem_monitor"
   | "transport_helper"
   | "ssh_command"
+  | "command_lookup"
+  | "git_environment"
+  | "loader"
+  | "shell_environment"
   | "other";
 
 export type AgentCommandPolicyUnsafeGitConfigEffect =
@@ -205,10 +213,44 @@ const UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
   ["GIT_SSH", "ssh_command"],
   ["GIT_SSH_COMMAND", "ssh_command"],
   ["GIT_PROXY_COMMAND", "transport_helper"],
+  ["GIT_ALLOW_PROTOCOL", "transport_helper"],
+  ["GIT_PROTOCOL", "transport_helper"],
+  ["GIT_PROTOCOL_FROM_USER", "transport_helper"],
+  ["GIT_DIR", "git_environment"],
+  ["GIT_WORK_TREE", "git_environment"],
+  ["GIT_COMMON_DIR", "git_environment"],
+  ["GIT_CEILING_DIRECTORIES", "git_environment"],
+  ["GIT_DISCOVERY_ACROSS_FILESYSTEM", "git_environment"],
+  ["GIT_INDEX_FILE", "git_environment"],
+  ["GIT_OBJECT_DIRECTORY", "git_environment"],
+  ["GIT_ALTERNATE_OBJECT_DIRECTORIES", "git_environment"],
+  ["GIT_NAMESPACE", "git_environment"],
   ["GIT_EXEC_PATH", "other"],
+  ["LD_PRELOAD", "loader"],
+  ["LD_LIBRARY_PATH", "loader"],
+  ["LD_AUDIT", "loader"],
+  ["DYLD_INSERT_LIBRARIES", "loader"],
+  ["DYLD_LIBRARY_PATH", "loader"],
+  ["DYLD_FRAMEWORK_PATH", "loader"],
 ]);
-const GIT_CONFIG_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM)$/u;
-const GIT_CONFIG_KEY_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_KEY_\d+$/u;
+const INLINE_ONLY_UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
+  string,
+  AgentCommandPolicyUnsafeGitConfigCategory
+> = new Map([
+  ["PATH", "command_lookup"],
+  ["PATHEXT", "command_lookup"],
+  ["HOME", "git_environment"],
+  ["XDG_CONFIG_HOME", "git_environment"],
+  ["XDG_CONFIG_DIRS", "git_environment"],
+  ["SHELL", "shell_environment"],
+  ["BASH_ENV", "shell_environment"],
+  ["ENV", "shell_environment"],
+]);
+const GIT_CONFIG_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)$/u;
+const GIT_CONFIG_INDEXED_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(KEY|VALUE)_(\d+)$/u;
+const MAX_GIT_CONFIG_ENVIRONMENT_COUNT = 64;
+const GIT_TRACE_ENVIRONMENT_KEY_PATTERN = /^GIT_TRACE(?:2)?(?:_|$)/u;
+const GIT_TRANSPORT_ENVIRONMENT_KEY_PATTERN = /^GIT_(?:CURL|HTTP|HTTPS|NO_PROXY|PROXY|SSL)(?:_|$)/u;
 
 export type AgentCommandPolicyPathStyle = "windows" | "posix" | "unc" | "bare" | "unknown";
 
@@ -290,6 +332,7 @@ export interface AgentCommandPolicyAuditPayload {
   readonly commandClass: AgentCommandPolicyCommandClass;
   readonly inlineEnvironmentKeys: readonly string[];
   readonly unsafeConfigCategories: readonly AgentCommandPolicyUnsafeGitConfigCategory[];
+  readonly unsafeConfigFindings?: readonly AgentCommandPolicyUnsafeGitConfigFinding[] | undefined;
   readonly upstreamContactAttempted: boolean;
   readonly outcome?: AgentCommandPolicyOutcome | undefined;
   readonly reasonKind?: AgentCommandPolicyReasonKind | undefined;
@@ -1466,12 +1509,16 @@ function redactSensitiveCommandTokens(tokens: readonly string[]): string[] {
   const redacted: string[] = [];
   let atCommandStart = true;
   let redactNextAuthValue = false;
+  let redactNextGitConfigValue = false;
+  let sawGitExecutable = false;
 
   for (const token of tokens) {
     if (isShellControlOperator(token)) {
       redacted.push(token);
       atCommandStart = true;
       redactNextAuthValue = false;
+      redactNextGitConfigValue = false;
+      sawGitExecutable = false;
       continue;
     }
 
@@ -1482,9 +1529,26 @@ function redactSensitiveCommandTokens(tokens: readonly string[]): string[] {
       continue;
     }
 
+    if (redactNextGitConfigValue) {
+      redacted.push(redactGitConfigAssignmentValue(token));
+      redactNextGitConfigValue = false;
+      atCommandStart = false;
+      continue;
+    }
+
     const environmentAssignment = parseEnvironmentAssignment(token);
     if (environmentAssignment && (atCommandStart || isSensitiveAssignmentKey(environmentAssignment.key))) {
       redacted.push(`${environmentAssignment.key}=${REDACTED_VALUE}`);
+      continue;
+    }
+
+    if (atCommandStart) {
+      sawGitExecutable = normalizeExecutableName(token) === "git";
+    } else if (sawGitExecutable && isGitInlineConfigOption(token)) {
+      const gitConfigOption = redactGitConfigOptionToken(token);
+      redacted.push(gitConfigOption.token);
+      redactNextGitConfigValue = gitConfigOption.redactNextValue;
+      atCommandStart = false;
       continue;
     }
 
@@ -1523,6 +1587,27 @@ function redactAuthOptionToken(token: string): { readonly token: string; readonl
   }
 
   return { token: redactSensitiveCommandText(token), redactNextValue: false };
+}
+
+function redactGitConfigOptionToken(token: string): { readonly token: string; readonly redactNextValue: boolean } {
+  if (token === "-c" || token === "--config-env") return { token, redactNextValue: true };
+  if (token.startsWith("-c")) {
+    return { token: `-c${redactGitConfigAssignmentValue(token.slice(2))}`, redactNextValue: false };
+  }
+  if (token.startsWith("--config-env=")) {
+    return {
+      token: `--config-env=${redactGitConfigAssignmentValue(token.slice("--config-env=".length))}`,
+      redactNextValue: false,
+    };
+  }
+  return { token: redactSensitiveCommandText(token), redactNextValue: false };
+}
+
+function redactGitConfigAssignmentValue(configText: string): string {
+  const separatorIndex = configText.indexOf("=");
+  if (separatorIndex < 0) return configText.length === 0 ? REDACTED_VALUE : configText;
+  const key = configText.slice(0, separatorIndex).trim();
+  return `${key.length === 0 ? REDACTED_VALUE : key}=${REDACTED_VALUE}`;
 }
 
 function redactSensitiveCommandText(text: string): string {
@@ -1597,19 +1682,22 @@ function classifyGitCommand(
   }
 
   if (LOCAL_INSPECTION_GIT_SUBCOMMANDS.has(gitSubcommand)) {
-    const unsafeConfigCategories = localGitInspectionUnsafeConfigCategories(
+    const unsafeConfigEvidence = localGitInspectionUnsafeConfigEvidence(
       input,
       tokens,
       gitSubcommandDetails.index,
       command,
     );
-    if (unsafeConfigCategories.length > 0) {
+    if (unsafeConfigEvidence.categories.length > 0) {
       return denyDecision(
         input,
         {
           ...gitAudit,
           commandClass: "git_local_inspection_with_helper",
-          unsafeConfigCategories,
+          unsafeConfigCategories: unsafeConfigEvidence.categories,
+          ...(unsafeConfigEvidence.findings.length === 0
+            ? {}
+            : { unsafeConfigFindings: unsafeConfigEvidence.findings }),
           upstreamContactAttempted: false,
         },
         "unsafe_git_config",
@@ -1900,6 +1988,17 @@ interface GitSubcommandDetails {
   readonly index: number;
 }
 
+interface LocalGitRepositorySelection {
+  readonly workingDirectory: string;
+  readonly repositorySelectionRequired: boolean;
+  readonly gitDirectory?: string | undefined;
+  readonly workTreeDirectory?: string | undefined;
+}
+
+type LocalGitRepositorySelectionResult =
+  | { readonly status: "ok"; readonly selection: LocalGitRepositorySelection }
+  | { readonly status: "ambiguous"; readonly finding: AgentCommandPolicyUnsafeGitConfigFinding };
+
 function extractGitSubcommand(tokens: string[]): string | null {
   return extractGitSubcommandDetails(tokens)?.subcommand ?? null;
 }
@@ -1916,15 +2015,179 @@ function extractGitSubcommandDetails(tokens: string[]): GitSubcommandDetails | n
       }
       continue;
     }
-    if (token === "-C" || token === "--git-dir" || token === "--work-tree" || token === "-c") {
+    if (
+      token === "-C" ||
+      token === "--git-dir" ||
+      token === "--work-tree" ||
+      token === "-c" ||
+      token === "--config-env" ||
+      token === "--exec-path"
+    ) {
       index += 1;
       continue;
     }
-    if (token.startsWith("--git-dir=") || token.startsWith("--work-tree=") || token.startsWith("-c")) continue;
+    if (
+      token.startsWith("--git-dir=") ||
+      token.startsWith("--work-tree=") ||
+      token.startsWith("-C") ||
+      (token.startsWith("-c") && token !== "-c") ||
+      token.startsWith("--config-env=") ||
+      token.startsWith("--exec-path=")
+    ) {
+      continue;
+    }
     if (token.startsWith("-")) continue;
     return { subcommand: token.toLowerCase(), index };
   }
   return null;
+}
+
+function localGitRepositorySelectionForInspection(
+  tokens: readonly string[],
+  gitSubcommandIndex: number,
+  initialWorkingDirectory: string,
+): LocalGitRepositorySelectionResult {
+  let sawGit = false;
+  let workingDirectory = path.resolve(initialWorkingDirectory);
+  let repositorySelectionRequired = false;
+  let rawGitDirectory: string | undefined;
+  let rawWorkTreeDirectory: string | undefined;
+
+  for (let index = 0; index < gitSubcommandIndex; index += 1) {
+    const token = tokens[index];
+    if (token === undefined) continue;
+
+    if (!sawGit) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) continue;
+      if (normalizeExecutableName(token) === "git") sawGit = true;
+      continue;
+    }
+
+    if (token === "-C") {
+      const selectedPath = gitOptionValue(tokens, index, workingDirectory, "<missing_git_c_path>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      workingDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("-C") && token !== "-C") {
+      const selectedPath = resolveGitSelectionPath(token.slice(2), workingDirectory, "<missing_git_c_path>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      workingDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      continue;
+    }
+
+    if (token === "--git-dir") {
+      const selectedPath = gitRawOptionValue(tokens, index, "<missing_git_dir>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      rawGitDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--git-dir=")) {
+      const selectedPath = gitRawPathValue(token.slice("--git-dir=".length), "<missing_git_dir>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      rawGitDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      continue;
+    }
+
+    if (token === "--work-tree") {
+      const selectedPath = gitRawOptionValue(tokens, index, "<missing_work_tree>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      rawWorkTreeDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--work-tree=")) {
+      const selectedPath = gitRawPathValue(token.slice("--work-tree=".length), "<missing_work_tree>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      rawWorkTreeDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      continue;
+    }
+
+    if (token === "-c" || token === "--config-env" || token === "--exec-path") {
+      index += 1;
+      continue;
+    }
+  }
+
+  const gitDirectory = rawGitDirectory === undefined
+    ? undefined
+    : resolveGitSelectionPath(rawGitDirectory, workingDirectory, "<missing_git_dir>");
+  if (gitDirectory?.status === "ambiguous") return gitDirectory;
+
+  const workTreeDirectory = rawWorkTreeDirectory === undefined
+    ? undefined
+    : resolveGitSelectionPath(rawWorkTreeDirectory, workingDirectory, "<missing_work_tree>");
+  if (workTreeDirectory?.status === "ambiguous") return workTreeDirectory;
+
+  return {
+    status: "ok",
+    selection: {
+      workingDirectory,
+      repositorySelectionRequired,
+      ...(gitDirectory === undefined ? {} : { gitDirectory: gitDirectory.value }),
+      ...(workTreeDirectory === undefined ? {} : { workTreeDirectory: workTreeDirectory.value }),
+    },
+  };
+}
+
+type GitSelectionPathResult =
+  | { readonly status: "ok"; readonly value: string }
+  | { readonly status: "ambiguous"; readonly finding: AgentCommandPolicyUnsafeGitConfigFinding };
+
+function gitOptionValue(
+  tokens: readonly string[],
+  optionIndex: number,
+  baseDirectory: string,
+  missingKey: string,
+): GitSelectionPathResult {
+  return resolveGitSelectionPath(tokens[optionIndex + 1] ?? "", baseDirectory, missingKey);
+}
+
+function gitRawOptionValue(tokens: readonly string[], optionIndex: number, missingKey: string): GitSelectionPathResult {
+  return gitRawPathValue(tokens[optionIndex + 1] ?? "", missingKey);
+}
+
+function gitRawPathValue(rawPath: string, missingKey: string): GitSelectionPathResult {
+  const selectedPath = rawPath.trim();
+  if (selectedPath.length === 0) {
+    return { status: "ambiguous", finding: ambiguousGitRepositorySelectionFinding(missingKey) };
+  }
+  return { status: "ok", value: selectedPath };
+}
+
+function resolveGitSelectionPath(rawPath: string, baseDirectory: string, missingKey: string): GitSelectionPathResult {
+  const selectedPath = rawPath.trim();
+  if (selectedPath.length === 0) {
+    return { status: "ambiguous", finding: ambiguousGitRepositorySelectionFinding(missingKey) };
+  }
+  return {
+    status: "ok",
+    value: isAbsolutePolicyPath(selectedPath) ? path.normalize(selectedPath) : path.resolve(baseDirectory, selectedPath),
+  };
+}
+
+function ambiguousGitRepositorySelectionFinding(key: string): AgentCommandPolicyUnsafeGitConfigFinding {
+  return {
+    source: "persisted_repo_config",
+    key,
+    category: "other",
+    effect: "ambiguous",
+  };
+}
+
+function isAbsolutePolicyPath(filePath: string): boolean {
+  return path.isAbsolute(filePath) || /^[A-Za-z]:[\\/]/u.test(filePath) || /^\\\\/u.test(filePath);
 }
 
 function isRemoteMutationCommand(tokens: string[], gitSubcommand: string): boolean {
@@ -1987,18 +2250,32 @@ function isShellControlOperator(token: string): boolean {
   return token === ";" || token === "|" || token === "&" || token === "&&" || token === "||";
 }
 
-function localGitInspectionUnsafeConfigCategories(
+interface LocalGitInspectionUnsafeConfigEvidence {
+  readonly categories: readonly AgentCommandPolicyUnsafeGitConfigCategory[];
+  readonly findings: readonly AgentCommandPolicyUnsafeGitConfigFinding[];
+}
+
+function localGitInspectionUnsafeConfigEvidence(
   input: AgentCommandPolicyInput,
   tokens: readonly string[],
   gitSubcommandIndex: number,
   command: string,
-): AgentCommandPolicyUnsafeGitConfigCategory[] {
+): LocalGitInspectionUnsafeConfigEvidence {
   const categories = new Set<AgentCommandPolicyUnsafeGitConfigCategory>();
+  const findings: AgentCommandPolicyUnsafeGitConfigFinding[] = [];
 
   if (containsInlineUnsafeLocalGitOption(command)) categories.add("external_diff");
 
-  addUnsafeLocalGitEnvironmentCategories(categories, extractInlineEnvironmentAssignments(tokens));
-  addUnsafeLocalGitEnvironmentCategories(categories, inheritedEnvironmentAssignments(input.environment));
+  addUnsafeLocalGitEnvironmentCategories(
+    categories,
+    extractInlineEnvironmentAssignments(tokens),
+    "inline_env",
+  );
+  addUnsafeLocalGitEnvironmentCategories(
+    categories,
+    inheritedEnvironmentAssignments(input.environment),
+    "inherited_env",
+  );
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
@@ -2026,48 +2303,179 @@ function localGitInspectionUnsafeConfigCategories(
     }
   }
 
-  return sortedUniqueKeys(categories) as AgentCommandPolicyUnsafeGitConfigCategory[];
+  const repositorySelection = localGitRepositorySelectionForInspection(tokens, gitSubcommandIndex, input.workingDirectory);
+  if (repositorySelection.status === "ambiguous") {
+    categories.add(repositorySelection.finding.category);
+    findings.push(repositorySelection.finding);
+  } else {
+    try {
+      for (const finding of inspectPersistedGitConfigForUnsafeEntries({
+        workingDirectory: repositorySelection.selection.workingDirectory,
+        environment: input.environment,
+        repositorySelectionRequired: repositorySelection.selection.repositorySelectionRequired,
+        gitDirectory: repositorySelection.selection.gitDirectory,
+        workTreeDirectory: repositorySelection.selection.workTreeDirectory,
+      })) {
+        categories.add(finding.category);
+        findings.push(finding);
+      }
+    } catch {
+      const finding: AgentCommandPolicyUnsafeGitConfigFinding = {
+        source: "unknown",
+        key: "<persisted_git_config_inspection_error>",
+        category: "other",
+        effect: "ambiguous",
+      };
+      categories.add(finding.category);
+      findings.push(finding);
+    }
+  }
+
+  return {
+    categories: sortedUniqueKeys(categories) as AgentCommandPolicyUnsafeGitConfigCategory[],
+    findings,
+  };
+}
+
+interface GitConfigEnvironmentEntry {
+  key: string | undefined;
+  value: string | undefined;
 }
 
 function addUnsafeLocalGitEnvironmentCategories(
   categories: Set<AgentCommandPolicyUnsafeGitConfigCategory>,
   environment: ReadonlyMap<string, string | undefined>,
+  source: "inline_env" | "inherited_env",
 ): void {
   let hasGitConfigEnvironment = false;
   let hasSpecificGitConfigCategory = false;
+  let hasAmbiguousGitConfigEnvironment = false;
+  let gitConfigCountValue: string | undefined;
+  const indexedGitConfigEntries = new Map<number, GitConfigEnvironmentEntry>();
 
   for (const [key, value] of environment) {
     const normalizedKey = normalizeEnvironmentKeyForPolicy(key);
-    const category = UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES.get(normalizedKey);
+    const inlineOnlyCategory =
+      source === "inline_env"
+        ? INLINE_ONLY_UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES.get(normalizedKey)
+        : undefined;
+    const category =
+      UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES.get(normalizedKey) ?? inlineOnlyCategory;
     if (category !== undefined) {
       categories.add(category);
       continue;
     }
 
-    if (GIT_CONFIG_KEY_ENVIRONMENT_KEY_PATTERN.test(normalizedKey)) {
-      hasGitConfigEnvironment = true;
-      if (value !== undefined && value.trim().length > 0) {
-        categories.add(unsafeGitConfigCategoryFromConfigText(value));
-        hasSpecificGitConfigCategory = true;
-      }
+    const gitEnvironmentPatternCategory = unsafeLocalGitEnvironmentPatternCategory(normalizedKey);
+    if (gitEnvironmentPatternCategory !== undefined) {
+      categories.add(gitEnvironmentPatternCategory);
       continue;
     }
 
     if (normalizedKey === "GIT_CONFIG_PARAMETERS") {
       hasGitConfigEnvironment = true;
-      if (value !== undefined && value.trim().length > 0) {
-        categories.add(unsafeGitConfigCategoryFromConfigText(value));
+      const configText = nonEmptyGitConfigEnvironmentValue(value);
+      if (configText !== undefined) {
+        categories.add(unsafeGitConfigCategoryFromConfigText(configText));
         hasSpecificGitConfigCategory = true;
+      } else {
+        hasAmbiguousGitConfigEnvironment = true;
       }
+      continue;
+    }
+
+    if (normalizedKey === "GIT_CONFIG_COUNT") {
+      hasGitConfigEnvironment = true;
+      gitConfigCountValue = value;
+      if (parseGitConfigCount(value) === null) hasAmbiguousGitConfigEnvironment = true;
+      continue;
+    }
+
+    const indexedGitConfigMatch = GIT_CONFIG_INDEXED_ENVIRONMENT_KEY_PATTERN.exec(normalizedKey);
+    if (indexedGitConfigMatch !== null) {
+      hasGitConfigEnvironment = true;
+      const field = indexedGitConfigMatch[1];
+      const rawIndex = indexedGitConfigMatch[2];
+      const index = rawIndex === undefined ? Number.NaN : Number.parseInt(rawIndex, 10);
+      if (
+        !Number.isSafeInteger(index) ||
+        index < 0 ||
+        index >= MAX_GIT_CONFIG_ENVIRONMENT_COUNT
+      ) {
+        hasAmbiguousGitConfigEnvironment = true;
+        continue;
+      }
+      const entry = indexedGitConfigEntries.get(index) ?? { key: undefined, value: undefined };
+      if (field === "KEY") {
+        entry.key = value;
+      } else {
+        entry.value = value;
+      }
+      indexedGitConfigEntries.set(index, entry);
       continue;
     }
 
     if (GIT_CONFIG_ENVIRONMENT_KEY_PATTERN.test(normalizedKey)) {
       hasGitConfigEnvironment = true;
+      hasAmbiguousGitConfigEnvironment = true;
+      continue;
+    }
+
+    const inlineGitEnvironmentCategory =
+      source === "inline_env" ? unsafeInlineGitEnvironmentFallbackCategory(normalizedKey) : undefined;
+    if (inlineGitEnvironmentCategory !== undefined) {
+      categories.add(inlineGitEnvironmentCategory);
     }
   }
 
+  for (const index of gitConfigEnvironmentIndexes(gitConfigCountValue, indexedGitConfigEntries)) {
+    const entry = indexedGitConfigEntries.get(index);
+    const configKey = nonEmptyGitConfigEnvironmentValue(entry?.key);
+    const configValue = nonEmptyGitConfigEnvironmentValue(entry?.value);
+    if (configKey === undefined) {
+      hasAmbiguousGitConfigEnvironment = true;
+      if (configValue !== undefined) {
+        const category = unsafeGitConfigCategoryFromConfigText(configValue);
+        if (category !== "other") {
+          categories.add(category);
+          hasSpecificGitConfigCategory = true;
+        }
+      }
+      continue;
+    }
+
+    categories.add(unsafeGitConfigCategoryFromGitConfigPair(configKey, configValue));
+    hasSpecificGitConfigCategory = true;
+  }
+
+  if (hasAmbiguousGitConfigEnvironment) categories.add("other");
   if (hasGitConfigEnvironment && !hasSpecificGitConfigCategory) categories.add("other");
+}
+
+function gitConfigEnvironmentIndexes(
+  gitConfigCountValue: string | undefined,
+  indexedGitConfigEntries: ReadonlyMap<number, GitConfigEnvironmentEntry>,
+): number[] {
+  const indexes = new Set<number>(indexedGitConfigEntries.keys());
+  const gitConfigCount = parseGitConfigCount(gitConfigCountValue);
+  if (gitConfigCount !== null) {
+    for (let index = 0; index < gitConfigCount; index += 1) indexes.add(index);
+  }
+  return [...indexes].sort((left, right) => left - right);
+}
+
+function parseGitConfigCount(value: string | undefined): number | null {
+  const normalizedValue = nonEmptyGitConfigEnvironmentValue(value);
+  if (normalizedValue === undefined || !/^\d+$/u.test(normalizedValue)) return null;
+  const count = Number.parseInt(normalizedValue, 10);
+  return Number.isSafeInteger(count) && count <= MAX_GIT_CONFIG_ENVIRONMENT_COUNT
+    ? count
+    : null;
+}
+
+function nonEmptyGitConfigEnvironmentValue(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed === undefined || trimmed.length === 0 ? undefined : trimmed;
 }
 
 function extractInlineEnvironmentAssignments(tokens: readonly string[]): ReadonlyMap<string, string> {
@@ -2102,6 +2510,39 @@ function inheritedEnvironmentAssignments(
 
 function normalizeEnvironmentKeyForPolicy(key: string): string {
   return key.trim().toUpperCase();
+}
+
+function unsafeLocalGitEnvironmentPatternCategory(
+  normalizedKey: string,
+): AgentCommandPolicyUnsafeGitConfigCategory | undefined {
+  if (GIT_TRACE_ENVIRONMENT_KEY_PATTERN.test(normalizedKey)) return "other";
+  if (GIT_TRANSPORT_ENVIRONMENT_KEY_PATTERN.test(normalizedKey) || normalizedKey === "GIT_SSH_VARIANT") {
+    return "transport_helper";
+  }
+  if (normalizedKey === "GIT_TERMINAL_PROMPT") return "credential_helper";
+  return undefined;
+}
+
+function unsafeInlineGitEnvironmentFallbackCategory(
+  normalizedKey: string,
+): AgentCommandPolicyUnsafeGitConfigCategory | undefined {
+  if (!normalizedKey.startsWith("GIT_")) return undefined;
+  if (normalizedKey.startsWith("GIT_CONFIG_")) return "other";
+  if (normalizedKey.includes("ASKPASS") || normalizedKey.includes("CREDENTIAL")) return "credential_helper";
+  if (
+    normalizedKey.includes("SSH") ||
+    normalizedKey.includes("PROXY") ||
+    normalizedKey.includes("PROTOCOL") ||
+    normalizedKey.includes("HTTP") ||
+    normalizedKey.includes("SSL") ||
+    normalizedKey.includes("CURL")
+  ) {
+    return "transport_helper";
+  }
+  if (normalizedKey.includes("PAGER")) return "pager";
+  if (normalizedKey.includes("DIFF")) return "external_diff";
+  if (normalizedKey.includes("EXEC") || normalizedKey.includes("HELPER")) return "other";
+  return "git_environment";
 }
 
 function isHelperFreeLocalGitInspectionInvocation(
@@ -2232,29 +2673,66 @@ function unsafeGitConfigCategoryFromInlineConfigOption(
 }
 
 function unsafeGitConfigCategoryFromConfigText(configText: string): AgentCommandPolicyUnsafeGitConfigCategory {
-  const normalizedConfigText = configText.toLowerCase();
-  if (normalizedConfigText.startsWith("alias.")) return "alias";
-  if (normalizedConfigText.includes("pager")) return "pager";
+  const normalizedConfigText = stripMatchingOuterQuotes(configText.trim()).toLowerCase();
+  const normalizedConfigKey = gitConfigKeyFromConfigText(normalizedConfigText);
+  if (normalizedConfigKey.startsWith("alias.")) return "alias";
+  if (normalizedConfigKey === "core.pager" || normalizedConfigKey.startsWith("pager.") || normalizedConfigText.includes("pager")) {
+    return "pager";
+  }
   if (
+    normalizedConfigKey === "core.externaldiff" ||
+    (normalizedConfigKey.startsWith("diff.") &&
+      (normalizedConfigKey.endsWith(".command") || normalizedConfigKey.endsWith(".textconv"))) ||
+    normalizedConfigKey.startsWith("difftool.") ||
     normalizedConfigText.includes("external") ||
     normalizedConfigText.includes("extcmd") ||
     normalizedConfigText.includes("textconv")
   ) {
     return "external_diff";
   }
-  if (normalizedConfigText.includes("credential")) return "credential_helper";
-  if (normalizedConfigText.includes("hook")) return "hook";
-  if (normalizedConfigText.startsWith("filter.")) return "filter";
-  if (normalizedConfigText.includes("signing") || normalizedConfigText.includes("gpg")) return "signing_program";
-  if (normalizedConfigText.includes("fsmonitor")) return "filesystem_monitor";
+  if (normalizedConfigKey.startsWith("credential.") || normalizedConfigText.includes("credential")) {
+    return "credential_helper";
+  }
+  if (normalizedConfigKey === "core.hookspath" || normalizedConfigKey.startsWith("hook.") || normalizedConfigText.includes("hook")) {
+    return "hook";
+  }
+  if (normalizedConfigKey.startsWith("filter.")) return "filter";
   if (
+    normalizedConfigKey === "gpg.program" ||
+    normalizedConfigKey === "gpg.ssh.program" ||
+    normalizedConfigText.includes("signing") ||
+    normalizedConfigText.includes("gpg")
+  ) {
+    return "signing_program";
+  }
+  if (normalizedConfigKey === "core.fsmonitor" || normalizedConfigText.includes("fsmonitor")) return "filesystem_monitor";
+  if (
+    normalizedConfigKey === "core.sshcommand" ||
+    normalizedConfigKey === "core.gitproxy" ||
+    normalizedConfigKey.startsWith("protocol.") ||
+    normalizedConfigKey.startsWith("url.") ||
     normalizedConfigText.includes("ssh") ||
+    normalizedConfigText.includes("proxy") ||
     normalizedConfigText.includes("insteadof") ||
     normalizedConfigText.includes("pushinsteadof")
   ) {
     return "transport_helper";
   }
   return "other";
+}
+
+function unsafeGitConfigCategoryFromGitConfigPair(
+  configKey: string,
+  configValue: string | undefined,
+): AgentCommandPolicyUnsafeGitConfigCategory {
+  const keyCategory = unsafeGitConfigCategoryFromConfigText(configKey);
+  if (keyCategory !== "other") return keyCategory;
+  return configValue === undefined ? "other" : unsafeGitConfigCategoryFromConfigText(`${configKey}=${configValue}`);
+}
+
+function gitConfigKeyFromConfigText(normalizedConfigText: string): string {
+  const separatorIndex = normalizedConfigText.indexOf("=");
+  return (separatorIndex < 0 ? normalizedConfigText : normalizedConfigText.slice(0, separatorIndex)).trim();
 }
 
 function inlineGitConfigText(tokens: readonly string[], optionIndex: number, token: string): string {

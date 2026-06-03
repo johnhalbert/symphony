@@ -129,10 +129,13 @@ import {
   type DurableProjectionName,
   type ProjectionPayloadRecord,
   type ProjectionPayloadWriteInput,
+  type ProjectionRevisionRecord,
+  type ProjectionRevisionSelector,
   type ProjectionSourceRevision,
   type ProjectionWriteResult,
 } from "../core/persistence/ProjectionTransactionService.js";
 import type { ProjectionSourceFreshnessInput } from "../core/persistence/ProjectionSourceFreshness.js";
+
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -163,7 +166,9 @@ export interface StatusServerProjectionWriter {
   writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult>;
 }
 
-export interface StatusServerProjectionReader extends WebProjectionPayloadReader {}
+export interface StatusServerProjectionReader extends WebProjectionPayloadReader {
+  readCurrentRevision?(selector: ProjectionRevisionSelector): Promise<ProjectionRevisionRecord | null>;
+}
 
 export type StatusServerProjectionRebuildEntryStatus = ProjectionWriteResult["status"] | "skipped" | "failed";
 
@@ -560,13 +565,15 @@ export class StatusServer {
           sendJson(response, 200, projectWebReferenceData(durableIssues.record.payload), durableProjectionReadHeaders(durableIssues));
           return;
         }
-        if (this.hasDurableProjectionReader()) {
+        if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
           sendJson(response, 200, projectWebReferenceData(null), durableProjectionReadHeaders(durableIssues));
           return;
         }
         let board: IssueBoardResponse | null = null;
+        let projection: { sourceIndex: BuiltWebProjectionSourceIndex; issueBoardColumns: IssueBoardColumnMapping } | null = null;
         try {
-          board = await this.fetchIssueBoard(forceRefresh);
+          projection = await this.fetchWebProjectionSourceIndex(forceRefresh);
+          board = await this.buildIssueBoardFromSourceIndex(projection.sourceIndex, projection.issueBoardColumns);
         } catch (error) {
           if (
             !(error instanceof SymphonyError) ||
@@ -575,9 +582,16 @@ export class StatusServer {
             throw error;
           }
         }
+        if (forceRefresh && projection) {
+          await this.persistWebIssueBoardProjection(projectWebIssueBoard(board), {
+            sourceIndex: projection.sourceIndex,
+            issueBoardColumns: projection.issueBoardColumns,
+          });
+        }
         sendJson(response, 200, projectWebReferenceData(board), durableProjectionReadHeaders(durableIssues));
         return;
       }
+
       if (request.method === "GET" && url.pathname === "/api/v1/web/dashboard") {
         const dashboard = await this.fetchWebDashboard(isWebProjectionRefreshRequested(url.searchParams.get("refresh")));
         sendJson(response, 200, dashboard.body, dashboard.headers);
@@ -607,7 +621,7 @@ export class StatusServer {
           sendJson(response, 200, durableIssues.record.payload, durableProjectionReadHeaders(durableIssues));
           return;
         }
-        if (this.hasDurableProjectionReader()) {
+        if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
           sendJson(response, 200, projectWebIssueBoard(null), durableProjectionReadHeaders(durableIssues));
           return;
         }
@@ -727,7 +741,7 @@ export class StatusServer {
             );
             return;
           }
-          if (this.hasDurableProjectionReader()) {
+          if (this.shouldReturnDurableOrchestratorChatFallback(durableChat, forceRefresh)) {
             sendJson(response, 200, [], durableProjectionReadHeaders(durableChat));
             return;
           }
@@ -848,7 +862,7 @@ export class StatusServer {
             throw error;
           }
           if (!result) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
-          if (decision === "reject") {
+          if (decision === "reject" && !result.replayed) {
             await this.recordRejectedApprovalRunTerminal(result.request);
           }
           if (decision === "approve" && result.request.status === "approved") {
@@ -1736,7 +1750,7 @@ export class StatusServer {
       };
     }
 
-    if (this.hasDurableProjectionReader()) {
+    if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
       return webProjectionJsonResponse(null, durableRead);
     }
 
@@ -1814,7 +1828,7 @@ export class StatusServer {
       return webProjectionJsonResponse(durableDashboard.record.payload, durableDashboard);
     }
 
-    if (this.hasDurableProjectionReader()) {
+    if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
       return webProjectionJsonResponse(this.buildProjectionFallbackDashboard(), durableDashboard);
     }
 
@@ -2093,7 +2107,7 @@ export class StatusServer {
       return webProjectionJsonResponse(durableSidebar.record.payload, durableSidebar);
     }
 
-    if (this.hasDurableProjectionReader()) {
+    if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
       return webProjectionJsonResponse(this.buildProjectionFallbackSidebar(), durableSidebar);
     }
 
@@ -2247,6 +2261,24 @@ export class StatusServer {
 
   private hasDurableProjectionReader(): boolean {
     return Boolean(this.options.projectionReader);
+  }
+
+  private hasDurableProjectionWriter(): boolean {
+    return Boolean(this.options.projectionWriter);
+  }
+
+  private shouldReturnDurableProjectionFallback(forceRefresh: boolean): boolean {
+    return this.hasDurableProjectionReader() && (!forceRefresh || !this.hasDurableProjectionWriter());
+  }
+
+  private shouldReturnDurableOrchestratorChatFallback(
+    read: DurableProjectionReadResult<unknown>,
+    forceRefresh: boolean,
+  ): boolean {
+    if (!this.hasDurableProjectionReader()) return false;
+    if (forceRefresh && this.hasDurableProjectionWriter()) return false;
+    if (read.status === "expired" && this.hasDurableProjectionWriter()) return false;
+    return true;
   }
 
   private buildProjectionFallbackDashboard(): ReturnType<typeof projectWebDashboard> {
@@ -2487,11 +2519,16 @@ export class StatusServer {
     issueBoardColumns: IssueBoardColumnMapping,
   ): Promise<WebProjectionCacheFingerprint> {
     const fetchedStates = webProjectionIssueBoardFetchStates(issueBoardColumns);
+    const [durableSourceRevisions, durableProjectionRevisions] = await Promise.all([
+      this.resolveWebProjectionSourceRevisions(),
+      this.resolveWebProjectionDurableProjectionRevisions(),
+    ]);
     return createWebProjectionFingerprint({
       runtimeGeneratedAt: statusServerRuntimeFingerprintKey(snapshot),
       issueBoardStates: [issueBoardFetchedStateCacheKey(fetchedStates)],
       issueBoardColumns: issueBoardColumnCacheKeyValues(issueBoardColumns),
-      durableSourceRevisions: await this.resolveWebProjectionSourceRevisions(),
+      durableSourceRevisions,
+      durableProjectionRevisions,
     });
   }
 
@@ -2499,6 +2536,20 @@ export class StatusServer {
     const providers = this.webProjectionRevisionProviders;
     if (providers.length === 0) return [];
     return Promise.all(providers.map((provider) => provider.getRevision()));
+  }
+
+  private async resolveWebProjectionDurableProjectionRevisions(): Promise<readonly WebProjectionSourceRevision[]> {
+    const reader = this.options.projectionReader;
+    if (!reader?.readCurrentRevision) return [];
+    return Promise.all(
+      statusServerWebProjectionContextDurableRevisionSelectors().map(async (selector) => {
+        try {
+          return durableProjectionRevisionFingerprint(selector, await reader.readCurrentRevision!(selector));
+        } catch {
+          return durableProjectionRevisionFingerprint(selector, null, "error");
+        }
+      }),
+    );
   }
 
   private async isWebProjectionContextCurrent(
@@ -2600,6 +2651,38 @@ function isStatusServerProjectionRevisionStore(store: unknown): store is StatusS
       typeof (store as Partial<StatusServerProjectionRevisionStore>).projectionRevision === "function" &&
       typeof (store as Partial<StatusServerProjectionRevisionStore>).onProjectionChanged === "function",
   );
+}
+
+function statusServerWebProjectionContextDurableRevisionSelectors(): readonly ProjectionRevisionSelector[] {
+  return [
+    { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+    { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+    {
+      projectionName: "history_projection",
+      scopeKind: "global_collection",
+      scopeKey: webHistoryProjectionScopeKey({
+        sessionLimit: WEB_HISTORY_DEFAULT_SESSION_LIMIT,
+        timelineLimit: WEB_HISTORY_DEFAULT_TIMELINE_LIMIT,
+      }),
+    },
+  ];
+}
+
+function durableProjectionRevisionFingerprint(
+  selector: ProjectionRevisionSelector,
+  record: ProjectionRevisionRecord | null,
+  missingRevision: string | number = 0,
+): WebProjectionSourceRevision {
+  return {
+    source: durableProjectionRevisionFingerprintSource(selector),
+    revision: record?.revision ?? missingRevision,
+    observedAt: record?.generatedAt ?? null,
+  };
+}
+
+function durableProjectionRevisionFingerprintSource(selector: ProjectionRevisionSelector): string {
+  return ["projection", selector.projectionName, selector.scopeKind ?? "global", selector.scopeKey ?? "global"].join(":");
 }
 
 async function readRunActivityTranscriptPage(

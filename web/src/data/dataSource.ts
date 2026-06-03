@@ -38,6 +38,7 @@ export type ProjectionChangeListener = (event: ProjectionChangeEvent) => void;
 export type ProjectionChangeUnsubscribe = () => void;
 
 export interface CacheInvalidationOptions {
+  /** API hrefs affected by a realtime update. Listed paths are invalidated selectively; refresh=1 hints are replayed on the next GET. */
   forceRefreshHrefs?: readonly string[];
 }
 
