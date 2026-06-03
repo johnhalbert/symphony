@@ -2,17 +2,45 @@ import {
   classifyAgentCommand,
   environmentKeysOnly,
   type AgentCommandPolicyClassifier,
+  type AgentCommandPolicyDecision,
   type AgentCommandPolicyInput,
   type AgentCommandPolicyRawInput,
 } from "./AgentCommandPolicy.js";
+import type {
+  HermesAcpPermissionDecision,
+  HermesAcpPermissionOptionId,
+} from "../../../hermes/src/HermesAcpPermissions.js";
 import type {
   HermesAcpPermissionResolver,
   HermesAcpPermissionResolverInput,
 } from "../../../hermes/src/HermesAcpHarness.js";
 
+export type AgentCommandPolicyAcpAllowOptionId = Extract<
+  HermesAcpPermissionOptionId,
+  "allow_once" | "allow_session"
+>;
+
+export interface AgentCommandPolicyAcpOutcomeMapperOptions {
+  allowOptionId?: AgentCommandPolicyAcpAllowOptionId | undefined;
+}
+
+export type AgentCommandPolicyAcpOutcomeMapper = (
+  decision: AgentCommandPolicyDecision,
+  options?: AgentCommandPolicyAcpOutcomeMapperOptions,
+) => HermesAcpPermissionDecision;
+
+export const DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID: AgentCommandPolicyAcpAllowOptionId = "allow_once";
+
+const AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_IDS = new Set<string>([
+  "allow_once",
+  "allow_session",
+]);
+
 export interface AgentCommandPolicyAcpResolverOptions {
   classify?: AgentCommandPolicyClassifier | undefined;
   environment?: Record<string, string | undefined> | undefined;
+  allowOptionId?: AgentCommandPolicyAcpAllowOptionId | undefined;
+  mapPolicyDecisionToAcpPermission?: AgentCommandPolicyAcpOutcomeMapper | undefined;
 }
 
 export type AgentCommandPolicyAcpResolverInputResult =
@@ -23,6 +51,8 @@ export function createAgentCommandPolicyAcpResolver(
   options: AgentCommandPolicyAcpResolverOptions = {},
 ): HermesAcpPermissionResolver {
   const classify = options.classify ?? classifyAgentCommand;
+  const mapPolicyDecisionToAcpPermission =
+    options.mapPolicyDecisionToAcpPermission ?? mapAgentCommandPolicyDecisionToAcpPermissionDecision;
   return async (input) => {
     if (input.request.requestKind !== "terminal_execute") {
       return { optionId: null, reason: "unsupported_agent_command_policy_permission_kind" };
@@ -35,12 +65,37 @@ export function createAgentCommandPolicyAcpResolver(
 
     try {
       const decision = await classify(policyInput.input);
-      if (decision.outcome === "deny") return { optionId: null, reason: decision.reasonKind };
-      return { optionId: "allow_once", reason: decision.reasonKind };
+      return mapPolicyDecisionToAcpPermission(decision, { allowOptionId: options.allowOptionId });
     } catch {
       return { optionId: null, reason: "classifier_error" };
     }
   };
+}
+
+export function mapAgentCommandPolicyDecisionToAcpPermissionDecision(
+  decision: AgentCommandPolicyDecision,
+  options: AgentCommandPolicyAcpOutcomeMapperOptions = {},
+): HermesAcpPermissionDecision {
+  if (decision.outcome === "deny") return { optionId: null, reason: decision.reasonKind };
+
+  const allowOptionId = normalizeAgentCommandPolicyAcpAllowOptionId(
+    options.allowOptionId ?? DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
+  );
+  if (!allowOptionId) {
+    return { optionId: null, reason: "unsupported_agent_command_policy_acp_allow_option" };
+  }
+
+  return { optionId: allowOptionId, reason: decision.reasonKind };
+}
+
+export const mapAgentCommandPolicyOutcomeToAcpPermissionDecision = mapAgentCommandPolicyDecisionToAcpPermissionDecision;
+
+export function isAgentCommandPolicyAcpAllowOptionId(value: unknown): value is AgentCommandPolicyAcpAllowOptionId {
+  return typeof value === "string" && AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_IDS.has(value);
+}
+
+function normalizeAgentCommandPolicyAcpAllowOptionId(value: unknown): AgentCommandPolicyAcpAllowOptionId | null {
+  return isAgentCommandPolicyAcpAllowOptionId(value) ? value : null;
 }
 
 export function buildAgentCommandPolicyInputForAcpPermission(
