@@ -416,6 +416,14 @@ async function renderAppWithMocks({
       hookCalls.history.push(options);
       return maybeEnabled(hooks.history, options);
     },
+    useTranscript: (sessionId: string | null): Loadable<TranscriptMessage[]> => {
+      const history = hooks.history.data;
+      if (!sessionId) return loaded([]);
+      if (history && Object.prototype.hasOwnProperty.call(history.transcriptBySession ?? {}, sessionId)) {
+        return loaded(history.transcriptBySession?.[sessionId] ?? []);
+      }
+      return failed(`Unexpected transcript request for ${sessionId}`);
+    },
     useSidebar: (options: HookOptions = {}) => {
       hookCalls.sidebar.push(options);
       return maybeEnabled(hooks.sidebar, options);
@@ -606,6 +614,7 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("WORKFLOW.api@api-branch");
     expect(markup).toContain("poll 5s");
     expect(markup).toContain("2/9 agents");
+    expect(markup).toContain('class="pulse"');
     expect(markup).toContain("concurrency cap 9");
     expect(markup).toContain("8/32 done");
     expect(markup).toContain("8/32 done · schedule unavailable");
@@ -714,17 +723,58 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("dashboard embedded fallback should not render");
   });
 
-  it("renders stale API dashboard data with a refresh-failure banner instead of replacing it with a first-load error", async () => {
+  it("labels refreshing API dashboard statusbar data as previous projection data with no live pulse", async () => {
+    const { markup } = await renderAppWithMocks({
+      hooks: appHookState({ dashboard: { data: apiDashboard, loading: true, error: null } }),
+    });
+
+    expect(markup).toContain("Refreshing dashboard");
+    expect(markup).toContain("Showing previous dashboard data while Symphony reloads.");
+    expect(markup).toContain("refreshing dashboard projection · 2/9 agents");
+    expect(markup).toContain("api/repo@api-branch");
+    expect(markup).not.toContain("Could not load dashboard");
+    expect(markup).not.toContain('class="pulse"');
+  });
+
+  it("renders stale API dashboard data with refresh-failure banner and previous statusbar chrome instead of replacing it with a first-load error", async () => {
     const { markup } = await renderAppWithMocks({
       hooks: appHookState({ dashboard: { data: apiDashboard, loading: false, error: "Symphony API returned HTTP 503" } }),
     });
 
     expect(markup).toContain("Could not refresh dashboard");
     expect(markup).toContain("Symphony API returned HTTP 503 Showing previous dashboard data.");
+    expect(markup).toContain("previous dashboard projection · 2/9 agents");
     expect(markup).toContain("api/repo@api-branch");
     expect(markup).toContain("tracker fresh · 4 issues");
     expect(markup).not.toContain("Could not load dashboard");
+    expect(markup).not.toContain('class="pulse"');
     expect(markup).not.toContain("openai/symphony@main");
+  });
+
+  it("suppresses statusbar live pulse when dashboard source freshness is stale or absent", async () => {
+    const staleDashboard: DashboardModel = {
+      ...apiDashboard,
+      source: {
+        ...apiDashboard.source!,
+        status: "stale",
+        label: "tracker stale · 4 cached issues",
+        detail: "Issue tracker source is stale; showing a cached dashboard projection.",
+        cached: true,
+      },
+    };
+    const sourceMissingDashboard: DashboardModel = { ...apiDashboard, source: null };
+
+    const stale = await renderAppWithMocks({ hooks: appHookState({ dashboard: loaded(staleDashboard) }) });
+    expect(stale.markup).toContain("tracker stale · 4 cached issues");
+    expect(stale.markup).toContain("Issue tracker source is stale; showing a cached dashboard projection.");
+    expect(stale.markup).toContain("stale dashboard projection · 2/9 agents");
+    expect(stale.markup).not.toContain('class="pulse"');
+
+    const sourceMissing = await renderAppWithMocks({ hooks: appHookState({ dashboard: loaded(sourceMissingDashboard) }) });
+    expect(sourceMissing.markup).toContain("source unavailable");
+    expect(sourceMissing.markup).toContain("Dashboard payload did not include freshness metadata; treating projection age as unknown.");
+    expect(sourceMissing.markup).toContain("dashboard projection freshness unknown · 2/9 agents");
+    expect(sourceMissing.markup).not.toContain('class="pulse"');
   });
 
   it("renders sidebar first-load loading and unavailable states without primary projection chrome", async () => {
@@ -774,6 +824,43 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("animation:pulse");
     expect(markup).not.toContain("spinner");
     expect(markup).not.toContain('class="pulse"');
+  });
+
+  it("uses neutral history tab badges for durable projection sessions without live copy", async () => {
+    const runningHistorySession: SessionModel = {
+      ...apiTranscriptSession,
+      id: "run-api-running-history",
+      issue: "API-RUNNING-HISTORY",
+      title: "API running history session",
+      state: "running",
+      lastEvent: "worker: running history projection",
+    };
+    const runningHistory: HistoryModel = {
+      ...apiHistory,
+      sessions: [runningHistorySession, apiEmptyTranscriptSession],
+      transcriptBySession: {
+        ...apiHistory.transcriptBySession,
+        [runningHistorySession.id]: [apiTranscriptMessage],
+      },
+      defaultSessionId: runningHistorySession.id,
+    };
+
+    const running = await renderAppWithMocks({
+      initialTab: "history",
+      hooks: appHookState({ history: loaded(runningHistory) }),
+    });
+    expect(running.hookCalls.history).toEqual([{ enabled: true }]);
+    expect(running.markup).toContain('class="badge">1 running</span>');
+    expect(running.markup).toContain("API running history session");
+    expect(running.markup).not.toContain('class="badge">1 live</span>');
+    expect(running.markup).not.toContain(">live<");
+
+    const finished = await renderAppWithMocks({
+      initialTab: "history",
+      hooks: appHookState({ history: loaded(apiHistory) }),
+    });
+    expect(finished.markup).toContain('class="badge">2</span>');
+    expect(finished.markup).not.toContain('class="badge">2 live</span>');
   });
 
   it("starts non-blocking API reference data while the dashboard is active and keeps inactive API views disabled", async () => {

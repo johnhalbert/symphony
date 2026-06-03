@@ -20,6 +20,7 @@ import {
 import { combineLiveResourceTokens, useLiveResourceState, type LiveResourceKey, type LiveResourceTokenMap } from "./hooks/useLiveResource";
 import type {
   AppTab,
+  DashboardModel,
   DashboardVariant,
   HistoryModel,
   HistoryVariant,
@@ -97,6 +98,30 @@ function resolveSidebarAgentUsageLabel(sidebar: Loadable<SidebarModel>): string 
   return `sidebar projection · ${runningLabel}`;
 }
 
+function fallbackDashboardAgentUsageLabel(dashboard: DashboardModel): string {
+  const label = dashboard.agentUsageLabel?.trim();
+  if (label) return label;
+  const count = dashboard.runningAgents.length;
+  const agentNoun = count === 1 ? "agent" : "agents";
+  return `${count} running ${agentNoun}`;
+}
+
+function resolveDashboardAgentChrome(dashboard: Loadable<DashboardModel>): { runningCount: number; agentUsageLabel: string } | null {
+  if (!dashboard.data) return null;
+
+  const usageLabel = fallbackDashboardAgentUsageLabel(dashboard.data);
+  const sourceStatus = dashboard.data.source?.status;
+  const isFreshCurrentData = sourceStatus === "fresh" && !dashboard.loading && !dashboard.error;
+  if (isFreshCurrentData) {
+    return { runningCount: dashboard.data.runningAgents.length, agentUsageLabel: usageLabel };
+  }
+
+  if (dashboard.error) return { runningCount: 0, agentUsageLabel: `previous dashboard projection · ${usageLabel}` };
+  if (dashboard.loading) return { runningCount: 0, agentUsageLabel: `refreshing dashboard projection · ${usageLabel}` };
+  if (!sourceStatus) return { runningCount: 0, agentUsageLabel: `dashboard projection freshness unknown · ${usageLabel}` };
+  return { runningCount: 0, agentUsageLabel: `${sourceStatus} dashboard projection · ${usageLabel}` };
+}
+
 function AppShell({
   initialReferenceData,
   lazyReferenceData = false,
@@ -132,8 +157,9 @@ function AppShell({
   const sidebar = useSidebar(resourceOptions(sidebarEnabled, sidebarRefreshToken));
   const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, orchestratorChatRefreshToken));
   const dashboardChrome = dashboard.data;
-  const statusbarRunningCount = dashboardChrome?.runningAgents.length ?? 0;
-  const agentUsageLabel = dashboardChrome?.agentUsageLabel ?? resolveSidebarAgentUsageLabel(sidebar);
+  const dashboardAgentChrome = resolveDashboardAgentChrome(dashboard);
+  const statusbarRunningCount = dashboardAgentChrome?.runningCount ?? 0;
+  const agentUsageLabel = dashboardAgentChrome?.agentUsageLabel ?? resolveSidebarAgentUsageLabel(sidebar);
   const tabBadges = resolveTabBadges(issueBoard.data, history.data);
 
   return (
@@ -334,10 +360,10 @@ function ViewControls({
 }
 
 function resolveTabBadges(issueBoard: IssueBoardModel | null, history: HistoryModel | null): Partial<Record<AppTab, string>> {
-  const liveSessions = history?.sessions.filter((session) => session.state === "running").length ?? null;
+  const runningSessions = history?.sessions.filter((session) => session.state === "running").length ?? null;
   return {
     issues: issueBoard ? String(issueBoard.issues.length) : undefined,
-    history: history ? (liveSessions ? `${liveSessions} live` : String(history.sessions.length)) : undefined,
+    history: history ? (runningSessions ? `${runningSessions} running` : String(history.sessions.length)) : undefined,
   };
 }
 
