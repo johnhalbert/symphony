@@ -4419,7 +4419,7 @@ describe("Orchestrator", () => {
 
     orchestrator.resumeIssue(candidate.id);
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await waitFor(() => harness.runs.length === 1, "resumed issue dispatch");
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(1);

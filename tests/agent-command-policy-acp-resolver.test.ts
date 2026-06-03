@@ -108,6 +108,38 @@ describe("AgentCommandPolicyAcpResolver", () => {
     });
   });
 
+  it.each([
+    {
+      name: "malformed option payload",
+      params: () => ({
+        ...terminalPermissionRequest("git status --short"),
+        options: [...terminalPermissionOptions(), { kind: "allow_once", name: "Missing option id" }],
+      }),
+      reason: "malformed_permission_options",
+      requestedOptionIds: ["allow_once", "allow_session", "allow_always", "deny", "deny_always"],
+    },
+    {
+      name: "duplicate option id",
+      params: () => ({
+        ...terminalPermissionRequest("git status --short"),
+        options: [...terminalPermissionOptions(), { optionId: "allow_once", kind: "allow_once", name: "Duplicate allow once" }],
+      }),
+      reason: "duplicate_permission_options",
+      requestedOptionIds: ["allow_once", "allow_session", "allow_always", "deny", "deny_always", "allow_once"],
+    },
+  ])("fails closed for $name permission requests", ({ params, reason, requestedOptionIds }) => {
+    const request = parseHermesAcpPermissionRequest(params());
+
+    expect(request.malformedReason).toBe(reason);
+    expect(request.options.map((option) => option.optionId)).toEqual(requestedOptionIds);
+    expect(resolveHermesAcpPermissionDecision(request, { optionId: "allow_once" })).toMatchObject({
+      response: { outcome: { outcome: "cancelled" } },
+      outcome: "cancelled",
+      selectedOptionId: null,
+      reason,
+    });
+  });
+
   it("maps command-policy outcomes to ACP permission decisions", () => {
     const allowDecision = allowPolicyDecision({ reasonKind: "local_only_inspection", commandClass: "local_git_inspection" });
     const denyDecision = denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" });
