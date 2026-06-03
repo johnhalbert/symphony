@@ -128,7 +128,15 @@ interface ActiveHermesAcpRun {
   symphonySessionId: string | null;
   cancelPromise: Promise<void> | null;
   cancelled: boolean;
-  permissionCancellationWaiters: Set<() => void>;
+  permissionAbortWaiters: Set<(reason: string) => void>;
+  pendingPermissionRequests: Map<string, ActiveHermesAcpPermissionRequest>;
+  emitPermissionResolution?: (resolution: HermesAcpPermissionResolution, jsonRpcRequestId: HostHermesAcpJsonRpcRequest["id"]) => void;
+}
+
+interface ActiveHermesAcpPermissionRequest {
+  request: HermesAcpPermissionRequest;
+  jsonRpcRequestId: HostHermesAcpJsonRpcRequest["id"];
+  auditedTerminalReason: string | null;
 }
 
 interface HermesAcpLeaseCompatibility {
@@ -285,6 +293,11 @@ type HermesAcpRuntimeEvent =
   | { type: "session.update"; sessionId: string | null; update: NormalizedHermesAcpSessionUpdate; raw: unknown }
   | { type: "diagnostic"; diagnostic: HostHermesAcpDiagnostic }
   | {
+      type: "permission.requested";
+      request: HermesAcpPermissionRequest;
+      jsonRpcRequestId: HostHermesAcpJsonRpcRequest["id"];
+    }
+  | {
       type: "permission.resolved";
       resolution: HermesAcpPermissionResolution;
       jsonRpcRequestId: HostHermesAcpJsonRpcRequest["id"];
@@ -292,7 +305,12 @@ type HermesAcpRuntimeEvent =
 
 const TERMINAL_SETUP_AUTH_METHOD_ID = "hermes-setup";
 const DEFAULT_PROFILE_PREFIX = "symphony";
-const RUN_CANCELLED = Symbol("hermes_acp_run_cancelled");
+const PERMISSION_ABORTED = Symbol("hermes_acp_permission_aborted");
+
+interface HermesAcpPermissionAbort {
+  type: typeof PERMISSION_ABORTED;
+  reason: string;
+}
 
 interface SelectedAuthMethod {
   id: string;
@@ -354,7 +372,8 @@ export class HermesAcpHarness implements AgentHarness {
       symphonySessionId: null,
       cancelPromise: null,
       cancelled: false,
-      permissionCancellationWaiters: new Set(),
+      permissionAbortWaiters: new Set(),
+      pendingPermissionRequests: new Map(),
     };
     this.activeRuns.set(runId, activeRun);
 
@@ -384,6 +403,9 @@ export class HermesAcpHarness implements AgentHarness {
         enqueue(mapped.event, mapped.runActivityMetadata);
       }
     };
+    activeRun.emitPermissionResolution = (resolution, jsonRpcRequestId) => {
+      enqueueRuntimeEvent({ type: "permission.resolved", resolution, jsonRpcRequestId });
+    };
     const onSessionUpdate = (params: unknown): void => {
       const event = hermesAcpSessionUpdateEvent(params);
       if (!acceptAcpSessionEvent(event, activeRun.acpSessionId)) return;
@@ -404,9 +426,23 @@ export class HermesAcpHarness implements AgentHarness {
       request: HostHermesAcpJsonRpcRequest,
     ): Promise<Record<string, unknown>> => {
       const parsedRequest = parseHermesAcpPermissionRequest(params);
-      const resolution = await this.resolvePermissionRequest(ctx, runId, activeRun, parsedRequest, request);
-      enqueueRuntimeEvent({ type: "permission.resolved", resolution, jsonRpcRequestId: request.id });
-      return resolution.response;
+      const requestKey = hermesAcpJsonRpcIdKey(request.id);
+      const activePermission: ActiveHermesAcpPermissionRequest = {
+        request: parsedRequest,
+        jsonRpcRequestId: request.id,
+        auditedTerminalReason: null,
+      };
+      activeRun.pendingPermissionRequests.set(requestKey, activePermission);
+      enqueueRuntimeEvent({ type: "permission.requested", request: parsedRequest, jsonRpcRequestId: request.id });
+      try {
+        const resolution = await this.resolvePermissionRequest(ctx, runId, activeRun, parsedRequest, request);
+        if (activePermission.auditedTerminalReason !== resolution.reason) {
+          enqueueRuntimeEvent({ type: "permission.resolved", resolution, jsonRpcRequestId: request.id });
+        }
+        return resolution.response;
+      } finally {
+        activeRun.pendingPermissionRequests.delete(requestKey);
+      }
     };
 
     const onDiagnostic = (diagnostic: HostHermesAcpDiagnostic): void => {
@@ -432,6 +468,7 @@ export class HermesAcpHarness implements AgentHarness {
     };
     const onExit = (exit: HostHermesAcpProcessExit): void => {
       this.retireLeaseAfterTransportExit(lease);
+      this.abortPendingPermissionRequests(activeRun, "acp_process_exited");
       failRun(`Host Hermes ACP process exited before the run completed (${hostHermesAcpExitDescription(exit)})`, {
         runId,
         sessionId: activeRun.symphonySessionId,
@@ -583,7 +620,7 @@ export class HermesAcpHarness implements AgentHarness {
     if (!resolver) return denyHermesAcpPermission(request, "permission_bridge_not_configured");
 
     try {
-      const decision = await this.resolvePermissionDecisionUnlessCancelled(
+      const decision = await this.resolvePermissionDecisionUnlessAborted(
         ctx,
         runId,
         activeRun,
@@ -602,18 +639,23 @@ export class HermesAcpHarness implements AgentHarness {
           "ACP permission resolver timed out",
         ),
       );
-      if (decision === RUN_CANCELLED || this.isRunCancelling(ctx, runId, activeRun)) {
+      if (isHermesAcpPermissionAbort(decision)) {
+        return denyHermesAcpPermission(request, decision.reason);
+      }
+      if (this.isRunCancelling(ctx, runId, activeRun)) {
         return denyHermesAcpPermission(request, "run_cancelled");
       }
       return resolveHermesAcpPermissionDecision(request, decision);
     } catch (error) {
+      const reason = error instanceof HermesAcpTimeoutError ? "permission_request_timeout" : "permission_bridge_error";
       ctx.logger.warn("hermes_acp permission resolver failed closed", {
         run_id: runId,
         issue_id: ctx.issue.id,
         issue_identifier: ctx.issue.identifier,
+        reason,
         error: errorMessage(error),
       });
-      return denyHermesAcpPermission(request, "permission_bridge_error");
+      return denyHermesAcpPermission(request, reason);
     }
   }
 
@@ -624,23 +666,23 @@ export class HermesAcpHarness implements AgentHarness {
     await this.interruptActiveRun(activeRun, "stop");
   }
 
-  private async resolvePermissionDecisionUnlessCancelled(
+  private async resolvePermissionDecisionUnlessAborted(
     ctx: AgentRunContext,
     runId: string,
     activeRun: ActiveHermesAcpRun,
     decisionPromise: Promise<HermesAcpPermissionDecision>,
-  ): Promise<HermesAcpPermissionDecision | typeof RUN_CANCELLED> {
-    if (this.isRunCancelling(ctx, runId, activeRun)) return RUN_CANCELLED;
+  ): Promise<HermesAcpPermissionDecision | HermesAcpPermissionAbort> {
+    if (this.isRunCancelling(ctx, runId, activeRun)) return hermesAcpPermissionAbort("run_cancelled");
 
-    let notifyCancelled: (() => void) | null = null;
-    const cancellationPromise = new Promise<typeof RUN_CANCELLED>((resolve) => {
-      notifyCancelled = () => resolve(RUN_CANCELLED);
-      activeRun.permissionCancellationWaiters.add(notifyCancelled);
+    let notifyAborted: ((reason: string) => void) | null = null;
+    const abortPromise = new Promise<HermesAcpPermissionAbort>((resolve) => {
+      notifyAborted = (reason: string) => resolve(hermesAcpPermissionAbort(reason));
+      activeRun.permissionAbortWaiters.add(notifyAborted);
     });
     try {
-      return await Promise.race([decisionPromise, cancellationPromise]);
+      return await Promise.race([decisionPromise, abortPromise]);
     } finally {
-      if (notifyCancelled) activeRun.permissionCancellationWaiters.delete(notifyCancelled);
+      if (notifyAborted) activeRun.permissionAbortWaiters.delete(notifyAborted);
     }
   }
 
@@ -651,11 +693,22 @@ export class HermesAcpHarness implements AgentHarness {
   private markRunCancelling(runId: string, activeRun: ActiveHermesAcpRun): void {
     activeRun.cancelled = true;
     this.cancelledRuns.add(runId);
-    for (const notifyCancelled of activeRun.permissionCancellationWaiters) notifyCancelled();
-    activeRun.permissionCancellationWaiters.clear();
+    this.abortPendingPermissionRequests(activeRun, "run_cancelled");
+  }
+
+  private abortPendingPermissionRequests(activeRun: ActiveHermesAcpRun, reason: string): void {
+    for (const pending of activeRun.pendingPermissionRequests.values()) {
+      if (pending.auditedTerminalReason === reason) continue;
+      const resolution = denyHermesAcpPermission(pending.request, reason);
+      pending.auditedTerminalReason = reason;
+      activeRun.emitPermissionResolution?.(resolution, pending.jsonRpcRequestId);
+    }
+    for (const notifyAborted of activeRun.permissionAbortWaiters) notifyAborted(reason);
+    activeRun.permissionAbortWaiters.clear();
   }
 
   async dispose(): Promise<void> {
+    for (const activeRun of this.activeRuns.values()) this.abortPendingPermissionRequests(activeRun, "harness_dispose");
     await Promise.all([...this.leases.values()].map((lease) => this.disposeLease(lease, null, "harness_dispose")));
     this.leases.clear();
     this.retiredReusableLeaseReasons.clear();
@@ -2618,6 +2671,34 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
   switch (event.type) {
     case "session.update":
       return mappedEvents ?? mapHermesAcpSessionUpdateWithMetadata(event.update).map((mapped) => withAcpSessionUpdateMetadata(mapped, event.sessionId, event.update));
+    case "permission.requested": {
+      const requestedOptionIds = event.request.options.map((option) => option.optionId);
+      const message = `Host Hermes ACP permission requested for ${event.request.requestKind}`;
+      const payload = {
+        acpJsonRpcRequestId: event.jsonRpcRequestId,
+        requestedOptionIds,
+        requestKind: event.request.requestKind,
+        toolCallId: event.request.toolCallId,
+        outcome: "pending",
+        selectedOptionId: null,
+        reason: "permission_requested",
+        acpSessionId: event.request.sessionId,
+        paramsPreview: preview(event.request.params, 500),
+        redacted: true,
+      };
+      return [
+        mappedAgentEvent(
+          { type: "progress", activitySource: "tool", message },
+          {
+            actor: "runtime",
+            channel: "diagnostic",
+            kind: "runtime_status_update",
+            text: message,
+            payload: { ...payload, status: "permission_requested" },
+          },
+        ),
+      ];
+    }
     case "permission.resolved": {
       const resolution = event.resolution;
       const selected = resolution.outcome === "selected";
@@ -2726,6 +2807,25 @@ function hostHermesAcpExitDescription(exit: HostHermesAcpProcessExit): string {
   return exit.error ? `${base}; process error: ${exit.error}` : base;
 }
 
+function hermesAcpPermissionAbort(reason: string): HermesAcpPermissionAbort {
+  return { type: PERMISSION_ABORTED, reason };
+}
+
+function isHermesAcpPermissionAbort(value: unknown): value is HermesAcpPermissionAbort {
+  return isRecord(value) && value.type === PERMISSION_ABORTED && typeof value.reason === "string";
+}
+
+function hermesAcpJsonRpcIdKey(id: HostHermesAcpJsonRpcRequest["id"]): string {
+  return `${typeof id}:${String(id)}`;
+}
+
+class HermesAcpTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HermesAcpTimeoutError";
+  }
+}
+
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise;
   let timeout: NodeJS.Timeout | null = null;
@@ -2733,7 +2833,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
     return await Promise.race([
       promise,
       new Promise<T>((_resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error(`${message} after ${timeoutMs}ms.`)), timeoutMs);
+        timeout = setTimeout(() => reject(new HermesAcpTimeoutError(`${message} after ${timeoutMs}ms.`)), timeoutMs);
       }),
     ]);
   } finally {
