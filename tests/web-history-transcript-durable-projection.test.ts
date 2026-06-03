@@ -339,6 +339,137 @@ describe("web history/transcript durable projection writes", () => {
     }
   });
 
+  it("rebuilds large transcript projections from durable activity pages without raw transcript hydration", async () => {
+    const projectionWriter = recordingProjectionWriter();
+    const run = runFixture({ runId: "run-large", sessionId: "session-large", transcriptEventCount: 2_050 });
+    const durableActivityStore = new InMemoryRunActivityAppendStore();
+    const appended = await durableActivityStore.appendEvents(
+      Array.from({ length: 2_050 }, (_, index) => {
+        const sequence = index + 1;
+        const text =
+          sequence === 2_050
+            ? "durable source message 2050 token=SECRET_DURABLE_TRANSCRIPT_TOKEN"
+            : `durable source message ${sequence}`;
+        return runActivityInputFixture({
+          id: `activity-large-${sequence}`,
+          runId: run.runId,
+          sessionId: run.sessionId,
+          sequence,
+          at: new Date(Date.UTC(2026, 0, 1, 0, 0, sequence)).toISOString(),
+          text,
+          payload: { messagePreview: text },
+        });
+      }),
+    );
+    expect(appended.rejected).toEqual([]);
+    const durableReadCalls: Array<{ runId: string; offset: number | undefined; limit: number | undefined }> = [];
+    const runActivitySourceStore = {
+      async readRunEvents(runId: string, options: { offset?: number; limit?: number } = {}) {
+        durableReadCalls.push({ runId, offset: options.offset, limit: options.limit });
+        return durableActivityStore.readRunEvents(runId, options);
+      },
+    };
+    let rawTranscriptReads = 0;
+    const server = createStatusServer({
+      runStore: runStoreFixture({
+        runs: [run],
+        beforeReadTranscript: () => {
+          rawTranscriptReads += 1;
+          throw new Error("large durable rebuild should not hydrate raw events.jsonl transcript pages");
+        },
+      }),
+      runActivitySourceStore,
+      projectionWriter,
+    });
+
+    const result = await server.rebuildDurableWebProjections({
+      projections: ["transcript_projection"],
+      transcriptPageLimit: 1_000,
+    });
+
+    expect(result).toMatchObject({ attempted: 4, written: 4, unchanged: 0, skipped: 0, failed: 0 });
+    expect(rawTranscriptReads).toBe(0);
+    expect(durableReadCalls).toEqual([
+      { runId: "run-large", offset: 0, limit: 1 },
+      { runId: "run-large", offset: 1_550, limit: 500 },
+      { runId: "run-large", offset: 0, limit: 1_000 },
+      { runId: "run-large", offset: 1_000, limit: 1_000 },
+      { runId: "run-large", offset: 2_000, limit: 1_000 },
+    ]);
+    expect(projectionWriter.writes.map((write) => write.scopeKey)).toEqual([
+      "run-large:offset:1550:limit:500",
+      "run-large:offset:0:limit:1000",
+      "run-large:offset:1000:limit:1000",
+      "run-large:offset:2000:limit:1000",
+    ]);
+    expect(projectionWriter.writes.map((write) => write.sourceCursors)).toMatchObject([
+      { offset: 1_550, limit: 500, eventCount: 500, firstSequence: 1_551, lastSequence: 2_050, nextOffset: null },
+      { offset: 0, limit: 1_000, eventCount: 1_000, firstSequence: 1, lastSequence: 1_000, nextOffset: 1_000 },
+      { offset: 1_000, limit: 1_000, eventCount: 1_000, firstSequence: 1_001, lastSequence: 2_000, nextOffset: 2_000 },
+      { offset: 2_000, limit: 1_000, eventCount: 50, firstSequence: 2_001, lastSequence: 2_050, nextOffset: null },
+    ]);
+    const serializedWrites = JSON.stringify(projectionWriter.writes);
+    expect(serializedWrites).not.toContain("SECRET_DURABLE_TRANSCRIPT_TOKEN");
+    expect(serializedWrites).toContain("token=[redacted]");
+  });
+
+  it("serves large history views from bounded run slices without transcript hydration", async () => {
+    const projectionWriter = recordingProjectionWriter();
+    const runs = Array.from({ length: 250 }, (_, index) =>
+      runFixture({
+        runId: `run-${String(index).padStart(3, "0")}`,
+        sessionId: `session-${String(index).padStart(3, "0")}`,
+        issueId: `issue-${index}`,
+        issueIdentifier: `TEST-${index}`,
+        updatedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+        startedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+        completedAt: new Date(Date.UTC(2026, 0, 1, 0, 5, index)).toISOString(),
+      }),
+    );
+    let transcriptReads = 0;
+    const server = createStatusServer({
+      runStore: runStoreFixture({
+        runs,
+        beforeReadTranscript: () => {
+          transcriptReads += 1;
+          throw new Error("history projection should not hydrate transcript pages");
+        },
+      }),
+      projectionWriter,
+    });
+    const address = await server.start();
+
+    try {
+      const { response, body } = await getJson(`${baseUrlFor(address)}/api/v1/web/history?sessionLimit=5&timelineLimit=7`);
+
+      expect(response.status).toBe(200);
+      expect(body.sessions.map((session: { id: string }) => session.id)).toEqual([
+        "run-249",
+        "run-248",
+        "run-247",
+        "run-246",
+        "run-245",
+      ]);
+      expect(body.timeline).toHaveLength(7);
+      expect(transcriptReads).toBe(0);
+      expect(projectionWriter.writes).toHaveLength(1);
+      expect(projectionWriter.writes[0]).toMatchObject({
+        projectionName: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+        sourceCursors: {
+          sessionLimit: 5,
+          timelineLimit: 7,
+          sessionCount: 5,
+          timelineCount: 7,
+          runIds: ["run-249", "run-248", "run-247", "run-246", "run-245"],
+        },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("rebuilds dashboard and sidebar rows with durable running runs and lifecycle-only issues omitted by the tracker board", async () => {
     const projectionWriter = statefulProjectionWriter();
     const runningRun = runFixture({

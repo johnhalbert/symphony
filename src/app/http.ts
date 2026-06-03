@@ -840,7 +840,7 @@ export class StatusServer {
             throw error;
           }
           if (!result) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
-          if (decision === "reject") {
+          if (decision === "reject" && !result.replayed) {
             await this.recordRejectedApprovalRunTerminal(result.request);
           }
           if (decision === "approve" && result.request.status === "approved") {
