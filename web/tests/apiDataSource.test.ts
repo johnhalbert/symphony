@@ -9,6 +9,7 @@ const originalFetch = globalThis.fetch;
 const originalEventSource = globalThis.EventSource;
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   globalThis.fetch = originalFetch;
   if (originalEventSource) {
@@ -599,7 +600,8 @@ describe("API data source", () => {
     expect(eventSource?.closed).toBe(true);
   });
 
-  it("surfaces realtime connect, reconnect, recovery, stale, and closed-error status", () => {
+  it("surfaces realtime connect, reconnect, recovery, stale, and closed-stream resume status", () => {
+    vi.useFakeTimers();
     FakeEventSource.instances = [];
     globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
     const events: RealtimeProjectionEvent[] = [];
@@ -625,19 +627,56 @@ describe("API data source", () => {
     eventSource?.emit("projection.updated", JSON.stringify(missedEvent));
     expect(statuses.at(-1)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
     eventSource?.emitError(FakeEventSource.CLOSED);
+    expect(eventSource?.closed).toBe(true);
+    expect(FakeEventSource.instances).toHaveLength(1);
+
+    vi.advanceTimersByTime(4_999);
+    expect(FakeEventSource.instances).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    const resumedEventSource = FakeEventSource.instances[1];
+    expect(resumedEventSource?.url).toBe("/status-server/api/v1/realtime?lastEventId=missed-7");
+    resumedEventSource?.emitOpen();
     unsubscribe?.();
 
-    expect(statuses.map((status) => status.kind)).toEqual(["connecting", "open", "reconnecting", "recovered", "stale", "error"]);
+    expect(statuses.map((status) => status.kind)).toEqual([
+      "connecting",
+      "open",
+      "reconnecting",
+      "recovered",
+      "stale",
+      "reconnecting",
+      "connecting",
+      "recovered",
+    ]);
     expect(statuses.map((status) => status.label)).toEqual([
       "realtime connecting",
       "realtime connected",
       "realtime reconnecting",
       "realtime recovered",
       "realtime stale · refetching",
-      "realtime error",
+      "realtime reconnecting",
+      "realtime connecting",
+      "realtime recovered",
     ]);
-    expect(statuses.at(-2)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
+    expect(statuses.at(4)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
     expect(events).toEqual([missedEvent]);
+    expect(resumedEventSource?.closed).toBe(true);
+  });
+
+  it("cancels pending realtime reconnect when the final subscriber unsubscribes", () => {
+    vi.useFakeTimers();
+    FakeEventSource.instances = [];
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const dataSource = createApiDataSource("/status-server/");
+
+    const unsubscribe = dataSource.subscribeToRealtimeEvents?.(() => undefined);
+    const eventSource = FakeEventSource.instances[0];
+    eventSource?.emitError(FakeEventSource.CLOSED);
+    unsubscribe?.();
+
+    vi.advanceTimersByTime(5_000);
+    expect(FakeEventSource.instances).toHaveLength(1);
     expect(eventSource?.closed).toBe(true);
   });
 

@@ -11,7 +11,10 @@ import {
 
 interface RealtimeEventSourceClientOptions {
   urlForLastEventId(lastEventId: string | null): string;
+  reconnectDelayMs?: number;
 }
+
+const REALTIME_EVENT_SOURCE_RECONNECT_MS = 5_000;
 
 interface RealtimeEventSourceSubscriber {
   listener: RealtimeEventListener;
@@ -25,8 +28,11 @@ export interface RealtimeEventSourceClient {
 
 export function createRealtimeEventSourceClient(options: RealtimeEventSourceClientOptions): RealtimeEventSourceClient {
   const subscribers = new Map<symbol, RealtimeEventSourceSubscriber>();
+  const reconnectDelayMs = Math.max(1, Math.trunc(options.reconnectDelayMs ?? REALTIME_EVENT_SOURCE_RECONNECT_MS));
   let eventSource: EventSource | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let lastStatus: RealtimeConnectionStatus | null = null;
+  let lastEventId: string | null = null;
   let sawConnectionError = false;
 
   function publishStatus(status: RealtimeConnectionStatus): void {
@@ -38,37 +44,65 @@ export function createRealtimeEventSourceClient(options: RealtimeEventSourceClie
     for (const subscriber of subscribers.values()) subscriber.listener(event);
   }
 
-  function open(lastEventId: string | null): void {
+  function open(resumeLastEventId: string | null): void {
+    clearReconnectTimer();
     publishStatus(realtimeConnectionStatus("connecting"));
-    eventSource = new EventSource(options.urlForLastEventId(lastEventId));
-    eventSource.addEventListener("open", handleOpen);
-    eventSource.addEventListener("error", handleConnectionError);
-    for (const type of REALTIME_PROJECTION_EVENT_TYPES) eventSource.addEventListener(type, handleRealtimeEvent);
-    eventSource.addEventListener("message", handleRealtimeEvent);
+    const source = new EventSource(options.urlForLastEventId(resumeLastEventId));
+    eventSource = source;
+    source.addEventListener("open", () => handleOpen(source));
+    source.addEventListener("error", () => handleConnectionError(source));
+    for (const type of REALTIME_PROJECTION_EVENT_TYPES) source.addEventListener(type, (event) => handleRealtimeEvent(source, event as MessageEvent));
+    source.addEventListener("message", (event) => handleRealtimeEvent(source, event as MessageEvent));
   }
 
   function close(): void {
+    clearReconnectTimer();
     eventSource?.close();
     eventSource = null;
     subscribers.clear();
     sawConnectionError = false;
     lastStatus = null;
+    lastEventId = null;
   }
 
-  function handleOpen(): void {
+  function clearReconnectTimer(): void {
+    if (!reconnectTimer) return;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  function scheduleReconnect(): void {
+    if (reconnectTimer || subscribers.size === 0) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (subscribers.size === 0 || eventSource) return;
+      open(lastEventId);
+    }, reconnectDelayMs);
+  }
+
+  function handleOpen(source: EventSource): void {
+    if (source !== eventSource) return;
     publishStatus(realtimeConnectionStatus(sawConnectionError ? "recovered" : "open"));
     sawConnectionError = false;
   }
 
-  function handleConnectionError(): void {
+  function handleConnectionError(source: EventSource): void {
+    if (source !== eventSource) return;
     sawConnectionError = true;
-    const closed = eventSource?.readyState === EventSource.CLOSED;
-    publishStatus(realtimeConnectionStatus(closed ? "error" : "reconnecting"));
+    const closed = source.readyState === EventSource.CLOSED;
+    if (closed) {
+      source.close();
+      if (source === eventSource) eventSource = null;
+    }
+    publishStatus(realtimeConnectionStatus("reconnecting"));
+    if (closed) scheduleReconnect();
   }
 
-  function handleRealtimeEvent(event: MessageEvent): void {
+  function handleRealtimeEvent(source: EventSource, event: MessageEvent): void {
+    if (source !== eventSource) return;
     const parsed = parseRealtimeProjectionTransportEvent(event);
     if (!parsed) return;
+    lastEventId = parsed.id;
     if (parsed.missedEvents || parsed.recovery.reason === "missed-events") {
       publishStatus(
         realtimeConnectionStatus("stale", {
@@ -88,10 +122,12 @@ export function createRealtimeEventSourceClient(options: RealtimeEventSourceClie
         return () => undefined;
       }
 
+      const hadSubscribers = subscribers.size > 0;
       const subscriberId = Symbol("realtime-event-source-subscriber");
       subscribers.set(subscriberId, { listener, onStatus: subscriptionOptions.onStatus });
-      if (!eventSource) {
-        open(subscriptionOptions.lastEventId?.trim() || null);
+      if (!eventSource && !hadSubscribers) {
+        lastEventId = normalizeSubscriptionLastEventId(subscriptionOptions.lastEventId);
+        open(lastEventId);
       } else if (lastStatus) {
         subscriptionOptions.onStatus?.(lastStatus);
       }
@@ -103,6 +139,11 @@ export function createRealtimeEventSourceClient(options: RealtimeEventSourceClie
     },
     close,
   };
+}
+
+function normalizeSubscriptionLastEventId(lastEventId: string | null | undefined): string | null {
+  const normalized = lastEventId?.trim();
+  return normalized && normalized.length > 0 ? normalized : null;
 }
 
 export function parseRealtimeProjectionTransportEvent(event: MessageEvent): RealtimeProjectionEvent | null {

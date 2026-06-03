@@ -154,6 +154,7 @@ export class RealtimeProjectionEventBus {
   private readonly subscribers = new Map<number, (event: RealtimeProjectionEvent) => void>();
   private readonly streamClosers = new Set<() => void>();
   private readonly history: RealtimeProjectionEvent[] = [];
+  private readonly recoveryCursors = new Map<string, number>();
   private readonly clock: () => Date;
   private readonly historyLimit: number;
   private nextSubscriberId = 0;
@@ -180,6 +181,7 @@ export class RealtimeProjectionEventBus {
     const event = this.createEvent(input);
     this.history.push(event);
     while (this.history.length > this.historyLimit) this.history.shift();
+    this.pruneRecoveryCursors();
     for (const listener of this.subscribers.values()) {
       try {
         listener(event);
@@ -271,16 +273,29 @@ export class RealtimeProjectionEventBus {
   private replayEvents(lastEventId: string | null): RealtimeProjectionEvent[] {
     const normalizedLastEventId = normalizeSseId(lastEventId);
     if (!normalizedLastEventId) return [];
-    if (this.history.length === 0) return [this.createMissedEventsRecovery(normalizedLastEventId)];
 
     const knownIndex = this.history.findIndex((event) => event.id === normalizedLastEventId);
     if (knownIndex >= 0) return this.history.slice(knownIndex + 1);
 
+    const recoveryCursorRevision = this.recoveryCursors.get(normalizedLastEventId);
+    if (recoveryCursorRevision !== undefined) {
+      const replay = this.replayAfterKnownRevision(recoveryCursorRevision);
+      if (replay) return replay;
+      this.recoveryCursors.delete(normalizedLastEventId);
+    }
+
     return [this.createMissedEventsRecovery(normalizedLastEventId)];
   }
 
+  private replayAfterKnownRevision(revision: number): RealtimeProjectionEvent[] | null {
+    if (this.history.length === 0) return [];
+    const earliestReplayableRevision = this.history[0]?.revision;
+    if (earliestReplayableRevision === undefined || revision < earliestReplayableRevision - 1) return null;
+    return this.history.filter((event) => event.revision > revision);
+  }
+
   private createMissedEventsRecovery(lastEventId: string): RealtimeProjectionEvent {
-    return this.createEvent({
+    const event = this.createEvent({
       type: "projection.updated",
       source: this.realtimeSourceRevision("realtime-recovery"),
       resources: realtimeResourcesForEventType("projection.updated"),
@@ -289,6 +304,27 @@ export class RealtimeProjectionEventBus {
       missedEvents: true,
       detail: { lastEventId },
     });
+    this.rememberRecoveryCursor(event);
+    return event;
+  }
+
+  private rememberRecoveryCursor(event: RealtimeProjectionEvent): void {
+    this.recoveryCursors.set(event.id, event.revision);
+    this.pruneRecoveryCursors();
+  }
+
+  private pruneRecoveryCursors(): void {
+    const earliestReplayableRevision = this.history[0]?.revision;
+    for (const [cursor, revision] of this.recoveryCursors) {
+      if (earliestReplayableRevision !== undefined && revision < earliestReplayableRevision - 1) {
+        this.recoveryCursors.delete(cursor);
+      }
+    }
+    while (this.recoveryCursors.size > this.historyLimit) {
+      const oldestCursor = this.recoveryCursors.keys().next().value;
+      if (oldestCursor === undefined) return;
+      this.recoveryCursors.delete(oldestCursor);
+    }
   }
 
   private realtimeSourceRevision(source: string): WebProjectionSourceRevision {
