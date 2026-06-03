@@ -145,22 +145,33 @@ describe("live resource realtime mapping", () => {
     expect(liveResourceKeysForRealtimeEvent(event)).toEqual(["history", "sessionTranscript"]);
   });
 
-  it("maps projection.updated payload resource changes that are not listed as concrete resource hrefs", () => {
+  it("uses projection.updated payload resource changes as the authoritative narrowed routing set", () => {
     const event = eventFor(
-      [{ kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" }],
+      [
+        { kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" },
+        { kind: "issue-board", href: "/api/v1/web/issues", relation: "refetch" },
+        { kind: "sidebar", href: "/api/v1/web/sidebar", relation: "refetch" },
+        { kind: "history", href: "/api/v1/web/history", relation: "refetch" },
+      ],
       {
+        id: "orchestrator-projection",
+        revision: 3,
         payload: {
           source: "orchestrator-chat",
           sourceRevision: 3,
           detail: null,
-          resourceKinds: ["dashboard"],
-          resourcesChanged: ["orchestrator-chat"],
+          resourceKinds: ["dashboard", "issue-board", "sidebar", "history"],
+          resourcesChanged: ["orchestrator-chat", "sidebar", "dashboard"],
         },
       },
     );
 
-    expect(liveResourceKeysForRealtimeEvent(event)).toEqual(["dashboard", "orchestratorChat"]);
-    expect(realtimeRefreshHrefsForEvent(event)).toEqual(["/api/v1/web/dashboard", "/api/v1/web/orchestrator-chat"]);
+    expect(liveResourceKeysForRealtimeEvent(event)).toEqual(["orchestratorChat", "sidebar", "dashboard"]);
+    expect(realtimeRefreshHrefsForEvent(event)).toEqual([
+      "/api/v1/web/orchestrator-chat",
+      "/api/v1/web/sidebar",
+      "/api/v1/web/dashboard",
+    ]);
   });
 
   it("falls back to all live resources when a missed-events recovery has no resource hints", () => {
@@ -285,6 +296,22 @@ describe("live resource realtime mapping", () => {
     expect(probe.state().tokens.dashboard).toBe(1);
 
     emit(
+      eventFor(
+        [
+          { kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" },
+          { kind: "sidebar", href: "/api/v1/web/sidebar", relation: "refetch" },
+        ],
+        { id: "rev-5-mixed", revision: 5 },
+      ),
+    );
+    expect(invalidateCachedReads).toHaveBeenCalledTimes(4);
+    expect(invalidateCachedReads).toHaveBeenLastCalledWith({ forceRefreshHrefs: ["/api/v1/web/sidebar"] });
+    expect(probe.state().tokens.dashboard).toBe(1);
+    expect(probe.state().tokens.sidebar).toBe(1);
+    expect(probe.state().revisions.dashboard).toBe(6);
+    expect(probe.state().revisions.sidebar).toBe(5);
+
+    emit(
       eventFor([], {
         id: "rev-4-missed-events",
         revision: 4,
@@ -292,11 +319,61 @@ describe("live resource realtime mapping", () => {
         recovery: { strategy: "refetch", reason: "missed-events", lastEventId: "rev-3", endpoints: [] },
       }),
     );
-    expect(invalidateCachedReads).toHaveBeenCalledTimes(4);
+    expect(invalidateCachedReads).toHaveBeenCalledTimes(5);
     for (const key of LIVE_RESOURCE_KEYS) {
       expect(probe.state().tokens[key]).toBeGreaterThan(0);
     }
     expect(probe.state().revisions.history).toBe(5);
+  });
+
+  it("routes backend-shaped orchestrator projection updates without refreshing issue board or history resources", () => {
+    let listener: RealtimeEventListener | null = null;
+    const invalidateCachedReads = vi.fn();
+    const dataSource = testDataSource({
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(nextListener) {
+        listener = nextListener;
+        return () => undefined;
+      },
+    });
+    const probe = renderLiveResourceProbe(dataSource);
+    const event = eventFor(
+      [
+        { kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" },
+        { kind: "issue-board", href: "/api/v1/web/issues", relation: "refetch" },
+        { kind: "sidebar", href: "/api/v1/web/sidebar", relation: "refetch" },
+        { kind: "history", href: "/api/v1/web/history", relation: "refetch" },
+      ],
+      {
+        id: "orchestrator-projection",
+        revision: 11,
+        payload: {
+          source: "orchestrator-chat",
+          sourceRevision: 11,
+          detail: null,
+          resourceKinds: ["dashboard", "issue-board", "sidebar", "history"],
+          resourcesChanged: ["orchestrator-chat", "sidebar", "dashboard"],
+        },
+      },
+    );
+
+    if (!listener) throw new Error("realtime listener was not subscribed");
+    act(() => listener?.(event));
+
+    expect(invalidateCachedReads).toHaveBeenCalledTimes(1);
+    expect(invalidateCachedReads).toHaveBeenLastCalledWith({
+      forceRefreshHrefs: ["/api/v1/web/orchestrator-chat", "/api/v1/web/sidebar", "/api/v1/web/dashboard"],
+    });
+    expect(probe.state().tokens.orchestratorChat).toBe(1);
+    expect(probe.state().tokens.sidebar).toBe(1);
+    expect(probe.state().tokens.dashboard).toBe(1);
+    expect(probe.state().tokens.issueBoard).toBe(0);
+    expect(probe.state().tokens.history).toBe(0);
+    expect(probe.state().revisions.orchestratorChat).toBe(11);
+    expect(probe.state().revisions.sidebar).toBe(11);
+    expect(probe.state().revisions.dashboard).toBe(11);
+    expect(probe.state().revisions.issueBoard).toBeNull();
+    expect(probe.state().revisions.history).toBeNull();
   });
 
   it("uses the legacy projection subscription as a hook-level fallback refetch path when realtime is unavailable", () => {
