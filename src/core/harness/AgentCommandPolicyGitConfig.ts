@@ -12,6 +12,9 @@ import type {
 interface PersistedGitConfigInspectionInput {
   readonly workingDirectory: string;
   readonly environment?: AgentCommandPolicyEnvironmentInput | undefined;
+  readonly repositorySelectionRequired?: boolean | undefined;
+  readonly gitDirectory?: string | undefined;
+  readonly workTreeDirectory?: string | undefined;
 }
 
 interface PersistedGitConfigFile {
@@ -22,6 +25,11 @@ interface PersistedGitConfigFile {
 interface ParsedGitConfigEntry {
   readonly key: string;
   readonly value: string | undefined;
+}
+
+interface PersistedGitConfigDiscovery {
+  readonly configFiles: readonly PersistedGitConfigFile[];
+  readonly findings: readonly AgentCommandPolicyUnsafeGitConfigFinding[];
 }
 
 const MAX_GIT_CONFIG_DISCOVERY_DEPTH = 64;
@@ -35,7 +43,10 @@ export function inspectPersistedGitConfigForUnsafeEntries(
   input: PersistedGitConfigInspectionInput,
 ): AgentCommandPolicyUnsafeGitConfigFinding[] {
   const findings = new Map<string, AgentCommandPolicyUnsafeGitConfigFinding>();
-  for (const configFile of persistedGitConfigFiles(input)) {
+  const discovery = persistedGitConfigDiscovery(input);
+  for (const finding of discovery.findings) addFinding(findings, finding);
+
+  for (const configFile of discovery.configFiles) {
     const configText = readPersistedGitConfigText(configFile.path);
     if (configText.status === "missing") continue;
     if (configText.status === "error") {
@@ -57,14 +68,60 @@ export function inspectPersistedGitConfigForUnsafeEntries(
   return [...findings.values()].sort(compareUnsafeGitConfigFindings);
 }
 
-function persistedGitConfigFiles(input: PersistedGitConfigInspectionInput): PersistedGitConfigFile[] {
-  return uniqueConfigFiles([
-    ...persistedRepoGitConfigFiles(input.workingDirectory),
-    ...persistedUserGitConfigFiles(input),
-  ]);
+function persistedGitConfigDiscovery(input: PersistedGitConfigInspectionInput): PersistedGitConfigDiscovery {
+  const repoDiscovery = persistedRepoGitConfigDiscovery(input);
+  return {
+    configFiles: uniqueConfigFiles([...repoDiscovery.configFiles, ...persistedUserGitConfigFiles(input)]),
+    findings: repoDiscovery.findings,
+  };
 }
 
-function persistedRepoGitConfigFiles(workingDirectory: string): PersistedGitConfigFile[] {
+function persistedRepoGitConfigDiscovery(input: PersistedGitConfigInspectionInput): PersistedGitConfigDiscovery {
+  const configFiles: PersistedGitConfigFile[] = [];
+  const findings: AgentCommandPolicyUnsafeGitConfigFinding[] = [];
+  const workingDirectory = path.resolve(input.workingDirectory);
+  const requiresSelectionResolution = input.repositorySelectionRequired === true;
+
+  if (requiresSelectionResolution && !isDirectory(workingDirectory)) {
+    findings.push(ambiguousPersistedRepoFinding("<unresolved_effective_working_directory>"));
+  }
+
+  if (input.gitDirectory !== undefined) {
+    if (isDirectory(input.gitDirectory)) {
+      configFiles.push(...configFilesForGitDirectory(input.gitDirectory));
+    } else {
+      findings.push(ambiguousPersistedRepoFinding("<unresolved_git_dir>"));
+    }
+
+    if (input.workTreeDirectory !== undefined && !isDirectory(input.workTreeDirectory)) {
+      findings.push(ambiguousPersistedRepoFinding("<unresolved_work_tree>"));
+    }
+
+    return { configFiles, findings };
+  }
+
+  const discoveryStarts: string[] = [];
+  if (input.workTreeDirectory !== undefined) {
+    if (isDirectory(input.workTreeDirectory)) {
+      discoveryStarts.push(input.workTreeDirectory);
+    } else {
+      findings.push(ambiguousPersistedRepoFinding("<unresolved_work_tree>"));
+    }
+  }
+  discoveryStarts.push(workingDirectory);
+
+  for (const discoveryStart of uniquePaths(discoveryStarts)) {
+    configFiles.push(...persistedRepoGitConfigFilesFromWorkingDirectory(discoveryStart));
+  }
+
+  if (requiresSelectionResolution && configFiles.length === 0 && findings.length === 0) {
+    findings.push(ambiguousPersistedRepoFinding("<unresolved_selected_git_repository>"));
+  }
+
+  return { configFiles, findings };
+}
+
+function persistedRepoGitConfigFilesFromWorkingDirectory(workingDirectory: string): PersistedGitConfigFile[] {
   const configFiles: PersistedGitConfigFile[] = [];
   const startDirectory = path.resolve(workingDirectory);
   const startStat = statPath(startDirectory);
@@ -86,6 +143,15 @@ function persistedRepoGitConfigFiles(workingDirectory: string): PersistedGitConf
   }
 
   return configFiles;
+}
+
+function ambiguousPersistedRepoFinding(key: string): AgentCommandPolicyUnsafeGitConfigFinding {
+  return {
+    source: "persisted_repo_config",
+    key,
+    category: "other",
+    effect: "ambiguous",
+  };
 }
 
 function resolveGitDirectory(dotGitPath: string, worktreeDirectory: string): string | null {
@@ -175,6 +241,10 @@ function statPath(filePath: string): fs.Stats | null {
   } catch {
     return null;
   }
+}
+
+function isDirectory(filePath: string): boolean {
+  return statPath(filePath)?.isDirectory() === true;
 }
 
 function parseGitConfigEntries(configText: string): ParsedGitConfigEntry[] {
@@ -326,6 +396,18 @@ function uniqueConfigFiles(configFiles: readonly PersistedGitConfigFile[]): Pers
     if (seen.has(key)) continue;
     seen.add(key);
     unique.push(configFile);
+  }
+  return unique;
+}
+
+function uniquePaths(paths: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const filePath of paths) {
+    const key = path.resolve(filePath).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(filePath);
   }
   return unique;
 }

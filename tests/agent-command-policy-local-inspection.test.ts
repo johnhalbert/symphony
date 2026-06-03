@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -44,11 +48,7 @@ describe("AgentCommandPolicy helper-free local Git inspection allowlist", () => 
       command: "git status --short --branch",
       gitSubcommand: "status",
     },
-    {
-      name: "status from an explicit local worktree path",
-      command: "git -C ../repo status --porcelain=v2",
-      gitSubcommand: "status",
-    },
+
     {
       name: "diff stat scoped to a pathspec",
       command: "git diff --stat -- src/core/harness/AgentCommandPolicy.ts",
@@ -111,6 +111,42 @@ describe("AgentCommandPolicy helper-free local Git inspection allowlist", () => 
     });
     expect(decision.message).toContain("helper-free local Git inspection");
     expect(decision.message).not.toContain("policy scaffold");
+  });
+
+  it("allows status from an explicit local worktree path after inspecting the selected clean repo config", () => {
+    const baseDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "symphony-agent-policy-local-"));
+    try {
+      const repoDirectory = path.join(baseDirectory, "repo");
+      fs.mkdirSync(path.join(repoDirectory, ".git"), { recursive: true });
+      fs.writeFileSync(
+        path.join(repoDirectory, ".git", "config"),
+        "[core]\n  repositoryformatversion = 0\n",
+        "utf8",
+      );
+
+      const decision = evaluateAgentCommandPolicy({
+        role: "worker",
+        phase: "implementation",
+        surface: "terminal",
+        workingDirectory: baseDirectory,
+        rawInput: { command: "git -C repo status --porcelain=v2" },
+        environment: { keysOnly: ["HOME", "PATH"] },
+      });
+
+      expect(decision).toMatchObject({
+        outcome: "allow",
+        reasonKind: "local_only_inspection",
+        commandClass: "local_git_inspection",
+        audit: {
+          normalizedExecutable: "git",
+          gitSubcommand: "status",
+          unsafeConfigCategories: [],
+          upstreamContactAttempted: false,
+        },
+      });
+    } finally {
+      fs.rmSync(baseDirectory, { recursive: true, force: true });
+    }
   });
 
   it.each<LocalGitUnsafeHelperCase>([

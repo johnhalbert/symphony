@@ -1,9 +1,12 @@
+import path from "node:path";
+
 import type { RedactedPreview } from "../transcript/TranscriptProjection.js";
 import { isSensitivePreviewKey, sanitizedPreviewValue } from "../transcript/TranscriptProjection.js";
 import { inspectPersistedGitConfigForUnsafeEntries } from "./AgentCommandPolicyGitConfig.js";
 
 const DEFAULT_POLICY_PREVIEW_LENGTH = 500;
 const MAX_POLICY_PREVIEW_REDACTION_DEPTH = 8;
+
 const WINDOWS_EXECUTABLE_SUFFIXES = [".exe", ".cmd", ".bat", ".com", ".ps1"] as const;
 
 const GIT_EXECUTABLES = new Set(["git", "git-lfs"]);
@@ -1985,6 +1988,17 @@ interface GitSubcommandDetails {
   readonly index: number;
 }
 
+interface LocalGitRepositorySelection {
+  readonly workingDirectory: string;
+  readonly repositorySelectionRequired: boolean;
+  readonly gitDirectory?: string | undefined;
+  readonly workTreeDirectory?: string | undefined;
+}
+
+type LocalGitRepositorySelectionResult =
+  | { readonly status: "ok"; readonly selection: LocalGitRepositorySelection }
+  | { readonly status: "ambiguous"; readonly finding: AgentCommandPolicyUnsafeGitConfigFinding };
+
 function extractGitSubcommand(tokens: string[]): string | null {
   return extractGitSubcommandDetails(tokens)?.subcommand ?? null;
 }
@@ -2015,6 +2029,7 @@ function extractGitSubcommandDetails(tokens: string[]): GitSubcommandDetails | n
     if (
       token.startsWith("--git-dir=") ||
       token.startsWith("--work-tree=") ||
+      token.startsWith("-C") ||
       (token.startsWith("-c") && token !== "-c") ||
       token.startsWith("--config-env=") ||
       token.startsWith("--exec-path=")
@@ -2025,6 +2040,154 @@ function extractGitSubcommandDetails(tokens: string[]): GitSubcommandDetails | n
     return { subcommand: token.toLowerCase(), index };
   }
   return null;
+}
+
+function localGitRepositorySelectionForInspection(
+  tokens: readonly string[],
+  gitSubcommandIndex: number,
+  initialWorkingDirectory: string,
+): LocalGitRepositorySelectionResult {
+  let sawGit = false;
+  let workingDirectory = path.resolve(initialWorkingDirectory);
+  let repositorySelectionRequired = false;
+  let rawGitDirectory: string | undefined;
+  let rawWorkTreeDirectory: string | undefined;
+
+  for (let index = 0; index < gitSubcommandIndex; index += 1) {
+    const token = tokens[index];
+    if (token === undefined) continue;
+
+    if (!sawGit) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) continue;
+      if (normalizeExecutableName(token) === "git") sawGit = true;
+      continue;
+    }
+
+    if (token === "-C") {
+      const selectedPath = gitOptionValue(tokens, index, workingDirectory, "<missing_git_c_path>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      workingDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("-C") && token !== "-C") {
+      const selectedPath = resolveGitSelectionPath(token.slice(2), workingDirectory, "<missing_git_c_path>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      workingDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      continue;
+    }
+
+    if (token === "--git-dir") {
+      const selectedPath = gitRawOptionValue(tokens, index, "<missing_git_dir>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      rawGitDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--git-dir=")) {
+      const selectedPath = gitRawPathValue(token.slice("--git-dir=".length), "<missing_git_dir>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      rawGitDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      continue;
+    }
+
+    if (token === "--work-tree") {
+      const selectedPath = gitRawOptionValue(tokens, index, "<missing_work_tree>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      rawWorkTreeDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--work-tree=")) {
+      const selectedPath = gitRawPathValue(token.slice("--work-tree=".length), "<missing_work_tree>");
+      if (selectedPath.status === "ambiguous") return selectedPath;
+      rawWorkTreeDirectory = selectedPath.value;
+      repositorySelectionRequired = true;
+      continue;
+    }
+
+    if (token === "-c" || token === "--config-env" || token === "--exec-path") {
+      index += 1;
+      continue;
+    }
+  }
+
+  const gitDirectory = rawGitDirectory === undefined
+    ? undefined
+    : resolveGitSelectionPath(rawGitDirectory, workingDirectory, "<missing_git_dir>");
+  if (gitDirectory?.status === "ambiguous") return gitDirectory;
+
+  const workTreeDirectory = rawWorkTreeDirectory === undefined
+    ? undefined
+    : resolveGitSelectionPath(rawWorkTreeDirectory, workingDirectory, "<missing_work_tree>");
+  if (workTreeDirectory?.status === "ambiguous") return workTreeDirectory;
+
+  return {
+    status: "ok",
+    selection: {
+      workingDirectory,
+      repositorySelectionRequired,
+      ...(gitDirectory === undefined ? {} : { gitDirectory: gitDirectory.value }),
+      ...(workTreeDirectory === undefined ? {} : { workTreeDirectory: workTreeDirectory.value }),
+    },
+  };
+}
+
+type GitSelectionPathResult =
+  | { readonly status: "ok"; readonly value: string }
+  | { readonly status: "ambiguous"; readonly finding: AgentCommandPolicyUnsafeGitConfigFinding };
+
+function gitOptionValue(
+  tokens: readonly string[],
+  optionIndex: number,
+  baseDirectory: string,
+  missingKey: string,
+): GitSelectionPathResult {
+  return resolveGitSelectionPath(tokens[optionIndex + 1] ?? "", baseDirectory, missingKey);
+}
+
+function gitRawOptionValue(tokens: readonly string[], optionIndex: number, missingKey: string): GitSelectionPathResult {
+  return gitRawPathValue(tokens[optionIndex + 1] ?? "", missingKey);
+}
+
+function gitRawPathValue(rawPath: string, missingKey: string): GitSelectionPathResult {
+  const selectedPath = rawPath.trim();
+  if (selectedPath.length === 0) {
+    return { status: "ambiguous", finding: ambiguousGitRepositorySelectionFinding(missingKey) };
+  }
+  return { status: "ok", value: selectedPath };
+}
+
+function resolveGitSelectionPath(rawPath: string, baseDirectory: string, missingKey: string): GitSelectionPathResult {
+  const selectedPath = rawPath.trim();
+  if (selectedPath.length === 0) {
+    return { status: "ambiguous", finding: ambiguousGitRepositorySelectionFinding(missingKey) };
+  }
+  return {
+    status: "ok",
+    value: isAbsolutePolicyPath(selectedPath) ? path.normalize(selectedPath) : path.resolve(baseDirectory, selectedPath),
+  };
+}
+
+function ambiguousGitRepositorySelectionFinding(key: string): AgentCommandPolicyUnsafeGitConfigFinding {
+  return {
+    source: "persisted_repo_config",
+    key,
+    category: "other",
+    effect: "ambiguous",
+  };
+}
+
+function isAbsolutePolicyPath(filePath: string): boolean {
+  return path.isAbsolute(filePath) || /^[A-Za-z]:[\\/]/u.test(filePath) || /^\\\\/u.test(filePath);
 }
 
 function isRemoteMutationCommand(tokens: string[], gitSubcommand: string): boolean {
@@ -2140,23 +2303,32 @@ function localGitInspectionUnsafeConfigEvidence(
     }
   }
 
-  try {
-    for (const finding of inspectPersistedGitConfigForUnsafeEntries({
-      workingDirectory: input.workingDirectory,
-      environment: input.environment,
-    })) {
+  const repositorySelection = localGitRepositorySelectionForInspection(tokens, gitSubcommandIndex, input.workingDirectory);
+  if (repositorySelection.status === "ambiguous") {
+    categories.add(repositorySelection.finding.category);
+    findings.push(repositorySelection.finding);
+  } else {
+    try {
+      for (const finding of inspectPersistedGitConfigForUnsafeEntries({
+        workingDirectory: repositorySelection.selection.workingDirectory,
+        environment: input.environment,
+        repositorySelectionRequired: repositorySelection.selection.repositorySelectionRequired,
+        gitDirectory: repositorySelection.selection.gitDirectory,
+        workTreeDirectory: repositorySelection.selection.workTreeDirectory,
+      })) {
+        categories.add(finding.category);
+        findings.push(finding);
+      }
+    } catch {
+      const finding: AgentCommandPolicyUnsafeGitConfigFinding = {
+        source: "unknown",
+        key: "<persisted_git_config_inspection_error>",
+        category: "other",
+        effect: "ambiguous",
+      };
       categories.add(finding.category);
       findings.push(finding);
     }
-  } catch {
-    const finding: AgentCommandPolicyUnsafeGitConfigFinding = {
-      source: "unknown",
-      key: "<persisted_git_config_inspection_error>",
-      category: "other",
-      effect: "ambiguous",
-    };
-    categories.add(finding.category);
-    findings.push(finding);
   }
 
   return {
