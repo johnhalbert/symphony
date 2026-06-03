@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
+import { createTranscriptWindowResponse } from "../src/data/transcriptWindow";
 import type { ProjectionChangeEvent, RealtimeConnectionStatus, RealtimeProjectionEvent } from "../src/data/dataSource";
 import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
@@ -859,13 +860,32 @@ describe("API data source", () => {
     });
   });
 
-  it("loads selected session transcripts using the encoded web session id", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(transcript));
+  it("loads selected session transcript windows using the encoded web session id", async () => {
+    const transcriptWindow = createTranscriptWindowResponse(transcript);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(transcriptWindow));
 
-    await expect(createApiDataSource("").getTranscript("run/with space")).resolves.toEqual(transcript);
+    await expect(createApiDataSource("").getTranscript("run/with space")).resolves.toEqual(transcriptWindow);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/sessions/run%2Fwith%20space/transcript", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
+  it("passes explicit transcript page options as bounded offset query params and keeps active-tail reads on the default tail route", async () => {
+    const transcriptWindow = createTranscriptWindowResponse(transcript, { kind: "page", offset: 25, limit: 100 });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => jsonResponse(transcriptWindow));
+    const dataSource = createApiDataSource("");
+
+    await expect(dataSource.getTranscript("run/page", undefined, { offset: 25.8, limit: 100.2 })).resolves.toEqual(transcriptWindow);
+    await expect(dataSource.getTranscript("run/page", undefined, { tail: true, offset: 1, limit: 2 })).resolves.toEqual(transcriptWindow);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/web/sessions/run%2Fpage/transcript?offset=25&limit=100", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/web/sessions/run%2Fpage/transcript", {
       headers: { Accept: "application/json" },
       signal: undefined,
     });
@@ -876,20 +896,22 @@ describe("API data source", () => {
     const secondDetail = { issue: { id: "ENG-124", title: "second detail" }, activity: [], runs: [], transcript: [] };
     const firstTranscript: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-05-30T00:00:00.000Z", text: "first transcript" }];
     const secondTranscript: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-05-30T00:00:01.000Z", text: "second transcript" }];
+    const firstTranscriptWindow = createTranscriptWindowResponse(firstTranscript);
+    const secondTranscriptWindow = createTranscriptWindowResponse(secondTranscript);
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(firstDetail))
       .mockResolvedValueOnce(jsonResponse(secondDetail))
-      .mockResolvedValueOnce(jsonResponse(firstTranscript))
-      .mockResolvedValueOnce(jsonResponse(secondTranscript));
+      .mockResolvedValueOnce(jsonResponse(firstTranscriptWindow))
+      .mockResolvedValueOnce(jsonResponse(secondTranscriptWindow));
     const firstController = new AbortController();
     const secondController = new AbortController();
     const dataSource = createApiDataSource("");
 
     await expect(dataSource.getIssueDetail("ENG-124", firstController.signal)).resolves.toEqual(firstDetail);
     await expect(dataSource.getIssueDetail("ENG-124", secondController.signal)).resolves.toEqual(secondDetail);
-    await expect(dataSource.getTranscript("run-124", firstController.signal)).resolves.toEqual(firstTranscript);
-    await expect(dataSource.getTranscript("run-124", secondController.signal)).resolves.toEqual(secondTranscript);
+    await expect(dataSource.getTranscript("run-124", firstController.signal)).resolves.toEqual(firstTranscriptWindow);
+    await expect(dataSource.getTranscript("run-124", secondController.signal)).resolves.toEqual(secondTranscriptWindow);
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/web/issues/ENG-124", {
       headers: { Accept: "application/json" },

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { DashboardView } from "../src/components/dashboard/DashboardView";
 import { SidebarViews } from "../src/components/sidebar/SidebarViews";
 import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
+import { createTranscriptWindowResponse } from "../src/data/transcriptWindow";
 import type { SymphonyDataSource } from "../src/data/dataSource";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
 import type { ChatMessage, DashboardModel, OrchestratorChatModel, OrchestratorChatState, SidebarModel } from "../src/types/symphony";
@@ -67,7 +68,7 @@ function dataSourceForChat(chat: OrchestratorChatModel | ChatMessage[]): Symphon
       return [];
     },
     async getTranscript() {
-      return [];
+      return createTranscriptWindowResponse([]);
     },
     async getSidebar() {
       return { providerGates: [], runningAgents: [], reviewIssues: [], activity: [], sessions: [], chat: chatMessages, totals: dashboardWithEmbeddedChat.totals };

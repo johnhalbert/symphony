@@ -45,11 +45,12 @@ describe("web route contract fixtures", () => {
     expect(fixtures.issueDetail.issue).toEqual(fixtures.issueBoard.issues.find((issue) => issue.id === WEB_CONTRACT_ISSUE_ID));
     expect(fixtures.issueDetail.activity).toEqual(fixtures.dashboard.activity);
     expect(fixtures.issueDetail.runs).toEqual(fixtures.history.sessions);
-    expect(fixtures.issueDetail.transcript).toEqual(fixtures.transcript);
+    expect(fixtures.issueDetail.transcript).toEqual(fixtures.transcript.messages);
 
     expect(fixtures.history.defaultSessionId).toBe(WEB_CONTRACT_SESSION_ID);
     expect(fixtures.history.sessions.map((session) => session.id)).toEqual([WEB_CONTRACT_SESSION_ID]);
-    expect(fixtures.transcript.map((message) => message.kind)).toEqual(["system", "user", "assistant", "tool_call"]);
+    expect(fixtures.transcript.messages.map((message) => message.kind)).toEqual(["system", "user", "assistant", "tool_call"]);
+    expect(fixtures.transcript.compatibility.responseShape).toBe("transcript_window");
 
     expect(fixtures.sidebar.providerGates).toEqual(fixtures.dashboard.providerGates);
     expect(fixtures.sidebar.runningAgents).toEqual(fixtures.dashboard.runningAgents);

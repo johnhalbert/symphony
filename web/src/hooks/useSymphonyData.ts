@@ -105,11 +105,31 @@ export function useHistory(options: SymphonyResourceOptions = {}) {
   );
 }
 
+interface TranscriptPatchCursor {
+  sessionId: string | null;
+  lastSequence: number | null;
+  lastRevision: number | null;
+  tailLimit: number;
+  refetchHref: string | null;
+  canAppend: boolean;
+}
+
+function createTranscriptPatchCursor(sessionId: string | null = null): TranscriptPatchCursor {
+  return {
+    sessionId,
+    lastSequence: null,
+    lastRevision: null,
+    tailLimit: 500,
+    refetchHref: null,
+    canAppend: false,
+  };
+}
+
 export function useTranscript(sessionId: string | null, refreshToken?: unknown): Loadable<TranscriptMessage[]> {
   const dataSource = useDataSource();
   const normalizedSessionId = sessionId || null;
   const [patchRefreshToken, setPatchRefreshToken] = useState(0);
-  const patchCursor = useRef<{ lastSequence: number | null; lastRevision: number | null }>({ lastSequence: null, lastRevision: null });
+  const patchCursor = useRef<TranscriptPatchCursor>(createTranscriptPatchCursor());
   const [state, setState] = useState<Loadable<TranscriptMessage[]> & { sessionId: string | null }>({
     sessionId: normalizedSessionId,
     data: normalizedSessionId ? null : [],
@@ -125,13 +145,17 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
   useEffect(() => {
     let active = true;
     if (!normalizedSessionId) {
-      patchCursor.current = { lastSequence: null, lastRevision: null };
+      patchCursor.current = createTranscriptPatchCursor();
       const nextState = { sessionId: null, data: [], loading: false, error: null };
       stateRef.current = nextState;
       setState(nextState);
       return () => {
         active = false;
       };
+    }
+
+    if (patchCursor.current.sessionId !== normalizedSessionId) {
+      patchCursor.current = createTranscriptPatchCursor(normalizedSessionId);
     }
 
     const controller = new AbortController();
@@ -147,10 +171,17 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
     });
     dataSource
       .getTranscript(normalizedSessionId, controller.signal)
-      .then((data) => {
+      .then((transcriptWindow) => {
         if (!active) return;
-        patchCursor.current = { ...patchCursor.current, lastSequence: null };
-        const nextState = { sessionId: normalizedSessionId, data, loading: false, error: null };
+        patchCursor.current = {
+          ...patchCursor.current,
+          sessionId: normalizedSessionId,
+          lastSequence: transcriptWindow.activeTail.afterSequence ?? transcriptWindow.window.lastSequence ?? transcriptWindow.page.lastSequence,
+          tailLimit: transcriptWindow.activeTail.tailLimit || transcriptWindow.window.tailLimit || 500,
+          refetchHref: transcriptWindow.activeTail.refetchHref ?? transcriptWindow.recovery.href,
+          canAppend: transcriptWindow.activeTail.canAppend === true,
+        };
+        const nextState = { sessionId: normalizedSessionId, data: transcriptWindow.messages, loading: false, error: null };
         stateRef.current = nextState;
         setState(nextState);
       })
@@ -179,20 +210,27 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
     if (!normalizedSessionId || !dataSource.subscribeToRealtimeEvents) return undefined;
     return dataSource.subscribeToRealtimeEvents((event) => {
       if (event.type !== "transcript.delta") return;
+      const cursor = patchCursor.current;
+      if (cursor.sessionId !== normalizedSessionId || !cursor.canAppend) return;
       const outcome = applyTranscriptDeltaEvent({
         event,
         sessionId: normalizedSessionId,
         current: stateRef.current.sessionId === normalizedSessionId ? stateRef.current.data : null,
-        lastSequence: patchCursor.current.lastSequence,
-        lastRevision: patchCursor.current.lastRevision,
+        lastSequence: cursor.lastSequence,
+        lastRevision: cursor.lastRevision,
+        tailLimit: cursor.tailLimit,
       });
       if (outcome.action === "ignored") return;
-      patchCursor.current = {
-        lastSequence: outcome.lastSequence ?? patchCursor.current.lastSequence,
-        lastRevision: outcome.lastRevision ?? patchCursor.current.lastRevision,
+      const nextCursor: TranscriptPatchCursor = {
+        ...cursor,
+        lastSequence: outcome.lastSequence ?? cursor.lastSequence,
+        lastRevision: outcome.lastRevision ?? cursor.lastRevision,
       };
+      patchCursor.current = nextCursor;
       if (outcome.action === "fallback") {
-        dataSource.invalidateCachedReads?.({ forceRefreshHrefs: [`/api/v1/web/sessions/${encodeURIComponent(normalizedSessionId)}/transcript?refresh=1`] });
+        dataSource.invalidateCachedReads?.({
+          forceRefreshHrefs: [nextCursor.refetchHref ?? `/api/v1/web/sessions/${encodeURIComponent(normalizedSessionId)}/transcript?refresh=1`],
+        });
         setPatchRefreshToken((current) => current + 1);
         return;
       }

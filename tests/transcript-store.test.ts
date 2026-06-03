@@ -139,6 +139,19 @@ describe("FileRunTranscriptStore", () => {
       "ci_status_changed",
     ]);
     expect(page.nextOffset).toBeNull();
+    expect(page).toMatchObject({
+      offset: 0,
+      limit: 10,
+      total: 5,
+      eventCount: 5,
+      previousOffset: null,
+      hasPrevious: false,
+      hasNext: false,
+      windowKind: "page",
+      firstSequence: 1,
+      lastSequence: 5,
+      lastEventAt: "2026-01-01T00:00:01.750Z",
+    });
   });
 
   it("does not backfill Cursor runtime fields onto explicit non-Cursor harness records", async () => {
@@ -271,7 +284,21 @@ describe("FileRunTranscriptStore", () => {
     await writeFile(eventsPath, `${malformedHugeFirstLine}${validTailLines}\n`, "utf8");
 
     const tail = await store.readTranscriptTail("run-tail", { limit: 5 });
-    expect(tail).toMatchObject({ runId: "run-tail", offset: 1_200, limit: 5, nextOffset: null });
+    expect(tail).toMatchObject({
+      runId: "run-tail",
+      offset: 1_200,
+      limit: 5,
+      nextOffset: null,
+      total: 1_205,
+      eventCount: 5,
+      previousOffset: 1_195,
+      hasPrevious: true,
+      hasNext: false,
+      windowKind: "tail",
+      firstSequence: 1_201,
+      lastSequence: 1_205,
+      lastEventAt: "2026-01-01T00:00:05.000Z",
+    });
     expect(tail.events.map((event) => event.sequence)).toEqual([1_201, 1_202, 1_203, 1_204, 1_205]);
     expect(tail.events.map((event) => event.message)).toEqual([
       "event 1201",
@@ -282,7 +309,20 @@ describe("FileRunTranscriptStore", () => {
     ]);
 
     const capped = await store.readTranscriptTail("run-tail", { limit: 9_999 });
-    expect(capped).toMatchObject({ runId: "run-tail", offset: 205, limit: 1_000, nextOffset: null });
+    expect(capped).toMatchObject({
+      runId: "run-tail",
+      offset: 205,
+      limit: 1_000,
+      nextOffset: null,
+      total: 1_205,
+      eventCount: 1_000,
+      previousOffset: 0,
+      hasPrevious: true,
+      hasNext: false,
+      windowKind: "tail",
+      firstSequence: 206,
+      lastSequence: 1_205,
+    });
     expect(capped.events).toHaveLength(1_000);
     expect(capped.events[0]?.sequence).toBe(206);
     expect(capped.events.at(-1)?.sequence).toBe(1_205);
@@ -292,6 +332,15 @@ describe("FileRunTranscriptStore", () => {
       offset: 0,
       limit: 5,
       nextOffset: null,
+      total: 0,
+      eventCount: 0,
+      previousOffset: null,
+      hasPrevious: false,
+      hasNext: false,
+      windowKind: "tail",
+      firstSequence: null,
+      lastSequence: null,
+      lastEventAt: null,
       events: [],
     });
   });

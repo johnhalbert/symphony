@@ -7,7 +7,8 @@ import type {
   OrchestratorChatModel,
   ReferenceData,
   SidebarModel,
-  TranscriptMessage,
+  TranscriptRequestOptions,
+  TranscriptWindowResponse,
 } from "../types/symphony";
 import type { RealtimeEventListener, RealtimeEventUnsubscribe, RealtimeSubscriptionOptions } from "./realtimeEvents";
 
@@ -50,7 +51,7 @@ export interface SymphonyDataSource {
   getIssueDetail(issueId: string, signal?: AbortSignal): Promise<IssueDetailModel | null>;
   getHistory(signal?: AbortSignal): Promise<HistoryModel>;
   getSessions(signal?: AbortSignal): Promise<HistoryModel["sessions"]>;
-  getTranscript(sessionId: string, signal?: AbortSignal): Promise<TranscriptMessage[]>;
+  getTranscript(sessionId: string, signal?: AbortSignal, options?: TranscriptRequestOptions): Promise<TranscriptWindowResponse>;
   getSidebar(signal?: AbortSignal): Promise<SidebarModel>;
   getOrchestratorChat(signal?: AbortSignal): Promise<OrchestratorChatModel>;
   sendOrchestratorMessage(input: string): Promise<ChatMessage[]>;

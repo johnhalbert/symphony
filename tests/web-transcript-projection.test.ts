@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { projectWebTranscript } from "../src/app/WebTranscriptProjection.js";
-import type { RunRecord, TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import {
+  emptyWebTranscriptProjectionPayload,
+  projectWebTranscript,
+  projectWebTranscriptWindow,
+} from "../src/app/WebTranscriptProjection.js";
+import type { RunRecord, TranscriptEvent, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
 
 describe("projectWebTranscript", () => {
   it("maps sanitized Cursor transcript preview payloads into public web transcript messages", () => {
@@ -1092,6 +1096,66 @@ describe("projectWebTranscript", () => {
     expect(cursorMessages[0]).toMatchObject({ kind: "system", model: "cursor-model" });
   });
 
+  it("wraps explicit transcript pages with window metadata and inactive tail state", () => {
+    const payload = projectWebTranscriptWindow(
+      transcriptPage({ offset: 25, limit: 100, nextOffset: 125, total: 250, windowKind: "page" }),
+      [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "paged message" }],
+      { run: runRecord({ status: "succeeded" }), kind: "page", requestedPage: { offset: 25, limit: 100 }, tailLimit: 500 },
+    );
+
+    expect(payload).toMatchObject({
+      schemaVersion: 1,
+      messages: [{ kind: "assistant", text: "paged message" }],
+      page: {
+        offset: 25,
+        limit: 100,
+        size: 1,
+        total: 250,
+        nextOffset: 125,
+        previousOffset: 0,
+        hasNext: true,
+        hasPrevious: true,
+        firstSequence: 26,
+        lastSequence: 26,
+        lastEventAt: "2026-01-01T00:00:26.000Z",
+      },
+      window: { kind: "page", requested: { offset: 25, limit: 100 }, tailLimit: 500, messageCount: 1 },
+      activeTail: { enabled: false, canAppend: false, runStatus: "succeeded", afterSequence: 26 },
+      recovery: { strategy: "refetch", reason: "tail-gap" },
+      compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+    });
+  });
+
+  it("enables active append metadata for running transcript tails", () => {
+    const payload = projectWebTranscriptWindow(
+      transcriptPage({ offset: 100, limit: 500, nextOffset: null, total: 101, windowKind: "tail" }),
+      [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "tail message" }],
+      { run: runRecord({ status: "running" }), kind: "tail", requestedPage: null, tailLimit: 500 },
+    );
+
+    expect(payload.window).toMatchObject({ kind: "tail", requested: { offset: null, limit: 500 }, tailLimit: 500 });
+    expect(payload.activeTail).toMatchObject({
+      enabled: true,
+      canAppend: true,
+      runStatus: "running",
+      tailLimit: 500,
+      afterSequence: 101,
+      refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+    });
+    expect(payload.activeTail.gapFallback).toEqual(payload.recovery);
+  });
+
+  it("creates empty transcript window payloads for unavailable or missing runs", () => {
+    expect(emptyWebTranscriptProjectionPayload({ runId: "missing-run", limit: 500 })).toMatchObject({
+      schemaVersion: 1,
+      messages: [],
+      page: { offset: 0, limit: 500, size: 0, total: 0, nextOffset: null, previousOffset: null },
+      window: { kind: "tail", messageCount: 0, requested: { offset: null, limit: 500 } },
+      activeTail: { enabled: false, canAppend: false, runStatus: null, afterSequence: null },
+      compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+    });
+  });
+
 });
 
 function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
@@ -1120,6 +1184,33 @@ function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
     tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     transcriptEventCount: 0,
     ...overrides,
+  };
+}
+
+function transcriptPage(input: {
+  offset: number;
+  limit: number;
+  nextOffset: number | null;
+  total: number;
+  windowKind: "page" | "tail";
+}): TranscriptPage {
+  const sequence = input.windowKind === "tail" ? input.total : input.offset + 1;
+  const at = `2026-01-01T00:00:${String(sequence).padStart(2, "0")}.000Z`;
+  return {
+    runId: "run-1",
+    offset: input.offset,
+    limit: input.limit,
+    nextOffset: input.nextOffset,
+    events: [event({ sequence, at })],
+    total: input.total,
+    eventCount: 1,
+    previousOffset: input.offset > 0 ? Math.max(0, input.offset - input.limit) : null,
+    hasPrevious: input.offset > 0,
+    hasNext: input.nextOffset !== null,
+    windowKind: input.windowKind,
+    firstSequence: sequence,
+    lastSequence: sequence,
+    lastEventAt: at,
   };
 }
 
