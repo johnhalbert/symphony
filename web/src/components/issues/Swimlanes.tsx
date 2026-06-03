@@ -1,5 +1,5 @@
 import type { IssueBoardModel, IssueModel } from "../../types/symphony";
-import { Icon, StatusIcon } from "../common";
+import { Icon, StatusIcon, UnavailableButton } from "../common";
 import { IssueCard } from "./IssueCard";
 
 export function Swimlanes({
@@ -19,12 +19,12 @@ export function Swimlanes({
           {board.cycleDateRange}
         </span>
         <div className="grow" />
-        <button className="btn btn--ghost" type="button" style={{ padding: "3px 8px" }}>
+        <span className="btn btn--ghost btn--readonly" style={{ padding: "3px 8px" }} title="Read-only grouping from the API issue board." aria-label="Issue board grouped by status">
           Group: status
-        </button>
-        <button className="icon-btn" type="button">
+        </span>
+        <UnavailableButton className="icon-btn" unavailableLabel="Issue lane filter" unavailableReason="lane filtering is not backed by an API command route yet">
           {Icon.filter()}
-        </button>
+        </UnavailableButton>
       </div>
       <div className="swimlanes">
         <Swimlane title="Todo" state="todo" items={board.lanes.todo} selectedId={selectedId} onSelect={onSelect} />
@@ -57,9 +57,9 @@ function Swimlane({
           <span className="count">{items.length}</span>
         </h4>
         <div className="grow" />
-        <button className="icon-btn" type="button">
+        <UnavailableButton className="icon-btn" unavailableLabel={`New ${title} issue`} unavailableReason="lane issue creation is unavailable until the backend exposes a command route">
           {Icon.plus()}
-        </button>
+        </UnavailableButton>
       </div>
       <div className="swim__body">
         {items.map((issue) => (

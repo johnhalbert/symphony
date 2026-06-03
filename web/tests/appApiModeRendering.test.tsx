@@ -465,6 +465,33 @@ async function renderHistoryView(history: HistoryModel, variant: "list" | "timel
   return renderToStaticMarkup(<ChatHistoryView history={history} variant={variant} />);
 }
 
+function renderedButtons(markup: string): string[] {
+  return Array.from(markup.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g), (match) => match[0]);
+}
+
+function markupText(markup: string): string {
+  return markup.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function buttonMatchesLabel(button: string, label: string): boolean {
+  return (
+    markupText(button).includes(label) ||
+    button.includes(`aria-label="${label}`) ||
+    button.includes(`title="${label}`) ||
+    button.includes(`data-unavailable-action="${label}"`)
+  );
+}
+
+function buttonIsUnavailable(button: string): boolean {
+  return button.includes("disabled") || button.includes('aria-disabled="true"') || /unavailable/i.test(button);
+}
+
+function expectUnavailableButton(markup: string, label: string) {
+  const candidates = renderedButtons(markup).filter((button) => buttonMatchesLabel(button, label));
+  expect(candidates.length).toBeGreaterThan(0);
+  expect(candidates.every(buttonIsUnavailable)).toBe(true);
+}
+
 afterEach(() => {
   vi.doUnmock("../src/data/dataSourceContext");
   vi.doUnmock("../src/hooks/useSymphonyData");
@@ -567,6 +594,10 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
     expect(markup).toContain("Full-app suggestion");
+    expectUnavailableButton(markup, "Status totals");
+    expectUnavailableButton(markup, "Trigger poll");
+    expectUnavailableButton(markup, "New issue");
+    expectUnavailableButton(markup, "Orchestrator chat menu");
 
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
@@ -730,6 +761,18 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("run-api-selected");
     expect(markup).toContain("#909");
     expect(markup).toContain("green");
+    expectUnavailableButton(markup, "Filter");
+    expectUnavailableButton(markup, "Sort");
+    expectUnavailableButton(markup, "New issue");
+    expectUnavailableButton(markup, "Issue lane filter");
+    expectUnavailableButton(markup, "New Todo issue");
+    expectUnavailableButton(markup, "New In Progress issue");
+    expectUnavailableButton(markup, "New In Review issue");
+    expectUnavailableButton(markup, "Open in Linear");
+    expectUnavailableButton(markup, "More");
+    expect(markup).toContain('aria-label="Status value"');
+    expect(markup).toContain('aria-label="Priority value"');
+    expect(markup).toContain('aria-label="Assignee value"');
 
     expect(markup).not.toContain("SYM-12");
     expect(markup).not.toContain("Add exponential backoff to retry queue with jitter");
@@ -800,6 +843,14 @@ describe("App API-mode rendering", () => {
     expect(transcriptMarkup).toContain("API-HISTORY");
     expect(transcriptMarkup).toContain("gpt-api-history");
     expect(transcriptMarkup).toContain("API transcript message rendered from selected session data.");
+    expectUnavailableButton(transcriptMarkup, "Filter");
+    expectUnavailableButton(transcriptMarkup, "Sort");
+    expectUnavailableButton(transcriptMarkup, "Running sessions filter");
+    expectUnavailableButton(transcriptMarkup, "Finished sessions filter");
+    expectUnavailableButton(transcriptMarkup, "Error sessions filter");
+    expectUnavailableButton(transcriptMarkup, "Open workspace");
+    expectUnavailableButton(transcriptMarkup, "Open issue");
+    expectUnavailableButton(transcriptMarkup, "More");
     expect(transcriptMarkup).not.toContain("No transcript messages for this session.");
     expect(transcriptMarkup).not.toContain("Mock transcript remains embedded.");
     expect(transcriptMarkup).not.toContain("Exponential backoff for retry queue");
@@ -807,6 +858,9 @@ describe("App API-mode rendering", () => {
     const timelineMarkup = await renderHistoryView(apiHistory, "timeline");
     expect(timelineMarkup).toContain("API timeline event rendered from history endpoint.");
     expect(timelineMarkup).toContain("run-api-transcript");
+    expectUnavailableButton(timelineMarkup, "Timeline filter");
+    expectUnavailableButton(timelineMarkup, "Group timeline by session");
+    expect(timelineMarkup).toContain("open unavailable");
 
     const emptyTranscriptMarkup = await renderHistoryView({
       ...apiHistory,

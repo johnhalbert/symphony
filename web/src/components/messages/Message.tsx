@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Icon, StatusBadge } from "../common";
+import { Icon, StatusBadge, UnavailableButton } from "../common";
 import type { TranscriptMessage } from "../../types/symphony";
 import { Paragraphs } from "./messageFormat";
 
@@ -241,9 +241,14 @@ function RequestMsg({ message }: { message: Extract<TranscriptMessage, { kind: "
           <div className="q">{message.q}</div>
           <div className="actions">
             {message.actions.map((action, index) => (
-              <button key={action} className={`btn ${index === 0 ? "btn--primary" : ""}`} type="button">
+              <UnavailableButton
+                key={action}
+                className={`btn ${index === 0 ? "btn--primary" : ""}`}
+                unavailableLabel={action}
+                unavailableReason="request responses cannot be submitted from the read-only transcript view"
+              >
                 {action}
-              </button>
+              </UnavailableButton>
             ))}
           </div>
         </div>

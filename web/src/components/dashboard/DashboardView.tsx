@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useDataSource } from "../../data/dataSourceContext";
 import type { ChatMessage, DashboardModel, DashboardVariant } from "../../types/symphony";
-import { Icon } from "../common";
+import { Icon, UnavailableButton } from "../common";
 import { AgentRow } from "./AgentRow";
 import { BurndownCommandCenter, BurndownPanel, StatsGridDense, StatsRow } from "./Stats";
 import { OrchestratorChat } from "./OrchestratorChat";
@@ -56,15 +56,15 @@ export function DashboardView({
             {dashboard.source ? <DashboardSourceStatus source={dashboard.source} /> : null}
           </div>
           <div className="dash__actions">
-            <button className="btn" type="button">
+            <UnavailableButton className="btn" unavailableLabel="Status totals" unavailableReason="status-total filtering is read-only until an API command route exists">
               {Icon.filter()}Status totals
-            </button>
-            <button className="btn" type="button">
+            </UnavailableButton>
+            <UnavailableButton className="btn" unavailableLabel="Trigger poll" unavailableReason="poll triggering is unavailable until the backend exposes a command route">
               {Icon.bolt()}Trigger poll
-            </button>
-            <button className="btn btn--primary" type="button">
+            </UnavailableButton>
+            <UnavailableButton className="btn btn--primary" unavailableLabel="New issue" unavailableReason="issue creation is unavailable until the backend exposes a command route">
               New issue
-            </button>
+            </UnavailableButton>
           </div>
         </div>
 
