@@ -9,6 +9,7 @@ import type { AgentCommandPolicyInput } from "../src/core/harness/AgentCommandPo
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import {
   DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
+  DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON,
   DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON,
   DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON,
   buildAgentCommandPolicyInputForAcpPermission,
@@ -141,13 +142,16 @@ describe("AgentCommandPolicyAcpResolver", () => {
     const classify = vi.fn((_input: AgentCommandPolicyInput) =>
       denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
     );
+    const fileEditApproval = vi.fn(() => ({ outcome: "approve" as const }));
     const resolver = createAgentCommandPolicyAcpResolver({
       classify,
+      fileEditApproval,
       environment: { GITHUB_TOKEN: "secret-token", PATH: "/usr/bin" },
     });
     const input = resolverInput(
       editPermissionRequest({
         snakeCase: true,
+        rawInputPath: null,
         content: [
           { path: "README.md", old_text: "old README", new_text: "updated README" },
           { path: "src/index.ts", old_text: "export {};", new_text: "export const ok = true;" },
@@ -159,11 +163,66 @@ describe("AgentCommandPolicyAcpResolver", () => {
 
     expect(decision).toEqual({ optionId: "allow_once", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON });
     expect(classify).not.toHaveBeenCalled();
+    expect(fileEditApproval).toHaveBeenCalledTimes(1);
+    expect(fileEditApproval).toHaveBeenCalledWith(
+      expect.objectContaining({ affectedPaths: ["README.md", "src/index.ts"] }),
+      input,
+    );
     expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
       response: { outcome: { outcome: "selected", optionId: "allow_once" } },
       outcome: "selected",
       selectedOptionId: "allow_once",
       reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON,
+    });
+  });
+
+  it("fails closed for valid ACP file-edit permission requests when no file-edit approval hook is configured", async () => {
+    const classify = vi.fn((_input: AgentCommandPolicyInput) =>
+      denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
+    );
+    const resolver = createAgentCommandPolicyAcpResolver({
+      classify,
+      environment: { PATH: "/usr/bin" },
+    });
+    const input = resolverInput(editPermissionRequest({ snakeCase: true }));
+
+    const decision = await resolver(input);
+
+    expect(decision).toEqual({
+      optionId: "deny",
+      reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON,
+    });
+    expect(classify).not.toHaveBeenCalled();
+    expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
+      response: { outcome: { outcome: "selected", optionId: "deny" } },
+      outcome: "selected",
+      selectedOptionId: "deny",
+      reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON,
+    });
+  });
+
+  it("fails closed when the file-edit approval hook fails", async () => {
+    const classify = vi.fn((_input: AgentCommandPolicyInput) =>
+      denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
+    );
+    const resolver = createAgentCommandPolicyAcpResolver({
+      classify,
+      fileEditApproval: () => {
+        throw new Error("approval unavailable");
+      },
+      environment: { PATH: "/usr/bin" },
+    });
+    const input = resolverInput(editPermissionRequest({ snakeCase: true }));
+
+    const decision = await resolver(input);
+
+    expect(decision).toEqual({ optionId: "deny", reason: "file_edit_approval_error" });
+    expect(classify).not.toHaveBeenCalled();
+    expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
+      response: { outcome: { outcome: "selected", optionId: "deny" } },
+      outcome: "selected",
+      selectedOptionId: "deny",
+      reason: "file_edit_approval_error",
     });
   });
 
@@ -222,12 +281,36 @@ describe("AgentCommandPolicyAcpResolver", () => {
         }),
       reason: "file_edit_path_outside_workspace",
     },
+    {
+      name: "raw input target differs from displayed diff path inside workspace",
+      params: () =>
+        editPermissionRequest({
+          snakeCase: true,
+          path: "README.md",
+          rawInputPath: "src/index.ts",
+          content: [{ path: "README.md", old_text: "old README", new_text: "updated README" }],
+        }),
+      reason: "file_edit_target_path_mismatch",
+    },
+    {
+      name: "raw input target outside workspace while displayed diff path is inside",
+      params: () =>
+        editPermissionRequest({
+          snakeCase: true,
+          path: "README.md",
+          rawInputPath: "../outside.txt",
+          content: [{ path: "README.md", old_text: "old README", new_text: "updated README" }],
+        }),
+      reason: "file_edit_path_outside_workspace",
+    },
   ])("fails closed for $name ACP file-edit permission requests", async ({ params, reason, maxFileEditDiffBytes }) => {
     const classify = vi.fn((_input: AgentCommandPolicyInput) =>
       denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
     );
+    const fileEditApproval = vi.fn(() => ({ outcome: "approve" as const }));
     const resolver = createAgentCommandPolicyAcpResolver({
       classify,
+      fileEditApproval,
       maxFileEditDiffBytes,
       environment: { PATH: "/usr/bin" },
     });
@@ -237,6 +320,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
 
     expect(decision).toEqual({ optionId: "deny", reason });
     expect(classify).not.toHaveBeenCalled();
+    expect(fileEditApproval).not.toHaveBeenCalled();
     expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
       response: { outcome: { outcome: "selected", optionId: "deny" } },
       outcome: "selected",
@@ -514,10 +598,12 @@ function terminalPermissionOptions(snakeCase = false): Array<Record<string, unkn
 }
 
 function editPermissionRequest(
-  options: { snakeCase?: boolean; path?: string; rawInputPath?: string; content?: unknown } = {},
+  options: { snakeCase?: boolean; path?: string; rawInputPath?: string | null; content?: unknown } = {},
 ): Record<string, unknown> {
   const diffPath = options.path ?? "README.md";
-  const rawInputPath = options.rawInputPath ?? diffPath;
+  const rawInputPath = Object.prototype.hasOwnProperty.call(options, "rawInputPath") ? options.rawInputPath : diffPath;
+  const rawInputArguments: Record<string, unknown> = { content: "updated README" };
+  if (rawInputPath !== null && rawInputPath !== undefined) rawInputArguments.path = rawInputPath;
   const content = Object.prototype.hasOwnProperty.call(options, "content")
     ? options.content
     : [{ path: diffPath, old_text: "old README", new_text: "updated README" }];
@@ -527,7 +613,7 @@ function editPermissionRequest(
     title: `Approve edit: ${diffPath}`,
     [options.snakeCase ? "raw_input" : "rawInput"]: {
       tool: "write_file",
-      arguments: { path: rawInputPath, content: "updated README" },
+      arguments: rawInputArguments,
     },
     content,
   };

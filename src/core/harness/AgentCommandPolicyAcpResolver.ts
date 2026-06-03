@@ -67,6 +67,8 @@ export type AgentCommandPolicyAcpFileEditApprovalResolver = (
 export const DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID: AgentCommandPolicyAcpAllowOptionId = "allow_once";
 export const DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON = "file_edit_permission_allowed";
 export const DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON = "file_edit_permission_denied";
+export const DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON =
+  "file_edit_approval_bridge_not_configured";
 export const DEFAULT_AGENT_COMMAND_POLICY_ACP_MAX_FILE_EDIT_DIFF_BYTES = 1024 * 1024;
 
 const AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_IDS = new Set<string>([
@@ -198,23 +200,26 @@ export function buildAgentCommandPolicyFileEditApprovalRequestForAcpPermission(
 
   const maxDiffBytes = normalizeFileEditMaxDiffBytes(options.maxFileEditDiffBytes);
   const affectedPaths: string[] = [];
-  const seenAffectedPaths = new Set<string>();
+  const diffTargetPaths = new Set<string>();
   let totalBytes = 0;
   for (const diff of diffsResult.diffs) {
     const pathPolicy = validateFileEditPathWithinWorkspace(workspacePath, diff.path);
     if (pathPolicy.status === "error") return { status: "error", reason: pathPolicy.reason };
-    if (!seenAffectedPaths.has(diff.path)) {
-      seenAffectedPaths.add(diff.path);
-      affectedPaths.push(diff.path);
-    }
+    if (!diffTargetPaths.has(pathPolicy.comparisonPath)) affectedPaths.push(diff.path);
+    diffTargetPaths.add(pathPolicy.comparisonPath);
     totalBytes += diff.byteLength;
     if (totalBytes > maxDiffBytes) return { status: "error", reason: "file_edit_diff_too_large" };
   }
 
   const rawInput = recordField(toolCall, "rawInput", "raw_input");
+  const rawInputTargetPaths = new Set<string>();
   for (const rawPath of fileEditRawInputPaths(rawInput)) {
     const pathPolicy = validateFileEditPathWithinWorkspace(workspacePath, rawPath);
     if (pathPolicy.status === "error") return { status: "error", reason: pathPolicy.reason };
+    rawInputTargetPaths.add(pathPolicy.comparisonPath);
+  }
+  if (rawInputTargetPaths.size > 0 && !sameStringSet(rawInputTargetPaths, diffTargetPaths)) {
+    return { status: "error", reason: "file_edit_target_path_mismatch" };
   }
 
   const title = nonEmptyString(unknownField(toolCall, "title"));
@@ -261,9 +266,10 @@ async function resolveAgentCommandPolicyFileEditAcpPermission(
   if (approvalRequest.status === "error") return { optionId: "deny", reason: approvalRequest.reason };
 
   try {
-    const outcome = options.fileEditApproval
-      ? await options.fileEditApproval(approvalRequest.request, input)
-      : "approve";
+    if (!options.fileEditApproval) {
+      return { optionId: "deny", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON };
+    }
+    const outcome = await options.fileEditApproval(approvalRequest.request, input);
     return mapAgentCommandPolicyFileEditApprovalOutcomeToAcpPermissionDecision(outcome);
   } catch {
     return { optionId: "deny", reason: "file_edit_approval_error" };
@@ -274,7 +280,7 @@ type AgentCommandPolicyAcpFileEditDiffsResult =
   | { status: "ok"; diffs: AgentCommandPolicyAcpFileEditDiff[] }
   | { status: "error"; reason: string };
 
-type FileEditPathPolicyResult = { status: "ok" } | { status: "error"; reason: string };
+type FileEditPathPolicyResult = { status: "ok"; comparisonPath: string } | { status: "error"; reason: string };
 
 function fileEditDiffsFromAcpToolCall(toolCall: Record<string, unknown>): AgentCommandPolicyAcpFileEditDiffsResult {
   const content = unknownField(toolCall, "content");
@@ -346,8 +352,16 @@ function validateFileEditPathWithinWorkspace(workspacePath: string, targetPath: 
 
   if (samePath(workspaceRoot, absoluteTargetPath, pathApi)) return { status: "error", reason: "invalid_file_edit_path" };
   return isPathInsideRoot(workspaceRoot, absoluteTargetPath, pathApi)
-    ? { status: "ok" }
+    ? { status: "ok", comparisonPath: pathForComparison(absoluteTargetPath, pathApi) }
     : { status: "error", reason: "file_edit_path_outside_workspace" };
+}
+
+function sameStringSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  if (left.size !== right.size) return false;
+  for (const value of left) {
+    if (!right.has(value)) return false;
+  }
+  return true;
 }
 
 function normalizeFileEditMaxDiffBytes(value: number | undefined): number {
