@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
 import type { SymphonyDataSource } from "../src/data/dataSource";
+import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
 import type { DashboardModel } from "../src/types/symphony";
 
 const originalFetch = globalThis.fetch;
@@ -64,7 +65,7 @@ const demoDataSource: SymphonyDataSource = {
     return { providerGates: [], runningAgents: [], reviewIssues: [], activity: [], sessions: [], chat: [], totals: demoDashboard.totals };
   },
   async getOrchestratorChat() {
-    return [];
+    return orchestratorChatModelFromMessages([]);
   },
   async sendOrchestratorMessage(input) {
     return [{ who: "user", text: input }];

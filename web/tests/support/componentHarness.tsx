@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { SymphonyDataSource } from "../../src/data/dataSource";
 import { DataSourceProvider } from "../../src/data/dataSourceContext";
 import { ReferenceDataProvider } from "../../src/data/referenceDataContext";
+import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../../src/data/orchestratorChat";
 import type {
   ChatMessage,
   DashboardModel,
@@ -11,6 +12,7 @@ import type {
   IssueBoardModel,
   IssueDetailModel,
   IssueModel,
+  OrchestratorChatModel,
   ReferenceData,
   SidebarModel,
 } from "../../src/types/symphony";
@@ -145,7 +147,7 @@ export interface ApiModeDataSourceOptions {
   issueDetails?: Record<string, IssueDetailModel | null>;
   history?: Partial<HistoryModel>;
   sidebar?: Partial<SidebarModel>;
-  orchestratorChat?: ChatMessage[];
+  orchestratorChat?: OrchestratorChatModel | ChatMessage[];
 }
 
 export function createApiModeDataSource(options: ApiModeDataSourceOptions = {}): SymphonyDataSource {
@@ -155,7 +157,7 @@ export function createApiModeDataSource(options: ApiModeDataSourceOptions = {}):
   const issueBoard = makeHarnessIssueBoard(primaryIssue, options.issueBoard);
   const history = makeHarnessHistory(options.history);
   const sidebar = makeHarnessSidebar(options.sidebar);
-  const orchestratorChat = options.orchestratorChat ?? dashboard.chat;
+  const orchestratorChat = normalizeOrchestratorChatModel(options.orchestratorChat ?? orchestratorChatModelFromMessages(dashboard.chat));
   const issueDetails = options.issueDetails ?? {
     [primaryIssue.id]: {
       issue: primaryIssue,
@@ -194,7 +196,7 @@ export function createApiModeDataSource(options: ApiModeDataSourceOptions = {}):
       return orchestratorChat;
     },
     async sendOrchestratorMessage(input) {
-      return [...orchestratorChat, { who: "user", text: input }];
+      return [...orchestratorChat.chat, { who: "user", text: input }];
     },
   };
 }

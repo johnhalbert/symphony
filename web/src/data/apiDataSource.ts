@@ -6,6 +6,7 @@ import type {
   SymphonyDataSource,
 } from "./dataSource";
 import { createRealtimeEventSourceClient } from "./eventSourceClient";
+import { normalizeOrchestratorChatModel } from "./orchestratorChat";
 import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
@@ -292,7 +293,9 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       return fetchJson(normalizedBaseUrl, "/api/v1/web/sidebar", { signal });
     },
     async getOrchestratorChat(signal) {
-      return fetchJson<ChatMessage[]>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat", { signal });
+      return normalizeOrchestratorChatModel(
+        await fetchJson<unknown>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat", { signal }),
+      );
     },
     async sendOrchestratorMessage(input) {
       const response = await fetch(`${normalizedBaseUrl}/api/v1/web/orchestrator-chat`, {

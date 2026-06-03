@@ -20,7 +20,7 @@ describe("API data source contract fixture conformance", () => {
   it("consumes every shared /api/v1/web contract fixture unchanged", async () => {
     apiFixture = createApiFetchFixture([
       ...webRouteContractGetFixtureCases.map((testCase) => ({ path: testCase.path, body: testCase.fixture })),
-      { method: "POST", path: webRouteContractPaths.orchestratorChat, body: webRouteContractFixturesWithIssueDetail.orchestratorChat },
+      { method: "POST", path: webRouteContractPaths.orchestratorChat, body: webRouteContractFixturesWithIssueDetail.orchestratorChat.chat },
     ]);
     const dataSource = createApiDataSource("");
 
@@ -36,7 +36,7 @@ describe("API data source contract fixture conformance", () => {
     await expect(dataSource.getSidebar()).resolves.toEqual(webRouteContractFixturesWithIssueDetail.sidebar);
     await expect(dataSource.getOrchestratorChat()).resolves.toEqual(webRouteContractFixturesWithIssueDetail.orchestratorChat);
     await expect(dataSource.sendOrchestratorMessage("show contract fixture status")).resolves.toEqual(
-      webRouteContractFixturesWithIssueDetail.orchestratorChat,
+      webRouteContractFixturesWithIssueDetail.orchestratorChat.chat,
     );
 
     expect(apiFixture.requests.map((request) => [request.method, request.path])).toEqual([
