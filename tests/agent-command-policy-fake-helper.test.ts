@@ -66,6 +66,13 @@ const PERSISTED_CONFIG_MATRIX: readonly PersistedConfigMatrixCase[] = [
     effect: "uses_credentials",
   },
   {
+    name: "core askPass helper",
+    lines: (helper) => ["[core]", `  askPass = ${helper.commandPath}`],
+    expectedKey: "core.askpass",
+    category: "credential_helper",
+    effect: "uses_credentials",
+  },
+  {
     name: "hook path helper",
     lines: (helper) => ["[core]", `  hooksPath = ${path.dirname(helper.commandPath)}`],
     expectedKey: "core.hookspath",
