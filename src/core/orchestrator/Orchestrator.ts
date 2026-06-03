@@ -8,6 +8,7 @@ import {
   renderCompletionMcpHandoffPrompt,
   renderIssueBreakdownMcpHandoffPrompt,
   renderMergeConflictResolutionMcpHandoffPrompt,
+  renderReviewMcpHandoffPrompt,
 } from "../harness/HandoffMcp.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
@@ -1430,6 +1431,14 @@ export class Orchestrator {
           reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
           workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
         }),
+        {
+          issue: entry.issue,
+          role: "reviewer",
+          workspacePath: workspace.path,
+          branchName: workspace.gitBranchName ?? entry.issue.branchName ?? null,
+          repoPath: workspace.repoPath ?? null,
+          baseRef: workspace.baseRef ?? null,
+        },
       );
       await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
         workspace,
@@ -2755,16 +2764,20 @@ export class Orchestrator {
     return DEFAULT_REVIEWER_PROMPT_TEMPLATE;
   }
 
-  private formatRenderedReviewerPrompt(prompt: string): string {
+  private formatRenderedReviewerPrompt(
+    prompt: string,
+    mcpHandoff: Parameters<typeof renderReviewMcpHandoffPrompt>[0],
+  ): string {
     const configured = this.config.reviewLoop.reviewerPromptTemplate;
     if (configured !== null && configured.trim().length > 0) return prompt;
-    return prompt
+    const rendered = prompt
       .replace(
         PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER,
         formatPromptExtensions("Project-specific reviewer extensions:", this.config.reviewLoop.reviewerPromptExtensions) ??
           "",
       )
       .trim();
+    return [rendered, renderReviewMcpHandoffPrompt(mcpHandoff)].join("\n").trim();
   }
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
