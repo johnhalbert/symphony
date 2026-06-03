@@ -76,6 +76,18 @@ export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase 
   lastMessageId: string | null;
   lastMessageStatus: string | null;
   lastMessageAt: string | null;
+  state: string | null;
+  conversationStatus: string | null;
+  active: boolean | null;
+  terminal: boolean | null;
+  empty: boolean | null;
+  latestMessageSequence: number | null;
+  latestMessageUpdatedAt: string | null;
+  conversation: Readonly<Record<string, unknown>> | null;
+  statusSummary: Readonly<Record<string, unknown>> | null;
+  statusCounts: Readonly<Record<string, unknown>> | null;
+  sourceSummary: Readonly<Record<string, unknown>> | null;
+  chat: readonly Readonly<Record<string, unknown>>[] | null;
 }
 
 export interface RealtimeSourceStatusPayload extends RealtimePayloadBase {
@@ -249,7 +261,19 @@ function isRealtimePayloadForEventType(type: RealtimeProjectionEventType, value:
         isNullableFiniteNumber(orchestratorPayload.status) &&
         isNullableString(orchestratorPayload.lastMessageId) &&
         isNullableString(orchestratorPayload.lastMessageStatus) &&
-        isNullableString(orchestratorPayload.lastMessageAt)
+        isNullableString(orchestratorPayload.lastMessageAt) &&
+        isNullableString(orchestratorPayload.state) &&
+        isNullableString(orchestratorPayload.conversationStatus) &&
+        isNullableBoolean(orchestratorPayload.active) &&
+        isNullableBoolean(orchestratorPayload.terminal) &&
+        isNullableBoolean(orchestratorPayload.empty) &&
+        isNullableFiniteNumber(orchestratorPayload.latestMessageSequence) &&
+        isNullableString(orchestratorPayload.latestMessageUpdatedAt) &&
+        isNullableRecord(orchestratorPayload.conversation) &&
+        isNullableRecord(orchestratorPayload.statusSummary) &&
+        isNullableRecord(orchestratorPayload.statusCounts) &&
+        isNullableRecord(orchestratorPayload.sourceSummary) &&
+        isNullableRecordArray(orchestratorPayload.chat)
       );
     }
     case "source.status": {
@@ -330,6 +354,10 @@ function isNullableFiniteNumber(value: unknown): value is number | null {
   return value === null || (typeof value === "number" && Number.isFinite(value));
 }
 
+function isNullableBoolean(value: unknown): value is boolean | null {
+  return value === null || typeof value === "boolean";
+}
+
 function isNullableSourceStatusError(value: unknown): value is RealtimeSourceStatusPayload["error"] {
   if (value === null) return true;
   if (!isRecord(value)) return false;
@@ -339,6 +367,14 @@ function isNullableSourceStatusError(value: unknown): value is RealtimeSourceSta
 
 function isRecordArray(value: unknown): value is readonly Readonly<Record<string, unknown>>[] {
   return Array.isArray(value) && value.every(isRecord);
+}
+
+function isNullableRecord(value: unknown): value is Readonly<Record<string, unknown>> | null {
+  return value === null || isRecord(value);
+}
+
+function isNullableRecordArray(value: unknown): value is readonly Readonly<Record<string, unknown>>[] | null {
+  return value === null || isRecordArray(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -125,7 +125,13 @@ interface RealtimeTranscriptDeltaPayload {
 Scope: `orchestrator`; `key` is the conversation id when known.
 
 Published for durable orchestrator conversation appends/updates and accepted
-operator chat posts.
+operator chat posts. Conversation-store and accepted-post events carry a current,
+sanitized chat-state snapshot in the payload so clients can apply the live state
+or continue to use the resource/recovery hints to refetch
+`/api/v1/web/orchestrator-chat`. Durable projection-publication events may carry
+only cursor-level state metadata (`state`, `conversationStatus`, message counts,
+and latest-message fields) when the projection payload itself is not available on
+the publication event.
 
 ```ts
 interface RealtimeOrchestratorMessagePayload {
@@ -134,7 +140,22 @@ interface RealtimeOrchestratorMessagePayload {
   conversationId: string | null;
   messageCount: number | null;
   inputLength: number | null;
-  status: number | null;
+  status: number | null; // HTTP status for accepted operator chat posts, otherwise null.
+  lastMessageId: string | null;
+  lastMessageStatus: string | null;
+  lastMessageAt: string | null;
+  state: string | null;
+  conversationStatus: string | null;
+  active: boolean | null;
+  terminal: boolean | null;
+  empty: boolean | null;
+  latestMessageSequence: number | null;
+  latestMessageUpdatedAt: string | null;
+  conversation: Record<string, unknown> | null;
+  statusSummary: Record<string, unknown> | null;
+  statusCounts: Record<string, unknown> | null;
+  sourceSummary: Record<string, unknown> | null;
+  chat: readonly Record<string, unknown>[] | null;
   detail: Record<string, unknown> | null;
 }
 ```

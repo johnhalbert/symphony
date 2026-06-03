@@ -815,18 +815,23 @@ export class StatusServer {
           });
           const chatProjection = webOrchestratorChatProjectionFromResponseBody(result.body, postConversationId);
           if (chatProjection) {
+            let currentChatProjection: Pick<WebOrchestratorChatProjectionResponse, "conversation" | "state" | "status" | "chat" | "source"> =
+              chatProjection;
             if (this.options.orchestratorConversationStore) {
-              await this.persistWebOrchestratorChatProjection(await this.fetchWebOrchestratorChatProjection(postConversationId));
+              const durableChatProjection = await this.fetchWebOrchestratorChatProjection(postConversationId);
+              await this.persistWebOrchestratorChatProjection(durableChatProjection);
+              currentChatProjection = durableChatProjection;
             }
-            if (chatProjection.chat.length > 0 && result.status !== 200) {
-              this.realtimeEvents.publishOrchestratorMessage({
-                inputLength: input.input.length,
-                messageCount: chatProjection.chat.length,
-                conversationId: postConversationId ?? DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
-                status: result.status,
-              });
+            if (currentChatProjection.chat.length > 0 && result.status !== 200) {
+              this.realtimeEvents.publishOrchestratorMessage(
+                orchestratorChatRealtimeDetailFromProjection(currentChatProjection, {
+                  inputLength: input.input.length,
+                  status: result.status,
+                }),
+              );
             }
           }
+
           sendJson(response, result.status, result.body);
           return;
         }
@@ -2772,7 +2777,12 @@ function orchestratorChatProjectionRealtimeDetail(
   const conversationId =
     recordStringValue(sourceCursors, "conversationId") ?? recordStringValue(sourceCursors, "conversationKey") ?? publication.scopeKey;
   const detail: Record<string, unknown> = { conversationId, conversationKey: conversationId };
+  copyStringRecordField(detail, sourceCursors, "conversationStatus");
+  copyStringRecordField(detail, sourceCursors, "state");
   copyNumberRecordField(detail, sourceCursors, "messageCount");
+  copyNumberRecordField(detail, sourceCursors, "latestMessageSequence");
+  copyStringRecordField(detail, sourceCursors, "latestMessageUpdatedAt");
+  copyStringRecordField(detail, sourceCursors, "sourceRevision");
   copyStringRecordField(detail, sourceCursors, "lastMessageId");
   copyStringRecordField(detail, sourceCursors, "lastMessageStatus");
   copyStringRecordField(detail, sourceCursors, "lastMessageAt");
@@ -3321,6 +3331,35 @@ function orchestratorChatProjectionSourceCursors(
     lastMessageId: lastMessage?.id ?? null,
     lastMessageStatus: lastMessage?.status ?? null,
     lastMessageAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null,
+  };
+}
+
+function orchestratorChatRealtimeDetailFromProjection(
+  projection: Pick<WebOrchestratorChatProjectionResponse, "conversation" | "state" | "status" | "chat" | "source">,
+  extras: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const lastMessage = projection.chat.at(-1) ?? null;
+  const latestMessageAt = lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null;
+  return {
+    conversationId: projection.conversation.id,
+    conversationKey: orchestratorChatProjectionScopeKey(projection.conversation.id),
+    conversation: projection.conversation,
+    conversationStatus: projection.conversation.status,
+    state: projection.state,
+    statusSummary: projection.status,
+    statusCounts: projection.status.statusCounts,
+    active: projection.status.active,
+    terminal: projection.status.terminal,
+    empty: projection.status.empty,
+    messageCount: projection.chat.length,
+    latestMessageSequence: projection.source.latestMessageSequence,
+    latestMessageUpdatedAt: projection.source.latestMessageUpdatedAt,
+    sourceSummary: projection.source,
+    lastMessageId: lastMessage?.id ?? null,
+    lastMessageStatus: lastMessage?.status ?? null,
+    lastMessageAt: latestMessageAt,
+    chat: projection.chat,
+    ...extras,
   };
 }
 

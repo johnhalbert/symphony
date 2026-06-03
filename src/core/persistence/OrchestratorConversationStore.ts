@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
   ProjectionRevisionNotifier,
+  type ProjectionChangeDetail,
   type ProjectionChangeListener,
   type ProjectionChangeUnsubscribe,
 } from "./ProjectionRevision.js";
@@ -120,7 +121,7 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
             messages: [],
           };
       await this.writeConversation(record);
-      this.notifyProjectionChanged();
+      this.notifyProjectionChanged(record);
       return record;
     });
   }
@@ -165,7 +166,7 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
         messages: [...record.messages, message],
       };
       await this.writeConversation(nextRecord);
-      this.notifyProjectionChanged();
+      this.notifyProjectionChanged(nextRecord);
       return message;
     });
   }
@@ -201,7 +202,7 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
         messages,
       };
       await this.writeConversation(nextRecord);
-      this.notifyProjectionChanged();
+      this.notifyProjectionChanged(nextRecord);
       return updated;
     });
   }
@@ -238,9 +239,157 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
     await writeJson(filePath, normalizeConversationRecordForConversation(record, conversationId, filePath));
   }
 
-  private notifyProjectionChanged(): void {
-    this.projectionNotifier.notify("orchestrator_conversations");
+  private notifyProjectionChanged(record: OrchestratorConversationRecord): void {
+    this.projectionNotifier.notify("orchestrator_conversations", orchestratorConversationProjectionChangeDetail(record));
   }
+}
+
+function orchestratorConversationProjectionChangeDetail(record: OrchestratorConversationRecord): ProjectionChangeDetail {
+  const chat = record.messages.map(projectOrchestratorConversationRealtimeMessage);
+  const statusSummary = summarizeOrchestratorConversationRealtimeStatus(chat, record.status);
+  const latestMessage = chat.at(-1) ?? null;
+  const latestStoredMessage = record.messages.at(-1) ?? null;
+  const latestMessageSequence = latestStoredMessage?.sequence ?? null;
+  const latestMessageUpdatedAt = typeof latestMessage?.updatedAt === "string" ? latestMessage.updatedAt : null;
+  return {
+    source: "orchestrator_conversations",
+    conversationId: record.conversationId,
+    conversationKey: record.conversationId,
+    conversationStatus: record.status,
+    conversation: {
+      id: record.conversationId,
+      status: record.status,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      messageCount: chat.length,
+      metadata: record.metadata,
+    },
+    state: statusSummary.state,
+    statusSummary,
+    statusCounts: statusSummary.statusCounts,
+    active: statusSummary.active,
+    terminal: statusSummary.terminal,
+    empty: statusSummary.empty,
+    messageCount: chat.length,
+    latestMessageSequence,
+    latestMessageUpdatedAt,
+    sourceSummary: {
+      source: "orchestrator_conversations",
+      revision: orchestratorConversationRealtimeRevision(record, latestStoredMessage),
+      observedAt: record.updatedAt,
+      conversationId: record.conversationId,
+      latestMessageSequence,
+      latestMessageUpdatedAt,
+    },
+    lastMessageId: latestMessage?.id ?? null,
+    lastMessageStatus: latestMessage?.status ?? null,
+    lastMessageAt:
+      typeof latestMessage?.updatedAt === "string"
+        ? latestMessage.updatedAt
+        : typeof latestMessage?.createdAt === "string"
+          ? latestMessage.createdAt
+          : null,
+    chat,
+  };
+}
+
+function projectOrchestratorConversationRealtimeMessage(message: OrchestratorConversationMessage): Record<string, unknown> {
+  return {
+    id: message.id,
+    conversationId: message.conversationId,
+    who: message.role === "user" ? "user" : "agent",
+    role: message.role,
+    text: message.body,
+    status: message.status,
+    createdAt: message.createdAt,
+    updatedAt: message.updatedAt,
+    metadata: message.metadata,
+    suggestions: [],
+  };
+}
+
+function summarizeOrchestratorConversationRealtimeStatus(
+  chat: readonly Readonly<Record<string, unknown>>[],
+  conversationStatus: OrchestratorConversationStatus,
+): Record<string, unknown> & {
+  state: OrchestratorConversationStatus | "empty";
+  active: boolean;
+  terminal: boolean;
+  empty: boolean;
+  statusCounts: Record<OrchestratorConversationStatus, number>;
+} {
+  const statusCounts = emptyOrchestratorConversationStatusCounts();
+  for (const message of chat) statusCounts[orchestratorConversationStatusValue(message.status) ?? "completed"] += 1;
+  const latestMessageStatus = orchestratorConversationStatusValue(chat.at(-1)?.status);
+  const state =
+    chat.length === 0 && conversationStatus === "completed"
+      ? "empty"
+      : deriveOrchestratorConversationRealtimeState(conversationStatus, latestMessageStatus, statusCounts);
+  const active = state === "pending" || state === "streaming";
+  return {
+    state,
+    conversationStatus,
+    latestMessageStatus,
+    active,
+    terminal: !active && state !== "empty",
+    empty: chat.length === 0,
+    messageCount: chat.length,
+    statusCounts,
+  };
+}
+
+function deriveOrchestratorConversationRealtimeState(
+  conversationStatus: OrchestratorConversationStatus,
+  latestMessageStatus: OrchestratorConversationStatus | null,
+  statusCounts: Record<OrchestratorConversationStatus, number>,
+): OrchestratorConversationStatus {
+  if (latestMessageStatus === "pending" || latestMessageStatus === "streaming") return latestMessageStatus;
+  if (conversationStatus === "pending" || conversationStatus === "streaming") return conversationStatus;
+  if (latestMessageStatus === "failed" || latestMessageStatus === "unavailable" || latestMessageStatus === "disabled") {
+    return latestMessageStatus;
+  }
+  if (conversationStatus === "failed" || conversationStatus === "unavailable" || conversationStatus === "disabled") {
+    return conversationStatus;
+  }
+  if (statusCounts.streaming > 0) return "streaming";
+  if (statusCounts.pending > 0) return "pending";
+  if (statusCounts.failed > 0) return "failed";
+  if (statusCounts.unavailable > 0) return "unavailable";
+  if (statusCounts.disabled > 0) return "disabled";
+  return "completed";
+}
+
+function emptyOrchestratorConversationStatusCounts(): Record<OrchestratorConversationStatus, number> {
+  return {
+    pending: 0,
+    streaming: 0,
+    completed: 0,
+    failed: 0,
+    disabled: 0,
+    unavailable: 0,
+  };
+}
+
+function orchestratorConversationStatusValue(value: unknown): OrchestratorConversationStatus | null {
+  return typeof value === "string" && isOrchestratorConversationStatus(value) ? value : null;
+}
+
+function isOrchestratorConversationStatus(value: string): value is OrchestratorConversationStatus {
+  return (
+    value === "pending" ||
+    value === "streaming" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "disabled" ||
+    value === "unavailable"
+  );
+}
+
+function orchestratorConversationRealtimeRevision(
+  record: OrchestratorConversationRecord,
+  latestMessage: OrchestratorConversationMessage | null,
+): string {
+  return [record.conversationId, record.messages.length, latestMessage?.id ?? "none", latestMessage?.updatedAt ?? record.updatedAt].join(":");
 }
 
 function normalizeConversationId(conversationId?: string | null): string {

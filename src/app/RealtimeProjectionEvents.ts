@@ -79,6 +79,18 @@ export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase 
   lastMessageId: string | null;
   lastMessageStatus: string | null;
   lastMessageAt: string | null;
+  state: string | null;
+  conversationStatus: string | null;
+  active: boolean | null;
+  terminal: boolean | null;
+  empty: boolean | null;
+  latestMessageSequence: number | null;
+  latestMessageUpdatedAt: string | null;
+  conversation: Readonly<Record<string, unknown>> | null;
+  statusSummary: Readonly<Record<string, unknown>> | null;
+  statusCounts: Readonly<Record<string, unknown>> | null;
+  sourceSummary: Readonly<Record<string, unknown>> | null;
+  chat: readonly Readonly<Record<string, unknown>>[] | null;
 }
 
 export interface RealtimeSourceStatusPayload extends RealtimePayloadBase {
@@ -463,7 +475,8 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
         afterSequence: readNumberDetail(detail, "afterSequence"),
         eventCount: readNumberDetail(detail, "eventCount"),
       } as RealtimeProjectionEventPayloadByType[TType];
-    case "orchestrator.message":
+    case "orchestrator.message": {
+      const statusSummary = readRecordDetail(detail, "statusSummary");
       return {
         ...base,
         conversationId: readStringDetail(detail, "conversationId"),
@@ -473,7 +486,20 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
         lastMessageId: readStringDetail(detail, "lastMessageId"),
         lastMessageStatus: readStringDetail(detail, "lastMessageStatus"),
         lastMessageAt: readStringDetail(detail, "lastMessageAt"),
+        state: readStringDetail(detail, "state"),
+        conversationStatus: readStringDetail(detail, "conversationStatus"),
+        active: readBooleanDetail(detail, "active"),
+        terminal: readBooleanDetail(detail, "terminal"),
+        empty: readBooleanDetail(detail, "empty"),
+        latestMessageSequence: readNumberDetail(detail, "latestMessageSequence"),
+        latestMessageUpdatedAt: readStringDetail(detail, "latestMessageUpdatedAt"),
+        conversation: readRecordDetail(detail, "conversation"),
+        statusSummary,
+        statusCounts: readRecordDetail(detail, "statusCounts") ?? readRecordField(statusSummary, "statusCounts"),
+        sourceSummary: readRecordDetail(detail, "sourceSummary"),
+        chat: readNullableRecordArrayDetail(detail, "chat"),
       } as RealtimeProjectionEventPayloadByType[TType];
+    }
     case "source.status": {
       const primaryFreshness = primarySourceFreshness(detail);
       return {
@@ -577,6 +603,21 @@ function readRecordArrayDetail(
   const value = detail?.[key];
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is Readonly<Record<string, unknown>> => isRecord(item));
+}
+
+function readNullableRecordArrayDetail(
+  detail: RealtimeProjectionEventDetail | null,
+  key: string,
+): readonly Readonly<Record<string, unknown>>[] | null {
+  if (!detail || !(key in detail)) return null;
+  const value = detail[key];
+  if (!Array.isArray(value)) return null;
+  return value.every(isRecord) ? value : null;
+}
+
+function readRecordField(record: Readonly<Record<string, unknown>> | null, key: string): Readonly<Record<string, unknown>> | null {
+  const value = record?.[key];
+  return isRecord(value) ? value : null;
 }
 
 function primarySourceFreshness(detail: RealtimeProjectionEventDetail | null): Readonly<Record<string, unknown>> | null {

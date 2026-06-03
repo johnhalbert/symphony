@@ -635,7 +635,11 @@ describe("StatusServer realtime SSE API", () => {
           ],
           sourceCursors: {
             conversationKey: "operator-room",
+            conversationStatus: "completed",
+            state: "completed",
             messageCount: 3,
+            latestMessageSequence: 3,
+            latestMessageUpdatedAt: "2026-01-01T00:00:03.500Z",
             lastMessageId: "message-3",
             lastMessageStatus: "completed",
             lastMessageAt: "2026-01-01T00:00:03.500Z",
@@ -688,10 +692,15 @@ describe("StatusServer realtime SSE API", () => {
         source: { source: "orchestrator_chat_projection:conversation:operator-room", revision: 12 },
         payload: {
           conversationId: "operator-room",
+          conversationStatus: "completed",
+          state: "completed",
           messageCount: 3,
+          latestMessageSequence: 3,
+          latestMessageUpdatedAt: "2026-01-01T00:00:03.500Z",
           lastMessageId: "message-3",
           lastMessageStatus: "completed",
           lastMessageAt: "2026-01-01T00:00:03.500Z",
+          chat: null,
         },
       });
     } finally {
@@ -1049,6 +1058,29 @@ describe("StatusServer realtime SSE API", () => {
       expect(assistantAppend.data).toMatchObject({
         type: "orchestrator.message",
         source: { source: "orchestrator_conversations", revision: 1 },
+        scope: "orchestrator",
+        key: "operator-room",
+        payload: {
+          conversationId: "operator-room",
+          conversationStatus: "streaming",
+          state: "streaming",
+          active: true,
+          messageCount: 1,
+          latestMessageSequence: 1,
+          latestMessageUpdatedAt: "2026-01-01T00:00:00.000Z",
+          lastMessageId: assistant.id,
+          lastMessageStatus: "streaming",
+          chat: [
+            expect.objectContaining({
+              id: assistant.id,
+              conversationId: "operator-room",
+              role: "assistant",
+              text: "I can help inspect the queue.",
+              status: "streaming",
+            }),
+          ],
+          statusSummary: expect.objectContaining({ state: "streaming", active: true, messageCount: 1 }),
+        },
         recovery: { strategy: "refetch", reason: "event" },
       });
       expect((assistantAppend.data as RealtimeProjectionEvent).resources).toEqual(
@@ -1069,6 +1101,26 @@ describe("StatusServer realtime SSE API", () => {
       expect(assistantUpdate.data).toMatchObject({
         type: "orchestrator.message",
         source: { source: "orchestrator_conversations", revision: 2 },
+        key: "operator-room",
+        payload: {
+          conversationId: "operator-room",
+          conversationStatus: "completed",
+          state: "completed",
+          active: false,
+          terminal: true,
+          messageCount: 1,
+          latestMessageSequence: 1,
+          latestMessageUpdatedAt: "2026-01-01T00:00:01.000Z",
+          lastMessageId: assistant.id,
+          lastMessageStatus: "completed",
+          chat: [
+            expect.objectContaining({
+              id: assistant.id,
+              text: "I found the queue summary.",
+              status: "completed",
+            }),
+          ],
+        },
         recovery: { strategy: "refetch", reason: "event" },
       });
       expect((assistantUpdate.data as RealtimeProjectionEvent).recovery.endpoints).toContain(
@@ -1086,6 +1138,19 @@ describe("StatusServer realtime SSE API", () => {
       expect(systemAppend.data).toMatchObject({
         type: "orchestrator.message",
         source: { source: "orchestrator_conversations", revision: 3 },
+        key: "operator-room",
+        payload: {
+          conversationId: "operator-room",
+          conversationStatus: "completed",
+          state: "completed",
+          messageCount: 2,
+          latestMessageSequence: 2,
+          latestMessageUpdatedAt: "2026-01-01T00:00:02.000Z",
+          chat: [
+            expect.objectContaining({ id: assistant.id, text: "I found the queue summary." }),
+            expect.objectContaining({ role: "system", text: "System note: summary persisted.", status: "completed" }),
+          ],
+        },
         recovery: { strategy: "refetch", reason: "event" },
       });
       expect((systemAppend.data as RealtimeProjectionEvent).resources).toEqual(
@@ -1167,6 +1232,20 @@ describe("StatusServer realtime SSE API", () => {
             inputLength: "hello from the operator".length,
             messageCount: 1,
             status: 202,
+            state: "pending",
+            conversationStatus: "pending",
+            active: true,
+            latestMessageSequence: 1,
+            latestMessageUpdatedAt: expect.any(String),
+            chat: [
+              expect.objectContaining({
+                conversationId: "orchestrator-default",
+                role: "user",
+                text: "hello from the operator",
+                status: "pending",
+              }),
+            ],
+            statusSummary: expect.objectContaining({ state: "pending", active: true, messageCount: 1 }),
           },
           recovery: { strategy: "refetch", reason: "event" },
         });
