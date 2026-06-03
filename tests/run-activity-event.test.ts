@@ -26,12 +26,14 @@ import {
 } from "../src/core/runActivity/RunActivityEvent.js";
 import type {
   RunActivityActorForChannel,
+  RunActivityCommandPolicyDecisionPayload,
   RunActivityEvent,
   RunActivityEventForChannel,
   RunActivityEventInput,
   RunActivityEventOrderingFields,
   RunActivityKindForChannel,
   RunActivityOrderingState,
+  RunCommandPolicyDecisionActivityEvent,
 } from "../src/core/runActivity/RunActivityEvent.js";
 import type { RunActivityEvent as PublicRunActivityEvent } from "../src/index.js";
 
@@ -74,6 +76,65 @@ const typedDiagnosticActivity = {
   payload: { runtimeSessionId: "runtime-session-1", status: "working" },
 } satisfies RunActivityEventForChannel<"diagnostic">;
 
+const typedCommandPolicyDecisionActivity = {
+  eventId: "activity-command-policy-1",
+  runSessionId: "run-session-1",
+  occurredAt: "2026-05-31T00:00:01.750Z",
+  sequence: 5,
+  harness: "hermes-command-policy",
+  actor: "harness",
+  channel: "diagnostic",
+  kind: "command_policy_decision",
+  text: "Command policy denied upstream GitHub activity",
+  payload: {
+    redacted: true,
+    decisionId: "policy-decision-1",
+    attemptId: "tool-call-1",
+    runId: "run-command-policy-1",
+    issueId: "issue-command-policy-1",
+    surface: "terminal",
+    role: "worker",
+    phase: "implementation",
+    outcome: "deny",
+    reasonKind: "upstream_github",
+    commandClass: "direct_upstream_git_operation",
+    message:
+      "Blocked worker/reviewer upstream GitHub contact: direct GitHub activity is disallowed for worker/reviewer agents. Use Symphony service-owned workflow actions.",
+    upstreamContactAttempted: false,
+    requiresCodeChange: false,
+    requiresUserOrServiceFix: true,
+    normalizedCommand: {
+      executable: "git",
+      executableKind: "git",
+      argumentsPreview: "push origin HEAD",
+      gitSubcommand: "push",
+      targetHosts: [],
+      hasNestedCommand: false,
+      hasInlineEnvironment: false,
+      hasUnsafeGitConfig: false,
+    },
+    audit: {
+      redacted: true,
+      surface: "terminal",
+      role: "worker",
+      phase: "implementation",
+      outcome: "deny",
+      reasonKind: "upstream_github",
+      commandClass: "direct_upstream_git_operation",
+      inlineEnvironmentKeys: [],
+      unsafeConfigCategories: [],
+      upstreamContactAttempted: false,
+      rawInputPreview: "git push origin HEAD",
+      rawInputPreviewTruncated: false,
+      rawInputPreviewRedacted: false,
+      normalizedExecutable: "git",
+      executableKind: "git",
+      gitSubcommand: "push",
+      inheritedEnvironmentKeys: ["HOME", "PATH"],
+    },
+  } satisfies RunActivityCommandPolicyDecisionPayload,
+} satisfies RunCommandPolicyDecisionActivityEvent;
+
 const typedRateLimitActivity = {
   eventId: "activity-limit-1",
   runSessionId: "run-session-1",
@@ -100,7 +161,16 @@ const typedTerminalActivity = {
 
 const toolKind: RunActivityKindForChannel<"tool"> = "tool_call_started";
 const diagnosticActor: RunActivityActorForChannel<"diagnostic"> = "runtime";
-void [typedChatActivity, typedToolActivity, typedDiagnosticActivity, typedRateLimitActivity, typedTerminalActivity, toolKind, diagnosticActor];
+void [
+  typedChatActivity,
+  typedToolActivity,
+  typedDiagnosticActivity,
+  typedCommandPolicyDecisionActivity,
+  typedRateLimitActivity,
+  typedTerminalActivity,
+  toolKind,
+  diagnosticActor,
+];
 
 // @ts-expect-error Chat kinds are not valid tool-channel kinds.
 const invalidToolKind: RunActivityKindForChannel<"tool"> = "assistant_message_delta";
@@ -481,6 +551,7 @@ describe("RunActivityEvent taxonomy", () => {
     expect(RUN_ACTIVITY_KIND_BY_CHANNEL.diagnostic).toContain("runtime_diagnostic");
     expect(RUN_ACTIVITY_KIND_BY_CHANNEL.diagnostic).toContain("available_commands_update");
     expect(RUN_ACTIVITY_KIND_BY_CHANNEL.diagnostic).toContain("mode_update");
+    expect(RUN_ACTIVITY_KIND_BY_CHANNEL.diagnostic).toContain("command_policy_decision");
     expect(RUN_ACTIVITY_KIND_BY_CHANNEL.token).toContain("token_usage_reported");
     expect(RUN_ACTIVITY_KIND_BY_CHANNEL.rate_limit).toContain("provider_limit_detected");
     expect(RUN_ACTIVITY_KIND_BY_CHANNEL.terminal).toContain("run_failed");
@@ -517,12 +588,16 @@ describe("RunActivityEvent taxonomy", () => {
     expect(normalizeRunActivityChannel("message")).toBe("chat");
     expect(normalizeRunActivityChannel("status")).toBe("diagnostic");
     expect(isRunActivityKind("tool_call_completed")).toBe(true);
+    expect(isRunActivityKind("command_policy_decision")).toBe(true);
     expect(isRunActivityKind("session/update")).toBe(false);
     expect(isRunActivityKindForChannel("tool", "tool_call_completed")).toBe(true);
     expect(isRunActivityKindForChannel("tool", "assistant_message_delta")).toBe(false);
+    expect(isRunActivityKindForChannel("diagnostic", "command_policy_decision")).toBe(true);
+    expect(isRunActivityKindForChannel("tool", "command_policy_decision")).toBe(false);
     expect(isRunActivityActorForChannel("rate_limit", "provider")).toBe(true);
     expect(isRunActivityActorForChannel("rate_limit", "assistant")).toBe(false);
     expect(isRunActivityEvent(typedChatActivity)).toBe(true);
+    expect(isRunActivityEvent(typedCommandPolicyDecisionActivity)).toBe(true);
     expect(isRunActivityEvent({ ...typedChatActivity, id: typedChatActivity.eventId, eventId: undefined })).toBe(false);
     expect(isRunActivityEvent({ ...typedChatActivity, channel: "message" })).toBe(false);
   });

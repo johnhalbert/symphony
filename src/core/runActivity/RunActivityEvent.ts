@@ -1,5 +1,13 @@
 import type { ProviderLimitKind, ProviderLimitResumePolicy, ProviderLimitWindow } from "../provider/ProviderLimits.js";
 import type { AgentRunKind, AgentRunPhase, AgentRunRole, TokenCounts } from "../types.js";
+import type {
+  AgentCommandPolicyAuditPayload,
+  AgentCommandPolicyCommandClass,
+  AgentCommandPolicyNormalizedCommand,
+  AgentCommandPolicyOutcome,
+  AgentCommandPolicyReasonKind,
+  AgentCommandPolicySurface,
+} from "../harness/AgentCommandPolicy.js";
 
 /**
  * Symphony-owned, harness-neutral run activity taxonomy.
@@ -95,6 +103,7 @@ export const RUN_ACTIVITY_DIAGNOSTIC_KINDS = [
   "sdk_status_update",
   "available_commands_update",
   "mode_update",
+  "command_policy_decision",
 ] as const;
 
 export type RunActivityDiagnosticKind = (typeof RUN_ACTIVITY_DIAGNOSTIC_KINDS)[number];
@@ -247,6 +256,53 @@ export interface RunActivityDiagnosticPayload extends RunActivityPayload {
   status?: string | null;
 }
 
+export interface RunActivityCommandPolicyDecisionPayload extends RunActivityDiagnosticPayload {
+  /** Stable policy decision id when the emitting surface can provide one. */
+  decisionId?: string | null;
+  /** Stable command attempt/tool-call id correlated with the policy decision. */
+  attemptId?: string | null;
+  /** Symphony run id associated with the command attempt when known. */
+  runId?: string | null;
+  /** Issue id associated with the command attempt when known. */
+  issueId?: string | null;
+  /** Command-capable surface that requested classification, e.g. terminal, ACP, or pre_tool_call. */
+  surface: AgentCommandPolicySurface;
+  /** Agent role whose command surface produced the decision. */
+  role: string;
+  /** Run phase whose command surface produced the decision. */
+  phase: string;
+  /** Structured allow/deny outcome, never inferred from message text. */
+  outcome: AgentCommandPolicyOutcome;
+  /** Structured redacted policy reason for audit and replay. */
+  reasonKind: AgentCommandPolicyReasonKind;
+  /** Normalized classifier bucket for the attempted command. */
+  commandClass: AgentCommandPolicyCommandClass;
+  /** Redacted actionable message returned to the agent. */
+  message: string;
+  /** True only when the policy observed contact evidence; correct pre-execution denials should be false. */
+  upstreamContactAttempted: boolean;
+  /** Whether the decision indicates implementation code should change instead of retrying the command. */
+  requiresCodeChange?: boolean;
+  /** Whether service-owned workflow or human action is needed instead of an agent command retry. */
+  requiresUserOrServiceFix?: boolean;
+  /** Bounded normalized command evidence with arguments already redacted/truncated. */
+  normalizedCommand?: AgentCommandPolicyNormalizedCommand;
+  /** Bounded, redacted audit payload; environment values and raw command values must not be present. */
+  audit: AgentCommandPolicyAuditPayload;
+  /** Optional ACP/gateway request kind for permission/hook decisions. */
+  requestKind?: string | null;
+  /** Optional runtime tool-call id correlated with the policy attempt. */
+  toolCallId?: string | null;
+  /** Optional ACP option selected for allow decisions; null/absent for denials. */
+  selectedOptionId?: string | null;
+  /** Optional permission outcome label emitted by ACP/gateway adapters. */
+  permissionOutcome?: string | null;
+  /** Optional gateway hook response action, such as block or allow. */
+  hookAction?: string | null;
+  /** Command policy payloads are always intended to be frontend-safe/redacted. */
+  redacted: true;
+}
+
 /** @deprecated Use RunActivityDiagnosticPayload with the canonical `diagnostic` channel. */
 export type RunActivityStatusPayload = RunActivityDiagnosticPayload;
 
@@ -367,6 +423,13 @@ export type RunDiagnosticActivityEvent = RunActivityEventBase<
   RunActivityDiagnosticKind,
   RunActivityActorForChannel<"diagnostic">,
   RunActivityDiagnosticPayload
+>;
+
+export type RunCommandPolicyDecisionActivityEvent = RunActivityEventBase<
+  "diagnostic",
+  "command_policy_decision",
+  RunActivityActorForChannel<"diagnostic">,
+  RunActivityCommandPolicyDecisionPayload
 >;
 
 /** @deprecated Use RunDiagnosticActivityEvent with the canonical `diagnostic` channel. */
