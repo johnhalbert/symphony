@@ -11,6 +11,7 @@ import type {
   RealtimeProjectionResource,
   SymphonyDataSource,
 } from "../src/data/dataSource";
+import { createApiDataSource } from "../src/data/apiDataSource";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION, realtimeConnectionStatus } from "../src/data/realtimeEvents";
 import {
@@ -28,6 +29,64 @@ import {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const mountedRoots: Root[] = [];
+const originalFetch = globalThis.fetch;
+const originalEventSource = globalThis.EventSource;
+
+function jsonResponse(body: unknown, init?: ResponseInit): Response {
+  return new Response(JSON.stringify(body), {
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+}
+
+class FakeEventSource {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 2;
+  static instances: FakeEventSource[] = [];
+
+  readonly url: string;
+  closed = false;
+  readyState = FakeEventSource.CONNECTING;
+  private readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+
+  constructor(url: string) {
+    this.url = url;
+    FakeEventSource.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    const listeners = this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  close(): void {
+    this.closed = true;
+    this.readyState = FakeEventSource.CLOSED;
+  }
+
+  emit(type: string, data?: string, init: MessageEventInit = {}): void {
+    const event = typeof data === "string" ? new MessageEvent(type, { ...init, data }) : new Event(type);
+    for (const listener of this.listeners.get(type) ?? []) {
+      if (typeof listener === "function") {
+        listener(event);
+      } else {
+        listener.handleEvent(event);
+      }
+    }
+  }
+
+  emitOpen(): void {
+    this.readyState = FakeEventSource.OPEN;
+    this.emit("open");
+  }
+
+  emitError(readyState = FakeEventSource.CONNECTING): void {
+    this.readyState = readyState;
+    this.emit("error");
+  }
+}
 
 function eventFor(resources: readonly RealtimeProjectionResource[], overrides: Partial<RealtimeProjectionEvent> = {}): RealtimeProjectionEvent {
   const source = overrides.source ?? { source: "runs", revision: 1, observedAt: "2026-06-02T00:00:00.000Z" };
@@ -112,7 +171,15 @@ afterEach(() => {
     });
   }
   document.body.innerHTML = "";
+  vi.useRealTimers();
   vi.restoreAllMocks();
+  globalThis.fetch = originalFetch;
+  if (originalEventSource) {
+    globalThis.EventSource = originalEventSource;
+  } else {
+    Reflect.deleteProperty(globalThis, "EventSource");
+  }
+  FakeEventSource.instances = [];
 });
 
 describe("live resource realtime mapping", () => {
@@ -362,6 +429,73 @@ describe("live resource realtime mapping", () => {
       expect(probe.state().tokens[key]).toBeGreaterThan(0);
     }
     expect(probe.state().revisions.history).toBe(5);
+  });
+
+  it("integrates EventSource missed-event recovery with live resource invalidation and reconnect resume", async () => {
+    vi.useFakeTimers();
+    FakeEventSource.instances = [];
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const initialDashboard = { projectName: "initial dashboard" };
+    const recoveredDashboard = { projectName: "recovered dashboard" };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(initialDashboard))
+      .mockResolvedValueOnce(jsonResponse(recoveredDashboard));
+    const dataSource = createApiDataSource("/status-server/");
+    const probe = renderLiveResourceProbe(dataSource);
+
+    const eventSource = FakeEventSource.instances[0];
+    expect(eventSource?.url).toBe("/status-server/api/v1/realtime");
+    expect(probe.state().realtimeStatus.kind).toBe("connecting");
+
+    act(() => eventSource?.emitOpen());
+    expect(probe.state().realtimeStatus.kind).toBe("open");
+
+    await expect(dataSource.getDashboard()).resolves.toEqual(initialDashboard);
+    await expect(dataSource.getDashboard()).resolves.toEqual(initialDashboard);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/status-server/api/v1/web/dashboard", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+
+    const missedRecovery = eventFor([], {
+      id: "recovery-10",
+      revision: 10,
+      source: { source: "realtime-recovery", revision: 10, observedAt: "2026-06-02T00:00:10.000Z" },
+      missedEvents: true,
+      recovery: { strategy: "refetch", reason: "missed-events", lastEventId: "evicted-9", endpoints: [] },
+    });
+    act(() => eventSource?.emit("projection.updated", JSON.stringify(missedRecovery), { lastEventId: "recovery-10" }));
+
+    expect(probe.state().realtimeStatus).toMatchObject({
+      kind: "stale",
+      lastEventId: "evicted-9",
+      revision: 10,
+      missedEvents: true,
+    });
+    for (const key of LIVE_RESOURCE_KEYS) {
+      expect(probe.state().tokens[key]).toBe(1);
+    }
+
+    await expect(dataSource.getDashboard()).resolves.toEqual(recoveredDashboard);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/status-server/api/v1/web/dashboard", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+
+    act(() => eventSource?.emitError(FakeEventSource.CLOSED));
+    expect(eventSource?.closed).toBe(true);
+    expect(probe.state().realtimeStatus.kind).toBe("reconnecting");
+
+    act(() => vi.advanceTimersByTime(5_000));
+    const resumedEventSource = FakeEventSource.instances[1];
+    expect(resumedEventSource?.url).toBe("/status-server/api/v1/realtime?lastEventId=recovery-10");
+    expect(probe.state().realtimeStatus.kind).toBe("connecting");
+
+    act(() => resumedEventSource?.emitOpen());
+    expect(probe.state().realtimeStatus.kind).toBe("recovered");
   });
 
   it("invalidates caches but leaves direct-patch resources to active patch hooks when SSE payloads are patchable", () => {
