@@ -367,7 +367,10 @@ subprocess.run(["gh", "pr", "create", "--fill"])`;
       environment: { HOME: "/tmp/home", PATH: "/bin", GIT_PAGER: pagerValue },
     });
 
-    expect(evaluation.policyInput?.environment).toEqual({ keysOnly: ["GIT_PAGER", "HOME", "PATH"] });
+    expect(evaluation.policyInput?.environment).toEqual({
+      keysOnly: ["GIT_PAGER", "HOME", "PATH"],
+      inherited: { HOME: "/tmp/home" },
+    });
     expect(evaluation.decision).toMatchObject({
       outcome: "deny",
       reasonKind: "unsafe_git_config",

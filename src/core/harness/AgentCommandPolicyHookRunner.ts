@@ -1,13 +1,28 @@
+import path from "node:path";
+
 import {
   buildFailClosedAgentCommandPolicyDecision,
   classifyAgentCommand,
   environmentKeysOnly,
   type AgentCommandPolicyClassifier,
   type AgentCommandPolicyDecision,
+  type AgentCommandPolicyEnvironmentInput,
   type AgentCommandPolicyInput,
 } from "./AgentCommandPolicy.js";
 
 export const AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES = 1024 * 1024;
+
+const TOOL_INPUT_WORKING_DIRECTORY_KEYS = [
+  "workdir",
+  "cwd",
+  "workingDirectory",
+  "working_directory",
+] as const;
+const LOCAL_GIT_CONFIG_ENVIRONMENT_VALUE_KEYS = new Set([
+  "HOME",
+  "USERPROFILE",
+  "XDG_CONFIG_HOME",
+]);
 
 export interface AgentCommandPolicyHookRunnerContext {
   role?: string | undefined;
@@ -191,7 +206,7 @@ function buildPolicyInput(
   const toolName = stringValue(payload.tool_name);
   const role = nonEmptyString(context.role);
   const phase = nonEmptyString(context.phase);
-  const workingDirectory = stringValue(payload.cwd) ?? context.workingDirectory ?? process.cwd();
+  const workingDirectory = effectiveHookWorkingDirectory(payload, context);
 
   if (hookEventName !== "pre_tool_call") {
     return missingContextDecision({
@@ -230,14 +245,16 @@ function buildPolicyInput(
   }
 
   const rawInput = isRecord(payload.tool_input) ? payload.tool_input : {};
+  const hookEnvironment = context.environment ?? process.env;
   const input: AgentCommandPolicyInput = {
     role,
     phase,
     surface: toolName,
     workingDirectory,
     rawInput,
-    environment: { keysOnly: environmentKeysOnly(context.environment ?? process.env) },
+    environment: buildHookPolicyEnvironment(hookEnvironment),
   };
+
   const runId = nonEmptyString(context.runId) ?? stringValue(payload.session_id);
   if (runId !== null) input.runId = runId;
   const issueId = nonEmptyString(context.issueId);
@@ -247,6 +264,58 @@ function buildPolicyInput(
     status: "ok",
     input,
   };
+}
+
+function effectiveHookWorkingDirectory(
+  payload: HermesPreToolCallHookPayload,
+  context: AgentCommandPolicyHookRunnerContext,
+): string {
+  const hookCwd = stringValue(payload.cwd);
+  const contextCwd = nonEmptyString(context.workingDirectory);
+  const fallback = hookCwd ?? contextCwd ?? process.cwd();
+  const toolInputCwd = toolInputWorkingDirectory(payload.tool_input);
+  if (toolInputCwd === null) return fallback;
+  return resolveWorkingDirectory(toolInputCwd, fallback);
+}
+
+function toolInputWorkingDirectory(toolInput: unknown): string | null {
+  if (!isRecord(toolInput)) return null;
+  for (const key of TOOL_INPUT_WORKING_DIRECTORY_KEYS) {
+    const value = stringValue(toolInput[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function resolveWorkingDirectory(candidate: string, baseDirectory: string): string {
+  if (isAbsoluteHookPath(candidate)) return path.normalize(candidate);
+  return path.resolve(baseDirectory, candidate);
+}
+
+function isAbsoluteHookPath(filePath: string): boolean {
+  return path.isAbsolute(filePath) || /^[A-Za-z]:[\\/]/u.test(filePath) || /^\\\\/u.test(filePath);
+}
+
+function buildHookPolicyEnvironment(
+  environment: Record<string, string | undefined>,
+): AgentCommandPolicyEnvironmentInput {
+  const keysOnly = environmentKeysOnly(environment);
+  const inherited = selectedLocalGitConfigEnvironmentValues(environment);
+  return Object.keys(inherited).length === 0
+    ? { keysOnly }
+    : { keysOnly, inherited };
+}
+
+function selectedLocalGitConfigEnvironmentValues(
+  environment: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const inherited: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(environment)) {
+    if (!LOCAL_GIT_CONFIG_ENVIRONMENT_VALUE_KEYS.has(key.trim().toUpperCase())) continue;
+    if (value === undefined || value.trim().length === 0) continue;
+    inherited[key] = value;
+  }
+  return inherited;
 }
 
 function missingContextDecision(input: {
