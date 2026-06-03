@@ -16,6 +16,7 @@ import {
   projectIssueModel,
   projectWebReferenceData,
   projectIssueDetailModel,
+  projectSessionModel,
   projectWebDashboard,
   projectWebIssueBoard,
   projectWebSidebar,
@@ -753,6 +754,18 @@ describe("web projection foundation", () => {
       status: "unknown",
       args: {},
       result: null,
+    });
+  });
+
+  it("does not project stale Cursor model as legacy session model for explicit Hermes ACP runs", () => {
+    expect(
+      projectSessionModel(
+        run({ harnessId: "hermes_acp", runtimeModel: null, cursorModel: "stale-cursor-model", cursorMode: "agent" }),
+      ),
+    ).toMatchObject({ model: null });
+
+    expect(projectSessionModel(run({ harnessId: "cursor", runtimeModel: null, cursorModel: "cursor-model" }))).toMatchObject({
+      model: "cursor-model",
     });
   });
 

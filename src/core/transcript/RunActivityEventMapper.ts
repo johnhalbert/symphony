@@ -44,6 +44,8 @@ export function mapAgentEventToRunActivityEvent(event: AgentEvent): RunActivityE
         sessionId: event.sessionId,
         ...(event.threadId === undefined ? {} : { threadId: event.threadId }),
         ...(event.runId === undefined ? {} : { runId: event.runId }),
+        ...(event.providerId === undefined ? {} : { providerId: event.providerId }),
+        ...(event.model === undefined ? {} : { model: event.model }),
       });
     case "progress": {
       const message = event.activitySource === "delta" ? deltaPreviewText(event.message, 500) : previewText(event.message, 500);

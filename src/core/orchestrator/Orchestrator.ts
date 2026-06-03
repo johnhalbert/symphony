@@ -1485,7 +1485,7 @@ export class Orchestrator {
         entry.runId = event.runId ?? event.sessionId;
         entry.activeRunId = entry.runId;
         entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-        const runtimeMetadata = runtimeMetadataForEntry(this.options.harness.id, entry, this.config);
+        const runtimeMetadata = runtimeMetadataForEntry(this.options.harness.id, entry, this.config, event);
         await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
         await this.options.runStore?.startRun({
           runId: entry.runId,
@@ -3322,13 +3322,13 @@ function effectiveRuntimeModeForEntry(entry: RunningEntry, config: ServiceConfig
 
 function runtimeProviderForHarness(harnessId: string, config: ServiceConfig): string | null {
   if (harnessId === "hermes") return config.hermes.provider;
-  if (harnessId === "hermes_acp") return config.hermes.provider ?? "host_hermes";
+  if (harnessId === "hermes_acp") return config.hermes.provider;
   return harnessId;
 }
 
 function runtimeModelForHarness(harnessId: string, config: ServiceConfig): string | null {
   if (harnessId === "hermes") return config.hermes.model;
-  if (harnessId === "hermes_acp") return config.hermes.model;
+  if (harnessId === "hermes_acp") return null;
   if (harnessId === "cursor") return config.cursor.model;
   return null;
 }
@@ -3345,6 +3345,7 @@ function runtimeMetadataForEntry(
   harnessId: string,
   entry: RunningEntry,
   config: ServiceConfig,
+  sessionStartedEvent?: Extract<AgentEvent, { type: "session_started" }>,
 ): Partial<
   Pick<
     StartRunInput,
@@ -3379,16 +3380,18 @@ function runtimeMetadataForEntry(
     };
   }
   if (harnessId === "hermes_acp") {
+    const runtimeProviderId = cleanRuntimeMetadataString(sessionStartedEvent?.providerId);
+    const runtimeModel = cleanRuntimeMetadataString(sessionStartedEvent?.model);
     return {
-      runtimeModel: config.hermes.model,
+      runtimeModel,
       runtimeModelParams: [],
       runtimeSettingSources: [
         `host_hermes:${config.hermesAcp.binaryPath ?? "PATH:hermes"}`,
         `source_profile:${config.hermesAcp.sourceProfile ?? "active"}`,
         `profile_prefix:${config.hermesAcp.profilePrefix}`,
-        ...(config.hermes.provider === null ? [] : [`provider:${config.hermes.provider}`]),
+        ...(runtimeProviderId === null ? [] : [`provider:${runtimeProviderId}`]),
       ],
-      runtimeMode: effectiveRuntimeModeForEntry(entry, config),
+      runtimeMode: null,
       runtimeAgentLifecycle: config.hermesAcp.workerSessionLifecycle,
     };
   }
@@ -3398,6 +3401,12 @@ function runtimeMetadataForEntry(
     runtimeSettingSources: [],
     runtimeMode: effectiveRuntimeModeForEntry(entry, config),
   };
+}
+
+function cleanRuntimeMetadataString(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function hermesTemplateForEntry(entry: RunningEntry, config: ServiceConfig): string {

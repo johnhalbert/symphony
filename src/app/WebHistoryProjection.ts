@@ -370,7 +370,23 @@ function sessionTitle(run: RunRecord): string {
 
 function sessionModel(run: RunRecord): string {
   const withOptionalFields = run as RunRecordWithOptionalWebFields;
-  return cleanString(withOptionalFields.runtimeModel) ?? cleanString(run.cursorModel) ?? "";
+  return cleanString(withOptionalFields.runtimeModel) ?? cursorRuntimeFallbackModel(run) ?? "";
+}
+
+function cursorRuntimeFallbackModel(run: RunRecord): string | null {
+  return shouldUseCursorRuntimeFallback(run) ? cleanString(run.cursorModel) : null;
+}
+
+function shouldUseCursorRuntimeFallback(run: RunRecord): boolean {
+  const harnessId = cleanString(run.harnessId);
+  if (harnessId === "cursor") return true;
+  if (harnessId) return false;
+  return (
+    run.cursorModel !== undefined ||
+    run.cursorModelParams !== undefined ||
+    run.cursorMode !== undefined ||
+    run.cursorSettingSources !== undefined
+  );
 }
 
 function fallbackLastEvent(run: RunRecord): string {
