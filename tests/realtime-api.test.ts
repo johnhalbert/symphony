@@ -135,6 +135,50 @@ describe("StatusServer realtime SSE API", () => {
     expect(serializeSseComment("keepalive\nignored")).toBe(": keepalive ignored\n\n");
   });
 
+  it("omits unsafe assistant delta patch payloads when canonical transcript patch state is unavailable", () => {
+    const bus = new RealtimeProjectionEventBus({ clock: () => new Date("2026-01-01T00:00:00.000Z") });
+
+    const revision = {
+      source: "runs",
+      revision: 8,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      detail: {
+        runId: "run-midstream",
+        sessionId: "session-midstream",
+        afterSequence: 41,
+        eventCount: 1,
+        events: [
+          {
+            runId: "run-midstream",
+            sequence: 42,
+            at: "2026-01-01T00:00:42.000Z",
+            source: "runtime",
+            eventType: "message_delta",
+            message: "Hermes message delta",
+            payload: { harnessId: "hermes", textPreview: "unsafe", redacted: true },
+          },
+        ],
+      },
+    } as Parameters<RealtimeProjectionEventBus["publishProjectionRevision"]>[0] & { detail: Record<string, unknown> };
+    const events = bus.publishProjectionRevision(revision);
+
+    const transcript = requireEvent(events.find((event) => event.type === "transcript.delta"));
+    expect(transcript).toMatchObject({
+      type: "transcript.delta",
+      scope: "session",
+      key: "session-midstream",
+      payload: {
+        source: "runs",
+        sourceRevision: 8,
+        runId: "run-midstream",
+        sessionId: "session-midstream",
+        afterSequence: 41,
+        eventCount: 1,
+      },
+    });
+    expect("messages" in (transcript.payload as unknown as Record<string, unknown>)).toBe(false);
+  });
+
   it("streams keepalive comments with SSE headers and cleans up disconnects", async () => {
     const server = createRealtimeServer({ realtime: { keepAliveIntervalMs: 20 } });
     const address = await server.start();
@@ -559,7 +603,7 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
-  it("publishes store-driven transcript deltas with patchable message payloads", async () => {
+  it("publishes store-driven transcript deltas with canonical patch payloads for mirrored assistant streams", async () => {
     const runStore = new FileRunTranscriptStore(root);
     await runStore.startRun({
       runId: "run-transcript-patch-1",
@@ -585,13 +629,13 @@ describe("StatusServer realtime SSE API", () => {
         runId: "run-transcript-patch-1",
         at: "2026-01-01T00:00:01.000Z",
         source: "runtime",
-        eventType: "assistant_delta",
-        message: "live transcript patch",
-        payload: { kind: "assistant", type: "assistant_delta", text: "live transcript patch", delta: "live transcript patch" },
+        eventType: "message_delta",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "Hel", redacted: true },
       });
 
-      const transcript = await client.nextEventOfType("transcript.delta");
-      expect(transcript.data).toMatchObject({
+      const runtimeHel = await client.nextEventOfType("transcript.delta");
+      expect(runtimeHel.data).toMatchObject({
         type: "transcript.delta",
         scope: "session",
         key: "session-transcript-patch-1",
@@ -606,14 +650,66 @@ describe("StatusServer realtime SSE API", () => {
           messages: [
             {
               sequence: 1,
-              operation: "merge-assistant-delta",
-              joinMode: "spaced",
-              message: { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "live transcript patch" },
+              operation: "append",
+              joinMode: "exact",
+              message: { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hel" },
             },
           ],
         },
       });
-      expect((transcript.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
+      expect((runtimeHel.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
+
+      await runStore.appendEvent({
+        runId: "run-transcript-patch-1",
+        at: "2026-01-01T00:00:01.100Z",
+        source: "harness",
+        eventType: "progress",
+        message: "Hel",
+        payload: { kind: "assistant_delta", activitySource: "delta", progressKind: "assistant_delta", messagePreview: "Hel", redacted: false },
+      });
+      const harnessHel = await client.nextEventOfType("transcript.delta");
+      expect((harnessHel.data as RealtimeProjectionEvent).payload).toMatchObject({
+        afterSequence: 1,
+        eventCount: 1,
+        messages: [{ sequence: 2, message: null }],
+      });
+
+      await runStore.appendEvent({
+        runId: "run-transcript-patch-1",
+        at: "2026-01-01T00:00:02.000Z",
+        source: "runtime",
+        eventType: "message_delta",
+        message: "Hermes message delta",
+        payload: { harnessId: "hermes", textPreview: "lo", redacted: true },
+      });
+      const runtimeLo = await client.nextEventOfType("transcript.delta");
+      expect((runtimeLo.data as RealtimeProjectionEvent).payload).toMatchObject({
+        afterSequence: 2,
+        eventCount: 1,
+        messages: [
+          {
+            sequence: 3,
+            operation: "merge-assistant-delta",
+            joinMode: "exact",
+            message: { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "lo" },
+          },
+        ],
+      });
+
+      await runStore.appendEvent({
+        runId: "run-transcript-patch-1",
+        at: "2026-01-01T00:00:02.100Z",
+        source: "harness",
+        eventType: "progress",
+        message: "lo",
+        payload: { kind: "assistant_delta", activitySource: "delta", progressKind: "assistant_delta", messagePreview: "lo", redacted: false },
+      });
+      const harnessLo = await client.nextEventOfType("transcript.delta");
+      expect((harnessLo.data as RealtimeProjectionEvent).payload).toMatchObject({
+        afterSequence: 3,
+        eventCount: 1,
+        messages: [{ sequence: 4, message: null }],
+      });
     } finally {
       await client.close();
       await server.stop();
@@ -645,6 +741,7 @@ describe("StatusServer realtime SSE API", () => {
       });
       expect((assistantAppend.data as RealtimeProjectionEvent).payload).toMatchObject({
         conversationId: "operator-room",
+        operation: "append",
         messageCount: 1,
         message: { id: assistant.id, conversationId: "operator-room", who: "agent", role: "assistant", text: "I can help inspect the queue.", status: "streaming" },
         messages: [
@@ -673,6 +770,7 @@ describe("StatusServer realtime SSE API", () => {
       });
       expect((assistantUpdate.data as RealtimeProjectionEvent).payload).toMatchObject({
         conversationId: "operator-room",
+        operation: "update",
         messageCount: 1,
         message: { id: assistant.id, conversationId: "operator-room", who: "agent", role: "assistant", text: "I found the queue summary.", status: "completed" },
         messages: [

@@ -167,6 +167,7 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
       await this.writeConversation(nextRecord);
       this.notifyProjectionChanged({
         conversationId,
+        operation: "append",
         message,
         messages: [message],
         messageCount: nextRecord.messages.length,
@@ -208,6 +209,7 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
       await this.writeConversation(nextRecord);
       this.notifyProjectionChanged({
         conversationId,
+        operation: "update",
         message: updated,
         messages: [updated],
         messageCount: nextRecord.messages.length,

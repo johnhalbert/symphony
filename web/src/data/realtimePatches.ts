@@ -7,7 +7,9 @@ import type {
 import type { ChatMessage, TranscriptMessage } from "../types/symphony";
 
 export const DEFAULT_ORCHESTRATOR_CONVERSATION_ID = "orchestrator-default";
-export const REALTIME_PATCH_TAIL_LIMIT = 100;
+export const REALTIME_TRANSCRIPT_PATCH_TAIL_LIMIT = 500;
+export const REALTIME_ORCHESTRATOR_CHAT_PATCH_TAIL_LIMIT = 100;
+export const REALTIME_PATCH_TAIL_LIMIT = REALTIME_ORCHESTRATOR_CHAT_PATCH_TAIL_LIMIT;
 
 export type RealtimePatchFallbackReason = "missed-events" | "missing-target" | "missing-payload" | "gap" | "incompatible";
 
@@ -35,7 +37,7 @@ export function applyTranscriptDeltaEvent({
   current,
   lastSequence,
   lastRevision,
-  tailLimit = REALTIME_PATCH_TAIL_LIMIT,
+  tailLimit = REALTIME_TRANSCRIPT_PATCH_TAIL_LIMIT,
 }: {
   event: RealtimeProjectionEvent;
   sessionId: string | null;
@@ -101,7 +103,7 @@ export function applyOrchestratorMessageEvent({
   conversationId = DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
   current,
   lastRevision,
-  tailLimit = REALTIME_PATCH_TAIL_LIMIT,
+  tailLimit = REALTIME_ORCHESTRATOR_CHAT_PATCH_TAIL_LIMIT,
 }: {
   event: RealtimeProjectionEvent;
   conversationId?: string | null;
@@ -127,7 +129,17 @@ export function applyOrchestratorMessageEvent({
     return { action: "fallback", reason: "incompatible", lastRevision: event.revision };
   }
 
-  const newMessageCount = patches.filter((message) => !current.some((existing) => existing.id && existing.id === message.id)).length;
+  const currentMessageIds = new Set(current.flatMap((message) => (message.id ? [message.id] : [])));
+  const absentPatches = patches.filter((message) => !currentMessageIds.has(message.id ?? ""));
+  const operation = orchestratorPatchOperation(payload.operation);
+  if (absentPatches.length > 0 && operation === "update") {
+    return { action: "fallback", reason: "gap", lastRevision: event.revision };
+  }
+  if (absentPatches.length > 0 && operation === null && current.length >= tailLimit) {
+    return { action: "fallback", reason: "gap", lastRevision: event.revision };
+  }
+
+  const newMessageCount = absentPatches.length;
   const messageCount = finiteNumberOrNull(payload.messageCount);
   if (messageCount !== null) {
     const expectedBefore = Math.max(0, messageCount - newMessageCount);
@@ -223,6 +235,10 @@ function isTranscriptPatchOperation(value: unknown): boolean {
 
 function isTranscriptPatchJoinMode(value: unknown): boolean {
   return value === undefined || value === "spaced" || value === "exact" || value === "token";
+}
+
+function orchestratorPatchOperation(value: unknown): RealtimeOrchestratorMessagePayload["operation"] | null {
+  return value === "append" || value === "update" ? value : null;
 }
 
 function normalizeChatPatchMessages(messages: readonly ChatMessage[]): readonly ChatMessage[] | null {

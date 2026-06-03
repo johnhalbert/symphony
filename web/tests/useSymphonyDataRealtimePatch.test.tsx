@@ -195,6 +195,35 @@ describe("useSymphonyData realtime direct patching", () => {
     expect(probe.result().data).toEqual(refetched);
   });
 
+  it("keeps a selected 500-event transcript tail live patched without shrinking or refetching", async () => {
+    let listener: RealtimeEventListener | null = null;
+    const initial: TranscriptMessage[] = Array.from({ length: 500 }, (_, index) => ({
+      kind: "assistant",
+      ts: `2026-01-01T00:00:${String(index % 60).padStart(2, "0")}.000Z`,
+      text: `event-${index + 1}`,
+    }));
+    const getTranscript = vi.fn<(_: string, signal?: AbortSignal) => Promise<TranscriptMessage[]>>().mockResolvedValueOnce(initial);
+    const dataSource = testDataSource({
+      getTranscript,
+      invalidateCachedReads: vi.fn(),
+      subscribeToRealtimeEvents(nextListener) {
+        listener = nextListener;
+        return () => undefined;
+      },
+    });
+    const probe = renderTranscriptProbe(dataSource);
+    await flushPromises();
+
+    act(() => listener?.(transcriptEvent(501, 500, "event-501", { revision: 501, id: "transcript-501" })));
+
+    expect(getTranscript).toHaveBeenCalledTimes(1);
+    const patched = probe.result().data ?? [];
+    expect(patched).toHaveLength(500);
+    expect(patched[0]?.kind === "assistant" ? patched[0].text : null).toBe("event-2");
+    const last = patched.at(-1);
+    expect(last?.kind === "assistant" ? last.text : null).toBe("event-501");
+  });
+
   it("patches orchestrator chat from message SSE payloads without refetching and refetches on missing messages", async () => {
     let listener: RealtimeEventListener | null = null;
     const invalidateCachedReads = vi.fn();
@@ -231,6 +260,43 @@ describe("useSymphonyData realtime direct patching", () => {
       listener?.(
         chatEvent(3, serverMessage, 2, {
           payload: { ...chatEvent(3, serverMessage, 2).payload, message: undefined, messages: undefined },
+        }),
+      ),
+    );
+    await flushPromises();
+
+    expect(invalidateCachedReads).toHaveBeenCalledWith({ forceRefreshHrefs: ["/api/v1/web/orchestrator-chat?refresh=1"] });
+    expect(getOrchestratorChat).toHaveBeenCalledTimes(2);
+    expect(probe.result().data).toEqual(refetched);
+  });
+
+  it("refetches orchestrator chat instead of appending updates for ids outside the active bounded tail", async () => {
+    let listener: RealtimeEventListener | null = null;
+    const invalidateCachedReads = vi.fn();
+    const initial: ChatMessage[] = [
+      { id: "msg-2", conversationId: "orchestrator-default", who: "agent", text: "visible-2" },
+      { id: "msg-3", conversationId: "orchestrator-default", who: "agent", text: "visible-3" },
+    ];
+    const refetched: ChatMessage[] = [...initial];
+    const getOrchestratorChat = vi.fn<(_: AbortSignal | undefined) => Promise<ChatMessage[]>>()
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(refetched);
+    const dataSource = testDataSource({
+      getOrchestratorChat,
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(nextListener) {
+        listener = nextListener;
+        return () => undefined;
+      },
+    });
+    const probe = renderChatProbe(dataSource);
+    await flushPromises();
+
+    const oldUpdate: ChatMessage = { id: "msg-1", conversationId: "orchestrator-default", who: "agent", text: "old updated" };
+    act(() =>
+      listener?.(
+        chatEvent(2, oldUpdate, 3, {
+          payload: { ...chatEvent(2, oldUpdate, 3).payload, operation: "update" },
         }),
       ),
     );

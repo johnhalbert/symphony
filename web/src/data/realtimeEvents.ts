@@ -83,6 +83,7 @@ export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase 
   messageCount: number | null;
   inputLength: number | null;
   status: number | null;
+  operation?: "append" | "update";
   message?: ChatMessage | null;
   messages?: readonly ChatMessage[];
 }
@@ -254,6 +255,7 @@ function isRealtimePayloadForEventType(type: RealtimeProjectionEventType, value:
         isNullableFiniteNumber(orchestratorPayload.messageCount) &&
         isNullableFiniteNumber(orchestratorPayload.inputLength) &&
         isNullableFiniteNumber(orchestratorPayload.status) &&
+        isOptionalOrchestratorMessageOperation(orchestratorPayload.operation) &&
         isOptionalChatMessage(orchestratorPayload.message) &&
         isOptionalChatMessages(orchestratorPayload.messages)
       );
@@ -295,6 +297,10 @@ function isOptionalTranscriptPatchOperation(value: unknown): boolean {
 
 function isOptionalTranscriptPatchJoinMode(value: unknown): boolean {
   return value === undefined || value === "spaced" || value === "exact" || value === "token";
+}
+
+function isOptionalOrchestratorMessageOperation(value: unknown): boolean {
+  return value === undefined || value === "append" || value === "update";
 }
 
 function isOptionalChatMessages(value: unknown): boolean {

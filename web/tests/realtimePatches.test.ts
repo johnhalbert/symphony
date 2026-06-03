@@ -60,6 +60,7 @@ function orchestratorEvent(overrides: Partial<RealtimeProjectionEvent<"orchestra
     messageCount: 2,
     inputLength: null,
     status: null,
+    operation: "append",
     message,
     messages: [message],
   };
@@ -103,6 +104,37 @@ describe("realtime active-view patch reducers", () => {
     expect(
       applyTranscriptDeltaEvent({ event: transcriptEvent({ revision: 2, id: "2-replay" }), sessionId: "session-1", current, lastSequence: 2, lastRevision: 2 }),
     ).toMatchObject({ action: "ignored" });
+  });
+
+  it("keeps the selected transcript active tail at the server default size when applying direct deltas", () => {
+    const current: TranscriptMessage[] = Array.from({ length: 500 }, (_, index) => ({
+      kind: "assistant",
+      ts: `2026-01-01T00:00:${String(index % 60).padStart(2, "0")}.000Z`,
+      text: `event-${index + 1}`,
+    }));
+
+    const applied = applyTranscriptDeltaEvent({
+      event: transcriptEvent({
+        id: "501",
+        revision: 501,
+        payload: {
+          ...transcriptEvent().payload,
+          afterSequence: 500,
+          messages: [{ sequence: 501, message: { kind: "assistant", ts: "2026-01-01T00:09:00.000Z", text: "event-501" } }],
+        },
+      }),
+      sessionId: "session-1",
+      current,
+      lastSequence: 500,
+      lastRevision: 500,
+    });
+
+    expect(applied).toMatchObject({ action: "applied", lastSequence: 501 });
+    const data = applied.action === "applied" ? applied.data : [];
+    expect(data).toHaveLength(500);
+    expect(data[0]?.kind === "assistant" ? data[0].text : null).toBe("event-2");
+    const last = data.at(-1);
+    expect(last?.kind === "assistant" ? last.text : null).toBe("event-501");
   });
 
   it("updates an active assistant transcript tail from streaming deltas and final replacements", () => {
@@ -154,6 +186,29 @@ describe("realtime active-view patch reducers", () => {
     });
 
     expect(replaced.action === "applied" ? replaced.data : []).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:03.000Z", text: "hello!" }]);
+
+    const mirrored = applyTranscriptDeltaEvent({
+      event: transcriptEvent({
+        revision: 4,
+        payload: {
+          ...transcriptEvent().payload,
+          sourceRevision: 4,
+          afterSequence: 1,
+          messages: [
+            { sequence: 2, operation: "merge-assistant-delta", joinMode: "exact", message: { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "Hel" } },
+            { sequence: 3, message: null },
+            { sequence: 4, operation: "merge-assistant-delta", joinMode: "exact", message: { kind: "assistant", ts: "2026-01-01T00:00:04.000Z", text: "lo" } },
+            { sequence: 5, message: null },
+          ],
+        },
+      }),
+      sessionId: "session-1",
+      current: [],
+      lastSequence: 1,
+      lastRevision: 3,
+    });
+    expect(mirrored).toMatchObject({ action: "applied", lastSequence: 5 });
+    expect(mirrored.action === "applied" ? mirrored.data : []).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:04.000Z", text: "Hello" }]);
   });
 
   it("falls back for missed, missing, stale/gapped, or incompatible transcript deltas and ignores inactive sessions", () => {
@@ -244,6 +299,7 @@ describe("realtime active-view patch reducers", () => {
       revision: 3,
       payload: {
         ...orchestratorEvent().payload,
+        operation: "update",
         messageCount: 2,
         message: { id: "msg-2", conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, who: "agent", text: "server message done", status: "completed" },
         messages: [{ id: "msg-2", conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, who: "agent", text: "server message done", status: "completed" }],
@@ -254,6 +310,42 @@ describe("realtime active-view patch reducers", () => {
     expect(updated.action === "applied" ? updated.data.at(-1)?.text : null).toBe("server message done");
 
     expect(applyOrchestratorMessageEvent({ event: update, current, lastRevision: 3 })).toMatchObject({ action: "ignored" });
+  });
+
+  it("falls back for absent orchestrator update ids outside a full active tail but still patches true appends", () => {
+    const current: ChatMessage[] = [
+      { id: "msg-2", conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, who: "agent", text: "visible-2" },
+      { id: "msg-3", conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, who: "agent", text: "visible-3" },
+    ];
+
+    const oldUpdate = orchestratorEvent({
+      payload: {
+        ...orchestratorEvent().payload,
+        operation: "update",
+        messageCount: 3,
+        message: { id: "msg-1", conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, who: "agent", text: "old updated" },
+        messages: [{ id: "msg-1", conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, who: "agent", text: "old updated" }],
+      },
+    });
+    expect(applyOrchestratorMessageEvent({ event: oldUpdate, current, lastRevision: 1, tailLimit: 2 })).toMatchObject({
+      action: "fallback",
+      reason: "gap",
+    });
+
+    const append = orchestratorEvent({
+      revision: 3,
+      payload: {
+        ...orchestratorEvent().payload,
+        sourceRevision: 3,
+        operation: "append",
+        messageCount: 4,
+        message: { id: "msg-4", conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, who: "agent", text: "new visible" },
+        messages: [{ id: "msg-4", conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID, who: "agent", text: "new visible" }],
+      },
+    });
+    const applied = applyOrchestratorMessageEvent({ event: append, current, lastRevision: 2, tailLimit: 2 });
+    expect(applied).toMatchObject({ action: "applied", lastRevision: 3 });
+    expect(applied.action === "applied" ? applied.data.map((message) => message.id) : []).toEqual(["msg-3", "msg-4"]);
   });
 
   it("falls back for missed, missing, gapped, or incompatible orchestrator message patches and ignores inactive conversations", () => {

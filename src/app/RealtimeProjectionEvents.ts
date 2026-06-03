@@ -87,6 +87,7 @@ export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase 
   messageCount: number | null;
   inputLength: number | null;
   status: number | null;
+  operation?: "append" | "update";
   message?: ChatMessage | null;
   messages?: readonly ChatMessage[];
 }
@@ -143,6 +144,20 @@ export interface RealtimeProjectionEventBusOptions {
   historyLimit?: number;
 }
 
+interface RealtimePayloadOptions {
+  transcriptPatchStateByRunId?: Map<string, RealtimeTranscriptPatchProjectionState>;
+}
+
+type AssistantDeltaMirrorSource = "runtime" | "harness";
+
+type AssistantDeltaMirrorCounts = Record<AssistantDeltaMirrorSource, Map<string, number>>;
+
+interface RealtimeTranscriptPatchProjectionState {
+  seenAssistantDeltaReplayKeys: Set<string>;
+  assistantDeltaMirrorCounts: AssistantDeltaMirrorCounts;
+  pendingAssistantDelta: boolean;
+}
+
 export interface RealtimeSseStreamOptions {
   response: ServerResponse;
   lastEventId?: string | null;
@@ -161,6 +176,7 @@ export class RealtimeProjectionEventBus {
   private readonly subscribers = new Map<number, (event: RealtimeProjectionEvent) => void>();
   private readonly streamClosers = new Set<() => void>();
   private readonly history: RealtimeProjectionEvent[] = [];
+  private readonly transcriptPatchStateByRunId = new Map<string, RealtimeTranscriptPatchProjectionState>();
   private readonly clock: () => Date;
   private readonly historyLimit: number;
   private nextSubscriberId = 0;
@@ -330,7 +346,9 @@ export class RealtimeProjectionEventBus {
         endpoints: resources.map((resource) => resource.href),
       },
       missedEvents: input.missedEvents ?? false,
-      payload: realtimePayloadForEvent(input.type, source, resources, detail),
+      payload: realtimePayloadForEvent(input.type, source, resources, detail, {
+        transcriptPatchStateByRunId: this.transcriptPatchStateByRunId,
+      }),
       detail,
     };
   }
@@ -407,6 +425,7 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
   source: WebProjectionSourceRevision,
   resources: readonly RealtimeProjectionResource[],
   detail: RealtimeProjectionEventDetail | null,
+  options: RealtimePayloadOptions = {},
 ): RealtimeProjectionEventPayloadByType[TType] {
   const base = realtimePayloadBase(source, detail);
   switch (type) {
@@ -427,7 +446,7 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
         status: readStringDetail(detail, "status"),
       } as RealtimeProjectionEventPayloadByType[TType];
     case "transcript.delta": {
-      const messages = readTranscriptPatchMessages(detail);
+      const messages = readTranscriptPatchMessages(detail, options);
       return {
         ...base,
         runId: readStringDetail(detail, "runId"),
@@ -445,6 +464,7 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
         messageCount: readNumberDetail(detail, "messageCount"),
         inputLength: readNumberDetail(detail, "inputLength"),
         status: readNumberDetail(detail, "status"),
+        ...orchestratorMessageOperationDetail(detail),
         ...(messages ? { messages, message: messages.at(-1) ?? null } : {}),
       } as RealtimeProjectionEventPayloadByType[TType];
     }
@@ -532,6 +552,13 @@ function readNumberDetail(detail: RealtimeProjectionEventDetail | null, key: str
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function orchestratorMessageOperationDetail(
+  detail: RealtimeProjectionEventDetail | null,
+): Pick<RealtimeOrchestratorMessagePayload, "operation"> {
+  const operation = readStringDetail(detail, "operation");
+  return operation === "append" || operation === "update" ? { operation } : {};
+}
+
 function readBooleanDetail(detail: RealtimeProjectionEventDetail | null, key: string): boolean | null {
   const value = detail?.[key];
   return typeof value === "boolean" ? value : null;
@@ -546,19 +573,79 @@ function readErrorDetail(detail: RealtimeProjectionEventDetail | null, key: stri
     : null;
 }
 
-function readTranscriptPatchMessages(detail: RealtimeProjectionEventDetail | null): readonly RealtimeTranscriptPatchMessage[] | null {
+function readTranscriptPatchMessages(
+  detail: RealtimeProjectionEventDetail | null,
+  options: RealtimePayloadOptions = {},
+): readonly RealtimeTranscriptPatchMessage[] | null {
   const explicit = readTranscriptPatchMessagesDetail(detail, "messages");
   if (explicit) return explicit;
   const events = readTranscriptEventsDetail(detail, "events");
   if (events.length === 0) return null;
-  return events.map((event) => {
+  return projectRealtimeTranscriptPatchMessages(events, readNumberDetail(detail, "afterSequence"), options.transcriptPatchStateByRunId);
+}
+
+function projectRealtimeTranscriptPatchMessages(
+  events: readonly TranscriptEvent[],
+  afterSequence: number | null,
+  stateByRunId: Map<string, RealtimeTranscriptPatchProjectionState> | undefined,
+): readonly RealtimeTranscriptPatchMessage[] | null {
+  const runId = events[0]?.runId;
+  if (!runId) return null;
+
+  let state = stateByRunId?.get(runId) ?? createRealtimeTranscriptPatchProjectionState();
+  let stateKnown = stateByRunId?.has(runId) ?? false;
+  if (afterSequence === 0 || events.some((event) => event.sequence === 1)) stateKnown = true;
+
+  const patches: RealtimeTranscriptPatchMessage[] = [];
+  for (const event of events) {
+    if (event.runId !== runId) return null;
     const message = projectWebTranscript([event], { includeRunPrelude: false })[0] ?? null;
-    return {
-      sequence: event.sequence,
-      message,
-      ...transcriptPatchMetadataForEvent(event, message),
-    };
-  });
+    if (message === null) {
+      patches.push({ sequence: event.sequence, message: null });
+      continue;
+    }
+
+    if (message.kind === "assistant" && isAssistantDeltaPatchEvent(event)) {
+      if (!stateKnown) return null;
+      const replayKey = assistantDeltaPatchReplayKey(event, message.text);
+      if (state.seenAssistantDeltaReplayKeys.has(replayKey)) {
+        patches.push({ sequence: event.sequence, message: null });
+        continue;
+      }
+      state.seenAssistantDeltaReplayKeys.add(replayKey);
+      const mirrorSource = assistantDeltaPatchMirrorSource(event);
+      if (mirrorSource && consumeAssistantDeltaPatchMirror(mirrorSource, message.text, state.assistantDeltaMirrorCounts)) {
+        patches.push({ sequence: event.sequence, message: null });
+        continue;
+      }
+      patches.push({
+        sequence: event.sequence,
+        message,
+        operation: state.pendingAssistantDelta ? "merge-assistant-delta" : "append",
+        joinMode: assistantDeltaPatchJoinMode(event),
+      });
+      state.pendingAssistantDelta = true;
+      continue;
+    }
+
+    if (message.kind === "assistant" && isAssistantCompletePatchEvent(event)) {
+      if (!stateKnown) return null;
+      patches.push({
+        sequence: event.sequence,
+        message,
+        operation: state.pendingAssistantDelta ? "replace-assistant" : "append",
+      });
+      resetRealtimeTranscriptAssistantDeltaGroup(state);
+      continue;
+    }
+
+    patches.push({ sequence: event.sequence, message });
+    resetRealtimeTranscriptAssistantDeltaGroup(state);
+    stateKnown = true;
+  }
+
+  if (stateByRunId && stateKnown) stateByRunId.set(runId, state);
+  return patches;
 }
 
 function readTranscriptPatchMessagesDetail(
@@ -587,11 +674,46 @@ function readTranscriptPatchMessage(value: unknown): RealtimeTranscriptPatchMess
   };
 }
 
-function transcriptPatchMetadataForEvent(event: TranscriptEvent, message: TranscriptMessage | null): Partial<RealtimeTranscriptPatchMessage> {
-  if (message?.kind !== "assistant") return {};
-  if (isAssistantDeltaPatchEvent(event)) return { operation: "merge-assistant-delta", joinMode: assistantDeltaPatchJoinMode(event) };
-  if (isAssistantCompletePatchEvent(event)) return { operation: "replace-assistant" };
-  return {};
+function createRealtimeTranscriptPatchProjectionState(): RealtimeTranscriptPatchProjectionState {
+  return {
+    seenAssistantDeltaReplayKeys: new Set<string>(),
+    assistantDeltaMirrorCounts: createAssistantDeltaPatchMirrorCounts(),
+    pendingAssistantDelta: false,
+  };
+}
+
+function createAssistantDeltaPatchMirrorCounts(): AssistantDeltaMirrorCounts {
+  return { runtime: new Map<string, number>(), harness: new Map<string, number>() };
+}
+
+function resetRealtimeTranscriptAssistantDeltaGroup(state: RealtimeTranscriptPatchProjectionState): void {
+  state.pendingAssistantDelta = false;
+  state.assistantDeltaMirrorCounts.runtime.clear();
+  state.assistantDeltaMirrorCounts.harness.clear();
+}
+
+function assistantDeltaPatchReplayKey(event: TranscriptEvent, text: string): string {
+  return `${event.runId}:${event.sequence}:${normalizeToken(event.eventType)}:${text}`;
+}
+
+function assistantDeltaPatchMirrorSource(event: TranscriptEvent): AssistantDeltaMirrorSource | null {
+  const eventType = normalizeToken(event.eventType);
+  const payload = transcriptEventPayloadRecord(event);
+  if (event.source === "runtime" && eventType === "message_delta") return "runtime";
+  if (event.source === "harness" && eventType === "progress" && normalizedOptionalToken(payload.activitySource) === "delta") return "harness";
+  return null;
+}
+
+function consumeAssistantDeltaPatchMirror(
+  source: AssistantDeltaMirrorSource,
+  text: string,
+  counts: AssistantDeltaMirrorCounts,
+): boolean {
+  const opposite = source === "runtime" ? "harness" : "runtime";
+  const sourceCount = counts[source].get(text) ?? 0;
+  const oppositeCount = counts[opposite].get(text) ?? 0;
+  counts[source].set(text, sourceCount + 1);
+  return oppositeCount > sourceCount;
 }
 
 function transcriptPatchOperation(value: unknown): RealtimeTranscriptPatchMessage["operation"] | null {
