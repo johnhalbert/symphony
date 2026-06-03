@@ -76,6 +76,9 @@ export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase 
   messageCount: number | null;
   inputLength: number | null;
   status: number | null;
+  lastMessageId: string | null;
+  lastMessageStatus: string | null;
+  lastMessageAt: string | null;
 }
 
 export interface RealtimeSourceStatusPayload extends RealtimePayloadBase {
@@ -85,6 +88,9 @@ export interface RealtimeSourceStatusPayload extends RealtimePayloadBase {
   cached: boolean | null;
   error: { code: string; message: string } | null;
   issueCount: number | null;
+  sourceRevisions: readonly Readonly<Record<string, unknown>>[];
+  sourceCursors: Readonly<Record<string, unknown>> | null;
+  sourceFreshness: readonly Readonly<Record<string, unknown>>[];
 }
 
 export interface RealtimeProjectionEventPayloadByType {
@@ -190,6 +196,7 @@ export class RealtimeProjectionEventBus {
         type,
         source: revision,
         resources: realtimeResourcesForEventType(type),
+        detail: revision.detail ?? null,
       }),
     );
   }
@@ -427,17 +434,28 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
         messageCount: readNumberDetail(detail, "messageCount"),
         inputLength: readNumberDetail(detail, "inputLength"),
         status: readNumberDetail(detail, "status"),
+        lastMessageId: readStringDetail(detail, "lastMessageId"),
+        lastMessageStatus: readStringDetail(detail, "lastMessageStatus"),
+        lastMessageAt: readStringDetail(detail, "lastMessageAt"),
       } as RealtimeProjectionEventPayloadByType[TType];
-    case "source.status":
+    case "source.status": {
+      const primaryFreshness = primarySourceFreshness(detail);
       return {
         ...base,
-        status: readStringDetail(detail, "status"),
+        status: readStringDetail(detail, "status") ?? readStringRecordField(primaryFreshness, "status"),
         fetchedStates: readStringArrayDetail(detail, "fetchedStates"),
-        fetchedAt: readStringDetail(detail, "fetchedAt"),
+        fetchedAt:
+          readStringDetail(detail, "fetchedAt") ??
+          readStringDetail(detail, "checkedAt") ??
+          readStringRecordField(primaryFreshness, "checkedAt"),
         cached: readBooleanDetail(detail, "cached"),
         error: readErrorDetail(detail, "error"),
         issueCount: readNumberDetail(detail, "issueCount"),
+        sourceRevisions: readRecordArrayDetail(detail, "sourceRevisions"),
+        sourceCursors: readRecordDetail(detail, "sourceCursors"),
+        sourceFreshness: readRecordArrayDetail(detail, "sourceFreshness"),
       } as RealtimeProjectionEventPayloadByType[TType];
+    }
   }
 }
 
@@ -511,26 +529,70 @@ function readErrorDetail(detail: RealtimeProjectionEventDetail | null, key: stri
     : null;
 }
 
+function readRecordDetail(detail: RealtimeProjectionEventDetail | null, key: string): Readonly<Record<string, unknown>> | null {
+  const value = detail?.[key];
+  return isRecord(value) ? value : null;
+}
+
+function readRecordArrayDetail(
+  detail: RealtimeProjectionEventDetail | null,
+  key: string,
+): readonly Readonly<Record<string, unknown>>[] {
+  const value = detail?.[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Readonly<Record<string, unknown>> => isRecord(item));
+}
+
+function primarySourceFreshness(detail: RealtimeProjectionEventDetail | null): Readonly<Record<string, unknown>> | null {
+  return readRecordArrayDetail(detail, "sourceFreshness")[0] ?? null;
+}
+
+function readStringRecordField(record: Readonly<Record<string, unknown>> | null, key: string): string | null {
+  const value = record?.[key];
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
 function realtimeEventTypesForSourceRevision(revision: WebProjectionSourceRevision): readonly RealtimeProjectionEventType[] {
   const source = revision.source.trim().toLowerCase();
+  const projectionName = readStringDetail(revision.detail ?? null, "projectionName")?.toLowerCase() ?? null;
   const types: RealtimeProjectionEventType[] = ["projection.updated", "source.status"];
-  if (source === "runs" || source === "runstore" || source === "transcript") {
+  if (isTranscriptRealtimeSource(source, projectionName)) {
     types.push("run.updated", "transcript.delta");
   }
-  if (isOrchestratorChatRealtimeSource(source)) {
+  if (isOrchestratorChatRealtimeSource(source, projectionName)) {
     types.push("orchestrator.message");
   }
   return types;
 }
 
-function isOrchestratorChatRealtimeSource(source: string): boolean {
+function isTranscriptRealtimeSource(source: string, projectionName: string | null): boolean {
+  return (
+    source === "runs" ||
+    source === "runstore" ||
+    source === "transcript" ||
+    source === "run_activity" ||
+    source === "run-activity" ||
+    projectionName === "transcript_projection" ||
+    source.startsWith("transcript_projection:")
+  );
+}
+
+function isOrchestratorChatRealtimeSource(source: string, projectionName: string | null = null): boolean {
   return (
     source === "orchestrator-chat" ||
     source === "chat" ||
     source === "orchestrator_conversations" ||
     source.startsWith("orchestrator_conversations:") ||
-    source.startsWith("orchestrator_chat:")
+    source.startsWith("orchestrator_chat:") ||
+    projectionName === "orchestrator_chat_projection" ||
+    source.startsWith("orchestrator_chat_projection:")
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function normalizeRealtimeSourceRevision(revision: WebProjectionSourceRevision): WebProjectionSourceRevision {

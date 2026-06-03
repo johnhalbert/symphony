@@ -109,7 +109,7 @@ import {
   type WebProjectionRevisionUnsubscribe,
   type WebProjectionSourceRevision,
 } from "./WebProjectionContext.js";
-import { RealtimeProjectionEventBus } from "./RealtimeProjectionEvents.js";
+import { RealtimeProjectionEventBus, type RealtimeResourceKind } from "./RealtimeProjectionEvents.js";
 import {
   createWebProjectionReadRepositories,
   webHistoryProjectionScopeKey,
@@ -125,13 +125,13 @@ import {
   type DurableProjectionName,
   type ProjectionPayloadRecord,
   type ProjectionPayloadWriteInput,
+  type ProjectionRevisionPublication,
   type ProjectionRevisionRecord,
   type ProjectionRevisionSelector,
   type ProjectionSourceRevision,
   type ProjectionWriteResult,
 } from "../core/persistence/ProjectionTransactionService.js";
-import type { ProjectionSourceFreshnessInput } from "../core/persistence/ProjectionSourceFreshness.js";
-
+import type { ProjectionSourceFreshness, ProjectionSourceFreshnessInput } from "../core/persistence/ProjectionSourceFreshness.js";
 import type {
   IssueBlockerRef,
   IssueDetailsEnvelope,
@@ -155,11 +155,12 @@ type StatusServerWritebackOutbox = Pick<FileWritebackOutboxStore, "list"> &
 
 interface StatusServerProjectionRevisionStore {
   projectionRevision(): number;
-  onProjectionChanged(listener: (event: { source: string; revision: number }) => void): () => void;
+  onProjectionChanged(listener: (event: { source: string; revision: number; detail?: Readonly<Record<string, unknown>> | null }) => void): () => void;
 }
 
 export interface StatusServerProjectionWriter {
   writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult>;
+  onProjectionChanged?(listener: (event: ProjectionRevisionPublication) => void): () => void;
 }
 
 export interface StatusServerProjectionReader extends WebProjectionPayloadReader {
@@ -341,6 +342,8 @@ export class StatusServer {
 
   private registerWebProjectionRevisionListeners(): void {
     if (this.webProjectionRevisionUnsubscribes.length > 0) return;
+    const projectionPublicationUnsubscribe = this.subscribeProjectionPublicationEvents();
+    if (projectionPublicationUnsubscribe) this.webProjectionRevisionUnsubscribes.push(projectionPublicationUnsubscribe);
     for (const provider of this.webProjectionRevisionProviders) {
       if (!provider.subscribe) continue;
       const unsubscribe = provider.subscribe((revision) => {
@@ -349,6 +352,16 @@ export class StatusServer {
       });
       this.webProjectionRevisionUnsubscribes.push(unsubscribe);
     }
+  }
+
+  private subscribeProjectionPublicationEvents(): WebProjectionRevisionUnsubscribe | null {
+    const writer = this.options.projectionWriter;
+    if (!writer || typeof writer.onProjectionChanged !== "function") return null;
+    return writer.onProjectionChanged((publication) => {
+      const revision = webProjectionSourceRevisionFromProjectionPublication(publication);
+      this.publishWebProjectionRevision(revision);
+      this.realtimeEvents.publishProjectionRevision(revision);
+    });
   }
 
   private unsubscribeWebProjectionRevisionListeners(): void {
@@ -363,8 +376,12 @@ export class StatusServer {
   }
 
   private markCompletedWebProjectionContextDirty(revision: WebProjectionSourceRevision): void {
-    this.webProjectionDirtyGeneration += 1;
     this.completedWebProjectionContext = null;
+    this.publishWebProjectionRevision(revision);
+  }
+
+  private publishWebProjectionRevision(revision: WebProjectionSourceRevision): void {
+    this.webProjectionDirtyGeneration += 1;
     this.broadcastWebProjectionRevision(revision);
   }
 
@@ -2563,12 +2580,171 @@ export class StatusServer {
   }
 }
 
+function webProjectionSourceRevisionFromProjectionPublication(
+  publication: ProjectionRevisionPublication,
+): WebProjectionSourceRevision {
+  return {
+    source: durableProjectionRealtimeSource(publication),
+    revision: publication.revision,
+    observedAt: publication.generatedAt,
+    detail: realtimeDetailFromProjectionPublication(publication),
+  };
+}
+
+function durableProjectionRealtimeSource(publication: ProjectionRevisionPublication): string {
+  return `${publication.projectionName}:${publication.scopeKind}:${publication.scopeKey}`;
+}
+
+function realtimeDetailFromProjectionPublication(publication: ProjectionRevisionPublication): Readonly<Record<string, unknown>> {
+  const sourceCursors = realtimeSafeRecord(publication.sourceCursors);
+  const sourceFreshness = publication.sourceFreshness.map(realtimeSourceFreshnessDetail);
+  const primaryFreshness = sourceFreshness[0] ?? null;
+  const detail: Record<string, unknown> = {
+    source: "projection",
+    projectionName: publication.projectionName,
+    scopeKind: publication.scopeKind,
+    scopeKey: publication.scopeKey,
+    projectionRevisionId: publication.projectionRevisionId,
+    contentSha256: publication.contentSha256,
+    expiresAt: publication.expiresAt,
+    resourcesChanged: realtimeResourceKindsForDurableProjection(publication.projectionName),
+    sourceRevisions: publication.sourceRevisions.map(realtimeProjectionSourceRevisionDetail),
+    sourceCursors,
+    sourceFreshness,
+  };
+
+  if (primaryFreshness) {
+    detail.checkedAt = recordStringValue(primaryFreshness, "checkedAt");
+    detail.fetchedAt = recordStringValue(primaryFreshness, "checkedAt");
+  }
+
+  return {
+    ...detail,
+    ...durableProjectionSpecificRealtimeDetail(publication, sourceCursors),
+  };
+}
+
+function realtimeProjectionSourceRevisionDetail(revision: ProjectionSourceRevision): Record<string, unknown> {
+  return { source: revision.source, revision: revision.revision, observedAt: revision.observedAt };
+}
+
+function realtimeSourceFreshnessDetail(freshness: ProjectionSourceFreshness): Record<string, unknown> {
+  return realtimeSafeRecord({
+    source: freshness.source,
+    status: freshness.status,
+    checkedAt: freshness.checkedAt,
+    revision: freshness.revision,
+    lastSuccessAt: freshness.lastSuccessAt,
+    lastErrorAt: freshness.lastErrorAt,
+    staleMs: freshness.staleMs,
+    detail: freshness.detail,
+  });
+}
+
+function durableProjectionSpecificRealtimeDetail(
+  publication: ProjectionRevisionPublication,
+  sourceCursors: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  switch (publication.projectionName) {
+    case "transcript_projection":
+      return transcriptProjectionRealtimeDetail(sourceCursors);
+    case "orchestrator_chat_projection":
+      return orchestratorChatProjectionRealtimeDetail(publication, sourceCursors);
+    case "dashboard_projection":
+    case "issue_board_projection":
+    case "sidebar_projection":
+    case "history_projection":
+      return {};
+  }
+}
+
+function transcriptProjectionRealtimeDetail(sourceCursors: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const firstSequence = recordNumberValue(sourceCursors, "firstSequence");
+  const afterSequence =
+    recordNumberValue(sourceCursors, "afterSequence") ??
+    (firstSequence === null ? recordNumberValue(sourceCursors, "offset") : Math.max(0, firstSequence - 1));
+  const detail: Record<string, unknown> = {};
+  copyStringRecordField(detail, sourceCursors, "runId");
+  copyStringRecordField(detail, sourceCursors, "sessionId");
+  copyStringRecordField(detail, sourceCursors, "issueKey");
+  if (typeof detail.issueKey === "string") detail.issueIdentifier = detail.issueKey;
+  copyNumberRecordField(detail, sourceCursors, "offset");
+  copyNumberRecordField(detail, sourceCursors, "limit");
+  copyNumberRecordField(detail, sourceCursors, "nextOffset");
+  copyNumberRecordField(detail, sourceCursors, "eventCount");
+  copyNumberRecordField(detail, sourceCursors, "firstSequence");
+  copyNumberRecordField(detail, sourceCursors, "lastSequence");
+  copyStringRecordField(detail, sourceCursors, "lastEventAt");
+  if (afterSequence !== null) detail.afterSequence = afterSequence;
+  return detail;
+}
+
+function orchestratorChatProjectionRealtimeDetail(
+  publication: ProjectionRevisionPublication,
+  sourceCursors: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const conversationId =
+    recordStringValue(sourceCursors, "conversationId") ?? recordStringValue(sourceCursors, "conversationKey") ?? publication.scopeKey;
+  const detail: Record<string, unknown> = { conversationId, conversationKey: conversationId };
+  copyNumberRecordField(detail, sourceCursors, "messageCount");
+  copyStringRecordField(detail, sourceCursors, "lastMessageId");
+  copyStringRecordField(detail, sourceCursors, "lastMessageStatus");
+  copyStringRecordField(detail, sourceCursors, "lastMessageAt");
+  return detail;
+}
+
+function realtimeSafeRecord(value: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const sanitized = sanitizePublicJson(value, 1_000);
+  return isRecord(sanitized) ? sanitized : {};
+}
+
+function copyStringRecordField(output: Record<string, unknown>, input: Readonly<Record<string, unknown>>, key: string): void {
+  const value = recordStringValue(input, key);
+  if (value !== null) output[key] = value;
+}
+
+function copyNumberRecordField(output: Record<string, unknown>, input: Readonly<Record<string, unknown>>, key: string): void {
+  const value = recordNumberValue(input, key);
+  if (value !== null) output[key] = value;
+}
+
+function recordStringValue(record: Readonly<Record<string, unknown>>, key: string): string | null {
+  const value = record[key];
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function recordNumberValue(record: Readonly<Record<string, unknown>>, key: string): number | null {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function realtimeResourceKindsForDurableProjection(projectionName: DurableProjectionName): readonly RealtimeResourceKind[] {
+  switch (projectionName) {
+    case "dashboard_projection":
+      return ["dashboard"];
+    case "issue_board_projection":
+      return ["issue-board", "issue-detail"];
+    case "sidebar_projection":
+      return ["sidebar"];
+    case "history_projection":
+      return ["history"];
+    case "transcript_projection":
+      return ["session-transcript", "history"];
+    case "orchestrator_chat_projection":
+      return ["orchestrator-chat", "sidebar", "dashboard"];
+  }
+}
+
 function createStatusServerWebProjectionRevisionProviders(
   options: StatusServerOptions,
 ): readonly WebProjectionRevisionProvider[] {
   const providers: WebProjectionRevisionProvider[] = [...(options.webProjectionRevisionProviders ?? [])];
   const runStoreProvider = createStatusServerStoreRevisionProvider("runStore", options.runStore);
   if (runStoreProvider) providers.push(runStoreProvider);
+  const runActivityProvider = createStatusServerStoreRevisionProvider("run_activity", options.runActivitySourceStore);
+  if (runActivityProvider) providers.push(runActivityProvider);
   const lifecycleStoreProvider = createStatusServerStoreRevisionProvider("lifecycleStore", options.lifecycleStore);
   if (lifecycleStoreProvider) providers.push(lifecycleStoreProvider);
   const writebackOutboxProvider = createStatusServerStoreRevisionProvider("writebackOutbox", options.writebackOutbox);
@@ -2591,7 +2767,7 @@ function createStatusServerStoreRevisionProvider(
     getRevision: () => ({ source, revision: store.projectionRevision(), observedAt: null }),
     subscribe: (listener: WebProjectionRevisionListener) =>
       store.onProjectionChanged((event) => {
-        listener({ source: event.source || source, revision: event.revision, observedAt: null });
+        listener({ source: event.source || source, revision: event.revision, observedAt: null, detail: event.detail ?? null });
       }),
   };
 }
@@ -2672,11 +2848,12 @@ function runActivityEventsPageToTranscriptPage(sourcePage: RunActivityEventsPage
 
 function statusServerProjectionSourceRevisions(
   sourceIndex: BuiltWebProjectionSourceIndex | null,
-  options: Pick<StatusServerOptions, "runStore" | "lifecycleStore" | "writebackOutbox">,
+  options: Pick<StatusServerOptions, "runStore" | "runActivitySourceStore" | "lifecycleStore" | "writebackOutbox">,
 ): ProjectionSourceRevision[] {
   if (sourceIndex) return sourceIndex.durableSourceRevisions.map(toProjectionSourceRevision);
   return [
     statusServerStoreProjectionSourceRevision("runStore", options.runStore),
+    statusServerStoreProjectionSourceRevision("run_activity", options.runActivitySourceStore),
     statusServerStoreProjectionSourceRevision("lifecycleStore", options.lifecycleStore),
     statusServerStoreProjectionSourceRevision("writebackOutbox", options.writebackOutbox),
   ].filter((revision): revision is ProjectionSourceRevision => revision !== null);

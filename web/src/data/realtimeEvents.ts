@@ -73,6 +73,9 @@ export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase 
   messageCount: number | null;
   inputLength: number | null;
   status: number | null;
+  lastMessageId: string | null;
+  lastMessageStatus: string | null;
+  lastMessageAt: string | null;
 }
 
 export interface RealtimeSourceStatusPayload extends RealtimePayloadBase {
@@ -82,6 +85,9 @@ export interface RealtimeSourceStatusPayload extends RealtimePayloadBase {
   cached: boolean | null;
   error: { code: string; message: string } | null;
   issueCount: number | null;
+  sourceRevisions: readonly Readonly<Record<string, unknown>>[];
+  sourceCursors: Readonly<Record<string, unknown>> | null;
+  sourceFreshness: readonly Readonly<Record<string, unknown>>[];
 }
 
 export interface RealtimeProjectionEventPayloadByType {
@@ -240,7 +246,10 @@ function isRealtimePayloadForEventType(type: RealtimeProjectionEventType, value:
         isNullableString(orchestratorPayload.conversationId) &&
         isNullableFiniteNumber(orchestratorPayload.messageCount) &&
         isNullableFiniteNumber(orchestratorPayload.inputLength) &&
-        isNullableFiniteNumber(orchestratorPayload.status)
+        isNullableFiniteNumber(orchestratorPayload.status) &&
+        isNullableString(orchestratorPayload.lastMessageId) &&
+        isNullableString(orchestratorPayload.lastMessageStatus) &&
+        isNullableString(orchestratorPayload.lastMessageAt)
       );
     }
     case "source.status": {
@@ -252,7 +261,10 @@ function isRealtimePayloadForEventType(type: RealtimeProjectionEventType, value:
         isNullableString(sourcePayload.fetchedAt) &&
         (sourcePayload.cached === null || typeof sourcePayload.cached === "boolean") &&
         isNullableSourceStatusError(sourcePayload.error) &&
-        isNullableFiniteNumber(sourcePayload.issueCount)
+        isNullableFiniteNumber(sourcePayload.issueCount) &&
+        isRecordArray(sourcePayload.sourceRevisions) &&
+        (sourcePayload.sourceCursors === null || isRecord(sourcePayload.sourceCursors)) &&
+        isRecordArray(sourcePayload.sourceFreshness)
       );
     }
   }
@@ -323,6 +335,10 @@ function isNullableSourceStatusError(value: unknown): value is RealtimeSourceSta
   if (!isRecord(value)) return false;
   const error = value as Partial<NonNullable<RealtimeSourceStatusPayload["error"]>>;
   return typeof error.code === "string" && typeof error.message === "string";
+}
+
+function isRecordArray(value: unknown): value is readonly Readonly<Record<string, unknown>>[] {
+  return Array.isArray(value) && value.every(isRecord);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
