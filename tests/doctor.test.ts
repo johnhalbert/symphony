@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -521,6 +521,7 @@ github:
       const binaryPath = path.join(root, "bin", "hermes");
       await mkdir(path.dirname(binaryPath), { recursive: true });
       await writeFile(binaryPath, "#!/usr/bin/env node\n", "utf8");
+      await chmod(binaryPath, 0o755);
       vi.stubEnv("HERMES_HOME", "secret-home");
       const calls: Array<{ file: string; args: string[]; hermesHome: string | undefined }> = [];
       const runner: HostHermesCommandRunner = async (file, args, options) => {
@@ -554,7 +555,7 @@ github:
         {
           id: "hermes_acp.acp_check",
           status: "ok",
-          message: "Host Hermes `hermes acp --check` completed successfully",
+          message: `Host Hermes ACP check passed: ${binaryPath} acp --check`,
         },
         {
           id: "hermes_acp.source_profile",
@@ -564,13 +565,13 @@ github:
         {
           id: "hermes_acp.source_profile_check",
           status: "ok",
-          message: "Host Hermes ACP source profile dogfood passed `hermes -p dogfood acp --check`",
+          message: `Host Hermes ACP source profile dogfood passed: ${binaryPath} -p dogfood acp --check`,
         },
       ]);
       await expect(runtimeHarnessDependencyDoctorChecks(config, { hostHermesCommandRunner: runner })).resolves.toContainEqual({
         id: "hermes_acp.source_profile_check",
         status: "ok",
-        message: "Host Hermes ACP source profile dogfood passed `hermes -p dogfood acp --check`",
+        message: `Host Hermes ACP source profile dogfood passed: ${binaryPath} -p dogfood acp --check`,
       });
       expect(calls.map((call) => call.args)).toEqual([
         ["--version"],
@@ -588,12 +589,124 @@ github:
     }
   });
 
+  it("reports a missing configured host Hermes ACP binary without invoking host commands", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-acp-missing-"));
+    try {
+      const binaryPath = path.join(root, "bin", "missing-hermes");
+      let runnerCalled = false;
+      const config = parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
+          agent: { harness: "hermes_acp" },
+          hermes_acp: {
+            binary_path: binaryPath,
+            source_profile: "dogfood",
+          },
+        },
+        path.join(root, "WORKFLOW.md"),
+        { LINEAR_API_KEY: "secret" },
+      );
+
+      const checks = await hostHermesAcpDoctorChecks(config, {
+        hostHermesCommandRunner: async () => {
+          runnerCalled = true;
+          return { stdout: "", stderr: "" };
+        },
+      });
+
+      expect(runnerCalled).toBe(false);
+      expect(checks).toEqual([
+        {
+          id: "hermes_acp.host_hermes_binary_missing",
+          status: "error",
+          message:
+            `Configured host Hermes ACP binary ${binaryPath} does not exist or is not executable. ` +
+            "Install host Hermes, update `hermes_acp.binary_path`, or leave it unset to resolve `hermes` from PATH; do not point this at Symphony's vendored `hermes/upstream-src` checkout.",
+        },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces host Hermes version probe failures with exact binary path remediation", async () => {
+    await withHostHermesAcpDoctorConfig(async ({ binaryPath, config }) => {
+      const runner: HostHermesCommandRunner = async (_file, args) => {
+        const command = args.join(" ");
+        if (command === "--version") return { stdout: "", stderr: "version boom\n", exitCode: 12 };
+        if (command === "acp --check") return { stdout: "ACP OK\n", stderr: "", exitCode: 0 };
+        if (command === "-p dogfood acp --check") return { stdout: "profile ACP OK\n", stderr: "", exitCode: 0 };
+        return { stdout: "", stderr: `unexpected command ${command}`, exitCode: 99 };
+      };
+
+      const checks = await hostHermesAcpDoctorChecks(config, { hostHermesCommandRunner: runner });
+      expect(checks).toContainEqual({
+        id: "hermes_acp.host_hermes_version_probe_failed",
+        status: "error",
+        message:
+          `Host Hermes executable was found at ${binaryPath}, but \`${binaryPath} --version\` failed: exit code 12. ` +
+          "Install or upgrade the host Hermes binary, or update `hermes_acp.binary_path` to a working host Hermes executable.",
+      });
+      expect(checks).toContainEqual({
+        id: "hermes_acp.source_profile_check",
+        status: "ok",
+        message: `Host Hermes ACP source profile dogfood passed: ${binaryPath} -p dogfood acp --check`,
+      });
+    });
+  });
+
+  it("reports unsupported host Hermes ACP check commands with upgrade remediation", async () => {
+    await withHostHermesAcpDoctorConfig(async ({ binaryPath, config }) => {
+      const runner: HostHermesCommandRunner = async (_file, args) => {
+        const command = args.join(" ");
+        if (command === "--version") return { stdout: "hermes 0.1.0\n", stderr: "", exitCode: 0 };
+        if (command === "acp --check") return { stdout: "", stderr: "error: unknown option '--check'\n", exitCode: 2 };
+        if (command === "-p dogfood acp --check") return { stdout: "profile ACP OK\n", stderr: "", exitCode: 0 };
+        return { stdout: "", stderr: `unexpected command ${command}`, exitCode: 99 };
+      };
+
+      const checks = await hostHermesAcpDoctorChecks(config, { hostHermesCommandRunner: runner });
+      const acpCheck = checks.find((check) => check.id === "hermes_acp.acp_check");
+      expect(acpCheck).toMatchObject({ id: "hermes_acp.acp_check", status: "error" });
+      expect(acpCheck?.message).toContain(`Host Hermes ACP command failed with exit code 2: ${binaryPath} acp --check`);
+      expect(acpCheck?.message).toContain("unknown option '--check'");
+      expect(acpCheck?.message).toContain("Host Hermes does not appear to support `hermes acp --check`");
+      expect(acpCheck?.message).toContain("upgrade the host Hermes installation to an ACP-capable version");
+    });
+  });
+
+  it("surfaces source profile ACP check failures with exact source profile remediation", async () => {
+    await withHostHermesAcpDoctorConfig(async ({ binaryPath, config }) => {
+      const runner: HostHermesCommandRunner = async (_file, args) => {
+        const command = args.join(" ");
+        if (command === "--version") return { stdout: "hermes 1.2.3\n", stderr: "", exitCode: 0 };
+        if (command === "acp --check") return { stdout: "ACP OK\n", stderr: "", exitCode: 0 };
+        if (command === "-p dogfood acp --check") {
+          return { stdout: "", stderr: "profile dogfood is not authenticated\n", exitCode: 7 };
+        }
+        return { stdout: "", stderr: `unexpected command ${command}`, exitCode: 99 };
+      };
+
+      const checks = await hostHermesAcpDoctorChecks(config, { hostHermesCommandRunner: runner });
+      const profileCheck = checks.find((check) => check.id === "hermes_acp.source_profile_check");
+      expect(profileCheck).toMatchObject({ id: "hermes_acp.source_profile_check", status: "error" });
+      expect(profileCheck?.message).toContain(
+        `Host Hermes ACP command failed with exit code 7: ${binaryPath} -p dogfood acp --check`,
+      );
+      expect(profileCheck?.message).toContain("profile dogfood is not authenticated");
+      expect(profileCheck?.message).toContain("Authenticate or repair host Hermes source profile dogfood");
+      expect(profileCheck?.message).toContain("Symphony-managed HERMES_HOME/HERMES_AUTH_HOME are not used");
+    });
+  });
+
   it("redacts credentials from failing host Hermes ACP doctor output", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-acp-redact-"));
     try {
       const binaryPath = path.join(root, "bin", "hermes");
       await mkdir(path.dirname(binaryPath), { recursive: true });
       await writeFile(binaryPath, "#!/usr/bin/env node\n", "utf8");
+      await chmod(binaryPath, 0o755);
       const longToken = "x".repeat(90);
       const runner: HostHermesCommandRunner = async (_file, args) => {
         const command = args.join(" ");
@@ -1113,6 +1226,35 @@ github:
     });
   });
 });
+
+async function withHostHermesAcpDoctorConfig(
+  run: (fixture: { root: string; binaryPath: string; config: ReturnType<typeof parseServiceConfig> }) => Promise<void>,
+): Promise<void> {
+  const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-hermes-acp-fixture-"));
+  try {
+    const binaryPath = path.join(root, "bin", "hermes");
+    await mkdir(path.dirname(binaryPath), { recursive: true });
+    await writeFile(binaryPath, "#!/usr/bin/env node\n", "utf8");
+    await chmod(binaryPath, 0o755);
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
+        agent: { harness: "hermes_acp" },
+        hermes_acp: {
+          binary_path: binaryPath,
+          source_profile: "dogfood",
+        },
+      },
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    await run({ root, binaryPath, config });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
 
 function completeAgentIssueContract(): string {
   return [
