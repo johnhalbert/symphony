@@ -655,8 +655,27 @@ export class StatusServer {
       const webTranscriptMatch = /^\/api\/v1\/web\/sessions\/([^/]+)\/transcript$/.exec(url.pathname);
       if (request.method === "GET" && webTranscriptMatch) {
         const sessionIdOrRunId = decodeURIComponent(webTranscriptMatch[1] ?? "").trim();
-        if (!this.options.runStore || sessionIdOrRunId.length === 0) {
+        if (sessionIdOrRunId.length === 0) {
           sendJson(response, 200, []);
+          return;
+        }
+        const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
+        if (!this.options.runStore) {
+          const requestedPage = parseWebTranscriptPagination(url);
+          const durableTranscript = requestedPage
+            ? await this.webProjectionRepositories.transcript.readRunPage(
+                { runId: sessionIdOrRunId, offset: requestedPage.offset, limit: requestedPage.limit },
+                { forceRefresh },
+              )
+            : await this.webProjectionRepositories.transcript.readRunDefaultPage(
+                { runId: sessionIdOrRunId, limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT },
+                { forceRefresh },
+              );
+          if (durableTranscript.status === "hit" && durableTranscript.record) {
+            sendJson(response, 200, durableTranscript.record.payload, durableProjectionReadHeaders(durableTranscript));
+            return;
+          }
+          sendJson(response, 200, [], durableProjectionReadHeaders(durableTranscript));
           return;
         }
         const run = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId);
@@ -664,7 +683,6 @@ export class StatusServer {
           sendJson(response, 200, []);
           return;
         }
-        const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
         const durableTranscript = await this.webProjectionRepositories.transcript.readRunPage(
           transcriptProjectionPageSelectorForRequest(run, url),
           { forceRefresh },
