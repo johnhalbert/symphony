@@ -175,6 +175,10 @@ export type AgentCommandPolicyUnsafeGitConfigCategory =
   | "filesystem_monitor"
   | "transport_helper"
   | "ssh_command"
+  | "command_lookup"
+  | "git_environment"
+  | "loader"
+  | "shell_environment"
   | "other";
 
 export type AgentCommandPolicyUnsafeGitConfigEffect =
@@ -205,10 +209,39 @@ const UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
   ["GIT_SSH", "ssh_command"],
   ["GIT_SSH_COMMAND", "ssh_command"],
   ["GIT_PROXY_COMMAND", "transport_helper"],
+  ["GIT_ALLOW_PROTOCOL", "transport_helper"],
+  ["GIT_PROTOCOL", "transport_helper"],
+  ["GIT_PROTOCOL_FROM_USER", "transport_helper"],
+  ["GIT_DIR", "git_environment"],
+  ["GIT_WORK_TREE", "git_environment"],
+  ["GIT_INDEX_FILE", "git_environment"],
+  ["GIT_OBJECT_DIRECTORY", "git_environment"],
+  ["GIT_ALTERNATE_OBJECT_DIRECTORIES", "git_environment"],
+  ["GIT_NAMESPACE", "git_environment"],
   ["GIT_EXEC_PATH", "other"],
+  ["LD_PRELOAD", "loader"],
+  ["LD_LIBRARY_PATH", "loader"],
+  ["LD_AUDIT", "loader"],
+  ["DYLD_INSERT_LIBRARIES", "loader"],
+  ["DYLD_LIBRARY_PATH", "loader"],
+  ["DYLD_FRAMEWORK_PATH", "loader"],
+]);
+const INLINE_ONLY_UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
+  string,
+  AgentCommandPolicyUnsafeGitConfigCategory
+> = new Map([
+  ["PATH", "command_lookup"],
+  ["PATHEXT", "command_lookup"],
+  ["HOME", "git_environment"],
+  ["XDG_CONFIG_HOME", "git_environment"],
+  ["XDG_CONFIG_DIRS", "git_environment"],
+  ["SHELL", "shell_environment"],
+  ["BASH_ENV", "shell_environment"],
+  ["ENV", "shell_environment"],
 ]);
 const GIT_CONFIG_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)$/u;
 const GIT_CONFIG_INDEXED_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(KEY|VALUE)_(\d+)$/u;
+const MAX_GIT_CONFIG_ENVIRONMENT_COUNT = 64;
 
 export type AgentCommandPolicyPathStyle = "windows" | "posix" | "unc" | "bare" | "unknown";
 
@@ -2012,8 +2045,16 @@ function localGitInspectionUnsafeConfigCategories(
 
   if (containsInlineUnsafeLocalGitOption(command)) categories.add("external_diff");
 
-  addUnsafeLocalGitEnvironmentCategories(categories, extractInlineEnvironmentAssignments(tokens));
-  addUnsafeLocalGitEnvironmentCategories(categories, inheritedEnvironmentAssignments(input.environment));
+  addUnsafeLocalGitEnvironmentCategories(
+    categories,
+    extractInlineEnvironmentAssignments(tokens),
+    "inline_env",
+  );
+  addUnsafeLocalGitEnvironmentCategories(
+    categories,
+    inheritedEnvironmentAssignments(input.environment),
+    "inherited_env",
+  );
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
@@ -2052,6 +2093,7 @@ interface GitConfigEnvironmentEntry {
 function addUnsafeLocalGitEnvironmentCategories(
   categories: Set<AgentCommandPolicyUnsafeGitConfigCategory>,
   environment: ReadonlyMap<string, string | undefined>,
+  source: "inline_env" | "inherited_env",
 ): void {
   let hasGitConfigEnvironment = false;
   let hasSpecificGitConfigCategory = false;
@@ -2061,7 +2103,12 @@ function addUnsafeLocalGitEnvironmentCategories(
 
   for (const [key, value] of environment) {
     const normalizedKey = normalizeEnvironmentKeyForPolicy(key);
-    const category = UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES.get(normalizedKey);
+    const inlineOnlyCategory =
+      source === "inline_env"
+        ? INLINE_ONLY_UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES.get(normalizedKey)
+        : undefined;
+    const category =
+      UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES.get(normalizedKey) ?? inlineOnlyCategory;
     if (category !== undefined) {
       categories.add(category);
       continue;
@@ -2092,7 +2139,11 @@ function addUnsafeLocalGitEnvironmentCategories(
       const field = indexedGitConfigMatch[1];
       const rawIndex = indexedGitConfigMatch[2];
       const index = rawIndex === undefined ? Number.NaN : Number.parseInt(rawIndex, 10);
-      if (!Number.isSafeInteger(index) || index < 0) {
+      if (
+        !Number.isSafeInteger(index) ||
+        index < 0 ||
+        index >= MAX_GIT_CONFIG_ENVIRONMENT_COUNT
+      ) {
         hasAmbiguousGitConfigEnvironment = true;
         continue;
       }
@@ -2152,7 +2203,9 @@ function parseGitConfigCount(value: string | undefined): number | null {
   const normalizedValue = nonEmptyGitConfigEnvironmentValue(value);
   if (normalizedValue === undefined || !/^\d+$/u.test(normalizedValue)) return null;
   const count = Number.parseInt(normalizedValue, 10);
-  return Number.isSafeInteger(count) ? count : null;
+  return Number.isSafeInteger(count) && count <= MAX_GIT_CONFIG_ENVIRONMENT_COUNT
+    ? count
+    : null;
 }
 
 function nonEmptyGitConfigEnvironmentValue(value: string | undefined): string | undefined {
