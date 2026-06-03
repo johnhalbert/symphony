@@ -3370,13 +3370,13 @@ function runtimeMetadataForEntry(
       runtimeModel: config.hermes.model,
       runtimeModelParams: [],
       runtimeSettingSources: [
-        `host_hermes:${config.hermes.acpBinaryPath ?? "PATH:hermes"}`,
-        `source_profile:${config.hermes.acpSourceProfile ?? "active"}`,
-        `profile_prefix:${config.hermes.acpProfilePrefix ?? "symphony"}`,
+        `host_hermes:${config.hermesAcp.binaryPath ?? "PATH:hermes"}`,
+        `source_profile:${config.hermesAcp.sourceProfile ?? "active"}`,
+        `profile_prefix:${config.hermesAcp.profilePrefix}`,
         ...(config.hermes.provider === null ? [] : [`provider:${config.hermes.provider}`]),
       ],
       runtimeMode: effectiveRuntimeModeForEntry(entry, config),
-      runtimeAgentLifecycle: config.hermes.workerSessionLifecycle,
+      runtimeAgentLifecycle: config.hermesAcp.workerSessionLifecycle,
     };
   }
   return {

@@ -141,10 +141,10 @@ describe("Orchestrator", () => {
     config.agent.harness = "hermes_acp";
     config.hermes.provider = "openrouter";
     config.hermes.model = "anthropic/claude-sonnet-test";
-    config.hermes.acpBinaryPath = "/opt/hermes/bin/hermes";
-    config.hermes.acpSourceProfile = "dogfood";
-    config.hermes.acpProfilePrefix = "sym-test";
-    config.hermes.workerSessionLifecycle = "fresh_per_run";
+    config.hermesAcp.binaryPath = "/opt/hermes/bin/hermes";
+    config.hermesAcp.sourceProfile = "dogfood";
+    config.hermesAcp.profilePrefix = "sym-test";
+    config.hermesAcp.workerSessionLifecycle = "fresh_per_run";
     const candidate = issue({ state: "Todo" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {

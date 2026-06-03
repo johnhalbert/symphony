@@ -1088,6 +1088,19 @@ Work on {{ issue.identifier }}.
     });
     expect(config.hermes.auth.managedRoot.replace(/\\/g, "/")).toMatch(/\/tmp\/hermes-home\/auth$/);
     expect(config.hermes.auth.bootstrapFrom.replace(/\\/g, "/")).toMatch(/\/tmp\/hermes-home$/);
+    expect(config.hermes.acpBinaryPath).toBeNull();
+    expect(config.hermes.acpSourceProfile).toBeNull();
+    expect(config.hermes.acpProfilePrefix).toBeNull();
+    expect(config.hermesAcp).toEqual({
+      binaryPath: null,
+      sourceProfile: null,
+      profilePrefix: "symphony",
+      workerSessionLifecycle: "reuse_by_issue",
+      keepProfiles: "failed",
+      startupTimeoutMs: 15_000,
+      requestTimeoutMs: 120_000,
+      permissionTimeoutMs: 120_000,
+    });
 
     const hermesConfig = parseServiceConfig(
       {
@@ -1107,6 +1120,129 @@ Work on {{ issue.identifier }}.
     expect(hermesConfig.agent.harness).toBe("hermes");
     expect(hermesConfig.hermes.auth.managedRoot.replace(/\\/g, "/")).toMatch(/\/tmp\/symphony-hermes-auth$/);
     expect(hermesConfig.hermes.auth.bootstrapFrom.replace(/\\/g, "/")).toMatch(/\/repo\/local-hermes-auth$/);
+  });
+
+  it("parses hermes_acp host harness defaults, overrides, and legacy compatibility aliases", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { harness: "hermes_acp" },
+        hermes: {
+          state_dir: "managed-hermes",
+          model: "gpt-test",
+          acp_binary_path: "/legacy/should-not-win",
+          acp_source_profile: "legacy-should-not-win",
+          acp_profile_prefix: "legacy-should-not-win",
+          worker_session_lifecycle: "reuse_by_issue",
+          keep_profiles: "failed",
+          request_timeout_ms: 33_000,
+        },
+        hermes_acp: {
+          binary_path: "$HOST_HERMES_BINARY",
+          source_profile: "$HOST_HERMES_SOURCE_PROFILE",
+          profile_name_prefix: "sym-alias",
+          profile_prefix: "sym-test",
+          worker_session_lifecycle: "fresh_per_run",
+          keep_profiles: "always",
+          startup_timeout_ms: 5_000,
+          request_timeout_ms: 6_000,
+          permission_timeout_ms: 7_000,
+        },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "secret",
+        HOST_HERMES_BINARY: "/opt/hermes/bin/hermes",
+        HOST_HERMES_SOURCE_PROFILE: "dogfood",
+      },
+    );
+
+    expect(config.hermesAcp).toEqual({
+      binaryPath: "/opt/hermes/bin/hermes",
+      sourceProfile: "dogfood",
+      profilePrefix: "sym-test",
+      workerSessionLifecycle: "fresh_per_run",
+      keepProfiles: "always",
+      startupTimeoutMs: 5_000,
+      requestTimeoutMs: 6_000,
+      permissionTimeoutMs: 7_000,
+    });
+    expect(config.hermes.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/managed-hermes$/);
+    expect(config.hermes.acpBinaryPath).toBe("/legacy/should-not-win");
+    expect(config.hermes.acpSourceProfile).toBe("legacy-should-not-win");
+    expect(config.hermes.acpProfilePrefix).toBe("legacy-should-not-win");
+    expect(config.hermes.workerSessionLifecycle).toBe("reuse_by_issue");
+    expect(config.hermes.keepProfiles).toBe("failed");
+    expect(config.hermes.requestTimeoutMs).toBe(33_000);
+
+    const legacy = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { harness: "hermes_acp" },
+        hermes: {
+          acp_binary_path: "/legacy/hermes",
+          acp_source_profile: "legacy-source",
+          acp_profile_prefix: "legacy-prefix",
+          startup_timeout_ms: 1_000,
+          request_timeout_ms: 2_000,
+          worker_session_lifecycle: "fresh_per_run",
+          keep_profiles: "never",
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+    expect(legacy.hermesAcp).toEqual({
+      binaryPath: "/legacy/hermes",
+      sourceProfile: "legacy-source",
+      profilePrefix: "legacy-prefix",
+      workerSessionLifecycle: "fresh_per_run",
+      keepProfiles: "never",
+      startupTimeoutMs: 1_000,
+      requestTimeoutMs: 2_000,
+      permissionTimeoutMs: 2_000,
+    });
+    expect(legacy.hermes).toMatchObject({
+      acpBinaryPath: "/legacy/hermes",
+      acpSourceProfile: "legacy-source",
+      acpProfilePrefix: "legacy-prefix",
+    });
+
+    const profileNameAlias = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        hermes_acp: { profile_name_prefix: "alias-prefix" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+    expect(profileNameAlias.hermesAcp.profilePrefix).toBe("alias-prefix");
+  });
+
+  it("rejects invalid hermes_acp timeouts and profile names", () => {
+    const base = { tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" } };
+    for (const hermesAcp of [
+      { startup_timeout_ms: 0 },
+      { request_timeout_ms: -1 },
+      { permission_timeout_ms: 1.5 },
+      { worker_session_lifecycle: "reuse" },
+      { keep_profiles: "sometimes" },
+    ]) {
+      expect(() => parseServiceConfig({ ...base, hermes_acp: hermesAcp }, "/repo/WORKFLOW.md", { LINEAR_API_KEY: "secret" })).toThrow(
+        "Workflow config is invalid",
+      );
+    }
+
+    expect(() =>
+      parseServiceConfig({ ...base, hermes_acp: { source_profile: "bad profile" } }, "/repo/WORKFLOW.md", {
+        LINEAR_API_KEY: "secret",
+      }),
+    ).toThrow("hermes_acp.source_profile must be a valid host Hermes profile name");
+    expect(() =>
+      parseServiceConfig({ ...base, hermes_acp: { profile_prefix: "../bad" } }, "/repo/WORKFLOW.md", {
+        LINEAR_API_KEY: "secret",
+      }),
+    ).toThrow("hermes_acp.profile_prefix must be a valid host Hermes profile name");
   });
 
   it("parses the canonical workflow with current Hermes dogfood defaults", async () => {

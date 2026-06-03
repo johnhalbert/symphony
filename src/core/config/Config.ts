@@ -224,6 +224,20 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    hermes_acp: z
+      .object({
+        binary_path: z.string().optional(),
+        source_profile: z.string().optional(),
+        profile_prefix: z.string().optional(),
+        profile_name_prefix: z.string().optional(),
+        worker_session_lifecycle: z.enum(["fresh_per_run", "reuse_by_issue"]).optional(),
+        keep_profiles: z.enum(["always", "failed", "never"]).optional(),
+        startup_timeout_ms: z.number().int().positive().optional(),
+        request_timeout_ms: z.number().int().positive().optional(),
+        permission_timeout_ms: z.number().int().positive().optional(),
+      })
+      .passthrough()
+      .optional(),
     server: z
       .object({
         port: z.number().int().min(0).optional(),
@@ -410,6 +424,17 @@ export interface HermesConfig {
   roleTemplates: HermesRoleTemplatesConfig;
 }
 
+export interface HermesAcpConfig {
+  binaryPath: string | null;
+  sourceProfile: string | null;
+  profilePrefix: string;
+  workerSessionLifecycle: HermesWorkerSessionLifecycle;
+  keepProfiles: HermesProfileRetention;
+  startupTimeoutMs: number;
+  requestTimeoutMs: number;
+  permissionTimeoutMs: number;
+}
+
 export interface ServerConfig {
   port: number | null;
   host: string;
@@ -537,6 +562,7 @@ export interface ServiceConfig {
   agent: AgentConfig;
   cursor: CursorConfig;
   hermes: HermesConfig;
+  hermesAcp: HermesAcpConfig;
   server: ServerConfig;
   writeback: WritebackConfig;
   github: GitHubConfig;
@@ -566,6 +592,12 @@ const DEFAULT_CURSOR_MODEL_PARAMS: CursorModelParameter[] = [
   { id: "reasoning", value: "extra-high" },
 ];
 const DEFAULT_GITHUB_APP_TOKEN_REFRESH_BUFFER_SECONDS = 300;
+const DEFAULT_HERMES_STARTUP_TIMEOUT_MS = 15_000;
+const DEFAULT_HERMES_REQUEST_TIMEOUT_MS = 120_000;
+const DEFAULT_HERMES_SHUTDOWN_GRACE_MS = 2_000;
+const DEFAULT_HERMES_WORKER_SESSION_LIFECYCLE: HermesWorkerSessionLifecycle = "reuse_by_issue";
+const DEFAULT_HERMES_PROFILE_RETENTION: HermesProfileRetention = "failed";
+const DEFAULT_HERMES_ACP_PROFILE_PREFIX = "symphony";
 const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
   "Break down {{ issue.identifier }} before implementation.",
   "",
@@ -701,14 +733,29 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     raw.hermes?.state_dir === undefined
       ? path.join(workspaceStateDir, "hermes")
       : resolvePathValue(raw.hermes.state_dir, workflowDir, env);
-  const hermesAcpBinaryPath = normalizeOptionalConfigString(
+  const legacyHermesAcpBinaryPath = normalizeOptionalConfigString(
     resolveConfigString(raw.hermes?.acp_binary_path ?? raw.hermes?.binary_path, env),
   );
-  const hermesAcpSourceProfile = normalizeOptionalConfigString(
+  const legacyHermesAcpSourceProfile = normalizeOptionalConfigString(
     resolveConfigString(raw.hermes?.acp_source_profile ?? raw.hermes?.source_profile, env),
   );
-  const hermesAcpProfilePrefix = normalizeOptionalConfigString(
+  const legacyHermesAcpProfilePrefix = normalizeOptionalConfigString(
     resolveConfigString(raw.hermes?.acp_profile_prefix ?? raw.hermes?.profile_name_prefix, env),
+  );
+  const hermesAcpBinaryPath = normalizeOptionalConfigString(
+    resolveConfigString(raw.hermes_acp?.binary_path, env),
+  ) ?? legacyHermesAcpBinaryPath;
+  const hermesAcpSourceProfile = normalizeHermesAcpOptionalProfileName(
+    normalizeOptionalConfigString(resolveConfigString(raw.hermes_acp?.source_profile, env)) ?? legacyHermesAcpSourceProfile,
+    "hermes_acp.source_profile",
+  );
+  const hermesAcpProfilePrefix = normalizeHermesAcpProfileName(
+    normalizeOptionalConfigString(
+      resolveConfigString(raw.hermes_acp?.profile_prefix ?? raw.hermes_acp?.profile_name_prefix, env),
+    ) ??
+      legacyHermesAcpProfilePrefix ??
+      DEFAULT_HERMES_ACP_PROFILE_PREFIX,
+    "hermes_acp.profile_prefix",
   );
   const hermesAuthManagedRoot =
     raw.hermes?.auth?.managed_root === undefined
@@ -725,6 +772,16 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const hermesPython = normalizeOptionalConfigString(resolveConfigString(raw.hermes?.python, env));
   const hermesModel = normalizeOptionalConfigString(resolveConfigString(raw.hermes?.model, env));
   const hermesProvider = normalizeOptionalConfigString(resolveConfigString(raw.hermes?.provider, env));
+  const hermesWorkerSessionLifecycle = raw.hermes?.worker_session_lifecycle ?? DEFAULT_HERMES_WORKER_SESSION_LIFECYCLE;
+  const hermesKeepProfiles = raw.hermes?.keep_profiles ?? DEFAULT_HERMES_PROFILE_RETENTION;
+  const hermesStartupTimeoutMs = raw.hermes?.startup_timeout_ms ?? DEFAULT_HERMES_STARTUP_TIMEOUT_MS;
+  const hermesRequestTimeoutMs = raw.hermes?.request_timeout_ms ?? DEFAULT_HERMES_REQUEST_TIMEOUT_MS;
+  const hermesShutdownGraceMs = raw.hermes?.shutdown_grace_ms ?? DEFAULT_HERMES_SHUTDOWN_GRACE_MS;
+  const hermesAcpWorkerSessionLifecycle = raw.hermes_acp?.worker_session_lifecycle ?? hermesWorkerSessionLifecycle;
+  const hermesAcpKeepProfiles = raw.hermes_acp?.keep_profiles ?? hermesKeepProfiles;
+  const hermesAcpStartupTimeoutMs = raw.hermes_acp?.startup_timeout_ms ?? hermesStartupTimeoutMs;
+  const hermesAcpRequestTimeoutMs = raw.hermes_acp?.request_timeout_ms ?? hermesRequestTimeoutMs;
+  const hermesAcpPermissionTimeoutMs = raw.hermes_acp?.permission_timeout_ms ?? hermesAcpRequestTimeoutMs;
   const cursorRuntimeApiKey = normalizeOptionalConfigString(resolveConfigString("$CURSOR_API_KEY", env));
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
@@ -828,9 +885,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       python: hermesPython,
       templatesDir: hermesTemplatesDir,
       stateDir: hermesStateDir,
-      acpBinaryPath: hermesAcpBinaryPath,
-      acpSourceProfile: hermesAcpSourceProfile,
-      acpProfilePrefix: hermesAcpProfilePrefix,
+      acpBinaryPath: legacyHermesAcpBinaryPath,
+      acpSourceProfile: legacyHermesAcpSourceProfile,
+      acpProfilePrefix: legacyHermesAcpProfilePrefix,
       auth: {
         mode: raw.hermes?.auth?.mode ?? "managed_root",
         managedRoot: hermesAuthManagedRoot,
@@ -840,17 +897,27 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       runtimeCredentialEnv: hermesRuntimeCredentialEnv,
       model: hermesModel,
       provider: hermesProvider,
-      workerSessionLifecycle: raw.hermes?.worker_session_lifecycle ?? "reuse_by_issue",
-      keepProfiles: raw.hermes?.keep_profiles ?? "failed",
-      startupTimeoutMs: raw.hermes?.startup_timeout_ms ?? 15_000,
-      requestTimeoutMs: raw.hermes?.request_timeout_ms ?? 120_000,
-      shutdownGraceMs: raw.hermes?.shutdown_grace_ms ?? 2_000,
+      workerSessionLifecycle: hermesWorkerSessionLifecycle,
+      keepProfiles: hermesKeepProfiles,
+      startupTimeoutMs: hermesStartupTimeoutMs,
+      requestTimeoutMs: hermesRequestTimeoutMs,
+      shutdownGraceMs: hermesShutdownGraceMs,
       roleTemplates: {
         worker: raw.hermes?.role_templates?.worker ?? "worker",
         reviewer: raw.hermes?.role_templates?.reviewer ?? "reviewer",
         planner: raw.hermes?.role_templates?.planner ?? "planner",
         mergeConflictResolution: raw.hermes?.role_templates?.merge_conflict_resolution ?? "worker",
       },
+    },
+    hermesAcp: {
+      binaryPath: hermesAcpBinaryPath,
+      sourceProfile: hermesAcpSourceProfile,
+      profilePrefix: hermesAcpProfilePrefix,
+      workerSessionLifecycle: hermesAcpWorkerSessionLifecycle,
+      keepProfiles: hermesAcpKeepProfiles,
+      startupTimeoutMs: hermesAcpStartupTimeoutMs,
+      requestTimeoutMs: hermesAcpRequestTimeoutMs,
+      permissionTimeoutMs: hermesAcpPermissionTimeoutMs,
     },
     server: {
       port: raw.server?.port ?? null,
@@ -1053,6 +1120,20 @@ function normalizePromptExtensions(input: string[] | undefined): string[] {
 function normalizeOptionalConfigString(value: string | undefined): string | null {
   const trimmed = value?.trim() ?? "";
   return trimmed.length === 0 ? null : trimmed;
+}
+
+function normalizeHermesAcpOptionalProfileName(value: string | null, configPath: string): string | null {
+  if (value === null) return null;
+  return normalizeHermesAcpProfileName(value, configPath);
+}
+
+function normalizeHermesAcpProfileName(value: string, configPath: string): string {
+  const trimmed = value.trim();
+  if (/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(trimmed)) return trimmed;
+  throw new SymphonyError(
+    "config_validation_error",
+    `${configPath} must be a valid host Hermes profile name using 1-64 letters, numbers, underscores, or dashes, starting with a letter or number`,
+  );
 }
 
 function normalizeHermesAuthProviders(providers: string[] | undefined): string[] {

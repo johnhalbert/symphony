@@ -83,8 +83,8 @@ const program = new Command()
     "Run an opt-in live smoke for host Hermes ACP without touching Linear, GitHub, tracked files, or vendored Hermes auth state",
   )
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
-  .option("--binary-path <path>", "explicit host Hermes executable to use instead of hermes.acp_binary_path or PATH")
-  .option("--source-profile <name>", "host Hermes source profile to clone instead of hermes.acp_source_profile or the active profile")
+  .option("--binary-path <path>", "explicit host Hermes executable to use instead of hermes_acp.binary_path or PATH")
+  .option("--source-profile <name>", "host Hermes source profile to clone instead of hermes_acp.source_profile or the active profile")
   .option("--profile-name <name>", "explicit disposable smoke profile name; must not already exist")
   .option("--profile-prefix <prefix>", "prefix for generated disposable smoke profile names", DEFAULT_PROFILE_PREFIX)
   .option("--expect <text>", "text that must appear in the ACP prompt response", DEFAULT_EXPECTED_TEXT)
@@ -219,8 +219,8 @@ export async function resolveHermesAcpSmokeHostSettings(
   timeoutMs: number,
   rawOptions: Pick<RawOptions, "binaryPath" | "sourceProfile">,
 ): Promise<HermesAcpSmokeHostSettings> {
-  const configuredBinary = nonEmptyString(rawOptions.binaryPath) ?? rawHermesString(config, ["acp_binary_path", "binary_path"]);
-  const configuredSource = nonEmptyString(rawOptions.sourceProfile) ?? rawHermesString(config, ["acp_source_profile", "source_profile"]);
+  const configuredBinary = nonEmptyString(rawOptions.binaryPath) ?? config.hermesAcp.binaryPath;
+  const configuredSource = nonEmptyString(rawOptions.sourceProfile) ?? config.hermesAcp.sourceProfile;
   const discovery = await discoverHostHermes({
     ...(configuredBinary === null ? {} : { binaryPath: configuredBinary }),
     ...(configuredSource === null ? {} : { sourceProfile: configuredSource }),
@@ -438,21 +438,12 @@ export async function probeActiveHostHermesProfile(
 function smokeProfileName(config: ServiceConfig, rawOptions: RawOptions, sourceProfile: string): string {
   const configured = nonEmptyString(rawOptions.profileName);
   const profileName = configured ?? buildHermesAcpSmokeProfileName({
-    prefix: nonEmptyString(rawOptions.profilePrefix) ?? rawHermesString(config, ["acp_profile_prefix", "profile_name_prefix"]) ?? DEFAULT_PROFILE_PREFIX,
+    prefix: nonEmptyString(rawOptions.profilePrefix) ?? config.hermesAcp.profilePrefix,
   });
   if (profileName.toLowerCase() === sourceProfile.toLowerCase()) {
     throw new Error("Refusing to use the source profile as the disposable Hermes ACP smoke profile.");
   }
   return normalizeHostHermesAcpProfileName(profileName);
-}
-
-function rawHermesString(config: ServiceConfig, keys: readonly string[]): string | null {
-  const rawHermes = isRecord(config.raw.hermes) ? config.raw.hermes : {};
-  for (const key of keys) {
-    const value = nonEmptyString(rawHermes[key]);
-    if (value) return value;
-  }
-  return null;
 }
 
 function selectNonTerminalAuthMethod(initializeResult: Record<string, unknown>): { id: string; label: string } {

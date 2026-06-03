@@ -304,7 +304,7 @@ type HermesAcpRuntimeEvent =
     };
 
 const TERMINAL_SETUP_AUTH_METHOD_ID = "hermes-setup";
-const DEFAULT_PROFILE_PREFIX = "symphony";
+const RUN_CANCELLED = Symbol("hermes_acp_run_cancelled");
 const PERMISSION_ABORTED = Symbol("hermes_acp_permission_aborted");
 
 interface HermesAcpPermissionAbort {
@@ -526,7 +526,7 @@ export class HermesAcpHarness implements AgentHarness {
         .request<Record<string, unknown> | null>(
           "session/prompt",
           { sessionId: acpSessionId, prompt: [{ type: "text", text: prompt }] },
-          { timeoutMs: ctx.config.hermes.requestTimeoutMs },
+          { timeoutMs: ctx.config.hermesAcp.requestTimeoutMs },
         )
         .then((result) => {
           if (terminalStatus !== null) return;
@@ -635,7 +635,7 @@ export class HermesAcpHarness implements AgentHarness {
               symphonySessionId: activeRun.symphonySessionId,
             }),
           ),
-          this.options.permissionRequestTimeoutMs ?? ctx.config.hermes.requestTimeoutMs,
+          this.options.permissionRequestTimeoutMs ?? ctx.config.hermesAcp.permissionTimeoutMs,
           "ACP permission resolver timed out",
         ),
       );
@@ -772,9 +772,9 @@ export class HermesAcpHarness implements AgentHarness {
     const profile = await this.profileLeaseFactory({
       binaryPath,
       cwd: ctx.workspace.path,
-      timeoutMs: ctx.config.hermes.startupTimeoutMs,
+      timeoutMs: ctx.config.hermesAcp.startupTimeoutMs,
       sourceProfile,
-      keepProfiles: ctx.config.hermes.keepProfiles,
+      keepProfiles: ctx.config.hermesAcp.keepProfiles,
       reusable,
       nameInput: {
         workspaceKey: ctx.workspace.workspaceKey,
@@ -783,10 +783,10 @@ export class HermesAcpHarness implements AgentHarness {
         phase,
         attempt: ctx.attempt,
         runId: reusable ? null : runId,
-        prefix: configuredHermesAcpProfilePrefix(ctx) ?? DEFAULT_PROFILE_PREFIX,
+        prefix: configuredHermesAcpProfilePrefix(ctx),
       },
     });
-    const client = this.acpClientFactory(profile.acpCommand, { requestTimeoutMs: ctx.config.hermes.requestTimeoutMs });
+    const client = this.acpClientFactory(profile.acpCommand, { requestTimeoutMs: ctx.config.hermesAcp.requestTimeoutMs });
     const lease: HermesAcpLease = {
       key,
       scopeKey,
@@ -823,7 +823,7 @@ export class HermesAcpHarness implements AgentHarness {
     const discovery = await this.discoverHostHermes({
       cwd: ctx.workspace.path,
       sourceProfile: configuredHostHermesSourceProfile(ctx),
-      timeoutMs: ctx.config.hermes.startupTimeoutMs,
+      timeoutMs: ctx.config.hermesAcp.startupTimeoutMs,
     });
     if (discovery.binary?.path && discovery.diagnostics.every((diagnostic) => diagnostic.severity !== "error")) {
       return discovery.binary.path;
@@ -837,7 +837,7 @@ export class HermesAcpHarness implements AgentHarness {
     const discovery = await this.discoverHostHermes({
       binaryPath,
       cwd: ctx.workspace.path,
-      timeoutMs: ctx.config.hermes.startupTimeoutMs,
+      timeoutMs: ctx.config.hermesAcp.startupTimeoutMs,
     });
     if (discovery.sourceProfile?.name && discovery.diagnostics.every((diagnostic) => diagnostic.severity !== "error")) {
       return discovery.sourceProfile.name;
@@ -854,7 +854,7 @@ export class HermesAcpHarness implements AgentHarness {
         clientCapabilities: {},
         clientInfo: { name: "symphony", title: "Symphony", version: "0.1.0" },
       },
-      { timeoutMs: ctx.config.hermes.startupTimeoutMs },
+      { timeoutMs: ctx.config.hermesAcp.startupTimeoutMs },
     );
     const method = selectNonTerminalAuthMethod(initializeResult, {
       expectedProvider: ctx.config.hermes.provider,
@@ -865,7 +865,7 @@ export class HermesAcpHarness implements AgentHarness {
       authenticateResult = await lease.client.request<unknown>(
         "authenticate",
         { methodId: method.id },
-        { timeoutMs: ctx.config.hermes.startupTimeoutMs },
+        { timeoutMs: ctx.config.hermesAcp.startupTimeoutMs },
       );
     } catch (error) {
       throw new SymphonyError(
@@ -885,7 +885,7 @@ export class HermesAcpHarness implements AgentHarness {
         cwd: ctx.workspace.path,
         mcpServers: mcpServersToAcpStdioServers(symphonyRoleMcpServers(ctx, { cliPath: this.cliPath(), mcpCwd: ctx.workspace.path })),
       },
-      { timeoutMs: ctx.config.hermes.startupTimeoutMs },
+      { timeoutMs: ctx.config.hermesAcp.startupTimeoutMs },
     );
     const sessionId = nonEmptyString(response.sessionId) ?? nonEmptyString(response.session_id);
     if (!sessionId) throw new SymphonyError("agent_error", "Host Hermes ACP session/new did not return a sessionId.");
@@ -1296,7 +1296,7 @@ function hermesAcpLeaseReusePolicy(ctx: AgentRunContext): { reusable: boolean; r
   const phase = currentRunPhase(ctx);
   if (ctx.role !== "worker") return { reusable: false, reason: "fresh_isolated_role" };
   if (phase !== "implementation") return { reusable: false, reason: "fresh_non_implementation_phase" };
-  if (ctx.config.hermes.workerSessionLifecycle !== "reuse_by_issue") {
+  if (ctx.config.hermesAcp.workerSessionLifecycle !== "reuse_by_issue") {
     return { reusable: false, reason: "fresh_worker_session_lifecycle" };
   }
   return { reusable: true, reason: "fresh_no_existing_reusable_lease" };
@@ -1318,10 +1318,10 @@ function hermesAcpLeaseCompatibility(
     binaryPath: input.binaryPath,
     cwd: ctx.workspace.path,
     sourceProfile: input.sourceProfile,
-    profilePrefix: configuredHermesAcpProfilePrefix(ctx) ?? DEFAULT_PROFILE_PREFIX,
-    keepProfiles: ctx.config.hermes.keepProfiles,
-    startupTimeoutMs: ctx.config.hermes.startupTimeoutMs,
-    requestTimeoutMs: ctx.config.hermes.requestTimeoutMs,
+    profilePrefix: configuredHermesAcpProfilePrefix(ctx),
+    keepProfiles: ctx.config.hermesAcp.keepProfiles,
+    startupTimeoutMs: ctx.config.hermesAcp.startupTimeoutMs,
+    requestTimeoutMs: ctx.config.hermesAcp.requestTimeoutMs,
     cliPath: input.cliPath,
   };
 }
@@ -1377,7 +1377,7 @@ function formatHermesAcpLeaseReuseReason(reason: HermesAcpLeaseReuseDecisionReas
     case "compatible_reusable_worker_implementation":
       return "existing worker implementation context is compatible";
     case "fresh_worker_session_lifecycle":
-      return "hermes.worker_session_lifecycle requires a fresh run";
+      return "hermes_acp.worker_session_lifecycle requires a fresh run";
     case "fresh_isolated_role":
       return "role requires an isolated fresh lease";
     case "fresh_non_implementation_phase":
@@ -1398,22 +1398,15 @@ function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
 }
 
 function configuredHostHermesBinaryPath(ctx: AgentRunContext): string | null {
-  const rawHermes = rawHermesConfig(ctx);
-  return nonEmptyString(rawHermes.acp_binary_path) ?? nonEmptyString(rawHermes.binary_path);
+  return ctx.config.hermesAcp.binaryPath;
 }
 
 function configuredHostHermesSourceProfile(ctx: AgentRunContext): string | null {
-  const rawHermes = rawHermesConfig(ctx);
-  return nonEmptyString(rawHermes.acp_source_profile) ?? nonEmptyString(rawHermes.source_profile);
+  return ctx.config.hermesAcp.sourceProfile;
 }
 
-function configuredHermesAcpProfilePrefix(ctx: AgentRunContext): string | null {
-  const rawHermes = rawHermesConfig(ctx);
-  return nonEmptyString(rawHermes.acp_profile_prefix) ?? nonEmptyString(rawHermes.profile_name_prefix);
-}
-
-function rawHermesConfig(ctx: AgentRunContext): Record<string, unknown> {
-  return isRecord(ctx.config.raw.hermes) ? (ctx.config.raw.hermes as Record<string, unknown>) : {};
+function configuredHermesAcpProfilePrefix(ctx: AgentRunContext): string {
+  return ctx.config.hermesAcp.profilePrefix;
 }
 
 function hostHermesDiscoveryErrorMessage(discovery: HostHermesDiscoveryResult): string {

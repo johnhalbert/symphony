@@ -318,21 +318,21 @@ export function hermesRuntimeDoctorChecks(config: ServiceConfig): DoctorCheck[] 
 }
 
 export function hermesAcpRuntimeDoctorChecks(config: ServiceConfig): DoctorCheck[] {
-  const binary = config.hermes.acpBinaryPath ?? "hermes (PATH)";
-  const sourceProfile = config.hermes.acpSourceProfile ?? "active host Hermes profile";
-  const prefix = config.hermes.acpProfilePrefix ?? "symphony";
+  const binary = config.hermesAcp.binaryPath ?? "hermes (PATH)";
+  const sourceProfile = config.hermesAcp.sourceProfile ?? "active host Hermes profile";
+  const prefix = config.hermesAcp.profilePrefix;
   return [
     {
       id: "hermes_acp.runtime",
       status: "ok",
-      message: `Hermes ACP uses host Hermes binary ${binary}; source profile is ${sourceProfile}`,
+      message: `Hermes ACP uses host Hermes binary ${binary}; source profile is ${sourceProfile}; host installation/profile store are used without Symphony-managed HERMES_HOME or HERMES_AUTH_HOME overrides`,
     },
     {
       id: "hermes_acp.profiles",
       status: "ok",
       message:
-        `ACP managed profile prefix is ${prefix}; worker lifecycle is ${config.hermes.workerSessionLifecycle}; ` +
-        `profile retention is ${config.hermes.keepProfiles}`,
+        `ACP managed profile prefix is ${prefix}; worker lifecycle is ${config.hermesAcp.workerSessionLifecycle}; ` +
+        `profile retention is ${config.hermesAcp.keepProfiles}`,
     },
   ];
 }
@@ -377,11 +377,11 @@ export async function hostHermesAcpDoctorChecks(
   options: Pick<RuntimeHarnessDependencyDoctorCheckOptions, "hostHermesCommandRunner"> = {},
 ): Promise<DoctorCheck[]> {
   const cwd = config.workspace.root;
-  const timeoutMs = config.hermes.startupTimeoutMs;
+  const timeoutMs = config.hermesAcp.startupTimeoutMs;
   const env = hostHermesCommandEnvironment(process.env);
   const discovery = await discoverHostHermes({
-    binaryPath: config.hermes.acpBinaryPath,
-    sourceProfile: config.hermes.acpSourceProfile,
+    binaryPath: config.hermesAcp.binaryPath,
+    sourceProfile: config.hermesAcp.sourceProfile,
     cwd,
     env,
     timeoutMs,
