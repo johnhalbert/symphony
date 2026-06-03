@@ -1122,6 +1122,84 @@ Work on {{ issue.identifier }}.
     expect(hermesConfig.hermes.auth.bootstrapFrom.replace(/\\/g, "/")).toMatch(/\/repo\/local-hermes-auth$/);
   });
 
+  it("keeps hermes_acp config isolated from Hermes TUI runtime config", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        agent: { harness: "hermes" },
+        hermes: {
+          upstream_root: "$HERMES_TUI_UPSTREAM",
+          templates_dir: "hermes-tui-templates",
+          state_dir: "$HERMES_TUI_STATE",
+          python: "python-tui",
+          provider: "openai-codex",
+          model: "gpt-5.5-tui",
+          worker_session_lifecycle: "reuse_by_issue",
+          keep_profiles: "failed",
+          startup_timeout_ms: 22_000,
+          request_timeout_ms: 33_000,
+          auth: {
+            managed_root: "$HERMES_TUI_AUTH_ROOT",
+            bootstrap_from: "local-hermes-auth",
+            providers: ["openai-codex"],
+          },
+        },
+        hermes_acp: {
+          binary_path: "$HOST_HERMES_BINARY",
+          source_profile: "$HOST_HERMES_SOURCE_PROFILE",
+          profile_prefix: "host-acp",
+          worker_session_lifecycle: "fresh_per_run",
+          keep_profiles: "always",
+          startup_timeout_ms: 5_000,
+          request_timeout_ms: 6_000,
+          permission_timeout_ms: 7_000,
+        },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "secret",
+        HERMES_TUI_UPSTREAM: "/srv/symphony/hermes-upstream",
+        HERMES_TUI_STATE: "/srv/symphony/hermes-tui-state",
+        HERMES_TUI_AUTH_ROOT: "/srv/symphony/hermes-tui-auth",
+        HOST_HERMES_BINARY: "/opt/host-hermes/bin/hermes",
+        HOST_HERMES_SOURCE_PROFILE: "dogfood-host",
+      },
+    );
+
+    expect(config.agent.harness).toBe("hermes");
+    expect(config.hermes).toMatchObject({
+      python: "python-tui",
+      provider: "openai-codex",
+      model: "gpt-5.5-tui",
+      workerSessionLifecycle: "reuse_by_issue",
+      keepProfiles: "failed",
+      startupTimeoutMs: 22_000,
+      requestTimeoutMs: 33_000,
+      acpBinaryPath: null,
+      acpSourceProfile: null,
+      acpProfilePrefix: null,
+      auth: {
+        mode: "managed_root",
+        providers: ["openai-codex"],
+      },
+    });
+    expect(config.hermes.upstreamRoot.replace(/\\/g, "/")).toMatch(/\/srv\/symphony\/hermes-upstream$/);
+    expect(config.hermes.templatesDir.replace(/\\/g, "/")).toMatch(/\/repo\/hermes-tui-templates$/);
+    expect(config.hermes.stateDir.replace(/\\/g, "/")).toMatch(/\/srv\/symphony\/hermes-tui-state$/);
+    expect(config.hermes.auth.managedRoot.replace(/\\/g, "/")).toMatch(/\/srv\/symphony\/hermes-tui-auth$/);
+    expect(config.hermes.auth.bootstrapFrom.replace(/\\/g, "/")).toMatch(/\/repo\/local-hermes-auth$/);
+    expect(config.hermesAcp).toEqual({
+      binaryPath: "/opt/host-hermes/bin/hermes",
+      sourceProfile: "dogfood-host",
+      profilePrefix: "host-acp",
+      workerSessionLifecycle: "fresh_per_run",
+      keepProfiles: "always",
+      startupTimeoutMs: 5_000,
+      requestTimeoutMs: 6_000,
+      permissionTimeoutMs: 7_000,
+    });
+  });
+
   it("parses hermes_acp host harness defaults, overrides, and legacy compatibility aliases", () => {
     const config = parseServiceConfig(
       {
