@@ -1,5 +1,6 @@
 import type { RedactedPreview } from "../transcript/TranscriptProjection.js";
 import { isSensitivePreviewKey, sanitizedPreviewValue } from "../transcript/TranscriptProjection.js";
+import { inspectPersistedGitConfigForUnsafeEntries } from "./AgentCommandPolicyGitConfig.js";
 
 const DEFAULT_POLICY_PREVIEW_LENGTH = 500;
 const MAX_POLICY_PREVIEW_REDACTION_DEPTH = 8;
@@ -328,6 +329,7 @@ export interface AgentCommandPolicyAuditPayload {
   readonly commandClass: AgentCommandPolicyCommandClass;
   readonly inlineEnvironmentKeys: readonly string[];
   readonly unsafeConfigCategories: readonly AgentCommandPolicyUnsafeGitConfigCategory[];
+  readonly unsafeConfigFindings?: readonly AgentCommandPolicyUnsafeGitConfigFinding[] | undefined;
   readonly upstreamContactAttempted: boolean;
   readonly outcome?: AgentCommandPolicyOutcome | undefined;
   readonly reasonKind?: AgentCommandPolicyReasonKind | undefined;
@@ -1677,19 +1679,22 @@ function classifyGitCommand(
   }
 
   if (LOCAL_INSPECTION_GIT_SUBCOMMANDS.has(gitSubcommand)) {
-    const unsafeConfigCategories = localGitInspectionUnsafeConfigCategories(
+    const unsafeConfigEvidence = localGitInspectionUnsafeConfigEvidence(
       input,
       tokens,
       gitSubcommandDetails.index,
       command,
     );
-    if (unsafeConfigCategories.length > 0) {
+    if (unsafeConfigEvidence.categories.length > 0) {
       return denyDecision(
         input,
         {
           ...gitAudit,
           commandClass: "git_local_inspection_with_helper",
-          unsafeConfigCategories,
+          unsafeConfigCategories: unsafeConfigEvidence.categories,
+          ...(unsafeConfigEvidence.findings.length === 0
+            ? {}
+            : { unsafeConfigFindings: unsafeConfigEvidence.findings }),
           upstreamContactAttempted: false,
         },
         "unsafe_git_config",
@@ -2082,13 +2087,19 @@ function isShellControlOperator(token: string): boolean {
   return token === ";" || token === "|" || token === "&" || token === "&&" || token === "||";
 }
 
-function localGitInspectionUnsafeConfigCategories(
+interface LocalGitInspectionUnsafeConfigEvidence {
+  readonly categories: readonly AgentCommandPolicyUnsafeGitConfigCategory[];
+  readonly findings: readonly AgentCommandPolicyUnsafeGitConfigFinding[];
+}
+
+function localGitInspectionUnsafeConfigEvidence(
   input: AgentCommandPolicyInput,
   tokens: readonly string[],
   gitSubcommandIndex: number,
   command: string,
-): AgentCommandPolicyUnsafeGitConfigCategory[] {
+): LocalGitInspectionUnsafeConfigEvidence {
   const categories = new Set<AgentCommandPolicyUnsafeGitConfigCategory>();
+  const findings: AgentCommandPolicyUnsafeGitConfigFinding[] = [];
 
   if (containsInlineUnsafeLocalGitOption(command)) categories.add("external_diff");
 
@@ -2129,7 +2140,29 @@ function localGitInspectionUnsafeConfigCategories(
     }
   }
 
-  return sortedUniqueKeys(categories) as AgentCommandPolicyUnsafeGitConfigCategory[];
+  try {
+    for (const finding of inspectPersistedGitConfigForUnsafeEntries({
+      workingDirectory: input.workingDirectory,
+      environment: input.environment,
+    })) {
+      categories.add(finding.category);
+      findings.push(finding);
+    }
+  } catch {
+    const finding: AgentCommandPolicyUnsafeGitConfigFinding = {
+      source: "unknown",
+      key: "<persisted_git_config_inspection_error>",
+      category: "other",
+      effect: "ambiguous",
+    };
+    categories.add(finding.category);
+    findings.push(finding);
+  }
+
+  return {
+    categories: sortedUniqueKeys(categories) as AgentCommandPolicyUnsafeGitConfigCategory[],
+    findings,
+  };
 }
 
 interface GitConfigEnvironmentEntry {
