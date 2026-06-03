@@ -14,7 +14,9 @@ import { DataSourceProvider } from "../src/data/dataSourceContext";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
 import {
   LIVE_RESOURCE_KEYS,
+  applyRealtimeEventToLiveResourceRevisions,
   combineLiveResourceTokens,
+  createLiveResourceRevisionMap,
   createLiveResourceTokenMap,
   liveResourceKeysForRealtimeEvent,
   realtimeRefreshHrefsForEvent,
@@ -143,6 +145,24 @@ describe("live resource realtime mapping", () => {
     expect(liveResourceKeysForRealtimeEvent(event)).toEqual(["history", "sessionTranscript"]);
   });
 
+  it("maps projection.updated payload resource changes that are not listed as concrete resource hrefs", () => {
+    const event = eventFor(
+      [{ kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" }],
+      {
+        payload: {
+          source: "orchestrator-chat",
+          sourceRevision: 3,
+          detail: null,
+          resourceKinds: ["dashboard"],
+          resourcesChanged: ["orchestrator-chat"],
+        },
+      },
+    );
+
+    expect(liveResourceKeysForRealtimeEvent(event)).toEqual(["dashboard", "orchestratorChat"]);
+    expect(realtimeRefreshHrefsForEvent(event)).toEqual(["/api/v1/web/dashboard", "/api/v1/web/orchestrator-chat"]);
+  });
+
   it("falls back to all live resources when a missed-events recovery has no resource hints", () => {
     const event = eventFor([], {
       missedEvents: true,
@@ -161,6 +181,41 @@ describe("live resource realtime mapping", () => {
     ]);
   });
 
+  it("records per-resource realtime revisions and returns only resources with newer updates", () => {
+    const revisions = createLiveResourceRevisionMap();
+    const first = eventFor(
+      [
+        { kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" },
+        { kind: "issue-board", href: "/api/v1/web/issues", relation: "refetch" },
+      ],
+      { id: "rev-7", revision: 7 },
+    );
+
+    expect(applyRealtimeEventToLiveResourceRevisions(revisions, first)).toEqual(["dashboard", "issueBoard"]);
+    expect(revisions.dashboard).toBe(7);
+    expect(revisions.issueBoard).toBe(7);
+
+    const mixed = eventFor(
+      [
+        { kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" },
+        { kind: "sidebar", href: "/api/v1/web/sidebar", relation: "refetch" },
+      ],
+      { id: "rev-6", revision: 6 },
+    );
+    expect(applyRealtimeEventToLiveResourceRevisions(revisions, mixed)).toEqual(["sidebar"]);
+    expect(revisions.dashboard).toBe(7);
+    expect(revisions.sidebar).toBe(6);
+
+    const missedRecovery = eventFor([], {
+      id: "rev-5-missed",
+      revision: 5,
+      missedEvents: true,
+      recovery: { strategy: "refetch", reason: "missed-events", lastEventId: "rev-4", endpoints: [] },
+    });
+    expect(applyRealtimeEventToLiveResourceRevisions(revisions, missedRecovery)).toEqual([...LIVE_RESOURCE_KEYS]);
+    expect(revisions.dashboard).toBe(7);
+  });
+
   it("combines resource counters for detail and transcript refresh dependencies", () => {
     const tokens = createLiveResourceTokenMap();
     tokens.issueBoard = 2;
@@ -172,7 +227,7 @@ describe("live resource realtime mapping", () => {
     expect(combineLiveResourceTokens(tokens, ["sessionTranscript", "history"])).toBe(12);
   });
 
-  it("ignores stale or duplicate realtime revisions before invalidating caches or refreshing selected transcript resources", () => {
+  it("ignores stale or duplicate realtime revisions per resource before invalidating caches or refreshing tokens", () => {
     let listener: RealtimeEventListener | null = null;
     const invalidateCachedReads = vi.fn();
     const dataSource = testDataSource({
@@ -200,6 +255,8 @@ describe("live resource realtime mapping", () => {
     expect(invalidateCachedReads).toHaveBeenCalledTimes(1);
     expect(probe.state().tokens.history).toBe(1);
     expect(probe.state().tokens.sessionTranscript).toBe(1);
+    expect(probe.state().revisions.history).toBe(5);
+    expect(probe.state().revisions.sessionTranscript).toBe(5);
 
     emit(
       eventFor(
@@ -210,14 +267,21 @@ describe("live resource realtime mapping", () => {
         { id: "rev-5-duplicate", revision: 5, type: "transcript.delta" },
       ),
     );
-    emit(eventFor([{ kind: "orchestrator-chat", href: "/api/v1/web/orchestrator-chat", relation: "refetch" }], { id: "rev-4", revision: 4 }));
     expect(invalidateCachedReads).toHaveBeenCalledTimes(1);
     expect(probe.state().tokens.history).toBe(1);
     expect(probe.state().tokens.sessionTranscript).toBe(1);
-    expect(probe.state().tokens.orchestratorChat).toBe(0);
+
+    emit(eventFor([{ kind: "orchestrator-chat", href: "/api/v1/web/orchestrator-chat", relation: "refetch" }], { id: "rev-4", revision: 4 }));
+    expect(invalidateCachedReads).toHaveBeenCalledTimes(2);
+    expect(probe.state().tokens.orchestratorChat).toBe(1);
+    expect(probe.state().revisions.orchestratorChat).toBe(4);
+
+    emit(eventFor([{ kind: "history", href: "/api/v1/web/history", relation: "refetch" }], { id: "rev-4-history", revision: 4 }));
+    expect(invalidateCachedReads).toHaveBeenCalledTimes(2);
+    expect(probe.state().tokens.history).toBe(1);
 
     emit(eventFor([{ kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" }], { id: "rev-6", revision: 6 }));
-    expect(invalidateCachedReads).toHaveBeenCalledTimes(2);
+    expect(invalidateCachedReads).toHaveBeenCalledTimes(3);
     expect(probe.state().tokens.dashboard).toBe(1);
 
     emit(
@@ -228,10 +292,11 @@ describe("live resource realtime mapping", () => {
         recovery: { strategy: "refetch", reason: "missed-events", lastEventId: "rev-3", endpoints: [] },
       }),
     );
-    expect(invalidateCachedReads).toHaveBeenCalledTimes(3);
+    expect(invalidateCachedReads).toHaveBeenCalledTimes(4);
     for (const key of LIVE_RESOURCE_KEYS) {
       expect(probe.state().tokens[key]).toBeGreaterThan(0);
     }
+    expect(probe.state().revisions.history).toBe(5);
   });
 
   it("uses the legacy projection subscription as a hook-level fallback refetch path when realtime is unavailable", () => {
