@@ -141,6 +141,46 @@ describe("FileRunTranscriptStore", () => {
     expect(page.nextOffset).toBeNull();
   });
 
+  it("does not backfill Cursor runtime fields onto explicit non-Cursor harness records", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await store.startRun({
+      runId: "run-hermes-acp-legacy-cursor",
+      sessionId: "session-hermes-acp",
+      agentId: "agent-hermes-acp",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      harnessId: "hermes_acp",
+      cursorModel: "cursor-model-should-not-leak",
+      cursorModelParams: [{ id: "reasoning", value: "high" }],
+      cursorSettingSources: ["cursor:settings"],
+      cursorMode: "plan",
+      cursorAllowLargeContext: true,
+      cursorWorkerAgentLifecycle: "fresh_per_run",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+
+    const run = await new FileRunTranscriptStore(root).getRun("run-hermes-acp-legacy-cursor");
+
+    expect(run).toMatchObject({
+      harnessId: "hermes_acp",
+      runtimeModel: null,
+      runtimeModelParams: [],
+      runtimeSettingSources: [],
+      runtimeMode: null,
+      cursorModel: "cursor-model-should-not-leak",
+      cursorModelParams: [{ id: "reasoning", value: "high" }],
+      cursorSettingSources: ["cursor:settings"],
+      cursorMode: "plan",
+    });
+    expect(run).not.toHaveProperty("runtimeAllowLargeContext");
+    expect(run).not.toHaveProperty("runtimeAgentLifecycle");
+  });
+
   it("reads bounded file-backed transcript tails without parsing the whole JSONL body", async () => {
     const store = new FileRunTranscriptStore(root);
     await store.startRun({

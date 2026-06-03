@@ -200,6 +200,71 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("persists default Hermes ACP runtime metadata and harness-provided ACP session identity without optional config", async () => {
+    const config = testConfig(root);
+    config.agent.harness = "hermes_acp";
+    config.hermes.provider = null;
+    config.hermes.model = "host-hermes-model";
+    config.hermesAcp.binaryPath = null;
+    config.hermesAcp.sourceProfile = null;
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness: AgentHarness & { runs: Array<{ ctx: AgentRunContext; prompt: string }> } = {
+      id: "hermes_acp",
+      capabilities: { continuation: true, mcpHandoff: true },
+      runs: [],
+      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+        this.runs.push({ ctx, prompt });
+        yield {
+          type: "session_started",
+          sessionId: "symphony-profile:acp-session-1:hermes-acp-run-1",
+          threadId: "acp-session-1",
+          runId: "hermes-acp-run-1",
+        };
+        yield { type: "completed", message: "hermes acp completed" };
+      },
+    };
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "Hermes ACP default dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "Hermes ACP default run completion");
+    await orchestrator.stop();
+
+    await expect(runStore.latestRunForIssue(candidate.id)).resolves.toMatchObject({
+      runId: "hermes-acp-run-1",
+      sessionId: "symphony-profile:acp-session-1:hermes-acp-run-1",
+      agentId: "acp-session-1",
+      harnessId: "hermes_acp",
+      runtimeModel: "host-hermes-model",
+      runtimeModelParams: [],
+      runtimeSettingSources: ["host_hermes:PATH:hermes", "source_profile:active", "profile_prefix:symphony"],
+      runtimeMode: null,
+      runtimeAgentLifecycle: "reuse_by_issue",
+    });
+  });
+
   it("persists harness-provided ACP RunActivityEvent metadata through the shared orchestrator transcript path", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });

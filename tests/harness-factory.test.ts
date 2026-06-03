@@ -23,6 +23,13 @@ describe("createAgentHarness", () => {
     const harness = createAgentHarness(config("hermes_acp"));
 
     expect(harness).toBeInstanceOf(HermesAcpHarness);
+    expect(harness.id).toBe("hermes_acp");
+    expect(harness.capabilities).toMatchObject({
+      continuation: true,
+      mcpHandoff: true,
+      runStatus: false,
+      liveDiagnostics: true,
+    });
     expect((harness as unknown as { options: { permissionResolver?: unknown } }).options.permissionResolver).toEqual(expect.any(Function));
     expect(createAgentHarness(config("hermes"))).toBeInstanceOf(HermesHarness);
   });

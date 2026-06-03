@@ -597,25 +597,34 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
     record.cursorSettingSources !== undefined
       ? "cursor"
       : undefined);
+  const shouldBackfillCursorRuntime = harnessId === "cursor";
   return {
     ...record,
     runPhase,
     runKind: record.runKind ?? runKindForPhase(runPhase),
     ...(harnessId === undefined ? {} : { harnessId }),
-    ...(record.runtimeModel !== undefined ? {} : { runtimeModel: record.cursorModel ?? null }),
-    ...(record.runtimeModelParams !== undefined ? {} : { runtimeModelParams: record.cursorModelParams ?? [] }),
-    ...(record.runtimeSettingSources !== undefined ? {} : { runtimeSettingSources: record.cursorSettingSources ?? [] }),
-    ...(record.runtimeMode !== undefined ? {} : { runtimeMode: record.cursorMode ?? null }),
+    ...(record.runtimeModel !== undefined
+      ? {}
+      : { runtimeModel: shouldBackfillCursorRuntime ? (record.cursorModel ?? null) : null }),
+    ...(record.runtimeModelParams !== undefined
+      ? {}
+      : { runtimeModelParams: shouldBackfillCursorRuntime ? (record.cursorModelParams ?? []) : [] }),
+    ...(record.runtimeSettingSources !== undefined
+      ? {}
+      : { runtimeSettingSources: shouldBackfillCursorRuntime ? (record.cursorSettingSources ?? []) : [] }),
+    ...(record.runtimeMode !== undefined
+      ? {}
+      : { runtimeMode: shouldBackfillCursorRuntime ? (record.cursorMode ?? null) : null }),
     ...(record.runtimeAllowLargeContext !== undefined
       ? {}
-      : record.cursorAllowLargeContext === undefined
-        ? {}
-        : { runtimeAllowLargeContext: record.cursorAllowLargeContext }),
+      : shouldBackfillCursorRuntime && record.cursorAllowLargeContext !== undefined
+        ? { runtimeAllowLargeContext: record.cursorAllowLargeContext }
+        : {}),
     ...(record.runtimeAgentLifecycle !== undefined
       ? {}
-      : record.cursorWorkerAgentLifecycle === undefined
-        ? {}
-        : { runtimeAgentLifecycle: record.cursorWorkerAgentLifecycle }),
+      : shouldBackfillCursorRuntime && record.cursorWorkerAgentLifecycle !== undefined
+        ? { runtimeAgentLifecycle: record.cursorWorkerAgentLifecycle }
+        : {}),
   };
 }
 
