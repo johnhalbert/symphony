@@ -352,6 +352,248 @@ describe("/api/v1/web route contracts", () => {
     ]);
   });
 
+  it("serves large-volume dashboard, issue board, history, sidebar, and transcript API payloads from durable projections without raw hydration or source-index rebuilds", async () => {
+    const issues = Array.from({ length: 360 }, (_, index) => {
+      const lane = index % 3 === 0 ? "todo" : index % 3 === 1 ? "progress" : "review";
+      return {
+        ...issueModelFixture(),
+        id: `ENG-${String(1000 + index)}`,
+        title: `Large durable issue ${index + 1}`,
+        status: lane,
+        priority: ((index % 4) + 1) as 1 | 2 | 3 | 4,
+        labels: ["durable-large", `team-${index % 12}`],
+        assignee: `Ada ${index % 9}`,
+        agent: `worker-${index % 5}`,
+        activity: Array.from({ length: 3 }, (_, activityIndex) => ({
+          id: `activity-${index}-${activityIndex}`,
+          verb: activityIndex === 0 ? "run_started" : activityIndex === 1 ? "commented" : "run_completed",
+          at: new Date(Date.UTC(2026, 4, 31, 0, index % 60, activityIndex)).toISOString(),
+          who: `agent-${index % 5}`,
+          extra: `large activity ${activityIndex}`,
+        })),
+      };
+    });
+    const historySessions = Array.from({ length: 100 }, (_, index) => ({
+      id: `session-large-${index + 1}`,
+      title: `Large durable session ${index + 1}`,
+      subtitle: `ENG-${1000 + index} · worker-${index % 5}`,
+      updatedAt: new Date(Date.UTC(2026, 4, 31, 2, index % 60, 0)).toISOString(),
+      msgCount: 500 + index,
+      lastEvent: `large event ${index + 1}`,
+      toolCount: index % 7,
+    }));
+    const historyTimeline = Array.from({ length: 250 }, (_, index) => ({
+      id: `timeline-large-${index + 1}`,
+      sessionId: historySessions[index % historySessions.length]?.id,
+      ts: new Date(Date.UTC(2026, 4, 31, 3, index % 60, index % 60)).toISOString(),
+      kind: index % 2 === 0 ? "assistant" : "tool",
+      text: `Large durable timeline item ${index + 1}`,
+    }));
+    const largeTranscript = Array.from({ length: 500 }, (_, index) => {
+      const sequence = 9_501 + index;
+      return {
+        kind: index % 5 === 0 ? ("tool" as const) : ("assistant" as const),
+        ts: new Date(Date.UTC(2026, 4, 31, 4, Math.floor(index / 60), index % 60)).toISOString(),
+        text: `Durable transcript tail event ${sequence}`,
+      };
+    });
+    const largeRun = runRecordFixture({
+      runId: "run-large-1",
+      sessionId: "session-large-1",
+      issueIdentifier: "ENG-1000",
+      workspaceKey: "ENG-1000",
+      transcriptEventCount: 10_000,
+    });
+    const runStore = new FailingTranscriptRunStore([largeRun]);
+    const sourceFreshness: ProjectionRevisionRecord["sourceFreshness"] = [
+      {
+        source: "trackerIssues",
+        status: "fresh",
+        checkedAt: "2026-01-01T00:00:00.000Z",
+        revision: "large-durable-issues",
+        lastSuccessAt: "2026-01-01T00:00:00.000Z",
+        lastErrorAt: null,
+        staleMs: null,
+        detail: "Large durable reader fixture is current",
+      },
+    ];
+    const largeSourceRevisions = [{ source: "runStore", revision: runStore.projectionRevision(), observedAt: null }];
+    const issueBoard = {
+      issues,
+      backlog: issues.filter((issue) => issue.status === "todo").slice(0, 60),
+      lanes: {
+        todo: issues.filter((issue) => issue.status === "todo"),
+        progress: issues.filter((issue) => issue.status === "progress"),
+        review: issues.filter((issue) => issue.status === "review"),
+      },
+      cycleLabel: "Large durable cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "ENG-1000",
+    };
+    const dashboard = {
+      projectName: "Large durable Symphony",
+      repoLabel: "durable/large-repo",
+      branch: "durable-large-branch",
+      workflowLabel: "durable workflow",
+      pollLabel: "large durable poll",
+      agentUsageLabel: "72 agents",
+      concurrencyCap: 72,
+      providerGates: [],
+      runningAgents: issues.slice(0, 72).map((issue, index) => ({ id: `agent-${index}`, issue: issue.id, status: "running" })),
+      activity: issues.flatMap((issue) => issue.activity).slice(0, 250),
+      chat: [],
+      totals: { ...emptyTotals(), todo: 120, progress: 120, review: 120, open: 360, all: 360, completeness: 33 },
+    };
+    const history = {
+      sessions: historySessions,
+      transcriptBySession: {},
+      timeline: historyTimeline,
+      defaultSessionId: "session-large-1",
+    };
+    const sidebar = {
+      providerGates: [],
+      runningAgents: dashboard.runningAgents.slice(0, 40),
+      reviewIssues: issueBoard.lanes.review.slice(0, 80),
+      activity: dashboard.activity.slice(0, 120),
+      sessions: history.sessions.slice(0, 50),
+      chat: [],
+      totals: dashboard.totals,
+    };
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+        dashboard,
+        { sourceRevisions: largeSourceRevisions, sourceCursors: { issueCount: issues.length, runningAgentCount: dashboard.runningAgents.length, activityCount: dashboard.activity.length }, sourceFreshness, revision: 11 },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        { sourceRevisions: largeSourceRevisions, sourceCursors: { issueCount: issues.length, laneCounts: { todo: 120, progress: 120, review: 120 } }, sourceFreshness, revision: 12 },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
+        history,
+        { sourceRevisions: largeSourceRevisions, sourceCursors: { sessionCount: history.sessions.length, timelineCount: history.timeline.length, totalRuns: issues.length }, revision: 13 },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+        sidebar,
+        { sourceRevisions: largeSourceRevisions, sourceCursors: { sessionCount: sidebar.sessions.length, reviewIssueCount: sidebar.reviewIssues.length, activityCount: sidebar.activity.length }, sourceFreshness, revision: 14 },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-large-1:offset:9500:limit:500" },
+        largeTranscript,
+        {
+          sourceRevisions: largeSourceRevisions,
+          sourceCursors: {
+            runId: "run-large-1",
+            sessionId: "session-large-1",
+            offset: 9_500,
+            limit: 500,
+            eventCount: largeTranscript.length,
+            nextOffset: null,
+            firstSequence: 9_501,
+            lastSequence: 10_000,
+          },
+          revision: 15,
+        },
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    let contextBuilds = 0;
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      projectionWriter,
+      runStore: runStore.asRunTranscriptStore(),
+      webProjectionContextBuilder: () => {
+        contextBuilds += 1;
+        throw new Error("large durable reader route must not rebuild the broad web projection source index");
+      },
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    const expectProjectionHeaders = (
+      response: Response,
+      expected: { name: DurableProjectionName; scopeKind: string; scopeKey: string; sourceCursors: Record<string, unknown> },
+    ) => {
+      expect(response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(response.headers.get("x-symphony-projection-cache")).toBe("hit");
+      expect(response.headers.get("x-symphony-projection-name")).toBe(expected.name);
+      expect(response.headers.get("x-symphony-projection-scope-kind")).toBe(expected.scopeKind);
+      expect(response.headers.get("x-symphony-projection-scope-key")).toBe(expected.scopeKey);
+      expect(headerJson(response, "x-symphony-projection-source-cursors")).toMatchObject(expected.sourceCursors);
+    };
+
+    try {
+      const durableDashboard = await getJson(`${baseUrl}/api/v1/web/dashboard`);
+      expect(durableDashboard.body).toEqual(dashboard);
+      expect((durableDashboard.body as { activity: unknown[] }).activity).toHaveLength(250);
+      expectProjectionHeaders(durableDashboard.response, {
+        name: "dashboard_projection",
+        scopeKind: "global",
+        scopeKey: "global",
+        sourceCursors: { issueCount: 360, runningAgentCount: 72, activityCount: 250 },
+      });
+
+      const durableIssues = await getJson(`${baseUrl}/api/v1/web/issues`);
+      expect(durableIssues.body).toEqual(issueBoard);
+      expect((durableIssues.body as { issues: unknown[] }).issues).toHaveLength(360);
+      expectProjectionHeaders(durableIssues.response, {
+        name: "issue_board_projection",
+        scopeKind: "board",
+        scopeKey: "default-board",
+        sourceCursors: { issueCount: 360, laneCounts: { todo: 120, progress: 120, review: 120 } },
+      });
+
+      const durableHistory = await getJson(`${baseUrl}/api/v1/web/history`);
+      expect(durableHistory.body).toEqual(history);
+      expect((durableHistory.body as { sessions: unknown[] }).sessions).toHaveLength(100);
+      expect((durableHistory.body as { timeline: unknown[] }).timeline).toHaveLength(250);
+      expectProjectionHeaders(durableHistory.response, {
+        name: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:100:timeline:250",
+        sourceCursors: { sessionCount: 100, timelineCount: 250, totalRuns: 360 },
+      });
+
+      const durableSidebar = await getJson(`${baseUrl}/api/v1/web/sidebar`);
+      expect(durableSidebar.body).toEqual(sidebar);
+      expect((durableSidebar.body as { reviewIssues: unknown[] }).reviewIssues).toHaveLength(80);
+      expectProjectionHeaders(durableSidebar.response, {
+        name: "sidebar_projection",
+        scopeKind: "global",
+        scopeKey: "global",
+        sourceCursors: { sessionCount: 50, reviewIssueCount: 80, activityCount: 120 },
+      });
+
+      const durableTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/session-large-1/transcript`);
+      expect(durableTranscript.body).toEqual(largeTranscript);
+      expect((durableTranscript.body as unknown[])).toHaveLength(500);
+      expect((durableTranscript.body as Array<{ text: string }>)[0]).toMatchObject({ text: "Durable transcript tail event 9501" });
+      expect((durableTranscript.body as Array<{ text: string }>).at(-1)).toMatchObject({ text: "Durable transcript tail event 10000" });
+      expectProjectionHeaders(durableTranscript.response, {
+        name: "transcript_projection",
+        scopeKind: "run_page",
+        scopeKey: "run-large-1:offset:9500:limit:500",
+        sourceCursors: { runId: "run-large-1", sessionId: "session-large-1", offset: 9_500, limit: 500, eventCount: 500, nextOffset: null },
+      });
+    } finally {
+      await server.stop();
+    }
+
+    expect(contextBuilds).toBe(0);
+    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(0);
+    expect(projectionWriter.writes).toEqual([]);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
+      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-large-1:offset:9500:limit:500" },
+    ]);
+  });
+
   it("returns explicit durable miss responses without broad source-index rebuilds when projection rows are absent", async () => {
     const projectionReader = new RecordingProjectionReader([]);
     const projectionWriter = new RecordingProjectionWriter();
@@ -1371,7 +1613,9 @@ class RecordingRunStore {
 
   async getRun(runId: string): Promise<RunRecord | null> {
     const run = this.runsById.get(runId);
-    return run ? cloneJson(run) : null;
+    if (run) return cloneJson(run);
+    const sessionRun = [...this.runsById.values()].find((candidate) => candidate.sessionId === runId);
+    return sessionRun ? cloneJson(sessionRun) : null;
   }
 
   async listRuns(): Promise<RunRecord[]> {
@@ -1400,6 +1644,18 @@ class RecordingRunStore {
 
   asRunTranscriptStore(): RunTranscriptStore {
     return this as unknown as RunTranscriptStore;
+  }
+}
+
+class FailingTranscriptRunStore extends RecordingRunStore {
+  async readTranscript(runId: string, page: { offset: number; limit: number }): Promise<TranscriptPage> {
+    this.transcriptReadCount += 1;
+    throw new Error(`large durable projection route must not hydrate raw transcript ${runId}:${page.offset}:${page.limit}`);
+  }
+
+  async readTranscriptTail(runId: string, page: { limit: number }): Promise<TranscriptPage> {
+    this.transcriptReadCount += 1;
+    throw new Error(`large durable projection route must not hydrate raw transcript tail ${runId}:${page.limit}`);
   }
 }
 
@@ -1445,6 +1701,7 @@ function projectionPayloadRecordFixture<TPayload>(
   payload: TPayload,
   options: {
     sourceRevisions?: ProjectionSourceRevision[];
+    sourceCursors?: ProjectionRevisionRecord["sourceCursors"];
     sourceFreshness?: ProjectionRevisionRecord["sourceFreshness"];
     expiresAt?: string | null;
     revision?: number;
@@ -1460,7 +1717,7 @@ function projectionPayloadRecordFixture<TPayload>(
       scopeKey: selector.scopeKey,
       revision,
       sourceRevisions: options.sourceRevisions ?? [],
-      sourceCursors: {},
+      sourceCursors: options.sourceCursors ?? {},
       sourceFreshness: options.sourceFreshness ?? [],
       contentSha256: "0".repeat(64),
       generatedAt,
