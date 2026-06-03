@@ -994,9 +994,11 @@ describe("StatusServer realtime SSE API", () => {
     const baseUrl = `http://${address.host}:${address.port}`;
 
     try {
+      let recoveryId = "";
       const recoveryClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": "0" });
       try {
         const recovery = await recoveryClient.nextEvent();
+        recoveryId = recovery.id;
         expect(recovery.event).toBe("projection.updated");
         expect(recovery.data).toMatchObject({
           type: "projection.updated",
@@ -1008,6 +1010,13 @@ describe("StatusServer realtime SSE API", () => {
         );
       } finally {
         await recoveryClient.close();
+      }
+
+      const recoveryCursorClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": recoveryId });
+      try {
+        await expect(recoveryCursorClient.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+      } finally {
+        await recoveryCursorClient.close();
       }
 
       const chatClient = await openSseClient(`${baseUrl}/api/v1/realtime`);

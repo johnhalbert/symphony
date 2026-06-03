@@ -17,11 +17,16 @@ data: <JSON.stringify(event)>
 
 The server sends `retry: 5000` when a stream opens and may send keepalive comment
 frames (`: keepalive`). Clients resume with the browser `Last-Event-ID` header or
-with `?lastEventId=<id>`. If the server can replay from its short in-memory
-history, it emits the missed events after the known id. If the id is unknown or
-history has been truncated, the stream emits a `projection.updated` recovery event
-with `missedEvents: true` and `recovery.reason: "missed-events"` so clients can
-refetch the listed resources.
+with `?lastEventId=<id>`. Browser clients also track the last accepted realtime
+frame id and explicitly reopen closed `EventSource` streams with that id so missed
+events can be replayed through the query-param cursor path. If the server can
+replay from its short in-memory history, it emits the missed events after the
+known id. If the id is unknown or history has been truncated, the stream emits a
+`projection.updated` recovery event with `missedEvents: true` and
+`recovery.reason: "missed-events"` so clients can refetch the listed resources.
+Recovery event ids are remembered as resume cursors while the following history is
+still replayable, preventing an immediate reconnect from receiving the same
+synthetic recovery frame again.
 
 SSE `id`, `event`, and comment fields are newline-sanitized before writing.
 
