@@ -232,6 +232,8 @@ const UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
   ["DYLD_INSERT_LIBRARIES", "loader"],
   ["DYLD_LIBRARY_PATH", "loader"],
   ["DYLD_FRAMEWORK_PATH", "loader"],
+  ["BASH_ENV", "shell_environment"],
+  ["ENV", "shell_environment"],
 ]);
 const INLINE_ONLY_UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
   string,
@@ -243,8 +245,6 @@ const INLINE_ONLY_UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
   ["XDG_CONFIG_HOME", "git_environment"],
   ["XDG_CONFIG_DIRS", "git_environment"],
   ["SHELL", "shell_environment"],
-  ["BASH_ENV", "shell_environment"],
-  ["ENV", "shell_environment"],
 ]);
 const GIT_CONFIG_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)$/u;
 const GIT_CONFIG_INDEXED_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(KEY|VALUE)_(\d+)$/u;
@@ -2690,7 +2690,12 @@ function unsafeGitConfigCategoryFromConfigText(configText: string): AgentCommand
   ) {
     return "external_diff";
   }
-  if (normalizedConfigKey.startsWith("credential.") || normalizedConfigText.includes("credential")) {
+  if (
+    normalizedConfigKey === "core.askpass" ||
+    normalizedConfigKey.startsWith("credential.") ||
+    normalizedConfigText.includes("askpass") ||
+    normalizedConfigText.includes("credential")
+  ) {
     return "credential_helper";
   }
   if (normalizedConfigKey === "core.hookspath" || normalizedConfigKey.startsWith("hook.") || normalizedConfigText.includes("hook")) {

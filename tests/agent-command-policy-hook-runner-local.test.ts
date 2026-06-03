@@ -315,6 +315,43 @@ describe("AgentCommandPolicyHookRunner local inspection context", () => {
     expect(evaluation.stdout).not.toContain(apiSecret);
     expect(evaluation.stdout).not.toContain(helperPath);
   });
+
+  it("blocks inherited shell startup environment hooks before local inspection reaches terminal execution", async () => {
+    const workspace = temporaryDirectory();
+    const shellStartupPath = path.join(workspace, "bash-env-helper.sh");
+    const apiSecret = "ambient-openai-secret-value";
+    writeSafeRepoConfig(workspace);
+
+    const evaluation = await evaluateAgentCommandPolicyHookPayload(
+      JSON.stringify(hermesPayload({ command: "git status --short" }, { cwd: workspace })),
+      hookContext({
+        environment: { BASH_ENV: shellStartupPath, OPENAI_API_KEY: apiSecret, PATH: path.dirname(process.execPath) },
+      }),
+    );
+
+    expect(evaluation.policyInput).toMatchObject({
+      workingDirectory: path.normalize(workspace),
+      environment: {
+        keysOnly: ["BASH_ENV", "OPENAI_API_KEY", "PATH"].sort((left, right) => left.localeCompare(right)),
+      },
+    });
+    expect(JSON.stringify(evaluation.policyInput?.environment)).not.toContain(shellStartupPath);
+    expect(JSON.stringify(evaluation.policyInput?.environment)).not.toContain(apiSecret);
+    expect(evaluation.decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "unsafe_git_config",
+      commandClass: "git_local_inspection_with_helper",
+      audit: {
+        inheritedEnvironmentKeys: ["BASH_ENV", "OPENAI_API_KEY", "PATH"].sort((left, right) =>
+          left.localeCompare(right),
+        ),
+        unsafeConfigCategories: ["shell_environment"],
+        upstreamContactAttempted: false,
+      },
+    });
+    expect(evaluation.stdout).not.toContain(shellStartupPath);
+    expect(evaluation.stdout).not.toContain(apiSecret);
+  });
 });
 
 function hookContext(
