@@ -214,6 +214,9 @@ const UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
   ["GIT_PROTOCOL_FROM_USER", "transport_helper"],
   ["GIT_DIR", "git_environment"],
   ["GIT_WORK_TREE", "git_environment"],
+  ["GIT_COMMON_DIR", "git_environment"],
+  ["GIT_CEILING_DIRECTORIES", "git_environment"],
+  ["GIT_DISCOVERY_ACROSS_FILESYSTEM", "git_environment"],
   ["GIT_INDEX_FILE", "git_environment"],
   ["GIT_OBJECT_DIRECTORY", "git_environment"],
   ["GIT_ALTERNATE_OBJECT_DIRECTORIES", "git_environment"],
@@ -242,6 +245,8 @@ const INLINE_ONLY_UNSAFE_LOCAL_GIT_ENVIRONMENT_KEY_CATEGORIES: ReadonlyMap<
 const GIT_CONFIG_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)$/u;
 const GIT_CONFIG_INDEXED_ENVIRONMENT_KEY_PATTERN = /^GIT_CONFIG_(KEY|VALUE)_(\d+)$/u;
 const MAX_GIT_CONFIG_ENVIRONMENT_COUNT = 64;
+const GIT_TRACE_ENVIRONMENT_KEY_PATTERN = /^GIT_TRACE(?:2)?(?:_|$)/u;
+const GIT_TRANSPORT_ENVIRONMENT_KEY_PATTERN = /^GIT_(?:CURL|HTTP|HTTPS|NO_PROXY|PROXY|SSL)(?:_|$)/u;
 
 export type AgentCommandPolicyPathStyle = "windows" | "posix" | "unc" | "bare" | "unknown";
 
@@ -1499,12 +1504,16 @@ function redactSensitiveCommandTokens(tokens: readonly string[]): string[] {
   const redacted: string[] = [];
   let atCommandStart = true;
   let redactNextAuthValue = false;
+  let redactNextGitConfigValue = false;
+  let sawGitExecutable = false;
 
   for (const token of tokens) {
     if (isShellControlOperator(token)) {
       redacted.push(token);
       atCommandStart = true;
       redactNextAuthValue = false;
+      redactNextGitConfigValue = false;
+      sawGitExecutable = false;
       continue;
     }
 
@@ -1515,9 +1524,26 @@ function redactSensitiveCommandTokens(tokens: readonly string[]): string[] {
       continue;
     }
 
+    if (redactNextGitConfigValue) {
+      redacted.push(redactGitConfigAssignmentValue(token));
+      redactNextGitConfigValue = false;
+      atCommandStart = false;
+      continue;
+    }
+
     const environmentAssignment = parseEnvironmentAssignment(token);
     if (environmentAssignment && (atCommandStart || isSensitiveAssignmentKey(environmentAssignment.key))) {
       redacted.push(`${environmentAssignment.key}=${REDACTED_VALUE}`);
+      continue;
+    }
+
+    if (atCommandStart) {
+      sawGitExecutable = normalizeExecutableName(token) === "git";
+    } else if (sawGitExecutable && isGitInlineConfigOption(token)) {
+      const gitConfigOption = redactGitConfigOptionToken(token);
+      redacted.push(gitConfigOption.token);
+      redactNextGitConfigValue = gitConfigOption.redactNextValue;
+      atCommandStart = false;
       continue;
     }
 
@@ -1556,6 +1582,27 @@ function redactAuthOptionToken(token: string): { readonly token: string; readonl
   }
 
   return { token: redactSensitiveCommandText(token), redactNextValue: false };
+}
+
+function redactGitConfigOptionToken(token: string): { readonly token: string; readonly redactNextValue: boolean } {
+  if (token === "-c" || token === "--config-env") return { token, redactNextValue: true };
+  if (token.startsWith("-c")) {
+    return { token: `-c${redactGitConfigAssignmentValue(token.slice(2))}`, redactNextValue: false };
+  }
+  if (token.startsWith("--config-env=")) {
+    return {
+      token: `--config-env=${redactGitConfigAssignmentValue(token.slice("--config-env=".length))}`,
+      redactNextValue: false,
+    };
+  }
+  return { token: redactSensitiveCommandText(token), redactNextValue: false };
+}
+
+function redactGitConfigAssignmentValue(configText: string): string {
+  const separatorIndex = configText.indexOf("=");
+  if (separatorIndex < 0) return configText.length === 0 ? REDACTED_VALUE : configText;
+  const key = configText.slice(0, separatorIndex).trim();
+  return `${key.length === 0 ? REDACTED_VALUE : key}=${REDACTED_VALUE}`;
 }
 
 function redactSensitiveCommandText(text: string): string {
@@ -2114,6 +2161,12 @@ function addUnsafeLocalGitEnvironmentCategories(
       continue;
     }
 
+    const gitEnvironmentPatternCategory = unsafeLocalGitEnvironmentPatternCategory(normalizedKey);
+    if (gitEnvironmentPatternCategory !== undefined) {
+      categories.add(gitEnvironmentPatternCategory);
+      continue;
+    }
+
     if (normalizedKey === "GIT_CONFIG_PARAMETERS") {
       hasGitConfigEnvironment = true;
       const configText = nonEmptyGitConfigEnvironmentValue(value);
@@ -2160,6 +2213,13 @@ function addUnsafeLocalGitEnvironmentCategories(
     if (GIT_CONFIG_ENVIRONMENT_KEY_PATTERN.test(normalizedKey)) {
       hasGitConfigEnvironment = true;
       hasAmbiguousGitConfigEnvironment = true;
+      continue;
+    }
+
+    const inlineGitEnvironmentCategory =
+      source === "inline_env" ? unsafeInlineGitEnvironmentFallbackCategory(normalizedKey) : undefined;
+    if (inlineGitEnvironmentCategory !== undefined) {
+      categories.add(inlineGitEnvironmentCategory);
     }
   }
 
@@ -2245,6 +2305,39 @@ function inheritedEnvironmentAssignments(
 
 function normalizeEnvironmentKeyForPolicy(key: string): string {
   return key.trim().toUpperCase();
+}
+
+function unsafeLocalGitEnvironmentPatternCategory(
+  normalizedKey: string,
+): AgentCommandPolicyUnsafeGitConfigCategory | undefined {
+  if (GIT_TRACE_ENVIRONMENT_KEY_PATTERN.test(normalizedKey)) return "other";
+  if (GIT_TRANSPORT_ENVIRONMENT_KEY_PATTERN.test(normalizedKey) || normalizedKey === "GIT_SSH_VARIANT") {
+    return "transport_helper";
+  }
+  if (normalizedKey === "GIT_TERMINAL_PROMPT") return "credential_helper";
+  return undefined;
+}
+
+function unsafeInlineGitEnvironmentFallbackCategory(
+  normalizedKey: string,
+): AgentCommandPolicyUnsafeGitConfigCategory | undefined {
+  if (!normalizedKey.startsWith("GIT_")) return undefined;
+  if (normalizedKey.startsWith("GIT_CONFIG_")) return "other";
+  if (normalizedKey.includes("ASKPASS") || normalizedKey.includes("CREDENTIAL")) return "credential_helper";
+  if (
+    normalizedKey.includes("SSH") ||
+    normalizedKey.includes("PROXY") ||
+    normalizedKey.includes("PROTOCOL") ||
+    normalizedKey.includes("HTTP") ||
+    normalizedKey.includes("SSL") ||
+    normalizedKey.includes("CURL")
+  ) {
+    return "transport_helper";
+  }
+  if (normalizedKey.includes("PAGER")) return "pager";
+  if (normalizedKey.includes("DIFF")) return "external_diff";
+  if (normalizedKey.includes("EXEC") || normalizedKey.includes("HELPER")) return "other";
+  return "git_environment";
 }
 
 function isHelperFreeLocalGitInspectionInvocation(

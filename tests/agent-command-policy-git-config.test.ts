@@ -119,6 +119,28 @@ describe("AgentCommandPolicy unsafe inline environment and per-command Git confi
       inlineEnvironmentKeys: ["GIT_WORK_TREE"],
     },
     {
+      name: "common directory redirection from inline GIT_COMMON_DIR",
+      command: "GIT_COMMON_DIR=../other/.git git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["git_environment"],
+      inlineEnvironmentKeys: ["GIT_COMMON_DIR"],
+    },
+    {
+      name: "trace side effect from inline GIT_TRACE2_EVENT",
+      command: "GIT_TRACE2_EVENT=../trace.json git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["other"],
+      inlineEnvironmentKeys: ["GIT_TRACE2_EVENT"],
+      redactedValue: "../trace.json",
+    },
+    {
+      name: "unrecognized inline GIT_* behavior fails closed",
+      command: "GIT_OPTIONAL_LOCKS=0 git status --short",
+      gitSubcommand: "status",
+      unsafeConfigCategories: ["git_environment"],
+      inlineEnvironmentKeys: ["GIT_OPTIONAL_LOCKS"],
+    },
+    {
       name: "loader helper execution from inline LD_PRELOAD",
       command: "LD_PRELOAD=./helper.so git status --short",
       gitSubcommand: "status",
@@ -218,6 +240,36 @@ describe("AgentCommandPolicy unsafe inline environment and per-command Git confi
         inlineEnvironmentKeys: [],
         role: "worker",
       });
+    },
+  );
+
+  it.each([
+    {
+      name: "separated -c credential helper",
+      command: "git -c credential.helper=plain-secret-sentinel status --short",
+      leakedValue: "plain-secret-sentinel",
+      expectedPreview: "credential.helper=[redacted]",
+    },
+    {
+      name: "attached -c credential helper",
+      command: "git -ccredential.helper=attached-secret-sentinel status --short",
+      leakedValue: "attached-secret-sentinel",
+      expectedPreview: "credential.helper=[redacted]",
+    },
+  ])(
+    "redacts denied per-command Git config values from audit commandPreview: $name",
+    ({ command, leakedValue, expectedPreview }) => {
+      const decision = evaluateAgentCommandPolicy(terminalInput(command));
+
+      expectUnsafeGitConfigDecision(decision, {
+        gitSubcommand: "status",
+        unsafeConfigCategories: ["credential_helper"],
+        inlineEnvironmentKeys: [],
+        role: "worker",
+      });
+      expect(decision.audit.commandPreview).toContain(expectedPreview);
+      expect(JSON.stringify(decision.audit)).not.toContain(leakedValue);
+      expect(decision.message).not.toContain(leakedValue);
     },
   );
 
