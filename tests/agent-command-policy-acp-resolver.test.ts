@@ -9,6 +9,7 @@ import type { AgentCommandPolicyInput } from "../src/core/harness/AgentCommandPo
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import {
   DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
+  DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON,
   DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON,
   buildAgentCommandPolicyInputForAcpPermission,
   createAgentCommandPolicyAcpResolver,
@@ -93,7 +94,50 @@ describe("AgentCommandPolicyAcpResolver", () => {
     await expect(resolver(input)).resolves.toEqual({ optionId: "allow_once", reason: "local_only_inspection" });
   });
 
-  it("selects allow_once for ACP file-edit permission requests without command classification", async () => {
+  it("validates and approves ACP file-edit permission requests without command classification", async () => {
+    const classify = vi.fn((_input: AgentCommandPolicyInput) =>
+      denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
+    );
+    const fileEditApproval = vi.fn(() => ({ outcome: "approve" as const, reason: "file_edit_operator_approved" }));
+    const resolver = createAgentCommandPolicyAcpResolver({
+      classify,
+      fileEditApproval,
+      environment: { GITHUB_TOKEN: "secret-token", PATH: "/usr/bin" },
+    });
+    const input = resolverInput(editPermissionRequest({ snakeCase: true }));
+
+    const decision = await resolver(input);
+
+    expect(decision).toEqual({ optionId: "allow_once", reason: "file_edit_operator_approved" });
+    expect(classify).not.toHaveBeenCalled();
+    expect(fileEditApproval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolCallId: "edit-tool-1",
+        toolName: "write_file",
+        title: "Approve edit: README.md",
+        summary: "Approve edit: README.md",
+        workspacePath: "/workspace/symphony",
+        affectedPaths: ["README.md"],
+        diffs: [
+          expect.objectContaining({
+            path: "README.md",
+            oldText: "old README",
+            newText: "updated README",
+          }),
+        ],
+        rawInput: expect.objectContaining({ tool: "write_file" }),
+      }),
+      input,
+    );
+    expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
+      response: { outcome: { outcome: "selected", optionId: "allow_once" } },
+      outcome: "selected",
+      selectedOptionId: "allow_once",
+      reason: "file_edit_operator_approved",
+    });
+  });
+
+  it("validates and approves multi-file ACP file-edit permission requests", async () => {
     const classify = vi.fn((_input: AgentCommandPolicyInput) =>
       denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
     );
@@ -101,7 +145,15 @@ describe("AgentCommandPolicyAcpResolver", () => {
       classify,
       environment: { GITHUB_TOKEN: "secret-token", PATH: "/usr/bin" },
     });
-    const input = resolverInput(editPermissionRequest({ snakeCase: true }));
+    const input = resolverInput(
+      editPermissionRequest({
+        snakeCase: true,
+        content: [
+          { path: "README.md", old_text: "old README", new_text: "updated README" },
+          { path: "src/index.ts", old_text: "export {};", new_text: "export const ok = true;" },
+        ],
+      }),
+    );
 
     const decision = await resolver(input);
 
@@ -112,6 +164,84 @@ describe("AgentCommandPolicyAcpResolver", () => {
       outcome: "selected",
       selectedOptionId: "allow_once",
       reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON,
+    });
+  });
+
+  it("selects the ACP deny option when file-edit approval rejects the request", async () => {
+    const classify = vi.fn((_input: AgentCommandPolicyInput) =>
+      denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
+    );
+    const resolver = createAgentCommandPolicyAcpResolver({
+      classify,
+      fileEditApproval: () => ({ outcome: "reject", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON }),
+      environment: { PATH: "/usr/bin" },
+    });
+    const input = resolverInput(editPermissionRequest({ snakeCase: true }));
+
+    const decision = await resolver(input);
+
+    expect(decision).toEqual({ optionId: "deny", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON });
+    expect(classify).not.toHaveBeenCalled();
+    expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
+      response: { outcome: { outcome: "selected", optionId: "deny" } },
+      outcome: "selected",
+      selectedOptionId: "deny",
+      reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON,
+    });
+  });
+
+  it.each([
+    {
+      name: "missing diff",
+      params: () => {
+        const params = editPermissionRequest({ snakeCase: true });
+        delete (params.tool_call as Record<string, unknown>).content;
+        return params;
+      },
+      reason: "missing_file_edit_diff",
+    },
+    {
+      name: "malformed diff",
+      params: () => editPermissionRequest({ snakeCase: true, content: [{ path: "README.md", old_text: "old README" }] }),
+      reason: "malformed_file_edit_diff",
+    },
+    {
+      name: "too-large diff",
+      params: () => editPermissionRequest({ snakeCase: true }),
+      reason: "file_edit_diff_too_large",
+      maxFileEditDiffBytes: 8,
+    },
+    {
+      name: "outside-workspace path",
+      params: () =>
+        editPermissionRequest({
+          snakeCase: true,
+          path: "../outside.txt",
+          rawInputPath: "../outside.txt",
+          content: [{ path: "../outside.txt", old_text: "old", new_text: "new" }],
+        }),
+      reason: "file_edit_path_outside_workspace",
+    },
+  ])("fails closed for $name ACP file-edit permission requests", async ({ params, reason, maxFileEditDiffBytes }) => {
+    const classify = vi.fn((_input: AgentCommandPolicyInput) =>
+      denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
+    );
+    const resolver = createAgentCommandPolicyAcpResolver({
+      classify,
+      maxFileEditDiffBytes,
+      environment: { PATH: "/usr/bin" },
+    });
+    const input = resolverInput(params());
+
+    const decision = await resolver(input);
+
+    expect(decision).toEqual({ optionId: "deny", reason });
+    expect(classify).not.toHaveBeenCalled();
+    expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
+      response: { outcome: { outcome: "selected", optionId: "deny" } },
+      outcome: "selected",
+      selectedOptionId: "deny",
+      reason,
     });
   });
 
@@ -215,6 +345,26 @@ describe("AgentCommandPolicyAcpResolver", () => {
       outcome: "cancelled",
       selectedOptionId: null,
       reason,
+    });
+  });
+
+  it("fails closed before resolver approval for unsupported ACP file-edit options", () => {
+    const request = parseHermesAcpPermissionRequest({
+      ...editPermissionRequest({ snakeCase: true }),
+      permission_options: [
+        ...editPermissionOptions(true),
+        { option_id: "allow_session", kind: "allow_always", name: "Allow for session" },
+      ],
+    });
+
+    expect(request.requestKind).toBe("file_edit");
+    expect(request.malformedReason).toBe("unsupported_permission_options");
+    expect(request.options.map((option) => option.optionId)).toEqual(["allow_once", "deny", "allow_session"]);
+    expect(resolveHermesAcpPermissionDecision(request, { optionId: "allow_once" })).toMatchObject({
+      response: { outcome: { outcome: "cancelled" } },
+      outcome: "cancelled",
+      selectedOptionId: null,
+      reason: "unsupported_permission_options",
     });
   });
 
@@ -363,16 +513,23 @@ function terminalPermissionOptions(snakeCase = false): Array<Record<string, unkn
   ];
 }
 
-function editPermissionRequest(options: { snakeCase?: boolean } = {}): Record<string, unknown> {
-  const toolCall = {
+function editPermissionRequest(
+  options: { snakeCase?: boolean; path?: string; rawInputPath?: string; content?: unknown } = {},
+): Record<string, unknown> {
+  const diffPath = options.path ?? "README.md";
+  const rawInputPath = options.rawInputPath ?? diffPath;
+  const content = Object.prototype.hasOwnProperty.call(options, "content")
+    ? options.content
+    : [{ path: diffPath, old_text: "old README", new_text: "updated README" }];
+  const toolCall: Record<string, unknown> = {
     [options.snakeCase ? "tool_call_id" : "toolCallId"]: "edit-tool-1",
     kind: "edit",
-    title: "Approve edit: README.md",
+    title: `Approve edit: ${diffPath}`,
     [options.snakeCase ? "raw_input" : "rawInput"]: {
       tool: "write_file",
-      arguments: { path: "README.md", content: "updated README" },
+      arguments: { path: rawInputPath, content: "updated README" },
     },
-    content: [{ path: "README.md", old_text: "old README", new_text: "updated README" }],
+    content,
   };
   return {
     [options.snakeCase ? "session_id" : "sessionId"]: "acp-session-1",
