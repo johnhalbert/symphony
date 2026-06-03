@@ -45,6 +45,15 @@ npm test -- tests/agent-command-policy-local-inspection.test.ts tests/agent-comm
 
 This Checkpoint B subset validates helper-free local status/diff/log/show/branch/blame allow decisions, unsafe inline and inherited environment denial, per-command Git config denial, persisted repo/user fake-helper fail-closed behavior, selected worktree config inspection, hook-runner working-directory resolution, and redacted hook environment propagation.
 
+For the Checkpoint C / Issue 19 / T051 US3 service-owned workflow boundary targeted validation subissue, run the present US3 command-policy suite:
+
+```powershell
+npm run typecheck
+npm test -- tests/mcp-subprocess-environment-command-policy.test.ts tests/completion-report-mcp-command-policy.test.ts tests/review-feedback-mcp-command-policy.test.ts tests/github-service-boundary-command-policy.test.ts
+```
+
+This Checkpoint C subset validates service MCP credential slicing, completion-report publication boundaries, review-feedback writeback boundaries, mergeability and CI service-owned paths, and equivalent worker/reviewer terminal or `execute_code` direct-deny behavior.
+
 For final targeted validation after the later user-story test files exist, run the full policy-facing suite:
 
 ```powershell
