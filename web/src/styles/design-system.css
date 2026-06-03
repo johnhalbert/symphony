@@ -360,8 +360,36 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
   color: var(--text-3);
   font-size: 12px;
   font-family: var(--font-mono);
+  margin-top: 4px;
 }
 .dash__subtitle .sep { color: var(--text-4); margin: 0 6px; }
+
+.dash__source {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 8px;
+  max-width: 780px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.dash__source .sep { color: var(--text-4); }
+.dash__source-label {
+  color: var(--text-1);
+  font-weight: 700;
+}
+.dash__source[data-status="fresh"],
+.dash__source[data-status="empty"] {
+  color: var(--text-2);
+}
+.dash__source[data-status="stale"] .dash__source-label {
+  color: var(--accent);
+}
+.dash__source[data-status="error"] .dash__source-label,
+.dash__source[data-status="unavailable"] .dash__source-label {
+  color: var(--pri-urgent);
+}
 
 .dash__actions { display: flex; gap: 6px; }
 

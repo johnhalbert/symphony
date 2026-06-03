@@ -85,6 +85,20 @@ const apiDashboard: DashboardModel = {
     all: 32,
     completeness: 73,
   },
+  source: {
+    status: "fresh",
+    label: "tracker fresh · 4 issues",
+    detail: "Issue board tracker source is current; 2 runs · 3 lifecycle records · 1 activity entries · 0 writeback operations.",
+    generatedAt: "2026-05-29T20:05:00.000Z",
+    trackerFetchedAt: "2026-05-29T20:04:00.000Z",
+    issueCount: 4,
+    runCount: 2,
+    lifecycleCount: 3,
+    activityCount: 1,
+    writebackCount: 0,
+    cached: false,
+    error: null,
+  },
 };
 
 function makeApiIssue(overrides: Partial<IssueModel> = {}): IssueModel {
@@ -533,6 +547,9 @@ describe("App API-mode rendering", () => {
     expect(hookCalls.orchestratorChat).toEqual([{ enabled: true }]);
     expect(markup).toContain("api source · api");
     expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("tracker fresh · 4 issues");
+    expect(markup).toContain("Issue board tracker source is current");
+    expect(markup).toContain("tracker fetched 2026-05-29T20:04:00.000Z");
     expect(markup).toContain("Symphony · api-branch");
     expect(markup).toContain("WORKFLOW.api@api-branch");
     expect(markup).toContain("poll 5s");
@@ -621,6 +638,19 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("API full-app chat");
     expect(markup).not.toContain("dashboard embedded fallback should not render");
+  });
+
+  it("renders stale API dashboard data with a refresh-failure banner instead of replacing it with a first-load error", async () => {
+    const { markup } = await renderAppWithMocks({
+      hooks: appHookState({ dashboard: { data: apiDashboard, loading: false, error: "Symphony API returned HTTP 503" } }),
+    });
+
+    expect(markup).toContain("Could not refresh dashboard");
+    expect(markup).toContain("Symphony API returned HTTP 503 Showing previous dashboard data.");
+    expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("tracker fresh · 4 issues");
+    expect(markup).not.toContain("Could not load dashboard");
+    expect(markup).not.toContain("openai/symphony@main");
   });
 
   it("starts non-blocking API reference data while the dashboard is active and keeps inactive API views disabled", async () => {

@@ -61,9 +61,11 @@ describe("/api/v1/web route contracts", () => {
               "providerGates",
               "repoLabel",
               "runningAgents",
+              "source",
               "totals",
               "workflowLabel",
             ]);
+
             expect(body).toEqual({
               projectName: "Symphony",
               repoLabel: "",
@@ -76,9 +78,11 @@ describe("/api/v1/web route contracts", () => {
               runningAgents: [],
               activity: [],
               chat: [],
+              source: unavailableDashboardSource(),
               totals: emptyTotals(),
             });
           },
+
         },
         {
           path: webRouteContractPaths.issueBoard,
@@ -715,6 +719,7 @@ describe("/api/v1/web route contracts", () => {
         "providerGates",
         "repoLabel",
         "runningAgents",
+        "source",
         "totals",
         "workflowLabel",
       ]);
@@ -834,6 +839,7 @@ describe("/api/v1/web route contracts", () => {
         "providerGates",
         "repoLabel",
         "runningAgents",
+        "source",
         "totals",
         "workflowLabel",
       ]);
@@ -1356,4 +1362,21 @@ function expectTopLevelKeys(body: unknown, keys: string[]): void {
 
 function emptyTotals(): Record<string, number> {
   return { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 };
+}
+
+function unavailableDashboardSource(): Record<string, unknown> {
+  return {
+    status: "unavailable",
+    label: "tracker unavailable",
+    detail: "Issue board requires a configured tracker client",
+    generatedAt: "2026-01-01T00:00:00.000Z",
+    trackerFetchedAt: null,
+    issueCount: 0,
+    runCount: 0,
+    lifecycleCount: 0,
+    activityCount: 0,
+    writebackCount: 0,
+    cached: false,
+    error: "Issue board requires a configured tracker client",
+  };
 }

@@ -23,6 +23,30 @@ body {
   color: var(--pri-urgent);
 }
 
+.resource-status-banner {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  background: rgba(122, 167, 255, 0.08);
+  color: var(--text-2);
+  font-size: 12px;
+  padding: 10px 16px;
+}
+
+.resource-status-banner[data-severity="error"] {
+  background: rgba(255, 120, 120, 0.1);
+  color: var(--pri-urgent);
+}
+
+.resource-status-banner strong {
+  color: var(--text-1);
+}
+
+.resource-status-banner[data-severity="error"] strong {
+  color: var(--pri-urgent);
+}
+
 .dev-switcher {
   display: inline-flex;
   align-items: center;

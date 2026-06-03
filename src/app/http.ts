@@ -19,6 +19,7 @@ import {
   projectWebSidebar,
   type ChatMessage,
   type DashboardRuntimeConfig,
+  type DashboardSourceProjectionInput,
   type IssueModel,
   type WebIssueBoardModel,
   type WebIssueDetailModel,
@@ -1224,6 +1225,7 @@ export class StatusServer {
         activity,
         runs: sourceIndex?.runs.runs ?? activitySources.runs,
         lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
+        source: dashboardSourceInputFromSourceIndex(sourceIndex, { activityCount: activity.activity.length }),
         config: this.options.dashboard ?? null,
       });
       await this.recordProjectionRebuildEntry(
@@ -1773,6 +1775,7 @@ export class StatusServer {
       activity,
       runs: sourceIndex?.runs.runs ?? activitySources.runs,
       lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
+      source: dashboardSourceInputFromSourceIndex(sourceIndex, { activityCount: activity.activity.length }),
       config: this.options.dashboard ?? null,
     });
     await this.persistWebDashboardProjection(dashboard, {
@@ -2349,7 +2352,7 @@ export class StatusServer {
       snapshot: input.snapshot,
       issueBoardColumns: input.issueBoardColumns,
       ...(this.options.tracker
-        ? { fetchTrackerProjection: ({ columns, forceRefresh }) => this.fetchIssueBoardTrackerProjection(columns, forceRefresh) }
+        ? { fetchTrackerProjection: ({ columns, forceRefresh }) => this.fetchIssueBoardTrackerProjection(columns, forceRefresh, input.clock) }
         : {}),
       forceRefresh: input.forceRefresh,
       clock: input.clock,
@@ -2402,6 +2405,7 @@ export class StatusServer {
   private async fetchIssueBoardTrackerProjection(
     columns: IssueBoardColumnMapping,
     forceRefresh: boolean,
+    clock: WebProjectionClock = () => new Date(),
   ): Promise<IssueBoardTrackerProjection> {
     const tracker = this.options.tracker;
     if (!tracker) {
@@ -2410,7 +2414,8 @@ export class StatusServer {
 
     const fetchedStates = webProjectionIssueBoardFetchStates(columns);
     const cacheKey = issueBoardFetchedStateCacheKey(fetchedStates);
-    const now = Date.now();
+    const nowDate = clock();
+    const now = nowDate.getTime();
     const cached = this.issueBoardTrackerCache;
     if (
       cached &&
@@ -2426,7 +2431,7 @@ export class StatusServer {
       const projection = {
         fetchedStates,
         trackerIssues,
-        fetchedAt: new Date(now).toISOString(),
+        fetchedAt: nowDate.toISOString(),
         cached: false,
       };
       this.issueBoardTrackerCache = {
@@ -2529,6 +2534,32 @@ function statusServerProjectionSourceRevisions(
   ].filter((revision): revision is ProjectionSourceRevision => revision !== null);
 }
 
+function dashboardSourceInputFromSourceIndex(
+  sourceIndex: BuiltWebProjectionSourceIndex | null,
+  input: { activityCount: number },
+): DashboardSourceProjectionInput {
+  if (!sourceIndex) {
+    return {
+      status: "unavailable",
+      detail: "Dashboard was rebuilt without a shared web projection source index.",
+      activityCount: input.activityCount,
+    };
+  }
+  const trackerIssues = sourceIndex.trackerIssues;
+  return {
+    status: trackerIssues.status,
+    generatedAt: sourceIndex.generatedAt,
+    trackerFetchedAt: trackerIssues.fetchedAt,
+    issueCount: trackerIssues.issues.length,
+    runCount: sourceIndex.runs.runs.length,
+    lifecycleCount: sourceIndex.lifecycles.records.length,
+    activityCount: input.activityCount,
+    writebackCount: sourceIndex.writebacks.operations.length,
+    cached: trackerIssues.cached,
+    error: trackerIssues.error?.message ?? null,
+  };
+}
+
 function statusServerProjectionSourceFreshness(
   sourceIndex: BuiltWebProjectionSourceIndex | null,
 ): ProjectionSourceFreshnessInput[] {
@@ -2552,7 +2583,7 @@ function statusServerProjectionSourceFreshness(
     ];
   }
 
-  const status = trackerIssues.issues.length === 0 ? "empty" : "fresh";
+  const status = trackerIssues.cached ? "stale" : trackerIssues.issues.length === 0 ? "empty" : "fresh";
   return [
     {
       source: "trackerIssues",
@@ -2561,7 +2592,12 @@ function statusServerProjectionSourceFreshness(
       revision,
       lastSuccessAt: checkedAt,
       lastErrorAt: null,
-      detail: status === "empty" ? "Issue board tracker source returned no issues" : "Issue board tracker source is current",
+      detail:
+        status === "stale"
+          ? "Using a cached issue board tracker source while refresh catches up"
+          : status === "empty"
+            ? "Issue board tracker source returned no issues"
+            : "Issue board tracker source is current",
     },
   ];
 }

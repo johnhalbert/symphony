@@ -298,9 +298,9 @@ describe("web history/transcript durable projection writes", () => {
       const baseUrl = baseUrlFor(address);
       const liveResponses = [
         await getJson(`${baseUrl}/api/v1/web/dashboard?refresh=1`),
-        await getJson(`${baseUrl}/api/v1/web/issues`),
-        await getJson(`${baseUrl}/api/v1/web/sidebar`),
-        await getJson(`${baseUrl}/api/v1/web/history?sessionLimit=1&timelineLimit=5`),
+        await getJson(`${baseUrl}/api/v1/web/issues?refresh=1`),
+        await getJson(`${baseUrl}/api/v1/web/sidebar?refresh=1`),
+        await getJson(`${baseUrl}/api/v1/web/history?refresh=1&sessionLimit=1&timelineLimit=5`),
         await getJson(`${baseUrl}/api/v1/web/sessions/session-parity/transcript`),
         await getJson(`${baseUrl}/api/v1/web/sessions/session-parity/transcript?offset=0&limit=1000`),
         await getJson(`${baseUrl}/api/v1/web/sessions/session-parity/transcript?offset=1000&limit=1000`),
@@ -321,7 +321,7 @@ describe("web history/transcript durable projection writes", () => {
       rawTranscriptAvailable.current = false;
       const rawReadsBeforeRebuild = rawTranscriptReads;
       const result = await server.rebuildDurableWebProjections({
-        forceRefresh: false,
+        forceRefresh: true,
         historyLimits: { sessionLimit: 1, timelineLimit: 5 },
         transcriptPageLimit: 1_000,
       });

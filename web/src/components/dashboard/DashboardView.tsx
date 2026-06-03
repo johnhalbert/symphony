@@ -53,6 +53,7 @@ export function DashboardView({
               <span className="sep">·</span>
               <span style={{ color: "var(--accent)" }}>● {dashboard.agentUsageLabel}</span>
             </div>
+            {dashboard.source ? <DashboardSourceStatus source={dashboard.source} /> : null}
           </div>
           <div className="dash__actions">
             <button className="btn" type="button">
@@ -161,6 +162,26 @@ export function DashboardView({
         error={orchestratorChatError}
         readOnly={orchestratorChatReadOnly}
       />
+    </div>
+  );
+}
+
+function DashboardSourceStatus({ source }: { source: NonNullable<DashboardModel["source"]> }) {
+  const timestamps = [
+    source.trackerFetchedAt ? `tracker fetched ${source.trackerFetchedAt}` : null,
+    source.generatedAt ? `projection generated ${source.generatedAt}` : null,
+  ].filter(Boolean);
+  return (
+    <div className="dash__source" data-status={source.status}>
+      <span className="dash__source-label">{source.label}</span>
+      <span className="sep">·</span>
+      <span>{source.detail}</span>
+      {timestamps.length > 0 ? (
+        <>
+          <span className="sep">·</span>
+          <span>{timestamps.join(" · ")}</span>
+        </>
+      ) : null}
     </div>
   );
 }
