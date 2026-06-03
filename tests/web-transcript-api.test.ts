@@ -3,12 +3,18 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http.js";
+import type { WebProjectionPayloadReader } from "../src/app/WebProjectionRepository.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileRunTranscriptStore, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
 import { mapAgentEventToRunActivityEvent } from "../src/core/transcript/RunActivityEventMapper.js";
 import type { RunActivityEvent } from "../src/core/runActivity/RunActivityEvent.js";
-import type { ProjectionPayloadWriteInput, ProjectionWriteResult } from "../src/core/persistence/ProjectionTransactionService.js";
+import type {
+  ProjectionPayloadRecord,
+  ProjectionPayloadWriteInput,
+  ProjectionRevisionSelector,
+  ProjectionWriteResult,
+} from "../src/core/persistence/ProjectionTransactionService.js";
 import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
@@ -134,6 +140,57 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(body[2]).toMatchObject({ kind: "assistant", text: "event 101" });
       expect(body.at(-1)).toMatchObject({ kind: "assistant", text: "event 600" });
       expect(tailCalls).toEqual([{ limit: 500 }]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("bypasses durable projections for running default transcript tails but still honors explicit durable pages", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "active-run", sessionId: "active-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "active-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "live event 1",
+    });
+    await runStore.appendEvent({
+      runId: "active-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "live event 2",
+    });
+    const durablePayload = [{ kind: "assistant", text: "stale durable transcript" }];
+    const projectionReader = new StaticProjectionReader(durablePayload, [
+      { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const server = createServer(config, runStore, { projectionReader, projectionWriter });
+    const address = await server.start();
+    try {
+      const liveResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/active-run/transcript`);
+      expect(liveResponse.status).toBe(200);
+      const liveBody = (await liveResponse.json()) as Array<Record<string, unknown>>;
+      expectRunPrelude(liveBody, { session: "active-session", issue: "TEST-1" });
+      expect(liveBody.slice(2).map((message) => message.text)).toEqual(["live event 1", "live event 2"]);
+      expect(liveBody.map((message) => message.text)).not.toContain("stale durable transcript");
+      expect(projectionReader.selectors).toEqual([]);
+      expect(projectionWriter.writes.at(-1)).toMatchObject({
+        projectionName: "transcript_projection",
+        scopeKind: "run_page",
+        scopeKey: "active-run:offset:0:limit:500",
+        fields: { runId: "active-run", sessionId: "active-session", offsetStart: 0, offsetLimit: 500 },
+      });
+
+      const explicitResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/active-run/transcript?offset=0&limit=1`);
+      expect(explicitResponse.status).toBe(200);
+      expect(await explicitResponse.json()).toEqual(durablePayload);
+      expect(projectionReader.selectors).toEqual([
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "active-run:offset:0:limit:1" },
+      ]);
     } finally {
       await server.stop();
     }
@@ -773,6 +830,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
 });
 
 interface CreateServerOptions {
+  projectionReader?: WebProjectionPayloadReader;
   projectionWriter?: StatusServerProjectionWriter;
 }
 
@@ -796,8 +854,53 @@ function createServer(
     openWorkspaceToken: "secret",
     trackerStateLists: testTrackerStateLists(),
     staleThresholdMs: 300_000,
+    ...(options.projectionReader ? { projectionReader: options.projectionReader } : {}),
     ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
   });
+}
+
+class StaticProjectionReader implements WebProjectionPayloadReader {
+  readonly selectors: ProjectionRevisionSelector[] = [];
+
+  constructor(
+    private readonly payload: unknown,
+    private readonly sourceRevisions: ProjectionPayloadRecord["revision"]["sourceRevisions"] = [],
+  ) {}
+
+  async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    this.selectors.push({ ...selector });
+    return projectionPayloadRecord(selector, this.payload as TPayload, this.sourceRevisions);
+  }
+}
+
+function projectionPayloadRecord<TPayload>(
+  selector: ProjectionRevisionSelector,
+  payload: TPayload,
+  sourceRevisions: ProjectionPayloadRecord["revision"]["sourceRevisions"],
+): ProjectionPayloadRecord<TPayload> {
+  const generatedAt = "2026-01-01T00:00:00.000Z";
+  return {
+    revision: {
+      projectionRevisionId: "test-projection-revision",
+      projectionName: selector.projectionName,
+      scopeKind: selector.scopeKind ?? "global",
+      scopeKey: selector.scopeKey ?? "global",
+      revision: 1,
+      sourceRevisions,
+      sourceCursors: {},
+      sourceFreshness: [],
+      contentSha256: null,
+      generatedAt,
+      expiresAt: null,
+      supersededAt: null,
+      createdAt: generatedAt,
+    },
+    payload,
+    payloadSha256: null,
+    rawPayloadRefs: [],
+    generatedAt,
+    expiresAt: null,
+  };
 }
 
 class RecordingProjectionWriter implements StatusServerProjectionWriter {
