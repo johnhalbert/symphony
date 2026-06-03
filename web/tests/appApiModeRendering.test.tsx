@@ -1,8 +1,12 @@
-import { Fragment, createElement, type ReactNode } from "react";
+// @vitest-environment happy-dom
+
+import { Fragment, act, createElement, type ReactNode } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveAppResourceLoading } from "../src/app/resourceLoading";
-import type { SymphonyDataSource } from "../src/data/dataSource";
+import type { RealtimeConnectionStatus, SymphonyDataSource } from "../src/data/dataSource";
+import type { LiveResourceState, LiveResourceTokenMap } from "../src/hooks/useLiveResource";
 import { fallbackReferenceData } from "../src/data/referenceDataContext";
 import type {
   AppTab,
@@ -18,6 +22,10 @@ import type {
   SessionModel,
   TranscriptMessage,
 } from "../src/types/symphony";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const mountedRoots: Root[] = [];
 
 const apiChat: ChatMessage[] = [{ who: "agent", text: "API full-app chat", suggestions: ["Full-app suggestion"] }];
 
@@ -83,6 +91,20 @@ const apiDashboard: DashboardModel = {
     open: 11,
     all: 32,
     completeness: 73,
+  },
+  source: {
+    status: "fresh",
+    label: "tracker fresh · 4 issues",
+    detail: "Issue board tracker source is current; 2 runs · 3 lifecycle records · 1 activity entries · 0 writeback operations.",
+    generatedAt: "2026-05-29T20:05:00.000Z",
+    trackerFetchedAt: "2026-05-29T20:04:00.000Z",
+    issueCount: 4,
+    runCount: 2,
+    lifecycleCount: 3,
+    activityCount: 1,
+    writebackCount: 0,
+    cached: false,
+    error: null,
   },
 };
 
@@ -268,7 +290,7 @@ type AppHookState = {
   orchestratorChat: Loadable<ChatMessage[]>;
 };
 
-type HookOptions = { enabled?: boolean };
+type HookOptions = { enabled?: boolean; refreshToken?: unknown };
 
 type AppHookCalls = {
   reference: HookOptions[];
@@ -278,6 +300,36 @@ type AppHookCalls = {
   sidebar: HookOptions[];
   orchestratorChat: HookOptions[];
 };
+
+const zeroLiveResourceTokens: LiveResourceTokenMap = {
+  referenceData: 0,
+  dashboard: 0,
+  issueBoard: 0,
+  issueDetail: 0,
+  history: 0,
+  sidebar: 0,
+  sessionTranscript: 0,
+  orchestratorChat: 0,
+};
+
+const zeroLiveResourceRevisions: LiveResourceState["revisions"] = {
+  referenceData: null,
+  dashboard: null,
+  issueBoard: null,
+  issueDetail: null,
+  history: null,
+  sidebar: null,
+  sessionTranscript: null,
+  orchestratorChat: null,
+};
+
+function realtimeStatus(kind: RealtimeConnectionStatus["kind"], label: string): RealtimeConnectionStatus {
+  return { kind, label };
+}
+
+function liveResourceState(status = realtimeStatus("connecting", "realtime connecting")): LiveResourceState {
+  return { tokens: { ...zeroLiveResourceTokens }, revisions: { ...zeroLiveResourceRevisions }, realtimeStatus: status };
+}
 
 function loaded<T>(data: T): Loadable<T> {
   return { data, loading: false, error: null };
@@ -310,9 +362,11 @@ function appHookState(overrides: Partial<AppHookState> = {}): AppHookState {
 async function renderAppWithMocks({
   mode = "api",
   hooks = appHookState(),
+  liveState = liveResourceState(),
 }: {
   mode?: "api" | "mock";
   hooks?: AppHookState;
+  liveState?: LiveResourceState;
 } = {}) {
   vi.resetModules();
 
@@ -365,6 +419,15 @@ async function renderAppWithMocks({
       return maybeEnabled(hooks.orchestratorChat, options);
     },
   }));
+
+  vi.doMock("../src/hooks/useLiveResource", async (importActual) => {
+    const actual = await importActual<typeof import("../src/hooks/useLiveResource")>();
+    return {
+      ...actual,
+      useLiveResourceState: () => liveState,
+      useLiveResourceTokens: () => liveState.tokens,
+    };
+  });
 
   const { App } = await import("../src/App");
   return { hookCalls, markup: renderToStaticMarkup(<App />) };
@@ -420,9 +483,43 @@ async function renderHistoryView(history: HistoryModel, variant: "list" | "timel
   return renderToStaticMarkup(<ChatHistoryView history={history} variant={variant} />);
 }
 
+function renderedButtons(markup: string): string[] {
+  return Array.from(markup.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g), (match) => match[0]);
+}
+
+function markupText(markup: string): string {
+  return markup.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function buttonMatchesLabel(button: string, label: string): boolean {
+  return (
+    markupText(button).includes(label) ||
+    button.includes(`aria-label="${label}`) ||
+    button.includes(`title="${label}`) ||
+    button.includes(`data-unavailable-action="${label}"`)
+  );
+}
+
+function buttonIsUnavailable(button: string): boolean {
+  return button.includes("disabled") || button.includes('aria-disabled="true"') || /unavailable/i.test(button);
+}
+
+function expectUnavailableButton(markup: string, label: string) {
+  const candidates = renderedButtons(markup).filter((button) => buttonMatchesLabel(button, label));
+  expect(candidates.length).toBeGreaterThan(0);
+  expect(candidates.every(buttonIsUnavailable)).toBe(true);
+}
+
 afterEach(() => {
+  for (const root of mountedRoots.splice(0)) {
+    act(() => {
+      root.unmount();
+    });
+  }
+  document.body.innerHTML = "";
   vi.doUnmock("../src/data/dataSourceContext");
   vi.doUnmock("../src/hooks/useSymphonyData");
+  vi.doUnmock("../src/hooks/useLiveResource");
   vi.resetModules();
   vi.restoreAllMocks();
 });
@@ -501,6 +598,9 @@ describe("App API-mode rendering", () => {
     expect(hookCalls.orchestratorChat).toEqual([{ enabled: true }]);
     expect(markup).toContain("api source · api");
     expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("tracker fresh · 4 issues");
+    expect(markup).toContain("Issue board tracker source is current");
+    expect(markup).toContain("tracker fetched 2026-05-29T20:04:00.000Z");
     expect(markup).toContain("Symphony · api-branch");
     expect(markup).toContain("WORKFLOW.api@api-branch");
     expect(markup).toContain("poll 5s");
@@ -513,11 +613,15 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("Burn-up unavailable");
     expect(markup).toContain("Velocity trend unavailable");
     expect(markup).toContain("ETA unavailable");
-    expect(markup).toContain("connection unavailable");
+    expect(markup).toContain("realtime connecting");
     expect(markup).toContain("errors unavailable");
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
     expect(markup).toContain("Full-app suggestion");
+    expectUnavailableButton(markup, "Status totals");
+    expectUnavailableButton(markup, "Trigger poll");
+    expectUnavailableButton(markup, "New issue");
+    expectUnavailableButton(markup, "Orchestrator chat menu");
 
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
@@ -533,6 +637,77 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("PR/day");
     expect(markup).not.toContain("linear · connected");
     expect(markup).not.toContain("0 errors");
+  });
+
+  it("keeps inactive API-mode resources disabled when realtime tokens change outside the active dashboard view", async () => {
+    const liveState = liveResourceState();
+    liveState.tokens.dashboard = 5;
+    liveState.tokens.issueBoard = 2;
+    liveState.tokens.history = 3;
+    liveState.tokens.sidebar = 4;
+    liveState.tokens.orchestratorChat = 6;
+
+    const { hookCalls } = await renderAppWithMocks({ liveState });
+
+    expect(hookCalls.dashboard).toEqual([{ enabled: true, refreshToken: 5 }]);
+    expect(hookCalls.issueBoard).toEqual([{ enabled: false, refreshToken: 2 }]);
+    expect(hookCalls.history).toEqual([{ enabled: false, refreshToken: 3 }]);
+    expect(hookCalls.sidebar).toEqual([{ enabled: false, refreshToken: 4 }]);
+    expect(hookCalls.orchestratorChat).toEqual([{ enabled: true, refreshToken: 6 }]);
+  });
+
+  it("preserves the selected tab while realtime tokens refresh the active issues view", async () => {
+    const liveState = liveResourceState();
+    const { hookCalls } = await renderAppWithMocks({ liveState, hooks: appHookState({ issueBoard: loaded(apiIssueBoard) }) });
+    const { App } = await import("../src/App");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    mountedRoots.push(root);
+
+    act(() => {
+      root.render(<App />);
+    });
+    const issuesTab = container.querySelector<HTMLButtonElement>('button[role="tab"][aria-label="Issues"]');
+    if (!issuesTab) throw new Error("expected issues tab to render");
+    act(() => {
+      issuesTab.click();
+    });
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("aria-label")).toBe("Issues");
+
+    liveState.tokens.dashboard = 5;
+    liveState.tokens.issueBoard = 7;
+    liveState.tokens.history = 11;
+    liveState.tokens.sidebar = 13;
+    liveState.tokens.orchestratorChat = 17;
+    act(() => {
+      root.render(<App />);
+    });
+
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("aria-label")).toBe("Issues");
+    expect(hookCalls.dashboard.at(-1)).toEqual({ enabled: false, refreshToken: 5 });
+    expect(hookCalls.issueBoard.at(-1)).toEqual({ enabled: true, refreshToken: 7 });
+    expect(hookCalls.history.at(-1)).toEqual({ enabled: false, refreshToken: 11 });
+    expect(hookCalls.sidebar.at(-1)).toEqual({ enabled: false, refreshToken: 13 });
+    expect(hookCalls.orchestratorChat.at(-1)).toEqual({ enabled: false, refreshToken: 17 });
+  });
+
+  it("renders non-blocking realtime connection, reconnect, recovered, and stale status in API chrome", async () => {
+    const statuses = [
+      realtimeStatus("connecting", "realtime connecting"),
+      realtimeStatus("open", "realtime connected"),
+      realtimeStatus("reconnecting", "realtime reconnecting"),
+      realtimeStatus("recovered", "realtime recovered"),
+      realtimeStatus("stale", "realtime stale · refetching"),
+    ] satisfies RealtimeConnectionStatus[];
+
+    for (const status of statuses) {
+      const { markup } = await renderAppWithMocks({ liveState: liveResourceState(status) });
+      expect(markup).toContain(status.label);
+      expect(markup).toContain("api source · api");
+      expect(markup).toContain("API full-app chat");
+      expect(markup).not.toContain("connection unavailable");
+    }
   });
 
   it("keeps mock-mode app-shell resources eager once reference data is loaded", async () => {
@@ -571,6 +746,19 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("API full-app chat");
     expect(markup).not.toContain("dashboard embedded fallback should not render");
+  });
+
+  it("renders stale API dashboard data with a refresh-failure banner instead of replacing it with a first-load error", async () => {
+    const { markup } = await renderAppWithMocks({
+      hooks: appHookState({ dashboard: { data: apiDashboard, loading: false, error: "Symphony API returned HTTP 503" } }),
+    });
+
+    expect(markup).toContain("Could not refresh dashboard");
+    expect(markup).toContain("Symphony API returned HTTP 503 Showing previous dashboard data.");
+    expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("tracker fresh · 4 issues");
+    expect(markup).not.toContain("Could not load dashboard");
+    expect(markup).not.toContain("openai/symphony@main");
   });
 
   it("starts non-blocking API reference data while the dashboard is active and keeps inactive API views disabled", async () => {
@@ -650,6 +838,18 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("run-api-selected");
     expect(markup).toContain("#909");
     expect(markup).toContain("green");
+    expectUnavailableButton(markup, "Filter");
+    expectUnavailableButton(markup, "Sort");
+    expectUnavailableButton(markup, "New issue");
+    expectUnavailableButton(markup, "Issue lane filter");
+    expectUnavailableButton(markup, "New Todo issue");
+    expectUnavailableButton(markup, "New In Progress issue");
+    expectUnavailableButton(markup, "New In Review issue");
+    expectUnavailableButton(markup, "Open in Linear");
+    expectUnavailableButton(markup, "More");
+    expect(markup).toContain('aria-label="Status value"');
+    expect(markup).toContain('aria-label="Priority value"');
+    expect(markup).toContain('aria-label="Assignee value"');
 
     expect(markup).not.toContain("SYM-12");
     expect(markup).not.toContain("Add exponential backoff to retry queue with jitter");
@@ -720,6 +920,14 @@ describe("App API-mode rendering", () => {
     expect(transcriptMarkup).toContain("API-HISTORY");
     expect(transcriptMarkup).toContain("gpt-api-history");
     expect(transcriptMarkup).toContain("API transcript message rendered from selected session data.");
+    expectUnavailableButton(transcriptMarkup, "Filter");
+    expectUnavailableButton(transcriptMarkup, "Sort");
+    expectUnavailableButton(transcriptMarkup, "Running sessions filter");
+    expectUnavailableButton(transcriptMarkup, "Finished sessions filter");
+    expectUnavailableButton(transcriptMarkup, "Error sessions filter");
+    expectUnavailableButton(transcriptMarkup, "Open workspace");
+    expectUnavailableButton(transcriptMarkup, "Open issue");
+    expectUnavailableButton(transcriptMarkup, "More");
     expect(transcriptMarkup).not.toContain("No transcript messages for this session.");
     expect(transcriptMarkup).not.toContain("Mock transcript remains embedded.");
     expect(transcriptMarkup).not.toContain("Exponential backoff for retry queue");
@@ -727,6 +935,9 @@ describe("App API-mode rendering", () => {
     const timelineMarkup = await renderHistoryView(apiHistory, "timeline");
     expect(timelineMarkup).toContain("API timeline event rendered from history endpoint.");
     expect(timelineMarkup).toContain("run-api-transcript");
+    expectUnavailableButton(timelineMarkup, "Timeline filter");
+    expectUnavailableButton(timelineMarkup, "Group timeline by session");
+    expect(timelineMarkup).toContain("open unavailable");
 
     const emptyTranscriptMarkup = await renderHistoryView({
       ...apiHistory,

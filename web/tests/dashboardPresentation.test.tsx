@@ -60,6 +60,20 @@ const apiDashboard: DashboardModel = {
     all: 32,
     completeness: 73,
   },
+  source: {
+    status: "stale",
+    label: "tracker stale · 4 cached issues",
+    detail: "Using a cached tracker source while refresh catches up; 2 runs · 3 lifecycle records · 1 activity entries · 0 writeback operations.",
+    generatedAt: "2026-05-29T20:05:00.000Z",
+    trackerFetchedAt: "2026-05-29T20:04:00.000Z",
+    issueCount: 4,
+    runCount: 2,
+    lifecycleCount: 3,
+    activityCount: 1,
+    writebackCount: 0,
+    cached: true,
+    error: null,
+  },
 };
 
 const zeroTotals: DashboardTotals = {
@@ -95,6 +109,7 @@ function dashboardFixture(overrides: Partial<DashboardModel> = {}): DashboardMod
     activity: overrides.activity ?? apiDashboard.activity,
     chat: overrides.chat ?? apiDashboard.chat,
     totals: overrides.totals ?? apiDashboard.totals,
+    source: overrides.source ?? apiDashboard.source,
   };
 }
 
@@ -213,6 +228,9 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("Rendering dashboard model");
     expect(markup).toContain("api-worker");
     expect(markup).toContain("from API activity");
+    expect(markup).toContain("tracker stale · 4 cached issues");
+    expect(markup).toContain("Using a cached tracker source while refresh catches up");
+    expect(markup).toContain("tracker fetched 2026-05-29T20:04:00.000Z");
     expect(markup).toContain("API hello");
     expect(markup).toContain("API suggestion");
     expect(markup).toContain("unavailable: no durable throughput or ETA source");

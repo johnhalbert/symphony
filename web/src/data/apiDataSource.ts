@@ -1,4 +1,11 @@
-import type { ProjectionChangeEvent, ProjectionChangeListener, ProjectionChangeUnsubscribe, SymphonyDataSource } from "./dataSource";
+import type {
+  CacheInvalidationOptions,
+  ProjectionChangeEvent,
+  ProjectionChangeListener,
+  ProjectionChangeUnsubscribe,
+  SymphonyDataSource,
+} from "./dataSource";
+import { createRealtimeEventSourceClient } from "./eventSourceClient";
 import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
@@ -16,12 +23,14 @@ const GET_SUCCESS_CACHE_MS = 5_000;
 interface CachedGetResponse {
   data: unknown;
   expiresAt: number;
+  path: string;
 }
 
 interface InFlightGetResponse {
   generation: number;
   promise: Promise<unknown>;
   token: symbol;
+  path: string;
 }
 
 interface FetchJsonOptions {
@@ -31,37 +40,47 @@ interface FetchJsonOptions {
 
 interface GetJsonFetcher {
   fetchJson<T>(baseUrl: string, path: string, options?: FetchJsonOptions): Promise<T>;
-  invalidateCache(): void;
+  invalidateCache(options?: CacheInvalidationOptions): void;
 }
 
 function createGetJsonFetcher(): GetJsonFetcher {
   const inFlight = new Map<string, InFlightGetResponse>();
   const successCache = new Map<string, CachedGetResponse>();
-  let invalidationGeneration = 0;
+  const forceRefreshPaths = new Set<string>();
+  const pathInvalidationGenerations = new Map<string, number>();
+  let broadInvalidationGeneration = 0;
+  let nextInvalidationGeneration = 0;
+
+  function invalidationGenerationForPath(path: string): number {
+    return Math.max(broadInvalidationGeneration, pathInvalidationGenerations.get(path) ?? 0);
+  }
 
   async function fetchJson<T>(baseUrl: string, path: string, options: FetchJsonOptions = {}): Promise<T> {
-    const url = `${baseUrl}${path}`;
+    const cachePath = normalizeApiCachePath(path);
+    const cacheKey = `${baseUrl}${cachePath}`;
+    const requestPath = consumeForceRefreshPath(forceRefreshPaths, path);
+    const requestUrl = `${baseUrl}${requestPath}`;
     const { signal, cacheable = true } = options;
-    if (!cacheable) return fetchJsonOnce<T>(url, signal);
+    if (!cacheable) return fetchJsonOnce<T>(requestUrl, signal);
 
-    const cached = successCache.get(url);
+    const cached = successCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return resolveCachedGet(cached.data as T, signal);
 
-    const pending = inFlight.get(url);
-    if (pending && pending.generation === invalidationGeneration) return resolveSharedGet(pending.promise as Promise<T>, signal);
+    const pending = inFlight.get(cacheKey);
+    if (pending && pending.generation === invalidationGenerationForPath(cachePath)) return resolveSharedGet(pending.promise as Promise<T>, signal);
 
-    const requestGeneration = invalidationGeneration;
-    const requestToken = Symbol(url);
-    const promise = fetchJsonOnce<T>(url).then((data) => {
-      const current = inFlight.get(url);
-      if (current?.token === requestToken && requestGeneration === invalidationGeneration) {
-        successCache.set(url, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS });
+    const requestGeneration = invalidationGenerationForPath(cachePath);
+    const requestToken = Symbol(cacheKey);
+    const promise = fetchJsonOnce<T>(requestUrl).then((data) => {
+      const current = inFlight.get(cacheKey);
+      if (current?.token === requestToken && requestGeneration === invalidationGenerationForPath(cachePath)) {
+        successCache.set(cacheKey, { data, expiresAt: Date.now() + GET_SUCCESS_CACHE_MS, path: cachePath });
       }
       return data;
     });
-    inFlight.set(url, { generation: requestGeneration, promise, token: requestToken });
+    inFlight.set(cacheKey, { generation: requestGeneration, promise, token: requestToken, path: cachePath });
     const clearIfCurrent = () => {
-      if (inFlight.get(url)?.token === requestToken) inFlight.delete(url);
+      if (inFlight.get(cacheKey)?.token === requestToken) inFlight.delete(cacheKey);
     };
     void promise.then(clearIfCurrent, clearIfCurrent);
     return resolveSharedGet(promise, signal);
@@ -69,12 +88,75 @@ function createGetJsonFetcher(): GetJsonFetcher {
 
   return {
     fetchJson,
-    invalidateCache() {
-      invalidationGeneration += 1;
-      successCache.clear();
-      inFlight.clear();
+    invalidateCache(options) {
+      const invalidatePaths = new Set(normalizedApiPaths(options?.forceRefreshHrefs ?? []));
+      rememberForceRefreshHrefs(forceRefreshPaths, options?.forceRefreshHrefs ?? []);
+      if (invalidatePaths.size === 0) {
+        broadInvalidationGeneration = ++nextInvalidationGeneration;
+        successCache.clear();
+        inFlight.clear();
+        return;
+      }
+      const invalidationGeneration = ++nextInvalidationGeneration;
+      for (const path of invalidatePaths) pathInvalidationGenerations.set(path, invalidationGeneration);
+      for (const [cacheKey, cached] of successCache) {
+        if (invalidatePaths.has(cached.path)) successCache.delete(cacheKey);
+      }
+      for (const [cacheKey, pending] of inFlight) {
+        if (invalidatePaths.has(pending.path)) inFlight.delete(cacheKey);
+      }
     },
   };
+}
+
+function normalizeApiCachePath(path: string): string {
+  return parseApiHref(path)?.pathname ?? path;
+}
+
+function normalizedApiPaths(hrefs: readonly string[]): readonly string[] {
+  const paths = new Set<string>();
+  for (const href of hrefs) {
+    const parsed = parseApiHref(href);
+    if (parsed) paths.add(parsed.pathname);
+  }
+  return [...paths];
+}
+
+function rememberForceRefreshHrefs(forceRefreshPaths: Set<string>, hrefs: readonly string[]): void {
+  for (const href of hrefs) {
+    const parsed = parseApiHref(href);
+    if (!parsed?.hasRefreshHint) continue;
+    forceRefreshPaths.add(parsed.pathname);
+  }
+}
+
+function consumeForceRefreshPath(forceRefreshPaths: Set<string>, path: string): string {
+  const parsed = parseApiHref(path);
+  if (!parsed || !forceRefreshPaths.delete(parsed.pathname)) return path;
+  return pathWithRefresh(path);
+}
+
+function parseApiHref(href: string): { pathname: string; hasRefreshHint: boolean } | null {
+  const trimmed = href.trim();
+  if (!trimmed) return null;
+  try {
+    const url = new URL(trimmed, "http://symphony.local");
+    if (!url.pathname.startsWith("/api/v1/web/")) return null;
+    return { pathname: url.pathname.replace(/\/+$/, ""), hasRefreshHint: isTruthyRefreshParam(url.searchParams.get("refresh")) };
+  } catch {
+    return null;
+  }
+}
+
+function pathWithRefresh(path: string): string {
+  const parsed = parseApiHref(path);
+  if (parsed?.hasRefreshHint) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}refresh=1`;
+}
+
+function isTruthyRefreshParam(value: string | null): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "force";
 }
 
 function resolveCachedGet<T>(data: T, signal?: AbortSignal): Promise<T> {
@@ -149,6 +231,13 @@ function parseProjectionChangeEvent(event: MessageEvent): ProjectionChangeEvent 
   return { type: event.type };
 }
 
+function realtimeEventSourceUrl(baseUrl: string, lastEventId: string | null): string {
+  const endpoint = `${baseUrl}/api/v1/realtime`;
+  const normalizedLastEventId = lastEventId?.trim();
+  if (!normalizedLastEventId) return endpoint;
+  return `${endpoint}?lastEventId=${encodeURIComponent(normalizedLastEventId)}`;
+}
+
 function normalizeReferenceRecord(record: Record<string, ApiReferenceEntry | null> | null | undefined) {
   return Object.fromEntries(
     Object.entries(record ?? {}).map(([key, entry]) => [
@@ -172,6 +261,9 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
   const getJsonFetcher = createGetJsonFetcher();
   const { fetchJson } = getJsonFetcher;
+  const realtimeEventSourceClient = createRealtimeEventSourceClient({
+    urlForLastEventId: (lastEventId) => realtimeEventSourceUrl(normalizedBaseUrl, lastEventId),
+  });
 
   return {
     async getReferenceData(signal) {
@@ -214,11 +306,14 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       if (!response.ok) throw new Error(`Symphony API returned HTTP ${response.status}`);
       return response.json() as Promise<ChatMessage[]>;
     },
-    invalidateCachedReads() {
-      getJsonFetcher.invalidateCache();
+    invalidateCachedReads(options) {
+      getJsonFetcher.invalidateCache(options);
     },
     subscribeToProjectionChanges(listener) {
       return openProjectionChangeSubscription(normalizedBaseUrl, listener);
+    },
+    subscribeToRealtimeEvents(listener, options) {
+      return realtimeEventSourceClient.subscribe(listener, options);
     },
   };
 }

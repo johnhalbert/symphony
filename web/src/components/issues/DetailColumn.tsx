@@ -1,5 +1,5 @@
 import type { IssueModel } from "../../types/symphony";
-import { Avatar, Icon, Label, Priority, STATUS_LABEL, StatusIcon } from "../common";
+import { Avatar, Icon, Label, Priority, STATUS_LABEL, StatusIcon, UnavailableButton } from "../common";
 import { useReferenceData } from "../../data/referenceDataContext";
 import { referenceDisplayName } from "../../data/referenceData";
 
@@ -56,12 +56,12 @@ export function DetailColumn({
       <div className="colhead">
         <h3 style={{ fontFamily: "var(--font-mono)", fontSize: 11.5, color: "var(--text-3)" }}>{issue.id}</h3>
         <div className="grow" />
-        <button className="icon-btn" title="Open in Linear" type="button">
+        <UnavailableButton className="icon-btn" unavailableLabel="Open in Linear" unavailableReason="issue navigation is unavailable until a safe Linear URL or command route exists">
           {Icon.link()}
-        </button>
-        <button className="icon-btn" title="More" type="button">
+        </UnavailableButton>
+        <UnavailableButton className="icon-btn" unavailableLabel="More" unavailableReason="issue action menus are unavailable until backend command routes exist">
           {Icon.more()}
-        </button>
+        </UnavailableButton>
         <button className="icon-btn" title="Close" type="button" onClick={onClose}>
           {Icon.close()}
         </button>
@@ -78,17 +78,17 @@ export function DetailColumn({
           </div>
           <h1 className="detail__title">{issue.title}</h1>
           <div className="detail__actions">
-            <button className="btn" type="button">
+            <span className="btn btn--readonly" title="Read-only status from the API issue detail." aria-label="Status value">
               <StatusIcon state={issue.status} />
               {STATUS_LABEL[issue.status]}
-            </button>
-            <button className="btn" type="button">
+            </span>
+            <span className="btn btn--readonly" title="Read-only priority from the API issue detail." aria-label="Priority value">
               <Priority level={issue.priority} />
               {priorityLabel(issue.priority)}
-            </button>
-            <button className="btn" type="button">
+            </span>
+            <span className="btn btn--readonly" title="Read-only assignee from the API issue detail." aria-label="Assignee value">
               <Avatar user={issue.assignee} /> {assigneeName}
-            </button>
+            </span>
           </div>
         </div>
         <div className="detail__body">

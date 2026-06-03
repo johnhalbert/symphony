@@ -232,9 +232,7 @@ function addGitHubCapabilityEnvironment(
 
   if (config.github.token !== null) {
     env.GITHUB_TOKEN = config.github.token;
-    return;
   }
-  env.GITHUB_TOKEN = "";
 }
 
 interface RawGitHubAppEnvironmentSource {

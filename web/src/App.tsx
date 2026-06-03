@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { AppChrome } from "./app/AppChrome";
 import { resolveAppResourceLoading } from "./app/resourceLoading";
 import { ThemeFrame } from "./app/ThemeFrame";
@@ -7,7 +7,7 @@ import { SidebarViews } from "./components/sidebar/SidebarViews";
 import { ChatHistoryView } from "./components/history/ChatHistoryView";
 import { DashboardView } from "./components/dashboard/DashboardView";
 import { IssuesView } from "./components/issues/IssuesView";
-import { DataSourceProvider, defaultDataSourceConfig, useDataSource } from "./data/dataSourceContext";
+import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
 import { fallbackReferenceData, ReferenceDataProvider } from "./data/referenceDataContext";
 import {
   useDashboard,
@@ -17,6 +17,7 @@ import {
   useReferenceData as useReferenceResource,
   useSidebar,
 } from "./hooks/useSymphonyData";
+import { combineLiveResourceTokens, useLiveResourceState, type LiveResourceKey, type LiveResourceTokenMap } from "./hooks/useLiveResource";
 import type {
   AppTab,
   DashboardVariant,
@@ -72,20 +73,8 @@ function referenceStatusLabel(reference: { data: ReferenceData | null; loading: 
   return null;
 }
 
-function useProjectionRefreshToken(enabled: boolean): number {
-  const dataSource = useDataSource();
-  const [refreshToken, setRefreshToken] = useState(0);
-
-  useEffect(() => {
-    if (!enabled || !dataSource.subscribeToProjectionChanges) return undefined;
-    return dataSource.subscribeToProjectionChanges((event) => {
-      if (event.type !== "projection_revision") return;
-      dataSource.invalidateCachedReads?.();
-      setRefreshToken((current) => current + 1);
-    });
-  }, [dataSource, enabled]);
-
-  return refreshToken;
+function liveRefreshToken(tokens: LiveResourceTokenMap, keys: readonly LiveResourceKey[]) {
+  return combineLiveResourceTokens(tokens, keys);
 }
 
 function resourceOptions(enabled: boolean, refreshToken: number) {
@@ -106,17 +95,26 @@ function AppShell({
   const [sidebarVariant, setSidebarVariant] = useState<SidebarVariant>("primary");
   const apiMode = defaultDataSourceConfig.mode === "api";
   const resourceLoading = resolveAppResourceLoading(activeTab, apiMode);
-  const projectionRefreshToken = useProjectionRefreshToken(apiMode);
+  const liveState = useLiveResourceState(apiMode);
+  const liveTokens = liveState.tokens;
+  const referenceRefreshToken = liveRefreshToken(liveTokens, ["referenceData"]);
+  const dashboardRefreshToken = liveRefreshToken(liveTokens, ["dashboard"]);
+  const issueBoardRefreshToken = liveRefreshToken(liveTokens, ["issueBoard"]);
+  const issueDetailRefreshToken = liveRefreshToken(liveTokens, ["issueDetail", "issueBoard"]);
+  const historyRefreshToken = liveRefreshToken(liveTokens, ["history"]);
+  const transcriptRefreshToken = liveRefreshToken(liveTokens, ["sessionTranscript", "history"]);
+  const sidebarRefreshToken = liveRefreshToken(liveTokens, ["sidebar"]);
+  const orchestratorChatRefreshToken = liveRefreshToken(liveTokens, ["orchestratorChat"]);
 
-  const reference = useReferenceResource(resourceOptions(lazyReferenceData && resourceLoading.referenceData, projectionRefreshToken));
+  const reference = useReferenceResource(resourceOptions(lazyReferenceData && resourceLoading.referenceData, referenceRefreshToken));
   const referenceData = lazyReferenceData ? (reference.data ?? initialReferenceData) : initialReferenceData;
   const referenceLabel = lazyReferenceData ? referenceStatusLabel(reference) : null;
-  const dashboard = useDashboard(resourceOptions(resourceLoading.dashboard, projectionRefreshToken));
-  const issueBoard = useIssueBoard(resourceOptions(resourceLoading.issueBoard, projectionRefreshToken));
-  const history = useHistory(resourceOptions(resourceLoading.history, projectionRefreshToken));
+  const dashboard = useDashboard(resourceOptions(resourceLoading.dashboard, dashboardRefreshToken));
+  const issueBoard = useIssueBoard(resourceOptions(resourceLoading.issueBoard, issueBoardRefreshToken));
+  const history = useHistory(resourceOptions(resourceLoading.history, historyRefreshToken));
   const sidebarEnabled = resourceLoading.sidebar || (apiMode && Boolean(dashboard.error));
-  const sidebar = useSidebar(resourceOptions(sidebarEnabled, projectionRefreshToken));
-  const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, projectionRefreshToken));
+  const sidebar = useSidebar(resourceOptions(sidebarEnabled, sidebarRefreshToken));
+  const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, orchestratorChatRefreshToken));
   const dashboardChrome = dashboard.data;
   const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
   const tabBadges = resolveTabBadges(issueBoard.data, history.data);
@@ -133,7 +131,7 @@ function AppShell({
           branch={dashboardChrome?.branch ?? ""}
           pollLabel={dashboardChrome?.pollLabel ?? "poll unavailable"}
           agentUsageLabel={dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`}
-          connectionStatusLabel={dashboardChrome?.metrics?.health?.connectionLabel ?? undefined}
+          connectionStatusLabel={apiMode ? liveState.realtimeStatus.label : (dashboardChrome?.metrics?.health?.connectionLabel ?? undefined)}
           errorStatusLabel={dashboardChrome?.metrics?.health?.errorSummaryLabel ?? undefined}
           dataSourceLabel={[
             `api source · ${defaultDataSourceConfig.mode}`,
@@ -156,7 +154,7 @@ function AppShell({
           }
         >
           {activeTab === "dashboard"
-            ? renderLoadable(dashboard, (data) => (
+            ? renderLoadable(dashboard, "dashboard", (data) => (
                 <DashboardView
                   dashboard={data}
                   variant={dashboardVariant}
@@ -168,13 +166,13 @@ function AppShell({
               ))
             : null}
           {activeTab === "issues"
-            ? renderLoadable(issueBoard, (data) => <IssuesView board={data} variant={issuesVariant} refreshToken={projectionRefreshToken} />)
+            ? renderLoadable(issueBoard, "issue board", (data) => <IssuesView board={data} variant={issuesVariant} refreshToken={issueDetailRefreshToken} />)
             : null}
           {activeTab === "history"
-            ? renderLoadable(history, (data) => <ChatHistoryView history={data} variant={historyVariant} refreshToken={projectionRefreshToken} />)
+            ? renderLoadable(history, "history", (data) => <ChatHistoryView history={data} variant={historyVariant} refreshToken={transcriptRefreshToken} />)
             : null}
           {activeTab === "sidebar"
-            ? renderLoadable(sidebar, (data) => (
+            ? renderLoadable(sidebar, "sidebar", (data) => (
                 <SidebarViews
                   sidebar={data}
                   variant={sidebarVariant}
@@ -200,12 +198,53 @@ function AppShell({
 
 function renderLoadable<T>(
   resource: { data: T | null; loading: boolean; error: string | null },
+  name: string,
   render: (data: T) => JSX.Element,
 ) {
-  if (resource.loading && !resource.data) return <div className="view-loading">Loading...</div>;
-  if (resource.error) return <div className="view-error">{resource.error}</div>;
-  if (!resource.data) return <div className="view-empty">No data.</div>;
-  return render(resource.data);
+  if (resource.data !== null) {
+    const content = render(resource.data);
+    if (resource.error) {
+      return (
+        <>
+          <ResourceStatusBanner
+            severity="error"
+            title={`Could not refresh ${name}`}
+            detail={`${resource.error} Showing previous ${name} data.`}
+          />
+          {content}
+        </>
+      );
+    }
+    if (resource.loading) {
+      return (
+        <>
+          <ResourceStatusBanner severity="info" title={`Refreshing ${name}`} detail={`Showing previous ${name} data while Symphony reloads.`} />
+          {content}
+        </>
+      );
+    }
+    return content;
+  }
+  if (resource.loading) return <div className="view-loading">Loading {name}...</div>;
+  if (resource.error) return <div className="view-error">Could not load {name}: {resource.error}</div>;
+  return <div className="view-empty">No {name} data.</div>;
+}
+
+function ResourceStatusBanner({
+  severity,
+  title,
+  detail,
+}: {
+  severity: "info" | "error";
+  title: string;
+  detail: string;
+}) {
+  return (
+    <div className="resource-status-banner" data-severity={severity}>
+      <strong>{title}</strong>
+      <span>{detail}</span>
+    </div>
+  );
 }
 
 function ViewControls({

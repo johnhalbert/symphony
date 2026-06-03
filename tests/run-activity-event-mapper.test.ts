@@ -180,6 +180,74 @@ describe("mapAgentEventToRunActivityEvent", () => {
     expect(serialized).not.toContain("legacy assistant chunk");
   });
 
+  it("maps ACP user replay and reasoning chunks without coercing them into assistant message deltas", () => {
+    const userReplay = mapAgentEventToRunActivityEvent({
+      type: "progress",
+      activitySource: "stream",
+      message: "Hermes ACP user message replay",
+      runActivity: {
+        eventId: "run-1:activity:3",
+        runSessionId: "profile:acp-session-1:run-1",
+        occurredAt: "2026-05-31T00:00:03.000Z",
+        sequence: 3,
+        sequenceSource: "harness",
+        externalEventId: "upstream-3",
+        protocol: "acp",
+        harness: "hermes-acp",
+        actor: "user",
+        channel: "chat",
+        kind: "user_message_submitted",
+        text: "Do work token=SECRET_USER_TOKEN",
+        payload: { runtimeSessionId: "acp-session-1", replay: true, messagePreview: "Do work token=SECRET_USER_TOKEN" },
+      },
+    });
+    const reasoning = mapAgentEventToRunActivityEvent({
+      type: "progress",
+      activitySource: "stream",
+      message: "Hermes ACP thought update",
+      runActivity: acpRunActivity({
+        eventId: "run-1:activity:4",
+        sequence: 4,
+        externalEventId: "upstream-4",
+        kind: "assistant_reasoning_delta",
+        text: "Hermes ACP thought update",
+        payload: { runtimeSessionId: "acp-session-1", delta: true, reasoning: true, messagePreview: "private thought token=SECRET_THOUGHT_TOKEN" },
+      }),
+    });
+
+    expect(userReplay).toMatchObject({
+      eventType: "user_message_submitted",
+      message: "Do work token=[redacted]",
+      payload: {
+        kind: "user_message_submitted",
+        actor: "user",
+        channel: "chat",
+        replay: true,
+        messagePreview: "Do work token=[redacted]",
+        textPreview: "Do work token=[redacted]",
+        redacted: true,
+      },
+    });
+    expect(reasoning).toMatchObject({
+      eventType: "assistant_reasoning_delta",
+      message: "Hermes ACP thought update",
+      payload: {
+        kind: "assistant_reasoning_delta",
+        actor: "assistant",
+        channel: "chat",
+        delta: true,
+        reasoning: true,
+        messagePreview: "private thought token=[redacted]",
+        textPreview: "Hermes ACP thought update",
+        redacted: true,
+      },
+    });
+    expect([userReplay.eventType, reasoning.eventType]).not.toEqual(expect.arrayContaining(["assistant_message_delta"]));
+    const serialized = JSON.stringify([userReplay, reasoning]);
+    expect(serialized).not.toContain("SECRET_USER_TOKEN");
+    expect(serialized).not.toContain("SECRET_THOUGHT_TOKEN");
+  });
+
   it("falls back to legacy AgentEvent mapping when harness-provided activity metadata is malformed", () => {
     const malformedActivity = { ...acpRunActivity(), channel: "message" } as unknown as RunActivityEvent;
 

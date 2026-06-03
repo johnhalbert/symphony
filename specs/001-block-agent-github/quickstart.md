@@ -22,13 +22,36 @@ Use this plan for ENG-243 implementation work only:
 
 ## Local Validation
 
-Run the focused checks that match the active Linear subissue. For final targeted validation, run the policy-facing suite:
+Run the focused checks that match the active Linear subissue.
+
+For the Checkpoint A / Issue 10 / T029 US1 upstream-deny validation subissue, run the present US1 command-policy suite:
+
+```powershell
+npm run typecheck
+npm test -- tests/agent-command-policy-upstream.test.ts tests/agent-command-policy-disguised.test.ts tests/agent-command-policy-execute-code.test.ts
+npm test -- tests/agent-command-policy-hook-runner.test.ts tests/agent-command-policy-cli.test.ts tests/agent-command-policy-acp-resolver.test.ts
+npm test -- tests/hermes-command-policy-profile.test.ts tests/hermes-delegated-command-policy.test.ts tests/hermes-template-policy.test.ts tests/hermes-mcp-config.test.ts
+npm test -- tests/hermes-acp-harness.test.ts tests/hermes-mcp-config.test.ts tests/hermes-template-policy.test.ts
+```
+
+This Checkpoint A subset validates direct and disguised upstream denials, `execute_code`, ACP permission resolution, Hermes hook/CLI behavior, gateway/TUI profile hook installation, delegated subagent and command reducer inheritance, and broader ACP harness wiring. Later US2 local-inspection/config, US3 service-boundary, and US4 audit/replay suites remain separate subissue validation until those files exist.
+
+For the Checkpoint B / Issue 15 / T041 US2 local-inspection targeted validation subissue, run the present US2 command-policy suite:
+
+```powershell
+npm run typecheck
+npm test -- tests/agent-command-policy-local-inspection.test.ts tests/agent-command-policy-git-config.test.ts tests/agent-command-policy-fake-helper.test.ts tests/agent-command-policy-hook-runner-local.test.ts
+```
+
+This Checkpoint B subset validates helper-free local status/diff/log/show/branch/blame allow decisions, unsafe inline and inherited environment denial, per-command Git config denial, persisted repo/user fake-helper fail-closed behavior, selected worktree config inspection, hook-runner working-directory resolution, and redacted hook environment propagation.
+
+For final targeted validation after the later user-story test files exist, run the full policy-facing suite:
 
 ```powershell
 npm run typecheck
 npm test -- tests/agent-command-policy-upstream.test.ts tests/agent-command-policy-disguised.test.ts tests/agent-command-policy-execute-code.test.ts tests/agent-command-policy-local-inspection.test.ts tests/agent-command-policy-git-config.test.ts tests/agent-command-policy-fake-helper.test.ts
 npm test -- tests/agent-command-policy-hook-runner.test.ts tests/agent-command-policy-hook-runner-local.test.ts tests/agent-command-policy-cli.test.ts
-npm test -- tests/hermes-acp-command-policy.test.ts tests/hermes-command-policy-profile.test.ts tests/hermes-delegated-command-policy.test.ts tests/hermes-template-policy.test.ts tests/hermes-mcp-config.test.ts
+npm test -- tests/agent-command-policy-acp-resolver.test.ts tests/hermes-acp-harness.test.ts tests/hermes-command-policy-profile.test.ts tests/hermes-delegated-command-policy.test.ts tests/hermes-template-policy.test.ts tests/hermes-mcp-config.test.ts
 npm test -- tests/mcp-subprocess-environment-command-policy.test.ts tests/completion-report-mcp-command-policy.test.ts tests/review-feedback-mcp-command-policy.test.ts tests/github-service-boundary-command-policy.test.ts
 npm test -- tests/run-activity-event-command-policy.test.ts tests/transcript-replay-command-policy.test.ts tests/web-transcript-projection-command-policy.test.ts
 ```

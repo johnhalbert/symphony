@@ -1,23 +1,40 @@
 import type { ServerResponse } from "node:http";
 import type { WebProjectionSourceRevision } from "./WebProjectionContext.js";
 
-export type RealtimeProjectionEventType =
-  | "projection.updated"
-  | "run.updated"
-  | "transcript.delta"
-  | "orchestrator.message"
-  | "source.status";
+export const REALTIME_EVENT_SCHEMA = "symphony.realtime.v1" as const;
+export const REALTIME_EVENT_SCHEMA_VERSION = 1 as const;
+
+export const REALTIME_PROJECTION_EVENT_TYPES = [
+  "projection.updated",
+  "run.updated",
+  "transcript.delta",
+  "orchestrator.message",
+  "source.status",
+] as const;
+
+export type RealtimeProjectionEventType = (typeof REALTIME_PROJECTION_EVENT_TYPES)[number];
+
+export const REALTIME_RESOURCE_KINDS = [
+  "dashboard",
+  "issue-board",
+  "issue-detail",
+  "history",
+  "sidebar",
+  "session-transcript",
+  "orchestrator-chat",
+  "source",
+] as const;
+
+export type RealtimeResourceKind = (typeof REALTIME_RESOURCE_KINDS)[number];
+
+export const REALTIME_EVENT_SCOPES = ["global", "source", "run", "session", "orchestrator"] as const;
+
+export type RealtimeProjectionEventScope = (typeof REALTIME_EVENT_SCOPES)[number];
+
+export type RealtimeProjectionEventDetail = Record<string, unknown>;
 
 export interface RealtimeProjectionResource {
-  kind:
-    | "dashboard"
-    | "issue-board"
-    | "issue-detail"
-    | "history"
-    | "sidebar"
-    | "session-transcript"
-    | "orchestrator-chat"
-    | "source";
+  kind: RealtimeResourceKind;
   href: string;
   relation: "refetch" | "template";
 }
@@ -29,26 +46,89 @@ export interface RealtimeProjectionRecoveryHint {
   endpoints: readonly string[];
 }
 
-export interface RealtimeProjectionEvent {
+interface RealtimePayloadBase {
+  source: string;
+  sourceRevision: string | number;
+  detail: RealtimeProjectionEventDetail | null;
+}
+
+export interface RealtimeProjectionUpdatedPayload extends RealtimePayloadBase {
+  resourceKinds: readonly RealtimeResourceKind[];
+  resourcesChanged: readonly RealtimeResourceKind[];
+}
+
+export interface RealtimeRunUpdatedPayload extends RealtimePayloadBase {
+  runId: string | null;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  status: string | null;
+}
+
+export interface RealtimeTranscriptDeltaPayload extends RealtimePayloadBase {
+  runId: string | null;
+  sessionId: string | null;
+  afterSequence: number | null;
+  eventCount: number | null;
+}
+
+export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase {
+  conversationId: string | null;
+  messageCount: number | null;
+  inputLength: number | null;
+  status: number | null;
+  lastMessageId: string | null;
+  lastMessageStatus: string | null;
+  lastMessageAt: string | null;
+}
+
+export interface RealtimeSourceStatusPayload extends RealtimePayloadBase {
+  status: string | null;
+  fetchedStates: readonly string[];
+  fetchedAt: string | null;
+  cached: boolean | null;
+  error: { code: string; message: string } | null;
+  issueCount: number | null;
+  sourceRevisions: readonly Readonly<Record<string, unknown>>[];
+  sourceCursors: Readonly<Record<string, unknown>> | null;
+  sourceFreshness: readonly Readonly<Record<string, unknown>>[];
+}
+
+export interface RealtimeProjectionEventPayloadByType {
+  "projection.updated": RealtimeProjectionUpdatedPayload;
+  "run.updated": RealtimeRunUpdatedPayload;
+  "transcript.delta": RealtimeTranscriptDeltaPayload;
+  "orchestrator.message": RealtimeOrchestratorMessagePayload;
+  "source.status": RealtimeSourceStatusPayload;
+}
+
+export type RealtimeProjectionEventPayload = RealtimeProjectionEventPayloadByType[RealtimeProjectionEventType];
+
+export interface RealtimeProjectionEvent<TType extends RealtimeProjectionEventType = RealtimeProjectionEventType> {
+  schema: typeof REALTIME_EVENT_SCHEMA;
+  schemaVersion: typeof REALTIME_EVENT_SCHEMA_VERSION;
   id: string;
-  type: RealtimeProjectionEventType;
+  type: TType;
   revision: number;
   createdAt: string;
+  scope: RealtimeProjectionEventScope;
+  key: string | null;
   source: WebProjectionSourceRevision;
   resources: readonly RealtimeProjectionResource[];
   recovery: RealtimeProjectionRecoveryHint;
   missedEvents: boolean;
-  detail: Record<string, unknown> | null;
+  payload: RealtimeProjectionEventPayloadByType[TType];
+  /** @deprecated Use the typed payload field. Kept for current web invalidation/detail consumers. */
+  detail: RealtimeProjectionEventDetail | null;
 }
 
-export interface RealtimeProjectionEventInput {
-  type: RealtimeProjectionEventType;
+export interface RealtimeProjectionEventInput<TType extends RealtimeProjectionEventType = RealtimeProjectionEventType> {
+  type: TType;
   source: WebProjectionSourceRevision;
   resources?: readonly RealtimeProjectionResource[];
   recoveryReason?: RealtimeProjectionRecoveryHint["reason"];
   lastEventId?: string | null;
   missedEvents?: boolean;
-  detail?: Record<string, unknown> | null;
+  detail?: RealtimeProjectionEventDetail | null;
 }
 
 export interface RealtimeProjectionEventBusOptions {
@@ -74,6 +154,7 @@ export class RealtimeProjectionEventBus {
   private readonly subscribers = new Map<number, (event: RealtimeProjectionEvent) => void>();
   private readonly streamClosers = new Set<() => void>();
   private readonly history: RealtimeProjectionEvent[] = [];
+  private readonly recoveryCursors = new Map<string, number>();
   private readonly clock: () => Date;
   private readonly historyLimit: number;
   private nextSubscriberId = 0;
@@ -96,10 +177,11 @@ export class RealtimeProjectionEventBus {
     for (const close of [...this.streamClosers]) close();
   }
 
-  publish(input: RealtimeProjectionEventInput): RealtimeProjectionEvent {
+  publish<TType extends RealtimeProjectionEventType>(input: RealtimeProjectionEventInput<TType>): RealtimeProjectionEvent<TType> {
     const event = this.createEvent(input);
     this.history.push(event);
     while (this.history.length > this.historyLimit) this.history.shift();
+    this.pruneRecoveryCursors();
     for (const listener of this.subscribers.values()) {
       try {
         listener(event);
@@ -116,11 +198,12 @@ export class RealtimeProjectionEventBus {
         type,
         source: revision,
         resources: realtimeResourcesForEventType(type),
+        detail: revision.detail ?? null,
       }),
     );
   }
 
-  publishOrchestratorMessage(detail: Record<string, unknown> | null = null): RealtimeProjectionEvent[] {
+  publishOrchestratorMessage(detail: RealtimeProjectionEventDetail | null = null): RealtimeProjectionEvent[] {
     const source = this.realtimeSourceRevision("orchestrator-chat");
     return [
       this.publish({
@@ -190,16 +273,29 @@ export class RealtimeProjectionEventBus {
   private replayEvents(lastEventId: string | null): RealtimeProjectionEvent[] {
     const normalizedLastEventId = normalizeSseId(lastEventId);
     if (!normalizedLastEventId) return [];
-    if (this.history.length === 0) return [this.createMissedEventsRecovery(normalizedLastEventId)];
 
     const knownIndex = this.history.findIndex((event) => event.id === normalizedLastEventId);
     if (knownIndex >= 0) return this.history.slice(knownIndex + 1);
 
+    const recoveryCursorRevision = this.recoveryCursors.get(normalizedLastEventId);
+    if (recoveryCursorRevision !== undefined) {
+      const replay = this.replayAfterKnownRevision(recoveryCursorRevision);
+      if (replay) return replay;
+      this.recoveryCursors.delete(normalizedLastEventId);
+    }
+
     return [this.createMissedEventsRecovery(normalizedLastEventId)];
   }
 
+  private replayAfterKnownRevision(revision: number): RealtimeProjectionEvent[] | null {
+    if (this.history.length === 0) return [];
+    const earliestReplayableRevision = this.history[0]?.revision;
+    if (earliestReplayableRevision === undefined || revision < earliestReplayableRevision - 1) return null;
+    return this.history.filter((event) => event.revision > revision);
+  }
+
   private createMissedEventsRecovery(lastEventId: string): RealtimeProjectionEvent {
-    return this.createEvent({
+    const event = this.createEvent({
       type: "projection.updated",
       source: this.realtimeSourceRevision("realtime-recovery"),
       resources: realtimeResourcesForEventType("projection.updated"),
@@ -208,6 +304,27 @@ export class RealtimeProjectionEventBus {
       missedEvents: true,
       detail: { lastEventId },
     });
+    this.rememberRecoveryCursor(event);
+    return event;
+  }
+
+  private rememberRecoveryCursor(event: RealtimeProjectionEvent): void {
+    this.recoveryCursors.set(event.id, event.revision);
+    this.pruneRecoveryCursors();
+  }
+
+  private pruneRecoveryCursors(): void {
+    const earliestReplayableRevision = this.history[0]?.revision;
+    for (const [cursor, revision] of this.recoveryCursors) {
+      if (earliestReplayableRevision !== undefined && revision < earliestReplayableRevision - 1) {
+        this.recoveryCursors.delete(cursor);
+      }
+    }
+    while (this.recoveryCursors.size > this.historyLimit) {
+      const oldestCursor = this.recoveryCursors.keys().next().value;
+      if (oldestCursor === undefined) return;
+      this.recoveryCursors.delete(oldestCursor);
+    }
   }
 
   private realtimeSourceRevision(source: string): WebProjectionSourceRevision {
@@ -218,15 +335,22 @@ export class RealtimeProjectionEventBus {
     };
   }
 
-  private createEvent(input: RealtimeProjectionEventInput): RealtimeProjectionEvent {
+  private createEvent<TType extends RealtimeProjectionEventType>(input: RealtimeProjectionEventInput<TType>): RealtimeProjectionEvent<TType> {
     const revision = ++this.nextRevision;
     const resources = input.resources ?? realtimeResourcesForEventType(input.type);
+    const source = normalizeRealtimeSourceRevision(input.source);
+    const detail = normalizeRealtimeDetail(input.detail ?? null);
+    const scope = realtimeScopeForEvent(input.type, source, detail);
     return {
+      schema: REALTIME_EVENT_SCHEMA,
+      schemaVersion: REALTIME_EVENT_SCHEMA_VERSION,
       id: String(revision),
       type: input.type,
       revision,
       createdAt: this.clock().toISOString(),
-      source: normalizeRealtimeSourceRevision(input.source),
+      scope: scope.scope,
+      key: scope.key,
+      source,
       resources,
       recovery: {
         strategy: "refetch",
@@ -235,15 +359,35 @@ export class RealtimeProjectionEventBus {
         endpoints: resources.map((resource) => resource.href),
       },
       missedEvents: input.missedEvents ?? false,
-      detail: input.detail ?? null,
+      payload: realtimePayloadForEvent(input.type, source, resources, detail),
+      detail,
     };
   }
+}
+
+export function serializeRealtimeEventData(event: RealtimeProjectionEvent): string {
+  return JSON.stringify({
+    schema: event.schema,
+    schemaVersion: event.schemaVersion,
+    id: event.id,
+    type: event.type,
+    revision: event.revision,
+    createdAt: event.createdAt,
+    scope: event.scope,
+    key: event.key,
+    source: event.source,
+    resources: event.resources,
+    recovery: event.recovery,
+    missedEvents: event.missedEvents,
+    payload: event.payload,
+    detail: event.detail,
+  });
 }
 
 export function serializeSseEvent(event: RealtimeProjectionEvent): string {
   const id = sanitizeSseField(event.id);
   const type = sanitizeSseField(event.type);
-  const data = JSON.stringify(event);
+  const data = serializeRealtimeEventData(event);
   return [`id: ${id}`, `event: ${type}`, ...data.split(/\r?\n/).map((line) => `data: ${line}`), "", ""].join("\n");
 }
 
@@ -287,26 +431,204 @@ export function realtimeResourcesForEventType(type: RealtimeProjectionEventType)
   }
 }
 
+function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
+  type: TType,
+  source: WebProjectionSourceRevision,
+  resources: readonly RealtimeProjectionResource[],
+  detail: RealtimeProjectionEventDetail | null,
+): RealtimeProjectionEventPayloadByType[TType] {
+  const base = realtimePayloadBase(source, detail);
+  switch (type) {
+    case "projection.updated": {
+      const resourceKinds = realtimeResourceKinds(resources);
+      return {
+        ...base,
+        resourceKinds,
+        resourcesChanged: readResourceKinds(detail, "resourcesChanged") ?? resourceKinds,
+      } as RealtimeProjectionEventPayloadByType[TType];
+    }
+    case "run.updated":
+      return {
+        ...base,
+        runId: readStringDetail(detail, "runId") ?? readStringDetail(detail, "id"),
+        issueId: readStringDetail(detail, "issueId"),
+        issueIdentifier: readStringDetail(detail, "issueIdentifier"),
+        status: readStringDetail(detail, "status"),
+      } as RealtimeProjectionEventPayloadByType[TType];
+    case "transcript.delta":
+      return {
+        ...base,
+        runId: readStringDetail(detail, "runId"),
+        sessionId: readStringDetail(detail, "sessionId"),
+        afterSequence: readNumberDetail(detail, "afterSequence"),
+        eventCount: readNumberDetail(detail, "eventCount"),
+      } as RealtimeProjectionEventPayloadByType[TType];
+    case "orchestrator.message":
+      return {
+        ...base,
+        conversationId: readStringDetail(detail, "conversationId"),
+        messageCount: readNumberDetail(detail, "messageCount"),
+        inputLength: readNumberDetail(detail, "inputLength"),
+        status: readNumberDetail(detail, "status"),
+        lastMessageId: readStringDetail(detail, "lastMessageId"),
+        lastMessageStatus: readStringDetail(detail, "lastMessageStatus"),
+        lastMessageAt: readStringDetail(detail, "lastMessageAt"),
+      } as RealtimeProjectionEventPayloadByType[TType];
+    case "source.status": {
+      const primaryFreshness = primarySourceFreshness(detail);
+      return {
+        ...base,
+        status: readStringDetail(detail, "status") ?? readStringRecordField(primaryFreshness, "status"),
+        fetchedStates: readStringArrayDetail(detail, "fetchedStates"),
+        fetchedAt:
+          readStringDetail(detail, "fetchedAt") ??
+          readStringDetail(detail, "checkedAt") ??
+          readStringRecordField(primaryFreshness, "checkedAt"),
+        cached: readBooleanDetail(detail, "cached"),
+        error: readErrorDetail(detail, "error"),
+        issueCount: readNumberDetail(detail, "issueCount"),
+        sourceRevisions: readRecordArrayDetail(detail, "sourceRevisions"),
+        sourceCursors: readRecordDetail(detail, "sourceCursors"),
+        sourceFreshness: readRecordArrayDetail(detail, "sourceFreshness"),
+      } as RealtimeProjectionEventPayloadByType[TType];
+    }
+  }
+}
+
+function realtimePayloadBase(
+  source: WebProjectionSourceRevision,
+  detail: RealtimeProjectionEventDetail | null,
+): RealtimePayloadBase {
+  return { source: source.source, sourceRevision: source.revision, detail };
+}
+
+function realtimeScopeForEvent(
+  type: RealtimeProjectionEventType,
+  source: WebProjectionSourceRevision,
+  detail: RealtimeProjectionEventDetail | null,
+): { scope: RealtimeProjectionEventScope; key: string | null } {
+  switch (type) {
+    case "run.updated":
+      return { scope: "run", key: readStringDetail(detail, "runId") ?? readStringDetail(detail, "id") };
+    case "transcript.delta":
+      return { scope: "session", key: readStringDetail(detail, "sessionId") ?? readStringDetail(detail, "runId") };
+    case "orchestrator.message":
+      return { scope: "orchestrator", key: readStringDetail(detail, "conversationId") };
+    case "source.status":
+      return { scope: "source", key: readStringDetail(detail, "source") ?? source.source };
+    case "projection.updated":
+    default:
+      return { scope: "global", key: null };
+  }
+}
+
+function realtimeResourceKinds(resources: readonly RealtimeProjectionResource[]): readonly RealtimeResourceKind[] {
+  return [...new Set(resources.map((resource) => resource.kind))];
+}
+
+function readResourceKinds(detail: RealtimeProjectionEventDetail | null, key: string): readonly RealtimeResourceKind[] | null {
+  const value = detail?.[key];
+  if (!Array.isArray(value)) return null;
+  const kinds = value.filter((item): item is RealtimeResourceKind => typeof item === "string" && isRealtimeResourceKind(item));
+  return kinds.length > 0 ? [...new Set(kinds)] : null;
+}
+
+function readStringDetail(detail: RealtimeProjectionEventDetail | null, key: string): string | null {
+  const value = detail?.[key];
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function readStringArrayDetail(detail: RealtimeProjectionEventDetail | null, key: string): readonly string[] {
+  const value = detail?.[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function readNumberDetail(detail: RealtimeProjectionEventDetail | null, key: string): number | null {
+  const value = detail?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readBooleanDetail(detail: RealtimeProjectionEventDetail | null, key: string): boolean | null {
+  const value = detail?.[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+function readErrorDetail(detail: RealtimeProjectionEventDetail | null, key: string): { code: string; message: string } | null {
+  const value = detail?.[key];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as { code?: unknown; message?: unknown };
+  return typeof candidate.code === "string" && typeof candidate.message === "string"
+    ? { code: candidate.code, message: candidate.message }
+    : null;
+}
+
+function readRecordDetail(detail: RealtimeProjectionEventDetail | null, key: string): Readonly<Record<string, unknown>> | null {
+  const value = detail?.[key];
+  return isRecord(value) ? value : null;
+}
+
+function readRecordArrayDetail(
+  detail: RealtimeProjectionEventDetail | null,
+  key: string,
+): readonly Readonly<Record<string, unknown>>[] {
+  const value = detail?.[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Readonly<Record<string, unknown>> => isRecord(item));
+}
+
+function primarySourceFreshness(detail: RealtimeProjectionEventDetail | null): Readonly<Record<string, unknown>> | null {
+  return readRecordArrayDetail(detail, "sourceFreshness")[0] ?? null;
+}
+
+function readStringRecordField(record: Readonly<Record<string, unknown>> | null, key: string): string | null {
+  const value = record?.[key];
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
 function realtimeEventTypesForSourceRevision(revision: WebProjectionSourceRevision): readonly RealtimeProjectionEventType[] {
   const source = revision.source.trim().toLowerCase();
+  const projectionName = readStringDetail(revision.detail ?? null, "projectionName")?.toLowerCase() ?? null;
   const types: RealtimeProjectionEventType[] = ["projection.updated", "source.status"];
-  if (source === "runs" || source === "runstore" || source === "transcript") {
+  if (isTranscriptRealtimeSource(source, projectionName)) {
     types.push("run.updated", "transcript.delta");
   }
-  if (isOrchestratorChatRealtimeSource(source)) {
+  if (isOrchestratorChatRealtimeSource(source, projectionName)) {
     types.push("orchestrator.message");
   }
   return types;
 }
 
-function isOrchestratorChatRealtimeSource(source: string): boolean {
+function isTranscriptRealtimeSource(source: string, projectionName: string | null): boolean {
+  return (
+    source === "runs" ||
+    source === "runstore" ||
+    source === "transcript" ||
+    source === "run_activity" ||
+    source === "run-activity" ||
+    projectionName === "transcript_projection" ||
+    source.startsWith("transcript_projection:")
+  );
+}
+
+function isOrchestratorChatRealtimeSource(source: string, projectionName: string | null = null): boolean {
   return (
     source === "orchestrator-chat" ||
     source === "chat" ||
     source === "orchestrator_conversations" ||
     source.startsWith("orchestrator_conversations:") ||
-    source.startsWith("orchestrator_chat:")
+    source.startsWith("orchestrator_chat:") ||
+    projectionName === "orchestrator_chat_projection" ||
+    source.startsWith("orchestrator_chat_projection:")
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function normalizeRealtimeSourceRevision(revision: WebProjectionSourceRevision): WebProjectionSourceRevision {
@@ -317,6 +639,10 @@ function normalizeRealtimeSourceRevision(revision: WebProjectionSourceRevision):
   };
 }
 
+function normalizeRealtimeDetail(detail: RealtimeProjectionEventDetail | null): RealtimeProjectionEventDetail | null {
+  return detail && typeof detail === "object" && !Array.isArray(detail) ? detail : null;
+}
+
 function normalizeSseId(value: string | null | undefined): string | null {
   const normalized = value?.trim();
   return normalized && normalized.length > 0 ? sanitizeSseField(normalized) : null;
@@ -324,4 +650,8 @@ function normalizeSseId(value: string | null | undefined): string | null {
 
 function sanitizeSseField(value: string): string {
   return value.replace(/[\r\n]/g, " ");
+}
+
+function isRealtimeResourceKind(kind: string): kind is RealtimeResourceKind {
+  return REALTIME_RESOURCE_KINDS.some((candidate) => candidate === kind);
 }

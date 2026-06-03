@@ -557,6 +557,41 @@ describe("ProjectionTransactionService", () => {
     expect(runner.sqls[0]).toContain("revision.superseded_at IS NULL");
   });
 
+  it("reads the current Postgres transcript default page by run id and bounded tail limit", async () => {
+    const runner = new RecordingProjectionSqlRunner({
+      currentPayloadRow: {
+        projection_revision_id: 43,
+        projection_name: "transcript_projection",
+        scope_kind: "run_page",
+        scope_key: "run-1:offset:700:limit:500",
+        revision: 4,
+        source_revisions: [{ source: "transcript:run-1", revision: "events-1200", observedAt: null }],
+        source_cursors: { eventCount: 500, nextOffset: null },
+        content_sha256: "c".repeat(64),
+        generated_at: "2026-01-02T03:04:05.000Z",
+        expires_at: null,
+        superseded_at: null,
+        created_at: "2026-01-02T03:04:05.000Z",
+        payload: [{ text: "tail event 701" }, { text: "tail event 1200" }],
+        payload_sha256: "d".repeat(64),
+        raw_payload_refs: [],
+        payload_generated_at: "2026-01-02T03:04:07.000Z",
+        payload_expires_at: null,
+      },
+    });
+    const service = new ProjectionTransactionService(new PostgresProjectionTransactionStore(runner), { clock: () => new Date(fixedTime) });
+
+    const payload = await service.readCurrentTranscriptDefaultPayload<readonly { text: string }[]>({ runId: "run-1", limit: 500 });
+
+    expect(payload?.revision.scopeKey).toBe("run-1:offset:700:limit:500");
+    expect(payload?.payload).toEqual([{ text: "tail event 701" }, { text: "tail event 1200" }]);
+    expect(runner.values[0]).toEqual(["run-1", 500]);
+    expect(runner.sqls[0]).toContain('JOIN "symphony"."transcript_projection" payload');
+    expect(runner.sqls[0]).toContain("payload.run_id = $1");
+    expect(runner.sqls[0]).toContain("payload.offset_limit = $2");
+    expect(runner.sqls[0]).toContain("ORDER BY (payload.next_offset IS NULL) DESC, payload.message_count DESC, payload.offset_start DESC");
+  });
+
   it("rolls back the Postgres transaction and suppresses publication on payload insert failure", async () => {
     const runner = new RecordingProjectionSqlRunner({ failPayloadInsert: true });
     const service = new ProjectionTransactionService(new PostgresProjectionTransactionStore(runner), { clock: () => new Date(fixedTime) });

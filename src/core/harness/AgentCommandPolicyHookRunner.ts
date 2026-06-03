@@ -1,13 +1,34 @@
+import fs from "node:fs";
+import path from "node:path";
+
 import {
   buildFailClosedAgentCommandPolicyDecision,
   classifyAgentCommand,
   environmentKeysOnly,
   type AgentCommandPolicyClassifier,
   type AgentCommandPolicyDecision,
+  type AgentCommandPolicyEnvironmentInput,
   type AgentCommandPolicyInput,
 } from "./AgentCommandPolicy.js";
 
 export const AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES = 1024 * 1024;
+
+const TOOL_INPUT_WORKING_DIRECTORY_KEYS = [
+  "workdir",
+  "cwd",
+  "workingDirectory",
+  "working_directory",
+] as const;
+const LOCAL_GIT_CONFIG_ENVIRONMENT_VALUE_KEYS = new Set([
+  "HOME",
+  "USERPROFILE",
+  "XDG_CONFIG_HOME",
+]);
+const UNRESOLVED_HOOK_WORKING_DIRECTORY = "<unresolved_hermes_tool_working_directory>";
+const UNTRUSTED_HOOK_WORKING_DIRECTORY_MESSAGE =
+  "Blocked worker/reviewer command: the Hermes pre_tool_call hook did not provide a trustworthy effective terminal working directory, so local command policy could not inspect the correct repository context. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.";
+const UNINSPECTABLE_HOOK_WORKING_DIRECTORY_MESSAGE =
+  "Blocked worker/reviewer command: the effective terminal working directory is not an inspectable directory, so local Git configuration could not be verified before this tool call. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.";
 
 export interface AgentCommandPolicyHookRunnerContext {
   role?: string | undefined;
@@ -59,7 +80,10 @@ export async function evaluateAgentCommandPolicyHookPayload(
 
   const classify = context.classify ?? classifyAgentCommand;
   try {
-    const decision = await classify(policyInput.input);
+    const decision = failClosedForUninspectableLocalGitInspection(
+      await classify(policyInput.input),
+      policyInput.input,
+    );
     return evaluationFromDecision(decision, policyInput.input);
   } catch {
     const decision = buildFailClosedAgentCommandPolicyDecision({
@@ -191,14 +215,14 @@ function buildPolicyInput(
   const toolName = stringValue(payload.tool_name);
   const role = nonEmptyString(context.role);
   const phase = nonEmptyString(context.phase);
-  const workingDirectory = stringValue(payload.cwd) ?? context.workingDirectory ?? process.cwd();
+  const workingDirectory = effectiveHookWorkingDirectory(payload, context);
 
   if (hookEventName !== "pre_tool_call") {
     return missingContextDecision({
       role,
       phase,
       surface: toolName ?? "unknown",
-      workingDirectory,
+      workingDirectory: workingDirectory.workingDirectory,
       commandClass: "unsupported_hermes_hook_event",
       message:
         "Blocked worker/reviewer command: agent command policy hook was invoked for an unsupported Hermes hook event. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
@@ -210,7 +234,7 @@ function buildPolicyInput(
       role,
       phase,
       surface: "unknown",
-      workingDirectory,
+      workingDirectory: workingDirectory.workingDirectory,
       commandClass: "missing_hermes_tool_name",
       message:
         "Blocked worker/reviewer command: Hermes pre_tool_call payload did not identify the tool name. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
@@ -222,22 +246,35 @@ function buildPolicyInput(
       role,
       phase,
       surface: toolName,
-      workingDirectory,
+      workingDirectory: workingDirectory.workingDirectory,
       commandClass: "missing_agent_command_policy_context",
       message:
         "Blocked worker/reviewer command: Symphony agent command policy context is incomplete. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
     });
   }
 
+  if (workingDirectory.status === "error") {
+    return missingContextDecision({
+      role,
+      phase,
+      surface: toolName,
+      workingDirectory: workingDirectory.workingDirectory,
+      commandClass: workingDirectory.commandClass,
+      message: workingDirectory.message,
+    });
+  }
+
   const rawInput = isRecord(payload.tool_input) ? payload.tool_input : {};
+  const hookEnvironment = context.environment ?? process.env;
   const input: AgentCommandPolicyInput = {
     role,
     phase,
     surface: toolName,
-    workingDirectory,
+    workingDirectory: workingDirectory.workingDirectory,
     rawInput,
-    environment: { keysOnly: environmentKeysOnly(context.environment ?? process.env) },
+    environment: buildHookPolicyEnvironment(hookEnvironment),
   };
+
   const runId = nonEmptyString(context.runId) ?? stringValue(payload.session_id);
   if (runId !== null) input.runId = runId;
   const issueId = nonEmptyString(context.issueId);
@@ -247,6 +284,157 @@ function buildPolicyInput(
     status: "ok",
     input,
   };
+}
+
+type HookWorkingDirectoryResolution =
+  | { status: "ok"; workingDirectory: string }
+  | { status: "error"; workingDirectory: string; commandClass: string; message: string };
+
+type HookToolWorkingDirectoryResolution =
+  | { status: "absent" }
+  | { status: "ok"; workingDirectory: string }
+  | { status: "error"; commandClass: string; message: string };
+
+function effectiveHookWorkingDirectory(
+  payload: HermesPreToolCallHookPayload,
+  context: AgentCommandPolicyHookRunnerContext,
+): HookWorkingDirectoryResolution {
+  const toolInputCwd = toolInputWorkingDirectory(payload.tool_input);
+  if (toolInputCwd.status === "error") {
+    return {
+      status: "error",
+      workingDirectory: UNRESOLVED_HOOK_WORKING_DIRECTORY,
+      commandClass: toolInputCwd.commandClass,
+      message: toolInputCwd.message,
+    };
+  }
+
+  if (toolInputCwd.status === "ok" && isAbsoluteHookPath(toolInputCwd.workingDirectory)) {
+    return { status: "ok", workingDirectory: path.normalize(toolInputCwd.workingDirectory) };
+  }
+
+  const baseDirectory = trustedHookBaseWorkingDirectory(payload, context);
+  if (baseDirectory === null) {
+    return {
+      status: "error",
+      workingDirectory: UNRESOLVED_HOOK_WORKING_DIRECTORY,
+      commandClass:
+        toolInputCwd.status === "ok"
+          ? "unresolved_relative_hermes_tool_working_directory"
+          : "missing_hermes_tool_working_directory_context",
+      message: UNTRUSTED_HOOK_WORKING_DIRECTORY_MESSAGE,
+    };
+  }
+
+  if (toolInputCwd.status === "ok") {
+    return { status: "ok", workingDirectory: resolveWorkingDirectory(toolInputCwd.workingDirectory, baseDirectory) };
+  }
+
+  return { status: "ok", workingDirectory: baseDirectory };
+}
+
+function toolInputWorkingDirectory(toolInput: unknown): HookToolWorkingDirectoryResolution {
+  if (!isRecord(toolInput)) return { status: "absent" };
+  const presentKeys = TOOL_INPUT_WORKING_DIRECTORY_KEYS.filter((key) =>
+    Object.prototype.hasOwnProperty.call(toolInput, key),
+  );
+  if (presentKeys.length === 0) return { status: "absent" };
+  if (presentKeys.length > 1) {
+    return {
+      status: "error",
+      commandClass: "ambiguous_hermes_tool_working_directory",
+      message: UNTRUSTED_HOOK_WORKING_DIRECTORY_MESSAGE,
+    };
+  }
+
+  const key = presentKeys[0];
+  const rawValue = key === undefined ? undefined : toolInput[key];
+  if (typeof rawValue !== "string" || rawValue.trim().length === 0) {
+    return {
+      status: "error",
+      commandClass: "malformed_hermes_tool_working_directory",
+      message: UNTRUSTED_HOOK_WORKING_DIRECTORY_MESSAGE,
+    };
+  }
+
+  return { status: "ok", workingDirectory: rawValue.trim() };
+}
+
+function resolveWorkingDirectory(candidate: string, baseDirectory: string): string {
+  if (isAbsoluteHookPath(candidate)) return path.normalize(candidate);
+  return path.resolve(baseDirectory, candidate);
+}
+
+function trustedHookBaseWorkingDirectory(
+  payload: HermesPreToolCallHookPayload,
+  context: AgentCommandPolicyHookRunnerContext,
+): string | null {
+  return trustedWorkingDirectoryValue(payload.cwd) ?? trustedWorkingDirectoryValue(context.workingDirectory);
+}
+
+function trustedWorkingDirectoryValue(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmedValue = value.trim();
+  if (trimmedValue.length === 0 || !isAbsoluteHookPath(trimmedValue)) return null;
+  return trimmedValue;
+}
+
+function isAbsoluteHookPath(filePath: string): boolean {
+  return path.isAbsolute(filePath) || /^[A-Za-z]:[\\/]/u.test(filePath) || /^\\\\/u.test(filePath);
+}
+
+function buildHookPolicyEnvironment(
+  environment: Record<string, string | undefined>,
+): AgentCommandPolicyEnvironmentInput {
+  const keysOnly = environmentKeysOnly(environment);
+  const inherited = selectedLocalGitConfigEnvironmentValues(environment);
+  return Object.keys(inherited).length === 0
+    ? { keysOnly }
+    : { keysOnly, inherited };
+}
+
+function selectedLocalGitConfigEnvironmentValues(
+  environment: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const inherited: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(environment)) {
+    if (!LOCAL_GIT_CONFIG_ENVIRONMENT_VALUE_KEYS.has(key.trim().toUpperCase())) continue;
+    if (value === undefined || value.trim().length === 0) continue;
+    inherited[key] = value;
+  }
+  return inherited;
+}
+
+function failClosedForUninspectableLocalGitInspection(
+  decision: AgentCommandPolicyDecision,
+  input: AgentCommandPolicyInput,
+): AgentCommandPolicyDecision {
+  if (
+    decision.outcome !== "allow" ||
+    decision.reasonKind !== "local_only_inspection" ||
+    decision.commandClass !== "local_git_inspection" ||
+    isDirectory(input.workingDirectory)
+  ) {
+    return decision;
+  }
+
+  return buildFailClosedAgentCommandPolicyDecision({
+    role: input.role,
+    phase: input.phase,
+    surface: input.surface,
+    workingDirectory: input.workingDirectory,
+    reasonKind: "missing_hook_context",
+    commandClass: "uninspectable_hermes_tool_working_directory",
+    message: UNINSPECTABLE_HOOK_WORKING_DIRECTORY_MESSAGE,
+  });
+}
+
+function isDirectory(directoryPath: string): boolean {
+  try {
+    return fs.statSync(directoryPath).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function missingContextDecision(input: {

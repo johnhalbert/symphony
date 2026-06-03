@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ChatMessage } from "../../types/symphony";
-import { Icon } from "../common";
+import { Icon, UnavailableButton } from "../common";
 import { formatInlineText } from "../messages/messageFormat";
 
 export function SidebarChat({
@@ -54,9 +54,9 @@ export function SidebarChat({
           </span>
         </div>
         <div style={{ flex: 1 }} />
-        <button className="icon-btn" type="button">
+        <UnavailableButton className="icon-btn" unavailableLabel="Compact chat history" unavailableReason="compact chat history navigation is unavailable until a backed API route exists">
           {Icon.history()}
-        </button>
+        </UnavailableButton>
       </div>
 
       <div style={{ overflow: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 14 }}>
@@ -109,12 +109,12 @@ export function SidebarChat({
           <div className="box">
             <textarea placeholder="Ask or command..." value={draft} onChange={(event) => setDraft(event.target.value)} style={{ minHeight: 34 }} />
             <div className="row">
-              <button className="btn btn--ghost" type="button" style={{ padding: "1px 6px", fontSize: 10.5 }}>
+              <UnavailableButton className="btn btn--ghost" style={{ padding: "1px 6px", fontSize: 10.5 }} unavailableLabel="Compact chat context picker" unavailableReason="context insertion is unavailable until a backed API command route exists">
                 @ context
-              </button>
-              <button className="btn btn--ghost" type="button" style={{ padding: "1px 6px", fontSize: 10.5 }}>
+              </UnavailableButton>
+              <UnavailableButton className="btn btn--ghost" style={{ padding: "1px 6px", fontSize: 10.5 }} unavailableLabel="Compact chat command picker" unavailableReason="command browsing is unavailable until a backed API command route exists">
                 /
-              </button>
+              </UnavailableButton>
               <div className="grow" />
               <button className="btn btn--primary" type="submit" style={{ padding: "2px 8px" }} disabled={sending || !draft.trim()}>
                 {Icon.send()}

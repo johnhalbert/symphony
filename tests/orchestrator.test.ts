@@ -141,10 +141,10 @@ describe("Orchestrator", () => {
     config.agent.harness = "hermes_acp";
     config.hermes.provider = "openrouter";
     config.hermes.model = "anthropic/claude-sonnet-test";
-    config.hermes.acpBinaryPath = "/opt/hermes/bin/hermes";
-    config.hermes.acpSourceProfile = "dogfood";
-    config.hermes.acpProfilePrefix = "sym-test";
-    config.hermes.workerSessionLifecycle = "fresh_per_run";
+    config.hermesAcp.binaryPath = "/opt/hermes/bin/hermes";
+    config.hermesAcp.sourceProfile = "dogfood";
+    config.hermesAcp.profilePrefix = "sym-test";
+    config.hermesAcp.workerSessionLifecycle = "fresh_per_run";
     const candidate = issue({ state: "Todo" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -238,8 +238,20 @@ describe("Orchestrator", () => {
       {
         type: "progress",
         activitySource: "stream",
-        message: "Hermes ACP thought update",
+        message: "Hermes ACP user message replay",
         runActivity: acpActivity(runId, 3, {
+          actor: "user",
+          channel: "chat",
+          kind: "user_message_submitted",
+          text: "Do work",
+          payload: { replay: true, messagePreview: "Do work" },
+        }),
+      },
+      {
+        type: "progress",
+        activitySource: "stream",
+        message: "Hermes ACP thought update",
+        runActivity: acpActivity(runId, 4, {
           actor: "assistant",
           channel: "chat",
           kind: "assistant_reasoning_delta",
@@ -251,7 +263,7 @@ describe("Orchestrator", () => {
         type: "progress",
         activitySource: "tool",
         message: "Hermes ACP tool started: terminal",
-        runActivity: acpActivity(runId, 4, {
+        runActivity: acpActivity(runId, 5, {
           actor: "tool",
           channel: "tool",
           kind: "tool_call_started",
@@ -263,7 +275,7 @@ describe("Orchestrator", () => {
         type: "progress",
         activitySource: "tool",
         message: "Hermes ACP tool completed: terminal",
-        runActivity: acpActivity(runId, 5, {
+        runActivity: acpActivity(runId, 6, {
           actor: "tool",
           channel: "tool",
           kind: "tool_call_completed",
@@ -274,7 +286,7 @@ describe("Orchestrator", () => {
       {
         type: "tokens",
         tokens: { inputTokens: 3, outputTokens: 5, totalTokens: 8 },
-        runActivity: acpActivity(runId, 6, {
+        runActivity: acpActivity(runId, 7, {
           actor: "runtime",
           channel: "token",
           kind: "token_usage_reported",
@@ -287,7 +299,7 @@ describe("Orchestrator", () => {
         code: "hermes_acp_permission_denied",
         message: "ACP permission denied",
         payload: { paramsPreview: "safe" },
-        runActivity: acpActivity(runId, 7, {
+        runActivity: acpActivity(runId, 8, {
           actor: "runtime",
           channel: "diagnostic",
           kind: "runtime_diagnostic",
@@ -298,7 +310,7 @@ describe("Orchestrator", () => {
       {
         type: "completed",
         message: "Run completed",
-        runActivity: acpActivity(runId, 8, {
+        runActivity: acpActivity(runId, 9, {
           actor: "runtime",
           channel: "terminal",
           kind: "run_succeeded",
@@ -332,6 +344,7 @@ describe("Orchestrator", () => {
       expect.arrayContaining([
         "session_started",
         "assistant_message_delta",
+        "user_message_submitted",
         "assistant_reasoning_delta",
         "tool_call_started",
         "tool_call_completed",
@@ -361,7 +374,8 @@ describe("Orchestrator", () => {
     expect(projected).toEqual(
       expect.arrayContaining([
         { kind: "assistant", ts: expect.any(String), text: "hello" },
-        { kind: "thinking", ts: expect.any(String), text: "Hermes ACP thought update" },
+        { kind: "user", ts: expect.any(String), from: "user", issue: "", text: "Do work" },
+        { kind: "thinking", ts: expect.any(String), text: "thought preview" },
         expect.objectContaining({ kind: "tool_call", call_id: "call-1", name: "terminal", status: "succeeded", result: "tests passed" }),
         { kind: "status", state: "token_usage_reported", ts: expect.any(String), text: "Tokens: input 3 · output 5 · total 8" },
         { kind: "status", state: "runtime_diagnostic", ts: expect.any(String), text: "ACP permission denied" },
@@ -4084,6 +4098,9 @@ describe("Orchestrator", () => {
     expect(prompt).toContain("These supplemental comments do not satisfy pass approval");
     expect(prompt).not.toContain('event "REQUEST_CHANGES", "COMMENT", or "APPROVE"');
     expect(prompt).toContain("PR number, repository, token, or commit identity");
+    expect(prompt).toContain("Symphony service-owned review feedback workflow");
+    expect(prompt).toContain("Do not run gh pr review");
+    expect(prompt).toContain("direct GitHub API/curl writes");
     expect(prompt).toContain("Before any fail verdict, perform a bounded sibling-risk sweep");
     expect(prompt).toContain("Include every known blocking gap");
     expect(prompt).toContain("required behavior, concrete evidence, expected validation");
@@ -4405,7 +4422,7 @@ describe("Orchestrator", () => {
 
     orchestrator.resumeIssue(candidate.id);
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await waitFor(() => harness.runs.length === 1, "resumed issue dispatch");
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(1);

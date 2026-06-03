@@ -107,6 +107,33 @@ describe("projectWebHistory", () => {
       failureDiagnosticCode: "cursor_run_wait_terminal_error",
       failureDiagnosticMessage: "diagnostic password=SECRET_DIAGNOSTIC",
       failureDiagnosticAt: "2026-01-01T00:06:00.000Z",
+      providerLimit: {
+        scope: {
+          harnessId: "hermes",
+          providerId: "openai-codex",
+          model: "gpt-5.5",
+          accountScopeKey: "acct-secret-key",
+        },
+        kind: "windowed_bucket_exhausted",
+        message: "Provider limit reached token=SECRET_PROVIDER_LIMIT",
+        observedAt: "2026-01-01T00:05:00.000Z",
+        resumePolicy: "auto_at_window_close",
+        window: {
+          resumeAt: "2026-01-01T05:00:00.000Z",
+          retryAfterMs: 18_000_000,
+          windowLabel: "5h bucket",
+          windowKind: "codex_5h",
+        },
+        source: {
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          runId: "run-secure",
+          sessionId: "session-secure",
+          role: "reviewer",
+          runPhase: "issue_breakdown",
+        },
+        raw: { authorization: "Bearer SECRET_PROVIDER_RAW" },
+      },
     });
     delete sourceRun.runKind;
 
@@ -176,6 +203,30 @@ describe("projectWebHistory", () => {
         diagnosticCode: "cursor_run_wait_terminal_error",
         diagnosticMessage: "diagnostic password=[redacted]",
         diagnosticAt: "2026-01-01T00:06:00.000Z",
+      },
+      providerLimit: {
+        provider: "openai-codex",
+        providerId: "openai-codex",
+        harnessId: "hermes",
+        model: "gpt-5.5",
+        kind: "windowed_bucket_exhausted",
+        message: "Provider limit reached token=[redacted]",
+        observedAt: "2026-01-01T00:05:00.000Z",
+        resumePolicy: "auto_at_window_close",
+        window: {
+          resumeAt: "2026-01-01T05:00:00.000Z",
+          retryAfterMs: 18_000_000,
+          windowLabel: "5h bucket",
+          windowKind: "codex_5h",
+        },
+        source: {
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          runId: "run-secure",
+          sessionId: "session-secure",
+          role: "reviewer",
+          runPhase: "issue_breakdown",
+        },
       },
       links: {
         issue: "/api/v1/web/issues/TEST-1",
@@ -272,6 +323,7 @@ describe("projectWebHistory", () => {
           cancelFailedSource: null,
         },
         failure: { kind: null, diagnosticCode: null, diagnosticMessage: null, diagnosticAt: null },
+        providerLimit: null,
       },
     });
     expect(JSON.stringify(model).toLowerCase()).not.toContain("mock");

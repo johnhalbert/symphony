@@ -14,7 +14,7 @@ import type {
 describe("AgentCommandPolicyHookRunner", () => {
   it("maps Hermes pre_tool_call payloads to policy input and emits block JSON for denied decisions", async () => {
     const seenInputs: AgentCommandPolicyInput[] = [];
-    const payload = hermesPayload({ command: "git push origin main" });
+    const payload = hermesPayload({ command: "git push origin main" }, { cwd: "/repo/worktree" });
 
     const evaluation = await evaluateAgentCommandPolicyHookPayload(JSON.stringify(payload), {
       role: "worker",
@@ -358,15 +358,46 @@ subprocess.run(["gh", "pr", "create", "--fill"])`;
     expect(evaluation.decision.audit.commandPreview).toContain("https://[redacted]@github.com");
     expect(evaluation.decision.audit.commandPreview).toContain("[redacted-github-token]");
   });
+
+  it("blocks local inspection when inherited hook environment contains unsafe Git variables", async () => {
+    const pagerValue = "sh -c echo blocked";
+    const evaluation = await evaluateAgentCommandPolicyHookPayload(JSON.stringify(hermesPayload({ command: "git log -1" })), {
+      role: "worker",
+      phase: "implementation",
+      environment: { HOME: "/tmp/home", PATH: "/bin", GIT_PAGER: pagerValue },
+    });
+
+    expect(evaluation.policyInput?.environment).toEqual({
+      keysOnly: ["GIT_PAGER", "HOME", "PATH"],
+      inherited: { HOME: "/tmp/home" },
+    });
+    expect(evaluation.decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "unsafe_git_config",
+      commandClass: "git_local_inspection_with_helper",
+      audit: {
+        inheritedEnvironmentKeys: ["GIT_PAGER", "HOME", "PATH"],
+        unsafeConfigCategories: ["pager"],
+        upstreamContactAttempted: false,
+      },
+    });
+    expect(evaluation.hookResponse).toEqual({
+      action: "block",
+      message:
+        "Blocked worker/reviewer Git command: local Git inspection would execute a configured helper. Use local inspection without helper configuration or rely on Symphony service-owned GitHub workflow actions.",
+    });
+    expect(evaluation.stdout).toContain("local Git inspection would execute a configured helper");
+    expect(evaluation.stdout).not.toContain(pagerValue);
+  });
 });
 
-function hermesPayload(toolInput: Record<string, unknown>, options: { toolName?: string } = {}) {
+function hermesPayload(toolInput: Record<string, unknown>, options: { toolName?: string; cwd?: string } = {}) {
   return {
     hook_event_name: "pre_tool_call",
     tool_name: options.toolName ?? "terminal",
     tool_input: toolInput,
     session_id: "test-session",
-    cwd: "/repo/worktree",
+    cwd: options.cwd ?? process.cwd(),
     extra: { task_id: "task-1", tool_call_id: "tool-call-1" },
   };
 }

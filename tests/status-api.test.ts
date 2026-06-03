@@ -2818,6 +2818,7 @@ describe("StatusServer durable API", () => {
         activity: Array<{ verb: string; id: string }>;
         chat: unknown[];
         totals: Record<string, number>;
+        source: { status: string; label: string; detail: string; issueCount: number; cached: boolean };
       };
       expect(dashboardResponse.status).toBe(200);
       expect(Object.keys(dashboardBody).sort()).toEqual([
@@ -2831,6 +2832,7 @@ describe("StatusServer durable API", () => {
         "providerGates",
         "repoLabel",
         "runningAgents",
+        "source",
         "totals",
         "workflowLabel",
       ]);
@@ -2852,6 +2854,13 @@ describe("StatusServer durable API", () => {
         state: "active",
         duration: "10m",
       });
+      expect(dashboardBody.source).toMatchObject({
+        status: "stale",
+        label: "tracker stale · 8 cached issues",
+        issueCount: 8,
+        cached: true,
+      });
+      expect(dashboardBody.source.detail).toContain("Using a cached tracker source while refresh catches up");
       expect(dashboardBody.activity[0]).toMatchObject({ verb: "run_started", id: "TEST-1" });
       expect(JSON.stringify(dashboardBody)).not.toContain("openai/symphony");
       expect(JSON.stringify(dashboardBody)).not.toContain("poll 22s");
@@ -3120,6 +3129,7 @@ describe("StatusServer durable API", () => {
         providerGates: unknown[];
         runningAgents: unknown[];
         totals: { all: number; open: number; completeness: number };
+        source: { status: string; label: string; detail: string; issueCount: number; cached: boolean; error: string | null };
       };
       const sidebarBody = (await sidebarResponse.json()) as {
         providerGates: unknown[];
@@ -3157,7 +3167,15 @@ describe("StatusServer durable API", () => {
         providerGates: [],
         runningAgents: [],
         totals: { all: 0, open: 0, completeness: 0 },
+        source: {
+          status: "unavailable",
+          label: "tracker unavailable",
+          issueCount: 0,
+          cached: false,
+          error: "Issue board requires a configured tracker client",
+        },
       });
+      expect(dashboardBody.source.detail).toBe("Issue board requires a configured tracker client");
       expect(sidebarResponse.status).toBe(200);
       expect(sidebarBody).toEqual({
         providerGates: [],

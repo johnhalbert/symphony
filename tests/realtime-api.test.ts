@@ -4,7 +4,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer, type StatusServerOptions } from "../src/app/http.js";
 import {
+  REALTIME_EVENT_SCHEMA,
+  REALTIME_EVENT_SCHEMA_VERSION,
   RealtimeProjectionEventBus,
+  serializeRealtimeEventData,
   serializeSseComment,
   serializeSseEvent,
   type RealtimeProjectionEvent,
@@ -12,9 +15,16 @@ import {
 } from "../src/app/RealtimeProjectionEvents.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileOrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
+import { InMemoryRunActivityAppendStore, type RunActivityAppendInput } from "../src/core/persistence/RunActivityAppendStore.js";
+import type { ProjectionPayloadWriteInput, ProjectionRevisionPublication, ProjectionWriteResult } from "../src/core/persistence/ProjectionTransactionService.js";
+import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileOperatorApprovalStore, OperatorApprovalService } from "../src/core/approval/OperatorApprovalService.js";
+import { PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON } from "../src/core/CompletionReportService.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue, TrackerStateLists } from "../src/core/types.js";
+import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
+import { testConfig } from "./helpers.js";
 
 describe("StatusServer realtime SSE API", () => {
   let root: string;
@@ -46,16 +56,83 @@ describe("StatusServer realtime SSE API", () => {
     expect(bus.subscriberCount()).toBe(0);
     expect([projection.revision, source.revision, run.revision, transcript.revision]).toEqual([1, 2, 3, 4]);
     expect(projection).toMatchObject({
+      schema: REALTIME_EVENT_SCHEMA,
+      schemaVersion: REALTIME_EVENT_SCHEMA_VERSION,
       id: "1",
       type: "projection.updated",
+      scope: "global",
+      key: null,
       source: { source: "runs", revision: 7, observedAt: "2026-01-01T00:00:00.000Z" },
       recovery: { strategy: "refetch", reason: "event", lastEventId: null },
       missedEvents: false,
+      payload: {
+        source: "runs",
+        sourceRevision: 7,
+        resourceKinds: ["dashboard", "issue-board", "sidebar", "history"],
+        resourcesChanged: ["dashboard", "issue-board", "sidebar", "history"],
+        detail: null,
+      },
+      detail: null,
+    });
+    expect(source).toMatchObject({
+      type: "source.status",
+      scope: "source",
+      key: "runs",
+      payload: { source: "runs", sourceRevision: 7, status: null, fetchedStates: [], cached: null, issueCount: null },
+    });
+    expect(run).toMatchObject({
+      type: "run.updated",
+      scope: "run",
+      key: null,
+      payload: { source: "runs", sourceRevision: 7, runId: null, issueId: null, status: null },
+    });
+    expect(transcript).toMatchObject({
+      type: "transcript.delta",
+      scope: "session",
+      key: null,
+      payload: { source: "runs", sourceRevision: 7, runId: null, sessionId: null, afterSequence: null },
     });
     expect(projection.recovery.endpoints).toEqual(
       expect.arrayContaining(["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/sidebar"]),
     );
     expect(transcript.recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
+
+    const runActivityEvents = bus.publishProjectionRevision({
+      source: "run_activity",
+      revision: 8,
+      observedAt: "2026-01-01T00:00:01.000Z",
+      detail: {
+        source: "run_activity",
+        runId: "run-activity-1",
+        sessionId: "session-activity-1",
+        afterSequence: 2,
+        eventCount: 3,
+        status: "running",
+        resourcesChanged: ["history", "session-transcript"],
+      },
+    });
+    expect(requireEvent(runActivityEvents.find((event) => event.type === "run.updated"))).toMatchObject({
+      type: "run.updated",
+      scope: "run",
+      key: "run-activity-1",
+      payload: { source: "run_activity", sourceRevision: 8, runId: "run-activity-1", status: "running" },
+    });
+    expect(requireEvent(runActivityEvents.find((event) => event.type === "transcript.delta"))).toMatchObject({
+      type: "transcript.delta",
+      scope: "session",
+      key: "session-activity-1",
+      payload: {
+        source: "run_activity",
+        sourceRevision: 8,
+        runId: "run-activity-1",
+        sessionId: "session-activity-1",
+        afterSequence: 2,
+        eventCount: 3,
+      },
+    });
+    expect(requireEvent(runActivityEvents.find((event) => event.type === "projection.updated"))).toMatchObject({
+      payload: { resourcesChanged: ["history", "session-transcript"] },
+    });
 
     for (const chatSource of [
       "orchestrator_conversations",
@@ -83,12 +160,74 @@ describe("StatusServer realtime SSE API", () => {
     const serialized = serializeSseEvent(projection);
     expect(serialized).toContain("id: 1\n");
     expect(serialized).toContain("event: projection.updated\n");
+    expect(requireDataLine(serialized)).toBe(serializeRealtimeEventData(projection));
     expect(JSON.parse(requireDataLine(serialized))).toMatchObject({
+      schema: REALTIME_EVENT_SCHEMA,
+      schemaVersion: REALTIME_EVENT_SCHEMA_VERSION,
       type: "projection.updated",
       revision: 1,
+      scope: "global",
+      key: null,
       source: { source: "runs", revision: 7 },
+      payload: { source: "runs", sourceRevision: 7, resourcesChanged: ["dashboard", "issue-board", "sidebar", "history"] },
     });
+
+    const newlineInjectedFrame = serializeSseEvent({
+      ...projection,
+      id: "malformed\nid",
+      type: "projection.updated\nextra" as RealtimeProjectionEventType,
+    });
+    expect(newlineInjectedFrame).toContain("id: malformed id\n");
+    expect(newlineInjectedFrame).toContain("event: projection.updated extra\n");
+    expect(newlineInjectedFrame).not.toContain("id: malformed\nid\n");
+    expect(newlineInjectedFrame).not.toContain("event: projection.updated\nextra\n");
     expect(serializeSseComment("keepalive\nignored")).toBe(": keepalive ignored\n\n");
+  });
+
+  it("streams keepalive comments with SSE headers and cleans up disconnects", async () => {
+    const server = createRealtimeServer({ realtime: { keepAliveIntervalMs: 20 } });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      expect(client.response.status).toBe(200);
+      expect(client.response.headers.get("content-type")).toContain("text/event-stream");
+      expect(client.response.headers.get("cache-control")).toContain("no-cache");
+      expect(client.response.headers.get("cache-control")).toContain("no-transform");
+      expect(client.response.headers.get("x-accel-buffering")).toBe("no");
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      await expect(client.nextRawBlock()).resolves.toBe("retry: 5000");
+      await expect(client.nextRawBlock(500)).resolves.toBe(": keepalive");
+
+      await client.close();
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "SSE subscriber to disconnect");
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("returns a clear JSON error when realtime transport is unavailable", async () => {
+    const server = createRealtimeServer({ realtime: { enabled: false } });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+
+    try {
+      const response = await fetch(`${baseUrl}/api/v1/realtime`);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("content-type")).toContain("application/json");
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          code: "realtime_unavailable",
+          message: "Realtime event stream is unavailable",
+        },
+      });
+      expect(server.activeRealtimeSubscriberCount()).toBe(0);
+    } finally {
+      await server.stop();
+    }
   });
 
   it("streams projection, source, run, and transcript updates, replays known Last-Event-ID, and cleans up disconnects", async () => {
@@ -148,6 +287,420 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
+  it("replays known events from lastEventId query cursors without missed-event recovery", async () => {
+    const runStore = new FileRunTranscriptStore(root);
+    const server = createRealtimeServer({ runStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+      await runStore.startRun({
+        runId: "run-realtime-query-cursor",
+        sessionId: "session-realtime-query-cursor",
+        agentId: "agent-1",
+        role: "worker",
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "work",
+        workspaceKey: "TEST-1",
+        workspacePath: "/tmp/workspace",
+      });
+
+      const liveEvents = [
+        await client.nextEventOfType("projection.updated"),
+        await client.nextEventOfType("source.status"),
+        await client.nextEventOfType("run.updated"),
+        await client.nextEventOfType("transcript.delta"),
+      ];
+      await client.close();
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "initial SSE subscriber to disconnect");
+
+      const queryReplayClient = await openSseClient(
+        `${baseUrl}/api/v1/realtime?lastEventId=${encodeURIComponent(liveEvents[0]!.id)}`,
+      );
+      try {
+        const replayedEvents = [
+          await queryReplayClient.nextEvent(),
+          await queryReplayClient.nextEvent(),
+          await queryReplayClient.nextEvent(),
+        ];
+        expect(replayedEvents.map((event) => event.id)).toEqual(liveEvents.slice(1).map((event) => event.id));
+        expect(replayedEvents.map((event) => event.event)).toEqual(["source.status", "run.updated", "transcript.delta"]);
+        for (const replayed of replayedEvents) {
+          const data = replayed.data as RealtimeProjectionEvent;
+          expect(data.id).toBe(replayed.id);
+          expect(data.type).toBe(replayed.event);
+          expect(typeof data.revision).toBe("number");
+          expect(data.source).toMatchObject({ source: "runs", revision: 1 });
+          expect(data.payload).toMatchObject({ source: "runs", sourceRevision: 1 });
+          expect(data.missedEvents).toBe(false);
+        }
+        await expect(queryReplayClient.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+      } finally {
+        await queryReplayClient.close();
+      }
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("streams run and transcript realtime events from accepted run activity appends", async () => {
+    const runActivitySourceStore = new InMemoryRunActivityAppendStore();
+    const server = createRealtimeServer({ runActivitySourceStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      await runActivitySourceStore.appendEvents([
+        runActivityInput({ id: "activity-realtime-1", sequence: 1 }),
+        runActivityInput({ id: "activity-realtime-2", sequence: 2 }),
+      ]);
+
+      const projection = await client.nextEventOfType("projection.updated");
+      const source = await client.nextEventOfType("source.status");
+      const run = await client.nextEventOfType("run.updated");
+      const transcript = await client.nextEventOfType("transcript.delta");
+
+      expect(projection.data).toMatchObject({
+        type: "projection.updated",
+        source: { source: "run_activity", revision: 1 },
+        payload: { resourcesChanged: ["history", "session-transcript", "dashboard", "sidebar"] },
+      });
+      expect(source.data).toMatchObject({
+        type: "source.status",
+        scope: "source",
+        key: "run_activity",
+        source: { source: "run_activity", revision: 1 },
+      });
+      expect(run.data).toMatchObject({
+        type: "run.updated",
+        scope: "run",
+        key: "run-realtime-activity",
+        source: { source: "run_activity", revision: 1 },
+        payload: { runId: "run-realtime-activity", status: null },
+      });
+      expect(transcript.data).toMatchObject({
+        type: "transcript.delta",
+        scope: "session",
+        key: "session-realtime-activity",
+        source: { source: "run_activity", revision: 1 },
+        payload: {
+          runId: "run-realtime-activity",
+          sessionId: "session-realtime-activity",
+          afterSequence: 0,
+          eventCount: 2,
+        },
+      });
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("suppresses realtime events for duplicate run activity appends", async () => {
+    const runActivitySourceStore = new InMemoryRunActivityAppendStore();
+    const server = createRealtimeServer({ runActivitySourceStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+      const accepted = await runActivitySourceStore.appendEvent(
+        runActivityInput({ id: "activity-realtime-duplicate", sequence: 1, externalEventId: "upstream-duplicate" }),
+      );
+      expect(accepted.status).toBe("accepted");
+      await readOrderedRealtimeEvents(client, "run_activity", 1, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+
+      const duplicate = await runActivitySourceStore.appendEvent(
+        runActivityInput({ id: "activity-realtime-duplicate", sequence: 2, externalEventId: "upstream-other" }),
+      );
+      expect(duplicate).toMatchObject({ status: "duplicate", reason: "event_id" });
+      expect(server.activeRealtimeSubscriberCount()).toBe(1);
+      await expect(client.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("streams realtime and legacy SSE events from durable projection publications to multiple subscribers", async () => {
+    const projectionWriter = fakeProjectionWriter();
+    const server = createRealtimeServer({ projectionWriter });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const realtimeClient = await openSseClient(`${baseUrl}/api/v1/realtime`);
+    const secondRealtimeClient = await openSseClient(`${baseUrl}/api/v1/realtime`);
+    const legacyClient = await openSseClient(`${baseUrl}/api/v1/web/events`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 2, "both SSE subscribers to register");
+      await expect(legacyClient.nextEvent()).resolves.toMatchObject({ event: "projection_ready" });
+
+      const firstRealtimeProjection = realtimeClient.nextEventOfType("projection.updated");
+      const secondRealtimeProjection = secondRealtimeClient.nextEventOfType("projection.updated");
+      projectionWriter.publish(
+        projectionPublication({
+          projectionName: "history_projection",
+          scopeKind: "global",
+          scopeKey: "global",
+          projectionRevisionId: "projection-revision-1",
+          revision: 3,
+          contentSha256: "history-sha",
+          generatedAt: "2026-01-01T00:00:02.000Z",
+        }),
+      );
+
+      const [realtime, secondRealtime] = await Promise.all([firstRealtimeProjection, secondRealtimeProjection]);
+      expect(secondRealtime.event).toBe(realtime.event);
+      expect(secondRealtime.id).toBe(realtime.id);
+      expect(secondRealtime.data).toEqual(realtime.data);
+      const [sourceStatus, secondSourceStatus] = await Promise.all([realtimeClient.nextEvent(), secondRealtimeClient.nextEvent()]);
+      expect(sourceStatus.event).toBe("source.status");
+      expect(secondSourceStatus.event).toBe(sourceStatus.event);
+      expect(secondSourceStatus.id).toBe(sourceStatus.id);
+      expect(secondSourceStatus.data).toEqual(sourceStatus.data);
+      expect(realtime.data).toMatchObject({
+        type: "projection.updated",
+        source: { source: "history_projection:global:global", revision: 3, observedAt: "2026-01-01T00:00:02.000Z" },
+        detail: {
+          source: "projection",
+          projectionName: "history_projection",
+          scopeKind: "global",
+          scopeKey: "global",
+          resourcesChanged: ["history"],
+        },
+        payload: { resourcesChanged: ["history"] },
+      });
+      await expect(legacyClient.nextEvent()).resolves.toMatchObject({
+        event: "projection_revision",
+        data: {
+          type: "projection_revision",
+          generation: 1,
+          source: "history_projection:global:global",
+          revision: 3,
+          observedAt: "2026-01-01T00:00:02.000Z",
+        },
+      });
+    } finally {
+      await realtimeClient.close();
+      await secondRealtimeClient.close();
+      await legacyClient.close();
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "both SSE subscribers to disconnect");
+      await server.stop();
+    }
+  });
+
+  it("emits typed realtime events and freshness payloads from durable transcript and orchestrator projection publications", async () => {
+    const projectionWriter = fakeProjectionWriter();
+    const server = createRealtimeServer({ projectionWriter });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      projectionWriter.publish(
+        projectionPublication({
+          projectionName: "transcript_projection",
+          scopeKind: "run_page",
+          scopeKey: "run-durable-transcript:0:50",
+          projectionRevisionId: "projection-revision-transcript",
+          revision: 11,
+          contentSha256: "transcript-sha",
+          generatedAt: "2026-01-01T00:00:03.000Z",
+          sourceRevisions: [
+            { source: "runs", revision: 10, observedAt: "2026-01-01T00:00:02.000Z" },
+            {
+              source: "transcript:run-durable-transcript",
+              revision: "2:5:2026-01-01T00:00:02.500Z",
+              observedAt: "2026-01-01T00:00:02.500Z",
+            },
+          ],
+          sourceCursors: {
+            runId: "run-durable-transcript",
+            sessionId: "session-durable-transcript",
+            issueKey: "ENG-214",
+            offset: 0,
+            limit: 50,
+            nextOffset: 2,
+            eventCount: 2,
+            firstSequence: 4,
+            lastSequence: 5,
+            lastEventAt: "2026-01-01T00:00:02.500Z",
+          },
+          sourceFreshness: [
+            {
+              source: "run_activity",
+              status: "fresh",
+              checkedAt: "2026-01-01T00:00:03.000Z",
+              revision: 10,
+              lastSuccessAt: "2026-01-01T00:00:03.000Z",
+              lastErrorAt: null,
+              staleMs: null,
+              detail: "durable transcript projection is current",
+            },
+          ],
+        }),
+      );
+
+      const transcriptProjection = await client.nextEventOfType("projection.updated");
+      const transcriptSource = await client.nextEventOfType("source.status");
+      const run = await client.nextEventOfType("run.updated");
+      const transcript = await client.nextEventOfType("transcript.delta");
+
+      expect(transcriptProjection.data).toMatchObject({
+        type: "projection.updated",
+        source: {
+          source: "transcript_projection:run_page:run-durable-transcript:0:50",
+          revision: 11,
+          observedAt: "2026-01-01T00:00:03.000Z",
+        },
+        payload: { resourcesChanged: ["session-transcript", "history"] },
+      });
+      expect(transcriptSource.data).toMatchObject({
+        type: "source.status",
+        scope: "source",
+        key: "projection",
+        source: { source: "transcript_projection:run_page:run-durable-transcript:0:50", revision: 11 },
+        detail: {
+          projectionName: "transcript_projection",
+          sourceRevisions: expect.arrayContaining([
+            { source: "runs", revision: 10, observedAt: "2026-01-01T00:00:02.000Z" },
+          ]),
+          sourceCursors: {
+            runId: "run-durable-transcript",
+            sessionId: "session-durable-transcript",
+            eventCount: 2,
+            firstSequence: 4,
+            lastSequence: 5,
+          },
+          sourceFreshness: expect.arrayContaining([
+            expect.objectContaining({ source: "run_activity", status: "fresh", revision: 10 }),
+          ]),
+        },
+        payload: {
+          status: "fresh",
+          fetchedAt: "2026-01-01T00:00:03.000Z",
+          sourceCursors: { runId: "run-durable-transcript", sessionId: "session-durable-transcript" },
+          sourceFreshness: expect.arrayContaining([
+            expect.objectContaining({ source: "run_activity", status: "fresh", checkedAt: "2026-01-01T00:00:03.000Z" }),
+          ]),
+        },
+      });
+      expect(run.data).toMatchObject({
+        type: "run.updated",
+        scope: "run",
+        key: "run-durable-transcript",
+        payload: { runId: "run-durable-transcript", issueIdentifier: "ENG-214", status: null },
+      });
+      expect(transcript.data).toMatchObject({
+        type: "transcript.delta",
+        scope: "session",
+        key: "session-durable-transcript",
+        payload: {
+          runId: "run-durable-transcript",
+          sessionId: "session-durable-transcript",
+          afterSequence: 3,
+          eventCount: 2,
+        },
+      });
+
+      projectionWriter.publish(
+        projectionPublication({
+          projectionName: "orchestrator_chat_projection",
+          scopeKind: "conversation",
+          scopeKey: "operator-room",
+          projectionRevisionId: "projection-revision-orchestrator",
+          revision: 12,
+          contentSha256: "orchestrator-sha",
+          generatedAt: "2026-01-01T00:00:04.000Z",
+          sourceRevisions: [
+            { source: "orchestrator_conversations", revision: 8, observedAt: null },
+            { source: "orchestrator_chat:operator-room", revision: "3:message-3:2026-01-01T00:00:03.500Z", observedAt: "2026-01-01T00:00:03.500Z" },
+          ],
+          sourceCursors: {
+            conversationKey: "operator-room",
+            messageCount: 3,
+            lastMessageId: "message-3",
+            lastMessageStatus: "completed",
+            lastMessageAt: "2026-01-01T00:00:03.500Z",
+          },
+          sourceFreshness: [
+            {
+              source: "orchestrator_chat:operator-room",
+              status: "fresh",
+              checkedAt: "2026-01-01T00:00:04.000Z",
+              revision: "3:message-3:2026-01-01T00:00:03.500Z",
+              lastSuccessAt: "2026-01-01T00:00:04.000Z",
+              lastErrorAt: null,
+              staleMs: null,
+              detail: "durable orchestrator chat projection is current",
+            },
+          ],
+        }),
+      );
+
+      const chatProjection = await client.nextEventOfType("projection.updated");
+      const chatSource = await client.nextEventOfType("source.status");
+      const chat = await client.nextEventOfType("orchestrator.message");
+
+      expect(chatProjection.data).toMatchObject({
+        type: "projection.updated",
+        source: { source: "orchestrator_chat_projection:conversation:operator-room", revision: 12 },
+        payload: { resourcesChanged: ["orchestrator-chat", "sidebar", "dashboard"] },
+      });
+      expect(chatSource.data).toMatchObject({
+        type: "source.status",
+        source: { source: "orchestrator_chat_projection:conversation:operator-room", revision: 12 },
+        payload: {
+          status: "fresh",
+          fetchedAt: "2026-01-01T00:00:04.000Z",
+          sourceCursors: {
+            conversationKey: "operator-room",
+            messageCount: 3,
+            lastMessageId: "message-3",
+            lastMessageStatus: "completed",
+          },
+          sourceFreshness: expect.arrayContaining([
+            expect.objectContaining({ source: "orchestrator_chat:operator-room", status: "fresh" }),
+          ]),
+        },
+      });
+      expect(chat.data).toMatchObject({
+        type: "orchestrator.message",
+        scope: "orchestrator",
+        key: "operator-room",
+        source: { source: "orchestrator_chat_projection:conversation:operator-room", revision: 12 },
+        payload: {
+          conversationId: "operator-room",
+          messageCount: 3,
+          lastMessageId: "message-3",
+          lastMessageStatus: "completed",
+          lastMessageAt: "2026-01-01T00:00:03.500Z",
+        },
+      });
+    } finally {
+      await client.close();
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "SSE subscriber to disconnect");
+      await server.stop();
+    }
+  });
+
   it("publishes tracker source freshness changes from reference-data, issues, and dashboard refresh paths", async () => {
     let currentIssue = testIssue();
     const tracker = mutableTracker(() => [currentIssue]);
@@ -164,10 +717,21 @@ describe("StatusServer realtime SSE API", () => {
       const fresh = await client.nextEventOfType("source.status");
       expect(fresh.data).toMatchObject({
         type: "source.status",
+        scope: "source",
+        key: "trackerIssues",
         source: { source: "trackerIssues", revision: 1 },
         detail: {
           source: "trackerIssues",
           status: "ok",
+          cached: false,
+          error: null,
+          issueCount: 1,
+        },
+        payload: {
+          source: "trackerIssues",
+          sourceRevision: 1,
+          status: "ok",
+          fetchedStates: expect.arrayContaining(["Todo", "In Progress"]),
           cached: false,
           error: null,
           issueCount: 1,
@@ -203,6 +767,207 @@ describe("StatusServer realtime SSE API", () => {
       expect((refreshed.data as RealtimeProjectionEvent).resources).toEqual(
         expect.arrayContaining([{ kind: "dashboard", href: "/api/v1/web/dashboard?refresh=1", relation: "refetch" }]),
       );
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("publishes ordered writeback outbox realtime events without duplicating idempotent replays", async () => {
+    const writebackOutbox = new FileWritebackOutboxStore(path.join(root, "writeback-state"));
+    const server = createRealtimeServer({ writebackOutbox });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+    const operation = {
+      idempotencyKey: "writeback:TEST-1:completion-note",
+      kind: "comment" as const,
+      issueId: "issue-1",
+      runId: "run-writeback-1",
+      payload: {
+        body: "Durable completion report writeback is ready.",
+        dedupeKey: "writeback-sse-dedupe",
+      },
+    };
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      const enqueued = await writebackOutbox.enqueueOnce(operation);
+      const enqueueEvents = await readOrderedRealtimeEvents(client, "writeback", 1, ["projection.updated", "source.status"]);
+      expect(enqueueEvents[0]?.resources).toEqual(
+        expect.arrayContaining([{ kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" }]),
+      );
+      expect(enqueueEvents[1]?.resources).toEqual(
+        expect.arrayContaining([{ kind: "source", href: "/api/v1/web/reference-data?refresh=1", relation: "refetch" }]),
+      );
+
+      const [claimed] = await writebackOutbox.claimDue(new Date(), { idempotencyKeys: [operation.idempotencyKey] });
+      expect(claimed).toMatchObject({ idempotencyKey: operation.idempotencyKey, status: "in_flight" });
+      await readOrderedRealtimeEvents(client, "writeback", 2, ["projection.updated", "source.status"]);
+
+      await writebackOutbox.markSucceeded(claimed ?? enqueued);
+      await readOrderedRealtimeEvents(client, "writeback", 3, ["projection.updated", "source.status"]);
+
+      await expect(writebackOutbox.enqueueOnce(operation)).resolves.toMatchObject({
+        idempotencyKey: operation.idempotencyKey,
+        status: "succeeded",
+      });
+      await expect(client.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("publishes approval request, lifecycle, and rejected-publication realtime events once across route replay", async () => {
+    const config = testConfig(root);
+    config.github.publishPullRequests = true;
+    config.github.operatorApproval!.requiredForPublication = true;
+    config.github.operatorApproval!.rejectPolicy = "cancel";
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const approvalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    await runStore.startRun({
+      runId: "run-approval-1",
+      sessionId: "session-approval-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-approval-1",
+      issueIdentifier: "TEST-APPROVAL",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "publish completion report",
+      workspaceKey: "TEST-APPROVAL",
+      workspacePath: path.join(root, "workspace"),
+    });
+    const server = createRealtimeServer({
+      runStore,
+      lifecycleStore,
+      operatorApproval,
+      openWorkspaceToken: "secret",
+    });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      const approval = await operatorApproval.requestPublicationApproval({
+        issueId: "issue-approval-1",
+        issueIdentifier: "TEST-APPROVAL",
+        runId: "run-approval-1",
+        evidenceCursor: "approval-evidence-1",
+        action: {
+          kind: "push_and_pr",
+          branchName: "symphony/TEST-APPROVAL",
+          baseBranch: "main",
+          workspacePath: path.join(root, "workspace"),
+          title: "TEST-APPROVAL durable publication",
+          evidenceCursor: "approval-evidence-1",
+          summaryPreview: "Publication approval required",
+          changedFiles: ["tests/realtime-api.test.ts"],
+          plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+        },
+      });
+      await readOrderedRealtimeEvents(client, "runs", 2, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      const requestTranscriptEvents = await readOrderedRealtimeEvents(client, "runs", 3, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      expect(requestTranscriptEvents[3]?.recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
+      await expect(runStore.readTranscript("run-approval-1", { offset: 0, limit: 10 })).resolves.toMatchObject({
+        events: [expect.objectContaining({ eventType: "approval_request" })],
+      });
+
+      await lifecycleStore.ensureIssue(
+        { id: "issue-approval-1", identifier: "TEST-APPROVAL" },
+        {
+          phase: "blocked",
+          blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          lastCompletionReportId: "report-approval-1",
+          completionReports: [
+            {
+              id: "report-approval-1",
+              idempotencyKey: "approval-evidence-1",
+              runId: "run-approval-1",
+              issueId: "issue-approval-1",
+              issueIdentifier: "TEST-APPROVAL",
+              summary: "Publication is waiting for operator approval.",
+              validationEvidence: ["approval realtime route test"],
+              acceptanceChecklist: [{ text: "approval requested", satisfied: true, evidence: "approval request created" }],
+              changedFiles: ["tests/realtime-api.test.ts"],
+              branchName: "symphony/TEST-APPROVAL",
+              pullRequest: null,
+              risks: [],
+              acceptedAt: "2026-01-01T00:00:00.000Z",
+              writebackOperationKeys: [],
+            },
+          ],
+        },
+      );
+      const lifecycleEvents = await readOrderedRealtimeEvents(client, "lifecycle", 1, ["projection.updated", "source.status"]);
+      expect(lifecycleEvents[0]?.resources).toEqual(
+        expect.arrayContaining([{ kind: "issue-board", href: "/api/v1/web/issues", relation: "refetch" }]),
+      );
+
+      const rejected = await fetch(`${baseUrl}/api/v1/approval-requests/${approval.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      await expect(rejected.json()).resolves.toMatchObject({ replayed: false, request: { status: "rejected" } });
+      expect(rejected.status).toBe(200);
+      await readOrderedRealtimeEvents(client, "runs", 4, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      await readOrderedRealtimeEvents(client, "runs", 5, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      const terminalEvents = await readOrderedRealtimeEvents(client, "runs", 6, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      expect(terminalEvents[2]?.resources).toEqual(
+        expect.arrayContaining([{ kind: "history", href: "/api/v1/web/history", relation: "refetch" }]),
+      );
+      await expect(runStore.getRun("run-approval-1")).resolves.toMatchObject({
+        status: "cancelled",
+        pendingApprovalRequestId: null,
+        pendingApprovalRequestedAt: null,
+      });
+      await expect(runStore.readTranscript("run-approval-1", { offset: 0, limit: 10 })).resolves.toMatchObject({
+        events: [
+          expect.objectContaining({ eventType: "approval_request" }),
+          expect.objectContaining({ eventType: "approval_resolved" }),
+        ],
+      });
+
+      const replay = await fetch(`${baseUrl}/api/v1/approval-requests/${approval.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      await expect(replay.json()).resolves.toMatchObject({ replayed: true, request: { status: "rejected" } });
+      expect(replay.status).toBe(200);
+      await expect(client.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
     } finally {
       await client.close();
       await server.stop();
@@ -249,6 +1014,12 @@ describe("StatusServer realtime SSE API", () => {
         expect((recovery.data as RealtimeProjectionEvent).recovery.endpoints).toEqual(
           expect.arrayContaining(["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/history"]),
         );
+        for (const endpoint of ["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/history"]) {
+          const refetch = await fetch(`${baseUrl}${endpoint}`);
+          expect(refetch.status, `missed-event recovery refetch ${endpoint} should use normal GET semantics`).toBe(200);
+          expect(refetch.headers.get("content-type")).toContain("application/json");
+          expect(await refetch.json()).toBeTruthy();
+        }
       } finally {
         await recoveryClient.close();
       }
@@ -333,9 +1104,11 @@ describe("StatusServer realtime SSE API", () => {
     const baseUrl = `http://${address.host}:${address.port}`;
 
     try {
+      let recoveryId = "";
       const recoveryClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": "0" });
       try {
         const recovery = await recoveryClient.nextEvent();
+        recoveryId = recovery.id;
         expect(recovery.event).toBe("projection.updated");
         expect(recovery.data).toMatchObject({
           type: "projection.updated",
@@ -347,6 +1120,13 @@ describe("StatusServer realtime SSE API", () => {
         );
       } finally {
         await recoveryClient.close();
+      }
+
+      const recoveryCursorClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": recoveryId });
+      try {
+        await expect(recoveryCursorClient.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+      } finally {
+        await recoveryCursorClient.close();
       }
 
       const chatClient = await openSseClient(`${baseUrl}/api/v1/realtime`);
@@ -372,11 +1152,20 @@ describe("StatusServer realtime SSE API", () => {
         const chat = await nextEventOfTypeFromSource(chatClient, "orchestrator.message", "orchestrator-chat");
         expect(chat.data).toMatchObject({
           type: "orchestrator.message",
+          scope: "orchestrator",
+          key: "orchestrator-default",
           source: { source: "orchestrator-chat" },
           detail: {
             inputLength: "hello from the operator".length,
             messageCount: 1,
             conversationId: "orchestrator-default",
+            status: 202,
+          },
+          payload: {
+            source: "orchestrator-chat",
+            conversationId: "orchestrator-default",
+            inputLength: "hello from the operator".length,
+            messageCount: 1,
             status: 202,
           },
           recovery: { strategy: "refetch", reason: "event" },
@@ -400,6 +1189,7 @@ interface ParsedSseEvent {
 
 interface SseTestClient {
   response: Response;
+  nextRawBlock(timeoutMs?: number): Promise<string>;
   nextEvent(timeoutMs?: number): Promise<ParsedSseEvent>;
   nextEventOfType(type: RealtimeProjectionEventType, timeoutMs?: number): Promise<ParsedSseEvent>;
   close(): Promise<void>;
@@ -408,25 +1198,79 @@ interface SseTestClient {
 function createRealtimeServer(
   options: {
     runStore?: FileRunTranscriptStore;
+    runActivitySourceStore?: InMemoryRunActivityAppendStore;
     tracker?: TrackerClient;
     orchestratorConversationStore?: FileOrchestratorConversationStore;
+    projectionWriter?: StatusServerOptions["projectionWriter"];
+    lifecycleStore?: FileIssueLifecycleStore;
+    writebackOutbox?: FileWritebackOutboxStore;
+    operatorApproval?: StatusServerOptions["operatorApproval"];
+    orchestrator?: Orchestrator;
+    openWorkspaceToken?: string | null;
+    realtime?: StatusServerOptions["realtime"];
   } = {},
 ): StatusServer {
   return new StatusServer({
-    orchestrator: fakeOrchestrator(),
+    orchestrator: options.orchestrator ?? fakeOrchestrator(),
     workspaceManager: {} as StatusServerOptions["workspaceManager"],
     workspaceOpener: {} as StatusServerOptions["workspaceOpener"],
     ...(options.runStore ? { runStore: options.runStore } : {}),
+    ...(options.runActivitySourceStore ? { runActivitySourceStore: options.runActivitySourceStore } : {}),
     ...(options.tracker ? { tracker: options.tracker } : {}),
     ...(options.orchestratorConversationStore
       ? { orchestratorConversationStore: options.orchestratorConversationStore }
       : {}),
+    ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
+    ...(options.lifecycleStore ? { lifecycleStore: options.lifecycleStore } : {}),
+    ...(options.writebackOutbox ? { writebackOutbox: options.writebackOutbox } : {}),
+    ...(options.operatorApproval ? { operatorApproval: options.operatorApproval } : {}),
     host: "127.0.0.1",
     port: 0,
-    openWorkspaceToken: null,
+    openWorkspaceToken: options.openWorkspaceToken ?? null,
     trackerStateLists: testTrackerStateLists(),
     staleThresholdMs: 300_000,
+    ...(options.realtime ? { realtime: options.realtime } : {}),
   });
+}
+
+interface FakeProjectionWriter extends NonNullable<StatusServerOptions["projectionWriter"]> {
+  publish(publication: ProjectionRevisionPublication): void;
+}
+
+function projectionPublication(overrides: Partial<ProjectionRevisionPublication> = {}): ProjectionRevisionPublication {
+  return {
+    projectionName: "history_projection",
+    scopeKind: "global",
+    scopeKey: "global",
+    projectionRevisionId: "projection-revision-default",
+    revision: 1,
+    buildMode: "bootstrap",
+    contentSha256: "projection-sha",
+    generatedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: null,
+    sourceRevisions: [],
+    sourceCursors: {},
+    sourceFreshness: [],
+    ...overrides,
+  };
+}
+
+function fakeProjectionWriter(): FakeProjectionWriter {
+  const listeners = new Set<(event: ProjectionRevisionPublication) => void>();
+  return {
+    async writeProjection(_input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
+      throw new Error("fake projection writer is only used for publication events in realtime tests");
+    },
+    onProjectionChanged(listener: (event: ProjectionRevisionPublication) => void): () => void {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    publish(publication: ProjectionRevisionPublication): void {
+      for (const listener of Array.from(listeners)) listener(publication);
+    },
+  };
 }
 
 function fakeOrchestrator(): Orchestrator {
@@ -530,6 +1374,23 @@ function testIssue(overrides: Partial<Issue> = {}): Issue {
   };
 }
 
+function runActivityInput(overrides: Record<string, unknown> = {}): RunActivityAppendInput {
+  return {
+    id: "activity-realtime",
+    runId: "run-realtime-activity",
+    sessionId: "session-realtime-activity",
+    at: "2026-01-01T00:00:00.000Z",
+    harnessId: "runtime-adapter",
+    actor: "runtime",
+    channel: "status",
+    kind: "runtime_log",
+    text: "runtime activity",
+    payload: {},
+    protocol: "json_rpc",
+    ...overrides,
+  } as RunActivityAppendInput;
+}
+
 async function openSseClient(url: string, headers: Record<string, string> = {}): Promise<SseTestClient> {
   const controller = new AbortController();
   const response = await fetch(url, { headers, signal: controller.signal });
@@ -539,26 +1400,34 @@ async function openSseClient(url: string, headers: Record<string, string> = {}):
   const decoder = new TextDecoder();
   let buffer = "";
 
-  const nextEvent = async (timeoutMs = 2_000): Promise<ParsedSseEvent> => {
+  const nextRawBlock = async (timeoutMs = 2_000, description = "SSE block"): Promise<string> => {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
       const delimiter = buffer.indexOf("\n\n");
       if (delimiter >= 0) {
         const raw = buffer.slice(0, delimiter);
         buffer = buffer.slice(delimiter + 2);
-        const event = parseSseBlock(raw);
-        if (event) return event;
-        continue;
+        return raw;
       }
-      const chunk = await withTimeout(reader.read(), timeoutMs - (Date.now() - startedAt), "SSE event");
-      if (chunk.done) throw new Error("SSE stream closed before an event was available");
+      const chunk = await withTimeout(reader.read(), timeoutMs - (Date.now() - startedAt), description);
+      if (chunk.done) throw new Error(`SSE stream closed before ${description === "SSE event" ? "an event" : "a block"} was available`);
       buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
+    }
+    throw new Error(`Timed out waiting for ${description}`);
+  };
+
+  const nextEvent = async (timeoutMs = 2_000): Promise<ParsedSseEvent> => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const event = parseSseBlock(await nextRawBlock(timeoutMs - (Date.now() - startedAt), "SSE event"));
+      if (event) return event;
     }
     throw new Error("Timed out waiting for SSE event");
   };
 
   return {
     response,
+    nextRawBlock,
     nextEvent,
     async nextEventOfType(type: RealtimeProjectionEventType, timeoutMs = 2_000): Promise<ParsedSseEvent> {
       const startedAt = Date.now();
@@ -605,6 +1474,34 @@ async function nextEventOfTypeFromSource(
     if ((event.data as RealtimeProjectionEvent).source.source === source) return event;
   }
   throw new Error(`Timed out waiting for SSE event type ${type} from source ${source}`);
+}
+
+async function readOrderedRealtimeEvents(
+  client: SseTestClient,
+  source: string,
+  sourceRevision: number,
+  expectedTypes: readonly RealtimeProjectionEventType[],
+): Promise<RealtimeProjectionEvent[]> {
+  const events: RealtimeProjectionEvent[] = [];
+  for (const type of expectedTypes) {
+    const event = await client.nextEvent();
+    expect(event.event).toBe(type);
+    const data = event.data as RealtimeProjectionEvent;
+    expect(data).toMatchObject({
+      type,
+      source: { source, revision: sourceRevision },
+      recovery: { strategy: "refetch", reason: "event" },
+      missedEvents: false,
+    });
+    expect(data.resources.length).toBeGreaterThan(0);
+    expect(data.recovery.endpoints.length).toBeGreaterThan(0);
+    events.push(data);
+  }
+  expect(events.map((event) => event.revision)).toEqual(
+    events.map((event) => event.revision).slice().sort((left, right) => left - right),
+  );
+  expect(new Set(events.map((event) => event.id)).size).toBe(events.length);
+  return events;
 }
 
 async function waitFor(predicate: () => boolean, description: string, timeoutMs = 2_000): Promise<void> {

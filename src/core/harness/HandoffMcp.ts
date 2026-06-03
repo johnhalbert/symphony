@@ -84,9 +84,27 @@ export function renderCompletionMcpHandoffPrompt(input: RuntimeHandoffPromptInpu
     `- Repository path: ${input.repoPath ?? "n/a"}`,
     `- Base ref: ${input.baseRef ?? "n/a"}`,
     "- Before ending the run, call the submit_completion_report MCP tool with summary, validationEvidence, acceptanceChecklist, changedFiles, branchName, pullRequest, risks, and idempotencyKey.",
-    "- Leave implementation changes uncommitted and unpushed in the assigned worktree. Do not run git commit, git push, gh pr create, or gh pr edit; Symphony performs service-owned commit, push, and PR creation/reuse after the completion report is accepted.",
+    "- Leave implementation changes uncommitted and unpushed in the assigned worktree. Do not run git commit, git push, gh pr create, or gh pr edit; the allowed GitHub path is the Symphony service-owned GitHub workflow through submit_completion_report, and Symphony performs service-owned commit, push, and PR creation/reuse after the completion report is accepted.",
     "- The MCP server is scoped to this issue and the current runtime run; Symphony injects runId and issueId for you.",
     "- Do not comment on Linear, transition Linear state, or request broad Linear write credentials. Symphony handles writeback after the tool accepts the report.",
+  ].join("\n");
+}
+
+export function renderReviewMcpHandoffPrompt(input: RuntimeHandoffPromptInput): string {
+  return [
+    "",
+    "Symphony MCP review handoff:",
+    `- Active issue: ${input.issue.identifier} (${input.issue.id})`,
+    `- Active role: ${input.role ?? "reviewer"}`,
+    `- Workspace path: ${input.workspacePath ?? "n/a"}`,
+    `- Branch: ${input.branchName ?? input.issue.branchName ?? "n/a"}`,
+    `- Repository path: ${input.repoPath ?? "n/a"}`,
+    `- Base ref: ${input.baseRef ?? "n/a"}`,
+    "- Use submit_pull_request_review_feedback for GitHub PR review feedback before submit_review_verdict; the allowed GitHub review-write path is the Symphony service-owned review feedback workflow against the lifecycle-bound PR.",
+    "- Do not run gh pr review, gh pr comment, git push, direct GitHub API/curl writes, or otherwise write to GitHub directly from the reviewer command surface.",
+    "- After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence, then call submit_review_verdict before ending the run.",
+    "- The MCP servers are scoped to this issue, active reviewer run, and lifecycle-bound PR; Symphony injects runId, issueId, PR number, repository, token, and commit identity when a tool needs them.",
+    "- Do not comment on Linear, transition Linear state, or request broad Linear or GitHub credentials. Symphony handles review writeback after the tools accept the report.",
   ].join("\n");
 }
 

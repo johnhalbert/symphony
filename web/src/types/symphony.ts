@@ -91,6 +91,31 @@ export interface RunSessionModelSettings {
   allowLargeContext: boolean | null;
 }
 
+export interface RunSessionProviderLimitModel {
+  provider: string | null;
+  providerId: string | null;
+  harnessId: string | null;
+  model: string | null;
+  kind: string | null;
+  message: string | null;
+  observedAt: string | null;
+  resumePolicy: string | null;
+  window: {
+    resumeAt: string | null;
+    retryAfterMs: number | null;
+    windowLabel: string | null;
+    windowKind: string | null;
+  } | null;
+  source: {
+    issueId: string | null;
+    issueIdentifier: string | null;
+    runId: string | null;
+    sessionId: string | null;
+    role: string | null;
+    runPhase: string | null;
+  } | null;
+}
+
 export interface RunSessionModel {
   runId: string;
   sessionId: string | null;
@@ -135,6 +160,7 @@ export interface RunSessionModel {
     cancelFailedSource: string | null;
   };
   failure: { kind: string | null; diagnosticCode: string | null; diagnosticMessage: string | null; diagnosticAt: string | null };
+  providerLimit: RunSessionProviderLimitModel | null;
   links: { issue: string; run: string; transcript: string };
 }
 
@@ -258,6 +284,23 @@ export interface DashboardMetrics {
   health?: DashboardHealthMetrics | null;
 }
 
+export type DashboardSourceStatus = "fresh" | "empty" | "stale" | "error" | "unavailable";
+
+export interface DashboardSourceModel {
+  status: DashboardSourceStatus;
+  label: string;
+  detail: string;
+  generatedAt: string | null;
+  trackerFetchedAt: string | null;
+  issueCount: number;
+  runCount: number;
+  lifecycleCount: number;
+  activityCount: number;
+  writebackCount: number;
+  cached: boolean;
+  error: string | null;
+}
+
 export interface DashboardModel {
   projectName: string;
   repoLabel: string;
@@ -272,6 +315,7 @@ export interface DashboardModel {
   chat: ChatMessage[];
   totals: DashboardTotals;
   metrics?: DashboardMetrics | null;
+  source?: DashboardSourceModel | null;
 }
 
 export interface IssueBoardModel {

@@ -33,7 +33,7 @@ export function useAsyncResource<T>(
       .catch((error: unknown) => {
         if (!active) return;
         const message = error instanceof Error ? error.message : String(error);
-        setState({ data: null, loading: false, error: message, enabled: true });
+        setState((current) => ({ data: current.data, loading: false, error: message, enabled: true }));
       });
     return () => {
       active = false;

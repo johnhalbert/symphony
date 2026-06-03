@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   StatusServer,
   WEB_PROJECTION_CONTEXT_TTL_MS,
+  type StatusServerProjectionReader,
   type StatusServerWebProjectionContext,
   type StatusServerWebProjectionContextBuildInput,
   type StatusServerWebProjectionContextBuilder,
@@ -84,6 +85,42 @@ describe("StatusServer web projection context cache", () => {
     expect(runtimeChanged).not.toBe(revisionChanged);
     expect(projectedBuild(runtimeChanged)).toBe(3);
     expect(builds).toBe(3);
+  });
+
+  it("rebuilds before TTL expiry when a durable projection revision changes", async () => {
+    const generatedAt = "2026-01-01T00:00:00.000Z";
+    let durableProjectionRevision = 1;
+    let builds = 0;
+    const server = createStatusServer({
+      generatedAt: () => generatedAt,
+      clock: () => new Date("2026-01-01T00:00:00.000Z"),
+      projectionReader: durableProjectionRevisionReader(() => durableProjectionRevision, generatedAt),
+      builder: (input) => {
+        builds += 1;
+        return contextFixture(input, builds);
+      },
+    });
+    const acquire = acquireFrom(server);
+
+    const first = await acquire(false);
+    expect(first.metadata.fingerprint.durableProjectionRevisions).toContainEqual({
+      source: "projection:dashboard_projection:global:global",
+      revision: 1,
+      observedAt: generatedAt,
+    });
+
+    durableProjectionRevision = 2;
+    const revisionChanged = await acquire(false);
+    expect(revisionChanged).not.toBe(first);
+    expect(projectedBuild(revisionChanged)).toBe(2);
+    expect(revisionChanged.metadata.fingerprint.durableProjectionRevisions).toContainEqual({
+      source: "projection:dashboard_projection:global:global",
+      revision: 2,
+      observedAt: generatedAt,
+    });
+
+    await expect(acquire(false)).resolves.toBe(revisionChanged);
+    expect(builds).toBe(2);
   });
 
   it("coalesces concurrent non-refresh requests onto the same in-flight build", async () => {
@@ -499,6 +536,7 @@ function createStatusServer(input: {
   runtimeCounts?: () => Partial<ReturnType<ConstructorParameters<typeof StatusServer>[0]["orchestrator"]["snapshot"]>["counts"]>;
   revisionProvider?: () => { source: string; revision: string | number; observedAt: string | null };
   revisionProviders?: readonly WebProjectionRevisionProvider[];
+  projectionReader?: StatusServerProjectionReader;
   runStore?: ConstructorParameters<typeof StatusServer>[0]["runStore"];
   lifecycleStore?: ConstructorParameters<typeof StatusServer>[0]["lifecycleStore"];
   writebackOutbox?: ConstructorParameters<typeof StatusServer>[0]["writebackOutbox"];
@@ -525,6 +563,7 @@ function createStatusServer(input: {
     webProjectionContextClock: input.clock,
     ...(input.builder ? { webProjectionContextBuilder: input.builder } : {}),
     ...(input.tracker ? { tracker: input.tracker } : {}),
+    ...(input.projectionReader ? { projectionReader: input.projectionReader } : {}),
     ...(input.runStore ? { runStore: input.runStore } : {}),
     ...(input.lifecycleStore ? { lifecycleStore: input.lifecycleStore } : {}),
     ...(input.writebackOutbox ? { writebackOutbox: input.writebackOutbox } : {}),
@@ -536,6 +575,33 @@ function createStatusServer(input: {
 function acquireFrom(server: StatusServer): (forceRefresh: boolean) => Promise<StatusServerWebProjectionContext> {
   const testable = server as TestableStatusServer;
   return (forceRefresh) => testable.acquireWebProjectionContext(forceRefresh);
+}
+
+function durableProjectionRevisionReader(revision: () => number, generatedAt: string): StatusServerProjectionReader {
+  return {
+    async readCurrentPayload() {
+      return null;
+    },
+    async readCurrentRevision(selector) {
+      const currentRevision = revision();
+      return {
+        projectionRevisionId: `${selector.projectionName}:${selector.scopeKind ?? "global"}:${selector.scopeKey ?? "global"}:${currentRevision}`,
+        projectionName: selector.projectionName,
+        scopeKind: selector.scopeKind ?? "global",
+        scopeKey: selector.scopeKey ?? "global",
+        revision: currentRevision,
+        buildMode: currentRevision === 1 ? "bootstrap" : "incremental",
+        sourceRevisions: [],
+        sourceCursors: {},
+        sourceFreshness: [],
+        contentSha256: "0".repeat(64),
+        generatedAt,
+        expiresAt: null,
+        supersededAt: null,
+        createdAt: generatedAt,
+      };
+    },
+  };
 }
 
 function contextFixture(

@@ -1,5 +1,6 @@
+import { useEffect, useRef } from "react";
 import type { SessionModel } from "../../types/symphony";
-import { Icon, SessionStateChip, StatusBadgeDot } from "../common";
+import { Icon, SessionStateChip, StatusBadgeDot, UnavailableButton } from "../common";
 
 export function SessionsList({
   sessions,
@@ -10,6 +11,23 @@ export function SessionsList({
   selectedId: string;
   onSelect: (sessionId: string) => void;
 }) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const scrollTopRef = useRef(0);
+
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    const maxScrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+    const nextScrollTop = Math.min(scrollTopRef.current, maxScrollTop);
+    list.scrollTop = nextScrollTop;
+    scrollTopRef.current = nextScrollTop;
+  }, [sessions]);
+
+  function rememberScrollPosition() {
+    const list = listRef.current;
+    if (list) scrollTopRef.current = list.scrollTop;
+  }
+
   return (
     <div className="history__sessions">
       <div className="colhead">
@@ -17,28 +35,28 @@ export function SessionsList({
           Sessions <span className="count">{sessions.length}</span>
         </h3>
         <div className="grow" />
-        <button className="icon-btn" title="Filter" type="button">
+        <UnavailableButton className="icon-btn" unavailableLabel="Filter" unavailableReason="session filtering is unavailable until a backed API command route exists">
           {Icon.filter()}
-        </button>
-        <button className="icon-btn" title="Sort" type="button">
+        </UnavailableButton>
+        <UnavailableButton className="icon-btn" unavailableLabel="Sort" unavailableReason="session sorting is unavailable until a backed API command route exists">
           {Icon.sort()}
-        </button>
+        </UnavailableButton>
       </div>
       <div className="sessions__filter">
-        <button className="pill" data-active="true" type="button">
+        <span className="pill btn--readonly" data-active="true" title="Read-only session filter state from the API history view." aria-label="All sessions selected">
           All
-        </button>
-        <button className="pill" type="button">
+        </span>
+        <UnavailableButton className="pill" unavailableLabel="Running sessions filter" unavailableReason="session status filtering is unavailable until a backed API command route exists">
           Running <span style={{ color: "var(--accent)", marginLeft: 4 }}>{sessions.filter((session) => session.state === "running").length}</span>
-        </button>
-        <button className="pill" type="button">
+        </UnavailableButton>
+        <UnavailableButton className="pill" unavailableLabel="Finished sessions filter" unavailableReason="session status filtering is unavailable until a backed API command route exists">
           Finished
-        </button>
-        <button className="pill" type="button">
+        </UnavailableButton>
+        <UnavailableButton className="pill" unavailableLabel="Error sessions filter" unavailableReason="session status filtering is unavailable until a backed API command route exists">
           Errors
-        </button>
+        </UnavailableButton>
       </div>
-      <div className="sessions__list">
+      <div className="sessions__list" ref={listRef} onScroll={rememberScrollPosition}>
         {sessions.map((session) => (
           <button
             className="session-row"

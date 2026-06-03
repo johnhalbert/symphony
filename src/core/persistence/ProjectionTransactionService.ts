@@ -135,8 +135,19 @@ export interface ProjectionPayloadRecord<TPayload = unknown> {
   expiresAt: string | null;
 }
 
+export interface ProjectionTranscriptDefaultPayloadSelector {
+  runId: string;
+  limit: number;
+}
+
 export interface ProjectionTransactionPayloadStore extends ProjectionTransactionStore {
   readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null>;
+}
+
+export interface ProjectionTranscriptDefaultPayloadStore extends ProjectionTransactionStore {
+  readCurrentTranscriptDefaultPayload<TPayload = unknown>(
+    selector: ProjectionTranscriptDefaultPayloadSelector,
+  ): Promise<ProjectionPayloadRecord<TPayload> | null>;
 }
 
 export interface ProjectionRevisionPublication {
@@ -211,6 +222,11 @@ export interface NormalizedProjectionRevisionSelector {
   scopeKey: string;
 }
 
+interface NormalizedProjectionTranscriptDefaultPayloadSelector {
+  runId: string;
+  limit: number;
+}
+
 export interface NormalizedProjectionPayloadFields {
   fetchedStates: readonly unknown[];
   issueKey: string | null;
@@ -274,6 +290,13 @@ export class ProjectionTransactionService {
   async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
     if (!isProjectionTransactionPayloadStore(this.store)) return null;
     return this.store.readCurrentPayload<TPayload>(normalizeProjectionRevisionSelector(selector));
+  }
+
+  async readCurrentTranscriptDefaultPayload<TPayload = unknown>(
+    selector: ProjectionTranscriptDefaultPayloadSelector,
+  ): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    if (!isProjectionTranscriptDefaultPayloadStore(this.store)) return null;
+    return this.store.readCurrentTranscriptDefaultPayload<TPayload>(normalizeProjectionTranscriptDefaultPayloadSelector(selector));
   }
 
   async nextRevisionNumber(selector: ProjectionRevisionSelector): Promise<number> {
@@ -439,6 +462,16 @@ export class PostgresProjectionTransactionStore implements ProjectionTransaction
     return this.withRunner((runner) => new PostgresProjectionTransaction(runner, this.schema).readCurrentPayload<TPayload>(normalizeProjectionRevisionSelector(selector)));
   }
 
+  async readCurrentTranscriptDefaultPayload<TPayload = unknown>(
+    selector: ProjectionTranscriptDefaultPayloadSelector,
+  ): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    return this.withRunner((runner) =>
+      new PostgresProjectionTransaction(runner, this.schema).readCurrentTranscriptDefaultPayload<TPayload>(
+        normalizeProjectionTranscriptDefaultPayloadSelector(selector),
+      ),
+    );
+  }
+
   async withTransaction<T>(operation: (transaction: ProjectionTransactionRevisionPort) => Promise<T>): Promise<T> {
     const run = () =>
       this.withRunner(async (runner) => {
@@ -527,6 +560,35 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
        ORDER BY revision.revision DESC
        LIMIT 1`,
       [selector.projectionName, selector.scopeKind, selector.scopeKey],
+    );
+    return mapProjectionPayloadRow<TPayload>(rows.rows[0]);
+  }
+
+  async readCurrentTranscriptDefaultPayload<TPayload = unknown>(
+    selector: NormalizedProjectionTranscriptDefaultPayloadSelector,
+  ): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    const rows = await this.runner.query<ProjectionPayloadRow>(
+      `SELECT ${projectionRevisionSelectColumns("revision")},
+              payload.payload,
+              payload.payload_sha256,
+              payload.raw_payload_refs,
+              payload.generated_at AS payload_generated_at,
+              payload.expires_at AS payload_expires_at
+       FROM ${this.table("projection_revision")} revision
+       JOIN ${this.table("transcript_projection")} payload
+         ON payload.projection_revision_id = revision.projection_revision_id
+       WHERE revision.projection_name = 'transcript_projection'
+         AND revision.scope_kind = 'run_page'
+         AND revision.superseded_at IS NULL
+         AND payload.run_id = $1
+         AND payload.offset_limit = $2
+       ORDER BY (payload.next_offset IS NULL) DESC,
+                payload.message_count DESC,
+                payload.offset_start DESC,
+                revision.revision DESC,
+                payload.generated_at DESC
+       LIMIT 1`,
+      [selector.runId, selector.limit],
     );
     return mapProjectionPayloadRow<TPayload>(rows.rows[0]);
   }
@@ -629,6 +691,15 @@ function normalizeProjectionRevisionSelector(selector: ProjectionRevisionSelecto
     "projection scope key",
   );
   return { projectionName: selector.projectionName, scopeKind, scopeKey };
+}
+
+function normalizeProjectionTranscriptDefaultPayloadSelector(
+  selector: ProjectionTranscriptDefaultPayloadSelector,
+): NormalizedProjectionTranscriptDefaultPayloadSelector {
+  return {
+    runId: normalizeNonEmptyString(selector.runId, null, "transcript projection runId"),
+    limit: normalizeInteger(selector.limit, { minimum: 1, name: "transcript projection limit" }),
+  };
 }
 
 function normalizeProjectionPayloadWrite(input: ProjectionPayloadWriteInput, clock: () => Date): NormalizedProjectionPayloadWrite {
@@ -1010,6 +1081,12 @@ function isProjectionSqlPool(value: ProjectionSqlPool | ProjectionSqlQueryRunner
 
 function isProjectionTransactionPayloadStore(store: ProjectionTransactionStore): store is ProjectionTransactionPayloadStore {
   return typeof (store as Partial<ProjectionTransactionPayloadStore>).readCurrentPayload === "function";
+}
+
+function isProjectionTranscriptDefaultPayloadStore(
+  store: ProjectionTransactionStore,
+): store is ProjectionTranscriptDefaultPayloadStore {
+  return typeof (store as Partial<ProjectionTranscriptDefaultPayloadStore>).readCurrentTranscriptDefaultPayload === "function";
 }
 
 function isRetryableProjectionWriteError(error: unknown): boolean {
