@@ -1,7 +1,22 @@
-import { redactTranscriptText, sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
+import { redactTranscriptText, sanitizeCommandPolicyPayloadForPublicOutput, sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
 import type { RunRecord, TranscriptEvent } from "../core/persistence/RunTranscriptStore.js";
 
 const USER_PROMPT_MAX_LENGTH = 5_000;
+
+export interface CommandPolicyStatusDetails {
+  outcome?: string;
+  reasonKind?: string;
+  role?: string;
+  phase?: string;
+  surface?: string;
+  commandClass?: string;
+  upstreamContactAttempted?: boolean;
+  requiresCodeChange?: boolean;
+  requiresUserOrServiceFix?: boolean;
+  requestKind?: string;
+  hookAction?: string;
+  permissionOutcome?: string;
+}
 
 export type TranscriptMessage =
   | {
@@ -29,7 +44,7 @@ export type TranscriptMessage =
       error?: string | null;
       truncated?: boolean;
     }
-  | { kind: "status"; state: string; ts: string; text: string }
+  | { kind: "status"; state: string; ts: string; text: string; policy?: CommandPolicyStatusDetails }
   | { kind: "task"; ts: string; title: string; desc: string }
   | { kind: "request"; ts: string; reason: string; q: string; actions: string[] };
 
@@ -119,6 +134,7 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage | 
   const payloadKind = normalizedPayloadKind(payload);
   const activitySource = normalizedActivitySource(payload);
   if (isToolEvent(eventType, payloadKind, payload)) return projectToolCallMessage(event, payload, eventType);
+  if (isCommandPolicyDecisionEvent(eventType, payloadKind, payload)) return projectCommandPolicyStatusMessage(event, payload);
   if (isDiagnosticEvent(eventType, payloadKind)) return projectDiagnosticStatusMessage(event, payload, eventType);
   if (isTokenUsageEvent(eventType, payloadKind) && isDisplayableTokenStatusEvent(event, payload)) {
     return projectTokenUsageStatusMessage(event, payload, eventType);
@@ -257,6 +273,57 @@ function projectStatusMessage(
     ts: event.at,
     text: eventText(event, payload),
   };
+}
+
+function projectCommandPolicyStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+): Extract<TranscriptMessage, { kind: "status" }> {
+  const policy = commandPolicyStatusDetails(payload);
+  return {
+    kind: "status",
+    state: "command_policy_decision",
+    ts: event.at,
+    text: firstCleanString(payload.message, payload.textPreview, payload.messagePreview, event.message) ?? commandPolicyStatusFallbackText(policy),
+    policy,
+  };
+}
+
+function commandPolicyStatusDetails(payload: Record<string, unknown>): CommandPolicyStatusDetails {
+  const details: CommandPolicyStatusDetails = {};
+  const outcome = firstCleanString(payload.outcome);
+  const reasonKind = firstCleanString(payload.reasonKind, payload.reason_kind);
+  const role = firstCleanString(payload.role);
+  const phase = firstCleanString(payload.phase);
+  const surface = firstCleanString(payload.surface);
+  const commandClass = firstCleanString(payload.commandClass, payload.command_class);
+  const requestKind = firstCleanString(payload.requestKind, payload.request_kind);
+  const hookAction = firstCleanString(payload.hookAction, payload.hook_action);
+  const permissionOutcome = firstCleanString(payload.permissionOutcome, payload.permission_outcome);
+  const upstreamContactAttempted = booleanFromUnknown(payload.upstreamContactAttempted ?? payload.upstream_contact_attempted);
+  const requiresCodeChange = booleanFromUnknown(payload.requiresCodeChange ?? payload.requires_code_change);
+  const requiresUserOrServiceFix = booleanFromUnknown(payload.requiresUserOrServiceFix ?? payload.requires_user_or_service_fix);
+
+  if (outcome) details.outcome = outcome;
+  if (reasonKind) details.reasonKind = reasonKind;
+  if (role) details.role = role;
+  if (phase) details.phase = phase;
+  if (surface) details.surface = surface;
+  if (commandClass) details.commandClass = commandClass;
+  if (upstreamContactAttempted !== null) details.upstreamContactAttempted = upstreamContactAttempted;
+  if (requiresCodeChange !== null) details.requiresCodeChange = requiresCodeChange;
+  if (requiresUserOrServiceFix !== null) details.requiresUserOrServiceFix = requiresUserOrServiceFix;
+  if (requestKind) details.requestKind = requestKind;
+  if (hookAction) details.hookAction = hookAction;
+  if (permissionOutcome) details.permissionOutcome = permissionOutcome;
+  return details;
+}
+
+function commandPolicyStatusFallbackText(policy: CommandPolicyStatusDetails): string {
+  const outcome = policy.outcome ?? "decision";
+  const reason = policy.reasonKind ? `: ${policy.reasonKind}` : "";
+  const scope = compactStrings([policy.role, policy.phase, policy.surface]).join(" · ");
+  return `Command policy ${outcome}${reason}${scope ? ` (${scope})` : ""}`;
 }
 
 function projectDiagnosticStatusMessage(
@@ -475,6 +542,22 @@ function isDisplayableTokenStatusEvent(event: TranscriptEvent, payload: Record<s
 
 function isDiagnosticEvent(eventType: string, payloadKind: string | null): boolean {
   return eventType === "run_diagnostic" || payloadKindIncludes(payloadKind, "run_diagnostic") || payloadKind === "diagnostic";
+}
+
+function isCommandPolicyDecisionEvent(
+  eventType: string,
+  payloadKind: string | null,
+  payload: Record<string, unknown>,
+): boolean {
+  return (
+    eventType === "command_policy_decision" ||
+    payloadKind === "command_policy_decision" ||
+    (typeof payload.outcome === "string" &&
+      typeof payload.reasonKind === "string" &&
+      typeof payload.role === "string" &&
+      typeof payload.phase === "string" &&
+      typeof payload.surface === "string")
+  );
 }
 
 function isTokenUsageEvent(eventType: string, payloadKind: string | null): boolean {
@@ -701,7 +784,12 @@ function normalizedOptionalToken(value: unknown): string | null {
 }
 
 function sanitizedPayloadRecord(event: TranscriptEvent): Record<string, unknown> {
-  const payload = sanitizePublicJson(event.payload);
+  const eventType = normalizeToken(event.eventType);
+  const rawPayload = rawPayloadRecord(event);
+  const rawPayloadKind = normalizedPayloadKind(rawPayload);
+  const payload = isCommandPolicyDecisionEvent(eventType, rawPayloadKind, rawPayload)
+    ? sanitizeCommandPolicyPayloadForPublicOutput(event.payload)
+    : sanitizePublicJson(event.payload);
   return isRecord(payload) ? payload : {};
 }
 
@@ -782,6 +870,10 @@ function payloadKindIncludes(payloadKind: string | null, token: string): boolean
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function booleanFromUnknown(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
 }
 
 function firstDeltaText(...values: unknown[]): string | null {

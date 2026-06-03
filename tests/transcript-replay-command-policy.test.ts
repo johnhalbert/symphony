@@ -19,7 +19,12 @@ import {
   mapRunActivityEventToTranscriptEvent,
   RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX,
 } from "../src/core/transcript/RunActivityEventMapper.js";
-import { agentCommandPolicyAuditPayload, allowPolicyDecision, denyPolicyDecision } from "./agent-command-policy-fixtures.js";
+import {
+  agentCommandPolicyAuditPayload,
+  agentCommandPolicyNormalizedCommand,
+  allowPolicyDecision,
+  denyPolicyDecision,
+} from "./agent-command-policy-fixtures.js";
 
 const RUN_ID = "run-command-policy-replay";
 const ISSUE_ID = "issue-command-policy-replay";
@@ -185,6 +190,110 @@ describe("command policy transcript replay and persistence", () => {
         expect.objectContaining({ kind: "status", state: "command_policy_decision", text: expect.stringContaining("Blocked worker/reviewer") }),
       ]),
     );
+  });
+
+  it("redacts command-policy payloads from public transcript reads while preserving replay-safe metadata", async () => {
+    const runId = "run-command-policy-public-read-redaction";
+    const store = new FileRunTranscriptStore(root);
+    await startRun(store, runId);
+
+    const policyEvent = commandPolicyTranscriptEvent(
+      denyPolicyDecision({
+        decisionId: "decision-public-read-redaction",
+        attemptId: "attempt-public-read-redaction",
+        reasonKind: "upstream_github",
+        commandClass: "direct_upstream_git_operation",
+        message: "Blocked worker/reviewer upstream GitHub activity for SECRET_POLICY_MESSAGE.",
+        normalizedCommand: agentCommandPolicyNormalizedCommand({
+          executable: "git",
+          executableKind: "git",
+          argumentsPreview: "push https://user:SECRET_TRANSCRIPT_PASSWORD@github.com/owner/repo.git HEAD",
+          gitSubcommand: "push",
+          targetHosts: ["github.com"],
+          hasInlineEnvironment: true,
+          hasUnsafeGitConfig: true,
+        }),
+        audit: agentCommandPolicyAuditPayload({
+          surface: "terminal_execute",
+          role: "worker",
+          phase: "implementation",
+          outcome: "deny",
+          reasonKind: "upstream_github",
+          commandClass: "direct_upstream_git_operation",
+          rawInputPreview: "GIT_ASKPASS=/tmp/secret-askpass git push https://user:SECRET_TRANSCRIPT_PASSWORD@github.com/owner/repo.git HEAD",
+          rawInputPreviewRedacted: true,
+          commandPreview: "git push https://user:SECRET_TRANSCRIPT_PASSWORD@github.com/owner/repo.git HEAD",
+          inlineEnvironmentKeys: ["GIT_ASKPASS"],
+          unsafeConfigCategories: ["credential_helper"],
+          upstreamContactAttempted: false,
+        }),
+      }),
+      1,
+      { permissionOutcome: "denied", hookAction: "block" },
+      runId,
+    );
+    const payload = policyEvent.payload as Record<string, unknown>;
+    payload.raw = { params: { command: "git push origin HEAD", token: "SECRET_RAW_POLICY_TOKEN" } };
+    payload.protocolPayload = { jsonrpc: "2.0", params: { command: "git push origin HEAD" } };
+    payload.env = { GIT_ASKPASS: "/tmp/secret-askpass", GITHUB_TOKEN: "SECRET_ENV_POLICY_TOKEN" };
+    payload.helperPath = "/tmp/secret-credential-helper";
+    const audit = payload.audit as Record<string, unknown>;
+    audit.helperPath = "/tmp/secret-credential-helper";
+    audit.unsafeConfigFindings = [
+      {
+        source: "command",
+        key: "credential.helper",
+        category: "credential_helper",
+        effect: "credential_helper",
+        helperPath: "/tmp/secret-credential-helper",
+      },
+    ];
+
+    await store.appendEvent(policyEvent);
+
+    const [publicEvent] = (await store.readTranscript(runId, { offset: 0, limit: 10 })).events;
+    const publicPayload = publicEvent?.payload as Record<string, unknown>;
+    const publicAudit = publicPayload.audit as Record<string, unknown>;
+    const publicNormalizedCommand = publicPayload.normalizedCommand as Record<string, unknown>;
+
+    expect(publicPayload).toMatchObject({
+      kind: "command_policy_decision",
+      outcome: "deny",
+      reasonKind: "upstream_github",
+      commandClass: "direct_upstream_git_operation",
+      permissionOutcome: "denied",
+      hookAction: "block",
+      redacted: true,
+      env: "[redacted environment values]",
+      helperPath: "[redacted helper path]",
+    });
+    expect(publicPayload).not.toHaveProperty("raw");
+    expect(publicPayload).not.toHaveProperty("protocolPayload");
+    expect(publicAudit).toMatchObject({
+      rawInputPreview: "[redacted command payload]",
+      rawInputPreviewRedacted: true,
+      commandPreview: "[redacted command payload]",
+      helperPath: "[redacted helper path]",
+      redacted: true,
+    });
+    expect(publicNormalizedCommand.argumentsPreview).toBe("[redacted command payload]");
+    expect(JSON.stringify(publicEvent)).not.toContain("SECRET_");
+    expect(JSON.stringify(publicEvent)).not.toContain("git push");
+    expect(JSON.stringify(publicEvent)).not.toContain("/tmp/secret");
+    expect(JSON.stringify(publicEvent)).not.toContain("user:SECRET_TRANSCRIPT_PASSWORD");
+
+    const replayed = replayRunSessionState((await store.getRun(runId)) as RunRecord, [publicEvent as TranscriptEvent]);
+    expect(policyEvidence(replayed.commandPolicy)).toEqual([
+      {
+        role: "worker",
+        phase: "implementation",
+        surface: "terminal_execute",
+        outcome: "deny",
+        reasonKind: "upstream_github",
+        commandClass: "direct_upstream_git_operation",
+        upstreamContactAttempted: false,
+      },
+    ]);
   });
 
   it("preserves ACP/gateway correlation fields and falls back to transcript run id during replay", async () => {

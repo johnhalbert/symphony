@@ -74,7 +74,7 @@ import {
   type WritebackOperation,
 } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
-import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
+import { sanitizedPreviewValue, sanitizeCommandPolicyReplayStateForPublicOutput, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import {
   DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
   type OrchestratorConversationMessage,
@@ -5862,6 +5862,9 @@ function publicRunRecord(run: RunRecord): RunRecord {
   const record: RunRecord = {
     ...run,
     error: publicDiagnosticText(run.error),
+    ...(run.commandPolicy === undefined
+      ? {}
+      : { commandPolicy: sanitizeCommandPolicyReplayStateForPublicOutput(run.commandPolicy) }),
   };
   if (run.cancelFailedReason !== undefined) record.cancelFailedReason = publicDiagnosticText(run.cancelFailedReason);
   if (run.harnessStopFailedReason !== undefined) record.harnessStopFailedReason = publicDiagnosticText(run.harnessStopFailedReason);
