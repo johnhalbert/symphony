@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { IssueModel, PriorityLevel, SidebarModel } from "../../types/symphony";
-import { Icon, StatusIcon } from "../common";
+import { Icon, StatusIcon, UnavailableButton } from "../common";
 
 export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
   return (
@@ -12,9 +12,9 @@ export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
           {sidebar.runningAgents.length} live · {sidebar.totals.open} open
         </span>
         <div style={{ flex: 1 }} />
-        <button className="icon-btn" type="button">
+        <UnavailableButton className="icon-btn" unavailableLabel="Sidebar menu" unavailableReason="sidebar action menus are unavailable until backend command routes exist">
           {Icon.more()}
-        </button>
+        </UnavailableButton>
       </div>
 
       <div style={{ padding: "12px 12px 4px" }}>

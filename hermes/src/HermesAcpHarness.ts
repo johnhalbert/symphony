@@ -284,7 +284,11 @@ type NormalizedHermesAcpSessionUpdate =
 type HermesAcpRuntimeEvent =
   | { type: "session.update"; sessionId: string | null; update: NormalizedHermesAcpSessionUpdate; raw: unknown }
   | { type: "diagnostic"; diagnostic: HostHermesAcpDiagnostic }
-  | { type: "permission.resolved"; resolution: HermesAcpPermissionResolution };
+  | {
+      type: "permission.resolved";
+      resolution: HermesAcpPermissionResolution;
+      jsonRpcRequestId: HostHermesAcpJsonRpcRequest["id"];
+    };
 
 const TERMINAL_SETUP_AUTH_METHOD_ID = "hermes-setup";
 const DEFAULT_PROFILE_PREFIX = "symphony";
@@ -401,7 +405,7 @@ export class HermesAcpHarness implements AgentHarness {
     ): Promise<Record<string, unknown>> => {
       const parsedRequest = parseHermesAcpPermissionRequest(params);
       const resolution = await this.resolvePermissionRequest(ctx, runId, activeRun, parsedRequest, request);
-      enqueueRuntimeEvent({ type: "permission.resolved", resolution });
+      enqueueRuntimeEvent({ type: "permission.resolved", resolution, jsonRpcRequestId: request.id });
       return resolution.response;
     };
 
@@ -2617,10 +2621,13 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
     case "permission.resolved": {
       const resolution = event.resolution;
       const selected = resolution.outcome === "selected";
+      const requestedOptionIds = resolution.request.options.map((option) => option.optionId);
       const message = selected
         ? `Host Hermes ACP permission ${resolution.selectedOptionId ?? "selected"} for ${resolution.request.requestKind}`
         : `Host Hermes ACP permission request denied: ${resolution.reason}`;
       const payload = {
+        acpJsonRpcRequestId: event.jsonRpcRequestId,
+        requestedOptionIds,
         requestKind: resolution.request.requestKind,
         toolCallId: resolution.request.toolCallId,
         outcome: resolution.outcome,
@@ -2640,9 +2647,12 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
                 message,
                 payload: {
                   sessionId: resolution.request.sessionId,
+                  acpJsonRpcRequestId: event.jsonRpcRequestId,
+                  requestedOptionIds,
                   requestKind: resolution.request.requestKind,
                   toolCallId: resolution.request.toolCallId,
                   outcome: resolution.outcome,
+                  selectedOptionId: resolution.selectedOptionId,
                   reason: resolution.reason,
                   paramsPreview: preview(resolution.request.params, 500),
                   redacted: true,

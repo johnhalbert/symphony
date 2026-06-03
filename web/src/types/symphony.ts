@@ -284,6 +284,23 @@ export interface DashboardMetrics {
   health?: DashboardHealthMetrics | null;
 }
 
+export type DashboardSourceStatus = "fresh" | "empty" | "stale" | "error" | "unavailable";
+
+export interface DashboardSourceModel {
+  status: DashboardSourceStatus;
+  label: string;
+  detail: string;
+  generatedAt: string | null;
+  trackerFetchedAt: string | null;
+  issueCount: number;
+  runCount: number;
+  lifecycleCount: number;
+  activityCount: number;
+  writebackCount: number;
+  cached: boolean;
+  error: string | null;
+}
+
 export interface DashboardModel {
   projectName: string;
   repoLabel: string;
@@ -298,6 +315,7 @@ export interface DashboardModel {
   chat: ChatMessage[];
   totals: DashboardTotals;
   metrics?: DashboardMetrics | null;
+  source?: DashboardSourceModel | null;
 }
 
 export interface IssueBoardModel {

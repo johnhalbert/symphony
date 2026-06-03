@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useReferenceData } from "../../data/referenceDataContext";
 import type { IssueModel } from "../../types/symphony";
-import { Avatar, Icon, Priority, StatusIcon } from "../common";
+import { Avatar, Icon, Priority, StatusIcon, UnavailableButton } from "../common";
 
 export function BacklogColumn({
   backlog,
@@ -29,15 +29,15 @@ export function BacklogColumn({
           Backlog <span className="count">{filtered.length}</span>
         </h3>
         <div className="grow" />
-        <button className="icon-btn" title="Filter" type="button">
+        <UnavailableButton className="icon-btn" title="Filter unavailable: use the search field below; no toolbar filter command route exists." unavailableLabel="Filter">
           {Icon.filter()}
-        </button>
-        <button className="icon-btn" title="Sort" type="button">
+        </UnavailableButton>
+        <UnavailableButton className="icon-btn" unavailableLabel="Sort" unavailableReason="issue sorting is not backed by an API command route yet">
           {Icon.sort()}
-        </button>
-        <button className="icon-btn" title="New issue" type="button">
+        </UnavailableButton>
+        <UnavailableButton className="icon-btn" unavailableLabel="New issue" unavailableReason="issue creation is unavailable until the backend exposes a command route">
           {Icon.plus()}
-        </button>
+        </UnavailableButton>
       </div>
       <div style={{ minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
         <div className="backlog__search">

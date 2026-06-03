@@ -539,7 +539,44 @@ describe("API data source", () => {
     expect(eventSource?.closed).toBe(true);
   });
 
-  it("surfaces realtime connect, reconnect, recovery, and stale missed-events status", () => {
+  it("shares one API-mode realtime EventSource connection across subscribers", () => {
+    FakeEventSource.instances = [];
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const firstSubscriberEvents: RealtimeProjectionEvent[] = [];
+    const secondSubscriberEvents: RealtimeProjectionEvent[] = [];
+    const firstSubscriberStatuses: RealtimeConnectionStatus[] = [];
+    const secondSubscriberStatuses: RealtimeConnectionStatus[] = [];
+    const dataSource = createApiDataSource("/status-server/");
+
+    const unsubscribeFirst = dataSource.subscribeToRealtimeEvents?.((event) => firstSubscriberEvents.push(event), {
+      lastEventId: " first-event ",
+      onStatus: (status) => firstSubscriberStatuses.push(status),
+    });
+    expect(FakeEventSource.instances).toHaveLength(1);
+    const eventSource = FakeEventSource.instances[0];
+    expect(eventSource?.url).toBe("/status-server/api/v1/realtime?lastEventId=first-event");
+    expect(firstSubscriberStatuses.map((status) => status.kind)).toEqual(["connecting"]);
+
+    eventSource?.emitOpen();
+    const unsubscribeSecond = dataSource.subscribeToRealtimeEvents?.((event) => secondSubscriberEvents.push(event), {
+      lastEventId: "second-event",
+      onStatus: (status) => secondSubscriberStatuses.push(status),
+    });
+    expect(FakeEventSource.instances).toHaveLength(1);
+    expect(secondSubscriberStatuses.map((status) => status.kind)).toEqual(["open"]);
+
+    const event = realtimeEvent({ id: "shared-2", revision: 2 });
+    eventSource?.emit("projection.updated", JSON.stringify(event));
+    expect(firstSubscriberEvents).toEqual([event]);
+    expect(secondSubscriberEvents).toEqual([event]);
+
+    unsubscribeFirst?.();
+    expect(eventSource?.closed).toBe(false);
+    unsubscribeSecond?.();
+    expect(eventSource?.closed).toBe(true);
+  });
+
+  it("surfaces realtime connect, reconnect, recovery, stale, and closed-error status", () => {
     FakeEventSource.instances = [];
     globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
     const events: RealtimeProjectionEvent[] = [];
@@ -563,17 +600,20 @@ describe("API data source", () => {
       resources: [],
     });
     eventSource?.emit("projection.updated", JSON.stringify(missedEvent));
+    expect(statuses.at(-1)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
+    eventSource?.emitError(FakeEventSource.CLOSED);
     unsubscribe?.();
 
-    expect(statuses.map((status) => status.kind)).toEqual(["connecting", "open", "reconnecting", "recovered", "stale"]);
+    expect(statuses.map((status) => status.kind)).toEqual(["connecting", "open", "reconnecting", "recovered", "stale", "error"]);
     expect(statuses.map((status) => status.label)).toEqual([
       "realtime connecting",
       "realtime connected",
       "realtime reconnecting",
       "realtime recovered",
       "realtime stale · refetching",
+      "realtime error",
     ]);
-    expect(statuses.at(-1)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
+    expect(statuses.at(-2)).toMatchObject({ lastEventId: "missed-6", revision: 7, missedEvents: true });
     expect(events).toEqual([missedEvent]);
     expect(eventSource?.closed).toBe(true);
   });
@@ -581,11 +621,15 @@ describe("API data source", () => {
   it("treats missing EventSource support as a no-op realtime subscription", () => {
     Reflect.deleteProperty(globalThis, "EventSource");
     const events: RealtimeProjectionEvent[] = [];
+    const statuses: RealtimeConnectionStatus[] = [];
 
-    const unsubscribe = createApiDataSource("").subscribeToRealtimeEvents?.((event) => events.push(event));
+    const unsubscribe = createApiDataSource("").subscribeToRealtimeEvents?.((event) => events.push(event), {
+      onStatus: (status) => statuses.push(status),
+    });
     unsubscribe?.();
 
     expect(events).toEqual([]);
+    expect(statuses.map((status) => status.kind)).toEqual(["unavailable"]);
   });
 
   it("uses realtime force-refresh hrefs on the next cacheable GET after invalidation", async () => {

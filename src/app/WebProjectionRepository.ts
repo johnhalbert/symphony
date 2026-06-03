@@ -19,6 +19,9 @@ export type WebProjectionReadStatus =
 
 export interface WebProjectionPayloadReader {
   readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null>;
+  readCurrentTranscriptDefaultPayload?<TPayload = unknown>(
+    selector: WebTranscriptProjectionDefaultPageSelector,
+  ): Promise<ProjectionPayloadRecord<TPayload> | null>;
 }
 
 export interface WebProjectionReadResult<TPayload> {
@@ -52,6 +55,11 @@ export interface WebTranscriptProjectionPageSelector {
   limit: number;
 }
 
+export interface WebTranscriptProjectionDefaultPageSelector {
+  runId: string;
+  limit: number;
+}
+
 export interface WebProjectionReadRepositories {
   readonly dashboard: WebDashboardProjectionRepository;
   readonly issueBoard: WebIssueBoardProjectionRepository;
@@ -74,14 +82,40 @@ export class WebProjectionReadRepository {
     selector: ProjectionRevisionSelector,
     options: WebProjectionReadOptions = {},
   ): Promise<WebProjectionReadResult<TPayload>> {
+    return this.readUsing(selector, options, (reader) => reader.readCurrentPayload<TPayload>(selector));
+  }
+
+  async readTranscriptDefaultPage<TPayload>(
+    selector: WebTranscriptProjectionDefaultPageSelector,
+    options: WebProjectionReadOptions = {},
+  ): Promise<WebProjectionReadResult<TPayload>> {
+    const defaultSelector: ProjectionRevisionSelector = {
+      projectionName: "transcript_projection",
+      scopeKind: "run_page",
+      scopeKey: webTranscriptDefaultProjectionScopeKey(selector),
+    };
+    return this.readUsing<TPayload>(defaultSelector, options, (reader) => {
+      if (reader.readCurrentTranscriptDefaultPayload) {
+        return reader.readCurrentTranscriptDefaultPayload<TPayload>(selector);
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  private async readUsing<TPayload>(
+    selector: ProjectionRevisionSelector,
+    options: WebProjectionReadOptions,
+    readRecord: (reader: WebProjectionPayloadReader) => Promise<ProjectionPayloadRecord<TPayload> | null>,
+  ): Promise<WebProjectionReadResult<TPayload>> {
     if (options.forceRefresh === true) return { status: "refresh_bypass", selector };
     if (!this.reader) return { status: "unavailable", selector };
     try {
-      const record = await this.reader.readCurrentPayload<TPayload>(selector);
+      const record = await readRecord(this.reader);
       if (!record) return { status: "missing", selector };
-      if (isWebProjectionPayloadExpired(record)) return { status: "expired", selector, record };
-      if (!(await this.isRecordCurrent(record))) return { status: "stale", selector, record };
-      return { status: "hit", selector, record };
+      const resolvedSelector = projectionRevisionSelector(record);
+      if (isWebProjectionPayloadExpired(record)) return { status: "expired", selector: resolvedSelector, record };
+      if (!(await this.isRecordCurrent(record))) return { status: "stale", selector: resolvedSelector, record };
+      return { status: "hit", selector: resolvedSelector, record };
     } catch {
       return { status: "error", selector };
     }
@@ -140,6 +174,13 @@ export class WebTranscriptProjectionRepository {
       options,
     );
   }
+
+  readRunDefaultPage(
+    page: WebTranscriptProjectionDefaultPageSelector,
+    options: WebProjectionReadOptions = {},
+  ): Promise<WebProjectionReadResult<ReturnType<typeof projectWebTranscript>>> {
+    return this.reads.readTranscriptDefaultPage(page, options);
+  }
 }
 
 export class WebOrchestratorChatProjectionRepository {
@@ -182,6 +223,10 @@ export function webTranscriptProjectionScopeKey(page: WebTranscriptProjectionPag
   return `${page.runId}:offset:${page.offset}:limit:${page.limit}`;
 }
 
+export function webTranscriptDefaultProjectionScopeKey(page: WebTranscriptProjectionDefaultPageSelector): string {
+  return `${page.runId}:tail:limit:${page.limit}`;
+}
+
 export function webOrchestratorChatProjectionScopeKey(conversationId?: string | null): string {
   const trimmed = conversationId?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_ORCHESTRATOR_CONVERSATION_ID;
@@ -191,4 +236,12 @@ export function isWebProjectionPayloadExpired(record: Pick<ProjectionPayloadReco
   if (record.expiresAt === null) return false;
   const expiresAtMs = Date.parse(record.expiresAt);
   return Number.isFinite(expiresAtMs) && expiresAtMs <= Date.now();
+}
+
+function projectionRevisionSelector(record: ProjectionPayloadRecord): ProjectionRevisionSelector {
+  return {
+    projectionName: record.revision.projectionName,
+    scopeKind: record.revision.scopeKind,
+    scopeKey: record.revision.scopeKey,
+  };
 }

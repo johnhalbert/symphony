@@ -8,8 +8,12 @@ import {
 import type { AgentCommandPolicyInput } from "../src/core/harness/AgentCommandPolicy.js";
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import {
+  DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
   buildAgentCommandPolicyInputForAcpPermission,
   createAgentCommandPolicyAcpResolver,
+  isAgentCommandPolicyAcpAllowOptionId,
+  mapAgentCommandPolicyDecisionToAcpPermissionDecision,
+  mapAgentCommandPolicyOutcomeToAcpPermissionDecision,
 } from "../src/core/harness/AgentCommandPolicyAcpResolver.js";
 import type { Issue } from "../src/core/types.js";
 import { allowPolicyDecision, denyPolicyDecision } from "./agent-command-policy-fixtures.js";
@@ -66,6 +70,45 @@ describe("AgentCommandPolicyAcpResolver", () => {
     ]);
   });
 
+  it("uses the raw input command from real ACP terminal permission payloads with display content", async () => {
+    const input = resolverInput(terminalPermissionRequest("git status --short", { realAcpDisplayContent: true, snakeCase: true }));
+    const resolver = createAgentCommandPolicyAcpResolver({ environment: { PATH: "/usr/bin" } });
+
+    const result = buildAgentCommandPolicyInputForAcpPermission(input, {
+      environment: { PATH: "/usr/bin" },
+    });
+
+    expect(result).toEqual({
+      status: "ok",
+      input: expect.objectContaining({
+        attemptId: "perm-tool-1",
+        surface: "terminal_execute",
+        rawInput: expect.objectContaining({
+          kind: "command",
+          command: "git status --short",
+        }),
+      }),
+    });
+    await expect(resolver(input)).resolves.toEqual({ optionId: "allow_once", reason: "local_only_inspection" });
+  });
+
+  it("fails closed when ACP terminal permission command sources conflict", async () => {
+    const params = terminalPermissionRequest("git status --short", {
+      displayCommand: "git push origin HEAD",
+      realAcpDisplayContent: true,
+    });
+    const input = resolverInput(params);
+    const resolver = createAgentCommandPolicyAcpResolver({ environment: { PATH: "/usr/bin" } });
+
+    expect(buildAgentCommandPolicyInputForAcpPermission(input, { environment: { PATH: "/usr/bin" } })).toEqual({
+      status: "ok",
+      input: expect.objectContaining({
+        rawInput: { command: "git status --short", cmd: "git push origin HEAD" },
+      }),
+    });
+    await expect(resolver(input)).resolves.toEqual({ optionId: null, reason: "ambiguous_command" });
+  });
+
   it("returns cancelled policy decisions for denied upstream terminal commands", async () => {
     const classify = vi.fn((_input: AgentCommandPolicyInput) =>
       denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" }),
@@ -104,7 +147,88 @@ describe("AgentCommandPolicyAcpResolver", () => {
     });
   });
 
-  it("selects only allow_once for allowed local terminal inspection", async () => {
+  it.each([
+    {
+      name: "malformed option payload",
+      params: () => ({
+        ...terminalPermissionRequest("git status --short"),
+        options: [...terminalPermissionOptions(), { kind: "allow_once", name: "Missing option id" }],
+      }),
+      reason: "malformed_permission_options",
+      requestedOptionIds: ["allow_once", "allow_session", "allow_always", "deny", "deny_always"],
+    },
+    {
+      name: "duplicate option id",
+      params: () => ({
+        ...terminalPermissionRequest("git status --short"),
+        options: [...terminalPermissionOptions(), { optionId: "allow_once", kind: "allow_once", name: "Duplicate allow once" }],
+      }),
+      reason: "duplicate_permission_options",
+      requestedOptionIds: ["allow_once", "allow_session", "allow_always", "deny", "deny_always", "allow_once"],
+    },
+  ])("fails closed for $name permission requests", ({ params, reason, requestedOptionIds }) => {
+    const request = parseHermesAcpPermissionRequest(params());
+
+    expect(request.malformedReason).toBe(reason);
+    expect(request.options.map((option) => option.optionId)).toEqual(requestedOptionIds);
+    expect(resolveHermesAcpPermissionDecision(request, { optionId: "allow_once" })).toMatchObject({
+      response: { outcome: { outcome: "cancelled" } },
+      outcome: "cancelled",
+      selectedOptionId: null,
+      reason,
+    });
+  });
+
+  it("maps command-policy outcomes to ACP permission decisions", () => {
+    const allowDecision = allowPolicyDecision({ reasonKind: "local_only_inspection", commandClass: "local_git_inspection" });
+    const denyDecision = denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" });
+
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision)).toEqual({
+      optionId: DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
+      reason: "local_only_inspection",
+    });
+    expect(mapAgentCommandPolicyOutcomeToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_session" })).toEqual({
+      optionId: "allow_session",
+      reason: "local_only_inspection",
+    });
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(denyDecision, { allowOptionId: "allow_session" })).toEqual({
+      optionId: null,
+      reason: "upstream_github",
+    });
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "deny" as never })).toEqual({
+      optionId: null,
+      reason: "unsupported_agent_command_policy_acp_allow_option",
+    });
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_always" as never })).toEqual({
+      optionId: null,
+      reason: "unsupported_agent_command_policy_acp_allow_option",
+    });
+
+    expect(isAgentCommandPolicyAcpAllowOptionId("allow_session")).toBe(true);
+    expect(isAgentCommandPolicyAcpAllowOptionId("allow_always")).toBe(false);
+    expect(isAgentCommandPolicyAcpAllowOptionId("deny")).toBe(false);
+  });
+
+  it.each(["allow_once", "allow_session"] as const)(
+    "selects configured ACP allow option %s for allowed local terminal inspection",
+    async (allowOptionId) => {
+      const classify = vi.fn((_input: AgentCommandPolicyInput) =>
+        allowPolicyDecision({ reasonKind: "local_only_inspection", commandClass: "local_git_inspection" }),
+      );
+      const resolver = createAgentCommandPolicyAcpResolver({
+        classify,
+        allowOptionId,
+        environment: { PATH: "/usr/bin" },
+      });
+
+      await expect(resolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toEqual({
+        optionId: allowOptionId,
+        reason: "local_only_inspection",
+      });
+    },
+  );
+
+  it("selects only allow_once for allowed local terminal inspection by default", async () => {
     const resolver = createAgentCommandPolicyAcpResolver({ environment: { HOME: "/tmp/home", PATH: "/usr/bin" } });
 
     await expect(resolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toEqual({
@@ -155,28 +279,48 @@ function resolverInput(
 
 function terminalPermissionRequest(
   command: string,
-  options: { field?: "command" | "cmd" | "script" } = {},
+  options: {
+    field?: "command" | "cmd" | "script";
+    displayCommand?: string;
+    realAcpDisplayContent?: boolean;
+    snakeCase?: boolean;
+  } = {},
 ): Record<string, unknown> {
   const field = options.field ?? "command";
-  return {
-    sessionId: "acp-session-1",
-    toolCall: {
-      toolCallId: "perm-tool-1",
-      kind: "execute",
-      title: "terminal command",
-      rawInput: { [field]: command },
+  const toolCall = {
+    toolCallId: "perm-tool-1",
+    kind: "execute",
+    title: "terminal command",
+    [options.snakeCase ? "raw_input" : "rawInput"]: {
+      [field]: command,
+      ...(options.realAcpDisplayContent ? { description: "terminal command" } : {}),
     },
-    options: terminalPermissionOptions(),
+    ...(options.realAcpDisplayContent
+      ? {
+          content: [
+            {
+              type: "text",
+              text: `terminal command\n$ ${options.displayCommand ?? command}`,
+            },
+          ],
+        }
+      : {}),
+  };
+  return {
+    [options.snakeCase ? "session_id" : "sessionId"]: "acp-session-1",
+    [options.snakeCase ? "tool_call" : "toolCall"]: toolCall,
+    [options.snakeCase ? "permission_options" : "options"]: terminalPermissionOptions(options.snakeCase),
   };
 }
 
-function terminalPermissionOptions(): Array<Record<string, unknown>> {
+function terminalPermissionOptions(snakeCase = false): Array<Record<string, unknown>> {
+  const optionIdKey = snakeCase ? "option_id" : "optionId";
   return [
-    { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
-    { optionId: "allow_session", kind: "allow_always", name: "Allow for session" },
-    { optionId: "allow_always", kind: "allow_always", name: "Allow always" },
-    { optionId: "deny", kind: "reject_once", name: "Deny" },
-    { optionId: "deny_always", kind: "reject_always", name: "Deny always" },
+    { [optionIdKey]: "allow_once", kind: "allow_once", name: "Allow once" },
+    { [optionIdKey]: "allow_session", kind: "allow_always", name: "Allow for session" },
+    { [optionIdKey]: "allow_always", kind: "allow_always", name: "Allow always" },
+    { [optionIdKey]: "deny", kind: "reject_once", name: "Deny" },
+    { [optionIdKey]: "deny_always", kind: "reject_always", name: "Deny always" },
   ];
 }
 

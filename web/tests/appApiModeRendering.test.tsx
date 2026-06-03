@@ -85,6 +85,20 @@ const apiDashboard: DashboardModel = {
     all: 32,
     completeness: 73,
   },
+  source: {
+    status: "fresh",
+    label: "tracker fresh · 4 issues",
+    detail: "Issue board tracker source is current; 2 runs · 3 lifecycle records · 1 activity entries · 0 writeback operations.",
+    generatedAt: "2026-05-29T20:05:00.000Z",
+    trackerFetchedAt: "2026-05-29T20:04:00.000Z",
+    issueCount: 4,
+    runCount: 2,
+    lifecycleCount: 3,
+    activityCount: 1,
+    writebackCount: 0,
+    cached: false,
+    error: null,
+  },
 };
 
 function makeApiIssue(overrides: Partial<IssueModel> = {}): IssueModel {
@@ -451,6 +465,33 @@ async function renderHistoryView(history: HistoryModel, variant: "list" | "timel
   return renderToStaticMarkup(<ChatHistoryView history={history} variant={variant} />);
 }
 
+function renderedButtons(markup: string): string[] {
+  return Array.from(markup.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g), (match) => match[0]);
+}
+
+function markupText(markup: string): string {
+  return markup.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function buttonMatchesLabel(button: string, label: string): boolean {
+  return (
+    markupText(button).includes(label) ||
+    button.includes(`aria-label="${label}`) ||
+    button.includes(`title="${label}`) ||
+    button.includes(`data-unavailable-action="${label}"`)
+  );
+}
+
+function buttonIsUnavailable(button: string): boolean {
+  return button.includes("disabled") || button.includes('aria-disabled="true"') || /unavailable/i.test(button);
+}
+
+function expectUnavailableButton(markup: string, label: string) {
+  const candidates = renderedButtons(markup).filter((button) => buttonMatchesLabel(button, label));
+  expect(candidates.length).toBeGreaterThan(0);
+  expect(candidates.every(buttonIsUnavailable)).toBe(true);
+}
+
 afterEach(() => {
   vi.doUnmock("../src/data/dataSourceContext");
   vi.doUnmock("../src/hooks/useSymphonyData");
@@ -533,6 +574,9 @@ describe("App API-mode rendering", () => {
     expect(hookCalls.orchestratorChat).toEqual([{ enabled: true }]);
     expect(markup).toContain("api source · api");
     expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("tracker fresh · 4 issues");
+    expect(markup).toContain("Issue board tracker source is current");
+    expect(markup).toContain("tracker fetched 2026-05-29T20:04:00.000Z");
     expect(markup).toContain("Symphony · api-branch");
     expect(markup).toContain("WORKFLOW.api@api-branch");
     expect(markup).toContain("poll 5s");
@@ -550,6 +594,10 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("API full-app activity");
     expect(markup).toContain("API full-app chat");
     expect(markup).toContain("Full-app suggestion");
+    expectUnavailableButton(markup, "Status totals");
+    expectUnavailableButton(markup, "Trigger poll");
+    expectUnavailableButton(markup, "New issue");
+    expectUnavailableButton(markup, "Orchestrator chat menu");
 
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
@@ -621,6 +669,19 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("poll 22s");
     expect(markup).not.toContain("API full-app chat");
     expect(markup).not.toContain("dashboard embedded fallback should not render");
+  });
+
+  it("renders stale API dashboard data with a refresh-failure banner instead of replacing it with a first-load error", async () => {
+    const { markup } = await renderAppWithMocks({
+      hooks: appHookState({ dashboard: { data: apiDashboard, loading: false, error: "Symphony API returned HTTP 503" } }),
+    });
+
+    expect(markup).toContain("Could not refresh dashboard");
+    expect(markup).toContain("Symphony API returned HTTP 503 Showing previous dashboard data.");
+    expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("tracker fresh · 4 issues");
+    expect(markup).not.toContain("Could not load dashboard");
+    expect(markup).not.toContain("openai/symphony@main");
   });
 
   it("starts non-blocking API reference data while the dashboard is active and keeps inactive API views disabled", async () => {
@@ -700,6 +761,18 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("run-api-selected");
     expect(markup).toContain("#909");
     expect(markup).toContain("green");
+    expectUnavailableButton(markup, "Filter");
+    expectUnavailableButton(markup, "Sort");
+    expectUnavailableButton(markup, "New issue");
+    expectUnavailableButton(markup, "Issue lane filter");
+    expectUnavailableButton(markup, "New Todo issue");
+    expectUnavailableButton(markup, "New In Progress issue");
+    expectUnavailableButton(markup, "New In Review issue");
+    expectUnavailableButton(markup, "Open in Linear");
+    expectUnavailableButton(markup, "More");
+    expect(markup).toContain('aria-label="Status value"');
+    expect(markup).toContain('aria-label="Priority value"');
+    expect(markup).toContain('aria-label="Assignee value"');
 
     expect(markup).not.toContain("SYM-12");
     expect(markup).not.toContain("Add exponential backoff to retry queue with jitter");
@@ -770,6 +843,14 @@ describe("App API-mode rendering", () => {
     expect(transcriptMarkup).toContain("API-HISTORY");
     expect(transcriptMarkup).toContain("gpt-api-history");
     expect(transcriptMarkup).toContain("API transcript message rendered from selected session data.");
+    expectUnavailableButton(transcriptMarkup, "Filter");
+    expectUnavailableButton(transcriptMarkup, "Sort");
+    expectUnavailableButton(transcriptMarkup, "Running sessions filter");
+    expectUnavailableButton(transcriptMarkup, "Finished sessions filter");
+    expectUnavailableButton(transcriptMarkup, "Error sessions filter");
+    expectUnavailableButton(transcriptMarkup, "Open workspace");
+    expectUnavailableButton(transcriptMarkup, "Open issue");
+    expectUnavailableButton(transcriptMarkup, "More");
     expect(transcriptMarkup).not.toContain("No transcript messages for this session.");
     expect(transcriptMarkup).not.toContain("Mock transcript remains embedded.");
     expect(transcriptMarkup).not.toContain("Exponential backoff for retry queue");
@@ -777,6 +858,9 @@ describe("App API-mode rendering", () => {
     const timelineMarkup = await renderHistoryView(apiHistory, "timeline");
     expect(timelineMarkup).toContain("API timeline event rendered from history endpoint.");
     expect(timelineMarkup).toContain("run-api-transcript");
+    expectUnavailableButton(timelineMarkup, "Timeline filter");
+    expectUnavailableButton(timelineMarkup, "Group timeline by session");
+    expect(timelineMarkup).toContain("open unavailable");
 
     const emptyTranscriptMarkup = await renderHistoryView({
       ...apiHistory,

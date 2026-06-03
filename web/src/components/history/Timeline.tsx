@@ -1,5 +1,5 @@
 import type { TimelineEvent, TranscriptMessage } from "../../types/symphony";
-import { Icon, StatusBadge } from "../common";
+import { Icon, StatusBadge, UnavailableButton } from "../common";
 
 export function Timeline({ events }: { events: TimelineEvent[] }) {
   return (
@@ -29,12 +29,12 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
             </div>
           </div>
           <div className="right">
-            <button className="btn" type="button">
+            <UnavailableButton className="btn" unavailableLabel="Timeline filter" unavailableReason="timeline filtering is unavailable until a backed API command route exists">
               {Icon.filter()}Filter
-            </button>
-            <button className="btn" type="button">
+            </UnavailableButton>
+            <UnavailableButton className="btn" unavailableLabel="Group timeline by session" unavailableReason="timeline regrouping is unavailable until a backed API command route exists">
               Group by session
-            </button>
+            </UnavailableButton>
           </div>
         </div>
         <div className="transcript" style={{ padding: "12px 24px 60px" }}>
@@ -107,7 +107,9 @@ function TimelineRow({ event }: { event: TimelineEvent }) {
         </div>
         <div style={{ color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{event.text}</div>
       </div>
-      <span style={{ color: "var(--text-4)", fontFamily: "var(--font-mono)", fontSize: 10.5 }}>open -&gt;</span>
+      <span style={{ color: "var(--text-4)", fontFamily: "var(--font-mono)", fontSize: 10.5 }} title="Timeline row navigation unavailable until a backed API route exists.">
+        open unavailable
+      </span>
     </div>
   );
 }

@@ -17,9 +17,14 @@ import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileOrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
 import { InMemoryRunActivityAppendStore, type RunActivityAppendInput } from "../src/core/persistence/RunActivityAppendStore.js";
 import type { ProjectionPayloadWriteInput, ProjectionRevisionPublication, ProjectionWriteResult } from "../src/core/persistence/ProjectionTransactionService.js";
+import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileOperatorApprovalStore, OperatorApprovalService } from "../src/core/approval/OperatorApprovalService.js";
+import { PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON } from "../src/core/CompletionReportService.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue, TrackerStateLists } from "../src/core/types.js";
+import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
+import { testConfig } from "./helpers.js";
 
 describe("StatusServer realtime SSE API", () => {
   let root: string;
@@ -664,6 +669,207 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
+  it("publishes ordered writeback outbox realtime events without duplicating idempotent replays", async () => {
+    const writebackOutbox = new FileWritebackOutboxStore(path.join(root, "writeback-state"));
+    const server = createRealtimeServer({ writebackOutbox });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+    const operation = {
+      idempotencyKey: "writeback:TEST-1:completion-note",
+      kind: "comment" as const,
+      issueId: "issue-1",
+      runId: "run-writeback-1",
+      payload: {
+        body: "Durable completion report writeback is ready.",
+        dedupeKey: "writeback-sse-dedupe",
+      },
+    };
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      const enqueued = await writebackOutbox.enqueueOnce(operation);
+      const enqueueEvents = await readOrderedRealtimeEvents(client, "writeback", 1, ["projection.updated", "source.status"]);
+      expect(enqueueEvents[0]?.resources).toEqual(
+        expect.arrayContaining([{ kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" }]),
+      );
+      expect(enqueueEvents[1]?.resources).toEqual(
+        expect.arrayContaining([{ kind: "source", href: "/api/v1/web/reference-data?refresh=1", relation: "refetch" }]),
+      );
+
+      const [claimed] = await writebackOutbox.claimDue(new Date(), { idempotencyKeys: [operation.idempotencyKey] });
+      expect(claimed).toMatchObject({ idempotencyKey: operation.idempotencyKey, status: "in_flight" });
+      await readOrderedRealtimeEvents(client, "writeback", 2, ["projection.updated", "source.status"]);
+
+      await writebackOutbox.markSucceeded(claimed ?? enqueued);
+      await readOrderedRealtimeEvents(client, "writeback", 3, ["projection.updated", "source.status"]);
+
+      await expect(writebackOutbox.enqueueOnce(operation)).resolves.toMatchObject({
+        idempotencyKey: operation.idempotencyKey,
+        status: "succeeded",
+      });
+      await expect(client.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("publishes approval request, lifecycle, and rejected-publication realtime events once across route replay", async () => {
+    const config = testConfig(root);
+    config.github.publishPullRequests = true;
+    config.github.operatorApproval!.requiredForPublication = true;
+    config.github.operatorApproval!.rejectPolicy = "cancel";
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const approvalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    await runStore.startRun({
+      runId: "run-approval-1",
+      sessionId: "session-approval-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-approval-1",
+      issueIdentifier: "TEST-APPROVAL",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "publish completion report",
+      workspaceKey: "TEST-APPROVAL",
+      workspacePath: path.join(root, "workspace"),
+    });
+    const server = createRealtimeServer({
+      runStore,
+      lifecycleStore,
+      operatorApproval,
+      openWorkspaceToken: "secret",
+    });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      const approval = await operatorApproval.requestPublicationApproval({
+        issueId: "issue-approval-1",
+        issueIdentifier: "TEST-APPROVAL",
+        runId: "run-approval-1",
+        evidenceCursor: "approval-evidence-1",
+        action: {
+          kind: "push_and_pr",
+          branchName: "symphony/TEST-APPROVAL",
+          baseBranch: "main",
+          workspacePath: path.join(root, "workspace"),
+          title: "TEST-APPROVAL durable publication",
+          evidenceCursor: "approval-evidence-1",
+          summaryPreview: "Publication approval required",
+          changedFiles: ["tests/realtime-api.test.ts"],
+          plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+        },
+      });
+      await readOrderedRealtimeEvents(client, "runs", 2, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      const requestTranscriptEvents = await readOrderedRealtimeEvents(client, "runs", 3, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      expect(requestTranscriptEvents[3]?.recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
+      await expect(runStore.readTranscript("run-approval-1", { offset: 0, limit: 10 })).resolves.toMatchObject({
+        events: [expect.objectContaining({ eventType: "approval_request" })],
+      });
+
+      await lifecycleStore.ensureIssue(
+        { id: "issue-approval-1", identifier: "TEST-APPROVAL" },
+        {
+          phase: "blocked",
+          blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          lastCompletionReportId: "report-approval-1",
+          completionReports: [
+            {
+              id: "report-approval-1",
+              idempotencyKey: "approval-evidence-1",
+              runId: "run-approval-1",
+              issueId: "issue-approval-1",
+              issueIdentifier: "TEST-APPROVAL",
+              summary: "Publication is waiting for operator approval.",
+              validationEvidence: ["approval realtime route test"],
+              acceptanceChecklist: [{ text: "approval requested", satisfied: true, evidence: "approval request created" }],
+              changedFiles: ["tests/realtime-api.test.ts"],
+              branchName: "symphony/TEST-APPROVAL",
+              pullRequest: null,
+              risks: [],
+              acceptedAt: "2026-01-01T00:00:00.000Z",
+              writebackOperationKeys: [],
+            },
+          ],
+        },
+      );
+      const lifecycleEvents = await readOrderedRealtimeEvents(client, "lifecycle", 1, ["projection.updated", "source.status"]);
+      expect(lifecycleEvents[0]?.resources).toEqual(
+        expect.arrayContaining([{ kind: "issue-board", href: "/api/v1/web/issues", relation: "refetch" }]),
+      );
+
+      const rejected = await fetch(`${baseUrl}/api/v1/approval-requests/${approval.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      await expect(rejected.json()).resolves.toMatchObject({ replayed: false, request: { status: "rejected" } });
+      expect(rejected.status).toBe(200);
+      await readOrderedRealtimeEvents(client, "runs", 4, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      await readOrderedRealtimeEvents(client, "runs", 5, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      const terminalEvents = await readOrderedRealtimeEvents(client, "runs", 6, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      expect(terminalEvents[2]?.resources).toEqual(
+        expect.arrayContaining([{ kind: "history", href: "/api/v1/web/history", relation: "refetch" }]),
+      );
+      await expect(runStore.getRun("run-approval-1")).resolves.toMatchObject({
+        status: "cancelled",
+        pendingApprovalRequestId: null,
+        pendingApprovalRequestedAt: null,
+      });
+      await expect(runStore.readTranscript("run-approval-1", { offset: 0, limit: 10 })).resolves.toMatchObject({
+        events: [
+          expect.objectContaining({ eventType: "approval_request" }),
+          expect.objectContaining({ eventType: "approval_resolved" }),
+        ],
+      });
+
+      const replay = await fetch(`${baseUrl}/api/v1/approval-requests/${approval.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      await expect(replay.json()).resolves.toMatchObject({ replayed: true, request: { status: "rejected" } });
+      expect(replay.status).toBe(200);
+      await expect(client.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
   it("recovers unknown high Last-Event-ID values without replaying an exact current ID", async () => {
     const runStore = new FileRunTranscriptStore(root);
     const server = createRealtimeServer({ runStore });
@@ -877,11 +1083,16 @@ function createRealtimeServer(
     tracker?: TrackerClient;
     orchestratorConversationStore?: FileOrchestratorConversationStore;
     projectionWriter?: StatusServerOptions["projectionWriter"];
+    lifecycleStore?: FileIssueLifecycleStore;
+    writebackOutbox?: FileWritebackOutboxStore;
+    operatorApproval?: StatusServerOptions["operatorApproval"];
+    orchestrator?: Orchestrator;
+    openWorkspaceToken?: string | null;
     realtime?: StatusServerOptions["realtime"];
   } = {},
 ): StatusServer {
   return new StatusServer({
-    orchestrator: fakeOrchestrator(),
+    orchestrator: options.orchestrator ?? fakeOrchestrator(),
     workspaceManager: {} as StatusServerOptions["workspaceManager"],
     workspaceOpener: {} as StatusServerOptions["workspaceOpener"],
     ...(options.runStore ? { runStore: options.runStore } : {}),
@@ -891,9 +1102,12 @@ function createRealtimeServer(
       ? { orchestratorConversationStore: options.orchestratorConversationStore }
       : {}),
     ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
+    ...(options.lifecycleStore ? { lifecycleStore: options.lifecycleStore } : {}),
+    ...(options.writebackOutbox ? { writebackOutbox: options.writebackOutbox } : {}),
+    ...(options.operatorApproval ? { operatorApproval: options.operatorApproval } : {}),
     host: "127.0.0.1",
     port: 0,
-    openWorkspaceToken: null,
+    openWorkspaceToken: options.openWorkspaceToken ?? null,
     trackerStateLists: testTrackerStateLists(),
     staleThresholdMs: 300_000,
     ...(options.realtime ? { realtime: options.realtime } : {}),
@@ -1140,6 +1354,34 @@ async function nextEventOfTypeFromSource(
     if ((event.data as RealtimeProjectionEvent).source.source === source) return event;
   }
   throw new Error(`Timed out waiting for SSE event type ${type} from source ${source}`);
+}
+
+async function readOrderedRealtimeEvents(
+  client: SseTestClient,
+  source: string,
+  sourceRevision: number,
+  expectedTypes: readonly RealtimeProjectionEventType[],
+): Promise<RealtimeProjectionEvent[]> {
+  const events: RealtimeProjectionEvent[] = [];
+  for (const type of expectedTypes) {
+    const event = await client.nextEvent();
+    expect(event.event).toBe(type);
+    const data = event.data as RealtimeProjectionEvent;
+    expect(data).toMatchObject({
+      type,
+      source: { source, revision: sourceRevision },
+      recovery: { strategy: "refetch", reason: "event" },
+      missedEvents: false,
+    });
+    expect(data.resources.length).toBeGreaterThan(0);
+    expect(data.recovery.endpoints.length).toBeGreaterThan(0);
+    events.push(data);
+  }
+  expect(events.map((event) => event.revision)).toEqual(
+    events.map((event) => event.revision).slice().sort((left, right) => left - right),
+  );
+  expect(new Set(events.map((event) => event.id)).size).toBe(events.length);
+  return events;
 }
 
 async function waitFor(predicate: () => boolean, description: string, timeoutMs = 2_000): Promise<void> {

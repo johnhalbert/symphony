@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Icon } from "../common";
+import { Icon, UnavailableButton } from "../common";
 import type { ChatMessage } from "../../types/symphony";
 import { formatInlineText } from "../messages/messageFormat";
 
@@ -52,9 +52,9 @@ export function OrchestratorChat({
           <span className="sub">{subtitle || "Dashboard context unavailable"}</span>
         </div>
         <div style={{ flex: 1 }} />
-        <button className="icon-btn" type="button">
+        <UnavailableButton className="icon-btn" unavailableLabel="Orchestrator chat menu" unavailableReason="chat menus are unavailable until backend command routes exist">
           {Icon.more()}
-        </button>
+        </UnavailableButton>
       </div>
       <div className="chat__body">
         {loading && hasNoMessages ? <div className="view-loading">Loading orchestrator chat...</div> : null}
@@ -104,12 +104,12 @@ export function OrchestratorChat({
               onChange={(event) => setDraft(event.target.value)}
             />
             <div className="row">
-              <button className="btn btn--ghost" type="button" style={{ padding: "2px 6px" }}>
+              <UnavailableButton className="btn btn--ghost" style={{ padding: "2px 6px" }} unavailableLabel="Chat context picker" unavailableReason="context insertion is unavailable until a backed API command route exists">
                 @ context
-              </button>
-              <button className="btn btn--ghost" type="button" style={{ padding: "2px 6px" }}>
+              </UnavailableButton>
+              <UnavailableButton className="btn btn--ghost" style={{ padding: "2px 6px" }} unavailableLabel="Chat command picker" unavailableReason="command browsing is unavailable until a backed API command route exists">
                 / commands
-              </button>
+              </UnavailableButton>
               <div className="grow" />
               <span style={{ color: "var(--text-4)", fontFamily: "var(--font-mono)", fontSize: 10.5 }}>{agentContextLabel}</span>
               <button className="btn btn--primary" type="submit" style={{ padding: "3px 9px" }} disabled={sending || !draft.trim()}>

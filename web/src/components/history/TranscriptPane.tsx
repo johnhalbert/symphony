@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import type { SessionModel, TranscriptMessage } from "../../types/symphony";
-import { Icon, SessionStateChip } from "../common";
+import { Icon, SessionStateChip, UnavailableButton } from "../common";
 import { Message } from "../messages/Message";
 
 export function TranscriptPane({
@@ -46,16 +46,16 @@ export function TranscriptPane({
           </div>
         </div>
         <div className="right">
-          <button className="btn" type="button">
+          <UnavailableButton className="btn" unavailableLabel="Open workspace" unavailableReason="workspace navigation is unavailable until a safe command route exists">
             <span>{Icon.branch()}</span>Open workspace
-          </button>
-          <button className="btn" type="button">
+          </UnavailableButton>
+          <UnavailableButton className="btn" unavailableLabel="Open issue" unavailableReason="issue navigation from transcripts is unavailable until a safe route exists">
             <span>{Icon.link()}</span>
             {session.issue}
-          </button>
-          <button className="icon-btn" title="More" type="button">
+          </UnavailableButton>
+          <UnavailableButton className="icon-btn" unavailableLabel="More" unavailableReason="transcript action menus are unavailable until backend command routes exist">
             {Icon.more()}
-          </button>
+          </UnavailableButton>
         </div>
       </div>
       <div className="transcript">

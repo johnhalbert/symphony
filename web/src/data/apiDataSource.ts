@@ -3,12 +3,9 @@ import type {
   ProjectionChangeEvent,
   ProjectionChangeListener,
   ProjectionChangeUnsubscribe,
-  RealtimeEventListener,
-  RealtimeEventUnsubscribe,
-  RealtimeSubscriptionOptions,
   SymphonyDataSource,
 } from "./dataSource";
-import { REALTIME_PROJECTION_EVENT_TYPES, parseRealtimeProjectionEventData, realtimeConnectionStatus } from "./realtimeEvents";
+import { createRealtimeEventSourceClient } from "./eventSourceClient";
 import type { ChatMessage, ReferenceData } from "../types/symphony";
 
 interface ApiReferenceEntry {
@@ -200,74 +197,11 @@ function parseProjectionChangeEvent(event: MessageEvent): ProjectionChangeEvent 
   return { type: event.type };
 }
 
-function openRealtimeEventSubscription(
-  baseUrl: string,
-  listener: RealtimeEventListener,
-  options: RealtimeSubscriptionOptions = {},
-): RealtimeEventUnsubscribe {
-  if (typeof EventSource === "undefined") {
-    options.onStatus?.(realtimeConnectionStatus("unavailable"));
-    return () => undefined;
-  }
-
-  options.onStatus?.(realtimeConnectionStatus("connecting"));
-  const eventSource = new EventSource(realtimeEventSourceUrl(baseUrl, options.lastEventId ?? null));
-  let sawConnectionError = false;
-  const handleOpen = () => {
-    options.onStatus?.(realtimeConnectionStatus(sawConnectionError ? "recovered" : "open"));
-    sawConnectionError = false;
-  };
-  const handleConnectionError = () => {
-    sawConnectionError = true;
-    const closed = eventSource.readyState === EventSource.CLOSED;
-    options.onStatus?.(realtimeConnectionStatus(closed ? "error" : "reconnecting"));
-  };
-  const handleRealtimeEvent = (event: MessageEvent) => {
-    const parsed = parseRealtimeProjectionEvent(event);
-    if (!parsed) return;
-    if (parsed.missedEvents || parsed.recovery.reason === "missed-events") {
-      options.onStatus?.(
-        realtimeConnectionStatus("stale", {
-          lastEventId: parsed.recovery.lastEventId,
-          revision: parsed.revision,
-          missedEvents: true,
-        }),
-      );
-    }
-    listener(parsed);
-  };
-  eventSource.addEventListener("open", handleOpen);
-  eventSource.addEventListener("error", handleConnectionError);
-  for (const type of REALTIME_PROJECTION_EVENT_TYPES) {
-    eventSource.addEventListener(type, handleRealtimeEvent);
-  }
-  eventSource.addEventListener("message", handleRealtimeEvent);
-  return () => {
-    eventSource.close();
-  };
-}
-
 function realtimeEventSourceUrl(baseUrl: string, lastEventId: string | null): string {
   const endpoint = `${baseUrl}/api/v1/realtime`;
   const normalizedLastEventId = lastEventId?.trim();
   if (!normalizedLastEventId) return endpoint;
   return `${endpoint}?lastEventId=${encodeURIComponent(normalizedLastEventId)}`;
-}
-
-function parseRealtimeProjectionEvent(event: MessageEvent) {
-  if (typeof event.data !== "string") return null;
-  const parsed = parseRealtimeProjectionEventData(event.data);
-  if (!parsed) return null;
-
-  if (event.type !== parsed.type) return null;
-
-  const lastEventId = typeof event.lastEventId === "string" ? event.lastEventId : "";
-  if (lastEventId !== "" && lastEventId !== parsed.id) return null;
-
-  const transportId = (event as { id?: unknown }).id;
-  if (typeof transportId === "string" && transportId !== "" && transportId !== parsed.id) return null;
-
-  return parsed;
 }
 
 function normalizeReferenceRecord(record: Record<string, ApiReferenceEntry | null> | null | undefined) {
@@ -293,6 +227,9 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
   const getJsonFetcher = createGetJsonFetcher();
   const { fetchJson } = getJsonFetcher;
+  const realtimeEventSourceClient = createRealtimeEventSourceClient({
+    urlForLastEventId: (lastEventId) => realtimeEventSourceUrl(normalizedBaseUrl, lastEventId),
+  });
 
   return {
     async getReferenceData(signal) {
@@ -342,7 +279,7 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       return openProjectionChangeSubscription(normalizedBaseUrl, listener);
     },
     subscribeToRealtimeEvents(listener, options) {
-      return openRealtimeEventSubscription(normalizedBaseUrl, listener, options);
+      return realtimeEventSourceClient.subscribe(listener, options);
     },
   };
 }

@@ -675,6 +675,17 @@ describe("web projection foundation", () => {
       },
       activity: activityInput,
       runtime,
+      source: {
+        status: "ok",
+        generatedAt: "2026-01-01T00:10:00.000Z",
+        trackerFetchedAt: "2026-01-01T00:09:00.000Z",
+        issueCount: 4,
+        runCount: 1,
+        lifecycleCount: 0,
+        activityCount: 2,
+        writebackCount: 0,
+        cached: false,
+      },
       config: {
         repoLabel: "acme/symphony",
         branch: "main",
@@ -696,6 +707,20 @@ describe("web projection foundation", () => {
       concurrencyCap: 2,
       chat: [],
       totals: { backlog: 0, todo: 1, progress: 1, review: 0, done: 1, cancelled: 1, open: 2, all: 4, completeness: 25 },
+      source: {
+        status: "fresh",
+        label: "tracker fresh · 4 issues",
+        detail: "Issue board tracker source is current; 1 runs · 0 lifecycle records · 2 activity entries · 0 writeback operations.",
+        generatedAt: "2026-01-01T00:10:00.000Z",
+        trackerFetchedAt: "2026-01-01T00:09:00.000Z",
+        issueCount: 4,
+        runCount: 1,
+        lifecycleCount: 0,
+        activityCount: 2,
+        writebackCount: 0,
+        cached: false,
+        error: null,
+      },
     });
     expect(dashboard.runningAgents[0]).toMatchObject({
       id: "run-1",
@@ -729,6 +754,42 @@ describe("web projection foundation", () => {
       args: {},
       result: null,
     });
+  });
+
+  it("projects dashboard source freshness metadata for stale and failed tracker sources", () => {
+    const staleDashboard = projectWebDashboard({
+      source: {
+        status: "ok",
+        cached: true,
+        issueCount: 3,
+        runCount: 2,
+        lifecycleCount: 1,
+        activityCount: 4,
+        writebackCount: 5,
+      },
+    });
+    expect(staleDashboard.source).toMatchObject({
+      status: "stale",
+      label: "tracker stale · 3 cached issues",
+      issueCount: 3,
+      cached: true,
+    });
+    expect(staleDashboard.source.detail).toContain("Using a cached tracker source while refresh catches up");
+
+    const failedDashboard = projectWebDashboard({
+      source: {
+        status: "error",
+        issueCount: 0,
+        error: "Issue board tracker fetch failed: request timed out",
+      },
+    });
+    expect(failedDashboard.source).toMatchObject({
+      status: "error",
+      label: "tracker error",
+      issueCount: 0,
+      error: "Issue board tracker fetch failed: request timed out",
+    });
+    expect(failedDashboard.source.detail).toBe("Issue board tracker fetch failed: request timed out");
   });
 
   it("derives dashboard totals and active agents from durable run and lifecycle state when board/runtime data is incomplete", () => {
@@ -901,6 +962,7 @@ describe("web projection foundation", () => {
       activity,
       chat: [],
       totals,
+      source: emptyDashboardModel().source,
     };
     const history = projectWebHistory([run({ runId: "run-sidebar", issueIdentifier: "TEST-REVIEW" })], []);
     const chat = [{ who: "user" as const, text: "show the sidebar" }];
@@ -1025,6 +1087,20 @@ describe("web projection foundation", () => {
       activity: [],
       chat: [],
       totals: { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 },
+      source: {
+        status: "unavailable",
+        label: "source unavailable",
+        detail: "No dashboard source metadata is available.",
+        generatedAt: null,
+        trackerFetchedAt: null,
+        issueCount: 0,
+        runCount: 0,
+        lifecycleCount: 0,
+        activityCount: 0,
+        writebackCount: 0,
+        cached: false,
+        error: null,
+      },
     };
 
     expect(emptyDashboardModel()).toEqual(emptyDashboard);

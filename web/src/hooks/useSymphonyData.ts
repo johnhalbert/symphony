@@ -55,7 +55,12 @@ export function useIssueDetail(issueId: string | null, refreshToken?: unknown): 
     }
 
     const controller = new AbortController();
-    setState({ issueId: normalizedIssueId, data: null, loading: true, error: null });
+    setState((current) => ({
+      issueId: normalizedIssueId,
+      data: current.issueId === normalizedIssueId ? current.data : null,
+      loading: true,
+      error: null,
+    }));
     dataSource
       .getIssueDetail(normalizedIssueId, controller.signal)
       .then((data) => {
@@ -64,7 +69,12 @@ export function useIssueDetail(issueId: string | null, refreshToken?: unknown): 
       .catch((error: unknown) => {
         if (!active) return;
         const message = error instanceof Error ? error.message : String(error);
-        setState({ issueId: normalizedIssueId, data: null, loading: false, error: message });
+        setState((current) => ({
+          issueId: normalizedIssueId,
+          data: current.issueId === normalizedIssueId ? current.data : null,
+          loading: false,
+          error: message,
+        }));
       });
 
     return () => {
@@ -109,7 +119,12 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
     }
 
     const controller = new AbortController();
-    setState({ sessionId: normalizedSessionId, data: null, loading: true, error: null });
+    setState((current) => ({
+      sessionId: normalizedSessionId,
+      data: current.sessionId === normalizedSessionId ? current.data : null,
+      loading: true,
+      error: null,
+    }));
     dataSource
       .getTranscript(normalizedSessionId, controller.signal)
       .then((data) => {
@@ -118,7 +133,12 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
       .catch((error: unknown) => {
         if (!active) return;
         const message = error instanceof Error ? error.message : String(error);
-        setState({ sessionId: normalizedSessionId, data: null, loading: false, error: message });
+        setState((current) => ({
+          sessionId: normalizedSessionId,
+          data: current.sessionId === normalizedSessionId ? current.data : null,
+          loading: false,
+          error: message,
+        }));
       });
 
     return () => {
