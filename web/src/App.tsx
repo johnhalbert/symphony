@@ -25,10 +25,12 @@ import type {
   HistoryVariant,
   IssueBoardModel,
   IssuesVariant,
+  Loadable,
   ReferenceData,
   RunningAgentModel,
   RunState,
   SessionModel,
+  SidebarModel,
   SidebarVariant,
 } from "./types/symphony";
 
@@ -81,6 +83,20 @@ function resourceOptions(enabled: boolean, refreshToken: number) {
   return refreshToken > 0 ? { enabled, refreshToken } : { enabled };
 }
 
+function resolveSidebarAgentUsageLabel(sidebar: Loadable<SidebarModel>): string {
+  if (!sidebar.data) {
+    if (sidebar.loading) return "agent usage loading";
+    return "agent usage unavailable";
+  }
+
+  const count = sidebar.data.runningAgents.length;
+  const agentNoun = count === 1 ? "agent" : "agents";
+  const runningLabel = `${count} running ${agentNoun}`;
+  if (sidebar.error) return `previous sidebar projection · ${runningLabel}`;
+  if (sidebar.loading) return `refreshing sidebar projection · ${runningLabel}`;
+  return `sidebar projection · ${runningLabel}`;
+}
+
 function AppShell({
   initialReferenceData,
   lazyReferenceData = false,
@@ -116,7 +132,8 @@ function AppShell({
   const sidebar = useSidebar(resourceOptions(sidebarEnabled, sidebarRefreshToken));
   const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, orchestratorChatRefreshToken));
   const dashboardChrome = dashboard.data;
-  const runningCount = dashboardChrome?.runningAgents.length ?? sidebar.data?.runningAgents.length ?? 0;
+  const statusbarRunningCount = dashboardChrome?.runningAgents.length ?? 0;
+  const agentUsageLabel = dashboardChrome?.agentUsageLabel ?? resolveSidebarAgentUsageLabel(sidebar);
   const tabBadges = resolveTabBadges(issueBoard.data, history.data);
 
   return (
@@ -126,11 +143,11 @@ function AppShell({
           activeTab={activeTab}
           onTabChange={setActiveTab}
           tabBadges={tabBadges}
-          runningCount={runningCount}
+          runningCount={statusbarRunningCount}
           repoLabel={dashboardChrome?.repoLabel ?? "repository unavailable"}
           branch={dashboardChrome?.branch ?? ""}
           pollLabel={dashboardChrome?.pollLabel ?? "poll unavailable"}
-          agentUsageLabel={dashboardChrome?.agentUsageLabel ?? `${runningCount} agents running`}
+          agentUsageLabel={agentUsageLabel}
           connectionStatusLabel={apiMode ? liveState.realtimeStatus.label : (dashboardChrome?.metrics?.health?.connectionLabel ?? undefined)}
           errorStatusLabel={dashboardChrome?.metrics?.health?.errorSummaryLabel ?? undefined}
           dataSourceLabel={[
@@ -172,9 +189,11 @@ function AppShell({
             ? renderLoadable(history, "history", (data) => <ChatHistoryView history={data} variant={historyVariant} refreshToken={transcriptRefreshToken} />)
             : null}
           {activeTab === "sidebar"
-            ? renderLoadable(sidebar, "sidebar", (data) => (
+            ? renderLoadable(sidebar, "sidebar", (data, state) => (
                 <SidebarViews
                   sidebar={data}
+                  sidebarError={state.error}
+                  sidebarLoading={state.loading}
                   variant={sidebarVariant}
                   orchestratorChat={orchestratorChat.data ?? []}
                   orchestratorChatError={orchestratorChat.error}
@@ -197,12 +216,12 @@ function AppShell({
 }
 
 function renderLoadable<T>(
-  resource: { data: T | null; loading: boolean; error: string | null },
+  resource: Loadable<T>,
   name: string,
-  render: (data: T) => JSX.Element,
+  render: (data: T, resource: Loadable<T>) => JSX.Element,
 ) {
   if (resource.data !== null) {
-    const content = render(resource.data);
+    const content = render(resource.data, resource);
     if (resource.error) {
       return (
         <>

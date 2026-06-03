@@ -356,12 +356,25 @@ async function renderAppWithMocks({
   mode = "api",
   hooks = appHookState(),
   liveState = liveResourceState(),
+  initialTab = "dashboard",
 }: {
   mode?: "api" | "mock";
   hooks?: AppHookState;
   liveState?: LiveResourceState;
+  initialTab?: AppTab;
 } = {}) {
   vi.resetModules();
+
+  if (initialTab !== "dashboard") {
+    vi.doMock("react", async (importActual) => {
+      const actual = await importActual<typeof import("react")>();
+      return {
+        ...actual,
+        useState: <S,>(initialState: S | (() => S)) =>
+          actual.useState(initialState === "dashboard" ? (initialTab as S) : initialState),
+      };
+    });
+  }
 
   const dataSource = {
     async sendOrchestratorMessage(input: string) {
@@ -504,6 +517,7 @@ function expectUnavailableButton(markup: string, label: string) {
 }
 
 afterEach(() => {
+  vi.doUnmock("react");
   vi.doUnmock("../src/data/dataSourceContext");
   vi.doUnmock("../src/hooks/useSymphonyData");
   vi.doUnmock("../src/hooks/useLiveResource");
@@ -690,8 +704,9 @@ describe("App API-mode rendering", () => {
     expect(hookCalls.orchestratorChat).toEqual([{ enabled: true }]);
     expect(markup).toContain("Symphony API returned HTTP 503");
     expect(markup).toContain("api source · api");
-    expect(markup).toContain("1 agents running");
+    expect(markup).toContain("sidebar projection · 1 running agent");
     expect(markup).toContain("poll unavailable");
+    expect(markup).not.toContain('class="pulse"');
 
     expect(markup).not.toContain("openai/symphony@main");
     expect(markup).not.toContain("poll 22s");
@@ -710,6 +725,55 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("tracker fresh · 4 issues");
     expect(markup).not.toContain("Could not load dashboard");
     expect(markup).not.toContain("openai/symphony@main");
+  });
+
+  it("renders sidebar first-load loading and unavailable states without primary projection chrome", async () => {
+    const loading = await renderAppWithMocks({
+      initialTab: "sidebar",
+      hooks: appHookState({ sidebar: { data: null, loading: true, error: null }, orchestratorChat: loaded([]) }),
+    });
+    const unavailable = await renderAppWithMocks({
+      initialTab: "sidebar",
+      hooks: appHookState({ sidebar: failed("Symphony API returned HTTP 503"), orchestratorChat: loaded([]) }),
+    });
+
+    expect(loading.hookCalls.sidebar).toEqual([{ enabled: true }]);
+    expect(loading.markup).toContain("Loading sidebar...");
+    expect(loading.markup).toContain("agent usage loading");
+    expect(loading.markup).not.toContain("sidebar projection ·");
+    expect(loading.markup).not.toContain("total issues");
+    expect(loading.markup).not.toContain("0 live");
+    expect(loading.markup).not.toContain('class="pulse"');
+
+    expect(unavailable.hookCalls.sidebar).toEqual([{ enabled: true }]);
+    expect(unavailable.markup).toContain("Could not load sidebar: Symphony API returned HTTP 503");
+    expect(unavailable.markup).toContain("agent usage unavailable");
+    expect(unavailable.markup).not.toContain("sidebar projection ·");
+    expect(unavailable.markup).not.toContain("total issues");
+    expect(unavailable.markup).not.toContain("0 live");
+    expect(unavailable.markup).not.toContain('class="pulse"');
+  });
+
+  it("renders stale API sidebar data with previous-projection copy and no live pulse", async () => {
+    const { hookCalls, markup } = await renderAppWithMocks({
+      initialTab: "sidebar",
+      hooks: appHookState({
+        sidebar: { data: sidebarWithOneAgent, loading: false, error: "Symphony API returned HTTP 503" },
+        orchestratorChat: loaded([]),
+      }),
+    });
+
+    expect(hookCalls.sidebar).toEqual([{ enabled: true }]);
+    expect(markup).toContain("Could not refresh sidebar");
+    expect(markup).toContain("Symphony API returned HTTP 503 Showing previous sidebar data.");
+    expect(markup).toContain("previous sidebar projection · 1 running agent");
+    expect(markup).toContain("Sidebar refresh failed; showing previous sidebar projection. Symphony API returned HTTP 503");
+    expect(markup).toContain("previous projection · 1 running");
+    expect(markup).toContain("Sidebar fallback agent count");
+    expect(markup).not.toContain("1 live");
+    expect(markup).not.toContain("animation:pulse");
+    expect(markup).not.toContain("spinner");
+    expect(markup).not.toContain('class="pulse"');
   });
 
   it("starts non-blocking API reference data while the dashboard is active and keeps inactive API views disabled", async () => {

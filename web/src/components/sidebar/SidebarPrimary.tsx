@@ -2,14 +2,22 @@ import type { ReactNode } from "react";
 import type { IssueModel, PriorityLevel, SidebarModel } from "../../types/symphony";
 import { Icon, StatusIcon, UnavailableButton } from "../common";
 
-export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
+interface SidebarPrimaryProps {
+  sidebar: SidebarModel;
+  loading?: boolean;
+  error?: string | null;
+}
+
+export function SidebarPrimary({ sidebar, loading = false, error = null }: SidebarPrimaryProps) {
+  const projectionState = resolveSidebarProjectionState(sidebar, { loading, error });
+
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "40px auto 1fr auto", background: "var(--bg)" }}>
       <div style={{ display: "flex", alignItems: "center", padding: "0 12px", gap: 10, background: "var(--panel)", borderBottom: "1px solid var(--border)" }}>
-        <span style={{ width: 8, height: 8, borderRadius: 999, background: "var(--accent)", boxShadow: "0 0 0 3px rgba(240,184,108,0.18)" }} />
+        <span aria-label={projectionState.indicatorLabel} style={{ width: 8, height: 8, borderRadius: 999, background: projectionState.indicatorColor }} />
         <span style={{ fontSize: 12, fontWeight: 500 }}>Symphony</span>
         <span style={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "var(--text-3)" }}>
-          {sidebar.runningAgents.length} live · {sidebar.totals.open} open
+          {projectionState.headerLabel}
         </span>
         <div style={{ flex: 1 }} />
         <UnavailableButton className="icon-btn" unavailableLabel="Sidebar menu" unavailableReason="sidebar action menus are unavailable until backend command routes exist">
@@ -18,6 +26,7 @@ export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
       </div>
 
       <div style={{ padding: "12px 12px 4px" }}>
+        {projectionState.notice ? <SidebarProjectionNotice>{projectionState.notice}</SidebarProjectionNotice> : null}
         {sidebar.providerGates.length ? (
           <div style={{ display: "grid", gap: 8, marginBottom: 8 }}>
             {sidebar.providerGates.map((gate) => (
@@ -47,14 +56,14 @@ export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
           {sidebar.runningAgents.length ? (
             sidebar.runningAgents.map((agent) => (
               <div key={agent.id} style={{ display: "grid", gridTemplateColumns: "8px 1fr auto", gap: 8, padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center" }}>
-                <span style={{ width: 6, height: 6, borderRadius: 999, background: "var(--accent)", boxShadow: "0 0 0 3px rgba(240,184,108,0.15)", animation: "pulse 1.6s ease-in-out infinite" }} />
+                <span style={{ width: 6, height: 6, borderRadius: 999, background: "var(--text-3)" }} />
                 <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
                   <div style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11.5 }}>
                     <span style={{ fontFamily: "var(--font-mono)", color: "var(--text-3)", fontSize: 10.5 }}>{agent.issue}</span>
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)" }}>{agent.title}</span>
                   </div>
-                  <div style={{ fontSize: 10.5, color: "var(--accent)", fontFamily: "var(--font-mono)", display: "flex", alignItems: "center", gap: 5 }}>
-                    <span className="spinner" />
+                  <div style={{ fontSize: 10.5, color: "var(--text-3)", fontFamily: "var(--font-mono)", display: "flex", alignItems: "center", gap: 5 }}>
+                    <span style={{ color: "var(--text-4)" }}>projected step</span>
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.step}</span>
                   </div>
                 </div>
@@ -115,8 +124,8 @@ export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", background: "var(--panel)", borderTop: "1px solid var(--border)", fontSize: 11, color: "var(--text-3)", fontFamily: "var(--font-mono)" }}>
-        <span style={{ width: 6, height: 6, borderRadius: 999, background: "var(--accent)", animation: "pulse 1.6s ease-in-out infinite" }} />
-        <span>{sidebar.totals.all} total issues</span>
+        <span style={{ width: 6, height: 6, borderRadius: 999, background: projectionState.indicatorColor }} />
+        <span>{projectionState.footerLabel} · {sidebar.totals.all} total issues</span>
         <div style={{ flex: 1 }} />
         <span>
           {sidebar.totals.done} done · {sidebar.totals.cancelled} cancelled
@@ -124,6 +133,50 @@ export function SidebarPrimary({ sidebar }: { sidebar: SidebarModel }) {
       </div>
     </div>
   );
+}
+
+function resolveSidebarProjectionState(sidebar: SidebarModel, state: { loading: boolean; error: string | null }) {
+  const runningLabel = sidebar.runningAgents.length === 0 ? "no running" : `${sidebar.runningAgents.length} running`;
+  const openLabel = `${sidebar.totals.open} open`;
+  const visiblePrimaryItems = sidebar.providerGates.length + sidebar.runningAgents.length + sidebar.reviewIssues.length + sidebar.activity.length;
+
+  if (state.error) {
+    return {
+      headerLabel: `previous projection · ${runningLabel} · ${openLabel}`,
+      footerLabel: "Previous sidebar projection",
+      indicatorColor: "var(--run-error)",
+      indicatorLabel: "Sidebar projection refresh failed",
+      notice: `Sidebar refresh failed; showing previous sidebar projection. ${state.error}`,
+    };
+  }
+
+  if (state.loading) {
+    return {
+      headerLabel: `refreshing projection · ${runningLabel} · ${openLabel}`,
+      footerLabel: "Refreshing sidebar projection",
+      indicatorColor: "var(--text-3)",
+      indicatorLabel: "Sidebar projection refreshing",
+      notice: "Refreshing sidebar projection; showing previous sidebar data.",
+    };
+  }
+
+  if (visiblePrimaryItems === 0 && sidebar.totals.all === 0) {
+    return {
+      headerLabel: `empty projection · ${runningLabel} · ${openLabel}`,
+      footerLabel: "Empty sidebar projection",
+      indicatorColor: "var(--text-4)",
+      indicatorLabel: "Sidebar projection loaded empty",
+      notice: null,
+    };
+  }
+
+  return {
+    headerLabel: `durable projection · ${runningLabel} · ${openLabel}`,
+    footerLabel: "Durable sidebar projection",
+    indicatorColor: "var(--text-3)",
+    indicatorLabel: "Sidebar projection loaded from durable data",
+    notice: null,
+  };
 }
 
 function formatPriority(priority: PriorityLevel): string {
@@ -167,6 +220,14 @@ function SidebarSection({ title, count, children }: { title: string; count: numb
         {count !== null ? <span style={{ marginLeft: 6, fontFamily: "var(--font-mono)", color: "var(--text-4)" }}>{count}</span> : null}
       </div>
       <div>{children}</div>
+    </div>
+  );
+}
+
+function SidebarProjectionNotice({ children }: { children: ReactNode }) {
+  return (
+    <div style={{ border: "1px solid var(--border)", borderRadius: 6, background: "var(--panel)", color: "var(--text-3)", fontSize: 11, lineHeight: 1.4, marginBottom: 8, padding: "7px 9px" }}>
+      {children}
     </div>
   );
 }
