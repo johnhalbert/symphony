@@ -8,8 +8,12 @@ import {
 import type { AgentCommandPolicyInput } from "../src/core/harness/AgentCommandPolicy.js";
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import {
+  DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
   buildAgentCommandPolicyInputForAcpPermission,
   createAgentCommandPolicyAcpResolver,
+  isAgentCommandPolicyAcpAllowOptionId,
+  mapAgentCommandPolicyDecisionToAcpPermissionDecision,
+  mapAgentCommandPolicyOutcomeToAcpPermissionDecision,
 } from "../src/core/harness/AgentCommandPolicyAcpResolver.js";
 import type { Issue } from "../src/core/types.js";
 import { allowPolicyDecision, denyPolicyDecision } from "./agent-command-policy-fixtures.js";
@@ -104,7 +108,56 @@ describe("AgentCommandPolicyAcpResolver", () => {
     });
   });
 
-  it("selects only allow_once for allowed local terminal inspection", async () => {
+  it("maps command-policy outcomes to ACP permission decisions", () => {
+    const allowDecision = allowPolicyDecision({ reasonKind: "local_only_inspection", commandClass: "local_git_inspection" });
+    const denyDecision = denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" });
+
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision)).toEqual({
+      optionId: DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
+      reason: "local_only_inspection",
+    });
+    expect(mapAgentCommandPolicyOutcomeToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_session" })).toEqual({
+      optionId: "allow_session",
+      reason: "local_only_inspection",
+    });
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(denyDecision, { allowOptionId: "allow_session" })).toEqual({
+      optionId: null,
+      reason: "upstream_github",
+    });
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "deny" as never })).toEqual({
+      optionId: null,
+      reason: "unsupported_agent_command_policy_acp_allow_option",
+    });
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_always" as never })).toEqual({
+      optionId: null,
+      reason: "unsupported_agent_command_policy_acp_allow_option",
+    });
+
+    expect(isAgentCommandPolicyAcpAllowOptionId("allow_session")).toBe(true);
+    expect(isAgentCommandPolicyAcpAllowOptionId("allow_always")).toBe(false);
+    expect(isAgentCommandPolicyAcpAllowOptionId("deny")).toBe(false);
+  });
+
+  it.each(["allow_once", "allow_session"] as const)(
+    "selects configured ACP allow option %s for allowed local terminal inspection",
+    async (allowOptionId) => {
+      const classify = vi.fn((_input: AgentCommandPolicyInput) =>
+        allowPolicyDecision({ reasonKind: "local_only_inspection", commandClass: "local_git_inspection" }),
+      );
+      const resolver = createAgentCommandPolicyAcpResolver({
+        classify,
+        allowOptionId,
+        environment: { PATH: "/usr/bin" },
+      });
+
+      await expect(resolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toEqual({
+        optionId: allowOptionId,
+        reason: "local_only_inspection",
+      });
+    },
+  );
+
+  it("selects only allow_once for allowed local terminal inspection by default", async () => {
     const resolver = createAgentCommandPolicyAcpResolver({ environment: { HOME: "/tmp/home", PATH: "/usr/bin" } });
 
     await expect(resolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toEqual({
