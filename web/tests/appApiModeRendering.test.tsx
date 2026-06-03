@@ -1,4 +1,7 @@
-import { Fragment, createElement, type ReactNode } from "react";
+// @vitest-environment happy-dom
+
+import { Fragment, act, createElement, type ReactNode } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveAppResourceLoading } from "../src/app/resourceLoading";
@@ -19,6 +22,10 @@ import type {
   SessionModel,
   TranscriptMessage,
 } from "../src/types/symphony";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const mountedRoots: Root[] = [];
 
 const apiChat: ChatMessage[] = [{ who: "agent", text: "API full-app chat", suggestions: ["Full-app suggestion"] }];
 
@@ -283,7 +290,7 @@ type AppHookState = {
   orchestratorChat: Loadable<ChatMessage[]>;
 };
 
-type HookOptions = { enabled?: boolean };
+type HookOptions = { enabled?: boolean; refreshToken?: unknown };
 
 type AppHookCalls = {
   reference: HookOptions[];
@@ -504,6 +511,12 @@ function expectUnavailableButton(markup: string, label: string) {
 }
 
 afterEach(() => {
+  for (const root of mountedRoots.splice(0)) {
+    act(() => {
+      root.unmount();
+    });
+  }
+  document.body.innerHTML = "";
   vi.doUnmock("../src/data/dataSourceContext");
   vi.doUnmock("../src/hooks/useSymphonyData");
   vi.doUnmock("../src/hooks/useLiveResource");
@@ -641,6 +654,42 @@ describe("App API-mode rendering", () => {
     expect(hookCalls.history).toEqual([{ enabled: false, refreshToken: 3 }]);
     expect(hookCalls.sidebar).toEqual([{ enabled: false, refreshToken: 4 }]);
     expect(hookCalls.orchestratorChat).toEqual([{ enabled: true, refreshToken: 6 }]);
+  });
+
+  it("preserves the selected tab while realtime tokens refresh the active issues view", async () => {
+    const liveState = liveResourceState();
+    const { hookCalls } = await renderAppWithMocks({ liveState, hooks: appHookState({ issueBoard: loaded(apiIssueBoard) }) });
+    const { App } = await import("../src/App");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    mountedRoots.push(root);
+
+    act(() => {
+      root.render(<App />);
+    });
+    const issuesTab = container.querySelector<HTMLButtonElement>('button[role="tab"][aria-label="Issues"]');
+    if (!issuesTab) throw new Error("expected issues tab to render");
+    act(() => {
+      issuesTab.click();
+    });
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("aria-label")).toBe("Issues");
+
+    liveState.tokens.dashboard = 5;
+    liveState.tokens.issueBoard = 7;
+    liveState.tokens.history = 11;
+    liveState.tokens.sidebar = 13;
+    liveState.tokens.orchestratorChat = 17;
+    act(() => {
+      root.render(<App />);
+    });
+
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("aria-label")).toBe("Issues");
+    expect(hookCalls.dashboard.at(-1)).toEqual({ enabled: false, refreshToken: 5 });
+    expect(hookCalls.issueBoard.at(-1)).toEqual({ enabled: true, refreshToken: 7 });
+    expect(hookCalls.history.at(-1)).toEqual({ enabled: false, refreshToken: 11 });
+    expect(hookCalls.sidebar.at(-1)).toEqual({ enabled: false, refreshToken: 13 });
+    expect(hookCalls.orchestratorChat.at(-1)).toEqual({ enabled: false, refreshToken: 17 });
   });
 
   it("renders non-blocking realtime connection, reconnect, recovered, and stale status in API chrome", async () => {
