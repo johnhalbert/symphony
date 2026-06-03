@@ -155,7 +155,7 @@ type StatusServerWritebackOutbox = Pick<FileWritebackOutboxStore, "list"> &
 
 interface StatusServerProjectionRevisionStore {
   projectionRevision(): number;
-  onProjectionChanged(listener: (event: { source: string; revision: number }) => void): () => void;
+  onProjectionChanged(listener: (event: { source: string; revision: number; detail?: Record<string, unknown> | null }) => void): () => void;
 }
 
 export interface StatusServerProjectionWriter {
@@ -778,6 +778,8 @@ export class StatusServer {
                 messageCount: chat.length,
                 conversationId: postConversationId ?? DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
                 status: result.status,
+                messages: chat,
+                message: chat.at(-1) ?? null,
               });
             }
           }
@@ -2604,7 +2606,13 @@ function createStatusServerStoreRevisionProvider(
     getRevision: () => ({ source, revision: store.projectionRevision(), observedAt: null }),
     subscribe: (listener: WebProjectionRevisionListener) =>
       store.onProjectionChanged((event) => {
-        listener({ source: event.source || source, revision: event.revision, observedAt: null });
+        const revision: WebProjectionSourceRevision & { detail?: Record<string, unknown> | null } = {
+          source: event.source || source,
+          revision: event.revision,
+          observedAt: null,
+          ...(event.detail ? { detail: event.detail } : {}),
+        };
+        listener(revision);
       }),
   };
 }

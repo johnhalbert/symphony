@@ -3,6 +3,7 @@ export type ProjectionChangeSource = "runs" | "workspaces" | "lifecycle" | "writ
 export interface ProjectionChangeEvent {
   source: ProjectionChangeSource;
   revision: number;
+  detail?: Record<string, unknown> | null;
 }
 
 export type ProjectionChangeListener = (event: ProjectionChangeEvent) => void;
@@ -23,9 +24,9 @@ export class ProjectionRevisionNotifier {
     };
   }
 
-  notify(source: ProjectionChangeSource): void {
+  notify(source: ProjectionChangeSource, detail: Record<string, unknown> | null = null): void {
     this.revision += 1;
-    const event: ProjectionChangeEvent = { source, revision: this.revision };
+    const event: ProjectionChangeEvent = detail ? { source, revision: this.revision, detail } : { source, revision: this.revision };
     for (const listener of Array.from(this.listeners)) {
       try {
         listener(event);

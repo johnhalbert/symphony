@@ -559,6 +559,67 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
+  it("publishes store-driven transcript deltas with patchable message payloads", async () => {
+    const runStore = new FileRunTranscriptStore(root);
+    await runStore.startRun({
+      runId: "run-transcript-patch-1",
+      sessionId: "session-transcript-patch-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+    });
+    const server = createRealtimeServer({ runStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+      await runStore.appendEvent({
+        runId: "run-transcript-patch-1",
+        at: "2026-01-01T00:00:01.000Z",
+        source: "runtime",
+        eventType: "assistant_delta",
+        message: "live transcript patch",
+        payload: { kind: "assistant", type: "assistant_delta", text: "live transcript patch", delta: "live transcript patch" },
+      });
+
+      const transcript = await client.nextEventOfType("transcript.delta");
+      expect(transcript.data).toMatchObject({
+        type: "transcript.delta",
+        scope: "session",
+        key: "session-transcript-patch-1",
+        source: { source: "runs", revision: 2 },
+        payload: {
+          source: "runs",
+          sourceRevision: 2,
+          runId: "run-transcript-patch-1",
+          sessionId: "session-transcript-patch-1",
+          afterSequence: 0,
+          eventCount: 1,
+          messages: [
+            {
+              sequence: 1,
+              operation: "merge-assistant-delta",
+              joinMode: "spaced",
+              message: { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "live transcript patch" },
+            },
+          ],
+        },
+      });
+      expect((transcript.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
   it("publishes store-driven assistant and system conversation writes as orchestrator chat realtime events", async () => {
     const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state"));
     const server = createRealtimeServer({ orchestratorConversationStore });
@@ -582,6 +643,14 @@ describe("StatusServer realtime SSE API", () => {
         source: { source: "orchestrator_conversations", revision: 1 },
         recovery: { strategy: "refetch", reason: "event" },
       });
+      expect((assistantAppend.data as RealtimeProjectionEvent).payload).toMatchObject({
+        conversationId: "operator-room",
+        messageCount: 1,
+        message: { id: assistant.id, conversationId: "operator-room", who: "agent", role: "assistant", text: "I can help inspect the queue.", status: "streaming" },
+        messages: [
+          { id: assistant.id, conversationId: "operator-room", who: "agent", role: "assistant", text: "I can help inspect the queue.", status: "streaming" },
+        ],
+      });
       expect((assistantAppend.data as RealtimeProjectionEvent).resources).toEqual(
         expect.arrayContaining([{ kind: "orchestrator-chat", href: "/api/v1/web/orchestrator-chat", relation: "refetch" }]),
       );
@@ -601,6 +670,14 @@ describe("StatusServer realtime SSE API", () => {
         type: "orchestrator.message",
         source: { source: "orchestrator_conversations", revision: 2 },
         recovery: { strategy: "refetch", reason: "event" },
+      });
+      expect((assistantUpdate.data as RealtimeProjectionEvent).payload).toMatchObject({
+        conversationId: "operator-room",
+        messageCount: 1,
+        message: { id: assistant.id, conversationId: "operator-room", who: "agent", role: "assistant", text: "I found the queue summary.", status: "completed" },
+        messages: [
+          { id: assistant.id, conversationId: "operator-room", who: "agent", role: "assistant", text: "I found the queue summary.", status: "completed" },
+        ],
       });
       expect((assistantUpdate.data as RealtimeProjectionEvent).recovery.endpoints).toContain(
         "/api/v1/web/orchestrator-chat",
@@ -689,6 +766,8 @@ describe("StatusServer realtime SSE API", () => {
             inputLength: "hello from the operator".length,
             messageCount: 1,
             status: 202,
+            message: { text: "hello from the operator" },
+            messages: [{ text: "hello from the operator" }],
           },
           recovery: { strategy: "refetch", reason: "event" },
         });

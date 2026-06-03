@@ -1,3 +1,5 @@
+import type { ChatMessage, TranscriptMessage } from "../types/symphony";
+
 export const REALTIME_EVENT_SCHEMA = "symphony.realtime.v1" as const;
 export const REALTIME_EVENT_SCHEMA_VERSION = 1 as const;
 
@@ -61,11 +63,19 @@ export interface RealtimeRunUpdatedPayload extends RealtimePayloadBase {
   status: string | null;
 }
 
+export interface RealtimeTranscriptPatchMessage {
+  sequence: number;
+  message: TranscriptMessage | null;
+  operation?: "append" | "merge-assistant-delta" | "replace-assistant";
+  joinMode?: "spaced" | "exact" | "token";
+}
+
 export interface RealtimeTranscriptDeltaPayload extends RealtimePayloadBase {
   runId: string | null;
   sessionId: string | null;
   afterSequence: number | null;
   eventCount: number | null;
+  messages?: readonly RealtimeTranscriptPatchMessage[];
 }
 
 export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase {
@@ -73,6 +83,8 @@ export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase 
   messageCount: number | null;
   inputLength: number | null;
   status: number | null;
+  message?: ChatMessage | null;
+  messages?: readonly ChatMessage[];
 }
 
 export interface RealtimeSourceStatusPayload extends RealtimePayloadBase {
@@ -231,7 +243,8 @@ function isRealtimePayloadForEventType(type: RealtimeProjectionEventType, value:
         isNullableString(transcriptPayload.runId) &&
         isNullableString(transcriptPayload.sessionId) &&
         isNullableFiniteNumber(transcriptPayload.afterSequence) &&
-        isNullableFiniteNumber(transcriptPayload.eventCount)
+        isNullableFiniteNumber(transcriptPayload.eventCount) &&
+        isOptionalTranscriptPatchMessages(transcriptPayload.messages)
       );
     }
     case "orchestrator.message": {
@@ -240,7 +253,9 @@ function isRealtimePayloadForEventType(type: RealtimeProjectionEventType, value:
         isNullableString(orchestratorPayload.conversationId) &&
         isNullableFiniteNumber(orchestratorPayload.messageCount) &&
         isNullableFiniteNumber(orchestratorPayload.inputLength) &&
-        isNullableFiniteNumber(orchestratorPayload.status)
+        isNullableFiniteNumber(orchestratorPayload.status) &&
+        isOptionalChatMessage(orchestratorPayload.message) &&
+        isOptionalChatMessages(orchestratorPayload.messages)
       );
     }
     case "source.status": {
@@ -256,6 +271,44 @@ function isRealtimePayloadForEventType(type: RealtimeProjectionEventType, value:
       );
     }
   }
+}
+
+function isOptionalTranscriptPatchMessages(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.every(isTranscriptPatchMessage));
+}
+
+function isTranscriptPatchMessage(value: unknown): value is RealtimeTranscriptPatchMessage {
+  if (!isRecord(value)) return false;
+  const patch = value as Partial<RealtimeTranscriptPatchMessage>;
+  return (
+    typeof patch.sequence === "number" &&
+    Number.isFinite(patch.sequence) &&
+    (patch.message === null || isRecord(patch.message)) &&
+    isOptionalTranscriptPatchOperation(patch.operation) &&
+    isOptionalTranscriptPatchJoinMode(patch.joinMode)
+  );
+}
+
+function isOptionalTranscriptPatchOperation(value: unknown): boolean {
+  return value === undefined || value === "append" || value === "merge-assistant-delta" || value === "replace-assistant";
+}
+
+function isOptionalTranscriptPatchJoinMode(value: unknown): boolean {
+  return value === undefined || value === "spaced" || value === "exact" || value === "token";
+}
+
+function isOptionalChatMessages(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.every(isChatMessage));
+}
+
+function isOptionalChatMessage(value: unknown): boolean {
+  return value === undefined || value === null || isChatMessage(value);
+}
+
+function isChatMessage(value: unknown): value is ChatMessage {
+  if (!isRecord(value)) return false;
+  const message = value as Partial<ChatMessage>;
+  return (message.who === "agent" || message.who === "user") && typeof message.text === "string";
 }
 
 function isRealtimePayloadBase(value: unknown): value is RealtimePayloadBase {

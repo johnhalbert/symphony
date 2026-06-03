@@ -1,7 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useDataSource } from "../data/dataSourceContext";
 import { useAsyncResource } from "./useAsyncResource";
-import type { IssueDetailModel, Loadable, TranscriptMessage } from "../types/symphony";
+import {
+  DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+  applyOrchestratorMessageEvent,
+  applyTranscriptDeltaEvent,
+} from "../data/realtimePatches";
+import type { ChatMessage, IssueDetailModel, Loadable, TranscriptMessage } from "../types/symphony";
 
 interface SymphonyResourceOptions {
   enabled?: boolean;
@@ -102,50 +107,99 @@ export function useHistory(options: SymphonyResourceOptions = {}) {
 export function useTranscript(sessionId: string | null, refreshToken?: unknown): Loadable<TranscriptMessage[]> {
   const dataSource = useDataSource();
   const normalizedSessionId = sessionId || null;
+  const [patchRefreshToken, setPatchRefreshToken] = useState(0);
+  const patchCursor = useRef<{ lastSequence: number | null; lastRevision: number | null }>({ lastSequence: null, lastRevision: null });
   const [state, setState] = useState<Loadable<TranscriptMessage[]> & { sessionId: string | null }>({
     sessionId: normalizedSessionId,
     data: normalizedSessionId ? null : [],
     loading: Boolean(normalizedSessionId),
     error: null,
   });
+  const stateRef = useRef(state);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   useEffect(() => {
     let active = true;
     if (!normalizedSessionId) {
-      setState({ sessionId: null, data: [], loading: false, error: null });
+      patchCursor.current = { lastSequence: null, lastRevision: null };
+      const nextState = { sessionId: null, data: [], loading: false, error: null };
+      stateRef.current = nextState;
+      setState(nextState);
       return () => {
         active = false;
       };
     }
 
     const controller = new AbortController();
-    setState((current) => ({
-      sessionId: normalizedSessionId,
-      data: current.sessionId === normalizedSessionId ? current.data : null,
-      loading: true,
-      error: null,
-    }));
+    setState((current) => {
+      const nextState = {
+        sessionId: normalizedSessionId,
+        data: current.sessionId === normalizedSessionId ? current.data : null,
+        loading: true,
+        error: null,
+      };
+      stateRef.current = nextState;
+      return nextState;
+    });
     dataSource
       .getTranscript(normalizedSessionId, controller.signal)
       .then((data) => {
-        if (active) setState({ sessionId: normalizedSessionId, data, loading: false, error: null });
+        if (!active) return;
+        patchCursor.current = { ...patchCursor.current, lastSequence: null };
+        const nextState = { sessionId: normalizedSessionId, data, loading: false, error: null };
+        stateRef.current = nextState;
+        setState(nextState);
       })
       .catch((error: unknown) => {
         if (!active) return;
         const message = error instanceof Error ? error.message : String(error);
-        setState((current) => ({
-          sessionId: normalizedSessionId,
-          data: current.sessionId === normalizedSessionId ? current.data : null,
-          loading: false,
-          error: message,
-        }));
+        setState((current) => {
+          const nextState = {
+            sessionId: normalizedSessionId,
+            data: current.sessionId === normalizedSessionId ? current.data : null,
+            loading: false,
+            error: message,
+          };
+          stateRef.current = nextState;
+          return nextState;
+        });
       });
 
     return () => {
       active = false;
       controller.abort();
     };
-  }, [dataSource, normalizedSessionId, refreshToken]);
+  }, [dataSource, normalizedSessionId, refreshToken, patchRefreshToken]);
+
+  useEffect(() => {
+    if (!normalizedSessionId || !dataSource.subscribeToRealtimeEvents) return undefined;
+    return dataSource.subscribeToRealtimeEvents((event) => {
+      if (event.type !== "transcript.delta") return;
+      const outcome = applyTranscriptDeltaEvent({
+        event,
+        sessionId: normalizedSessionId,
+        current: stateRef.current.sessionId === normalizedSessionId ? stateRef.current.data : null,
+        lastSequence: patchCursor.current.lastSequence,
+        lastRevision: patchCursor.current.lastRevision,
+      });
+      if (outcome.action === "ignored") return;
+      patchCursor.current = {
+        lastSequence: outcome.lastSequence ?? patchCursor.current.lastSequence,
+        lastRevision: outcome.lastRevision ?? patchCursor.current.lastRevision,
+      };
+      if (outcome.action === "fallback") {
+        dataSource.invalidateCachedReads?.({ forceRefreshHrefs: [`/api/v1/web/sessions/${encodeURIComponent(normalizedSessionId)}/transcript?refresh=1`] });
+        setPatchRefreshToken((current) => current + 1);
+        return;
+      }
+      const nextState = { sessionId: normalizedSessionId, data: outcome.data, loading: false, error: null };
+      stateRef.current = nextState;
+      setState(nextState);
+    });
+  }, [dataSource, normalizedSessionId]);
 
   if (state.sessionId !== normalizedSessionId) {
     return { data: normalizedSessionId ? null : [], loading: Boolean(normalizedSessionId), error: null };
@@ -163,11 +217,81 @@ export function useSidebar(options: SymphonyResourceOptions = {}) {
   );
 }
 
-export function useOrchestratorChat(options: SymphonyResourceOptions = {}) {
+export function useOrchestratorChat(options: SymphonyResourceOptions = {}): Loadable<ChatMessage[]> {
   const dataSource = useDataSource();
-  return useAsyncResource(
-    useCallback((signal?: AbortSignal) => dataSource.getOrchestratorChat(signal), [dataSource]),
-    [dataSource, options.refreshToken],
-    options,
-  );
+  const enabled = options.enabled ?? true;
+  const [patchRefreshToken, setPatchRefreshToken] = useState(0);
+  const lastRevision = useRef<number | null>(null);
+  const [state, setState] = useState<Loadable<ChatMessage[]> & { enabled: boolean }>({ data: null, loading: enabled, error: null, enabled });
+  const stateRef = useRef(state);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  useEffect(() => {
+    if (!enabled) {
+      setState((current) => {
+        const nextState = { data: current.data, loading: false, error: null, enabled: false };
+        stateRef.current = nextState;
+        return nextState;
+      });
+      return undefined;
+    }
+
+    let active = true;
+    const controller = new AbortController();
+    setState((current) => {
+      const nextState = { data: current.data, loading: true, error: null, enabled: true };
+      stateRef.current = nextState;
+      return nextState;
+    });
+    dataSource
+      .getOrchestratorChat(controller.signal)
+      .then((data) => {
+        if (!active) return;
+        const nextState = { data, loading: false, error: null, enabled: true };
+        stateRef.current = nextState;
+        setState(nextState);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setState((current) => {
+          const nextState = { data: current.data, loading: false, error: message, enabled: true };
+          stateRef.current = nextState;
+          return nextState;
+        });
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [dataSource, enabled, options.refreshToken, patchRefreshToken]);
+
+  useEffect(() => {
+    if (!enabled || !dataSource.subscribeToRealtimeEvents) return undefined;
+    return dataSource.subscribeToRealtimeEvents((event) => {
+      if (event.type !== "orchestrator.message") return;
+      const outcome = applyOrchestratorMessageEvent({
+        event,
+        conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+        current: stateRef.current.enabled ? stateRef.current.data : null,
+        lastRevision: lastRevision.current,
+      });
+      if (outcome.action === "ignored") return;
+      lastRevision.current = outcome.lastRevision ?? lastRevision.current;
+      if (outcome.action === "fallback") {
+        dataSource.invalidateCachedReads?.({ forceRefreshHrefs: ["/api/v1/web/orchestrator-chat?refresh=1"] });
+        setPatchRefreshToken((current) => current + 1);
+        return;
+      }
+      const nextState = { data: outcome.data, loading: false, error: null, enabled: true };
+      stateRef.current = nextState;
+      setState(nextState);
+    });
+  }, [dataSource, enabled]);
+
+  if (enabled && !state.enabled) return { data: state.data, loading: true, error: null };
+  return { data: state.data, loading: state.loading, error: state.error };
 }

@@ -326,6 +326,72 @@ describe("live resource realtime mapping", () => {
     expect(probe.state().revisions.history).toBe(5);
   });
 
+  it("invalidates caches but leaves direct-patch resources to active patch hooks when SSE payloads are patchable", () => {
+    let listener: RealtimeEventListener | null = null;
+    const invalidateCachedReads = vi.fn();
+    const dataSource = testDataSource({
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(nextListener) {
+        listener = nextListener;
+        return () => undefined;
+      },
+    });
+    const probe = renderLiveResourceProbe(dataSource);
+
+    const transcript = eventFor(
+      [
+        { kind: "history", href: "/api/v1/web/history", relation: "refetch" },
+        { kind: "session-transcript", href: "/api/v1/web/sessions/{sessionId}/transcript", relation: "template" },
+      ],
+      {
+        id: "transcript-patch-7",
+        revision: 7,
+        type: "transcript.delta",
+        payload: {
+          source: "runs",
+          sourceRevision: 7,
+          detail: null,
+          runId: "run-1",
+          sessionId: "session-1",
+          afterSequence: 1,
+          eventCount: 1,
+          messages: [{ sequence: 2, message: { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "delta" } }],
+        },
+      },
+    );
+
+    if (!listener) throw new Error("realtime listener was not subscribed");
+    act(() => listener?.(transcript));
+
+    expect(invalidateCachedReads).toHaveBeenCalledWith({
+      forceRefreshHrefs: ["/api/v1/web/history", "/api/v1/web/sessions/{sessionId}/transcript"],
+    });
+    expect(probe.state().tokens.history).toBe(1);
+    expect(probe.state().tokens.sessionTranscript).toBe(0);
+    expect(probe.state().revisions.sessionTranscript).toBe(7);
+
+    const chat = eventFor([{ kind: "orchestrator-chat", href: "/api/v1/web/orchestrator-chat", relation: "refetch" }], {
+      id: "chat-patch-8",
+      revision: 8,
+      type: "orchestrator.message",
+      payload: {
+        source: "orchestrator_conversations",
+        sourceRevision: 8,
+        detail: null,
+        conversationId: "orchestrator-default",
+        messageCount: 1,
+        inputLength: null,
+        status: null,
+        message: { id: "msg-1", conversationId: "orchestrator-default", who: "agent", text: "server" },
+        messages: [{ id: "msg-1", conversationId: "orchestrator-default", who: "agent", text: "server" }],
+      },
+    });
+
+    act(() => listener?.(chat));
+    expect(probe.state().tokens.orchestratorChat).toBe(0);
+    expect(probe.state().revisions.orchestratorChat).toBe(8);
+  });
+
   it("routes backend-shaped orchestrator projection updates without refreshing issue board or history resources", () => {
     let listener: RealtimeEventListener | null = null;
     const invalidateCachedReads = vi.fn();

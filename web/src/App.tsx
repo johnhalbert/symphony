@@ -102,7 +102,7 @@ function AppShell({
   const issueBoardRefreshToken = liveRefreshToken(liveTokens, ["issueBoard"]);
   const issueDetailRefreshToken = liveRefreshToken(liveTokens, ["issueDetail", "issueBoard"]);
   const historyRefreshToken = liveRefreshToken(liveTokens, ["history"]);
-  const transcriptRefreshToken = liveRefreshToken(liveTokens, ["sessionTranscript", "history"]);
+  const transcriptRefreshToken = liveRefreshToken(liveTokens, ["sessionTranscript"]);
   const sidebarRefreshToken = liveRefreshToken(liveTokens, ["sidebar"]);
   const orchestratorChatRefreshToken = liveRefreshToken(liveTokens, ["orchestratorChat"]);
 
