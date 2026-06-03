@@ -60,6 +60,7 @@ export interface WebProjectionCacheFingerprint {
   issueBoardStateKey: string;
   issueBoardColumnKey: string;
   durableSourceRevisions: readonly WebProjectionSourceRevision[];
+  durableProjectionRevisions: readonly WebProjectionSourceRevision[];
 }
 
 export interface WebProjectionCacheMetadata {
@@ -496,12 +497,14 @@ export function createWebProjectionFingerprint(input: {
   issueBoardStates?: readonly WebProjectionAliasValue[];
   issueBoardColumns?: readonly WebProjectionAliasValue[];
   durableSourceRevisions?: readonly WebProjectionSourceRevision[];
+  durableProjectionRevisions?: readonly WebProjectionSourceRevision[];
 } = {}): WebProjectionCacheFingerprint {
   return {
     runtimeGeneratedAt: input.runtimeGeneratedAt ?? null,
     issueBoardStateKey: webProjectionAliasesFromValues(input.issueBoardStates ?? []).join(","),
     issueBoardColumnKey: webProjectionAliasesFromValues(input.issueBoardColumns ?? []).join(","),
     durableSourceRevisions: [...(input.durableSourceRevisions ?? [])].sort(compareSourceRevisions),
+    durableProjectionRevisions: [...(input.durableProjectionRevisions ?? [])].sort(compareSourceRevisions),
   };
 }
 
@@ -529,6 +532,7 @@ export function webProjectionFingerprintCacheKey(fingerprint: WebProjectionCache
     issueBoardStateKey: fingerprint.issueBoardStateKey,
     issueBoardColumnKey: fingerprint.issueBoardColumnKey,
     durableSourceRevisions: [...fingerprint.durableSourceRevisions].sort(compareSourceRevisions),
+    durableProjectionRevisions: [...fingerprint.durableProjectionRevisions].sort(compareSourceRevisions),
   });
 }
 
