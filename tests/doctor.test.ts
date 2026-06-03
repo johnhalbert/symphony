@@ -465,12 +465,10 @@ github:
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
         agent: { harness: "hermes_acp" },
-        hermes: {
-          acp_binary_path: "/opt/hermes/bin/hermes",
-          acp_source_profile: "dogfood",
-          acp_profile_prefix: "sym-test",
-          provider: "openrouter",
-          model: "anthropic/claude-sonnet-test",
+        hermes_acp: {
+          binary_path: "/opt/hermes/bin/hermes",
+          source_profile: "dogfood",
+          profile_prefix: "sym-test",
           worker_session_lifecycle: "fresh_per_run",
           keep_profiles: "always",
         },
@@ -479,14 +477,22 @@ github:
       { LINEAR_API_KEY: "secret" },
     );
 
-    expect(config.hermes.acpBinaryPath).toBe("/opt/hermes/bin/hermes");
-    expect(config.hermes.acpSourceProfile).toBe("dogfood");
-    expect(config.hermes.acpProfilePrefix).toBe("sym-test");
+    expect(config.hermes.acpBinaryPath).toBeNull();
+    expect(config.hermes.acpSourceProfile).toBeNull();
+    expect(config.hermes.acpProfilePrefix).toBeNull();
+    expect(config.hermesAcp).toMatchObject({
+      binaryPath: "/opt/hermes/bin/hermes",
+      sourceProfile: "dogfood",
+      profilePrefix: "sym-test",
+      workerSessionLifecycle: "fresh_per_run",
+      keepProfiles: "always",
+    });
     expect(hermesAcpRuntimeDoctorChecks(config)).toEqual([
       {
         id: "hermes_acp.runtime",
         status: "ok",
-        message: "Hermes ACP uses host Hermes binary /opt/hermes/bin/hermes; source profile is dogfood",
+        message:
+          "Hermes ACP uses host Hermes binary /opt/hermes/bin/hermes; source profile is dogfood; host installation/profile store are used without Symphony-managed HERMES_HOME or HERMES_AUTH_HOME overrides",
       },
       {
         id: "hermes_acp.profiles",
@@ -530,9 +536,9 @@ github:
           tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
           workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
           agent: { harness: "hermes_acp" },
-          hermes: {
-            acp_binary_path: binaryPath,
-            acp_source_profile: "dogfood",
+          hermes_acp: {
+            binary_path: binaryPath,
+            source_profile: "dogfood",
           },
         },
         path.join(root, "WORKFLOW.md"),
@@ -607,9 +613,9 @@ github:
           tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
           workspace: { root: path.join(root, "workspaces"), state_dir: path.join(root, "state") },
           agent: { harness: "hermes_acp" },
-          hermes: {
-            acp_binary_path: binaryPath,
-            acp_source_profile: "dogfood",
+          hermes_acp: {
+            binary_path: binaryPath,
+            source_profile: "dogfood",
           },
         },
         path.join(root, "WORKFLOW.md"),
