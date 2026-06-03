@@ -5,13 +5,14 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   ProjectionChangeListener,
+  RealtimeConnectionStatus,
   RealtimeEventListener,
   RealtimeProjectionEvent,
   RealtimeProjectionResource,
   SymphonyDataSource,
 } from "../src/data/dataSource";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
-import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
+import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION, realtimeConnectionStatus } from "../src/data/realtimeEvents";
 import {
   LIVE_RESOURCE_KEYS,
   applyRealtimeEventToLiveResourceRevisions,
@@ -480,6 +481,43 @@ describe("live resource realtime mapping", () => {
     expect(probe.state().revisions.dashboard).toBe(11);
     expect(probe.state().revisions.issueBoard).toBeNull();
     expect(probe.state().revisions.history).toBeNull();
+  });
+
+  it("reports unavailable zero state while disabled without subscribing or invalidating caches", () => {
+    const invalidateCachedReads = vi.fn();
+    const subscribeToRealtimeEvents = vi.fn(() => () => undefined);
+    const dataSource = testDataSource({ invalidateCachedReads, subscribeToRealtimeEvents });
+
+    const probe = renderLiveResourceProbe(dataSource, false);
+
+    expect(subscribeToRealtimeEvents).not.toHaveBeenCalled();
+    expect(invalidateCachedReads).not.toHaveBeenCalled();
+    expect(probe.state().tokens).toEqual(createLiveResourceTokenMap());
+    expect(probe.state().revisions).toEqual(createLiveResourceRevisionMap());
+    expect(probe.state().realtimeStatus).toEqual(realtimeConnectionStatus("unavailable"));
+  });
+
+  it("propagates realtime connection status without forcing resource refresh tokens", () => {
+    let statusListener: ((status: RealtimeConnectionStatus) => void) | null = null;
+    const invalidateCachedReads = vi.fn();
+    const dataSource = testDataSource({
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(_nextListener, options) {
+        statusListener = options?.onStatus ?? null;
+        return () => undefined;
+      },
+    });
+
+    const probe = renderLiveResourceProbe(dataSource);
+    expect(probe.state().realtimeStatus).toEqual(realtimeConnectionStatus("connecting"));
+
+    act(() => statusListener?.(realtimeConnectionStatus("open")));
+    expect(probe.state().realtimeStatus).toEqual(realtimeConnectionStatus("open"));
+
+    act(() => statusListener?.(realtimeConnectionStatus("stale", { lastEventId: "event-3", revision: 4, missedEvents: true })));
+    expect(probe.state().realtimeStatus).toEqual(realtimeConnectionStatus("stale", { lastEventId: "event-3", revision: 4, missedEvents: true }));
+    expect(invalidateCachedReads).not.toHaveBeenCalled();
+    expect(probe.state().tokens).toEqual(createLiveResourceTokenMap());
   });
 
   it("uses the legacy projection subscription as a hook-level fallback refetch path when realtime is unavailable", () => {
