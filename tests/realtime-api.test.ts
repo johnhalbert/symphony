@@ -171,6 +171,16 @@ describe("StatusServer realtime SSE API", () => {
       source: { source: "runs", revision: 7 },
       payload: { source: "runs", sourceRevision: 7, resourcesChanged: ["dashboard", "issue-board", "sidebar", "history"] },
     });
+
+    const newlineInjectedFrame = serializeSseEvent({
+      ...projection,
+      id: "malformed\nid",
+      type: "projection.updated\nextra" as RealtimeProjectionEventType,
+    });
+    expect(newlineInjectedFrame).toContain("id: malformed id\n");
+    expect(newlineInjectedFrame).toContain("event: projection.updated extra\n");
+    expect(newlineInjectedFrame).not.toContain("id: malformed\nid\n");
+    expect(newlineInjectedFrame).not.toContain("event: projection.updated\nextra\n");
     expect(serializeSseComment("keepalive\nignored")).toBe(": keepalive ignored\n\n");
   });
 
@@ -277,6 +287,68 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
+  it("replays known events from lastEventId query cursors without missed-event recovery", async () => {
+    const runStore = new FileRunTranscriptStore(root);
+    const server = createRealtimeServer({ runStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+      await runStore.startRun({
+        runId: "run-realtime-query-cursor",
+        sessionId: "session-realtime-query-cursor",
+        agentId: "agent-1",
+        role: "worker",
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "work",
+        workspaceKey: "TEST-1",
+        workspacePath: "/tmp/workspace",
+      });
+
+      const liveEvents = [
+        await client.nextEventOfType("projection.updated"),
+        await client.nextEventOfType("source.status"),
+        await client.nextEventOfType("run.updated"),
+        await client.nextEventOfType("transcript.delta"),
+      ];
+      await client.close();
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "initial SSE subscriber to disconnect");
+
+      const queryReplayClient = await openSseClient(
+        `${baseUrl}/api/v1/realtime?lastEventId=${encodeURIComponent(liveEvents[0]!.id)}`,
+      );
+      try {
+        const replayedEvents = [
+          await queryReplayClient.nextEvent(),
+          await queryReplayClient.nextEvent(),
+          await queryReplayClient.nextEvent(),
+        ];
+        expect(replayedEvents.map((event) => event.id)).toEqual(liveEvents.slice(1).map((event) => event.id));
+        expect(replayedEvents.map((event) => event.event)).toEqual(["source.status", "run.updated", "transcript.delta"]);
+        for (const replayed of replayedEvents) {
+          const data = replayed.data as RealtimeProjectionEvent;
+          expect(data.id).toBe(replayed.id);
+          expect(data.type).toBe(replayed.event);
+          expect(typeof data.revision).toBe("number");
+          expect(data.source).toMatchObject({ source: "runs", revision: 1 });
+          expect(data.payload).toMatchObject({ source: "runs", sourceRevision: 1 });
+          expect(data.missedEvents).toBe(false);
+        }
+        await expect(queryReplayClient.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+      } finally {
+        await queryReplayClient.close();
+      }
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
   it("streams run and transcript realtime events from accepted run activity appends", async () => {
     const runActivitySourceStore = new InMemoryRunActivityAppendStore();
     const server = createRealtimeServer({ runActivitySourceStore });
@@ -327,6 +399,38 @@ describe("StatusServer realtime SSE API", () => {
           eventCount: 2,
         },
       });
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("suppresses realtime events for duplicate run activity appends", async () => {
+    const runActivitySourceStore = new InMemoryRunActivityAppendStore();
+    const server = createRealtimeServer({ runActivitySourceStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+      const accepted = await runActivitySourceStore.appendEvent(
+        runActivityInput({ id: "activity-realtime-duplicate", sequence: 1, externalEventId: "upstream-duplicate" }),
+      );
+      expect(accepted.status).toBe("accepted");
+      await readOrderedRealtimeEvents(client, "run_activity", 1, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+
+      const duplicate = await runActivitySourceStore.appendEvent(
+        runActivityInput({ id: "activity-realtime-duplicate", sequence: 2, externalEventId: "upstream-other" }),
+      );
+      expect(duplicate).toMatchObject({ status: "duplicate", reason: "event_id" });
+      expect(server.activeRealtimeSubscriberCount()).toBe(1);
+      await expect(client.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
     } finally {
       await client.close();
       await server.stop();
@@ -910,6 +1014,12 @@ describe("StatusServer realtime SSE API", () => {
         expect((recovery.data as RealtimeProjectionEvent).recovery.endpoints).toEqual(
           expect.arrayContaining(["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/history"]),
         );
+        for (const endpoint of ["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/history"]) {
+          const refetch = await fetch(`${baseUrl}${endpoint}`);
+          expect(refetch.status, `missed-event recovery refetch ${endpoint} should use normal GET semantics`).toBe(200);
+          expect(refetch.headers.get("content-type")).toContain("application/json");
+          expect(await refetch.json()).toBeTruthy();
+        }
       } finally {
         await recoveryClient.close();
       }
