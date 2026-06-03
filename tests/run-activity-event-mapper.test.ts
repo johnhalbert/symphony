@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { AgentEvent } from "../src/core/harness/AgentHarness.js";
-import type { RunActivityEvent } from "../src/core/runActivity/RunActivityEvent.js";
-import { mapAgentEventToRunActivityEvent, RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX } from "../src/core/transcript/RunActivityEventMapper.js";
+import type { RunActivityCommandPolicyDecisionPayload, RunActivityEvent } from "../src/core/runActivity/RunActivityEvent.js";
+import {
+  mapAgentEventToRunActivityEvent,
+  mapRunActivityEventToTranscriptEvent,
+  RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX,
+} from "../src/core/transcript/RunActivityEventMapper.js";
 
 const providerLimitSignal = {
   scope: { harnessId: "hermes", providerId: "openai-codex", model: "gpt-5.5" },
@@ -180,6 +184,79 @@ describe("mapAgentEventToRunActivityEvent", () => {
     expect(serialized).not.toContain("legacy assistant chunk");
   });
 
+  it("maps command policy decisions into schema-tagged redacted transcript events", () => {
+    const activity = commandPolicyRunActivity();
+    const mapped = mapAgentEventToRunActivityEvent({
+      type: "progress",
+      activitySource: "tool",
+      message: "legacy command policy fallback token=SECRET_LEGACY_TOKEN",
+      runActivity: activity,
+    });
+    const durable = mapRunActivityEventToTranscriptEvent(activity, { runId: "run-1", source: "harness" });
+
+    expect(mapped.eventType).toBe("command_policy_decision");
+    expect(mapped.payloadSchema).toBe(`${RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX}.command_policy_decision.v1`);
+    expect(mapped.message).not.toContain("SECRET_TEXT_TOKEN");
+    expect(mapped.message).toContain("[redacted]");
+    expect(mapped.payload).toMatchObject({
+      kind: "command_policy_decision",
+      actor: "harness",
+      channel: "diagnostic",
+      protocol: "symphony",
+      harnessId: "hermes-command-policy",
+      activityId: "run-1:policy:1",
+      runSessionId: "run-1:policy-session",
+      activitySequence: 8,
+      sequenceSource: "symphony",
+      decisionId: "policy-decision-1",
+      attemptId: "tool-call-1",
+      surface: "terminal_execute",
+      role: "worker",
+      phase: "implementation",
+      outcome: "deny",
+      reasonKind: "upstream_github",
+      commandClass: "direct_upstream_git_operation",
+      upstreamContactAttempted: false,
+      redacted: true,
+      audit: {
+        redacted: true,
+        surface: "terminal_execute",
+        role: "worker",
+        phase: "implementation",
+        outcome: "deny",
+        reasonKind: "upstream_github",
+        commandClass: "direct_upstream_git_operation",
+        upstreamContactAttempted: false,
+        targetHosts: ["github.com"],
+      },
+      normalizedCommand: {
+        executable: "git",
+        executableKind: "git",
+        gitSubcommand: "push",
+        targetHosts: ["github.com"],
+      },
+    });
+    expect(durable).toMatchObject({
+      runId: "run-1",
+      sequence: 8,
+      at: "2026-06-01T12:00:00.000Z",
+      source: "harness",
+      eventType: "command_policy_decision",
+      payloadSchema: `${RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX}.command_policy_decision.v1`,
+      payload: {
+        kind: "command_policy_decision",
+        activityId: "run-1:policy:1",
+        outcome: "deny",
+        reasonKind: "upstream_github",
+        upstreamContactAttempted: false,
+      },
+    });
+    const serialized = JSON.stringify([mapped, durable]);
+    expect(serialized).not.toContain("SECRET_");
+    expect(serialized).not.toContain("rawPayload");
+    expect(serialized).not.toContain("legacy command policy fallback");
+  });
+
   it("maps ACP user replay and reasoning chunks without coercing them into assistant message deltas", () => {
     const userReplay = mapAgentEventToRunActivityEvent({
       type: "progress",
@@ -262,6 +339,25 @@ describe("mapAgentEventToRunActivityEvent", () => {
     expect(mapped.payload).toMatchObject({ kind: "assistant_delta", activitySource: "delta", progressKind: "assistant_delta" });
   });
 
+  it("rejects malformed command-policy metadata instead of schema-tagging incomplete audit events", () => {
+    const malformedActivity = { ...commandPolicyRunActivity(), payload: {} } as unknown as RunActivityEvent;
+
+    const mapped = mapAgentEventToRunActivityEvent({
+      type: "progress",
+      activitySource: "tool",
+      message: "legacy command policy fallback",
+      runActivity: malformedActivity,
+    });
+
+    expect(mapped.eventType).toBe("progress");
+    expect(mapped.payloadSchema).toBe(`${RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX}.progress.v1`);
+    expect(mapped.payload).toMatchObject({ kind: "tool", activitySource: "tool", progressKind: "tool" });
+    expect(mapped.payload).not.toMatchObject({ kind: "command_policy_decision" });
+    expect(() => mapRunActivityEventToTranscriptEvent(malformedActivity, { runId: "run-1", source: "harness" })).toThrow(
+      /Invalid run activity event for transcript projection: run-1:policy:1/,
+    );
+  });
+
   it("redacts secrets, marks truncated previews, and omits raw protocol fields from frontend payloads", () => {
     const longSecret = `${"x".repeat(560)} SECRET_LONG_TOKEN`;
     const diagnostic = mapAgentEventToRunActivityEvent({
@@ -288,6 +384,77 @@ describe("mapAgentEventToRunActivityEvent", () => {
     expect(serialized).not.toContain("json-rpc body");
   });
 });
+
+function commandPolicyRunActivity(overrides: Partial<RunActivityEvent> = {}): RunActivityEvent {
+  const payload =
+    overrides.payload && typeof overrides.payload === "object" && !Array.isArray(overrides.payload) ? overrides.payload : {};
+  const commandPolicyPayload = {
+    runtimeSessionId: "policy-session-1",
+    redacted: true,
+    decisionId: "policy-decision-1",
+    attemptId: "tool-call-1",
+    runId: "run-1",
+    issueId: "issue-1",
+    surface: "terminal_execute",
+    role: "worker",
+    phase: "implementation",
+    outcome: "deny",
+    reasonKind: "upstream_github",
+    commandClass: "direct_upstream_git_operation",
+    message: "Blocked worker/reviewer upstream GitHub contact: token=SECRET_MESSAGE_TOKEN",
+    upstreamContactAttempted: false,
+    requiresCodeChange: false,
+    requiresUserOrServiceFix: true,
+    normalizedCommand: {
+      executable: "git",
+      executableKind: "git",
+      argumentsPreview: "push https://[redacted]@github.com/owner/repo.git",
+      gitSubcommand: "push",
+      targetHosts: ["github.com"],
+      hasNestedCommand: false,
+      hasInlineEnvironment: false,
+      hasUnsafeGitConfig: false,
+    },
+    audit: {
+      redacted: true,
+      surface: "terminal_execute",
+      role: "worker",
+      phase: "implementation",
+      outcome: "deny",
+      reasonKind: "upstream_github",
+      commandClass: "direct_upstream_git_operation",
+      inlineEnvironmentKeys: [],
+      unsafeConfigCategories: [],
+      upstreamContactAttempted: false,
+      rawInputPreview: "git push https://SECRET_AUDIT_TOKEN@github.com/owner/repo.git",
+      rawInputPreviewTruncated: false,
+      rawInputPreviewRedacted: true,
+      normalizedExecutable: "git",
+      executableKind: "git",
+      gitSubcommand: "push",
+      commandPreview: "git push https://[redacted]@github.com/owner/repo.git",
+      targetHosts: ["github.com"],
+      inheritedEnvironmentKeys: ["HOME", "PATH"],
+    },
+    rawPayload: { token: "SECRET_RAW_TOKEN" },
+    ...(payload as Record<string, unknown>),
+  } as RunActivityCommandPolicyDecisionPayload;
+  return {
+    eventId: "run-1:policy:1",
+    runSessionId: "run-1:policy-session",
+    occurredAt: "2026-06-01T12:00:00.000Z",
+    sequence: 8,
+    sequenceSource: "symphony",
+    protocol: "symphony",
+    harness: "hermes-command-policy",
+    actor: "harness",
+    channel: "diagnostic",
+    kind: "command_policy_decision",
+    text: "Blocked worker/reviewer upstream GitHub contact: token=SECRET_TEXT_TOKEN",
+    ...overrides,
+    payload: commandPolicyPayload,
+  } as RunActivityEvent;
+}
 
 function acpRunActivity(overrides: Partial<RunActivityEvent> = {}): RunActivityEvent {
   const payload =
