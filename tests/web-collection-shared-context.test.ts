@@ -124,11 +124,11 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
     try {
       const { response, body } = await getJson(`${baseUrlFor(address)}/api/v1/web/sessions/run-1/transcript`);
       expect(response.status).toBe(200);
-      expect(body).toEqual(
-        expect.arrayContaining([
+      expect(body).toMatchObject({
+        messages: expect.arrayContaining([
           expect.objectContaining({ kind: "assistant", text: "transcript message" }),
         ]),
-      );
+      });
       expect(contextBuilds).toBe(0);
       expect(calls).toMatchObject({ getRun: 1, listRuns: 0, readTranscript: 0, readTranscriptTail: 1 });
     } finally {

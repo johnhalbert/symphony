@@ -570,23 +570,29 @@ describe("GET /api/v1/web/issues/:issueId", () => {
       const explicitResponse = await fetch(
         `http://${address.host}:${address.port}/api/v1/web/issues/TEST-1?includeTranscript=1`,
       );
-      const explicitBody = (await explicitResponse.json()) as { transcript: unknown[] };
+      const explicitBody = (await explicitResponse.json()) as { transcript: unknown };
       expect(explicitResponse.status).toBe(200);
-      expect(explicitBody.transcript).toHaveLength(3);
-      expect(explicitBody.transcript[0]).toMatchObject({
+      const explicitTranscript =
+        typeof explicitBody.transcript === "object" && explicitBody.transcript !== null && "messages" in explicitBody.transcript
+          ? ((explicitBody.transcript as { messages?: unknown[] }).messages ?? [])
+          : (explicitBody.transcript as unknown[]);
+      expect(Array.isArray(explicitTranscript)).toBe(true);
+      const explicitMessages = explicitTranscript as unknown[];
+      expect(explicitMessages).toHaveLength(3);
+      expect(explicitMessages[0]).toMatchObject({
         kind: "system",
         model: "gpt-5-test",
         workspace: "TEST-1",
         session: "session-1",
         note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
       });
-      expect(explicitBody.transcript[1]).toMatchObject({
+      expect(explicitMessages[1]).toMatchObject({
         kind: "user",
         from: "orchestrator",
         issue: "TEST-1",
         text: "work",
       });
-      expect(explicitBody.transcript[2]).toMatchObject({
+      expect(explicitMessages[2]).toMatchObject({
         kind: "tool_call",
         ts: "2026-01-01T00:03:00.000Z",
         call_id: "call-route-1",
@@ -597,15 +603,15 @@ describe("GET /api/v1/web/issues/:issueId", () => {
         output: expect.stringContaining("[redacted]"),
         error: expect.stringContaining("[redacted]"),
       });
-      expect(explicitBody.transcript[2]).not.toHaveProperty("payload");
-      expect(explicitBody.transcript[2]).not.toHaveProperty("runId");
+      expect(explicitMessages[2]).not.toHaveProperty("payload");
+      expect(explicitMessages[2]).not.toHaveProperty("runId");
       expect(readTailSpy).toHaveBeenCalledWith("run-1", { limit: 500 });
 
       const transcriptResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/sessions/session-1/transcript`);
-      const sessionTranscript = await transcriptResponse.json();
       expect(transcriptResponse.status).toBe(200);
-      expect(explicitBody.transcript).toEqual(sessionTranscript);
-      const serializedTranscript = JSON.stringify(explicitBody.transcript);
+      const sessionTranscriptPayload = ((await transcriptResponse.json()) as { messages?: unknown[] }).messages;
+      expect(explicitMessages).toEqual(sessionTranscriptPayload);
+      const serializedTranscript = JSON.stringify(explicitMessages);
       expect(serializedTranscript).toContain("[redacted]");
       expect(serializedTranscript).not.toContain("SECRET_");
       expect(serializedTranscript).not.toContain("message-token");
