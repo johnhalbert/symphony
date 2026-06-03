@@ -4098,6 +4098,9 @@ describe("Orchestrator", () => {
     expect(prompt).toContain("These supplemental comments do not satisfy pass approval");
     expect(prompt).not.toContain('event "REQUEST_CHANGES", "COMMENT", or "APPROVE"');
     expect(prompt).toContain("PR number, repository, token, or commit identity");
+    expect(prompt).toContain("Symphony service-owned review feedback workflow");
+    expect(prompt).toContain("Do not run gh pr review");
+    expect(prompt).toContain("direct GitHub API/curl writes");
     expect(prompt).toContain("Before any fail verdict, perform a bounded sibling-risk sweep");
     expect(prompt).toContain("Include every known blocking gap");
     expect(prompt).toContain("required behavior, concrete evidence, expected validation");
