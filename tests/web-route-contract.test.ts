@@ -1058,6 +1058,213 @@ describe("/api/v1/web route contracts", () => {
     }
   });
 
+  it("does not serve expired durable projection payloads while preserving record metadata headers", async () => {
+    const expiresAt = "2000-01-01T00:00:00.000Z";
+    const sourceRevisions = [{ source: "runs", revision: "expired-run-revision", observedAt: null }];
+    const sourceCursors = { durableEdge: "expired", eventCount: 3 };
+    const expiredIssue = issueModelFixture();
+    const expiredDashboard = {
+      projectName: "Expired durable dashboard",
+      repoLabel: "expired/repo",
+      branch: "expired-branch",
+      workflowLabel: "expired workflow",
+      pollLabel: "expired poll",
+      agentUsageLabel: "expired agents",
+      concurrencyCap: 99,
+      providerGates: [],
+      runningAgents: [],
+      activity: [],
+      chat: [],
+      totals: { ...emptyTotals(), progress: 99, open: 99, all: 99 },
+    };
+    const expiredIssueBoard = {
+      issues: [expiredIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [expiredIssue], review: [] },
+      cycleLabel: "Expired cycle",
+      cycleDateRange: "Expired dates",
+      selectedIssueId: expiredIssue.id,
+    };
+    const expiredHistory = {
+      sessions: [
+        {
+          id: "expired-session",
+          title: "Expired session",
+          subtitle: "must not be served",
+          updatedAt: "2026-05-31T00:00:00.000Z",
+          msgCount: 3,
+          lastEvent: "expired",
+          toolCount: 0,
+        },
+      ],
+      transcriptBySession: {},
+      timeline: [],
+      defaultSessionId: "expired-session",
+    };
+    const expiredChat = [{ id: "expired-chat", who: "agent", text: "expired chat must not leak", createdAt: "2026-05-31T00:00:00.000Z" }];
+    const expiredTranscript = [{ kind: "assistant" as const, ts: "2026-05-31T00:00:00.000Z", text: "expired transcript must not leak" }];
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+        expiredDashboard,
+        { expiresAt, revision: 9, sourceRevisions, sourceCursors },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        expiredIssueBoard,
+        { expiresAt, revision: 10, sourceRevisions, sourceCursors },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:7:timeline:9" },
+        expiredHistory,
+        { expiresAt, revision: 11, sourceRevisions, sourceCursors },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+        expiredChat,
+        { expiresAt, revision: 12, sourceRevisions, sourceCursors },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:2:limit:3" },
+        expiredTranscript,
+        { expiresAt, revision: 13, sourceRevisions, sourceCursors },
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, { projectionReader, projectionWriter });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+
+    try {
+      const dashboard = await getJson(`${baseUrl}/api/v1/web/dashboard`);
+      expect(dashboard.body).toMatchObject({ projectName: "Symphony", agentUsageLabel: "0 agents" });
+      expect(dashboard.body).not.toEqual(expiredDashboard);
+      expect(dashboard.response.headers.get("x-symphony-projection-status")).toBe("expired");
+      expect(dashboard.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(dashboard.response.headers.get("x-symphony-projection-revision")).toBe("9");
+      expect(dashboard.response.headers.get("x-symphony-projection-expires-at")).toBe(expiresAt);
+      expect(dashboard.response.headers.get("x-symphony-projection-content-sha256")).toBe("0".repeat(64));
+      expect(dashboard.response.headers.get("x-symphony-projection-payload-sha256")).toBe("1".repeat(64));
+      expect(headerJson(dashboard.response, "x-symphony-projection-source-revisions")).toEqual(sourceRevisions);
+      expect(headerJson(dashboard.response, "x-symphony-projection-source-cursors")).toEqual(sourceCursors);
+
+      const referenceData = await getJson(`${baseUrl}/api/v1/web/reference-data`);
+      expect(referenceData.body).toEqual({ labels: {}, users: { unassigned: { name: "Unassigned", color: expect.any(String) } } });
+      expect(referenceData.response.headers.get("x-symphony-projection-status")).toBe("expired");
+      expect(referenceData.response.headers.get("x-symphony-projection-revision")).toBe("10");
+      expect(referenceData.body).not.toMatchObject({ labels: { durable: expect.anything() } });
+
+      const history = await getJson(`${baseUrl}/api/v1/web/history?sessionLimit=7&timelineLimit=9`);
+      expect(history.body).toEqual({ sessions: [], transcriptBySession: {}, timeline: [], defaultSessionId: "" });
+      expect(history.body).not.toEqual(expiredHistory);
+      expect(history.response.headers.get("x-symphony-projection-status")).toBe("expired");
+      expect(history.response.headers.get("x-symphony-projection-scope-key")).toBe("global:session:7:timeline:9");
+      expect(history.response.headers.get("x-symphony-projection-revision")).toBe("11");
+
+      const chat = await getJson(`${baseUrl}/api/v1/web/orchestrator-chat?conversationId=operator-room`);
+      expect(chat.body).toEqual([]);
+      expect(chat.body).not.toEqual(expiredChat);
+      expect(chat.response.headers.get("x-symphony-projection-status")).toBe("expired");
+      expect(chat.response.headers.get("x-symphony-projection-scope-key")).toBe("operator-room");
+      expect(chat.response.headers.get("x-symphony-projection-revision")).toBe("12");
+
+      const transcript = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?offset=2&limit=3`);
+      expect(transcript.body).toEqual([]);
+      expect(transcript.body).not.toEqual(expiredTranscript);
+      expect(transcript.response.headers.get("x-symphony-projection-status")).toBe("expired");
+      expect(transcript.response.headers.get("x-symphony-projection-scope-key")).toBe("run-1:offset:2:limit:3");
+      expect(transcript.response.headers.get("x-symphony-projection-revision")).toBe("13");
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionWriter.writes.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:7:timeline:9" },
+      { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+    ]);
+    expect(projectionWriter.writeFor("history_projection").payload).toEqual({
+      sessions: [],
+      transcriptBySession: {},
+      timeline: [],
+      defaultSessionId: "",
+    });
+    expect(projectionWriter.writeFor("orchestrator_chat_projection").payload).toEqual([]);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:7:timeline:9" },
+      { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:2:limit:3" },
+    ]);
+  });
+
+  it("keeps orchestrator chat durable reads scoped to conversation-source revisions", async () => {
+    const chat = [{ id: "chat-1", who: "agent", text: "chat source is current", createdAt: "2026-05-31T00:00:00.000Z" }];
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+        chat,
+        {
+          sourceRevisions: [
+            { source: "runs", revision: "old-unrelated-run-revision", observedAt: null },
+            { source: "lifecycleStore", revision: "old-unrelated-lifecycle-revision", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+    ]);
+    const { server } = createStatusServer(root, {
+      projectionReader,
+      webProjectionRevisionProviders: [
+        { source: "runs", getRevision: () => ({ source: "runs", revision: "new-unrelated-run-revision", observedAt: null }) },
+        { source: "lifecycleStore", getRevision: () => ({ source: "lifecycleStore", revision: "new-unrelated-lifecycle-revision", observedAt: null }) },
+        {
+          source: "orchestrator_conversations",
+          getRevision: () => ({ source: "orchestrator_conversations", revision: "chat-current", observedAt: null }),
+        },
+      ],
+    });
+    const address = await server.start();
+    try {
+      const response = await getJson(`${baseUrlFor(address)}/api/v1/web/orchestrator-chat?conversationId=operator-room`);
+      expect(response.body).toEqual(chat);
+      expect(response.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(response.response.headers.get("x-symphony-projection-cache")).toBe("hit");
+      expect(response.response.headers.get("x-symphony-projection-scope-key")).toBe("operator-room");
+    } finally {
+      await server.stop();
+    }
+
+    const staleChat = [{ id: "chat-stale", who: "agent", text: "stale chat must not leak", createdAt: "2026-05-31T00:00:00.000Z" }];
+    const staleReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+        staleChat,
+        { sourceRevisions: [{ source: "orchestrator_conversations", revision: "chat-old", observedAt: null }] },
+      ),
+    ]);
+    const staleServer = createStatusServer(root, {
+      projectionReader: staleReader,
+      webProjectionRevisionProviders: [
+        {
+          source: "orchestrator_conversations",
+          getRevision: () => ({ source: "orchestrator_conversations", revision: "chat-new", observedAt: null }),
+        },
+      ],
+    }).server;
+    const staleAddress = await staleServer.start();
+    try {
+      const stale = await getJson(`${baseUrlFor(staleAddress)}/api/v1/web/orchestrator-chat?conversationId=operator-room`);
+      expect(stale.body).toEqual([]);
+      expect(stale.body).not.toEqual(staleChat);
+      expect(stale.response.headers.get("x-symphony-projection-status")).toBe("stale");
+      expect(stale.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(stale.response.headers.get("x-symphony-projection-revision")).toBe("1");
+    } finally {
+      await staleServer.stop();
+    }
+  });
+
   it("annotates durable projection fallback states for unavailable readers, missing records, refresh bypass, read errors, and missing detail items", async () => {
     const unavailableServer = createStatusServer(root).server;
     const unavailableAddress = await unavailableServer.start();
