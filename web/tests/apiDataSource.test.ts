@@ -1119,6 +1119,65 @@ describe("API data source", () => {
     });
   });
 
+  it("extracts chat messages from a projection-shaped orchestrator POST response", async () => {
+    const responseProjection = {
+      schemaVersion: 1,
+      conversation: {
+        id: "orchestrator-default",
+        status: "completed",
+        createdAt: "2026-06-03T00:00:00.000Z",
+        updatedAt: "2026-06-03T00:00:01.000Z",
+        messageCount: 2,
+        metadata: { runId: "run-115" },
+      },
+      state: "completed",
+      status: {
+        state: "completed",
+        conversationStatus: "completed",
+        latestMessageStatus: "completed",
+        active: false,
+        terminal: true,
+        empty: false,
+        messageCount: 2,
+        statusCounts: {
+          pending: 0,
+          streaming: 0,
+          completed: 2,
+          failed: 0,
+          disabled: 0,
+          unavailable: 0,
+        },
+      },
+      chat: [
+        { who: "agent", text: "Status acknowledged" },
+        { who: "user", text: "pause ENG-115" },
+      ],
+      source: {
+        source: "orchestrator_conversations",
+        revision: "chat-1",
+        observedAt: "2026-06-03T00:00:01.000Z",
+        conversationId: "orchestrator-default",
+        latestMessageSequence: 2,
+        latestMessageUpdatedAt: "2026-06-03T00:00:01.000Z",
+      },
+    };
+
+    const responseChat = responseProjection.chat;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(responseProjection));
+
+    await expect(createApiDataSource("").sendOrchestratorMessage("pause ENG-115")).resolves.toEqual(responseChat);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/orchestrator-chat", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ input: "pause ENG-115" }),
+    });
+  });
+
   it("surfaces non-2xx API responses as errors", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: "nope" }, { status: 502 }));
 
