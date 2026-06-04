@@ -7,7 +7,8 @@ import type {
   OrchestratorChatModel,
   ReferenceData,
   SidebarModel,
-  TranscriptMessage,
+  TranscriptRequestOptions,
+  TranscriptWindowResponse,
 } from "../types/symphony";
 import type { RealtimeEventListener, RealtimeEventUnsubscribe, RealtimeSubscriptionOptions } from "./realtimeEvents";
 
@@ -34,13 +35,19 @@ export interface ProjectionChangeEvent {
   revision?: number;
   observedAt?: string;
 }
-
 export type ProjectionChangeListener = (event: ProjectionChangeEvent) => void;
 export type ProjectionChangeUnsubscribe = () => void;
 
 export interface CacheInvalidationOptions {
   /** API hrefs affected by a realtime update. Listed paths are invalidated selectively; refresh=1 hints are replayed on the next GET. */
   forceRefreshHrefs?: readonly string[];
+}
+
+export interface TriggerPollResult {
+  queued: boolean;
+  coalesced?: boolean;
+  requested_at?: string;
+  operations?: readonly string[];
 }
 
 export interface SymphonyDataSource {
@@ -50,10 +57,11 @@ export interface SymphonyDataSource {
   getIssueDetail(issueId: string, signal?: AbortSignal): Promise<IssueDetailModel | null>;
   getHistory(signal?: AbortSignal): Promise<HistoryModel>;
   getSessions(signal?: AbortSignal): Promise<HistoryModel["sessions"]>;
-  getTranscript(sessionId: string, signal?: AbortSignal): Promise<TranscriptMessage[]>;
+  getTranscript(sessionId: string, signal?: AbortSignal, options?: TranscriptRequestOptions): Promise<TranscriptWindowResponse>;
   getSidebar(signal?: AbortSignal): Promise<SidebarModel>;
   getOrchestratorChat(signal?: AbortSignal): Promise<OrchestratorChatModel>;
   sendOrchestratorMessage(input: string): Promise<ChatMessage[]>;
+  triggerPoll?(): Promise<TriggerPollResult>;
   invalidateCachedReads?(options?: CacheInvalidationOptions): void;
   subscribeToProjectionChanges?(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe;
   subscribeToRealtimeEvents?(listener: RealtimeEventListener, options?: RealtimeSubscriptionOptions): RealtimeEventUnsubscribe;

@@ -1,7 +1,23 @@
-import { redactTranscriptText, sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
-import type { RunRecord, TranscriptEvent } from "../core/persistence/RunTranscriptStore.js";
+import { redactTranscriptText, sanitizeCommandPolicyPayloadForPublicOutput, sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
+import type { RunRecord, TranscriptEvent, TranscriptPage } from "../core/persistence/RunTranscriptStore.js";
 
 const USER_PROMPT_MAX_LENGTH = 5_000;
+export const WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION = 1;
+
+export interface CommandPolicyStatusDetails {
+  outcome?: string;
+  reasonKind?: string;
+  role?: string;
+  phase?: string;
+  surface?: string;
+  commandClass?: string;
+  upstreamContactAttempted?: boolean;
+  requiresCodeChange?: boolean;
+  requiresUserOrServiceFix?: boolean;
+  requestKind?: string;
+  hookAction?: string;
+  permissionOutcome?: string;
+}
 
 export type TranscriptMessage =
   | {
@@ -29,13 +45,77 @@ export type TranscriptMessage =
       error?: string | null;
       truncated?: boolean;
     }
-  | { kind: "status"; state: string; ts: string; text: string }
+  | { kind: "status"; state: string; ts: string; text: string; policy?: CommandPolicyStatusDetails }
   | { kind: "task"; ts: string; title: string; desc: string }
   | { kind: "request"; ts: string; reason: string; q: string; actions: string[] };
+
+export interface WebTranscriptWindowPageModel {
+  offset: number;
+  limit: number;
+  size: number;
+  total: number | null;
+  nextOffset: number | null;
+  previousOffset: number | null;
+  hasNext: boolean;
+  hasPrevious: boolean;
+  firstSequence: number | null;
+  lastSequence: number | null;
+  lastEventAt: string | null;
+}
+
+export interface WebTranscriptWindowModel extends WebTranscriptWindowPageModel {
+  kind: "page" | "tail";
+  tailLimit: number;
+  messageCount: number;
+  requested: {
+    offset: number | null;
+    limit: number;
+  };
+}
+
+export interface WebTranscriptActiveTailModel {
+  enabled: boolean;
+  canAppend: boolean;
+  runStatus: RunRecord["status"] | null;
+  tailLimit: number;
+  afterSequence: number | null;
+  lastEventAt: string | null;
+  refetchHref: string | null;
+  gapFallback: {
+    strategy: "refetch";
+    reason: "tail-gap";
+    href: string | null;
+  };
+}
+
+export interface WebTranscriptProjectionPayload {
+  schemaVersion: typeof WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION;
+  messages: TranscriptMessage[];
+  page: WebTranscriptWindowPageModel;
+  window: WebTranscriptWindowModel;
+  activeTail: WebTranscriptActiveTailModel;
+  recovery: {
+    strategy: "refetch";
+    reason: "tail-gap";
+    href: string | null;
+  };
+  compatibility: {
+    responseShape: "transcript_window";
+    messagesField: "messages";
+  };
+}
 
 export interface WebTranscriptProjectionOptions {
   run?: RunRecord | null;
   includeRunPrelude?: boolean;
+}
+
+export interface WebTranscriptWindowProjectionOptions {
+  run?: RunRecord | null;
+  kind?: "page" | "tail";
+  requestedPage?: { offset: number; limit: number } | null;
+  tailLimit: number;
+  refetchHref?: string | null;
 }
 
 export function projectWebTranscript(
@@ -45,6 +125,128 @@ export function projectWebTranscript(
   const messages = projectTranscriptEvents(events);
   if (!options.run || options.includeRunPrelude === false) return messages;
   return [...projectRunPreludeMessages(options.run, messages), ...messages];
+}
+
+export function projectWebTranscriptWindow(
+  page: TranscriptPage,
+  messages: readonly TranscriptMessage[],
+  options: WebTranscriptWindowProjectionOptions,
+): WebTranscriptProjectionPayload {
+  const pageModel = webTranscriptWindowPageModel(page);
+  const windowKind = options.kind ?? page.windowKind ?? (options.requestedPage ? "page" : "tail");
+  const refetchHref = options.refetchHref ?? webTranscriptRefetchHref(options.run ?? null);
+  const window: WebTranscriptWindowModel = {
+    ...pageModel,
+    kind: windowKind,
+    tailLimit: options.tailLimit,
+    messageCount: messages.length,
+    requested: {
+      offset: options.requestedPage?.offset ?? null,
+      limit: options.requestedPage?.limit ?? page.limit,
+    },
+  };
+  const active = windowKind === "tail" && options.run?.status === "running";
+  const recovery = { strategy: "refetch" as const, reason: "tail-gap" as const, href: refetchHref };
+  return {
+    schemaVersion: WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION,
+    messages: [...messages],
+    page: pageModel,
+    window,
+    activeTail: {
+      enabled: active,
+      canAppend: active,
+      runStatus: options.run?.status ?? null,
+      tailLimit: options.tailLimit,
+      afterSequence: pageModel.lastSequence,
+      lastEventAt: pageModel.lastEventAt,
+      refetchHref,
+      gapFallback: recovery,
+    },
+    recovery,
+    compatibility: {
+      responseShape: "transcript_window",
+      messagesField: "messages",
+    },
+  };
+}
+
+export function emptyWebTranscriptProjectionPayload(input: {
+  runId: string;
+  limit: number;
+  kind?: "page" | "tail";
+  refetchHref?: string | null;
+}): WebTranscriptProjectionPayload {
+  return projectWebTranscriptWindow(
+    {
+      runId: input.runId,
+      offset: 0,
+      limit: input.limit,
+      nextOffset: null,
+      events: [],
+      total: 0,
+      eventCount: 0,
+      previousOffset: null,
+      hasPrevious: false,
+      hasNext: false,
+      windowKind: input.kind ?? "tail",
+      firstSequence: null,
+      lastSequence: null,
+      lastEventAt: null,
+    },
+    [],
+    { tailLimit: input.limit, kind: input.kind ?? "tail", refetchHref: input.refetchHref ?? null },
+  );
+}
+
+export function isWebTranscriptProjectionPayload(value: unknown): value is WebTranscriptProjectionPayload {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.schemaVersion === WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION &&
+    Array.isArray(record.messages) &&
+    isObjectRecord(record.page) &&
+    isObjectRecord(record.window) &&
+    isObjectRecord(record.activeTail) &&
+    isObjectRecord(record.recovery) &&
+    isObjectRecord(record.compatibility)
+  );
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function webTranscriptWindowPageModel(page: TranscriptPage): WebTranscriptWindowPageModel {
+  const firstEvent = page.events[0] ?? null;
+  const lastEvent = page.events.at(-1) ?? null;
+  const size = finiteNumberOrNull(page.eventCount) ?? page.events.length;
+  const total = finiteNumberOrNull(page.total);
+  const previousOffset = page.previousOffset !== undefined ? page.previousOffset : page.offset > 0 ? Math.max(0, page.offset - page.limit) : null;
+  const hasNext = page.hasNext ?? page.nextOffset !== null;
+  const hasPrevious = page.hasPrevious ?? previousOffset !== null;
+  return {
+    offset: page.offset,
+    limit: page.limit,
+    size,
+    total,
+    nextOffset: page.nextOffset,
+    previousOffset,
+    hasNext,
+    hasPrevious,
+    firstSequence: page.firstSequence ?? firstEvent?.sequence ?? null,
+    lastSequence: page.lastSequence ?? lastEvent?.sequence ?? null,
+    lastEventAt: page.lastEventAt ?? lastEvent?.at ?? null,
+  };
+}
+
+function webTranscriptRefetchHref(run: RunRecord | null): string | null {
+  if (!run) return null;
+  const transcriptId = run.sessionId?.trim() || run.runId;
+  return `/api/v1/web/sessions/${encodeURIComponent(transcriptId)}/transcript?refresh=1`;
+}
+
+function finiteNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function projectTranscriptEvents(events: readonly TranscriptEvent[]): TranscriptMessage[] {
@@ -119,6 +321,7 @@ function projectWebTranscriptEvent(event: TranscriptEvent): TranscriptMessage | 
   const payloadKind = normalizedPayloadKind(payload);
   const activitySource = normalizedActivitySource(payload);
   if (isToolEvent(eventType, payloadKind, payload)) return projectToolCallMessage(event, payload, eventType);
+  if (isCommandPolicyDecisionEvent(eventType, payloadKind, payload)) return projectCommandPolicyStatusMessage(event, payload);
   if (isDiagnosticEvent(eventType, payloadKind)) return projectDiagnosticStatusMessage(event, payload, eventType);
   if (isTokenUsageEvent(eventType, payloadKind) && isDisplayableTokenStatusEvent(event, payload)) {
     return projectTokenUsageStatusMessage(event, payload, eventType);
@@ -257,6 +460,57 @@ function projectStatusMessage(
     ts: event.at,
     text: eventText(event, payload),
   };
+}
+
+function projectCommandPolicyStatusMessage(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+): Extract<TranscriptMessage, { kind: "status" }> {
+  const policy = commandPolicyStatusDetails(payload);
+  return {
+    kind: "status",
+    state: "command_policy_decision",
+    ts: event.at,
+    text: commandPolicyStatusFallbackText(policy),
+    policy,
+  };
+}
+
+function commandPolicyStatusDetails(payload: Record<string, unknown>): CommandPolicyStatusDetails {
+  const details: CommandPolicyStatusDetails = {};
+  const outcome = firstCleanString(payload.outcome);
+  const reasonKind = firstCleanString(payload.reasonKind, payload.reason_kind);
+  const role = firstCleanString(payload.role);
+  const phase = firstCleanString(payload.phase);
+  const surface = firstCleanString(payload.surface);
+  const commandClass = firstCleanString(payload.commandClass, payload.command_class);
+  const requestKind = firstCleanString(payload.requestKind, payload.request_kind);
+  const hookAction = firstCleanString(payload.hookAction, payload.hook_action);
+  const permissionOutcome = firstCleanString(payload.permissionOutcome, payload.permission_outcome);
+  const upstreamContactAttempted = booleanFromUnknown(payload.upstreamContactAttempted ?? payload.upstream_contact_attempted);
+  const requiresCodeChange = booleanFromUnknown(payload.requiresCodeChange ?? payload.requires_code_change);
+  const requiresUserOrServiceFix = booleanFromUnknown(payload.requiresUserOrServiceFix ?? payload.requires_user_or_service_fix);
+
+  if (outcome) details.outcome = outcome;
+  if (reasonKind) details.reasonKind = reasonKind;
+  if (role) details.role = role;
+  if (phase) details.phase = phase;
+  if (surface) details.surface = surface;
+  if (commandClass) details.commandClass = commandClass;
+  if (upstreamContactAttempted !== null) details.upstreamContactAttempted = upstreamContactAttempted;
+  if (requiresCodeChange !== null) details.requiresCodeChange = requiresCodeChange;
+  if (requiresUserOrServiceFix !== null) details.requiresUserOrServiceFix = requiresUserOrServiceFix;
+  if (requestKind) details.requestKind = requestKind;
+  if (hookAction) details.hookAction = hookAction;
+  if (permissionOutcome) details.permissionOutcome = permissionOutcome;
+  return details;
+}
+
+function commandPolicyStatusFallbackText(policy: CommandPolicyStatusDetails): string {
+  const outcome = policy.outcome ?? "decision";
+  const reason = policy.reasonKind ? `: ${policy.reasonKind}` : "";
+  const scope = compactStrings([policy.role, policy.phase, policy.surface]).join(" · ");
+  return `Command policy ${outcome}${reason}${scope ? ` (${scope})` : ""}`;
 }
 
 function projectDiagnosticStatusMessage(
@@ -475,6 +729,23 @@ function isDisplayableTokenStatusEvent(event: TranscriptEvent, payload: Record<s
 
 function isDiagnosticEvent(eventType: string, payloadKind: string | null): boolean {
   return eventType === "run_diagnostic" || payloadKindIncludes(payloadKind, "run_diagnostic") || payloadKind === "diagnostic";
+}
+
+function isCommandPolicyDecisionEvent(
+  eventType: string,
+  payloadKind: string | null,
+  payload: Record<string, unknown>,
+): boolean {
+  const reasonKind = payload.reasonKind ?? payload.reason_kind;
+  return (
+    eventType === "command_policy_decision" ||
+    payloadKind === "command_policy_decision" ||
+    (typeof payload.outcome === "string" &&
+      typeof reasonKind === "string" &&
+      typeof payload.role === "string" &&
+      typeof payload.phase === "string" &&
+      typeof payload.surface === "string")
+  );
 }
 
 function isTokenUsageEvent(eventType: string, payloadKind: string | null): boolean {
@@ -701,7 +972,12 @@ function normalizedOptionalToken(value: unknown): string | null {
 }
 
 function sanitizedPayloadRecord(event: TranscriptEvent): Record<string, unknown> {
-  const payload = sanitizePublicJson(event.payload);
+  const eventType = normalizeToken(event.eventType);
+  const rawPayload = rawPayloadRecord(event);
+  const rawPayloadKind = normalizedPayloadKind(rawPayload);
+  const payload = isCommandPolicyDecisionEvent(eventType, rawPayloadKind, rawPayload)
+    ? sanitizeCommandPolicyPayloadForPublicOutput(event.payload)
+    : sanitizePublicJson(event.payload);
   return isRecord(payload) ? payload : {};
 }
 
@@ -782,6 +1058,10 @@ function payloadKindIncludes(payloadKind: string | null, token: string): boolean
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function booleanFromUnknown(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
 }
 
 function firstDeltaText(...values: unknown[]): string | null {

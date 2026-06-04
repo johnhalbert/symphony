@@ -82,8 +82,8 @@ function createLazyMockDataSource(loadMockDataSource: DataSourceFactoryOptions["
     async getSessions(signal) {
       return (await dataSource()).getSessions(signal);
     },
-    async getTranscript(sessionId, signal) {
-      return (await dataSource()).getTranscript(sessionId, signal);
+    async getTranscript(sessionId, signal, options) {
+      return (await dataSource()).getTranscript(sessionId, signal, options);
     },
     async getSidebar(signal) {
       return (await dataSource()).getSidebar(signal);
@@ -93,6 +93,11 @@ function createLazyMockDataSource(loadMockDataSource: DataSourceFactoryOptions["
     },
     async sendOrchestratorMessage(input) {
       return (await dataSource()).sendOrchestratorMessage(input);
+    },
+    async triggerPoll() {
+      const loaded = await dataSource();
+      if (!loaded.triggerPoll) throw new Error("Trigger poll is unavailable for this data source.");
+      return loaded.triggerPoll();
     },
   };
 }

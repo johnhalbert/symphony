@@ -159,6 +159,76 @@ const session = {
 
 const transcript = [{ kind: "assistant", ts: session.updatedAt, text: "Dedicated session transcript from API endpoint" }];
 const staleTranscript = [{ kind: "assistant", ts: staleSession.updatedAt, text: "STALE embedded history transcript should not render" }];
+const transcriptWindow = createTranscriptWindowResponse(transcript, {
+  runStatus: "running",
+  lastSequence: 1,
+  lastEventAt: session.updatedAt,
+  refetchHref: "/api/v1/web/sessions/smoke-session/transcript?refresh=1",
+});
+const staleTranscriptWindow = createTranscriptWindowResponse(staleTranscript, {
+  runStatus: "succeeded",
+  lastSequence: 1,
+  lastEventAt: staleSession.updatedAt,
+  refetchHref: "/api/v1/web/sessions/stale-session/transcript?refresh=1",
+});
+
+function createTranscriptWindowResponse(messages, input = {}) {
+  const limit = Number.isFinite(input.limit) ? input.limit : 500;
+  const offset = Number.isFinite(input.offset) ? input.offset : 0;
+  const total = Number.isFinite(input.total) ? input.total : messages.length;
+  const previousOffset = input.previousOffset !== undefined && input.previousOffset !== null
+    ? input.previousOffset
+    : offset > 0
+      ? Math.max(0, offset - limit)
+      : null;
+  const nextOffset = input.nextOffset ?? null;
+  const kind = input.kind === "page" ? "page" : "tail";
+  const lastSequence = Number.isFinite(input.lastSequence) ? input.lastSequence : null;
+  const firstSequence = Number.isFinite(input.firstSequence) ? input.firstSequence : lastSequence;
+  const lastEventAt = typeof input.lastEventAt === "string" && input.lastEventAt.trim().length > 0
+    ? input.lastEventAt
+    : messages.at(-1)?.ts ?? null;
+  const refetchHref = typeof input.refetchHref === "string" && input.refetchHref.trim().length > 0 ? input.refetchHref : null;
+  const runStatus = typeof input.runStatus === "string" && input.runStatus.trim().length > 0 ? input.runStatus : null;
+  const activeTailEnabled = kind === "tail" && runStatus === "running";
+  const page = {
+    offset,
+    limit,
+    size: messages.length,
+    total,
+    nextOffset,
+    previousOffset,
+    hasNext: input.hasNext ?? nextOffset !== null,
+    hasPrevious: input.hasPrevious ?? previousOffset !== null,
+    firstSequence,
+    lastSequence,
+    lastEventAt,
+  };
+  return {
+    schemaVersion: 1,
+    messages: [...messages],
+    page,
+    window: {
+      ...page,
+      kind,
+      tailLimit: limit,
+      messageCount: messages.length,
+      requested: { offset: kind === "tail" ? null : offset, limit },
+    },
+    activeTail: {
+      enabled: activeTailEnabled,
+      canAppend: activeTailEnabled,
+      runStatus,
+      tailLimit: limit,
+      afterSequence: lastSequence,
+      lastEventAt,
+      refetchHref,
+      gapFallback: { strategy: "refetch", reason: "tail-gap", href: refetchHref },
+    },
+    recovery: { strategy: "refetch", reason: "tail-gap", href: refetchHref },
+    compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+  };
+}
 
 const referenceData = {
   users: {
@@ -371,6 +441,25 @@ async function runBrowserSmokeAssertions(page) {
     ],
     exclude: forbiddenMarkers,
   });
+  await assertButtonUnavailableByLabel(page, "Status totals", "dashboard Status totals button");
+  await assertButtonEnabledByLabel(page, "Trigger poll", "dashboard Trigger poll button");
+  await assertButtonUnavailableByLabel(page, "New issue", "dashboard New issue button");
+  await assertButtonUnavailableByLabel(page, "Search", "dashboard Search button");
+  await assertButtonUnavailableByLabel(page, "More", "dashboard More button");
+  const refreshPostCountBefore = countObservedEndpoint("POST /api/v1/refresh");
+  await clickButtonByText(page, "Trigger poll", "dashboard Trigger poll button");
+  await waitFor(
+    async () => (countObservedEndpoint("POST /api/v1/refresh") >= refreshPostCountBefore + 1 ? true : null),
+    5_000,
+    100,
+    "dashboard trigger poll POST request",
+    () => `refresh POST count=${countObservedEndpoint("POST /api/v1/refresh")}`,
+  );
+  await waitForBrowserText(page, "dashboard API-mode data after trigger poll", {
+    include: ["api source · api", "proxy/symphony", "Trigger poll"],
+    exclude: forbiddenMarkers,
+  });
+  await assertButtonEnabledByLabel(page, "Trigger poll", "dashboard Trigger poll button after refresh");
 
   await waitForBrowserText(page, "dashboard orchestrator chat functional API-mode controls", {
     include: [
@@ -468,8 +557,10 @@ async function runBrowserSmokeAssertions(page) {
     "GET /api/v1/web/sessions/smoke-session/transcript",
     "GET /api/v1/web/sidebar",
     "GET /api/v1/web/orchestrator-chat",
+    "POST /api/v1/refresh",
     "POST /api/v1/web/orchestrator-chat",
   ]);
+  assertObservedEndpointCountAtLeast("POST /api/v1/refresh", 1);
   assertObservedEndpointCountAtLeast("POST /api/v1/web/orchestrator-chat", 2);
 }
 
@@ -542,14 +633,22 @@ async function handleFakeApiRequest(request, response, url) {
   if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") return sendJson(response, 200, sidebar);
   if (request.method === "GET" && url.pathname === "/api/v1/web/history") return sendJson(response, 200, history);
   if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") return sendJson(response, 200, orchestratorChat);
+  if (request.method === "POST" && url.pathname === "/api/v1/refresh") {
+    return sendJson(response, 202, {
+      queued: true,
+      coalesced: false,
+      requested_at: "2026-06-03T13:30:00.000Z",
+      operations: ["poll", "reconcile"],
+    });
+  }
   if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-1") {
     return sendJson(response, 200, { issue: issueDetail, activity: issueDetail.activity, runs: [session], transcript });
   }
   if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-0") {
     return sendJson(response, 200, { issue: staleIssueDetail, activity: [], runs: [staleSession], transcript: staleTranscript });
   }
-  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/smoke-session/transcript") return sendJson(response, 200, transcript);
-  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/stale-session/transcript") return sendJson(response, 200, staleTranscript);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/smoke-session/transcript") return sendJson(response, 200, transcriptWindow);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/stale-session/transcript") return sendJson(response, 200, staleTranscriptWindow);
   if (request.method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
     const bodyText = await readRequestBody(request);
     const input = parseChatInput(bodyText) ?? "browser smoke input";
@@ -1066,6 +1165,55 @@ async function clickButtonByText(page, text, description) {
       return Array.from(document.querySelectorAll("button")).find((button) => normalize(button.innerText || button.textContent).includes(expected));
     })()`,
     description,
+  );
+}
+
+function buttonLabelExpression(label) {
+  return `(() => {
+    const expected = ${JSON.stringify(label)};
+    const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
+    return Array.from(document.querySelectorAll("button")).find((candidate) => {
+      const text = normalize(candidate.innerText || candidate.textContent);
+      return (
+        text.includes(expected) ||
+        String(candidate.getAttribute("aria-label") ?? "").includes(expected) ||
+        String(candidate.getAttribute("title") ?? "").includes(expected) ||
+        String(candidate.getAttribute("data-unavailable-action") ?? "").includes(expected)
+      );
+    }) ?? null;
+  })()`;
+}
+
+async function buttonStateByLabel(page, label) {
+  return page.evaluate(`(() => {
+    const button = ${buttonLabelExpression(label)};
+    if (!button) return { found: false };
+    const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
+    return {
+      found: true,
+      disabled: Boolean(button.disabled),
+      ariaDisabled: button.getAttribute("aria-disabled"),
+      unavailableAction: button.getAttribute("data-unavailable-action"),
+      text: normalize(button.innerText || button.textContent).slice(0, 160),
+    };
+  })()`);
+}
+
+async function assertButtonEnabledByLabel(page, label, description) {
+  const result = await buttonStateByLabel(page, label);
+  assert(result?.found, `Could not find ${description} in the browser`);
+  assert(
+    !result.disabled && result.ariaDisabled !== "true",
+    `Expected ${description} to be enabled for the API-mode send path, got ${JSON.stringify(result)}`,
+  );
+}
+
+async function assertButtonUnavailableByLabel(page, label, description) {
+  const result = await buttonStateByLabel(page, label);
+  assert(result?.found, `Could not find ${description} in the browser`);
+  assert(
+    result.disabled && result.ariaDisabled === "true" && result.unavailableAction === label,
+    `Expected ${description} to remain honestly unavailable, got ${JSON.stringify(result)}`,
   );
 }
 

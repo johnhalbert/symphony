@@ -4,10 +4,11 @@ import type {
   ProjectionChangeListener,
   ProjectionChangeUnsubscribe,
   SymphonyDataSource,
+  TriggerPollResult,
 } from "./dataSource";
 import { createRealtimeEventSourceClient } from "./eventSourceClient";
 import { normalizeOrchestratorChatModel } from "./orchestratorChat";
-import type { ChatMessage, ReferenceData } from "../types/symphony";
+import type { ChatMessage, ReferenceData, TranscriptRequestOptions, TranscriptWindowResponse } from "../types/symphony";
 
 interface ApiReferenceEntry {
   name?: string | null;
@@ -20,6 +21,7 @@ interface ApiReferenceData {
 }
 
 const GET_SUCCESS_CACHE_MS = 5_000;
+const TRIGGER_POLL_REFRESH_HREFS = ["/api/v1/web/dashboard?refresh=1", "/api/v1/web/sidebar?refresh=1", "/api/v1/web/issues?refresh=1", "/api/v1/web/history?refresh=1"] as const;
 
 interface CachedGetResponse {
   data: unknown;
@@ -239,6 +241,22 @@ function realtimeEventSourceUrl(baseUrl: string, lastEventId: string | null): st
   return `${endpoint}?lastEventId=${encodeURIComponent(normalizedLastEventId)}`;
 }
 
+function webTranscriptPath(sessionId: string, options: TranscriptRequestOptions | undefined): string {
+  const path = `/api/v1/web/sessions/${encodeURIComponent(sessionId)}/transcript`;
+  if (options?.tail === true) return path;
+  const params = new URLSearchParams();
+  const offset = options?.offset;
+  const limit = options?.limit;
+  if (isFiniteNumber(offset)) params.set("offset", String(Math.max(0, Math.trunc(offset))));
+  if (isFiniteNumber(limit)) params.set("limit", String(Math.max(1, Math.trunc(limit))));
+  const query = params.toString();
+  return query ? `${path}?${query}` : path;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 function normalizeReferenceRecord(record: Record<string, ApiReferenceEntry | null> | null | undefined) {
   return Object.fromEntries(
     Object.entries(record ?? {}).map(([key, entry]) => [
@@ -286,8 +304,8 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       const history = await this.getHistory(signal);
       return history.sessions;
     },
-    async getTranscript(sessionId, signal) {
-      return fetchJson(normalizedBaseUrl, `/api/v1/web/sessions/${encodeURIComponent(sessionId)}/transcript`, { signal, cacheable: false });
+    async getTranscript(sessionId, signal, options) {
+      return fetchJson<TranscriptWindowResponse>(normalizedBaseUrl, webTranscriptPath(sessionId, options), { signal, cacheable: false });
     },
     async getSidebar(signal) {
       return fetchJson(normalizedBaseUrl, "/api/v1/web/sidebar", { signal });
@@ -296,6 +314,16 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       return normalizeOrchestratorChatModel(
         await fetchJson<unknown>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat", { signal }),
       );
+    },
+    async triggerPoll() {
+      const response = await fetch(`${normalizedBaseUrl}/api/v1/refresh`, {
+        method: "POST",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) throw new Error(`Symphony API returned HTTP ${response.status}`);
+      const result = (await response.json()) as TriggerPollResult;
+      getJsonFetcher.invalidateCache({ forceRefreshHrefs: TRIGGER_POLL_REFRESH_HREFS });
+      return result;
     },
     async sendOrchestratorMessage(input) {
       const response = await fetch(`${normalizedBaseUrl}/api/v1/web/orchestrator-chat`, {

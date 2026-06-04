@@ -9,6 +9,7 @@ import {
 } from "./adapters";
 import type { SymphonyDataSource } from "./dataSource";
 import { orchestratorChatModelFromMessages } from "./orchestratorChat";
+import { createTranscriptWindowResponse } from "./transcriptWindow";
 import type { ChatMessage } from "../types/symphony";
 import type { RawData } from "./adapters";
 
@@ -61,7 +62,7 @@ export const mockDataSource: SymphonyDataSource = {
   },
   async getTranscript(sessionId) {
     const history = await this.getHistory();
-    return history.transcriptBySession[sessionId] ?? [];
+    return createTranscriptWindowResponse(history.transcriptBySession[sessionId] ?? []);
   },
   getSidebar() {
     return delay({ ...toSidebarModel(rawData), chat: chatMessages });
@@ -74,5 +75,13 @@ export const mockDataSource: SymphonyDataSource = {
     if (!trimmed) return delay(chatMessages);
     chatMessages = [...chatMessages, { who: "user", text: trimmed }, mockReply(trimmed)];
     return delay(chatMessages, 120);
+  },
+  triggerPoll() {
+    return delay({
+      queued: true,
+      coalesced: false,
+      requested_at: new Date().toISOString(),
+      operations: ["poll", "reconcile"],
+    });
   },
 };

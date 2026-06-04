@@ -267,6 +267,68 @@ export type TranscriptMessage =
   | { kind: "task"; ts: string; title: string; desc: string }
   | { kind: "request"; ts: string; reason: string; q: string; actions: string[] };
 
+export interface TranscriptWindowPageModel {
+  offset: number;
+  limit: number;
+  size: number;
+  total: number | null;
+  nextOffset: number | null;
+  previousOffset: number | null;
+  hasNext: boolean;
+  hasPrevious: boolean;
+  firstSequence: number | null;
+  lastSequence: number | null;
+  lastEventAt: string | null;
+}
+
+export interface TranscriptWindowModel extends TranscriptWindowPageModel {
+  kind: "page" | "tail";
+  tailLimit: number;
+  messageCount: number;
+  requested: {
+    offset: number | null;
+    limit: number;
+  };
+}
+
+export interface TranscriptActiveTailModel {
+  enabled: boolean;
+  canAppend: boolean;
+  runStatus: string | null;
+  tailLimit: number;
+  afterSequence: number | null;
+  lastEventAt: string | null;
+  refetchHref: string | null;
+  gapFallback: {
+    strategy: "refetch";
+    reason: "tail-gap";
+    href: string | null;
+  };
+}
+
+export interface TranscriptWindowResponse {
+  schemaVersion: number;
+  messages: TranscriptMessage[];
+  page: TranscriptWindowPageModel;
+  window: TranscriptWindowModel;
+  activeTail: TranscriptActiveTailModel;
+  recovery: {
+    strategy: "refetch";
+    reason: "tail-gap";
+    href: string | null;
+  };
+  compatibility?: {
+    responseShape?: string;
+    messagesField?: string;
+  };
+}
+
+export interface TranscriptRequestOptions {
+  offset?: number | null;
+  limit?: number | null;
+  tail?: boolean;
+}
+
 export interface TimelineEvent {
   t: string;
   sess: string;

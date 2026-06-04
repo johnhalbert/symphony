@@ -25,13 +25,13 @@ review_loop:
   max_incomplete_turns: 3
   continuation_history_threshold: 5
   reviewer_prompt_extensions:
-    - If an issue is missing `Contract Checklist` or `Validation Requirements`, derive conservative expected behavior from issue text, repository invariants, and the general matrix; fail missed behavior or validation without treating the missing issue contract itself as the implementation defect.
+    - Review the fenced JSON `Issue Contract` first. If it is missing, invalid, or lacks a non-empty `requirements` array with stable unique IDs, treat that as an issue-authoring defect and fail fast instead of deriving a substitute contract.
     - Check lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions when shared orchestration behavior is touched.
     - Check MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when the change crosses those systems.
     - Check approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when publication behavior is touched.
     - "Check dispatch invariants: no redispatch and no incomplete-turn burn while an intentional non-dispatch or human-required state is active."
   worker_prompt_extensions:
-    - If the issue lacks `Contract Checklist` or `Validation Requirements`, derive a conservative checklist from acceptance criteria, touched surfaces, repository invariants, and the general scenario matrix; mention the issue-authoring gap in the completion report without reducing validation scope.
+    - Use the fenced JSON `Issue Contract` as the authoritative requirements list. If it is missing, invalid, or lacks a non-empty `requirements` array with stable unique IDs, stop and report the issue-authoring gap instead of inventing a substitute contract.
     - For Symphony orchestration, workflow, tracker, harness, API, approval, publication, or writeback changes, validate lifecycle phase, blockedReason, review counters, incomplete-turn counters, run terminal status, transcript events, PR metadata, and tracker/writeback comments/transitions.
     - Validate MCP, HTTP/status API, orchestrator, writeback/outbox, tracker, harness, and persistence boundaries when touched.
     - Cover approval/publication variants including pending, approved, rejected, cancelled, stale, expired, already-terminal, replay, rejectPolicy cancel/fail, live worker wait, and after-worker-exit resume when applicable.
@@ -188,7 +188,7 @@ Transcript search remains disabled until the transcript recall implementation is
 5. Do not push directly to `main`, merge PRs, force-push protected branches, or remove dirty worktrees.
 6. Do not run `git commit`, `git push`, `gh pr create`, `gh pr edit`, or otherwise create/update the lifecycle-bound GitHub PR yourself during implementation or merge-gate repair runs. Leave the implementation changes in the assigned worktree and call `submit_completion_report` when ready; Symphony performs service-owned commit, push, and PR creation/reuse after the completion report is accepted.
 7. When `github.operator_approval.required_for_publication` is enabled, `submit_completion_report` creates an `approval_request` transcript event and Symphony waits for operator approval before the service-owned commit, push, and PR publication.
-8. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, and any PR/branch details. Do not rely on a natural-language chat exit as the completion signal. Symphony will publish or reuse the lifecycle-bound pull request and move accepted completion reports directly to `In Review` while PR handoff remains disabled.
+8. When implementation is ready, call `submit_completion_report` with the work summary, validation, remaining risk, any PR/branch details, and the structured requirements proof block when proof-gated completion is enabled. Do not rely on a natural-language chat exit as the completion signal. Symphony will publish or reuse the lifecycle-bound pull request and move accepted completion reports directly to `In Review` while PR handoff remains disabled.
 
 ## Prompt Extension Layers
 

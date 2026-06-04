@@ -74,7 +74,7 @@ import {
   type WritebackOperation,
 } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
-import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
+import { sanitizedPreviewValue, sanitizeCommandPolicyReplayStateForPublicOutput, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import {
   DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
   type OrchestratorConversationMessage,
@@ -97,7 +97,14 @@ import {
 } from "../core/orchestrator/OrchestratorChatCommand.js";
 
 import { projectWebHistory } from "./WebHistoryProjection.js";
-import { projectWebTranscript } from "./WebTranscriptProjection.js";
+import {
+  emptyWebTranscriptProjectionPayload,
+  isWebTranscriptProjectionPayload,
+  projectWebTranscript,
+  projectWebTranscriptWindow,
+  type TranscriptMessage as WebTranscriptMessage,
+  type WebTranscriptProjectionPayload,
+} from "./WebTranscriptProjection.js";
 import {
   buildWebProjectionSourceIndex,
   createWebProjectionCacheMetadata,
@@ -243,6 +250,12 @@ interface WebProjectionJsonResponse<TBody> {
   body: TBody;
   headers?: Record<string, string>;
 }
+
+type WebOrchestratorChatPostResult = {
+  status: number;
+  body: unknown;
+  stateChanged: boolean;
+};
 
 type DurableProjectionReadResult<TPayload> = WebProjectionReadResult<TPayload>;
 
@@ -701,16 +714,17 @@ export class StatusServer {
       const webTranscriptMatch = /^\/api\/v1\/web\/sessions\/([^/]+)\/transcript$/.exec(url.pathname);
       if (request.method === "GET" && webTranscriptMatch) {
         const sessionIdOrRunId = decodeURIComponent(webTranscriptMatch[1] ?? "").trim();
+        const requestedTranscriptPage = parseWebTranscriptPagination(url);
+        const requestedTranscriptLimit = requestedTranscriptPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
         if (sessionIdOrRunId.length === 0) {
-          sendJson(response, 200, []);
+          sendJson(response, 200, emptyWebTranscriptProjectionPayload({ runId: sessionIdOrRunId, limit: requestedTranscriptLimit }));
           return;
         }
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
         if (!this.options.runStore) {
-          const requestedPage = parseWebTranscriptPagination(url);
-          const durableTranscript = requestedPage
+          const durableTranscript = requestedTranscriptPage
             ? await this.webProjectionRepositories.transcript.readRunPage(
-                { runId: sessionIdOrRunId, offset: requestedPage.offset, limit: requestedPage.limit },
+                { runId: sessionIdOrRunId, offset: requestedTranscriptPage.offset, limit: requestedTranscriptPage.limit },
                 { forceRefresh },
               )
             : await this.webProjectionRepositories.transcript.readRunDefaultPage(
@@ -718,33 +732,65 @@ export class StatusServer {
                 { forceRefresh },
               );
           if (durableTranscript.status === "hit" && durableTranscript.record) {
-            sendJson(response, 200, durableTranscript.record.payload, durableProjectionReadHeaders(durableTranscript));
+            sendJson(
+              response,
+              200,
+              webTranscriptProjectionResponseBody(durableTranscript.record.payload, {
+                run: null,
+                runId: sessionIdOrRunId,
+                requestedPage: requestedTranscriptPage,
+                limit: requestedTranscriptLimit,
+                sourceCursors: durableTranscript.record.revision.sourceCursors,
+              }),
+              durableProjectionReadHeaders(durableTranscript),
+            );
             return;
           }
-          sendJson(response, 200, [], durableProjectionReadHeaders(durableTranscript));
+          sendJson(
+            response,
+            200,
+            emptyWebTranscriptProjectionPayload({ runId: sessionIdOrRunId, limit: requestedTranscriptLimit, kind: requestedTranscriptPage ? "page" : "tail" }),
+            durableProjectionReadHeaders(durableTranscript),
+          );
           return;
         }
         const run = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId);
         if (!run) {
-          sendJson(response, 200, []);
+          sendJson(response, 200, emptyWebTranscriptProjectionPayload({ runId: sessionIdOrRunId, limit: requestedTranscriptLimit, kind: requestedTranscriptPage ? "page" : "tail" }));
           return;
         }
-        const requestedTranscriptPage = parseWebTranscriptPagination(url);
-        let durableTranscript: DurableProjectionReadResult<ReturnType<typeof projectWebTranscript>> | undefined;
+        let durableTranscript: DurableProjectionReadResult<WebTranscriptProjectionPayload> | undefined;
         if (!shouldBypassDurableWebTranscriptForActiveTail(run, requestedTranscriptPage)) {
           durableTranscript = await this.webProjectionRepositories.transcript.readRunPage(
             transcriptProjectionPageSelectorForRequest(run, requestedTranscriptPage),
             { forceRefresh },
           );
           if (durableTranscript.status === "hit" && durableTranscript.record) {
-            sendJson(response, 200, durableTranscript.record.payload, durableProjectionReadHeaders(durableTranscript));
+            sendJson(
+              response,
+              200,
+              webTranscriptProjectionResponseBody(durableTranscript.record.payload, {
+                run,
+                runId: run.runId,
+                requestedPage: requestedTranscriptPage,
+                limit: requestedTranscriptLimit,
+                sourceCursors: durableTranscript.record.revision.sourceCursors,
+              }),
+              durableProjectionReadHeaders(durableTranscript),
+            );
             return;
           }
         }
         const transcriptPage = await readBoundedWebTranscriptPage(this.options.runStore, run.runId, url);
         const transcript = projectWebTranscript(transcriptPage.events, { run });
-        await this.persistWebTranscriptProjection(run, transcriptPage, transcript);
-        sendJson(response, 200, transcript, durableProjectionReadHeaders(durableTranscript));
+        const transcriptPayload = projectWebTranscriptWindow(transcriptPage, transcript, {
+          run,
+          requestedPage: requestedTranscriptPage,
+          tailLimit: transcriptPage.limit,
+          kind: requestedTranscriptPage ? "page" : "tail",
+        });
+        await this.persistWebTranscriptProjection(run, transcriptPage, transcriptPayload);
+        sendJson(response, 200, transcriptPayload, durableProjectionReadHeaders(durableTranscript));
         return;
       }
       if (url.pathname === "/api/v1/web/orchestrator-chat") {
@@ -824,23 +870,25 @@ export class StatusServer {
           });
           const chatProjection = webOrchestratorChatProjectionFromResponseBody(result.body, postConversationId);
           if (chatProjection) {
+            let currentChatProjection: Pick<WebOrchestratorChatProjectionResponse, "conversation" | "state" | "status" | "chat" | "source"> =
+              chatProjection;
             if (this.options.orchestratorConversationStore) {
-              await this.persistWebOrchestratorChatProjection(await this.fetchWebOrchestratorChatProjection(postConversationId));
+              const durableChatProjection = await this.fetchWebOrchestratorChatProjection(postConversationId);
+              await this.persistWebOrchestratorChatProjection(durableChatProjection);
+              currentChatProjection = durableChatProjection;
             }
-            if (chatProjection.chat.length > 0 && result.status !== 200) {
-              this.realtimeEvents.publishOrchestratorMessage({
-                inputLength: input.input.length,
-                messageCount: chatProjection.chat.length,
-                conversationId: postConversationId ?? DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
-                status: result.status,
-                lastMessageId: chatProjection.chat.at(-1)?.id ?? null,
-                lastMessageStatus: chatProjection.chat.at(-1)?.status ?? null,
-                lastMessageAt: chatProjection.chat.at(-1)?.updatedAt ?? chatProjection.chat.at(-1)?.createdAt ?? null,
-                messages: chatProjection.chat,
-                message: chatProjection.chat.at(-1) ?? null,
-              });
+            if (result.stateChanged && currentChatProjection.chat.length > 0 && result.status !== 200) {
+              const directPatchMessage = chatProjection.chat.at(-1) ?? currentChatProjection.chat.at(-1) ?? null;
+              this.realtimeEvents.publishOrchestratorMessage(
+                orchestratorChatRealtimeDetailFromProjection(currentChatProjection, {
+                  inputLength: input.input.length,
+                  status: result.status,
+                  ...(directPatchMessage ? { message: directPatchMessage, messages: [directPatchMessage] } : {}),
+                }),
+              );
             }
           }
+
           sendJson(response, result.status, result.body);
           return;
         }
@@ -1558,7 +1606,13 @@ export class StatusServer {
     if (recordedScopeKeys.has(scopeKey)) return;
     recordedScopeKeys.add(scopeKey);
     const transcript = projectWebTranscript(page.events, { run });
-    await this.recordProjectionRebuildEntry(this.webTranscriptProjectionWriteInput(run, page, transcript), entries);
+    const transcriptPayload = projectWebTranscriptWindow(page, transcript, {
+      run,
+      tailLimit: page.limit,
+      kind: page.windowKind ?? "page",
+      requestedPage: page.windowKind === "tail" ? null : { offset: page.offset, limit: page.limit },
+    });
+    await this.recordProjectionRebuildEntry(this.webTranscriptProjectionWriteInput(run, page, transcriptPayload), entries);
   }
 
   private async readTranscriptProjectionSourceTail(
@@ -1745,7 +1799,7 @@ export class StatusServer {
   private webTranscriptProjectionWriteInput(
     run: RunRecord,
     page: TranscriptPage,
-    transcript: ReturnType<typeof projectWebTranscript>,
+    transcript: WebTranscriptProjectionPayload,
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "transcript_projection",
@@ -1761,7 +1815,7 @@ export class StatusServer {
         offsetStart: page.offset,
         offsetLimit: page.limit,
         nextOffset: page.nextOffset,
-        messageCount: transcript.length,
+        messageCount: transcript.messages.length,
       },
     };
   }
@@ -1955,15 +2009,18 @@ export class StatusServer {
     conversationId?: string | null;
     messageId?: string;
     input: string;
-  }): Promise<{ status: number; body: unknown }> {
+  }): Promise<WebOrchestratorChatPostResult> {
     const store = this.options.orchestratorConversationStore;
     if (!store) {
-      return webOrchestratorChatErrorResponse(
-        503,
-        "orchestrator_chat_unavailable",
-        "Web orchestrator chat is unavailable because durable conversation storage is not configured",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          503,
+          "orchestrator_chat_unavailable",
+          "Web orchestrator chat is unavailable because durable conversation storage is not configured",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
 
     if (input.messageId !== undefined) {
@@ -1996,17 +2053,20 @@ export class StatusServer {
   private async acceptWebOrchestratorChatPostWithStore(
     store: OrchestratorConversationStore,
     input: { conversationId?: string | null; messageId?: string; input: string },
-  ): Promise<{ status: number; body: unknown }> {
+  ): Promise<WebOrchestratorChatPostResult> {
     let existingMessages: OrchestratorConversationMessage[] = [];
     try {
       existingMessages = input.messageId === undefined ? [] : await store.listMessages(input.conversationId);
     } catch {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not inspect existing messages",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not inspect existing messages",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
     const existingMessage =
       input.messageId === undefined ? undefined : existingMessages.find((message) => message.id === input.messageId);
@@ -2035,12 +2095,15 @@ export class StatusServer {
         },
       });
     } catch {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the user message",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the user message",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
 
     if (!webOrchestratorChatMessageMatchesClaim(message, commandClaimId)) {
@@ -2074,12 +2137,15 @@ export class StatusServer {
         metadata: webOrchestratorChatCommandDispatchingMetadata(commandClaimId, new Date().toISOString()),
       });
     } catch {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the command dispatch claim",
-        projectWebOrchestratorChatPost(input.input, [message]),
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the command dispatch claim",
+          projectWebOrchestratorChatPost(input.input, [message]),
+        ),
+        stateChanged: true,
+      };
     }
 
     let result: OrchestratorChatCommandResult;
@@ -2112,15 +2178,18 @@ export class StatusServer {
     input: { conversationId?: string | null; input: string };
     actionDispatched: boolean;
     result: OrchestratorChatCommandResult;
-  }): Promise<{ status: number; body: unknown }> {
+  }): Promise<WebOrchestratorChatPostResult> {
     const message = input.message;
     if (!message) {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the user message",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the user message",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
     let messages: OrchestratorConversationMessage[];
     try {
@@ -2159,23 +2228,29 @@ export class StatusServer {
       } catch {
         messages = [recoveryMessage];
       }
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the command state update",
-        projectWebOrchestratorChatPost(input.input.input, messages),
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the command state update",
+          projectWebOrchestratorChatPost(input.input.input, messages),
+        ),
+        stateChanged: true,
+      };
     }
 
     if (input.result.status === "accepted") {
-      return { status: 202, body: projectWebOrchestratorChatPost(input.input.input, messages) };
+      return { status: 202, body: projectWebOrchestratorChatPost(input.input.input, messages), stateChanged: true };
     }
-    return webOrchestratorChatErrorResponse(
-      webOrchestratorChatHttpStatusFromCommandResult(input.result.status),
-      webOrchestratorChatErrorCodeFromCommandResult(input.result.status),
-      webOrchestratorChatErrorMessageFromCommandResult(input.result.status),
-      projectWebOrchestratorChatPost(input.input.input, messages),
-    );
+    return {
+      ...webOrchestratorChatErrorResponse(
+        webOrchestratorChatHttpStatusFromCommandResult(input.result.status),
+        webOrchestratorChatErrorCodeFromCommandResult(input.result.status),
+        webOrchestratorChatErrorMessageFromCommandResult(input.result.status),
+        projectWebOrchestratorChatPost(input.input.input, messages),
+      ),
+      stateChanged: true,
+    };
   }
 
   private async fetchWebSidebar(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebSidebar>>> {
@@ -2312,7 +2387,7 @@ export class StatusServer {
   private async persistWebTranscriptProjection(
     run: RunRecord,
     page: TranscriptPage,
-    transcript: ReturnType<typeof projectWebTranscript>,
+    transcript: WebTranscriptProjectionPayload,
   ): Promise<void> {
     await this.persistProjection(this.webTranscriptProjectionWriteInput(run, page, transcript));
   }
@@ -2794,7 +2869,12 @@ function orchestratorChatProjectionRealtimeDetail(
   const conversationId =
     recordStringValue(sourceCursors, "conversationId") ?? recordStringValue(sourceCursors, "conversationKey") ?? publication.scopeKey;
   const detail: Record<string, unknown> = { conversationId, conversationKey: conversationId };
+  copyStringRecordField(detail, sourceCursors, "conversationStatus");
+  copyStringRecordField(detail, sourceCursors, "state");
   copyNumberRecordField(detail, sourceCursors, "messageCount");
+  copyNumberRecordField(detail, sourceCursors, "latestMessageSequence");
+  copyStringRecordField(detail, sourceCursors, "latestMessageUpdatedAt");
+  copyStringRecordField(detail, sourceCursors, "sourceRevision");
   copyStringRecordField(detail, sourceCursors, "lastMessageId");
   copyStringRecordField(detail, sourceCursors, "lastMessageStatus");
   copyStringRecordField(detail, sourceCursors, "lastMessageAt");
@@ -2941,16 +3021,30 @@ async function readRunActivityTranscriptTail(
   return runActivityEventsPageToTranscriptPage(
     await sourceStore.readRunEvents(run.runId, { offset, limit: options.limit }),
     run,
+    "tail",
   );
 }
 
-function runActivityEventsPageToTranscriptPage(sourcePage: RunActivityEventsPage, run: RunRecord): TranscriptPage {
+function runActivityEventsPageToTranscriptPage(sourcePage: RunActivityEventsPage, run: RunRecord, windowKind: "page" | "tail" = "page"): TranscriptPage {
+  const events = sourcePage.events.map((stored) => mapRunActivityEventToTranscriptEvent(stored.event, { runId: run.runId }));
+  const firstEvent = events[0] ?? null;
+  const lastEvent = events.at(-1) ?? null;
+  const previousOffset = sourcePage.offset > 0 ? Math.max(0, sourcePage.offset - sourcePage.limit) : null;
   return {
     runId: run.runId,
     offset: sourcePage.offset,
     limit: sourcePage.limit,
     nextOffset: sourcePage.nextOffset,
-    events: sourcePage.events.map((stored) => mapRunActivityEventToTranscriptEvent(stored.event, { runId: run.runId })),
+    events,
+    total: sourcePage.total,
+    eventCount: events.length,
+    previousOffset,
+    hasPrevious: previousOffset !== null,
+    hasNext: sourcePage.nextOffset !== null,
+    windowKind,
+    firstSequence: firstEvent?.sequence ?? null,
+    lastSequence: lastEvent?.sequence ?? null,
+    lastEventAt: lastEvent?.at ?? null,
   };
 }
 
@@ -3308,11 +3402,85 @@ function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage)
     offset: page.offset,
     limit: page.limit,
     nextOffset: page.nextOffset,
-    eventCount: page.events.length,
-    firstSequence: firstEvent?.sequence ?? null,
-    lastSequence: lastEvent?.sequence ?? null,
-    lastEventAt: lastEvent?.at ?? null,
+    previousOffset: page.previousOffset ?? (page.offset > 0 ? Math.max(0, page.offset - page.limit) : null),
+    total: page.total ?? null,
+    windowKind: page.windowKind ?? "page",
+    hasNext: page.hasNext ?? page.nextOffset !== null,
+    hasPrevious: page.hasPrevious ?? page.offset > 0,
+    eventCount: page.eventCount ?? page.events.length,
+    firstSequence: page.firstSequence ?? firstEvent?.sequence ?? null,
+    lastSequence: page.lastSequence ?? lastEvent?.sequence ?? null,
+    lastEventAt: page.lastEventAt ?? lastEvent?.at ?? null,
   };
+}
+
+function webTranscriptProjectionResponseBody(
+  body: unknown,
+  input: {
+    run: RunRecord | null;
+    runId: string;
+    requestedPage: { offset: number; limit: number } | null;
+    limit: number;
+    sourceCursors?: Record<string, unknown> | null;
+  },
+): WebTranscriptProjectionPayload {
+  if (isWebTranscriptProjectionPayload(body)) return body;
+  const record = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
+  const pageRecord = record?.page && typeof record.page === "object" && !Array.isArray(record.page) ? (record.page as Record<string, unknown>) : null;
+  const windowRecord = record?.window && typeof record.window === "object" && !Array.isArray(record.window) ? (record.window as Record<string, unknown>) : null;
+  const messages = Array.isArray(body)
+    ? (body as WebTranscriptMessage[])
+    : Array.isArray(record?.messages)
+      ? (record.messages as WebTranscriptMessage[])
+      : [];
+  const cursor = input.sourceCursors ?? {};
+  const offset = optionalNumber(pageRecord?.offset) ?? optionalNumber(cursor.offset) ?? input.requestedPage?.offset ?? 0;
+  const limit = optionalNumber(pageRecord?.limit) ?? optionalNumber(cursor.limit) ?? input.limit;
+  const nextOffset = optionalNumber(pageRecord?.nextOffset) ?? optionalNumber(cursor.nextOffset);
+  const previousOffset =
+    optionalNumber(pageRecord?.previousOffset) ??
+    optionalNumber(cursor.previousOffset) ??
+    (offset > 0 ? Math.max(0, offset - limit) : null);
+  const kind =
+    (windowRecord?.kind === "tail" || windowRecord?.kind === "page"
+      ? windowRecord.kind
+      : cursor.windowKind === "tail" || cursor.windowKind === "page"
+        ? cursor.windowKind
+        : null) ?? (input.requestedPage ? "page" : "tail");
+  const page: TranscriptPage = {
+    runId: input.run?.runId ?? input.runId,
+    offset,
+    limit,
+    nextOffset,
+    events: [],
+    total: optionalNumber(pageRecord?.total) ?? optionalNumber(cursor.total),
+    eventCount: optionalNumber(pageRecord?.size) ?? optionalNumber(cursor.eventCount) ?? messages.length,
+    previousOffset,
+    hasNext: optionalBoolean(pageRecord?.hasNext) ?? optionalBoolean(cursor.hasNext) ?? nextOffset !== null,
+    hasPrevious: optionalBoolean(pageRecord?.hasPrevious) ?? optionalBoolean(cursor.hasPrevious) ?? previousOffset !== null,
+    windowKind: kind,
+    firstSequence: optionalNumber(pageRecord?.firstSequence) ?? optionalNumber(cursor.firstSequence),
+    lastSequence: optionalNumber(pageRecord?.lastSequence) ?? optionalNumber(cursor.lastSequence),
+    lastEventAt: optionalString(pageRecord?.lastEventAt) ?? optionalString(cursor.lastEventAt),
+  };
+  return projectWebTranscriptWindow(page, messages, {
+    run: input.run,
+    requestedPage: input.requestedPage,
+    tailLimit: limit,
+    kind,
+  });
+}
+
+function optionalNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function optionalBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 type WebOrchestratorChatProjectionResponse = {
@@ -3353,6 +3521,37 @@ function orchestratorChatProjectionSourceCursors(
     lastMessageId: lastMessage?.id ?? null,
     lastMessageStatus: lastMessage?.status ?? null,
     lastMessageAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null,
+  };
+}
+
+function orchestratorChatRealtimeDetailFromProjection(
+  projection: Pick<WebOrchestratorChatProjectionResponse, "conversation" | "state" | "status" | "chat" | "source">,
+  extras: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const chat = selectChatMessageTail(projection.chat);
+  const lastMessage = chat.at(-1) ?? null;
+  const latestMessageAt = lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null;
+  const messageCount = typeof projection.conversation.messageCount === "number" ? projection.conversation.messageCount : projection.chat.length;
+  return {
+    conversationId: projection.conversation.id,
+    conversationKey: orchestratorChatProjectionScopeKey(projection.conversation.id),
+    conversation: projection.conversation,
+    conversationStatus: projection.conversation.status,
+    state: projection.state,
+    statusSummary: projection.status,
+    statusCounts: projection.status.statusCounts,
+    active: projection.status.active,
+    terminal: projection.status.terminal,
+    empty: projection.status.empty,
+    messageCount,
+    latestMessageSequence: projection.source.latestMessageSequence,
+    latestMessageUpdatedAt: projection.source.latestMessageUpdatedAt,
+    sourceSummary: projection.source,
+    lastMessageId: lastMessage?.id ?? null,
+    lastMessageStatus: lastMessage?.status ?? null,
+    lastMessageAt: latestMessageAt,
+    chat,
+    ...extras,
   };
 }
 
@@ -4171,13 +4370,14 @@ function webOrchestratorChatReplayResponse(
   input: string,
   message: OrchestratorConversationMessage,
   messages: readonly OrchestratorConversationMessage[],
-): { status: number; body: unknown } {
+): WebOrchestratorChatPostResult {
   return {
     status: webOrchestratorChatReplayStatus(message),
     body: projectWebOrchestratorChatPost(
       input,
       selectOrchestratorConversationMessageTail(messages, { includeMessageId: message.id }),
     ),
+    stateChanged: false,
   };
 }
 
@@ -5933,6 +6133,9 @@ function publicRunRecord(run: RunRecord): RunRecord {
   const record: RunRecord = {
     ...run,
     error: publicDiagnosticText(run.error),
+    ...(run.commandPolicy === undefined
+      ? {}
+      : { commandPolicy: sanitizeCommandPolicyReplayStateForPublicOutput(run.commandPolicy) }),
   };
   if (run.cancelFailedReason !== undefined) record.cancelFailedReason = publicDiagnosticText(run.cancelFailedReason);
   if (run.harnessStopFailedReason !== undefined) record.harnessStopFailedReason = publicDiagnosticText(run.harnessStopFailedReason);

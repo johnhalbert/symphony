@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
+import { createTranscriptWindowResponse } from "../src/data/transcriptWindow";
 import type { SymphonyDataSource } from "../src/data/dataSource";
 import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
 import type { DashboardModel } from "../src/types/symphony";
@@ -59,7 +60,7 @@ const demoDataSource: SymphonyDataSource = {
     return [];
   },
   async getTranscript() {
-    return [];
+    return createTranscriptWindowResponse([]);
   },
   async getSidebar() {
     return { providerGates: [], runningAgents: [], reviewIssues: [], activity: [], sessions: [], chat: [], totals: demoDashboard.totals };

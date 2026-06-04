@@ -4,6 +4,7 @@ import type { SymphonyDataSource } from "../../src/data/dataSource";
 import { DataSourceProvider } from "../../src/data/dataSourceContext";
 import { ReferenceDataProvider } from "../../src/data/referenceDataContext";
 import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../../src/data/orchestratorChat";
+import { createTranscriptWindowResponse } from "../../src/data/transcriptWindow";
 import type {
   ChatMessage,
   DashboardModel,
@@ -187,7 +188,7 @@ export function createApiModeDataSource(options: ApiModeDataSourceOptions = {}):
       return history.sessions;
     },
     async getTranscript(sessionId) {
-      return history.transcriptBySession[sessionId] ?? [];
+      return createTranscriptWindowResponse(history.transcriptBySession[sessionId] ?? []);
     },
     async getSidebar() {
       return sidebar;

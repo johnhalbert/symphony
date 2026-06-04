@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { projectWebTranscript } from "../src/app/WebTranscriptProjection.js";
-import type { RunRecord, TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import {
+  emptyWebTranscriptProjectionPayload,
+  projectWebTranscript,
+  projectWebTranscriptWindow,
+} from "../src/app/WebTranscriptProjection.js";
+import type { RunRecord, TranscriptEvent, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
 
 describe("projectWebTranscript", () => {
   it("maps sanitized Cursor transcript preview payloads into public web transcript messages", () => {
@@ -111,6 +115,80 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("Cursor thinking event");
     expect(serialized).not.toContain("Cursor assistant message");
     expect(serialized).not.toContain("Cursor task event");
+  });
+
+  it("projects command-policy decisions as public status details without exposing hook payloads or command secrets", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "command_policy_decision",
+        source: "harness",
+        message: "Blocked command containing SECRET_POLICY_MESSAGE for https://user:pass@github.com/owner/repo.git",
+        payload: {
+          kind: "command_policy_decision",
+          redacted: true,
+          decisionId: "decision-public-policy",
+          surface: "terminal_execute",
+          role: "worker",
+          phase: "implementation",
+          outcome: "deny",
+          reasonKind: "upstream_github",
+          commandClass: "direct_upstream_git_operation",
+          message: "Blocked command containing SECRET_POLICY_MESSAGE for https://user:pass@github.com/owner/repo.git",
+          upstreamContactAttempted: false,
+          requiresUserOrServiceFix: true,
+          requestKind: "pre_tool_call",
+          permissionOutcome: "denied",
+          hookAction: "block",
+          commandPreview: "git push https://user:pass@github.com/owner/repo.git",
+          raw: { params: { command: "git push origin HEAD", token: "SECRET_RAW_TOKEN" } },
+          env: { GIT_ASKPASS: "/tmp/secret-askpass", GITHUB_TOKEN: "SECRET_ENV_TOKEN" },
+          audit: {
+            redacted: true,
+            surface: "terminal_execute",
+            role: "worker",
+            phase: "implementation",
+            outcome: "deny",
+            reasonKind: "upstream_github",
+            commandClass: "direct_upstream_git_operation",
+            rawInputPreview: "GIT_ASKPASS=/tmp/secret-askpass git push origin HEAD",
+            commandPreview: "git push https://user:pass@github.com/owner/repo.git",
+            inlineEnvironmentKeys: ["GIT_ASKPASS"],
+            unsafeConfigCategories: ["credential_helper"],
+            helperPath: "/tmp/secret-credential-helper",
+            upstreamContactAttempted: false,
+          },
+        },
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      {
+        kind: "status",
+        state: "command_policy_decision",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Command policy deny: upstream_github (worker · implementation · terminal_execute)",
+        policy: {
+          outcome: "deny",
+          reasonKind: "upstream_github",
+          role: "worker",
+          phase: "implementation",
+          surface: "terminal_execute",
+          commandClass: "direct_upstream_git_operation",
+          upstreamContactAttempted: false,
+          requiresUserOrServiceFix: true,
+          requestKind: "pre_tool_call",
+          hookAction: "block",
+          permissionOutcome: "denied",
+        },
+      },
+    ]);
+    const serialized = JSON.stringify(messages);
+    expect(serialized).not.toContain("SECRET_");
+    expect(serialized).not.toContain("git push");
+    expect(serialized).not.toContain("/tmp/secret");
+    expect(serialized).not.toContain("user:pass");
+    expect(serialized).not.toContain("raw");
+    expect(serialized).not.toContain("GITHUB_TOKEN");
   });
 
   it("preserves persisted harness stream progress text while routing explicit progress status", () => {
@@ -1092,6 +1170,66 @@ describe("projectWebTranscript", () => {
     expect(cursorMessages[0]).toMatchObject({ kind: "system", model: "cursor-model" });
   });
 
+  it("wraps explicit transcript pages with window metadata and inactive tail state", () => {
+    const payload = projectWebTranscriptWindow(
+      transcriptPage({ offset: 25, limit: 100, nextOffset: 125, total: 250, windowKind: "page" }),
+      [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "paged message" }],
+      { run: runRecord({ status: "succeeded" }), kind: "page", requestedPage: { offset: 25, limit: 100 }, tailLimit: 500 },
+    );
+
+    expect(payload).toMatchObject({
+      schemaVersion: 1,
+      messages: [{ kind: "assistant", text: "paged message" }],
+      page: {
+        offset: 25,
+        limit: 100,
+        size: 1,
+        total: 250,
+        nextOffset: 125,
+        previousOffset: 0,
+        hasNext: true,
+        hasPrevious: true,
+        firstSequence: 26,
+        lastSequence: 26,
+        lastEventAt: "2026-01-01T00:00:26.000Z",
+      },
+      window: { kind: "page", requested: { offset: 25, limit: 100 }, tailLimit: 500, messageCount: 1 },
+      activeTail: { enabled: false, canAppend: false, runStatus: "succeeded", afterSequence: 26 },
+      recovery: { strategy: "refetch", reason: "tail-gap" },
+      compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+    });
+  });
+
+  it("enables active append metadata for running transcript tails", () => {
+    const payload = projectWebTranscriptWindow(
+      transcriptPage({ offset: 100, limit: 500, nextOffset: null, total: 101, windowKind: "tail" }),
+      [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "tail message" }],
+      { run: runRecord({ status: "running" }), kind: "tail", requestedPage: null, tailLimit: 500 },
+    );
+
+    expect(payload.window).toMatchObject({ kind: "tail", requested: { offset: null, limit: 500 }, tailLimit: 500 });
+    expect(payload.activeTail).toMatchObject({
+      enabled: true,
+      canAppend: true,
+      runStatus: "running",
+      tailLimit: 500,
+      afterSequence: 101,
+      refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+    });
+    expect(payload.activeTail.gapFallback).toEqual(payload.recovery);
+  });
+
+  it("creates empty transcript window payloads for unavailable or missing runs", () => {
+    expect(emptyWebTranscriptProjectionPayload({ runId: "missing-run", limit: 500 })).toMatchObject({
+      schemaVersion: 1,
+      messages: [],
+      page: { offset: 0, limit: 500, size: 0, total: 0, nextOffset: null, previousOffset: null },
+      window: { kind: "tail", messageCount: 0, requested: { offset: null, limit: 500 } },
+      activeTail: { enabled: false, canAppend: false, runStatus: null, afterSequence: null },
+      compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+    });
+  });
+
 });
 
 function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
@@ -1120,6 +1258,33 @@ function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
     tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     transcriptEventCount: 0,
     ...overrides,
+  };
+}
+
+function transcriptPage(input: {
+  offset: number;
+  limit: number;
+  nextOffset: number | null;
+  total: number;
+  windowKind: "page" | "tail";
+}): TranscriptPage {
+  const sequence = input.windowKind === "tail" ? input.total : input.offset + 1;
+  const at = `2026-01-01T00:00:${String(sequence).padStart(2, "0")}.000Z`;
+  return {
+    runId: "run-1",
+    offset: input.offset,
+    limit: input.limit,
+    nextOffset: input.nextOffset,
+    events: [event({ sequence, at })],
+    total: input.total,
+    eventCount: 1,
+    previousOffset: input.offset > 0 ? Math.max(0, input.offset - input.limit) : null,
+    hasPrevious: input.offset > 0,
+    hasNext: input.nextOffset !== null,
+    windowKind: input.windowKind,
+    firstSequence: sequence,
+    lastSequence: sequence,
+    lastEventAt: at,
   };
 }
 

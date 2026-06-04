@@ -1,5 +1,13 @@
 import type { ReactNode } from "react";
-import { Icon } from "../components/common";
+import { Icon, UnavailableButton } from "../components/common";
+
+const sidebarNavigationItems = [
+  { label: "Compact dashboard navigation", icon: Icon.dashboard, active: false },
+  { label: "Compact issue-board navigation", icon: Icon.layout, active: false },
+  { label: "Compact agent-status navigation", icon: Icon.bolt, active: true },
+  { label: "Compact history navigation", icon: Icon.history, active: false },
+  { label: "Compact chat navigation", icon: Icon.message, active: false },
+];
 
 export function SidebarChrome({ children }: { children: ReactNode }) {
   return (
@@ -22,16 +30,13 @@ export function SidebarChrome({ children }: { children: ReactNode }) {
           gap: 4,
         }}
       >
-        {[
-          { icon: Icon.dashboard, active: false },
-          { icon: Icon.layout, active: false },
-          { icon: Icon.bolt, active: true },
-          { icon: Icon.history, active: false },
-          { icon: Icon.message, active: false },
-        ].map((item, index) => (
-          <button
-            key={index}
-            type="button"
+        {sidebarNavigationItems.map((item) => (
+          <UnavailableButton
+            className="icon-btn"
+            key={item.label}
+            aria-current={item.active ? "page" : undefined}
+            unavailableLabel={item.label}
+            unavailableReason="compact sidebar navigation is read-only here; use the main Symphony tabs to switch views"
             style={{
               width: 30,
               height: 30,
@@ -58,7 +63,7 @@ export function SidebarChrome({ children }: { children: ReactNode }) {
               />
             ) : null}
             <span style={{ width: 16, height: 16, display: "inline-flex" }}>{item.icon()}</span>
-          </button>
+          </UnavailableButton>
         ))}
         <div style={{ flex: 1 }} />
       </div>
