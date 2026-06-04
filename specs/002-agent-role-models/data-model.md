@@ -6,7 +6,7 @@ Represents operator-provided model assignments in workflow configuration.
 
 **Fields**:
 
-- `orchestrator`: Optional model identifier for service-owned orchestrator chat/command sessions.
+- `planner`: Optional model identifier for the existing user-facing planner template and main-dashboard planning/chat sessions.
 - `worker`: Optional model identifier for worker implementation and worker repair sessions.
 - `reviewer`: Optional model identifier for reviewer sessions.
 
@@ -24,7 +24,7 @@ Represents the effective model decision for a specific role at a specific sessio
 
 **Fields**:
 
-- `role`: `orchestrator`, `worker`, or `reviewer`.
+- `role`: `planner`, `worker`, or `reviewer`.
 - `model`: Resolved model identifier, or `null` only when the active runtime's existing behavior has no known model before session startup.
 - `source`: `explicit` when selected from `role_models.<role>`, otherwise `default`.
 - `sourcePath`: Human-readable configuration source such as `role_models.worker`, `hermes.model`, `cursor.model`, or host ACP session metadata.
@@ -44,9 +44,9 @@ Represents a unit of work or command handling that receives a model assignment b
 **Fields**:
 
 - `role`: Role receiving the model assignment.
-- `runId` or `conversationId`: Durable identifier for the role session or orchestrator conversation command.
+- `runId` or `conversationId`: Durable identifier for the role session or planner conversation command.
 - `harnessId`: Runtime harness for worker/reviewer sessions, when applicable.
-- `runPhase`: Implementation, review, issue breakdown, merge-conflict resolution, or service-owned orchestrator command phase.
+- `runPhase`: Implementation, review, issue breakdown, merge-conflict resolution, or service-owned planner command phase.
 - `resolvedModel`: Role model resolution snapshot.
 - `startedAt`: Timestamp when the session was accepted.
 

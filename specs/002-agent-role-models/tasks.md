@@ -22,7 +22,7 @@
 
 - [ ] T001 Inspect existing model configuration and metadata paths in `src/core/config/Config.ts`, `src/core/orchestrator/Orchestrator.ts`, `cursor/src/CursorHarness.ts`, and `hermes/src/HermesHarness.ts`
 - [ ] T002 [P] Inspect existing run evidence and projection paths in `src/core/persistence/RunTranscriptStore.ts`, `src/app/webProjection.ts`, `src/app/WebHistoryProjection.ts`, and `src/app/WebTranscriptProjection.ts`
-- [ ] T003 [P] Inspect dirty orchestrator conversation changes before editing `src/core/persistence/OrchestratorConversationStore.ts` and `tests/orchestrator-conversation-store.test.ts`
+- [ ] T003 [P] Inspect dirty planner conversation metadata changes before editing existing orchestrator conversation storage files in `src/core/persistence/OrchestratorConversationStore.ts` and `tests/orchestrator-conversation-store.test.ts`
 - [ ] T004 [P] Confirm no task requires vendored Hermes edits by checking `hermes/upstream-src/` and documenting any read-only evidence in `specs/002-agent-role-models/quickstart.md`
 
 ---
@@ -35,7 +35,7 @@
 
 ### Tests And Validation
 
-- [ ] T005 [P] Add workflow config tests for accepting optional `role_models.orchestrator`, `role_models.worker`, and `role_models.reviewer` in `tests/workflow.test.ts`
+- [ ] T005 [P] Add workflow config tests for accepting optional `role_models.planner`, `role_models.worker`, and `role_models.reviewer` in `tests/workflow.test.ts`
 - [ ] T006 [P] Add resolver unit tests for explicit source markers, default source markers, same-model reuse, and environment expansion in `tests/role-model-resolution.test.ts`
 - [ ] T007 [P] Add type-level coverage or compile fixtures for role model roles remaining separate from `AgentRunRole` in `tests/provider-neutrality.test.ts`
 
@@ -53,9 +53,9 @@
 
 ## Phase 3: User Story 1 - Assign Distinct Models By Role (Priority: P1) MVP
 
-**Goal**: Configure different models for orchestrator, worker, and reviewer and ensure each stable role session uses its own resolved model.
+**Goal**: Configure different models for planner, worker, and reviewer and ensure each stable role session uses its own resolved model.
 
-**Independent Test**: Configure three different role models, start a run that exercises orchestrator, worker, and reviewer roles on Cursor or Hermes TUI/JSON-RPC, and confirm each role session uses its configured model.
+**Independent Test**: Configure three different role models, start a run that exercises planner, worker, and reviewer roles on the dashboard planning surface, Cursor, or Hermes TUI/JSON-RPC, and confirm each role session uses its configured model.
 
 ### Tests For User Story 1
 
@@ -63,19 +63,19 @@
 - [ ] T014 [P] [US1] Add Cursor harness tests proving worker and reviewer `ModelSelection` use their resolved role models in `tests/cursor-harness.test.ts`
 - [ ] T015 [P] [US1] Add Hermes TUI/JSON-RPC tests proving worker and reviewer gateway environment models come from resolved role models in `tests/hermes-harness.test.ts`
 - [ ] T016 [P] [US1] Add Hermes provider-limit default tests proving provider scope uses the resolved role model in `tests/hermes-harness.test.ts`
-- [ ] T017 [P] [US1] Add orchestrator runtime metadata tests for explicit `role_models.orchestrator` in `tests/orchestrator.test.ts`
-- [ ] T018 [P] [US1] Add orchestrator chat API tests for explicit orchestrator model metadata in `tests/web-orchestrator-chat-api.test.ts`
+- [ ] T017 [P] [US1] Add planner runtime metadata tests for explicit `role_models.planner` in `tests/orchestrator.test.ts`
+- [ ] T018 [P] [US1] Add planner dashboard/chat API tests for explicit planner model metadata in `tests/web-orchestrator-chat-api.test.ts`
 
 ### Implementation For User Story 1
 
 - [ ] T019 [US1] Replace Cursor worker/reviewer model selection with the shared role model resolver in `cursor/src/CursorHarness.ts`
 - [ ] T020 [US1] Replace Hermes TUI/JSON-RPC gateway model selection with the shared role model resolver in `hermes/src/HermesHarness.ts`
 - [ ] T021 [US1] Include the resolved Hermes role model in worker lease compatibility so changed models do not reuse stale sessions in `hermes/src/HermesHarness.ts`
-- [ ] T022 [US1] Use resolved role models for runtime model metadata and cursor compatibility metadata in `src/core/orchestrator/Orchestrator.ts`
-- [ ] T023 [US1] Record explicit orchestrator model metadata for accepted and rejected chat commands in `src/core/orchestrator/OrchestratorChatCommand.ts`
-- [ ] T024 [US1] Preserve orchestrator chat command model metadata in `src/core/persistence/OrchestratorConversationStore.ts`
+- [ ] T022 [US1] Use resolved role models for planner/runtime model metadata and cursor compatibility metadata in `src/core/orchestrator/Orchestrator.ts`
+- [ ] T023 [US1] Record explicit planner model metadata for accepted and rejected dashboard planning chat commands in `src/core/orchestrator/OrchestratorChatCommand.ts`
+- [ ] T024 [US1] Preserve planner chat command model metadata in `src/core/persistence/OrchestratorConversationStore.ts`
 
-**Checkpoint**: User Story 1 is complete when distinct configured models are used by orchestrator chat, Cursor worker/reviewer sessions, and Hermes TUI/JSON-RPC worker/reviewer sessions.
+**Checkpoint**: User Story 1 is complete when distinct configured models are used by planner dashboard/chat sessions, Cursor worker/reviewer sessions, and Hermes TUI/JSON-RPC worker/reviewer sessions.
 
 ---
 
@@ -88,13 +88,13 @@
 ### Tests For User Story 2
 
 - [ ] T025 [P] [US2] Add workflow config tests for absent `role_models`, partial role maps, and removed role entries in `tests/workflow.test.ts`
-- [ ] T026 [P] [US2] Add resolver tests for orchestrator defaulting to `cursor.model` in `tests/role-model-resolution.test.ts`
+- [ ] T026 [P] [US2] Add resolver tests for planner defaulting to the existing planner/chat model behavior in `tests/role-model-resolution.test.ts`
 - [ ] T027 [P] [US2] Add resolver tests for worker and reviewer defaulting to active harness defaults in `tests/role-model-resolution.test.ts`
 - [ ] T028 [P] [US2] Add harness regression tests proving absent role models preserve current Cursor and Hermes behavior in `tests/cursor-harness.test.ts` and `tests/hermes-harness.test.ts`
 
 ### Implementation For User Story 2
 
-- [ ] T029 [US2] Implement documented default fallback paths for orchestrator, worker, and reviewer in `src/core/config/RoleModelResolution.ts`
+- [ ] T029 [US2] Implement documented default fallback paths for planner, worker, and reviewer in `src/core/config/RoleModelResolution.ts`
 - [ ] T030 [US2] Add `role_model:<role>:default:<sourcePath>` setting source markers in `src/core/config/RoleModelResolution.ts`
 - [ ] T031 [US2] Preserve existing Cursor model params behavior when Cursor roles default through `cursor.model` in `cursor/src/CursorHarness.ts`
 - [ ] T032 [US2] Preserve existing Hermes provider and template defaults when Hermes roles default through `hermes.model` in `hermes/src/HermesHarness.ts`
@@ -246,7 +246,7 @@ npm test -- tests/workflow.test.ts tests/cursor-harness.test.ts tests/hermes-har
 
 1. Complete Phase 1 setup.
 2. Complete Phase 2 foundational resolver and config contract.
-3. Complete Phase 3 US1 for orchestrator, Cursor, and Hermes TUI/JSON-RPC.
+3. Complete Phase 3 US1 for planner dashboard/chat, Cursor, and Hermes TUI/JSON-RPC.
 4. Stop and validate US1 independently with the tests listed in the Phase 3 checkpoint.
 
 ### Incremental Delivery
@@ -272,5 +272,5 @@ Run `npm test -- tests/hermes-acp-harness.test.ts tests/host-hermes-acp-profile-
 
 - Role models are non-secret identifiers; credentials and provider auth material remain in existing secret-bearing paths.
 - Do not modify `hermes/upstream-src/`.
-- `role_models.orchestrator` is a service-owned orchestration/chat model role and must remain separate from delegated `AgentRunRole` values.
+- `role_models.planner` is the user-facing planning/dashboard model role. Do not introduce `role_models.orchestrator`; `orchestrator` remains the service-owned coordination concept and must remain separate from delegated `AgentRunRole` values.
 - Optional Spec Kit git commit hooks exist before and after task generation, but they are not auto-run here unless explicitly requested.

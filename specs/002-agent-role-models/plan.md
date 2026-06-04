@@ -6,7 +6,7 @@
 
 ## Summary
 
-Add a role-scoped model resolution contract so Symphony operators can configure independent model identifiers for orchestrator, worker, and reviewer responsibilities while preserving existing harness-level defaults. The implementation should introduce a shared resolver for non-secret `role_models` workflow configuration, feed resolved worker/reviewer models into Cursor and stable Hermes TUI/JSON-RPC role sessions before prompt submission, and record each role session's resolved model plus selection source in existing run metadata. Orchestrator chat uses the same resolver for service-owned orchestrator command/session metadata without granting runtime agents authority to choose their own model. Hermes ACP role-model wiring is planned as a blocked follow-up lane and must not be implemented until the underlying ACP feature work is complete and stable.
+Add a role-scoped model resolution contract so Symphony operators can configure independent model identifiers for planner, worker, and reviewer responsibilities while preserving existing harness-level defaults. The implementation should introduce a shared resolver for non-secret `role_models` workflow configuration, feed resolved planner/worker/reviewer models into the existing planner dashboard/chat surface, Cursor, and stable Hermes TUI/JSON-RPC role sessions before prompt submission, and record each role session's resolved model plus selection source in existing run metadata. The planner role maps to the existing user-facing planner template and main-dashboard planning agent; `orchestrator` remains the service-owned coordination/runtime concept and must not be introduced as a separate role-model key. Hermes ACP role-model wiring is planned as a blocked follow-up lane and must not be implemented until the underlying ACP feature work is complete and stable.
 
 ## Technical Context
 
@@ -26,7 +26,7 @@ Add a role-scoped model resolution contract so Symphony operators can configure 
 
 **Constraints**: Preserve existing behavior when `role_models` is absent. Treat role model identifiers as non-secret metadata, but do not expose provider tokens, API keys, auth home contents, profile secrets, or environment values. Reject explicitly empty or malformed role model values. Confirm unavailable model errors before prompt/work is delegated to the affected role for implemented harnesses. Do not modify vendored Hermes source under `hermes/upstream-src/**`. Do not implement Hermes ACP role-model wiring until the ACP harness/session feature implementation is stable; represent that work as blocked/dependent tasks rather than mixing it into the first implementation slice.
 
-**Scale/Scope**: Three first-class model roles for this feature: `orchestrator`, `worker`, and `reviewer`. Worker/reviewer coverage must work across supported runtime harnesses. Merge-conflict repair workers use the worker model unless a future feature adds a separate role.
+**Scale/Scope**: Three first-class model roles for this feature: `planner`, `worker`, and `reviewer`. Planner coverage must align with the existing planner template and main-dashboard planning/chat surface. Worker/reviewer coverage must work across supported runtime harnesses. Merge-conflict repair workers use the worker model unless a future feature adds a separate role.
 
 ## Constitution Check
 
@@ -36,7 +36,7 @@ Add a role-scoped model resolution contract so Symphony operators can configure 
 - **II. Least-Privilege Credentials And Secret Hygiene**: PASS. `role_models` stores only model identifiers. Provider credentials remain in existing secret-bearing credential/profile paths. Errors, run records, and docs must display model identifiers only and redact credential/profile values.
 - **III. Testable Contracts Before Implementation**: PASS. The spec defines prioritized stories, acceptance scenarios, measurable outcomes, and validation scope. This plan identifies concrete config, harness, run-record, and API projection surfaces before task generation.
 - **IV. Durable Audit, Replay, And Idempotence**: PASS. Started role sessions will persist the resolved model and whether it was explicit or defaulted in existing run metadata, with `runtimeSettingSources` preserving the selection source for replay and diagnostics.
-- **V. Scoped Change Ownership And Protected Surfaces**: PASS. Work stays in Symphony-owned config, orchestrator, stable harness adapters, runtime profile/session wiring, tests, and documentation. Vendored Hermes source is read-only evidence and is not modified. Hermes ACP changes are explicitly gated behind ACP stabilization work and must not be advanced by this feature until that dependency is satisfied.
+- **V. Scoped Change Ownership And Protected Surfaces**: PASS. Work stays in Symphony-owned config, planner/dashboard chat integration, orchestrator service coordination paths where they own planner dispatch metadata, stable harness adapters, runtime profile/session wiring, tests, and documentation. Vendored Hermes source is read-only evidence and is not modified. Hermes ACP changes are explicitly gated behind ACP stabilization work and must not be advanced by this feature until that dependency is satisfied.
 
 Pre-design gate result: PASS, no constitution violations.
 
@@ -103,7 +103,7 @@ tests/
 └── web-orchestrator-chat-api.test.ts
 ```
 
-**Structure Decision**: Implement model selection as a Symphony-owned shared resolver used by config parsing, orchestrator run metadata, Cursor SDK options, and Hermes TUI/JSON-RPC gateway environment. Do not encode role-specific branching directly in each harness beyond passing a resolved model. Do not change vendored Hermes upstream code. Record Hermes ACP integration as a blocked follow-up task dependent on completion of the ACP harness/session feature, because ACP implementation is still in flight and should stabilize before role-model behavior is layered onto it.
+**Structure Decision**: Implement model selection as a Symphony-owned shared resolver used by config parsing, planner/dashboard chat metadata, orchestrator service run metadata where planner dispatch is coordinated, Cursor SDK options, and Hermes TUI/JSON-RPC gateway environment. Do not encode role-specific branching directly in each harness beyond passing a resolved model. Do not change vendored Hermes upstream code. Record Hermes ACP integration as a blocked follow-up task dependent on completion of the ACP harness/session feature, because ACP implementation is still in flight and should stabilize before role-model behavior is layered onto it.
 
 ## Complexity Tracking
 

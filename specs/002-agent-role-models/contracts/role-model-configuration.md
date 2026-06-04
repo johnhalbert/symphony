@@ -6,7 +6,7 @@ Add optional top-level workflow configuration:
 
 ```yaml
 role_models:
-  orchestrator: gpt-5.5
+  planner: gpt-5.5
   worker: gpt-5.3-codex-spark
   reviewer: gpt-5.4
 ```
@@ -23,7 +23,7 @@ role_models:
 1. Resolve environment-variable references using the existing config string resolver.
 2. If a role key is present, trim the resolved value and validate it as a model identifier.
 3. If a role key is omitted, use the role's documented default:
-   - `orchestrator`: current general Cursor model default.
+   - `planner`: current planner/chat model behavior, including the general Cursor model default where the planner is Cursor-backed.
    - `worker`: current active harness default model behavior.
    - `reviewer`: current active harness default model behavior.
 4. Freeze the resolved role model when the role session starts.
@@ -76,11 +76,12 @@ ACP role-model wiring is intentionally blocked until the ACP harness/session fea
 - Treat model switch failure as a role-specific configuration problem.
 - Record the confirmed ACP session model when reported by the host runtime.
 
-### Orchestrator Chat
+### Planner Dashboard / Chat
 
-- Resolve the `orchestrator` model for service-owned orchestrator chat command handling.
-- Record the resolved model in orchestrator conversation command metadata when a command is accepted or rejected.
-- Do not create worker/reviewer run authority for orchestrator chat.
+- Resolve the `planner` model for the existing user-facing planner template and main-dashboard planning/chat command handling.
+- Record the resolved planner model in planner conversation command metadata when a command is accepted or rejected.
+- Do not create worker/reviewer run authority for planner chat.
+- Do not add a separate `role_models.orchestrator` key; `orchestrator` remains the internal service coordination concept.
 
 ## Run Metadata Contract
 

@@ -6,24 +6,24 @@ Use optional non-secret workflow configuration:
 
 ```yaml
 role_models:
-  orchestrator: gpt-5.5
+  planner: gpt-5.5
   worker: gpt-5.3-codex-spark
   reviewer: gpt-5.4
 ```
 
-**Rationale**: Existing `cursor.model` and `hermes.model` are harness-level defaults, not role-level assignments. A top-level role map keeps the operator intent direct, avoids overloading `agent` with service/orchestrator concerns, and remains independent of whether a role is currently backed by Cursor, Hermes TUI/JSON-RPC, or a future stable Hermes ACP path.
+**Rationale**: Existing `cursor.model` and `hermes.model` are harness-level defaults, not role-level assignments. A top-level role map keeps the operator intent direct, aligns with the existing planner template and main-dashboard planning agent, avoids overloading `agent` with service coordination concerns, and remains independent of whether a role is currently backed by Cursor, Hermes TUI/JSON-RPC, or a future stable Hermes ACP path.
 
 **Alternatives considered**:
 
-- Extend `hermes.model` into a nested role map. Rejected because it would not cover Cursor-backed runs or orchestrator chat.
-- Add `review_loop.reviewer_model` and `worker_model`. Rejected because it splits one concern across unrelated sections and leaves orchestrator unresolved.
+- Extend `hermes.model` into a nested role map. Rejected because it would not cover Cursor-backed runs or the planner dashboard/chat surface.
+- Add `review_loop.reviewer_model` and `worker_model`. Rejected because it splits one concern across unrelated sections and leaves the planner unresolved.
 - Require separate Hermes source profiles per role. Rejected as the main contract because it exposes runtime-specific setup and does not help Cursor-backed roles.
 
 ## Decision: Preserve existing defaults through a shared resolver
 
 Resolved role models should use explicit `role_models.<role>` when present. Missing role entries fall back to existing behavior:
 
-- `orchestrator` falls back to the existing general Cursor model path.
+- `planner` falls back to the existing planner/chat model behavior, which currently uses the general Cursor model path where the planner is Cursor-backed.
 - `worker` falls back to the active harness's current model behavior.
 - `reviewer` falls back to the active harness's current model behavior.
 
@@ -79,12 +79,13 @@ Hermes ACP should be represented in tasks as blocked follow-up work, dependent o
 - Drop ACP from the plan entirely. Rejected because the eventual behavior should be documented so task generation does not forget the dependency.
 - Implement ACP best-effort now. Rejected because incomplete ACP substrate would make failures ambiguous and could block delivery of role-model support for stable runtime paths.
 
-## Decision: Treat orchestrator as a service model role, not an `AgentRunRole`
+## Decision: Treat planner as a service model role, not an `AgentRunRole`
 
-Introduce a model-role type for `orchestrator | worker | reviewer` rather than expanding the existing agent run role union immediately.
+Introduce a model-role type for `planner | worker | reviewer` rather than expanding the existing agent run role union immediately.
 
-**Rationale**: Current persisted agent run roles are worker/reviewer. Orchestrator chat and orchestration decisions are service-owned surfaces, not delegated runtime worker/reviewer sessions. Keeping the type separate avoids accidentally granting orchestrator authority to runtime agents.
+**Rationale**: Current persisted agent run roles are worker/reviewer. Planner chat and dashboard planning are service-owned user-facing surfaces backed by the existing planner template, not delegated runtime worker/reviewer sessions. Keeping the type separate avoids accidentally granting planning authority to runtime agents. Keeping `orchestrator` out of the role-model type avoids conflating the user-facing planner with the internal coordination service.
 
 **Alternatives considered**:
 
-- Add `orchestrator` to `AgentRunRole`. Rejected because it would affect many lifecycle, credential, MCP, and tracker surfaces that intentionally model only delegated worker/reviewer runs.
+- Add `planner` to `AgentRunRole`. Rejected because it would affect many lifecycle, credential, MCP, and tracker surfaces that intentionally model only delegated worker/reviewer runs.
+- Add `orchestrator` as a model-role key. Rejected because it would introduce vocabulary drift with the existing planner template and make the service-owned orchestrator look like a user-facing agent role.
