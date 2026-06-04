@@ -57,12 +57,10 @@ describe("AgentCommandPolicyAcpResolver", () => {
       environment: { PATH: "/usr/bin" },
     });
 
-    await expect(resolver(resolverInput(terminalPermissionRequest("git status --short", { field: "cmd" })))).resolves.toEqual({
-      optionId: "allow_once",
+    await expect(resolver(resolverInput(terminalPermissionRequest("git status --short", { field: "cmd" })))).resolves.toMatchObject({ optionId: "allow_once",
       reason: "local_only_inspection",
     });
-    await expect(resolver(resolverInput(terminalPermissionRequest("git status --short", { field: "script" })))).resolves.toEqual({
-      optionId: "allow_once",
+    await expect(resolver(resolverInput(terminalPermissionRequest("git status --short", { field: "script" })))).resolves.toMatchObject({ optionId: "allow_once",
       reason: "local_only_inspection",
     });
 
@@ -92,7 +90,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
         }),
       }),
     });
-    await expect(resolver(input)).resolves.toEqual({ optionId: "allow_once", reason: "local_only_inspection" });
+    await expect(resolver(input)).resolves.toMatchObject({ optionId: "allow_once", reason: "local_only_inspection" });
   });
 
   it("validates and approves ACP file-edit permission requests without command classification", async () => {
@@ -109,7 +107,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
 
     const decision = await resolver(input);
 
-    expect(decision).toEqual({ optionId: "allow_once", reason: "file_edit_operator_approved" });
+    expect(decision).toMatchObject({ optionId: "allow_once", reason: "file_edit_operator_approved" });
     expect(classify).not.toHaveBeenCalled();
     expect(fileEditApproval).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -161,7 +159,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
 
     const decision = await resolver(input);
 
-    expect(decision).toEqual({ optionId: "allow_once", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON });
+    expect(decision).toMatchObject({ optionId: "allow_once", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON });
     expect(classify).not.toHaveBeenCalled();
     expect(fileEditApproval).toHaveBeenCalledTimes(1);
     expect(fileEditApproval).toHaveBeenCalledWith(
@@ -188,8 +186,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
 
     const decision = await resolver(input);
 
-    expect(decision).toEqual({
-      optionId: "deny",
+    expect(decision).toMatchObject({ optionId: "deny",
       reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON,
     });
     expect(classify).not.toHaveBeenCalled();
@@ -216,7 +213,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
 
     const decision = await resolver(input);
 
-    expect(decision).toEqual({ optionId: "deny", reason: "file_edit_approval_error" });
+    expect(decision).toMatchObject({ optionId: "deny", reason: "file_edit_approval_error" });
     expect(classify).not.toHaveBeenCalled();
     expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
       response: { outcome: { outcome: "selected", optionId: "deny" } },
@@ -239,7 +236,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
 
     const decision = await resolver(input);
 
-    expect(decision).toEqual({ optionId: "deny", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON });
+    expect(decision).toMatchObject({ optionId: "deny", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON });
     expect(classify).not.toHaveBeenCalled();
     expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
       response: { outcome: { outcome: "selected", optionId: "deny" } },
@@ -318,7 +315,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
 
     const decision = await resolver(input);
 
-    expect(decision).toEqual({ optionId: "deny", reason });
+    expect(decision).toMatchObject({ optionId: "deny", reason });
     expect(classify).not.toHaveBeenCalled();
     expect(fileEditApproval).not.toHaveBeenCalled();
     expect(resolveHermesAcpPermissionDecision(input.request, decision)).toMatchObject({
@@ -341,7 +338,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
         ...baseInput,
         request: { ...baseInput.request, requestKind: "unknown" },
       }),
-    ).resolves.toEqual({ optionId: null, reason: "unsupported_agent_command_policy_permission_kind" });
+    ).resolves.toMatchObject({ optionId: null, reason: "unsupported_agent_command_policy_permission_kind" });
     expect(classify).not.toHaveBeenCalled();
   });
 
@@ -359,7 +356,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
         rawInput: { command: "git status --short", cmd: "git push origin HEAD" },
       }),
     });
-    await expect(resolver(input)).resolves.toEqual({ optionId: null, reason: "ambiguous_command" });
+    await expect(resolver(input)).resolves.toMatchObject({ optionId: null, reason: "ambiguous_command" });
   });
 
   it("returns cancelled policy decisions for denied upstream terminal commands", async () => {
@@ -373,7 +370,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
 
     const decision = await resolver(resolverInput(terminalPermissionRequest("git push origin HEAD")));
 
-    expect(decision).toEqual({ optionId: null, reason: "upstream_github" });
+    expect(decision).toMatchObject({ optionId: null, reason: "upstream_github" });
     expect(classify).toHaveBeenCalledWith(
       expect.objectContaining({
         surface: "terminal_execute",
@@ -456,24 +453,19 @@ describe("AgentCommandPolicyAcpResolver", () => {
     const allowDecision = allowPolicyDecision({ reasonKind: "local_only_inspection", commandClass: "local_git_inspection" });
     const denyDecision = denyPolicyDecision({ reasonKind: "upstream_github", commandClass: "git_push" });
 
-    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision)).toEqual({
-      optionId: DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision)).toMatchObject({ optionId: DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
       reason: "local_only_inspection",
     });
-    expect(mapAgentCommandPolicyOutcomeToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_session" })).toEqual({
-      optionId: "allow_session",
+    expect(mapAgentCommandPolicyOutcomeToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_session" })).toMatchObject({ optionId: "allow_session",
       reason: "local_only_inspection",
     });
-    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(denyDecision, { allowOptionId: "allow_session" })).toEqual({
-      optionId: null,
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(denyDecision, { allowOptionId: "allow_session" })).toMatchObject({ optionId: null,
       reason: "upstream_github",
     });
-    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "deny" as never })).toEqual({
-      optionId: null,
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "deny" as never })).toMatchObject({ optionId: null,
       reason: "unsupported_agent_command_policy_acp_allow_option",
     });
-    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_always" as never })).toEqual({
-      optionId: null,
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_always" as never })).toMatchObject({ optionId: null,
       reason: "unsupported_agent_command_policy_acp_allow_option",
     });
 
@@ -494,8 +486,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
         environment: { PATH: "/usr/bin" },
       });
 
-      await expect(resolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toEqual({
-        optionId: allowOptionId,
+      await expect(resolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toMatchObject({ optionId: allowOptionId,
         reason: "local_only_inspection",
       });
     },
@@ -504,8 +495,7 @@ describe("AgentCommandPolicyAcpResolver", () => {
   it("selects only allow_once for allowed local terminal inspection by default", async () => {
     const resolver = createAgentCommandPolicyAcpResolver({ environment: { HOME: "/tmp/home", PATH: "/usr/bin" } });
 
-    await expect(resolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toEqual({
-      optionId: "allow_once",
+    await expect(resolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toMatchObject({ optionId: "allow_once",
       reason: "local_only_inspection",
     });
   });
@@ -522,12 +512,10 @@ describe("AgentCommandPolicyAcpResolver", () => {
       },
     });
 
-    await expect(createAgentCommandPolicyAcpResolver()(missingPhaseInput)).resolves.toEqual({
-      optionId: null,
+    await expect(createAgentCommandPolicyAcpResolver()(missingPhaseInput)).resolves.toMatchObject({ optionId: null,
       reason: "missing_agent_command_policy_context",
     });
-    await expect(throwingResolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toEqual({
-      optionId: null,
+    await expect(throwingResolver(resolverInput(terminalPermissionRequest("git status --short")))).resolves.toMatchObject({ optionId: null,
       reason: "classifier_error",
     });
   });

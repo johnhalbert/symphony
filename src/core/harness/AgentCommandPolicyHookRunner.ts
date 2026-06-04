@@ -522,8 +522,9 @@ function appendHookDecisionJournalEntry(journalPath: string, entry: AgentCommand
   try {
     fs.mkdirSync(path.dirname(journalPath), { recursive: true });
     fs.appendFileSync(journalPath, `${JSON.stringify(entry)}\n`, "utf8");
-  } catch {
-    // Preserve the hook's allow/block decision even if best-effort journaling fails.
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to append command policy decision journal at ${journalPath}: ${message}`);
   }
 }
 

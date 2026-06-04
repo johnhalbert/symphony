@@ -60,6 +60,37 @@ describe("agent-command-policy-hook CLI", () => {
     }
   });
 
+  it.each([
+    { name: "allow", input: JSON.stringify(hermesPayload("git status --short")) },
+    { name: "deny", input: JSON.stringify(hermesPayload("git push origin main")) },
+    { name: "fail-closed malformed payload", input: '{"tool_name":"terminal","tool_input":' },
+  ])("exits non-zero when decision journaling fails for $name outcomes", async ({ input }) => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-cli-journal-error-"));
+    try {
+      const result = await runPolicyHookCli({
+        args: [
+          "--role",
+          "worker",
+          "--phase",
+          "implementation",
+          "--issue-id",
+          "issue-1",
+          "--run-id",
+          "run-1",
+          "--decision-journal",
+          tempRoot,
+        ],
+        input,
+      });
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("Failed to append command policy decision journal");
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("uses environment context and keeps stdout empty for allowed local Git inspection", async () => {
     const result = await runPolicyHookCli({
       env: {

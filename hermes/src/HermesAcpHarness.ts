@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
+import type { AgentCommandPolicyDecision } from "../../src/core/harness/AgentCommandPolicy.js";
 import type {
   RunActivityActor,
   RunActivityChannel,
+  RunActivityCommandPolicyDecisionPayload,
   RunActivityEvent,
   RunActivityKind,
 } from "../../src/core/runActivity/RunActivityEvent.js";
@@ -124,6 +126,8 @@ interface HermesAcpLease {
 }
 
 interface ActiveHermesAcpRun {
+  ctx: AgentRunContext;
+  runId: string;
   lease: HermesAcpLease;
   acpSessionId: string | null;
   symphonySessionId: string | null;
@@ -379,6 +383,8 @@ export class HermesAcpHarness implements AgentHarness {
     const leaseAcquisition = await this.getOrCreateLease(ctx, runId);
     const lease = leaseAcquisition.lease;
     const activeRun: ActiveHermesAcpRun = {
+      ctx,
+      runId,
       lease,
       acpSessionId: null,
       symphonySessionId: null,
@@ -492,7 +498,7 @@ export class HermesAcpHarness implements AgentHarness {
       });
     };
     const abort = (): void => {
-      this.markRunCancelling(runId, activeRun);
+      this.markRunCancelling(activeRun);
       void this.interruptActiveRun(activeRun, "abort_signal").catch((error) => {
         ctx.logger.warn("hermes_acp cancel after abort failed", {
           run_id: runId,
@@ -632,11 +638,11 @@ export class HermesAcpHarness implements AgentHarness {
     request: HermesAcpPermissionRequest,
     jsonRpcRequest: HostHermesAcpJsonRpcRequest,
   ): Promise<HermesAcpPermissionResolution> {
-    if (request.malformedReason) return denyHermesAcpPermission(request, request.malformedReason);
-    if (this.isRunCancelling(ctx, runId, activeRun)) return denyHermesAcpPermission(request, "run_cancelled");
+    if (request.malformedReason) return finalizePermissionResolution(ctx, runId, denyHermesAcpPermission(request, request.malformedReason));
+    if (this.isRunCancelling(ctx, runId, activeRun)) return finalizePermissionResolution(ctx, runId, denyHermesAcpPermission(request, "run_cancelled"));
 
     const resolver = this.options.permissionResolver;
-    if (!resolver) return denyHermesAcpPermission(request, "permission_bridge_not_configured");
+    if (!resolver) return finalizePermissionResolution(ctx, runId, denyHermesAcpPermission(request, "permission_bridge_not_configured"));
 
     try {
       const decision = await this.resolvePermissionDecisionUnlessAborted(
@@ -659,12 +665,12 @@ export class HermesAcpHarness implements AgentHarness {
         ),
       );
       if (isHermesAcpPermissionAbort(decision)) {
-        return denyHermesAcpPermission(request, decision.reason);
+        return finalizePermissionResolution(ctx, runId, denyHermesAcpPermission(request, decision.reason));
       }
       if (this.isRunCancelling(ctx, runId, activeRun)) {
-        return denyHermesAcpPermission(request, "run_cancelled");
+        return finalizePermissionResolution(ctx, runId, denyHermesAcpPermission(request, "run_cancelled"));
       }
-      return resolveHermesAcpPermissionDecision(request, decision);
+      return finalizePermissionResolution(ctx, runId, resolveHermesAcpPermissionDecision(request, decision));
     } catch (error) {
       const reason = error instanceof HermesAcpTimeoutError ? "permission_request_timeout" : "permission_bridge_error";
       ctx.logger.warn("hermes_acp permission resolver failed closed", {
@@ -674,14 +680,14 @@ export class HermesAcpHarness implements AgentHarness {
         reason,
         error: errorMessage(error),
       });
-      return denyHermesAcpPermission(request, reason);
+      return finalizePermissionResolution(ctx, runId, denyHermesAcpPermission(request, reason));
     }
   }
 
   async stop(runId: string): Promise<void> {
     const activeRun = this.activeRuns.get(runId);
     if (!activeRun) return;
-    this.markRunCancelling(runId, activeRun);
+    this.markRunCancelling(activeRun);
     await this.interruptActiveRun(activeRun, "stop");
   }
 
@@ -709,16 +715,20 @@ export class HermesAcpHarness implements AgentHarness {
     return ctx.abortSignal.aborted || activeRun.cancelled || this.cancelledRuns.has(runId);
   }
 
-  private markRunCancelling(runId: string, activeRun: ActiveHermesAcpRun): void {
+  private markRunCancelling(activeRun: ActiveHermesAcpRun): void {
     activeRun.cancelled = true;
-    this.cancelledRuns.add(runId);
+    this.cancelledRuns.add(activeRun.runId);
     this.abortPendingPermissionRequests(activeRun, "run_cancelled");
   }
 
   private abortPendingPermissionRequests(activeRun: ActiveHermesAcpRun, reason: string): void {
     for (const pending of activeRun.pendingPermissionRequests.values()) {
       if (pending.auditedTerminalReason === reason) continue;
-      const resolution = denyHermesAcpPermission(pending.request, reason);
+      const resolution = finalizePermissionResolution(
+        activeRun.ctx,
+        activeRun.runId,
+        denyHermesAcpPermission(pending.request, reason),
+      );
       pending.auditedTerminalReason = reason;
       activeRun.emitPermissionResolution?.(resolution, pending.jsonRpcRequestId);
     }
@@ -2817,59 +2827,36 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
     }
     case "permission.resolved": {
       const resolution = event.resolution;
-      const selected = resolution.outcome === "selected";
-      const requestedOptionIds = resolution.request.options.map((option) => option.optionId);
-      const message = selected
-        ? `Host Hermes ACP permission ${resolution.selectedOptionId ?? "selected"} for ${resolution.request.requestKind}`
-        : `Host Hermes ACP permission request denied: ${resolution.reason}`;
-      const payload = {
-        acpJsonRpcRequestId: event.jsonRpcRequestId,
-        requestedOptionIds,
+      const decision = resolution.policyDecision;
+      if (!decision) {
+        throw new Error("Hermes ACP permission resolution was missing a structured policyDecision payload");
+      }
+      const message = permissionResolutionSummary(decision);
+      const eventPayload = {
+        outcome: decision.outcome,
+        reasonKind: decision.reasonKind,
         requestKind: resolution.request.requestKind,
         toolCallId: resolution.request.toolCallId,
-        outcome: resolution.outcome,
-        selectedOptionId: resolution.selectedOptionId,
-        reason: resolution.reason,
-        acpSessionId: resolution.request.sessionId,
-        paramsPreview: preview(resolution.request.params, 500),
+        permissionOutcome: resolution.outcome,
+        hookAction: null,
+        ...(decision.outcome === "allow" ? { selectedOptionId: resolution.selectedOptionId } : {}),
         redacted: true,
       };
       return [
         mappedAgentEvent(
-          selected
-            ? { type: "progress", activitySource: "tool", message }
-            : {
-                type: "run_diagnostic",
-                code: "hermes_acp_permission_denied",
-                message,
-                payload: {
-                  sessionId: resolution.request.sessionId,
-                  acpJsonRpcRequestId: event.jsonRpcRequestId,
-                  requestedOptionIds,
-                  requestKind: resolution.request.requestKind,
-                  toolCallId: resolution.request.toolCallId,
-                  outcome: resolution.outcome,
-                  selectedOptionId: resolution.selectedOptionId,
-                  reason: resolution.reason,
-                  paramsPreview: preview(resolution.request.params, 500),
-                  redacted: true,
-                },
-              },
-          selected
-            ? {
-                actor: "runtime",
-                channel: "diagnostic",
-                kind: "runtime_status_update",
-                text: message,
-                payload: { ...payload, status: "permission_selected" },
-              }
-            : {
-                actor: "runtime",
-                channel: "diagnostic",
-                kind: "runtime_diagnostic",
-                text: message,
-                payload: { ...payload, code: "hermes_acp_permission_denied", severity: "warning" },
-              },
+          {
+            type: "run_diagnostic",
+            code: "command_policy_decision",
+            message,
+            payload: eventPayload,
+          },
+          {
+            actor: "runtime",
+            channel: "diagnostic",
+            kind: "command_policy_decision",
+            text: message,
+            payload: permissionResolutionRunActivityPayload(resolution, decision),
+          },
         ),
       ];
     }
@@ -2897,6 +2884,250 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
         ),
       ];
   }
+}
+
+const ACP_ALLOW_PERMISSION_OPTION_IDS = new Set<string>(["allow_once", "allow_session", "allow_always"]);
+
+function finalizePermissionResolution(
+  ctx: AgentRunContext,
+  runId: string,
+  resolution: HermesAcpPermissionResolution,
+): HermesAcpPermissionResolution {
+  const issueId = nonEmptyString(ctx.issue.id) ?? nonEmptyString(ctx.issue.identifier);
+  return {
+    ...resolution,
+    runId,
+    issueId,
+    policyDecision: resolution.policyDecision ?? fallbackPermissionPolicyDecision(ctx, resolution),
+  };
+}
+
+function fallbackPermissionPolicyDecision(
+  ctx: AgentRunContext,
+  resolution: HermesAcpPermissionResolution,
+): AgentCommandPolicyDecision {
+  const outcome = permissionResolutionOutcome(resolution);
+  const reasonKind = permissionResolutionReasonKind(resolution.reason, outcome, resolution.request.requestKind);
+  const commandClass = permissionResolutionCommandClass(reasonKind, outcome, resolution.request.requestKind);
+  return {
+    attemptId: resolution.request.toolCallId,
+    outcome,
+    reasonKind,
+    commandClass,
+    message: permissionResolutionMessage(reasonKind, outcome, resolution.request.requestKind),
+    requiresCodeChange: false,
+    requiresUserOrServiceFix: permissionResolutionRequiresUserOrServiceFix(reasonKind),
+    audit: {
+      redacted: true,
+      surface: resolution.request.requestKind,
+      role: ctx.role,
+      phase: ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation"),
+      commandClass,
+      inlineEnvironmentKeys: [],
+      unsafeConfigCategories: [],
+      upstreamContactAttempted: false,
+      outcome,
+      reasonKind,
+    },
+  };
+}
+
+function permissionResolutionOutcome(resolution: HermesAcpPermissionResolution): AgentCommandPolicyDecision["outcome"] {
+  if (resolution.policyDecision) return resolution.policyDecision.outcome;
+  if (resolution.outcome === "selected" && resolution.selectedOptionId && ACP_ALLOW_PERMISSION_OPTION_IDS.has(resolution.selectedOptionId)) {
+    return "allow";
+  }
+  return "deny";
+}
+
+function permissionResolutionReasonKind(
+  reason: string,
+  outcome: AgentCommandPolicyDecision["outcome"],
+  requestKind: HermesAcpPermissionRequest["requestKind"],
+): AgentCommandPolicyDecision["reasonKind"] {
+  switch (reason) {
+    case "harness_dispose":
+      return "run_cancelled";
+    case "permission_bridge_not_configured":
+    case "permission_bridge_error":
+    case "permission_request_timeout":
+    case "run_cancelled":
+    case "acp_process_exited":
+    case "malformed_permission_request":
+    case "missing_permission_session_id":
+    case "missing_permission_tool_call":
+    case "missing_permission_tool_call_kind":
+    case "missing_permission_tool_call_id":
+    case "missing_permission_tool_call_content":
+    case "missing_permission_options":
+    case "malformed_permission_options":
+    case "duplicate_permission_options":
+    case "unsupported_permission_tool_call":
+    case "unsupported_permission_options":
+    case "permission_option_not_offered":
+    case "permission_option_not_supported":
+    case "permission_option_selected":
+    case "no_permission_policy":
+    case "file_edit_permission_allowed":
+    case "file_edit_permission_denied":
+    case "file_edit_approval_bridge_not_configured":
+    case "file_edit_approval_error":
+    case "missing_file_edit_diff":
+    case "malformed_file_edit_diff":
+    case "file_edit_diff_too_large":
+    case "invalid_file_edit_path":
+    case "file_edit_path_outside_workspace":
+    case "file_edit_target_path_mismatch":
+    case "missing_file_edit_workspace":
+    case "unsupported_agent_command_policy_permission_kind":
+    case "unsupported_agent_command_policy_acp_allow_option":
+      return reason;
+    default:
+      return requestKind === "file_edit"
+        ? outcome === "allow"
+          ? "file_edit_permission_allowed"
+          : "file_edit_permission_denied"
+        : outcome === "allow"
+          ? "permission_option_selected"
+          : "no_permission_policy";
+  }
+}
+
+function permissionResolutionCommandClass(
+  reasonKind: AgentCommandPolicyDecision["reasonKind"],
+  outcome: AgentCommandPolicyDecision["outcome"],
+  requestKind: HermesAcpPermissionRequest["requestKind"],
+): string {
+  if (requestKind === "file_edit") {
+    switch (reasonKind) {
+      case "file_edit_permission_allowed":
+        return "acp_file_edit_permission_allowed";
+      case "file_edit_permission_denied":
+        return "acp_file_edit_permission_denied";
+      case "file_edit_approval_bridge_not_configured":
+      case "file_edit_approval_error":
+        return "acp_file_edit_approval_bridge";
+      default:
+        return "acp_file_edit_permission_validation";
+    }
+  }
+  switch (reasonKind) {
+    case "permission_bridge_not_configured":
+    case "permission_bridge_error":
+      return "acp_permission_bridge";
+    case "permission_request_timeout":
+      return "acp_permission_timeout";
+    case "run_cancelled":
+      return "acp_permission_cancelled";
+    case "acp_process_exited":
+      return "acp_process_exit";
+    case "permission_option_selected":
+      return outcome === "allow" ? "acp_permission_allowed" : "acp_permission_denied";
+    default:
+      return "acp_permission_validation";
+  }
+}
+
+function permissionResolutionMessage(
+  reasonKind: AgentCommandPolicyDecision["reasonKind"],
+  outcome: AgentCommandPolicyDecision["outcome"],
+  requestKind: HermesAcpPermissionRequest["requestKind"],
+): string {
+  if (requestKind === "file_edit") {
+    switch (reasonKind) {
+      case "file_edit_permission_allowed":
+        return "Allowed ACP file-edit request after Symphony review.";
+      case "file_edit_permission_denied":
+        return "Denied ACP file-edit request during Symphony review.";
+      case "file_edit_approval_bridge_not_configured":
+        return "Blocked ACP file-edit request because the Symphony file-edit approval bridge is not configured.";
+      case "file_edit_approval_error":
+        return "Blocked ACP file-edit request because the Symphony file-edit approval bridge failed closed.";
+      case "missing_file_edit_diff":
+        return "Blocked ACP file-edit request because it did not include an auditable diff.";
+      case "malformed_file_edit_diff":
+        return "Blocked ACP file-edit request because the presented diff was malformed.";
+      case "file_edit_diff_too_large":
+        return "Blocked ACP file-edit request because the presented diff exceeded the allowed audit size.";
+      case "invalid_file_edit_path":
+        return "Blocked ACP file-edit request because the edited path was invalid.";
+      case "file_edit_path_outside_workspace":
+        return "Blocked ACP file-edit request because the edited path was outside the workspace.";
+      case "file_edit_target_path_mismatch":
+        return "Blocked ACP file-edit request because the displayed diff did not match the raw file-edit target paths.";
+      case "missing_file_edit_workspace":
+        return "Blocked ACP file-edit request because the workspace context was incomplete.";
+      default:
+        return outcome === "allow"
+          ? "Allowed ACP file-edit request after Symphony review."
+          : "Blocked ACP file-edit request because it could not be audited safely.";
+    }
+  }
+  switch (reasonKind) {
+    case "permission_option_selected":
+      return outcome === "allow"
+        ? "Allowed ACP permission request via explicit resolver selection."
+        : "Denied ACP permission request via explicit resolver selection.";
+    case "permission_bridge_not_configured":
+      return "Blocked ACP permission request because the Symphony permission bridge is not configured.";
+    case "permission_bridge_error":
+      return "Blocked ACP permission request because the Symphony permission bridge failed closed.";
+    case "permission_request_timeout":
+      return "Blocked ACP permission request because the Symphony permission bridge timed out.";
+    case "run_cancelled":
+      return "Blocked ACP permission request because the active Symphony run was cancelled.";
+    case "acp_process_exited":
+      return "Blocked ACP permission request because the Host Hermes ACP process exited before permission resolution completed.";
+    default:
+      return outcome === "allow"
+        ? "Allowed ACP permission request after Symphony review."
+        : "Blocked ACP permission request because it could not be audited safely.";
+  }
+}
+
+function permissionResolutionRequiresUserOrServiceFix(reasonKind: AgentCommandPolicyDecision["reasonKind"]): boolean {
+  return (
+    reasonKind === "permission_bridge_not_configured" ||
+    reasonKind === "permission_bridge_error" ||
+    reasonKind === "permission_request_timeout" ||
+    reasonKind === "acp_process_exited"
+  );
+}
+
+function permissionResolutionSummary(decision: AgentCommandPolicyDecision): string {
+  return `Command policy ${decision.outcome}: ${decision.reasonKind} (${decision.audit.role} · ${decision.audit.phase} · ${decision.audit.surface})`;
+}
+
+function permissionResolutionRunActivityPayload(
+  resolution: HermesAcpPermissionResolution,
+  decision: AgentCommandPolicyDecision,
+): RunActivityCommandPolicyDecisionPayload {
+  return {
+    decisionId: decision.decisionId ?? null,
+    attemptId: decision.attemptId ?? resolution.request.toolCallId ?? null,
+    runId: resolution.runId ?? null,
+    issueId: resolution.issueId ?? null,
+    surface: decision.audit.surface,
+    role: decision.audit.role,
+    phase: decision.audit.phase,
+    outcome: decision.outcome,
+    reasonKind: decision.reasonKind,
+    commandClass: decision.commandClass,
+    message: decision.message,
+    upstreamContactAttempted: decision.audit.upstreamContactAttempted,
+    ...(decision.requiresCodeChange === undefined ? {} : { requiresCodeChange: decision.requiresCodeChange }),
+    ...(decision.requiresUserOrServiceFix === undefined
+      ? {}
+      : { requiresUserOrServiceFix: decision.requiresUserOrServiceFix }),
+    ...(decision.normalizedCommand === undefined ? {} : { normalizedCommand: decision.normalizedCommand }),
+    audit: decision.audit,
+    requestKind: resolution.request.requestKind,
+    toolCallId: resolution.request.toolCallId,
+    ...(decision.outcome === "allow" ? { selectedOptionId: resolution.selectedOptionId } : {}),
+    permissionOutcome: resolution.outcome,
+    hookAction: null,
+    redacted: true,
+  };
 }
 
 function acpLogTailPayload(lease: HermesAcpLease): { lines: string[]; lineCount: number } | null {

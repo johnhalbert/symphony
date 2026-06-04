@@ -128,20 +128,159 @@ export function mapAgentCommandPolicyDecisionToAcpPermissionDecision(
   decision: AgentCommandPolicyDecision,
   options: AgentCommandPolicyAcpOutcomeMapperOptions = {},
 ): HermesAcpPermissionDecision {
-  if (decision.outcome === "deny") return { optionId: null, reason: decision.reasonKind };
+  if (decision.outcome === "deny") return { optionId: null, reason: decision.reasonKind, policyDecision: decision };
 
   const allowOptionId = normalizeAgentCommandPolicyAcpAllowOptionId(
     options.allowOptionId ?? DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
   );
   if (!allowOptionId) {
-    return { optionId: null, reason: "unsupported_agent_command_policy_acp_allow_option" };
+    return { optionId: null, reason: "unsupported_agent_command_policy_acp_allow_option", policyDecision: decision };
   }
 
-  return { optionId: allowOptionId, reason: decision.reasonKind };
+  return { optionId: allowOptionId, reason: decision.reasonKind, policyDecision: decision };
 }
 
 export const mapAgentCommandPolicyOutcomeToAcpPermissionDecision = mapAgentCommandPolicyDecisionToAcpPermissionDecision;
 
+function acpResolverRunPhase(input: HermesAcpPermissionResolverInput): string {
+  return input.ctx.runPhase ?? (input.ctx.role === "reviewer" ? "review" : "implementation");
+}
+
+function fileEditPolicyDecisionForAcpPermission(input: HermesAcpPermissionResolverInput, policy: {
+  outcome: AgentCommandPolicyDecision["outcome"];
+  reasonKind: AgentCommandPolicyDecision["reasonKind"];
+  commandClass: string;
+  message: string;
+}): AgentCommandPolicyDecision {
+  return {
+    attemptId: input.request.toolCallId,
+    outcome: policy.outcome,
+    reasonKind: policy.reasonKind,
+    commandClass: policy.commandClass,
+    message: policy.message,
+    requiresCodeChange: false,
+    requiresUserOrServiceFix: policy.outcome === "deny",
+    audit: {
+      redacted: true,
+      surface: input.request.requestKind,
+      role: input.ctx.role,
+      phase: acpResolverRunPhase(input),
+      commandClass: policy.commandClass,
+      inlineEnvironmentKeys: [],
+      unsafeConfigCategories: [],
+      upstreamContactAttempted: false,
+      outcome: policy.outcome,
+      reasonKind: policy.reasonKind,
+    },
+  };
+}
+
+function fileEditReasonKind(reason: string, outcome: AgentCommandPolicyDecision["outcome"]): AgentCommandPolicyDecision["reasonKind"] {
+  switch (reason) {
+    case DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON:
+      return "file_edit_permission_allowed";
+    case DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON:
+      return "file_edit_permission_denied";
+    case DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON:
+      return "file_edit_approval_bridge_not_configured";
+    case "file_edit_approval_error":
+      return "file_edit_approval_error";
+    case "missing_file_edit_diff":
+      return "missing_file_edit_diff";
+    case "malformed_file_edit_diff":
+      return "malformed_file_edit_diff";
+    case "file_edit_diff_too_large":
+      return "file_edit_diff_too_large";
+    case "invalid_file_edit_path":
+      return "invalid_file_edit_path";
+    case "file_edit_path_outside_workspace":
+      return "file_edit_path_outside_workspace";
+    case "file_edit_target_path_mismatch":
+      return "file_edit_target_path_mismatch";
+    case "missing_file_edit_workspace":
+      return "missing_file_edit_workspace";
+    case "missing_permission_tool_call":
+      return "missing_permission_tool_call";
+    case "missing_permission_tool_call_id":
+      return "missing_permission_tool_call_id";
+    case "unsupported_agent_command_policy_permission_kind":
+      return "unsupported_agent_command_policy_permission_kind";
+    default:
+      return outcome === "allow" ? "file_edit_permission_allowed" : "file_edit_permission_denied";
+  }
+}
+
+function fileEditCommandClass(reasonKind: AgentCommandPolicyDecision["reasonKind"]): string {
+  switch (reasonKind) {
+    case "file_edit_permission_allowed":
+      return "acp_file_edit_permission_allowed";
+    case "file_edit_permission_denied":
+      return "acp_file_edit_permission_denied";
+    case "file_edit_approval_bridge_not_configured":
+    case "file_edit_approval_error":
+      return "acp_file_edit_approval_bridge";
+    default:
+      return "acp_file_edit_permission_validation";
+  }
+}
+
+function fileEditDecisionMessage(reasonKind: AgentCommandPolicyDecision["reasonKind"], outcome: AgentCommandPolicyDecision["outcome"]): string {
+  switch (reasonKind) {
+    case "file_edit_permission_allowed":
+      return "Allowed ACP file-edit request after Symphony review.";
+    case "file_edit_permission_denied":
+      return "Denied ACP file-edit request during Symphony review.";
+    case "file_edit_approval_bridge_not_configured":
+      return "Blocked ACP file-edit request because the Symphony file-edit approval bridge is not configured.";
+    case "file_edit_approval_error":
+      return "Blocked ACP file-edit request because the Symphony file-edit approval bridge failed closed.";
+    case "missing_file_edit_diff":
+      return "Blocked ACP file-edit request because it did not include an auditable diff.";
+    case "malformed_file_edit_diff":
+      return "Blocked ACP file-edit request because the presented diff was malformed.";
+    case "file_edit_diff_too_large":
+      return "Blocked ACP file-edit request because the presented diff exceeded the allowed audit size.";
+    case "invalid_file_edit_path":
+      return "Blocked ACP file-edit request because the edited path was invalid.";
+    case "file_edit_path_outside_workspace":
+      return "Blocked ACP file-edit request because the edited path was outside the workspace.";
+    case "file_edit_target_path_mismatch":
+      return "Blocked ACP file-edit request because the displayed diff did not match the raw file-edit target paths.";
+    case "missing_file_edit_workspace":
+      return "Blocked ACP file-edit request because the workspace context was incomplete.";
+    default:
+      return outcome === "allow"
+        ? "Allowed ACP file-edit request after Symphony review."
+        : "Blocked ACP file-edit request because it could not be audited safely.";
+  }
+}
+
+function fileEditPolicyDecisionResult(
+  input: HermesAcpPermissionResolverInput,
+  decision: HermesAcpPermissionDecision,
+): HermesAcpPermissionDecision {
+  const decisionRecord = typeof decision === "object" && decision !== null ? decision : {};
+  const optionId = "optionId" in decisionRecord ? decisionRecord.optionId ?? null : null;
+  const reason =
+    typeof decisionRecord.reason === "string" && decisionRecord.reason.length > 0
+      ? decisionRecord.reason
+      : optionId === "allow_once"
+        ? DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON
+        : DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON;
+  const outcome = optionId === "allow_once" ? "allow" : "deny";
+  const reasonKind = fileEditReasonKind(reason, outcome);
+  return {
+    ...decisionRecord,
+    optionId,
+    reason,
+    policyDecision: fileEditPolicyDecisionForAcpPermission(input, {
+      outcome,
+      reasonKind,
+      commandClass: fileEditCommandClass(reasonKind),
+      message: fileEditDecisionMessage(reasonKind, outcome),
+    }),
+  };
+}
 export function isAgentCommandPolicyAcpAllowOptionId(value: unknown): value is AgentCommandPolicyAcpAllowOptionId {
   return typeof value === "string" && AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_IDS.has(value);
 }
@@ -240,6 +379,7 @@ export function buildAgentCommandPolicyFileEditApprovalRequestForAcpPermission(
 }
 
 export function mapAgentCommandPolicyFileEditApprovalOutcomeToAcpPermissionDecision(
+  input: HermesAcpPermissionResolverInput,
   outcome: AgentCommandPolicyAcpFileEditApprovalOutcome,
 ): HermesAcpPermissionDecision {
   const normalized = typeof outcome === "string" ? { outcome, reason: null } : outcome;
@@ -247,12 +387,21 @@ export function mapAgentCommandPolicyFileEditApprovalOutcomeToAcpPermissionDecis
   switch (normalized.outcome) {
     case "approve":
     case "allow":
-      return { optionId: "allow_once", reason: reason ?? DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON };
+      return fileEditPolicyDecisionResult(input, {
+        optionId: "allow_once",
+        reason: reason ?? DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_REASON,
+      });
     case "deny":
     case "reject":
-      return { optionId: "deny", reason: reason ?? DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON };
+      return fileEditPolicyDecisionResult(input, {
+        optionId: "deny",
+        reason: reason ?? DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON,
+      });
     case "cancel":
-      return { optionId: null, reason: reason ?? DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON };
+      return fileEditPolicyDecisionResult(input, {
+        optionId: null,
+        reason: reason ?? DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_DENY_REASON,
+      });
   }
 }
 
@@ -263,16 +412,16 @@ async function resolveAgentCommandPolicyFileEditAcpPermission(
   const approvalRequest = buildAgentCommandPolicyFileEditApprovalRequestForAcpPermission(input, {
     maxFileEditDiffBytes: options.maxFileEditDiffBytes,
   });
-  if (approvalRequest.status === "error") return { optionId: "deny", reason: approvalRequest.reason };
+  if (approvalRequest.status === "error") return fileEditPolicyDecisionResult(input, { optionId: "deny", reason: approvalRequest.reason });
 
   try {
     if (!options.fileEditApproval) {
-      return { optionId: "deny", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON };
+      return fileEditPolicyDecisionResult(input, { optionId: "deny", reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON });
     }
     const outcome = await options.fileEditApproval(approvalRequest.request, input);
-    return mapAgentCommandPolicyFileEditApprovalOutcomeToAcpPermissionDecision(outcome);
+    return mapAgentCommandPolicyFileEditApprovalOutcomeToAcpPermissionDecision(input, outcome);
   } catch {
-    return { optionId: "deny", reason: "file_edit_approval_error" };
+    return fileEditPolicyDecisionResult(input, { optionId: "deny", reason: "file_edit_approval_error" });
   }
 }
 

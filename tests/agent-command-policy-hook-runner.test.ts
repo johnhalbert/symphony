@@ -283,6 +283,57 @@ subprocess.run(["gh", "pr", "create", "--fill"])`;
     }
   });
 
+  it.each([
+    {
+      name: "allow",
+      input: JSON.stringify(hermesPayload({ command: "git status --short" })),
+      classify: (input: Parameters<typeof decisionFor>[0]) =>
+        decisionFor(input, "allow", {
+          reasonKind: "local_only_inspection",
+          commandClass: "local_git_inspection",
+          message: "allowed through stdio",
+        }),
+    },
+    {
+      name: "deny",
+      input: JSON.stringify(hermesPayload({ command: "git push origin main" })),
+      classify: (input: Parameters<typeof decisionFor>[0]) =>
+        decisionFor(input, "deny", {
+          reasonKind: "direct_upstream_github",
+          commandClass: "direct_upstream_git_operation",
+          message: "blocked through stdio",
+        }),
+    },
+    {
+      name: "fail-closed malformed payload",
+      input: '{"tool_name":"terminal","tool_input":',
+      classify: (input: Parameters<typeof decisionFor>[0]) =>
+        decisionFor(input, "deny", {
+          reasonKind: "malformed_hook_payload",
+          commandClass: "malformed_hermes_hook_payload",
+          message: "blocked malformed payload",
+        }),
+    },
+  ])("surfaces journal append failures for $name stdio decisions", async ({ input, classify }) => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-journal-error-"));
+    try {
+      await expect(
+        runAgentCommandPolicyHookStdio({
+          input: Readable.from([input]),
+          output: new CapturingWritable(),
+          role: "worker",
+          phase: "implementation",
+          issueId: "issue-1",
+          runId: "run-1",
+          journalPath: tempRoot,
+          classify,
+        }),
+      ).rejects.toThrow(/Failed to append command policy decision journal/);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("keeps stdout empty for allowed stdio evaluations", async () => {
     const output = new CapturingWritable();
 

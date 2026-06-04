@@ -656,7 +656,7 @@ function hookDecisionRunActivity(
   const payload: RunActivityCommandPolicyDecisionPayload = {
     decisionId: entry.decision.decisionId ?? null,
     attemptId: entry.decision.attemptId ?? entry.toolCallId ?? null,
-    runId: entry.runId,
+    runId: context.runId,
     issueId: entry.issueId,
     surface: entry.decision.audit.surface,
     role: entry.decision.audit.role,
