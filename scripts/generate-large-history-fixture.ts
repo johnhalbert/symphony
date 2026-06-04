@@ -8,6 +8,7 @@ import { Command } from "commander";
 import { PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON } from "../src/core/CompletionReportService.js";
 import type { OperatorApprovalRecord, OperatorApprovalStatus } from "../src/core/approval/OperatorApprovalService.js";
 import { buildIssueHandoffState, type IssueCompletionReportRecord, type IssueLifecyclePhase, type IssueLifecycleRecord, type IssueLifecycleSummaryPointers, type IssueReviewVerdictRecord } from "../src/core/persistence/IssueLifecycleStore.js";
+import { DEFAULT_ORCHESTRATOR_CONVERSATION_ID, FileOrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
 import type { RunRecord, RunStatus, TranscriptEvent, WorkspaceRecord } from "../src/core/persistence/RunTranscriptStore.js";
 import type { ProviderLimitSignal } from "../src/core/provider/ProviderLimits.js";
 import type { WritebackOperation, WritebackStatus } from "../src/core/writeback/WritebackOutbox.js";
@@ -77,11 +78,13 @@ export interface LargeHistoryFixtureManifest {
     transcriptEvents: number;
     approvalRequests: number;
     writebackOperations: number;
+    orchestratorMessages: number;
   };
   apiHints: {
     historyEndpoint: string;
     issueHistoryEndpointTemplate: string;
     transcriptEndpointTemplate: string;
+    orchestratorChatEndpointTemplate: string;
     stateDirUsage: string;
   };
   issues: LargeHistoryFixtureIssueSummary[];
@@ -124,6 +127,8 @@ export async function generateLargeHistoryFixture(
     writebackOperationCount += result.writebackOperations;
   }
 
+  const orchestratorMessageCount = await writeFixtureOrchestratorConversation(options, issues, baseMs);
+
   const manifest: LargeHistoryFixtureManifest = {
     version: 1,
     generator: "scripts/generate-large-history-fixture.ts",
@@ -145,11 +150,13 @@ export async function generateLargeHistoryFixture(
       transcriptEvents: transcriptEventCount,
       approvalRequests: approvalRequestCount,
       writebackOperations: writebackOperationCount,
+      orchestratorMessages: orchestratorMessageCount,
     },
     apiHints: {
       historyEndpoint: "/api/v1/web/history?limit=100&offset=0",
       issueHistoryEndpointTemplate: "/api/v1/web/history?issue={issueIdentifier}&limit=100&offset=0",
       transcriptEndpointTemplate: "/api/v1/web/sessions/{sessionId}/transcript?limit=100&offset=0",
+      orchestratorChatEndpointTemplate: "/api/v1/web/orchestrator-chat?conversationId={conversationId}",
       stateDirUsage: "Point workspace.state_dir at this directory, then start the Symphony status server and browse /api/v1/web/history.",
     },
     issues,
@@ -324,6 +331,75 @@ async function writeFixtureIssue(
     approvalRequests: approvalRecords.length,
     writebackOperations: writebackOperations.length,
   };
+}
+
+async function writeFixtureOrchestratorConversation(
+  options: NormalizedLargeHistoryFixtureOptions,
+  issues: readonly LargeHistoryFixtureIssueSummary[],
+  baseMs: number,
+): Promise<number> {
+  const conversationStore = new FileOrchestratorConversationStore(options.outputDir);
+  await conversationStore.createConversation({
+    conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+    status: "completed",
+    at: iso(baseMs - 60_000),
+    metadata: {
+      source: "large_history_fixture",
+      issueCount: options.issueCount,
+      runsPerIssue: options.runsPerIssue,
+    },
+  });
+
+  let messageCount = 0;
+  for (const [issueIndex, issue] of issues.entries()) {
+    for (const [runIndex, runId] of issue.runIds.entries()) {
+      const messageBaseMs = baseMs + issueIndex * 60 * 60 * 1000 + runIndex * 15 * 60 * 1000;
+      const runOrdinal = pad(runIndex + 1, 2);
+      const messagePrefix = `fixture-chat-${issue.identifier.toLowerCase()}-${runOrdinal}`;
+      const sharedMetadata = {
+        source: "large_history_fixture",
+        issueIdentifier: issue.identifier,
+        workspaceKey: issue.workspaceKey,
+        runId,
+      };
+
+      await conversationStore.appendMessage({
+        conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+        id: `${messagePrefix}-user`,
+        role: "user",
+        body: `Summarize durable projection coverage for ${issue.identifier} run ${runOrdinal}.`,
+        status: "completed",
+        at: iso(messageBaseMs),
+        metadata: { ...sharedMetadata, historyIndex: messageCount + 1, messageKind: "prompt" },
+      });
+      messageCount += 1;
+
+      await conversationStore.appendMessage({
+        conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+        id: `${messagePrefix}-assistant`,
+        role: "assistant",
+        body: `Projection cache review for ${issue.identifier} run ${runOrdinal} is complete.`,
+        status: "completed",
+        at: iso(messageBaseMs + 1_000),
+        metadata: { ...sharedMetadata, historyIndex: messageCount + 1, messageKind: "summary" },
+        transcriptLinks: [{ runId, sequence: 1, eventType: "user_prompt" }],
+      });
+      messageCount += 1;
+
+      await conversationStore.appendMessage({
+        conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+        id: `${messagePrefix}-server`,
+        role: "server",
+        body: `Cached dashboard, issue board, history, sidebar, transcript, and chat projections are ready for ${issue.identifier}.`,
+        status: "completed",
+        at: iso(messageBaseMs + 2_000),
+        metadata: { ...sharedMetadata, historyIndex: messageCount + 1, messageKind: "status" },
+      });
+      messageCount += 1;
+    }
+  }
+
+  return messageCount;
 }
 
 function buildRunRecord(input: {

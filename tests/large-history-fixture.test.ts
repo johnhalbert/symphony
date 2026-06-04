@@ -7,6 +7,7 @@ import { projectWebTranscript } from "../src/app/WebTranscriptProjection.js";
 import { approvalMatchesReport, isAwaitingPublicationApprovalLifecycle, pendingPublicationReport } from "../src/core/CompletionReportService.js";
 import { FileOperatorApprovalStore } from "../src/core/approval/OperatorApprovalService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { DEFAULT_ORCHESTRATOR_CONVERSATION_ID, FileOrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { generateLargeHistoryFixture } from "../scripts/generate-large-history-fixture.js";
@@ -41,6 +42,7 @@ describe("generateLargeHistoryFixture", () => {
       transcriptEvents: 192,
       approvalRequests: 6,
       writebackOperations: 30,
+      orchestratorMessages: 72,
     });
     expect(manifest.issues[0]).toMatchObject({
       id: "fixture-issue-0001",
@@ -48,9 +50,11 @@ describe("generateLargeHistoryFixture", () => {
       workspaceKey: "LH-0001",
       runIds: ["fixture-run-0001-01", "fixture-run-0001-02", "fixture-run-0001-03", "fixture-run-0001-04"],
     });
+    expect(manifest.apiHints.orchestratorChatEndpointTemplate).toBe("/api/v1/web/orchestrator-chat?conversationId={conversationId}");
 
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const orchestratorConversationStore = new FileOrchestratorConversationStore(stateDir);
     const writebackStore = new FileWritebackOutboxStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
 
@@ -72,6 +76,27 @@ describe("generateLargeHistoryFixture", () => {
     const transcriptTail = await runStore.readTranscriptTail("fixture-run-0001-01", { limit: 3 });
     expect(transcriptTail.offset).toBe(5);
     expect(transcriptTail.events.map((event) => event.sequence)).toEqual([6, 7, 8]);
+
+    const orchestratorConversation = await orchestratorConversationStore.getConversation(DEFAULT_ORCHESTRATOR_CONVERSATION_ID);
+    expect(orchestratorConversation).toMatchObject({
+      conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
+      status: "completed",
+      metadata: { source: "large_history_fixture", issueCount: 6, runsPerIssue: 4 },
+    });
+    const orchestratorMessages = await orchestratorConversationStore.listMessages(DEFAULT_ORCHESTRATOR_CONVERSATION_ID);
+    expect(orchestratorMessages).toHaveLength(manifest.counts.orchestratorMessages);
+    expect(orchestratorMessages[0]).toMatchObject({
+      role: "user",
+      metadata: { issueIdentifier: "LH-0001", runId: "fixture-run-0001-01", historyIndex: 1, messageKind: "prompt" },
+    });
+    expect(orchestratorMessages[1]).toMatchObject({
+      role: "assistant",
+      transcriptLinks: [{ runId: "fixture-run-0001-01", sequence: 1, eventType: "user_prompt" }],
+    });
+    expect(orchestratorMessages.at(-1)).toMatchObject({
+      role: "server",
+      metadata: { issueIdentifier: "LH-0006", runId: "fixture-run-0006-04", messageKind: "status" },
+    });
 
     const lifecycles = await lifecycleStore.list();
     expect(lifecycles).toHaveLength(6);
