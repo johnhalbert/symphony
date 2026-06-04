@@ -548,7 +548,7 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
-  it("emits typed realtime events and freshness payloads from durable transcript and orchestrator projection publications", async () => {
+  it("emits typed realtime events and freshness payloads from durable transcript publications and suppresses patchless durable orchestrator chat events", async () => {
     const projectionWriter = fakeProjectionWriter();
     const server = createRealtimeServer({ projectionWriter });
     const address = await server.start();
@@ -705,7 +705,6 @@ describe("StatusServer realtime SSE API", () => {
 
       const chatProjection = await client.nextEventOfType("projection.updated");
       const chatSource = await client.nextEventOfType("source.status");
-      const chat = await client.nextEventOfType("orchestrator.message");
 
       expect(chatProjection.data).toMatchObject({
         type: "projection.updated",
@@ -729,24 +728,7 @@ describe("StatusServer realtime SSE API", () => {
           ]),
         },
       });
-      expect(chat.data).toMatchObject({
-        type: "orchestrator.message",
-        scope: "orchestrator",
-        key: "operator-room",
-        source: { source: "orchestrator_chat_projection:conversation:operator-room", revision: 12 },
-        payload: {
-          conversationId: "operator-room",
-          conversationStatus: "completed",
-          state: "completed",
-          messageCount: 3,
-          latestMessageSequence: 3,
-          latestMessageUpdatedAt: "2026-01-01T00:00:03.500Z",
-          lastMessageId: "message-3",
-          lastMessageStatus: "completed",
-          lastMessageAt: "2026-01-01T00:00:03.500Z",
-          chat: null,
-        },
-      });
+      await expect(client.nextEventOfType("orchestrator.message", 150)).rejects.toThrow(/Timed out waiting for SSE event/);
     } finally {
       await client.close();
       await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "SSE subscriber to disconnect");
@@ -1339,7 +1321,7 @@ describe("StatusServer realtime SSE API", () => {
 
   it("emits missed-event recovery hints, replays post-recovery publications, and orchestrator chat message events", async () => {
     const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state"));
-    const projectionWriter = fakeProjectionWriter();
+    const projectionWriter = fakeProjectionWriterPublishingWrites();
     const server = createRealtimeServer({ orchestratorConversationStore, projectionWriter });
     const address = await server.start();
     const baseUrl = `http://${address.host}:${address.port}`;
@@ -1428,6 +1410,28 @@ describe("StatusServer realtime SSE API", () => {
           "/api/v1/web/orchestrator-chat",
         );
 
+        const projectionSource = "orchestrator_chat_projection:conversation:orchestrator-default";
+        const persistedProjection = await nextEventOfTypeFromSource(chatClient, "projection.updated", projectionSource);
+        expect(persistedProjection.data).toMatchObject({
+          type: "projection.updated",
+          source: { source: projectionSource, revision: expect.any(Number) },
+          payload: { resourcesChanged: ["orchestrator-chat", "sidebar", "dashboard"] },
+        });
+
+        const persistedFreshness = await nextEventOfTypeFromSource(chatClient, "source.status", projectionSource);
+        expect(persistedFreshness.data).toMatchObject({
+          type: "source.status",
+          source: { source: projectionSource, revision: expect.any(Number) },
+          payload: {
+            sourceCursors: {
+              conversationKey: "orchestrator-default",
+              messageCount: 1,
+              lastMessageId: expect.any(String),
+              lastMessageStatus: "pending",
+            },
+          },
+        });
+
         const chat = await nextEventOfTypeFromSource(chatClient, "orchestrator.message", "orchestrator-chat");
         expect(chat.data).toMatchObject({
           type: "orchestrator.message",
@@ -1478,6 +1482,9 @@ describe("StatusServer realtime SSE API", () => {
           recovery: { strategy: "refetch", reason: "event" },
         });
         expect((chat.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/orchestrator-chat");
+        await expect(nextEventOfTypeFromSource(chatClient, "orchestrator.message", projectionSource, 150)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
       } finally {
         await chatClient.close();
       }
@@ -1625,12 +1632,13 @@ describe("StatusServer realtime SSE API", () => {
       const orchestratorConversationStore = new FileOrchestratorConversationStore(
         path.join(root, `chat-state-${resultStatus}`),
       );
+      const projectionWriter = fakeProjectionWriterPublishingWrites();
       const orchestrator = fakeOrchestrator();
       orchestrator.dispatchOrchestratorChatCommand = async () => ({
         status: resultStatus,
         reason: `test_${resultStatus}`,
       });
-      const server = createRealtimeServer({ orchestratorConversationStore, orchestrator });
+      const server = createRealtimeServer({ orchestratorConversationStore, orchestrator, projectionWriter });
       const address = await server.start();
       const baseUrl = `http://${address.host}:${address.port}`;
       const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
@@ -1656,6 +1664,28 @@ describe("StatusServer realtime SSE API", () => {
               status: resultStatus,
             }),
           ],
+        });
+
+        const projectionSource = "orchestrator_chat_projection:conversation:orchestrator-default";
+        const persistedProjection = await nextEventOfTypeFromSource(client, "projection.updated", projectionSource);
+        expect(persistedProjection.data).toMatchObject({
+          type: "projection.updated",
+          source: { source: projectionSource, revision: expect.any(Number) },
+          payload: { resourcesChanged: ["orchestrator-chat", "sidebar", "dashboard"] },
+        });
+
+        const persistedFreshness = await nextEventOfTypeFromSource(client, "source.status", projectionSource);
+        expect(persistedFreshness.data).toMatchObject({
+          type: "source.status",
+          source: { source: projectionSource, revision: expect.any(Number) },
+          payload: {
+            sourceCursors: {
+              conversationKey: "orchestrator-default",
+              messageCount: 1,
+              lastMessageId: expect.any(String),
+              lastMessageStatus: resultStatus,
+            },
+          },
         });
 
         const chat = await nextEventOfTypeFromSource(client, "orchestrator.message", "orchestrator-chat");
@@ -1698,6 +1728,9 @@ describe("StatusServer realtime SSE API", () => {
           recovery: { strategy: "refetch", reason: "event" },
         });
         expect((chat.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/orchestrator-chat");
+        await expect(nextEventOfTypeFromSource(client, "orchestrator.message", projectionSource, 150)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
       } finally {
         await client.close();
         await server.stop();
@@ -1797,6 +1830,75 @@ function fakeProjectionWriter(): FakeProjectionWriter {
       for (const listener of Array.from(listeners)) listener(publication);
     },
   };
+}
+
+function fakeProjectionWriterPublishingWrites(): FakeProjectionWriter {
+  const writer = fakeProjectionWriter();
+  let nextRevision = 100;
+  return {
+    ...writer,
+    async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
+      const revision = nextRevision;
+      nextRevision += 1;
+      const generatedAt = normalizeProjectionWriteTimestamp(input.generatedAt, revision);
+      const publication = projectionPublication({
+        projectionName: input.projectionName,
+        scopeKind: input.scopeKind ?? "global",
+        scopeKey: input.scopeKey ?? "global",
+        projectionRevisionId: `projection-revision-write-${revision}`,
+        revision,
+        buildMode: input.buildMode ?? "incremental",
+        contentSha256: input.contentSha256 ?? `projection-sha-${revision}`,
+        generatedAt,
+        expiresAt: normalizeOptionalProjectionWriteTimestamp(input.expiresAt),
+        sourceRevisions: (input.sourceRevisions ?? []).map((sourceRevision) => ({
+          source: sourceRevision.source,
+          revision: sourceRevision.revision,
+          observedAt: normalizeOptionalProjectionWriteTimestamp(sourceRevision.observedAt),
+        })),
+        sourceCursors: (input.sourceCursors ?? {}) as ProjectionRevisionPublication["sourceCursors"],
+        sourceFreshness: [],
+      });
+      writer.publish(publication);
+      return {
+        status: "written",
+        revision: {
+          projectionRevisionId: publication.projectionRevisionId,
+          projectionName: publication.projectionName,
+          scopeKind: publication.scopeKind,
+          scopeKey: publication.scopeKey,
+          revision: publication.revision,
+          buildMode: publication.buildMode,
+          sourceRevisions: publication.sourceRevisions,
+          sourceCursors: publication.sourceCursors,
+          sourceFreshness: publication.sourceFreshness,
+          contentSha256: publication.contentSha256,
+          generatedAt: publication.generatedAt,
+          expiresAt: publication.expiresAt,
+          supersededAt: null,
+          createdAt: publication.generatedAt,
+        },
+        previousRevision: null,
+        requestedBuildMode: input.buildMode ?? "incremental",
+        buildMode: publication.buildMode,
+        contentSha256: publication.contentSha256,
+        payloadSha256: input.payloadSha256 ?? publication.contentSha256,
+        event: publication,
+      };
+    },
+  };
+}
+
+function normalizeProjectionWriteTimestamp(value: Date | string | undefined, revision: number): string {
+  if (typeof value === "string") return value;
+  if (value instanceof Date) return value.toISOString();
+  return new Date(Date.UTC(2026, 0, 1, 0, 0, revision)).toISOString();
+}
+
+function normalizeOptionalProjectionWriteTimestamp(value: Date | string | null | undefined): string | null {
+  if (typeof value === "string") return value;
+  if (value instanceof Date) return value.toISOString();
+  return value ?? null;
 }
 
 function fakeOrchestrator(): Orchestrator {

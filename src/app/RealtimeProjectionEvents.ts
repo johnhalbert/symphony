@@ -1005,7 +1005,11 @@ function realtimeEventTypesForSourceRevision(revision: WebProjectionSourceRevisi
   if (isTranscriptRealtimeSource(source, projectionName)) {
     types.push("run.updated", "transcript.delta");
   }
-  if (isOrchestratorChatRealtimeSource(source, projectionName)) {
+  if (
+    isOrchestratorChatRealtimeSource(source, projectionName) &&
+    (!isDurableOrchestratorChatProjectionSource(source, projectionName) ||
+      realtimeDetailHasOrchestratorPatchPayload(revision.detail ?? null))
+  ) {
     types.push("orchestrator.message");
   }
   return types;
@@ -1033,6 +1037,14 @@ function isOrchestratorChatRealtimeSource(source: string, projectionName: string
     projectionName === "orchestrator_chat_projection" ||
     source.startsWith("orchestrator_chat_projection:")
   );
+}
+
+function isDurableOrchestratorChatProjectionSource(source: string, projectionName: string | null): boolean {
+  return projectionName === "orchestrator_chat_projection" || source.startsWith("orchestrator_chat_projection:");
+}
+
+function realtimeDetailHasOrchestratorPatchPayload(detail: RealtimeProjectionEventDetail | null): boolean {
+  return readChatPatchMessages(detail) !== null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
