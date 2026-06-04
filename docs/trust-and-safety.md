@@ -34,7 +34,17 @@ Linear writeback should be idempotent and should re-check current Linear state b
 
 Dogfood dispatch is opt-in. The reference `WORKFLOW.md` requires `dogfood-ready` and excludes `dogfood-blocked` and `safety-blocked`.
 
-Operators must not add `dogfood-ready` or remove `dogfood-blocked` for an agent-eligible issue until the issue uses the required authoring sections from [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md): `Problem / Goal`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`. The `Validation Requirements` section must include a concrete validation plan, and the `Contract Checklist` must be reviewed for the touched surfaces before promotion.
+Operators must not add `dogfood-ready` or remove `dogfood-blocked` for an
+agent-eligible issue until the issue uses the required authoring sections from
+[`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md):
+`Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`,
+`Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and
+`Promotion Readiness`. The `Issue Contract` section MUST contain a fenced
+`json` block with positive `schemaVersion`, non-empty `contractVersion`, and a
+non-empty `requirements` array whose entries have stable unique `id` values and
+non-empty `requirement` text. The `Validation Requirements` section must
+include a concrete validation plan, and the `Contract Checklist` must be
+reviewed for the touched surfaces before promotion.
 
 The template explicitly forbids secrets, tokens, private keys, credential values, and private customer data in issue descriptions. Issues should describe credential/security variants without including credential material.
 

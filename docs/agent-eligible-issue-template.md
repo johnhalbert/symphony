@@ -1,13 +1,37 @@
 # Agent-Eligible Linear Issue Template
 
-Use this template before an issue is promoted for Symphony agent dispatch. It applies to docs-only issues and implementation issues; keep the section names exactly as written so prompt guidance, reviewers, and doctor lint all evaluate the same contract.
+Use this template before an issue is promoted for Symphony agent dispatch. It
+applies to docs-only issues and implementation issues. The fenced JSON issue
+contract is mandatory and authoritative; the prose sections help humans,
+workers, reviewers, and doctor lint interpret the work but do not replace the
+JSON requirements.
 
 Do not include secrets, tokens, private keys, credential values, or private customer data. Describe credential boundaries and required credential states without pasting values.
 
-```markdown
+````markdown
 ## Problem / Goal
 
 Describe the workflow-visible or user-visible problem and the intended outcome.
+
+## Issue Contract
+
+Every issue must include this fenced JSON block. Add one object to
+`requirements` for each required obligation. Keep `id` values stable and unique
+within the issue. Update `contractVersion` when obligations materially change.
+
+```json
+{
+  "schemaVersion": 1,
+  "contractVersion": "2026-06-04.1",
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "requirement": "Concrete, reviewable obligation the worker must satisfy.",
+      "proofHint": "Optional non-authoritative evidence guidance."
+    }
+  ]
+}
+```
 
 ## Touched Surfaces
 
@@ -31,6 +55,9 @@ Mark every surface that the issue is expected to touch.
 
 ## Contract Checklist
 
+Use this checklist as planning context for the JSON requirements and validation
+plan. It is not a substitute for the fenced JSON contract.
+
 - Happy path:
 - Negative/error path:
 - Adjacent sibling surface:
@@ -53,10 +80,16 @@ Mark every surface that the issue is expected to touch.
 
 - Ready for `dogfood-ready`: yes/no
 - Remaining blocker:
-```
+````
 
 ## Promotion Rules
 
-An issue must not receive `dogfood-ready` until an operator has reviewed the completed contract checklist and validation plan. If the issue is still blocked, leave `dogfood-blocked` in place. Remove `dogfood-blocked` and add `dogfood-ready` only after the operator confirms the required sections are present, the validation plan is concrete, and no open blockers remain.
+An issue must not receive `dogfood-ready` until an operator has reviewed the
+fenced JSON issue contract, completed checklist, and validation plan. If the
+issue is still blocked, leave `dogfood-blocked` in place. Remove
+`dogfood-blocked` and add `dogfood-ready` only after the operator confirms the
+required JSON and prose sections are present, each JSON requirement has a
+stable unique ID and non-empty text, the validation plan is concrete, and no
+open blockers remain.
 
 The template does not authorize automatic label changes. AI issue drafters should propose the contract and readiness recommendation, then leave promotion labels for operator review.
