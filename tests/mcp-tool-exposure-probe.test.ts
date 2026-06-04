@@ -692,6 +692,10 @@ class FakeHermesGatewayClient extends EventEmitter implements HermesGatewayClien
   getLogTail(): string {
     return "";
   }
+
+  isClosed(): boolean {
+    return false;
+  }
 }
 
 async function writeHermesTemplates(root: string): Promise<void> {

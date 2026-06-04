@@ -169,7 +169,7 @@ describe("command policy run activity schema", () => {
     const event = commandPolicyEvent(decision, {
       eventId: "command-policy:decision-allow-local-1",
       text: "Command policy allowed local inspection",
-      payload: commandPolicyPayload(decision, { selectedOptionId: "allow_once", permissionOutcome: "allow_once" }),
+      payload: commandPolicyPayload(decision, { selectedOptionId: "allow_once", permissionOutcome: "allowed" }),
     });
 
     expect(isRunActivityEvent(event)).toBe(true);
@@ -181,7 +181,7 @@ describe("command policy run activity schema", () => {
       phase: "review",
       upstreamContactAttempted: false,
       selectedOptionId: "allow_once",
-      permissionOutcome: "allow_once",
+      permissionOutcome: "allowed",
       audit: {
         outcome: "allow",
         reasonKind: "local_only_inspection",

@@ -27,9 +27,11 @@ export type HermesShellHooksConfig = Record<string, HermesShellHookConfig[]>;
 export const SYMPHONY_HERMES_AGENT_MAX_TURNS = 999;
 export const SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER = "terminal|execute_code";
 export const SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS = 10;
+export const SYMPHONY_AGENT_COMMAND_POLICY_DECISION_JOURNAL_BASENAME = "agent-command-policy-decisions.ndjson";
 
 export interface BuildHermesAgentCommandPolicyHookOptions {
   cliPath: string;
+  decisionJournalPath: string;
   role: string;
   phase: string;
   issueId?: string | null;
@@ -101,6 +103,10 @@ export function buildHermesAgentCommandPolicyHookConfig(options: BuildHermesAgen
   };
 }
 
+export function buildHermesAgentCommandPolicyDecisionJournalPath(profileDir: string): string {
+  return path.join(profileDir, SYMPHONY_AGENT_COMMAND_POLICY_DECISION_JOURNAL_BASENAME);
+}
+
 export function buildHermesAgentCommandPolicyHookCommand(options: BuildHermesAgentCommandPolicyHookOptions): string {
   const invocation = buildHermesAgentCommandPolicyHookInvocation(options);
   return [invocation.command, ...invocation.args].map(shellQuote).join(" ");
@@ -117,6 +123,8 @@ export function buildHermesAgentCommandPolicyHookInvocation(
     options.role,
     "--phase",
     options.phase,
+    "--decision-journal",
+    options.decisionJournalPath,
   ];
   const issueId = nonEmptyString(options.issueId);
   if (issueId) args.push("--issue-id", issueId);

@@ -39,12 +39,18 @@ export interface HermesGatewayClient {
   request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
   kill(reason?: string): void;
   getLogTail(limit?: number): string;
+  isClosed(): boolean;
 }
 
 export class ScopedGatewayClient implements HermesGatewayClient {
   readonly #client = new UpstreamGatewayClient();
+  #closed = false;
 
-  constructor(private readonly env: HermesGatewayEnvironment) {}
+  constructor(private readonly env: HermesGatewayEnvironment) {
+    this.#client.on("exit", () => {
+      this.#closed = true;
+    });
+  }
 
   on(event: "event", listener: (event: GatewayEvent) => void): this;
   on(event: "exit", listener: (code: number | null) => void): this;
@@ -69,11 +75,16 @@ export class ScopedGatewayClient implements HermesGatewayClient {
   }
 
   kill(reason?: string): void {
+    this.#closed = true;
     this.#client.kill(reason);
   }
 
   getLogTail(limit?: number): string {
     return this.#client.getLogTail(limit);
+  }
+
+  isClosed(): boolean {
+    return this.#closed;
   }
 }
 

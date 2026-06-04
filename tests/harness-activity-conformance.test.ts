@@ -271,6 +271,10 @@ class FixtureGatewayClient extends EventEmitter implements HermesGatewayClient {
   getLogTail(_limit?: number): string {
     return "";
   }
+
+  isClosed(): boolean {
+    return false;
+  }
 }
 
 class FixtureAcpClient extends EventEmitter implements HermesAcpRuntimeClient {

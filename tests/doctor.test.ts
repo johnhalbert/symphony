@@ -1405,6 +1405,10 @@ class DoctorFakeHermesGatewayClient extends EventEmitter implements HermesGatewa
   getLogTail(): string {
     return "";
   }
+
+  isClosed(): boolean {
+    return false;
+  }
 }
 
 async function writeHermesTemplates(root: string): Promise<void> {

@@ -32,7 +32,27 @@ Implement a role-scoped command policy that prevents worker and reviewer agents 
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-The installed constitution at `.specify/memory/constitution.md` is still a placeholder and does not define enforceable project gates. Treat this as a pass with a process note: the feature still follows the active session contract for careful workflow safety, testability, credential redaction, and service/agent boundary preservation.
+The installed constitution is now `1.0.0` and defines enforceable Symphony
+gates. ENG-243 satisfies them as follows:
+
+- **I. Service-Owned Authority Boundaries**: PASS. The feature explicitly denies
+  worker/reviewer upstream GitHub command ownership while preserving
+  service-owned publication, review feedback, mergeability, CI, and writeback
+  paths.
+- **II. Least-Privilege Credentials And Secret Hygiene**: PASS. Requirements and
+  tasks fail closed for ambiguous GitHub or credential paths, preserve service
+  credential slicing, and require redacted denial/audit output.
+- **III. Testable Contracts Before Implementation**: PASS. The spec defines P1
+  and P2 independently testable stories, acceptance scenarios, measurable
+  outcomes, and FR-014 validation coverage; tasks place test work before
+  implementation in every story.
+- **IV. Durable Audit, Replay, And Idempotence**: PASS. US4 requires durable
+  policy evidence, transcript replay coverage, redaction, and persisted run
+  activity events.
+- **V. Scoped Change Ownership And Protected Surfaces**: PASS. The plan and
+  tasks make vendored Hermes source edits under `hermes/upstream-src/**` a hard
+  blocker and route enforcement through Symphony-owned code, generated profile
+  assets, hooks/plugins, MCP/service boundaries, or configuration.
 
 Pre-design gate result: PASS, no constitution violations.
 

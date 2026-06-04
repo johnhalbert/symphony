@@ -180,12 +180,14 @@ program
   .option("--phase <phase>", "agent run phase for this hook invocation; falls back to SYMPHONY_RUN_PHASE")
   .option("--issue-id <id>", "active issue id; falls back to SYMPHONY_ISSUE_ID")
   .option("--run-id <id>", "active run id; falls back to SYMPHONY_RUN_ID or Hermes session_id")
-  .action(async (options: { role?: string; phase?: string; issueId?: string; runId?: string }) => {
+  .option("--decision-journal <path>", "append redacted structured policy decisions to this newline-delimited JSON journal")
+  .action(async (options: { role?: string; phase?: string; issueId?: string; runId?: string; decisionJournal?: string }) => {
     await runAgentCommandPolicyHookStdio({
       role: options.role ?? process.env.SYMPHONY_AGENT_ROLE,
       phase: options.phase ?? process.env.SYMPHONY_RUN_PHASE,
       issueId: options.issueId ?? process.env.SYMPHONY_ISSUE_ID,
       runId: options.runId ?? process.env.SYMPHONY_RUN_ID,
+      journalPath: options.decisionJournal,
     });
   });
 

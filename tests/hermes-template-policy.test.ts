@@ -3,6 +3,7 @@ import path from "node:path";
 import YAML from "yaml";
 import { describe, expect, it } from "vitest";
 import {
+  buildHermesAgentCommandPolicyDecisionJournalPath,
   buildHermesAgentCommandPolicyHookConfig,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
@@ -70,12 +71,14 @@ describe("Hermes role template policy", () => {
       role: "worker",
       phase: "implementation",
       issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(path.resolve("hermes", "worker-profile")),
     });
     const reviewerHooks = buildHermesAgentCommandPolicyHookConfig({
       cliPath: path.resolve("dist", "cli.js"),
       role: "reviewer",
       phase: "review",
       issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(path.resolve("hermes", "reviewer-profile")),
     });
 
     const workerPreToolHooks = workerHooks.pre_tool_call ?? [];
