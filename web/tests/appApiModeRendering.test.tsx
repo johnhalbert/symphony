@@ -825,6 +825,11 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("refreshing dashboard projection · 2/9 agents");
     expectNoDashboardBodyLiveIndicators(markup, "refreshing dashboard projection · 2/9 agents");
     expect(markup).toContain("api/repo@api-branch");
+    expectUnavailableButton(markup, "Status totals");
+    expectAvailableButton(markup, "Trigger poll");
+    expectUnavailableButton(markup, "New issue");
+    expectUnavailableButton(markup, "Search");
+    expectUnavailableButton(markup, "More");
     expect(markup).not.toContain("Could not load dashboard");
     expect(markup).not.toContain('class="pulse"');
   });
@@ -840,6 +845,11 @@ describe("App API-mode rendering", () => {
     expectNoDashboardBodyLiveIndicators(markup, "previous dashboard projection · 2/9 agents");
     expect(markup).toContain("api/repo@api-branch");
     expect(markup).toContain("tracker fresh · 4 issues");
+    expectUnavailableButton(markup, "Status totals");
+    expectAvailableButton(markup, "Trigger poll");
+    expectUnavailableButton(markup, "New issue");
+    expectUnavailableButton(markup, "Search");
+    expectUnavailableButton(markup, "More");
     expect(markup).not.toContain("Could not load dashboard");
     expect(markup).not.toContain('class="pulse"');
     expect(markup).not.toContain("openai/symphony@main");
@@ -863,6 +873,11 @@ describe("App API-mode rendering", () => {
     expect(stale.markup).toContain("Issue tracker source is stale; showing a cached dashboard projection.");
     expect(stale.markup).toContain("stale dashboard projection · 2/9 agents");
     expectNoDashboardBodyLiveIndicators(stale.markup, "stale dashboard projection · 2/9 agents");
+    expectUnavailableButton(stale.markup, "Status totals");
+    expectAvailableButton(stale.markup, "Trigger poll");
+    expectUnavailableButton(stale.markup, "New issue");
+    expectUnavailableButton(stale.markup, "Search");
+    expectUnavailableButton(stale.markup, "More");
     expect(stale.markup).not.toContain('class="pulse"');
 
     const sourceMissing = await renderAppWithMocks({ hooks: appHookState({ dashboard: loaded(sourceMissingDashboard) }) });
@@ -870,6 +885,11 @@ describe("App API-mode rendering", () => {
     expect(sourceMissing.markup).toContain("Dashboard payload did not include freshness metadata; treating projection age as unknown.");
     expect(sourceMissing.markup).toContain("dashboard projection freshness unknown · 2/9 agents");
     expectNoDashboardBodyLiveIndicators(sourceMissing.markup, "dashboard projection freshness unknown · 2/9 agents");
+    expectUnavailableButton(sourceMissing.markup, "Status totals");
+    expectAvailableButton(sourceMissing.markup, "Trigger poll");
+    expectUnavailableButton(sourceMissing.markup, "New issue");
+    expectUnavailableButton(sourceMissing.markup, "Search");
+    expectUnavailableButton(sourceMissing.markup, "More");
     expect(sourceMissing.markup).not.toContain('class="pulse"');
   });
 
