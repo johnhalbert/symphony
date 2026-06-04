@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
+import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { IssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type {
   RunRecord,
   RunTranscriptStore,
@@ -8,8 +13,9 @@ import type {
   WorkspaceRecord,
 } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
-import type { TrackerStateLists } from "../src/core/types.js";
-import type { FileWritebackOutboxStore, WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
+import type { Issue, TrackerStateLists } from "../src/core/types.js";
+import { FileWritebackOutboxStore, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
+import { generateLargeHistoryFixture } from "../scripts/generate-large-history-fixture.js";
 
 interface SourceCalls {
   fetchIssuesByStates: number;
@@ -22,6 +28,12 @@ interface SourceCalls {
   readTranscriptTail: number;
   readTranscriptEventCount: number;
 }
+
+const tempRoots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(tempRoots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+});
 
 describe("/api/v1/web collection endpoints shared projection context", () => {
   it("coalesces a cold web collection burst through one context build and one raw source scan", async () => {
@@ -135,7 +147,198 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
       await server.stop();
     }
   });
+
+  it("coalesces large fixture collection routes through one shared projection scan without transcript hydration", async () => {
+    const { calls, tracker, runStore, lifecycleStore, writebackOutbox, manifest } = await largeFixtureSources({
+      issueCount: 18,
+      runsPerIssue: 5,
+      eventsPerRun: 16,
+      writebacksPerIssue: 4,
+      issuePrefix: "BP",
+    });
+    const server = createStatusServer({ tracker, runStore, lifecycleStore, writebackOutbox });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+
+    try {
+      const requests = [
+        "/api/v1/web/reference-data",
+        "/api/v1/web/issues",
+        "/api/v1/web/dashboard",
+        "/api/v1/web/history?sessionLimit=12&timelineLimit=18",
+        "/api/v1/web/sidebar",
+      ].map((route) => getJson(`${baseUrl}${route}`));
+
+      const responses = await Promise.all(requests);
+      expect(responses.map(({ response }) => response.status)).toEqual([200, 200, 200, 200, 200]);
+
+      const referenceData = responses[0]?.body as { labels: Record<string, unknown>; users: Record<string, unknown> };
+      const issueBoard = responses[1]?.body as { issues: Array<{ id: string }>; lanes: Record<string, unknown> };
+      const dashboard = responses[2]?.body as { activity: unknown[]; totals: Record<string, unknown> };
+      const history = responses[3]?.body as { sessions: Array<{ id: string }>; timeline: unknown[] };
+      const sidebar = responses[4]?.body as { reviewIssues: unknown[]; sessions: unknown[] };
+
+      expect(Object.keys(referenceData.labels).length).toBeGreaterThan(0);
+      expect(Object.keys(referenceData.users)).toContain("unassigned");
+      expect(issueBoard.issues.length).toBe(manifest.counts.issues);
+      expect(issueBoard.lanes).toMatchObject({ todo: expect.any(Array), progress: expect.any(Array), review: expect.any(Array) });
+      expect(Array.isArray(dashboard.activity)).toBe(true);
+      expect(Object.keys(dashboard.totals)).toContain("open");
+      expect(history.sessions).toHaveLength(12);
+      expect(history.timeline.length).toBeGreaterThan(0);
+      expect(sidebar.reviewIssues.length).toBeGreaterThan(0);
+      expect(sidebar.sessions.length).toBeGreaterThan(0);
+      expect(calls).toMatchObject({
+        fetchIssuesByStates: 1,
+        listRuns: 1,
+        listWorkspaces: 1,
+        listLifecycles: 1,
+        listWritebacks: 1,
+        readTranscriptTail: 0,
+      });
+      expect(calls.readTranscript).toBeGreaterThan(0);
+      expect(calls.readTranscript).toBeLessThan(manifest.counts.runs);
+      expect(calls.readTranscriptEventCount).toBe(calls.readTranscript);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("reuses the completed large fixture projection context until explicit refresh requests a rebuild", async () => {
+    const { calls, tracker, runStore, lifecycleStore, writebackOutbox, manifest } = await largeFixtureSources({
+      issueCount: 12,
+      runsPerIssue: 4,
+      eventsPerRun: 12,
+      writebacksPerIssue: 3,
+      issuePrefix: "RF",
+    });
+    const server = createStatusServer({ tracker, runStore, lifecycleStore, writebackOutbox });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+
+    try {
+      await expectOk(getJson(`${baseUrl}/api/v1/web/dashboard`));
+      expect(calls).toMatchObject({
+        fetchIssuesByStates: 1,
+        listRuns: 1,
+        listWorkspaces: 1,
+        listLifecycles: 1,
+        listWritebacks: 1,
+      });
+
+      await expectOk(getJson(`${baseUrl}/api/v1/web/history?sessionLimit=10&timelineLimit=15`));
+      await expectOk(getJson(`${baseUrl}/api/v1/web/sidebar`));
+      expect(calls).toMatchObject({
+        fetchIssuesByStates: 1,
+        listRuns: 1,
+        listWorkspaces: 1,
+        listLifecycles: 1,
+        listWritebacks: 1,
+      });
+
+      await expectOk(getJson(`${baseUrl}/api/v1/web/issues?refresh=1`));
+      expect(calls).toMatchObject({
+        fetchIssuesByStates: 2,
+        listRuns: 2,
+        listWorkspaces: 2,
+        listLifecycles: 2,
+        listWritebacks: 2,
+      });
+
+      await expectOk(getJson(`${baseUrl}/api/v1/web/reference-data`));
+      expect(calls).toMatchObject({
+        fetchIssuesByStates: 2,
+        listRuns: 2,
+        listWorkspaces: 2,
+        listLifecycles: 2,
+        listWritebacks: 2,
+        readTranscriptTail: 0,
+      });
+      expect(calls.readTranscript).toBeGreaterThan(0);
+      expect(calls.readTranscript).toBeLessThan(manifest.counts.runs);
+      expect(calls.readTranscriptEventCount).toBe(calls.readTranscript);
+    } finally {
+      await server.stop();
+    }
+  });
 });
+
+
+async function largeFixtureSources(options: {
+  issueCount: number;
+  runsPerIssue: number;
+  eventsPerRun: number;
+  writebacksPerIssue: number;
+  issuePrefix: string;
+}): Promise<{
+  calls: SourceCalls;
+  tracker: TrackerClient;
+  runStore: RunTranscriptStore;
+  lifecycleStore: IssueLifecycleStore;
+  writebackOutbox: Pick<FileWritebackOutboxStore, "list">;
+  manifest: Awaited<ReturnType<typeof generateLargeHistoryFixture>>;
+}> {
+  const root = await makeTempRoot();
+  const stateDir = path.join(root, `${options.issuePrefix.toLowerCase()}-large-history-fixture`);
+  const manifest = await generateLargeHistoryFixture({
+    outputDir: stateDir,
+    issueCount: options.issueCount,
+    runsPerIssue: options.runsPerIssue,
+    eventsPerRun: options.eventsPerRun,
+    writebacksPerIssue: options.writebacksPerIssue,
+    baseTimestamp: "2026-02-03T04:05:06.000Z",
+    issuePrefix: options.issuePrefix,
+  });
+  const calls: SourceCalls = {
+    fetchIssuesByStates: 0,
+    listRuns: 0,
+    listWorkspaces: 0,
+    listLifecycles: 0,
+    listWritebacks: 0,
+    getRun: 0,
+    readTranscript: 0,
+    readTranscriptTail: 0,
+    readTranscriptEventCount: 0,
+  };
+  const issues = trackerIssuesFromManifest(manifest);
+  const tracker: TrackerClient = {
+    async fetchIssuesByStates(states: string[]) {
+      calls.fetchIssuesByStates += 1;
+      return issues.filter((issue) => states.includes(issue.state));
+    },
+  } as TrackerClient;
+  const runStore = instrumentMethods(new FileRunTranscriptStore(stateDir), {
+    listRuns: () => {
+      calls.listRuns += 1;
+    },
+    listWorkspaces: () => {
+      calls.listWorkspaces += 1;
+    },
+    getRun: () => {
+      calls.getRun += 1;
+    },
+    readTranscript: () => {
+      calls.readTranscript += 1;
+    },
+    readTranscriptTail: () => {
+      calls.readTranscriptTail += 1;
+    },
+    readTranscriptEventCount: () => {
+      calls.readTranscriptEventCount += 1;
+    },
+  }) as unknown as RunTranscriptStore;
+  const lifecycleStore = instrumentMethods(new FileIssueLifecycleStore(stateDir), {
+    list: () => {
+      calls.listLifecycles += 1;
+    },
+  }) as unknown as IssueLifecycleStore;
+  const writebackOutbox = instrumentMethods(new FileWritebackOutboxStore(stateDir), {
+    list: () => {
+      calls.listWritebacks += 1;
+    },
+  }) as Pick<FileWritebackOutboxStore, "list">;
+  return { calls, tracker, runStore, lifecycleStore, writebackOutbox, manifest };
+}
 
 function createStatusServer(
   overrides: Partial<ConstructorParameters<typeof StatusServer>[0]> = {},
@@ -247,6 +450,51 @@ function recordingSources(options: {
       },
     },
   };
+}
+
+
+function trackerIssuesFromManifest(manifest: Awaited<ReturnType<typeof generateLargeHistoryFixture>>): Issue[] {
+  const trackerStates = ["Todo", "In Progress", "In Review"] as const;
+  const baseTimestamp = Date.parse("2026-02-03T04:05:06.000Z");
+  return manifest.issues.map((issue, index) => {
+    const state = trackerStates[index % trackerStates.length] ?? "Todo";
+    return {
+      id: issue.id,
+      identifier: issue.identifier,
+      title: `Backend projection fixture ${issue.identifier}`,
+      description: `Generated large-history fixture issue ${issue.identifier}`,
+      priority: null,
+      state,
+      branchName: `fixture/${issue.identifier.toLowerCase()}`,
+      url: `https://example.test/issues/${issue.identifier}`,
+      assigneeId: null,
+      delegateId: null,
+      assignedToWorker: state !== "In Review",
+      labels: [index % 2 === 0 ? "dogfood-ready" : "projection-perf", `bucket-${index % 3}`],
+      blockedBy: [],
+      createdAt: new Date(baseTimestamp + index * 60_000).toISOString(),
+      updatedAt: new Date(baseTimestamp + index * 120_000).toISOString(),
+    } satisfies Issue;
+  });
+}
+
+function instrumentMethods<T extends object>(target: T, hooks: Partial<Record<string, () => void>>): T {
+  return new Proxy(target, {
+    get(original, prop, receiver) {
+      const value = Reflect.get(original, prop, receiver);
+      if (typeof prop !== "string" || typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        hooks[prop]?.();
+        return Reflect.apply(value, original, args);
+      };
+    },
+  });
+}
+
+async function makeTempRoot(): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "symphony-web-projection-perf-"));
+  tempRoots.push(root);
+  return root;
 }
 
 function fakeOrchestrator(): ConstructorParameters<typeof StatusServer>[0]["orchestrator"] {
