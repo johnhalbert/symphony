@@ -75,4 +75,12 @@ export const mockDataSource: SymphonyDataSource = {
     chatMessages = [...chatMessages, { who: "user", text: trimmed }, mockReply(trimmed)];
     return delay(chatMessages, 120);
   },
+  triggerPoll() {
+    return delay({
+      queued: true,
+      coalesced: false,
+      requested_at: new Date().toISOString(),
+      operations: ["poll", "reconcile"],
+    });
+  },
 };

@@ -141,6 +141,17 @@ export function orchestratorChatStateNotice(model: OrchestratorChatModel, compac
   return null;
 }
 
+export function orchestratorChatCommandUnavailableNotice(model: OrchestratorChatModel | null | undefined, compact = false): string | null {
+  const noun = compact ? "Compact chat" : "Orchestrator chat";
+  if (model?.state === "disabled") {
+    return `${noun} commands are disabled by the backend; no orchestrator action will be dispatched.`;
+  }
+  if (model?.state === "unavailable") {
+    return `${noun} commands are unavailable because the backend reports no active command dispatcher; no orchestrator action will be dispatched.`;
+  }
+  return null;
+}
+
 function summarizeOrchestratorChatStatus(
   chat: readonly ChatMessage[],
   conversationStatus: OrchestratorChatConversationStatus,

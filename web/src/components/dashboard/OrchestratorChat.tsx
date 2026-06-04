@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Icon, UnavailableButton } from "../common";
-import { orchestratorChatStateNotice } from "../../data/orchestratorChat";
+import { orchestratorChatCommandUnavailableNotice, orchestratorChatStateNotice } from "../../data/orchestratorChat";
 import type { ChatMessage, OrchestratorChatModel } from "../../types/symphony";
 import { formatInlineText } from "../messages/messageFormat";
 
@@ -33,13 +33,14 @@ export function OrchestratorChat({
       : `Could not refresh orchestrator chat: ${error}. Showing previous messages.`
     : null;
   const stateNotice = projection ? orchestratorChatStateNotice(projection) : null;
+  const commandUnavailableNotice = orchestratorChatCommandUnavailableNotice(projection);
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this web chat is not supported yet; no orchestrator action will be dispatched.";
   const agentContextLabel = agentLabel?.trim() || "agent unavailable";
 
   async function submit(input = draft) {
     const trimmed = input.trim();
-    if (readOnly || !trimmed || sending) return;
+    if (readOnly || commandUnavailableNotice || !trimmed || sending) return;
     setSending(true);
     setSendError(null);
     try {
@@ -87,7 +88,7 @@ export function OrchestratorChat({
               {message.suggestions ? (
                 <div style={{ marginTop: 4 }}>
                   {message.suggestions.map((suggestion, suggestionIndex) => (
-                    <button className="chat__suggestion" disabled={readOnly || sending} key={suggestion} onClick={() => submit(suggestion)} type="button">
+                    <button className="chat__suggestion" disabled={readOnly || Boolean(commandUnavailableNotice) || sending} key={suggestion} onClick={() => submit(suggestion)} type="button">
                       {suggestionIndex === 0 ? Icon.bolt() : null}
                       {suggestion}
                     </button>
@@ -98,9 +99,9 @@ export function OrchestratorChat({
           </div>
         ))}
       </div>
-      {readOnly ? (
+      {readOnly || commandUnavailableNotice ? (
         <div className="chat__input chat__input--readonly" role="status" aria-live="polite">
-          <div className="view-empty">{readOnlyNotice}</div>
+          <div className="view-empty">{readOnly ? readOnlyNotice : commandUnavailableNotice}</div>
         </div>
       ) : (
         <form

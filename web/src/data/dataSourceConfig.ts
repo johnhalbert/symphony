@@ -94,5 +94,10 @@ function createLazyMockDataSource(loadMockDataSource: DataSourceFactoryOptions["
     async sendOrchestratorMessage(input) {
       return (await dataSource()).sendOrchestratorMessage(input);
     },
+    async triggerPoll() {
+      const loaded = await dataSource();
+      if (!loaded.triggerPoll) throw new Error("Trigger poll is unavailable for this data source.");
+      return loaded.triggerPoll();
+    },
   };
 }

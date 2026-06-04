@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type { TriggerPollResult } from "../../data/dataSource";
 import { useDataSource } from "../../data/dataSourceContext";
 import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../../data/orchestratorChat";
 import type { ChatMessage, DashboardModel, DashboardVariant, OrchestratorChatModel } from "../../types/symphony";
@@ -17,6 +18,7 @@ export function DashboardView({
   variant = "cards",
   useModelBurnupTotals = true,
   freshnessCue,
+  onPollTriggered,
 }: {
   dashboard: DashboardModel;
   orchestratorChat?: OrchestratorChatModel | ChatMessage[];
@@ -26,6 +28,7 @@ export function DashboardView({
   variant?: DashboardVariant;
   useModelBurnupTotals?: boolean;
   freshnessCue?: DashboardFreshnessCue;
+  onPollTriggered?: (result: TriggerPollResult) => void;
 }) {
   const dataSource = useDataSource();
   const sourceChat = useMemo(() => normalizeOrchestratorChatModel(orchestratorChat ?? dashboard.chat), [orchestratorChat, dashboard.chat]);
@@ -43,6 +46,7 @@ export function DashboardView({
   const activityCountLabel = liveIndicatorsEnabled
     ? `${dashboard.activity.length} ${activityNoun}`
     : `${dashboard.activity.length} projected ${activityNoun}`;
+  const [pollAction, setPollAction] = useState<PollActionState>({ status: "idle", message: null });
 
   useEffect(() => {
     setChat(sourceChat);
@@ -52,6 +56,18 @@ export function DashboardView({
     if (orchestratorChatReadOnly) return;
     const nextMessages = await dataSource.sendOrchestratorMessage(input);
     setChat(orchestratorChatModelFromMessages(nextMessages, { conversationId: chat.conversation.id }));
+  }
+
+  async function triggerPoll() {
+    if (!dataSource.triggerPoll || pollAction.status === "sending") return;
+    setPollAction({ status: "sending", message: "Requesting an immediate poll..." });
+    try {
+      const result = await dataSource.triggerPoll();
+      onPollTriggered?.(result);
+      setPollAction({ status: "queued", message: pollTriggerResultMessage(result) });
+    } catch (error: unknown) {
+      setPollAction({ status: "failed", message: `Poll trigger failed: ${errorMessage(error)}` });
+    }
   }
 
   return (
@@ -77,12 +93,33 @@ export function DashboardView({
             <UnavailableButton className="btn" unavailableLabel="Status totals" unavailableReason="status-total filtering is read-only until an API command route exists">
               {Icon.filter()}Status totals
             </UnavailableButton>
-            <UnavailableButton className="btn" unavailableLabel="Trigger poll" unavailableReason="poll triggering is unavailable until the backend exposes a command route">
-              {Icon.bolt()}Trigger poll
-            </UnavailableButton>
+            {dataSource.triggerPoll ? (
+              <button
+                aria-describedby={pollAction.message ? "dashboard-poll-action-status" : undefined}
+                className="btn"
+                disabled={pollAction.status === "sending"}
+                onClick={triggerPoll}
+                type="button"
+              >
+                {Icon.bolt()}{pollAction.status === "sending" ? "Triggering poll..." : "Trigger poll"}
+              </button>
+            ) : (
+              <UnavailableButton
+                className="btn"
+                unavailableLabel="Trigger poll"
+                unavailableReason="poll triggering is unavailable because the active data source does not expose the /api/v1/refresh command"
+              >
+                {Icon.bolt()}Trigger poll
+              </UnavailableButton>
+            )}
             <UnavailableButton className="btn btn--primary" unavailableLabel="New issue" unavailableReason="issue creation is unavailable until the backend exposes a command route">
               New issue
             </UnavailableButton>
+            {pollAction.message ? (
+              <span className="dash__action-status" data-status={pollAction.status} id="dashboard-poll-action-status" role="status" aria-live="polite">
+                {pollAction.message}
+              </span>
+            ) : null}
           </div>
         </div>
 
@@ -231,6 +268,24 @@ function chatSubtitle(dashboard: DashboardModel) {
 
 function chatAgentLabel(dashboard: DashboardModel) {
   return dashboard.runningAgents[0]?.id ?? null;
+}
+
+
+type PollActionState =
+  | { status: "idle"; message: null }
+  | { status: "sending" | "queued" | "failed"; message: string };
+
+function pollTriggerResultMessage(result: TriggerPollResult): string {
+  const operations = result.operations?.map((operation) => operation.trim()).filter(Boolean).join(", ") || "poll";
+  const queueState = result.queued ? "queued" : "requested";
+  const coalesced = result.coalesced ? " · coalesced with an in-flight refresh" : "";
+  const requestedAt = result.requested_at ? ` · ${result.requested_at}` : "";
+  return `Poll trigger ${queueState}: ${operations}${coalesced}${requestedAt}.`;
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 function dotColorForVerb(verb: string) {
