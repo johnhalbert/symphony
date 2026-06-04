@@ -132,3 +132,13 @@ export function agentEligibleIssueContract(
     `- Remaining blocker: ${remainingBlocker}`,
   ].join("\n");
 }
+
+export function fencedAuthoringSectionSpoof(
+  overrides: Parameters<typeof agentEligibleIssueContract>[0] = {},
+): string {
+  const lines = agentEligibleIssueContract(overrides).split("\n");
+  const secondHeadingIndex = lines.findIndex((line, index) => index > 0 && line.startsWith("## "));
+  if (secondHeadingIndex === -1) return lines.join("\n");
+
+  return [...lines.slice(0, secondHeadingIndex), "````md", ...lines.slice(secondHeadingIndex), "````"].join("\n");
+}

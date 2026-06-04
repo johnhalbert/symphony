@@ -11,7 +11,7 @@ import {
 import type { IssueBreakdownPlanInput } from "../src/core/IssueBreakdownPlanService.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
-import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, fencedAuthoringSectionSpoof, issue, testConfig } from "./helpers.js";
 
 describe("IssueBreakdownPlanService", () => {
   let root: string;
@@ -435,6 +435,55 @@ describe("IssueBreakdownPlanService", () => {
         ),
       ).rejects.toMatchObject({ code: "invalid_request" });
     }
+
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+  });
+
+  it("rejects proposed issues that hide required authoring sections inside fenced code blocks", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-fenced-heading-spoof",
+          issueId: candidate.id,
+          summary: "Real markdown headings must exist outside fenced code blocks.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: fencedAuthoringSectionSpoof(),
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+              labels: [],
+            },
+          ],
+          idempotencyKey: "plan-fenced-heading-spoof",
+        },
+        {
+          issue: candidate,
+          activeRunId: "run-plan-fenced-heading-spoof",
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      details: {
+        missingSections: expect.arrayContaining([
+          "Issue Contract",
+          "Touched Surfaces",
+          "Acceptance Criteria",
+          "Contract Checklist",
+          "Validation Requirements",
+          "Out Of Scope",
+          "Promotion Readiness",
+        ]),
+      },
+      message: expect.stringContaining("must include the required issue contract headings"),
+    });
 
     await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
   });

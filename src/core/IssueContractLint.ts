@@ -199,10 +199,17 @@ function markdownHeadings(description: string): Set<string> {
   return new Set(markdownSections(description).keys());
 }
 
+interface MarkdownFenceDelimiter {
+  marker: "`" | "~";
+  length: number;
+  trailing: string;
+}
+
 function markdownSections(description: string): Map<string, string> {
   const sections = new Map<string, string>();
   let currentHeading: string | null = null;
   let buffer: string[] = [];
+  let activeFence: MarkdownFenceDelimiter | null = null;
 
   const flush = (): void => {
     if (!currentHeading) return;
@@ -210,6 +217,26 @@ function markdownSections(description: string): Map<string, string> {
   };
 
   for (const line of description.split(/\r?\n/)) {
+    const fence = parseMarkdownFenceDelimiter(line);
+    if (activeFence) {
+      if (
+        fence &&
+        fence.marker === activeFence.marker &&
+        fence.length >= activeFence.length &&
+        fence.trailing.trim().length === 0
+      ) {
+        activeFence = null;
+      }
+      if (currentHeading) buffer.push(line);
+      continue;
+    }
+
+    if (fence) {
+      activeFence = fence;
+      if (currentHeading) buffer.push(line);
+      continue;
+    }
+
     const match = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
     if (match) {
       flush();
@@ -222,6 +249,21 @@ function markdownSections(description: string): Map<string, string> {
 
   flush();
   return sections;
+}
+
+function parseMarkdownFenceDelimiter(line: string): MarkdownFenceDelimiter | null {
+  const match = line.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+  if (!match) return null;
+
+  const delimiter = match[1] ?? "";
+  const marker = delimiter[0];
+  if (marker !== "`" && marker !== "~") return null;
+
+  return {
+    marker,
+    length: delimiter.length,
+    trailing: match[2] ?? "",
+  };
 }
 
 function parseReadyForDogfoodReady(section: string): boolean | null {

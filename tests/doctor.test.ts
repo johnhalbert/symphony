@@ -23,7 +23,7 @@ import {
   runtimeHarnessDoctorChecks,
   trackerHandoffDoctorCheck,
 } from "../src/doctor.js";
-import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, fencedAuthoringSectionSpoof, issue, testConfig } from "./helpers.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 import type { HostHermesCommandRunner } from "../hermes/src/HostHermesDiscovery.js";
 
@@ -50,6 +50,21 @@ describe("doctor review-loop checks", () => {
       status: "ok",
       message:
         "1 agent-eligible candidate issue(s) include required authoring sections: Problem / Goal, Issue Contract, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+    });
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: fencedAuthoringSectionSpoof(),
+        }),
+      ]),
+    ).toMatchObject({
+      id: "linear.issue_contract",
+      status: "warn",
+      message: expect.stringContaining(
+        "TEST-1 missing Issue Contract, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+      ),
     });
 
     expect(

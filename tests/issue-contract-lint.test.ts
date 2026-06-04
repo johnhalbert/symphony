@@ -4,13 +4,32 @@ import {
   hasMeaningfulRemainingBlocker,
   missingRequiredIssueContractSections,
 } from "../src/core/IssueContractLint.js";
-import { agentEligibleIssueContract } from "./helpers.js";
+import { agentEligibleIssueContract, fencedAuthoringSectionSpoof } from "./helpers.js";
 
 describe("IssueContractLint", () => {
   it("requires the Issue Contract heading in required sections", () => {
     expect(missingRequiredIssueContractSections(agentEligibleIssueContract({ includeIssueContract: false }))).toContain(
       "Issue Contract",
     );
+  });
+
+  it("ignores required authoring headings hidden inside fenced code blocks", () => {
+    const analysis = analyzeIssueContractDescription(fencedAuthoringSectionSpoof(), []);
+
+    expect(analysis.missingSections).toEqual(
+      expect.arrayContaining([
+        "Issue Contract",
+        "Touched Surfaces",
+        "Acceptance Criteria",
+        "Contract Checklist",
+        "Validation Requirements",
+        "Out Of Scope",
+        "Promotion Readiness",
+      ]),
+    );
+    expect(analysis.missingSections).not.toContain("Problem / Goal");
+    expect(analysis.readyForDogfoodReady).toBeNull();
+    expect(analysis.remainingBlocker).toBeNull();
   });
 
   it.each([
