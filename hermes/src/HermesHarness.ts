@@ -226,6 +226,7 @@ export class HermesHarness implements AgentHarness {
       });
 
       const promptSubmitError = await promptSubmit;
+      enqueueHookDecisionJournal();
       if (promptSubmitError !== null) throw promptSubmitError;
 
       for await (const event of queue) {

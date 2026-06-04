@@ -462,10 +462,12 @@ describe("AgentCommandPolicyAcpResolver", () => {
     expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(denyDecision, { allowOptionId: "allow_session" })).toMatchObject({ optionId: null,
       reason: "upstream_github",
     });
-    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "deny" as never })).toMatchObject({ optionId: null,
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "deny" as never })).toEqual({
+      optionId: null,
       reason: "unsupported_agent_command_policy_acp_allow_option",
     });
-    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_always" as never })).toMatchObject({ optionId: null,
+    expect(mapAgentCommandPolicyDecisionToAcpPermissionDecision(allowDecision, { allowOptionId: "allow_always" as never })).toEqual({
+      optionId: null,
       reason: "unsupported_agent_command_policy_acp_allow_option",
     });
 

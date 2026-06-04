@@ -77,7 +77,7 @@ describe("command policy transcript replay and persistence", () => {
           }),
         }),
         1,
-        { selectedOptionId: "allow_once", permissionOutcome: "allow_once" },
+        { selectedOptionId: "allow_once", permissionOutcome: "allowed" },
       ),
       commandPolicyTranscriptEvent(
         denyPolicyDecision({
@@ -332,7 +332,7 @@ describe("command policy transcript replay and persistence", () => {
         requestKind: "pre_tool_call",
         toolCallId: "tool-call-correlation",
         selectedOptionId: "allow_once",
-        permissionOutcome: "allow_once",
+        permissionOutcome: "allowed",
         hookAction: "allow",
       },
       runId,
@@ -352,7 +352,7 @@ describe("command policy transcript replay and persistence", () => {
       requestKind: "pre_tool_call",
       toolCallId: "tool-call-correlation",
       selectedOptionId: "allow_once",
-      permissionOutcome: "allow_once",
+      permissionOutcome: "allowed",
       hookAction: "allow",
       requiresCodeChange: false,
       requiresUserOrServiceFix: false,

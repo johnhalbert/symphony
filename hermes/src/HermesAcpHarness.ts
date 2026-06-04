@@ -2832,12 +2832,13 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
         throw new Error("Hermes ACP permission resolution was missing a structured policyDecision payload");
       }
       const message = permissionResolutionSummary(decision);
+      const permissionOutcome = permissionResolutionPermissionOutcome(resolution, decision);
       const eventPayload = {
         outcome: decision.outcome,
         reasonKind: decision.reasonKind,
         requestKind: resolution.request.requestKind,
         toolCallId: resolution.request.toolCallId,
-        permissionOutcome: resolution.outcome,
+        permissionOutcome,
         hookAction: null,
         ...(decision.outcome === "allow" ? { selectedOptionId: resolution.selectedOptionId } : {}),
         redacted: true,
@@ -2887,6 +2888,38 @@ function runtimeAgentEventsForHermesAcpRuntimeEvent(
 }
 
 const ACP_ALLOW_PERMISSION_OPTION_IDS = new Set<string>(["allow_once", "allow_session", "allow_always"]);
+const ACP_FAIL_CLOSED_REASON_KINDS = new Set<AgentCommandPolicyDecision["reasonKind"]>([
+  "run_cancelled",
+  "permission_bridge_not_configured",
+  "permission_bridge_error",
+  "permission_request_timeout",
+  "acp_process_exited",
+  "malformed_permission_request",
+  "missing_permission_session_id",
+  "missing_permission_tool_call",
+  "missing_permission_tool_call_kind",
+  "missing_permission_tool_call_id",
+  "missing_permission_tool_call_content",
+  "missing_permission_options",
+  "malformed_permission_options",
+  "duplicate_permission_options",
+  "unsupported_permission_tool_call",
+  "unsupported_permission_options",
+  "permission_option_not_offered",
+  "permission_option_not_supported",
+  "classifier_error",
+  "file_edit_approval_bridge_not_configured",
+  "file_edit_approval_error",
+  "missing_file_edit_diff",
+  "malformed_file_edit_diff",
+  "file_edit_diff_too_large",
+  "invalid_file_edit_path",
+  "file_edit_path_outside_workspace",
+  "file_edit_target_path_mismatch",
+  "missing_file_edit_workspace",
+  "unsupported_agent_command_policy_permission_kind",
+  "unsupported_agent_command_policy_acp_allow_option",
+]);
 
 function finalizePermissionResolution(
   ctx: AgentRunContext,
@@ -3108,6 +3141,7 @@ function permissionResolutionRunActivityPayload(
   resolution: HermesAcpPermissionResolution,
   decision: AgentCommandPolicyDecision,
 ): RunActivityCommandPolicyDecisionPayload {
+  const permissionOutcome = permissionResolutionPermissionOutcome(resolution, decision);
   return {
     decisionId: decision.decisionId ?? null,
     attemptId: decision.attemptId ?? resolution.request.toolCallId ?? null,
@@ -3130,10 +3164,19 @@ function permissionResolutionRunActivityPayload(
     requestKind: resolution.request.requestKind,
     toolCallId: resolution.request.toolCallId,
     ...(decision.outcome === "allow" ? { selectedOptionId: resolution.selectedOptionId } : {}),
-    permissionOutcome: resolution.outcome,
+    permissionOutcome,
     hookAction: null,
     redacted: true,
   };
+}
+
+function permissionResolutionPermissionOutcome(
+  resolution: HermesAcpPermissionResolution,
+  decision: AgentCommandPolicyDecision,
+): "allowed" | "denied" | "fail_closed" {
+  if (decision.outcome === "allow") return "allowed";
+  if (resolution.selectedOptionId === null && ACP_FAIL_CLOSED_REASON_KINDS.has(decision.reasonKind)) return "fail_closed";
+  return "denied";
 }
 
 function acpLogTailPayload(lease: HermesAcpLease): { lines: string[]; lineCount: number } | null {

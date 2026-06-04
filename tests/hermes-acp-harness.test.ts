@@ -35,6 +35,8 @@ import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue } from "../src/core/types.js";
 import { mapAgentEventToRunActivityEvent } from "../src/core/transcript/RunActivityEventMapper.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
+import { createAgentCommandPolicyAcpResolver } from "../src/core/harness/AgentCommandPolicyAcpResolver.js";
+import { allowPolicyDecision } from "./agent-command-policy-fixtures.js";
 
 interface RecordedRequest {
   method: string;
@@ -538,6 +540,83 @@ describe("HermesAcpHarness", () => {
     expect(text).not.toContain(secret);
     expect(client.requests.some((request) => request.method === "session/new")).toBe(false);
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("normalizes ACP permissionOutcome to allowed/denied/fail_closed semantics, including mapper failures", async () => {
+    const scenarios = [
+      {
+        name: "allow",
+        requestId: "permission-outcome-allow",
+        permissionResolver: vi.fn(() => ({ optionId: "allow_once" })),
+        expectedResponse: { outcome: { outcome: "selected", optionId: "allow_once" } },
+        expected: {
+          outcome: "allow" as const,
+          reasonKind: "permission_option_selected",
+          permissionOutcome: "allowed",
+          selectedOptionId: "allow_once",
+        },
+      },
+      {
+        name: "explicit deny",
+        requestId: "permission-outcome-deny",
+        permissionResolver: vi.fn(() => ({ optionId: "deny" })),
+        expectedResponse: { outcome: { outcome: "selected", optionId: "deny" } },
+        expected: {
+          outcome: "deny" as const,
+          reasonKind: "permission_option_selected",
+          permissionOutcome: "denied",
+          selectedOptionId: undefined,
+        },
+      },
+      {
+        name: "mapper fail closed",
+        requestId: "permission-outcome-mapper-fail-closed",
+        permissionResolver: createAgentCommandPolicyAcpResolver({
+          allowOptionId: "deny" as never,
+          classify: () => allowPolicyDecision({ reasonKind: "local_only_inspection", commandClass: "local_git_inspection" }),
+          environment: { PATH: "/usr/bin" },
+        }),
+        expectedResponse: { outcome: { outcome: "cancelled" } },
+        expected: {
+          outcome: "deny" as const,
+          reasonKind: "unsupported_agent_command_policy_acp_allow_option",
+          permissionOutcome: "fail_closed",
+          selectedOptionId: undefined,
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const client = new FakeAcpClient();
+      client.promptDeferred = deferred<Record<string, unknown> | null>();
+      client.promptStarted = deferred<void>();
+      client.promptNotificationParams = null;
+      const { ctx, harness } = await fixture({ client, permissionResolver: scenario.permissionResolver });
+      const { runPromise } = await startPendingRun({ client, ctx, harness });
+
+      const responses = await client.invokeClientRequest("session/request_permission", terminalPermissionRequest(), scenario.requestId);
+      client.promptDeferred.resolve({ stopReason: "end_turn" });
+      const events = await runPromise;
+      const transcriptEvents = transcriptEventsFromAgentEvents(events);
+
+      expect(responses).toEqual([scenario.expectedResponse]);
+      expectAcpPolicyDecisionEvent(events, {
+        outcome: scenario.expected.outcome,
+        reasonKind: scenario.expected.reasonKind,
+        requestKind: "terminal_execute",
+        permissionOutcome: scenario.expected.permissionOutcome,
+        selectedOptionId: scenario.expected.selectedOptionId,
+      });
+      expectAcpPolicyDecisionTranscriptEvent(transcriptEvents, {
+        outcome: scenario.expected.outcome,
+        reasonKind: scenario.expected.reasonKind,
+        requestKind: "terminal_execute",
+        permissionOutcome: scenario.expected.permissionOutcome,
+        selectedOptionId: scenario.expected.selectedOptionId,
+      });
+
+      await harness.dispose();
+    }
   });
 
   it.each([
@@ -2467,6 +2546,7 @@ function expectAcpPolicyDecisionEvent(
     reasonKind: string;
     requestKind?: string;
     toolCallId?: string;
+    permissionOutcome?: string;
     selectedOptionId?: string | undefined;
   },
 ): void {
@@ -2481,6 +2561,7 @@ function expectAcpPolicyDecisionEvent(
           reasonKind: input.reasonKind,
           ...(input.requestKind === undefined ? {} : { requestKind: input.requestKind }),
           ...(input.toolCallId === undefined ? {} : { toolCallId: input.toolCallId }),
+          ...(input.permissionOutcome === undefined ? {} : { permissionOutcome: input.permissionOutcome }),
           ...(outcome === "allow" && input.selectedOptionId ? { selectedOptionId: input.selectedOptionId } : {}),
         }),
       }),
@@ -2495,6 +2576,7 @@ function expectAcpPolicyDecisionTranscriptEvent(
     reasonKind: string;
     requestKind?: string;
     toolCallId?: string;
+    permissionOutcome?: string;
     selectedOptionId?: string | undefined;
   },
 ): void {
@@ -2509,6 +2591,7 @@ function expectAcpPolicyDecisionTranscriptEvent(
           reasonKind: input.reasonKind,
           ...(input.requestKind === undefined ? {} : { requestKind: input.requestKind }),
           ...(input.toolCallId === undefined ? {} : { toolCallId: input.toolCallId }),
+          ...(input.permissionOutcome === undefined ? {} : { permissionOutcome: input.permissionOutcome }),
           ...(outcome === "allow" && input.selectedOptionId ? { selectedOptionId: input.selectedOptionId } : {}),
         }),
       }),

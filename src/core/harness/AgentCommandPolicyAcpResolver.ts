@@ -134,7 +134,7 @@ export function mapAgentCommandPolicyDecisionToAcpPermissionDecision(
     options.allowOptionId ?? DEFAULT_AGENT_COMMAND_POLICY_ACP_ALLOW_OPTION_ID,
   );
   if (!allowOptionId) {
-    return { optionId: null, reason: "unsupported_agent_command_policy_acp_allow_option", policyDecision: decision };
+    return { optionId: null, reason: "unsupported_agent_command_policy_acp_allow_option" };
   }
 
   return { optionId: allowOptionId, reason: decision.reasonKind, policyDecision: decision };

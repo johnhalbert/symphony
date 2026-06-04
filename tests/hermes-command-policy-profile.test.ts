@@ -151,6 +151,72 @@ describe("Hermes command policy profile hooks", () => {
     await harness.dispose();
   });
 
+  it("emits blocked hook-path command_policy_decision activity before any follow-up gateway event arrives", async () => {
+    const cliPath = path.join(root, "cli.js");
+    let client: FakeGatewayClient | null = null;
+    const harness = new HermesHarness({
+      cliPath,
+      commandPolicyHookVerifier: async () => undefined,
+      gatewayFactory: (env) => {
+        client = new FakeGatewayClient(env, "gw-blocked-without-followup", {
+          emitPromptCompleteEvent: false,
+          onPromptSubmit: async (gatewayClient) => {
+            const entry = hookJournalEntry("direct_upstream_github", "deny", {
+              permissionOutcome: "denied",
+              hookAction: "block",
+            });
+            await writeFile(
+              buildHermesAgentCommandPolicyDecisionJournalPath(gatewayClient.env.hermesHome),
+              `${JSON.stringify(entry)}\n`,
+              "utf8",
+            );
+          },
+        });
+        return client;
+      },
+    });
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const iterator = harness
+      .run(context(config, { workspacePath, role: "worker", runPhase: "implementation", turnNumber: 1 }), "worker")
+      [Symbol.asyncIterator]();
+
+    const started = await iterator.next();
+    expect(started.value).toMatchObject({ type: "session_started" });
+
+    const blockedDecision = await Promise.race([
+      iterator.next(),
+      new Promise<IteratorResult<AgentEvent>>((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for blocked hook decision")), 200)),
+    ]);
+    expect(blockedDecision.done).toBe(false);
+    expect(blockedDecision.value).toMatchObject({
+      type: "run_diagnostic",
+      code: "command_policy_decision",
+      payload: expect.objectContaining({
+        outcome: "deny",
+        reasonKind: "direct_upstream_github",
+        permissionOutcome: "denied",
+        hookAction: "block",
+      }),
+    });
+
+    expect(client).not.toBeNull();
+    client!.emit("event", {
+      type: "message.complete",
+      session_id: "gw-blocked-without-followup",
+      payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
+    } satisfies GatewayEvent);
+
+    const nextEvents = [await iterator.next(), await iterator.next()];
+    expect(nextEvents.map((entry) => entry.value?.type)).toEqual(expect.arrayContaining(["tokens", "completed"]));
+    const done = await iterator.next();
+    expect(done.done).toBe(true);
+
+    await harness.dispose();
+  });
+
   it("emits durable command_policy_decision activity from fallback hook journals when primary journaling fails", async () => {
     const cliPath = path.join(root, "cli.js");
     const harness = new HermesHarness({
@@ -287,7 +353,10 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   constructor(
     readonly env: HermesGatewayEnvironment,
     private readonly sessionId: string,
-    private readonly options: { onPromptSubmit?: (client: FakeGatewayClient) => Promise<void> | void } = {},
+    private readonly options: {
+      onPromptSubmit?: (client: FakeGatewayClient) => Promise<void> | void;
+      emitPromptCompleteEvent?: boolean;
+    } = {},
   ) {
     super();
   }
@@ -313,13 +382,15 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
     if (method === "session.create") return { session_id: this.sessionId } as T;
     if (method === "prompt.submit") {
       await this.options.onPromptSubmit?.(this);
-      queueMicrotask(() => {
-        this.emit("event", {
-          type: "message.complete",
-          session_id: this.sessionId,
-          payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
-        } satisfies GatewayEvent);
-      });
+      if (this.options.emitPromptCompleteEvent !== false) {
+        queueMicrotask(() => {
+          this.emit("event", {
+            type: "message.complete",
+            session_id: this.sessionId,
+            payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
+          } satisfies GatewayEvent);
+        });
+      }
       return { ok: true } as T;
     }
     return { ok: true } as T;
