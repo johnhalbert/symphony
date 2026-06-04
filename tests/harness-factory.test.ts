@@ -34,6 +34,16 @@ describe("createAgentHarness", () => {
     expect(createAgentHarness(config("hermes"))).toBeInstanceOf(HermesHarness);
   });
 
+  it("keeps the Hermes TUI harness registered when Hermes ACP config coexists in the same workflow", () => {
+    const hermesHarness = createAgentHarness(configWithHermesAndAcp("hermes"));
+    const acpHarness = createAgentHarness(configWithHermesAndAcp("hermes_acp"));
+
+    expect(hermesHarness).toBeInstanceOf(HermesHarness);
+    expect(hermesHarness.id).toBe("hermes");
+    expect(acpHarness).toBeInstanceOf(HermesAcpHarness);
+    expect(acpHarness.id).toBe("hermes_acp");
+  });
+
   it("wires the Hermes ACP default permission resolver to fail closed for valid file-edit requests", async () => {
     const harness = createAgentHarness(config("hermes_acp"));
     const permissionResolver = (harness as unknown as { options: { permissionResolver?: HermesAcpPermissionResolver } }).options
@@ -83,6 +93,28 @@ function config(harness = "cursor") {
     {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
       agent: { harness, max_turns: 2 },
+    },
+    "/repo/WORKFLOW.md",
+    { LINEAR_API_KEY: "secret" },
+  );
+}
+
+function configWithHermesAndAcp(harness: "hermes" | "hermes_acp") {
+  return parseServiceConfig(
+    {
+      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      agent: { harness, max_turns: 2 },
+      hermes: {
+        state_dir: "/runtime/tui-hermes-home",
+        provider: "openai-codex",
+        model: "gpt-5.5-tui",
+      },
+      hermes_acp: {
+        binary_path: "/host/bin/hermes",
+        source_profile: "dogfood-host",
+        profile_prefix: "symphony-host",
+        worker_session_lifecycle: "fresh_per_run",
+      },
     },
     "/repo/WORKFLOW.md",
     { LINEAR_API_KEY: "secret" },

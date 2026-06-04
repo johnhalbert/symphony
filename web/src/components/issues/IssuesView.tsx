@@ -10,7 +10,8 @@ export function resolveSelectedIssueId(
   board: Pick<IssueBoardModel, "issues" | "selectedIssueId">,
 ): string {
   if (currentSelectedId && board.issues.some((issue) => issue.id === currentSelectedId)) return currentSelectedId;
-  return board.selectedIssueId;
+  if (board.selectedIssueId && board.issues.some((issue) => issue.id === board.selectedIssueId)) return board.selectedIssueId;
+  return board.issues[0]?.id ?? "";
 }
 
 export function IssuesView({
@@ -34,6 +35,11 @@ export function IssuesView({
   const effectiveSelectedId = resolveSelectedIssueId(selectedId, board);
   const selectedDetailId = detailOpen && effectiveSelectedId ? effectiveSelectedId : null;
   const issueDetail = useIssueDetail(selectedDetailId, refreshToken);
+  const detailEmptyMessage = board.issues.length === 0
+    ? "No issue detail is available because the current issue projection is empty."
+    : selectedDetailId
+      ? "Issue detail not found or unavailable."
+      : undefined;
   const columns = variant === "detail-heavy" ? "240px minmax(0, 1fr) 480px" : "280px minmax(0, 1fr) 400px";
   const closedColumns = `${columns.split(" ").slice(0, 2).join(" ")} 0`;
   const layoutStyle = {
@@ -60,7 +66,7 @@ export function IssuesView({
           issueId={selectedDetailId}
           loading={Boolean(selectedDetailId) && issueDetail.loading}
           error={issueDetail.error}
-          emptyMessage={selectedDetailId ? "Issue detail not found or unavailable." : undefined}
+          emptyMessage={detailEmptyMessage}
           onClose={() => setDetailOpen(false)}
         />
       ) : null}

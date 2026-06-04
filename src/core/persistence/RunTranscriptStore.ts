@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
+import { isRunActivityCommandPolicyDecisionPayload } from "../runActivity/RunActivityEvent.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
@@ -22,6 +23,58 @@ export interface RunActivitySnapshot {
   lastStreamActivityAt: string | null;
   lastDeltaOrToolActivityAt: string | null;
   lastToolActivityAt: string | null;
+}
+
+export interface PersistedCommandPolicyDecisionRecord {
+  sequence: number;
+  at: string;
+  source: TranscriptEvent["source"];
+  decisionId: string | null;
+  attemptId: string | null;
+  activityId: string | null;
+  runId: string | null;
+  issueId: string | null;
+  surface: string;
+  role: string;
+  phase: string;
+  outcome: "allow" | "deny";
+  reasonKind: string;
+  commandClass: string;
+  message: string;
+  upstreamContactAttempted: boolean;
+  redacted: true;
+  payloadSchema?: string;
+  requiresCodeChange?: boolean;
+  requiresUserOrServiceFix?: boolean;
+  requestKind?: string | null;
+  toolCallId?: string | null;
+  selectedOptionId?: string | null;
+  permissionOutcome?: string | null;
+  hookAction?: string | null;
+  normalizedCommand?: unknown;
+  audit: unknown;
+}
+
+export interface PersistedMalformedCommandPolicyDecisionRecord {
+  sequence: number;
+  at: string;
+  source: TranscriptEvent["source"];
+  eventType: "command_policy_decision";
+  payloadSchema?: string;
+  payloadPresent: boolean;
+  failureKind: "malformed_persisted_policy_data";
+  safeOutcome: "deny";
+  message: string;
+  redacted: true;
+}
+
+export interface PersistedCommandPolicyReplayState {
+  decisionCount: number;
+  malformedEventCount: number;
+  lastDecisionAt: string | null;
+  lastMalformedAt: string | null;
+  decisions: PersistedCommandPolicyDecisionRecord[];
+  malformedEvents: PersistedMalformedCommandPolicyDecisionRecord[];
 }
 
 export interface PersistedCursorModelParam {
@@ -78,6 +131,7 @@ export interface RunMetadata {
   pendingApprovalRequestId?: string | null;
   pendingApprovalRequestedAt?: string | null;
   providerLimit?: ProviderLimitSignal | null;
+  commandPolicy?: PersistedCommandPolicyReplayState;
 }
 
 export interface RunRecord {
@@ -148,6 +202,7 @@ export interface RunRecord {
   pendingApprovalRequestId?: string | null;
   pendingApprovalRequestedAt?: string | null;
   providerLimit?: ProviderLimitSignal | null;
+  commandPolicy?: PersistedCommandPolicyReplayState;
 }
 
 export interface TranscriptEvent {
@@ -396,7 +451,13 @@ export class FileRunTranscriptStore {
       if (reduced) {
         await this.writeRun(reduced);
       }
-      this.notifyProjectionChanged("runs");
+      this.notifyProjectionChanged("runs", {
+        runId: event.runId,
+        sessionId: (reduced ?? record)?.sessionId ?? event.runId,
+        afterSequence: count,
+        eventCount: 1,
+        events: [projectTranscriptEventForPublicRead(event)],
+      });
       return event;
     });
   }
@@ -517,8 +578,8 @@ export class FileRunTranscriptStore {
     return count;
   }
 
-  private notifyProjectionChanged(source: "runs" | "workspaces"): void {
-    this.projectionNotifier.notify(source);
+  private notifyProjectionChanged(source: "runs" | "workspaces", detail: Record<string, unknown> | null = null): void {
+    this.projectionNotifier.notify(source, detail);
   }
 
   private workspacesDir(): string {
@@ -625,6 +686,7 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
       : shouldBackfillCursorRuntime && record.cursorWorkerAgentLifecycle !== undefined
         ? { runtimeAgentLifecycle: record.cursorWorkerAgentLifecycle }
         : {}),
+    ...(record.commandPolicy === undefined ? {} : { commandPolicy: commandPolicyReplayStateFromExisting(record.commandPolicy) }),
   };
 }
 
@@ -668,6 +730,7 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.pendingApprovalRequestId === undefined ? {} : { pendingApprovalRequestId: metadata.pendingApprovalRequestId }),
     ...(metadata.pendingApprovalRequestedAt === undefined ? {} : { pendingApprovalRequestedAt: metadata.pendingApprovalRequestedAt }),
     ...(metadata.providerLimit === undefined ? {} : { providerLimit: metadata.providerLimit }),
+    ...(metadata.commandPolicy === undefined ? {} : { commandPolicy: commandPolicyReplayStateFromExisting(metadata.commandPolicy) }),
   };
 }
 
@@ -701,7 +764,7 @@ function reduceRunActivityEvent(
     next = applyRunMetadataPayload(next, payload);
   }
 
-  switch (event.eventType) {
+  switch (normalizeTranscriptEventType(event.eventType)) {
     case "session_started":
       next = reduceSessionStarted(next, event, payload);
       break;
@@ -713,6 +776,9 @@ function reduceRunActivityEvent(
       break;
     case "run_diagnostic":
       next = reduceRunDiagnostic(next, event, payload);
+      break;
+    case "command_policy_decision":
+      next = reduceCommandPolicyDecision(next, event);
       break;
     case "provider_limit":
       next = reduceProviderLimit(next, event, payload, options);
@@ -783,6 +849,7 @@ function resetReplayableRunState(record: RunRecord): RunRecord {
     pendingApprovalRequestId: null,
     pendingApprovalRequestedAt: null,
     providerLimit: null,
+    commandPolicy: emptyCommandPolicyReplayState(),
     updatedAt: record.startedAt,
   });
 }
@@ -855,6 +922,207 @@ function reduceRunDiagnostic(record: RunRecord, event: TranscriptEvent, payload:
     failureDiagnosticAt: event.at,
   };
   return payload && Object.hasOwn(payload, "payload") ? { ...next, failureDiagnosticPayload: payload.payload } : next;
+}
+
+function reduceCommandPolicyDecision(record: RunRecord, event: TranscriptEvent): RunRecord {
+  return {
+    ...record,
+    commandPolicy: reduceCommandPolicyReplayState(record.commandPolicy, event),
+  };
+}
+
+export function emptyCommandPolicyReplayState(): PersistedCommandPolicyReplayState {
+  return commandPolicyReplayState([], []);
+}
+
+export function reduceCommandPolicyReplayState(
+  existing: PersistedCommandPolicyReplayState | undefined,
+  event: TranscriptEvent,
+): PersistedCommandPolicyReplayState {
+  const current = commandPolicyReplayStateFromExisting(existing);
+  if (normalizeTranscriptEventType(event.eventType) !== "command_policy_decision") return current;
+
+  if (!isRunActivityCommandPolicyDecisionPayload(event.payload)) {
+    const malformed = malformedCommandPolicyDecisionRecord(event);
+    if (current.malformedEvents.some((item) => malformedCommandPolicyEventKey(item) === malformedCommandPolicyEventKey(malformed))) {
+      return current;
+    }
+    return commandPolicyReplayState(current.decisions, [...current.malformedEvents, malformed]);
+  }
+
+  const decision = commandPolicyDecisionRecord(event, event.payload);
+  if (current.decisions.some((item) => commandPolicyDecisionKey(item) === commandPolicyDecisionKey(decision))) {
+    return current;
+  }
+  return commandPolicyReplayState([...current.decisions, decision], current.malformedEvents);
+}
+
+function commandPolicyReplayStateFromExisting(
+  existing: PersistedCommandPolicyReplayState | undefined,
+): PersistedCommandPolicyReplayState {
+  if (!existing) return emptyCommandPolicyReplayState();
+  const decisions = dedupeCommandPolicyDecisionRecords(
+    Array.isArray(existing.decisions) ? existing.decisions.filter(isPersistedCommandPolicyDecisionRecord) : [],
+  );
+  const malformedEvents = dedupeMalformedCommandPolicyEventRecords(
+    Array.isArray(existing.malformedEvents) ? existing.malformedEvents.filter(isPersistedMalformedCommandPolicyDecisionRecord) : [],
+  );
+  return commandPolicyReplayState(decisions, malformedEvents);
+}
+
+function commandPolicyReplayState(
+  decisions: PersistedCommandPolicyDecisionRecord[],
+  malformedEvents: PersistedMalformedCommandPolicyDecisionRecord[],
+): PersistedCommandPolicyReplayState {
+  return {
+    decisionCount: decisions.length,
+    malformedEventCount: malformedEvents.length,
+    lastDecisionAt: decisions.at(-1)?.at ?? null,
+    lastMalformedAt: malformedEvents.at(-1)?.at ?? null,
+    decisions,
+    malformedEvents,
+  };
+}
+
+function commandPolicyDecisionRecord(
+  event: TranscriptEvent,
+  payload: Record<string, unknown>,
+): PersistedCommandPolicyDecisionRecord {
+  return {
+    sequence: event.sequence,
+    at: event.at,
+    source: event.source,
+    decisionId: stringField(payload, "decisionId") ?? null,
+    attemptId: stringField(payload, "attemptId") ?? null,
+    activityId: stringField(payload, "activityId") ?? null,
+    runId: stringField(payload, "runId") ?? event.runId,
+    issueId: stringField(payload, "issueId") ?? null,
+    surface: payload.surface as string,
+    role: payload.role as string,
+    phase: payload.phase as string,
+    outcome: payload.outcome as "allow" | "deny",
+    reasonKind: payload.reasonKind as string,
+    commandClass: payload.commandClass as string,
+    message: payload.message as string,
+    upstreamContactAttempted: payload.upstreamContactAttempted as boolean,
+    redacted: true,
+    ...(event.payloadSchema === undefined ? {} : { payloadSchema: event.payloadSchema }),
+    ...(typeof payload.requiresCodeChange === "boolean" ? { requiresCodeChange: payload.requiresCodeChange } : {}),
+    ...(typeof payload.requiresUserOrServiceFix === "boolean" ? { requiresUserOrServiceFix: payload.requiresUserOrServiceFix } : {}),
+    ...optionalStringRecordPatch(payload, "requestKind"),
+    ...optionalStringRecordPatch(payload, "toolCallId"),
+    ...optionalStringRecordPatch(payload, "selectedOptionId"),
+    ...optionalStringRecordPatch(payload, "permissionOutcome"),
+    ...optionalStringRecordPatch(payload, "hookAction"),
+    ...(payload.normalizedCommand === undefined ? {} : { normalizedCommand: sanitizeJson(payload.normalizedCommand) }),
+    audit: sanitizeJson(payload.audit),
+  };
+}
+
+function malformedCommandPolicyDecisionRecord(event: TranscriptEvent): PersistedMalformedCommandPolicyDecisionRecord {
+  return {
+    sequence: event.sequence,
+    at: event.at,
+    source: event.source,
+    eventType: "command_policy_decision",
+    ...(event.payloadSchema === undefined ? {} : { payloadSchema: event.payloadSchema }),
+    payloadPresent: event.payload !== undefined && event.payload !== null,
+    failureKind: "malformed_persisted_policy_data",
+    safeOutcome: "deny",
+    message: "Malformed persisted command-policy decision could not be replayed; treating the policy attempt as denied for audit.",
+    redacted: true,
+  };
+}
+
+function commandPolicyDecisionKey(decision: PersistedCommandPolicyDecisionRecord): string {
+  if (decision.decisionId) return `decision:${decision.decisionId}`;
+  if (decision.activityId) return `activity:${decision.activityId}`;
+  return `sequence:${decision.sequence}`;
+}
+
+function malformedCommandPolicyEventKey(event: PersistedMalformedCommandPolicyDecisionRecord): string {
+  return `sequence:${event.sequence}`;
+}
+
+function isPersistedCommandPolicyDecisionRecord(value: unknown): value is PersistedCommandPolicyDecisionRecord {
+  const record = recordPayload(value);
+  return (
+    record !== null &&
+    typeof record.sequence === "number" &&
+    typeof record.at === "string" &&
+    typeof record.source === "string" &&
+    isNullableString(record.decisionId) &&
+    isNullableString(record.attemptId) &&
+    isNullableString(record.activityId) &&
+    isNullableString(record.runId) &&
+    isNullableString(record.issueId) &&
+    record.redacted === true &&
+    (record.outcome === "allow" || record.outcome === "deny") &&
+    typeof record.surface === "string" &&
+    typeof record.role === "string" &&
+    typeof record.phase === "string" &&
+    typeof record.reasonKind === "string" &&
+    typeof record.commandClass === "string" &&
+    typeof record.message === "string" &&
+    typeof record.upstreamContactAttempted === "boolean" &&
+    Object.hasOwn(record, "audit")
+  );
+}
+
+function isPersistedMalformedCommandPolicyDecisionRecord(
+  value: unknown,
+): value is PersistedMalformedCommandPolicyDecisionRecord {
+  const record = recordPayload(value);
+  return (
+    record !== null &&
+    typeof record.sequence === "number" &&
+    typeof record.at === "string" &&
+    typeof record.source === "string" &&
+    record.eventType === "command_policy_decision" &&
+    record.failureKind === "malformed_persisted_policy_data" &&
+    record.safeOutcome === "deny" &&
+    typeof record.payloadPresent === "boolean" &&
+    typeof record.message === "string" &&
+    record.redacted === true
+  );
+}
+
+function optionalStringRecordPatch(record: UnknownRecord, key: string): Record<string, string | null> {
+  if (!(key in record)) return {};
+  const value = record[key];
+  return value === null || typeof value === "string" ? { [key]: value } : {};
+}
+
+function dedupeCommandPolicyDecisionRecords(
+  decisions: PersistedCommandPolicyDecisionRecord[],
+): PersistedCommandPolicyDecisionRecord[] {
+  const seen = new Set<string>();
+  const deduped: PersistedCommandPolicyDecisionRecord[] = [];
+  for (const decision of decisions) {
+    const key = commandPolicyDecisionKey(decision);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(decision);
+  }
+  return deduped;
+}
+
+function dedupeMalformedCommandPolicyEventRecords(
+  events: PersistedMalformedCommandPolicyDecisionRecord[],
+): PersistedMalformedCommandPolicyDecisionRecord[] {
+  const seen = new Set<string>();
+  const deduped: PersistedMalformedCommandPolicyDecisionRecord[] = [];
+  for (const event of events) {
+    const key = malformedCommandPolicyEventKey(event);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(event);
+  }
+  return deduped;
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
 }
 
 function reduceProviderLimit(
@@ -1051,6 +1319,10 @@ function terminalStatusField(value: string | undefined): Exclude<RunStatus, "run
 function stringField(record: UnknownRecord | null | undefined, key: string): string | undefined {
   const value = record?.[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function normalizeTranscriptEventType(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
 function cleanStringField(record: UnknownRecord | null | undefined, key: string): string | undefined {

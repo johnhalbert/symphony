@@ -48,40 +48,46 @@ export function BacklogColumn({
           </div>
         </div>
         <div className="backlog__body">
-          {filtered.map((issue) => (
-            <button
-              className="backlog__item"
-              data-selected={issue.id === selectedId}
-              key={issue.id}
-              onClick={() => onSelect(issue.id)}
-              style={{ textAlign: "left", width: "100%" }}
-              type="button"
-            >
-              <StatusIcon state={issue.status} />
-              <div className="ttl">
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span className="id">{issue.id}</span>
-                  <Priority level={issue.priority} />
+          {filtered.length ? (
+            filtered.map((issue) => (
+              <button
+                className="backlog__item"
+                data-selected={issue.id === selectedId}
+                key={issue.id}
+                onClick={() => onSelect(issue.id)}
+                style={{ textAlign: "left", width: "100%" }}
+                type="button"
+              >
+                <StatusIcon state={issue.status} />
+                <div className="ttl">
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span className="id">{issue.id}</span>
+                    <Priority level={issue.priority} />
+                  </div>
+                  <span className="t">{issue.title}</span>
                 </div>
-                <span className="t">{issue.title}</span>
-              </div>
-              <div className="right">
-                {issue.labels.slice(0, 1).map((label) => (
-                  <span
-                    key={label}
-                    className="swatch-dot"
-                    style={{
-                      width: 7,
-                      height: 7,
-                      borderRadius: 999,
-                      background: labels[label]?.color || "var(--text-4)",
-                    }}
-                  />
-                ))}
-                <Avatar user={issue.assignee} />
-              </div>
-            </button>
-          ))}
+                <div className="right">
+                  {issue.labels.slice(0, 1).map((label) => (
+                    <span
+                      key={label}
+                      className="swatch-dot"
+                      style={{
+                        width: 7,
+                        height: 7,
+                        borderRadius: 999,
+                        background: labels[label]?.color || "var(--text-4)",
+                      }}
+                    />
+                  ))}
+                  <Avatar user={issue.assignee} />
+                </div>
+              </button>
+            ))
+          ) : (
+            <div className="view-empty">
+              {query.trim() ? "No backlog issues match the current filter." : "No backlog issues in this projection."}
+            </div>
+          )}
         </div>
       </div>
     </div>

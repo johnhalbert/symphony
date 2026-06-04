@@ -153,8 +153,6 @@ export async function createHostHermesAcpProfileLease(
   const env = hostHermesAcpCommandEnvironment(options.env ?? process.env);
   const runner = options.runner ?? defaultHostHermesAcpCommandRunner;
   const keepProfiles = options.keepProfiles ?? "failed";
-  const reservedProfileNames = combineReservedProfileNames(options.reservedProfileNames);
-  const profileName = resolveRequestedProfileName(options, reservedProfileNames);
   const sourceProfile = await resolveHostHermesAcpSourceProfile({
     binaryPath,
     cwd,
@@ -162,6 +160,13 @@ export async function createHostHermesAcpProfileLease(
     timeoutMs,
     ...(options.sourceProfile !== undefined ? { sourceProfile: options.sourceProfile } : {}),
     runner,
+  });
+  const profileName = resolveVerifiedLeaseProfileName(options, sourceProfile);
+
+  await verifyHostHermesAcpSourceProfile(runner, binaryPath, sourceProfile, {
+    cwd,
+    env,
+    timeoutMs,
   });
 
   const profileDisposition = await acquireHostHermesAcpLeaseProfile(runner, binaryPath, profileName, sourceProfile, {
@@ -416,6 +421,10 @@ export function buildHostHermesAcpLaunchArgs(profileName: string): readonly stri
   return ["-p", profileName, "acp"];
 }
 
+export function buildHostHermesAcpProfileCheckArgs(profileName: string): readonly string[] {
+  return ["-p", profileName, "acp", "--check"];
+}
+
 export function buildHostHermesAcpDeleteProfileArgs(profileName: string): readonly string[] {
   return ["profile", "delete", profileName, "--yes"];
 }
@@ -468,6 +477,46 @@ export async function resolveHostHermesAcpSourceProfile(input: {
   return activeProfile;
 }
 
+function resolveVerifiedLeaseProfileName(options: HostHermesAcpProfileLeaseOptions, sourceProfile: string): string {
+  const callerReservedProfileNames = combineReservedProfileNames(options.reservedProfileNames);
+  const explicitProfileName = normalizeOptionalString(options.profileName);
+  if (explicitProfileName) {
+    const explicitWithoutSourceReservation = normalizeHostHermesAcpProfileName(explicitProfileName, {
+      reservedNames: callerReservedProfileNames,
+    });
+    if (isSameHostHermesAcpProfileName(explicitWithoutSourceReservation, sourceProfile)) {
+      throw new Error(
+        `Host Hermes ACP profile lease name ${explicitProfileName} resolves to the source profile ${sourceProfile}; choose a disposable profile name that differs from the source profile.`,
+      );
+    }
+  }
+
+  const reservedProfileNames = combineReservedProfileNames([...callerReservedProfileNames, sourceProfile]);
+  const profileName = resolveRequestedProfileName(options, reservedProfileNames);
+  if (isSameHostHermesAcpProfileName(profileName, sourceProfile)) {
+    throw new Error(
+      `Host Hermes ACP lease profile ${profileName} must differ from source profile ${sourceProfile}; refusing to create or launch ACP from the source profile.`,
+    );
+  }
+  return profileName;
+}
+
+async function verifyHostHermesAcpSourceProfile(
+  runner: HostHermesAcpCommandRunner,
+  file: string,
+  sourceProfile: string,
+  options: HostHermesAcpCommandOptions,
+): Promise<void> {
+  const args = buildHostHermesAcpProfileCheckArgs(sourceProfile);
+  try {
+    await runRequiredHostHermesAcpCommand(runner, file, args, options);
+  } catch (error) {
+    throw new Error(
+      `Host Hermes ACP source profile ${sourceProfile} failed safety verification with \`${file} ${args.join(" ")}\`: ${errorMessage(error)}. Refresh host Hermes credentials or update \`hermes_acp.source_profile\`; Symphony will not create or launch a disposable ACP profile until the source profile passes \`hermes -p <source> acp --check\`.`,
+    );
+  }
+}
+
 export function parseHostHermesAcpActiveProfile(output: string): string | null {
   const sanitized = stripAnsi(output).replace(/\r/g, "");
   const match = sanitized.match(/^\s*Active profile:\s*([^\s]+)\s*$/im);
@@ -509,10 +558,15 @@ async function acquireHostHermesAcpLeaseProfile(
   sourceProfile: string,
   options: HostHermesAcpCommandOptions,
 ): Promise<HostHermesAcpProfileLeaseProfileDisposition> {
-  if (isSameHostHermesAcpProfileName(profileName, sourceProfile)) return "reused";
+  if (isSameHostHermesAcpProfileName(profileName, sourceProfile)) {
+    throw new Error(
+      `Host Hermes ACP lease profile ${profileName} must differ from source profile ${sourceProfile}; refusing to create, launch, or delete a run profile that targets the source profile.`,
+    );
+  }
 
   const args = buildHostHermesAcpCreateProfileArgs(profileName, sourceProfile);
   const result = await runHostHermesAcpCommand(runner, file, args, options);
+
   if (result.exitCode === 0) return "created";
   if (typeof result.exitCode === "number" && isExpectedExistingHostHermesAcpProfile(result, profileName)) return "reused";
   throw hostHermesAcpCommandResultError(result, file, args);

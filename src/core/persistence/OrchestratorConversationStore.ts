@@ -11,6 +11,8 @@ import { redactTranscriptText, sanitizePublicJson, sanitizedPreviewValue } from 
 
 export const DEFAULT_ORCHESTRATOR_CONVERSATION_ID = "orchestrator-default";
 
+const ORCHESTRATOR_CONVERSATION_REALTIME_CHAT_TAIL_LIMIT = 100;
+
 export type OrchestratorConversationRole = "user" | "assistant" | "system" | "server";
 export type OrchestratorConversationStatus =
   | "pending"
@@ -166,7 +168,12 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
         messages: [...record.messages, message],
       };
       await this.writeConversation(nextRecord);
-      this.notifyProjectionChanged(nextRecord);
+      const realtimeMessage = projectOrchestratorConversationRealtimeMessage(message);
+      this.notifyProjectionChanged(nextRecord, {
+        operation: "append",
+        message: realtimeMessage,
+        messages: [realtimeMessage],
+      });
       return message;
     });
   }
@@ -202,7 +209,12 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
         messages,
       };
       await this.writeConversation(nextRecord);
-      this.notifyProjectionChanged(nextRecord);
+      const realtimeMessage = projectOrchestratorConversationRealtimeMessage(updated);
+      this.notifyProjectionChanged(nextRecord, {
+        operation: "update",
+        message: realtimeMessage,
+        messages: [realtimeMessage],
+      });
       return updated;
     });
   }
@@ -239,15 +251,22 @@ export class FileOrchestratorConversationStore implements OrchestratorConversati
     await writeJson(filePath, normalizeConversationRecordForConversation(record, conversationId, filePath));
   }
 
-  private notifyProjectionChanged(record: OrchestratorConversationRecord): void {
-    this.projectionNotifier.notify("orchestrator_conversations", orchestratorConversationProjectionChangeDetail(record));
+  private notifyProjectionChanged(record: OrchestratorConversationRecord, extras: ProjectionChangeDetail = {}): void {
+    this.projectionNotifier.notify(
+      "orchestrator_conversations",
+      orchestratorConversationProjectionChangeDetail(record, extras),
+    );
   }
 }
 
-function orchestratorConversationProjectionChangeDetail(record: OrchestratorConversationRecord): ProjectionChangeDetail {
-  const chat = record.messages.map(projectOrchestratorConversationRealtimeMessage);
-  const statusSummary = summarizeOrchestratorConversationRealtimeStatus(chat, record.status);
-  const latestMessage = chat.at(-1) ?? null;
+function orchestratorConversationProjectionChangeDetail(
+  record: OrchestratorConversationRecord,
+  extras: ProjectionChangeDetail = {},
+): ProjectionChangeDetail {
+  const fullChat = record.messages.map(projectOrchestratorConversationRealtimeMessage);
+  const chat = selectRecentTail(fullChat, ORCHESTRATOR_CONVERSATION_REALTIME_CHAT_TAIL_LIMIT);
+  const statusSummary = summarizeOrchestratorConversationRealtimeStatus(fullChat, record.status);
+  const latestMessage = fullChat.at(-1) ?? null;
   const latestStoredMessage = record.messages.at(-1) ?? null;
   const latestMessageSequence = latestStoredMessage?.sequence ?? null;
   const latestMessageUpdatedAt = typeof latestMessage?.updatedAt === "string" ? latestMessage.updatedAt : null;
@@ -261,7 +280,7 @@ function orchestratorConversationProjectionChangeDetail(record: OrchestratorConv
       status: record.status,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
-      messageCount: chat.length,
+      messageCount: fullChat.length,
       metadata: record.metadata,
     },
     state: statusSummary.state,
@@ -270,7 +289,7 @@ function orchestratorConversationProjectionChangeDetail(record: OrchestratorConv
     active: statusSummary.active,
     terminal: statusSummary.terminal,
     empty: statusSummary.empty,
-    messageCount: chat.length,
+    messageCount: fullChat.length,
     latestMessageSequence,
     latestMessageUpdatedAt,
     sourceSummary: {
@@ -290,7 +309,13 @@ function orchestratorConversationProjectionChangeDetail(record: OrchestratorConv
           ? latestMessage.createdAt
           : null,
     chat,
+    ...extras,
   };
+}
+
+function selectRecentTail<T>(values: readonly T[], limit: number): T[] {
+  if (limit <= 0 || values.length === 0) return [];
+  return values.length <= limit ? [...values] : values.slice(-limit);
 }
 
 function projectOrchestratorConversationRealtimeMessage(message: OrchestratorConversationMessage): Record<string, unknown> {

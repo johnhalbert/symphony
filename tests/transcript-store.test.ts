@@ -837,7 +837,7 @@ describe("FileRunTranscriptStore", () => {
 
   it("tracks projection revisions for successful run and workspace writes only", async () => {
     const store = new FileRunTranscriptStore(root);
-    const events: Array<{ source: string; revision: number }> = [];
+    const events: Array<{ source: string; revision: number; detail?: Readonly<Record<string, unknown>> | null }> = [];
     store.onProjectionChanged(() => {
       throw new Error("listener failure must not affect durable writes");
     });
@@ -882,13 +882,25 @@ describe("FileRunTranscriptStore", () => {
     await store.deleteWorkspace("TEST-1");
 
     expect(store.projectionRevision()).toBe(5);
-    expect(events).toEqual([
+    expect(events).toMatchObject([
       { source: "runs", revision: 1 },
-      { source: "runs", revision: 2 },
+      {
+        source: "runs",
+        revision: 2,
+        detail: { runId: "run-projection", sessionId: "run-projection", afterSequence: 0, eventCount: 1 },
+      },
       { source: "runs", revision: 3 },
       { source: "workspaces", revision: 4 },
       { source: "workspaces", revision: 5 },
     ]);
+    const appendDetailEvents = events[1]?.detail?.events;
+    expect(Array.isArray(appendDetailEvents) ? appendDetailEvents[0] : null).toMatchObject({
+      runId: "run-projection",
+      sequence: 1,
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+    });
 
     await expect(store.getRun("run-projection")).resolves.toMatchObject({ runId: "run-projection" });
     await expect(store.listRunsForIssue("TEST-1")).resolves.toHaveLength(1);
@@ -926,7 +938,7 @@ describe("FileRunTranscriptStore", () => {
       source: "harness",
       eventType: "progress",
     });
-    const events: Array<{ source: string; revision: number }> = [];
+    const events: Array<{ source: string; revision: number; detail?: Readonly<Record<string, unknown>> | null }> = [];
     store.onProjectionChanged((event) => events.push(event));
     const beforeLegacyEditRevision = store.projectionRevision();
     const metaPath = path.join(root, "runs", "run-repair", "meta.json");
@@ -945,7 +957,7 @@ describe("FileRunTranscriptStore", () => {
 
   it("does not advance projection revisions when run writes fail", async () => {
     const store = new FileRunTranscriptStore(root);
-    const events: Array<{ source: string; revision: number }> = [];
+    const events: Array<{ source: string; revision: number; detail?: Readonly<Record<string, unknown>> | null }> = [];
     store.onProjectionChanged((event) => events.push(event));
     vi.spyOn(nodeFs, "writeFile").mockRejectedValueOnce(new Error("disk full"));
 

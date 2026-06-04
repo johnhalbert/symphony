@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Icon } from "../components/common";
+import { Icon, UnavailableButton } from "../components/common";
 import type { AppTab } from "../types/symphony";
 import { appTabs } from "./navigation";
 
@@ -75,18 +75,26 @@ export function AppChrome({
         </div>
         <div className="titlebar__right">
           {rightSlot}
-          <button className="icon-btn" type="button" title="Search">
+          <UnavailableButton
+            className="icon-btn"
+            unavailableLabel="Search"
+            unavailableReason="global dashboard search is unavailable until the backend exposes a backed search route"
+          >
             {Icon.search()}
-          </button>
-          <button className="icon-btn" type="button" title="More">
+          </UnavailableButton>
+          <UnavailableButton
+            className="icon-btn"
+            unavailableLabel="More"
+            unavailableReason="additional dashboard actions are unavailable until the web dashboard maps this menu to explicit backed commands"
+          >
             {Icon.more()}
-          </button>
+          </UnavailableButton>
         </div>
       </div>
       {children}
       <div className="statusbar">
         <span className="statusbar__seg">
-          <span className="pulse" />
+          {runningCount > 0 ? <span className="pulse" /> : null}
           {runningLabel}
         </span>
         <span className="statusbar__sep">·</span>

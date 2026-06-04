@@ -1,7 +1,16 @@
-import type { TimelineEvent, TranscriptMessage } from "../../types/symphony";
+import type { SessionModel, TimelineEvent, TranscriptMessage } from "../../types/symphony";
 import { Icon, StatusBadge, UnavailableButton } from "../common";
 
-export function Timeline({ events }: { events: TimelineEvent[] }) {
+export function Timeline({ events, sessions = [] }: { events: TimelineEvent[]; sessions?: SessionModel[] }) {
+  const runningCount = sessions.filter((session) => session.state === "running").length;
+  const finishedCount = sessions.filter((session) => session.state === "finished").length;
+  const timelineMeta = [
+    `${events.length} ${events.length === 1 ? "event" : "events"}`,
+    `${sessions.length} ${sessions.length === 1 ? "session" : "sessions"}`,
+    sessions.length ? `${runningCount} running · ${finishedCount} finished` : null,
+    "durable history projection",
+  ].filter((item): item is string => Boolean(item));
+
   return (
     <div className="history" style={{ gridTemplateColumns: "1fr" }}>
       <div className="transcript-wrap">
@@ -9,23 +18,12 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
           <div>
             <h2>Activity timeline</h2>
             <div className="meta">
-              <span>All sessions · last 1h</span>
-              <span style={{ color: "var(--text-4)" }}>·</span>
-              <span>4 running · 7 finished</span>
-              <span style={{ color: "var(--text-4)" }}>·</span>
-              <span>live</span>
-              <span
-                className="pulse"
-                style={{
-                  width: 6,
-                  height: 6,
-                  borderRadius: 999,
-                  background: "var(--accent)",
-                  boxShadow: "0 0 0 2px rgba(240,184,108,0.18)",
-                  display: "inline-block",
-                  animation: "pulse 1.6s ease-in-out infinite",
-                }}
-              />
+              {timelineMeta.map((item, index) => (
+                <span key={item}>
+                  {index > 0 ? <span style={{ color: "var(--text-4)", marginRight: 6 }}>·</span> : null}
+                  {item}
+                </span>
+              ))}
             </div>
           </div>
           <div className="right">
@@ -38,9 +36,11 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
           </div>
         </div>
         <div className="transcript" style={{ padding: "12px 24px 60px" }}>
-          {events.map((event, index) => (
-            <TimelineRow key={`${event.t}-${event.sess}-${index}`} event={event} />
-          ))}
+          {events.length ? (
+            events.map((event, index) => <TimelineRow key={`${event.t}-${event.sess}-${index}`} event={event} />)
+          ) : (
+            <div className="transcript-status">No timeline events are available from the current history projection.</div>
+          )}
         </div>
       </div>
     </div>

@@ -676,6 +676,38 @@ describe("API data source", () => {
     expect(resumedEventSource?.closed).toBe(true);
   });
 
+  it("ignores stale events from a closed realtime EventSource after reconnecting", () => {
+    vi.useFakeTimers();
+    FakeEventSource.instances = [];
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const events: RealtimeProjectionEvent[] = [];
+    const dataSource = createApiDataSource("/status-server/");
+
+    const unsubscribe = dataSource.subscribeToRealtimeEvents?.((event) => events.push(event));
+    const firstEventSource = FakeEventSource.instances[0];
+    firstEventSource?.emitOpen();
+    const firstEvent = realtimeEvent({ id: "first-1", revision: 1 });
+    firstEventSource?.emit("projection.updated", JSON.stringify(firstEvent), { lastEventId: "first-1" });
+    expect(events).toEqual([firstEvent]);
+
+    firstEventSource?.emitError(FakeEventSource.CLOSED);
+    vi.advanceTimersByTime(5_000);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    const resumedEventSource = FakeEventSource.instances[1];
+    expect(resumedEventSource?.url).toBe("/status-server/api/v1/realtime?lastEventId=first-1");
+
+    const staleClosedSourceEvent = realtimeEvent({ id: "stale-2", revision: 2 });
+    firstEventSource?.emit("projection.updated", JSON.stringify(staleClosedSourceEvent), { lastEventId: "stale-2" });
+    expect(events).toEqual([firstEvent]);
+
+    const resumedEvent = realtimeEvent({ id: "resumed-2", revision: 2 });
+    resumedEventSource?.emit("projection.updated", JSON.stringify(resumedEvent), { lastEventId: "resumed-2" });
+    unsubscribe?.();
+
+    expect(events).toEqual([firstEvent, resumedEvent]);
+    expect(resumedEventSource?.closed).toBe(true);
+  });
+
   it("cancels pending realtime reconnect when the final subscriber unsubscribes", () => {
     vi.useFakeTimers();
     FakeEventSource.instances = [];
@@ -764,6 +796,48 @@ describe("API data source", () => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ input: "status" }),
+    });
+  });
+
+  it("posts trigger poll to /api/v1/refresh and force-refreshes cached dashboard reads", async () => {
+    const triggerResult = {
+      queued: true,
+      coalesced: false,
+      requested_at: "2026-06-03T13:30:00.000Z",
+      operations: ["poll", "reconcile"],
+    };
+    const refreshedDashboard = { ...dashboardModel, pollLabel: "poll triggered" };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(dashboardModel))
+      .mockResolvedValueOnce(jsonResponse(triggerResult, { status: 202 }))
+      .mockResolvedValueOnce(jsonResponse(refreshedDashboard));
+    const dataSource = createApiDataSource("/status-server/");
+
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    await expect(dataSource.getDashboard()).resolves.toEqual(dashboardModel);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await expect(dataSource.triggerPoll?.()).resolves.toEqual(triggerResult);
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/status-server/api/v1/refresh", {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    });
+
+    await expect(dataSource.getDashboard()).resolves.toEqual(refreshedDashboard);
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/status-server/api/v1/web/dashboard?refresh=1", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+  });
+
+  it("surfaces trigger poll HTTP failures instead of reporting fake success", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: "refresh unavailable" }, { status: 503 }));
+
+    await expect(createApiDataSource("").triggerPoll?.()).rejects.toThrow("Symphony API returned HTTP 503");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/refresh", {
+      method: "POST",
+      headers: { Accept: "application/json" },
     });
   });
 

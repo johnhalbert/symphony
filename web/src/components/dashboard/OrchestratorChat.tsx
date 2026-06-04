@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Icon, UnavailableButton } from "../common";
-import { orchestratorChatStateNotice } from "../../data/orchestratorChat";
+import { orchestratorChatCommandUnavailableNotice, orchestratorChatStateNotice } from "../../data/orchestratorChat";
 import type { ChatMessage, OrchestratorChatModel } from "../../types/symphony";
 import { formatInlineText } from "../messages/messageFormat";
 
@@ -27,14 +27,20 @@ export function OrchestratorChat({
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const hasNoMessages = messages.length === 0;
+  const chatError = error
+    ? hasNoMessages
+      ? `Orchestrator chat unavailable: ${error}`
+      : `Could not refresh orchestrator chat: ${error}. Showing previous messages.`
+    : null;
   const stateNotice = projection ? orchestratorChatStateNotice(projection) : null;
+  const commandUnavailableNotice = orchestratorChatCommandUnavailableNotice(projection);
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this web chat is not supported yet; no orchestrator action will be dispatched.";
   const agentContextLabel = agentLabel?.trim() || "agent unavailable";
 
   async function submit(input = draft) {
     const trimmed = input.trim();
-    if (readOnly || !trimmed || sending) return;
+    if (readOnly || commandUnavailableNotice || !trimmed || sending) return;
     setSending(true);
     setSendError(null);
     try {
@@ -62,7 +68,8 @@ export function OrchestratorChat({
       </div>
       <div className="chat__body">
         {loading && hasNoMessages ? <div className="view-loading">Loading orchestrator chat...</div> : null}
-        {error ? <div className="view-error">Orchestrator chat unavailable: {error}</div> : null}
+        {loading && !hasNoMessages ? <div className="transcript-status">Refreshing orchestrator chat... showing previous messages.</div> : null}
+        {chatError ? <div className="view-error">{chatError}</div> : null}
         {sendError ? <div className="view-error">Orchestrator command failed: {sendError}</div> : null}
         {!loading && !error && stateNotice ? (
           <div className="view-empty" data-orchestrator-chat-state={projection?.state}>{stateNotice}</div>
@@ -81,7 +88,7 @@ export function OrchestratorChat({
               {message.suggestions ? (
                 <div style={{ marginTop: 4 }}>
                   {message.suggestions.map((suggestion, suggestionIndex) => (
-                    <button className="chat__suggestion" disabled={readOnly || sending} key={suggestion} onClick={() => submit(suggestion)} type="button">
+                    <button className="chat__suggestion" disabled={readOnly || Boolean(commandUnavailableNotice) || sending} key={suggestion} onClick={() => submit(suggestion)} type="button">
                       {suggestionIndex === 0 ? Icon.bolt() : null}
                       {suggestion}
                     </button>
@@ -92,9 +99,9 @@ export function OrchestratorChat({
           </div>
         ))}
       </div>
-      {readOnly ? (
+      {readOnly || commandUnavailableNotice ? (
         <div className="chat__input chat__input--readonly" role="status" aria-live="polite">
-          <div className="view-empty">{readOnlyNotice}</div>
+          <div className="view-empty">{readOnly ? readOnlyNotice : commandUnavailableNotice}</div>
         </div>
       ) : (
         <form

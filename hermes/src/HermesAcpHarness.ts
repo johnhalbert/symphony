@@ -793,6 +793,7 @@ export class HermesAcpHarness implements AgentHarness {
       cwd: ctx.workspace.path,
       timeoutMs: ctx.config.hermesAcp.startupTimeoutMs,
       sourceProfile,
+      reservedProfileNames: [sourceProfile],
       keepProfiles: ctx.config.hermesAcp.keepProfiles,
       reusable,
       nameInput: {

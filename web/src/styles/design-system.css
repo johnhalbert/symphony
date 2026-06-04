@@ -425,7 +425,21 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
   color: var(--pri-urgent);
 }
 
-.dash__actions { display: flex; gap: 6px; }
+.dash__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.dash__action-status {
+  flex-basis: 100%;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: right;
+}
+.dash__action-status[data-status="failed"] { color: var(--pri-urgent); }
+.dash__action-status[data-status="queued"] { color: var(--accent); }
 
 .provider-limit-banner {
   display: grid;

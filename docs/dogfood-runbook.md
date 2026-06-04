@@ -68,7 +68,7 @@ hermes profile
 hermes acp --check
 ```
 
-Configure `hermes.acp_binary_path` when the intended host `hermes` is not first on `PATH`. Configure `hermes.acp_source_profile` when the source profile should be a specific host profile rather than the active profile, and optionally configure `hermes.acp_profile_prefix` to identify Symphony-created clones. The source profile must already be authenticated for the configured provider/model, must pass `hermes acp --check` without interactive terminal setup, and must be safe to clone with `hermes profile create <disposable> --clone --clone-from <source> --no-alias`.
+Configure `hermes_acp.binary_path` when the intended host `hermes` is not first on `PATH`. Configure `hermes_acp.source_profile` when the source profile should be a specific host profile rather than the active profile, and optionally configure `hermes_acp.profile_prefix` to identify Symphony-created clones. The older `hermes.acp_binary_path`, `hermes.acp_source_profile`, and `hermes.acp_profile_prefix` aliases remain accepted for compatibility, but new workflows should use the `hermes_acp` section. The source profile must already be authenticated for the configured provider/model, must pass `hermes acp --check` without interactive terminal setup, and must be safe to clone with `hermes profile create <disposable> --clone --clone-from <source> --no-alias`.
 
 Run the opt-in ACP smoke only when host Hermes credentials are available:
 
@@ -76,11 +76,11 @@ Run the opt-in ACP smoke only when host Hermes credentials are available:
 npm run smoke:hermes-acp -- --source-profile <host-profile>
 ```
 
-The smoke strips vendored/managed Hermes environment overrides (`HERMES_HOME`, `HERMES_AUTH_HOME`, `HERMES_PYTHON_SRC_ROOT`, `PYTHONPATH`, `HERMES_MODEL`, and `HERMES_TUI_PROVIDER`), verifies `hermes --version`, `hermes acp --check`, verifies the source profile with `hermes -p <source> acp --check`, creates a disposable cloned profile, verifies `hermes -p <clone> acp --check`, sends one small ACP prompt through the clone, deletes the clone by default, and confirms the active host profile selection did not change. Use `--keep-profile` or `--keep-temp` only for troubleshooting; delete retained smoke profiles before promoting more work.
+The smoke strips vendored/managed Hermes environment overrides (`HERMES_HOME`, `HERMES_AUTH_HOME`, `HERMES_PYTHON_SRC_ROOT`, `PYTHONPATH`, `HERMES_MODEL`, and `HERMES_TUI_PROVIDER`), honors `hermes_acp.profile_prefix` for generated disposable profile names unless `--profile-prefix` is provided, verifies `hermes --version`, `hermes acp --check`, verifies the source profile with `hermes -p <source> acp --check`, creates a disposable cloned profile, verifies `hermes -p <clone> acp --check`, sends one small ACP prompt through the clone, deletes the clone by default, and confirms the active host profile selection did not change. Use `--keep-profile` or `--keep-temp` only for troubleshooting; delete retained smoke profiles before promoting more work. If the host Hermes binary or profile prerequisite is unavailable, the smoke reports `SKIPPED` with `status: "skipped"` and actionable diagnostics instead of failing the validation command; fix the host prerequisite and rerun before treating host ACP as validated.
 
 Troubleshooting:
 
-- Missing binary: install host Hermes or set `hermes.acp_binary_path`/`--binary-path`; do not point this at `hermes/upstream-src`.
+- Missing binary or active source profile: install host Hermes, set `hermes_acp.binary_path`/`--binary-path`, or set `hermes_acp.source_profile`/`--source-profile`; legacy `hermes.acp_binary_path` and `hermes.acp_source_profile` remain accepted. The smoke treats these host prerequisites as an actionable skip, not a failed repository validation. Do not point the binary at `hermes/upstream-src`.
 - Missing ACP dependencies: run `hermes acp --check` in the host profile and fix the host Hermes installation until it passes.
 - Auth failures or only terminal auth methods: refresh provider auth in the host source profile with the normal host Hermes auth flow, then rerun `hermes acp --check`; do not expect `HERMES_AUTH_HOME` or Symphony managed auth bootstrap to satisfy ACP.
 - Clone/create failures: choose a fresh `--profile-name` or remove stale smoke profiles with `hermes profile delete <name> --yes`.
@@ -116,7 +116,7 @@ Before removing `dogfood-blocked` from Hermes ACP dogfood issues, record the fol
 - `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded and reported a deleted disposable profile.
 - The smoke response contained the expected text, the prompt stopped with a normal stop reason, and the ACP session id was recorded.
 - The active host profile before and after the smoke matched; the source profile was not renamed, selected, deleted, or used directly as the disposable smoke profile.
-- No retained `symphony-smoke-*` profile remains unless an operator intentionally used `--keep-profile` for troubleshooting and tracked the cleanup.
+- No retained disposable profile with the configured `hermes_acp.profile_prefix` (or the operator-selected `--profile-prefix`/`--profile-name`) remains unless an operator intentionally used `--keep-profile` for troubleshooting and tracked the cleanup.
 - Default validation remains non-ACP unless the operator explicitly runs this smoke; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
 
 Only unblock `dogfood-blocked` after the checklist passes for the same host environment that will run the dogfood worker. If any item fails, leave the issue blocked, fix the host Hermes installation/auth/profile setup, and rerun the ACP smoke before promotion.

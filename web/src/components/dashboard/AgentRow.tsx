@@ -1,6 +1,6 @@
 import type { RunningAgentModel } from "../../types/symphony";
 
-export function AgentRow({ agent }: { agent: RunningAgentModel }) {
+export function AgentRow({ agent, liveIndicatorsEnabled = true }: { agent: RunningAgentModel; liveIndicatorsEnabled?: boolean }) {
   return (
     <div className="agent-row">
       <span className="left" />
@@ -10,8 +10,8 @@ export function AgentRow({ agent }: { agent: RunningAgentModel }) {
           <span>{agent.title}</span>
         </div>
         <div className="meta">
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 5, color: "var(--accent)" }}>
-            <span className="spinner" />
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 5, color: liveIndicatorsEnabled ? "var(--accent)" : "var(--text-3)" }}>
+            {liveIndicatorsEnabled ? <span className="spinner" /> : null}
             {agent.step}
           </span>
         </div>

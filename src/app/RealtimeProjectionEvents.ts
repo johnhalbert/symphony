@@ -1,5 +1,8 @@
 import type { ServerResponse } from "node:http";
+import { projectWebTranscript, type TranscriptMessage } from "./WebTranscriptProjection.js";
+import { projectWebOrchestratorChat, type ChatMessage } from "./webProjection.js";
 import type { WebProjectionSourceRevision } from "./WebProjectionContext.js";
+import type { TranscriptEvent } from "../core/persistence/RunTranscriptStore.js";
 
 export const REALTIME_EVENT_SCHEMA = "symphony.realtime.v1" as const;
 export const REALTIME_EVENT_SCHEMA_VERSION = 1 as const;
@@ -64,11 +67,19 @@ export interface RealtimeRunUpdatedPayload extends RealtimePayloadBase {
   status: string | null;
 }
 
+export interface RealtimeTranscriptPatchMessage {
+  sequence: number;
+  message: TranscriptMessage | null;
+  operation?: "append" | "merge-assistant-delta" | "replace-assistant";
+  joinMode?: "spaced" | "exact" | "token";
+}
+
 export interface RealtimeTranscriptDeltaPayload extends RealtimePayloadBase {
   runId: string | null;
   sessionId: string | null;
   afterSequence: number | null;
   eventCount: number | null;
+  messages?: readonly RealtimeTranscriptPatchMessage[];
 }
 
 export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase {
@@ -76,6 +87,9 @@ export interface RealtimeOrchestratorMessagePayload extends RealtimePayloadBase 
   messageCount: number | null;
   inputLength: number | null;
   status: number | null;
+  operation?: "append" | "update";
+  message?: ChatMessage | null;
+  messages?: readonly ChatMessage[];
   lastMessageId: string | null;
   lastMessageStatus: string | null;
   lastMessageAt: string | null;
@@ -148,6 +162,21 @@ export interface RealtimeProjectionEventBusOptions {
   historyLimit?: number;
 }
 
+interface RealtimePayloadOptions {
+  transcriptPatchStateByRunId?: Map<string, RealtimeTranscriptPatchProjectionState>;
+  payloadDetail?: RealtimeProjectionEventDetail | null;
+}
+
+type AssistantDeltaMirrorSource = "runtime" | "harness";
+
+type AssistantDeltaMirrorCounts = Record<AssistantDeltaMirrorSource, Map<string, number>>;
+
+interface RealtimeTranscriptPatchProjectionState {
+  seenAssistantDeltaReplayKeys: Set<string>;
+  assistantDeltaMirrorCounts: AssistantDeltaMirrorCounts;
+  pendingAssistantDelta: boolean;
+}
+
 export interface RealtimeSseStreamOptions {
   response: ServerResponse;
   lastEventId?: string | null;
@@ -166,6 +195,7 @@ export class RealtimeProjectionEventBus {
   private readonly subscribers = new Map<number, (event: RealtimeProjectionEvent) => void>();
   private readonly streamClosers = new Set<() => void>();
   private readonly history: RealtimeProjectionEvent[] = [];
+  private readonly transcriptPatchStateByRunId = new Map<string, RealtimeTranscriptPatchProjectionState>();
   private readonly recoveryCursors = new Map<string, number>();
   private readonly clock: () => Date;
   private readonly historyLimit: number;
@@ -352,6 +382,7 @@ export class RealtimeProjectionEventBus {
     const resources = input.resources ?? realtimeResourcesForEventType(input.type);
     const source = normalizeRealtimeSourceRevision(input.source);
     const detail = normalizeRealtimeDetail(input.detail ?? null);
+    const publicDetail = publicRealtimeDetailForEvent(input.type, detail);
     const scope = realtimeScopeForEvent(input.type, source, detail);
     return {
       schema: REALTIME_EVENT_SCHEMA,
@@ -371,8 +402,11 @@ export class RealtimeProjectionEventBus {
         endpoints: resources.map((resource) => resource.href),
       },
       missedEvents: input.missedEvents ?? false,
-      payload: realtimePayloadForEvent(input.type, source, resources, detail),
-      detail,
+      payload: realtimePayloadForEvent(input.type, source, resources, detail, {
+        transcriptPatchStateByRunId: this.transcriptPatchStateByRunId,
+        payloadDetail: publicDetail,
+      }),
+      detail: publicDetail,
     };
   }
 }
@@ -448,8 +482,9 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
   source: WebProjectionSourceRevision,
   resources: readonly RealtimeProjectionResource[],
   detail: RealtimeProjectionEventDetail | null,
+  options: RealtimePayloadOptions = {},
 ): RealtimeProjectionEventPayloadByType[TType] {
-  const base = realtimePayloadBase(source, detail);
+  const base = realtimePayloadBase(source, options.payloadDetail ?? detail);
   switch (type) {
     case "projection.updated": {
       const resourceKinds = realtimeResourceKinds(resources);
@@ -467,15 +502,19 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
         issueIdentifier: readStringDetail(detail, "issueIdentifier"),
         status: readStringDetail(detail, "status"),
       } as RealtimeProjectionEventPayloadByType[TType];
-    case "transcript.delta":
+    case "transcript.delta": {
+      const messages = readTranscriptPatchMessages(detail, options);
       return {
         ...base,
         runId: readStringDetail(detail, "runId"),
         sessionId: readStringDetail(detail, "sessionId"),
         afterSequence: readNumberDetail(detail, "afterSequence"),
         eventCount: readNumberDetail(detail, "eventCount"),
+        ...(messages ? { messages } : {}),
       } as RealtimeProjectionEventPayloadByType[TType];
+    }
     case "orchestrator.message": {
+      const messages = readChatPatchMessages(detail);
       const statusSummary = readRecordDetail(detail, "statusSummary");
       return {
         ...base,
@@ -483,6 +522,8 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
         messageCount: readNumberDetail(detail, "messageCount"),
         inputLength: readNumberDetail(detail, "inputLength"),
         status: readNumberDetail(detail, "status"),
+        ...orchestratorMessageOperationDetail(detail),
+        ...(messages ? { messages, message: messages.at(-1) ?? null } : {}),
         lastMessageId: readStringDetail(detail, "lastMessageId"),
         lastMessageStatus: readStringDetail(detail, "lastMessageStatus"),
         lastMessageAt: readStringDetail(detail, "lastMessageAt"),
@@ -526,6 +567,43 @@ function realtimePayloadBase(
   detail: RealtimeProjectionEventDetail | null,
 ): RealtimePayloadBase {
   return { source: source.source, sourceRevision: source.revision, detail };
+}
+
+function publicRealtimeDetailForEvent(
+  type: RealtimeProjectionEventType,
+  detail: RealtimeProjectionEventDetail | null,
+): RealtimeProjectionEventDetail | null {
+  if (!detail) return null;
+  switch (type) {
+    case "orchestrator.message":
+      return omitRealtimeDetailKeys(detail, [
+        "chat",
+        "conversation",
+        "statusSummary",
+        "statusCounts",
+        "sourceSummary",
+        "message",
+        "messages",
+      ]);
+    case "projection.updated":
+    case "run.updated":
+    case "transcript.delta":
+    case "source.status":
+    default:
+      return detail;
+  }
+}
+
+function omitRealtimeDetailKeys(
+  detail: RealtimeProjectionEventDetail,
+  keys: readonly string[],
+): RealtimeProjectionEventDetail {
+  const omitted = new Set(keys);
+  const next: RealtimeProjectionEventDetail = {};
+  for (const [key, value] of Object.entries(detail)) {
+    if (!omitted.has(key)) next[key] = value;
+  }
+  return next;
 }
 
 function realtimeScopeForEvent(
@@ -577,6 +655,13 @@ function readNumberDetail(detail: RealtimeProjectionEventDetail | null, key: str
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function orchestratorMessageOperationDetail(
+  detail: RealtimeProjectionEventDetail | null,
+): Pick<RealtimeOrchestratorMessagePayload, "operation"> {
+  const operation = readStringDetail(detail, "operation");
+  return operation === "append" || operation === "update" ? { operation } : {};
+}
+
 function readBooleanDetail(detail: RealtimeProjectionEventDetail | null, key: string): boolean | null {
   const value = detail?.[key];
   return typeof value === "boolean" ? value : null;
@@ -589,6 +674,284 @@ function readErrorDetail(detail: RealtimeProjectionEventDetail | null, key: stri
   return typeof candidate.code === "string" && typeof candidate.message === "string"
     ? { code: candidate.code, message: candidate.message }
     : null;
+}
+
+function readTranscriptPatchMessages(
+  detail: RealtimeProjectionEventDetail | null,
+  options: RealtimePayloadOptions = {},
+): readonly RealtimeTranscriptPatchMessage[] | null {
+  const explicit = readTranscriptPatchMessagesDetail(detail, "messages");
+  if (explicit) return explicit;
+  const events = readTranscriptEventsDetail(detail, "events");
+  if (events.length === 0) return null;
+  return projectRealtimeTranscriptPatchMessages(events, readNumberDetail(detail, "afterSequence"), options.transcriptPatchStateByRunId);
+}
+
+function projectRealtimeTranscriptPatchMessages(
+  events: readonly TranscriptEvent[],
+  afterSequence: number | null,
+  stateByRunId: Map<string, RealtimeTranscriptPatchProjectionState> | undefined,
+): readonly RealtimeTranscriptPatchMessage[] | null {
+  const runId = events[0]?.runId;
+  if (!runId) return null;
+
+  let state = stateByRunId?.get(runId) ?? createRealtimeTranscriptPatchProjectionState();
+  let stateKnown = stateByRunId?.has(runId) ?? false;
+  if (afterSequence === 0 || events.some((event) => event.sequence === 1)) stateKnown = true;
+
+  const patches: RealtimeTranscriptPatchMessage[] = [];
+  for (const event of events) {
+    if (event.runId !== runId) return null;
+    const message = projectWebTranscript([event], { includeRunPrelude: false })[0] ?? null;
+    if (message === null) {
+      patches.push({ sequence: event.sequence, message: null });
+      continue;
+    }
+
+    if (message.kind === "assistant" && isAssistantDeltaPatchEvent(event)) {
+      if (!stateKnown) return null;
+      const replayKey = assistantDeltaPatchReplayKey(event, message.text);
+      if (state.seenAssistantDeltaReplayKeys.has(replayKey)) {
+        patches.push({ sequence: event.sequence, message: null });
+        continue;
+      }
+      state.seenAssistantDeltaReplayKeys.add(replayKey);
+      const mirrorSource = assistantDeltaPatchMirrorSource(event);
+      if (mirrorSource && consumeAssistantDeltaPatchMirror(mirrorSource, message.text, state.assistantDeltaMirrorCounts)) {
+        patches.push({ sequence: event.sequence, message: null });
+        continue;
+      }
+      patches.push({
+        sequence: event.sequence,
+        message,
+        operation: state.pendingAssistantDelta ? "merge-assistant-delta" : "append",
+        joinMode: assistantDeltaPatchJoinMode(event),
+      });
+      state.pendingAssistantDelta = true;
+      continue;
+    }
+
+    if (message.kind === "assistant" && isAssistantCompletePatchEvent(event)) {
+      if (!stateKnown) return null;
+      patches.push({
+        sequence: event.sequence,
+        message,
+        operation: state.pendingAssistantDelta ? "replace-assistant" : "append",
+      });
+      resetRealtimeTranscriptAssistantDeltaGroup(state);
+      continue;
+    }
+
+    patches.push({ sequence: event.sequence, message });
+    resetRealtimeTranscriptAssistantDeltaGroup(state);
+    stateKnown = true;
+  }
+
+  if (stateByRunId && stateKnown) stateByRunId.set(runId, state);
+  return patches;
+}
+
+function readTranscriptPatchMessagesDetail(
+  detail: RealtimeProjectionEventDetail | null,
+  key: string,
+): readonly RealtimeTranscriptPatchMessage[] | null {
+  const value = detail?.[key];
+  if (!Array.isArray(value)) return null;
+  const patches = value.map(readTranscriptPatchMessage).filter((patch): patch is RealtimeTranscriptPatchMessage => patch !== null);
+  return patches.length === value.length ? patches : null;
+}
+
+function readTranscriptPatchMessage(value: unknown): RealtimeTranscriptPatchMessage | null {
+  if (!isRecordValue(value)) return null;
+  const sequence = value.sequence;
+  if (typeof sequence !== "number" || !Number.isFinite(sequence)) return null;
+  const message = value.message;
+  if (message !== null && !isRecordValue(message)) return null;
+  const operation = transcriptPatchOperation(value.operation);
+  const joinMode = transcriptPatchJoinMode(value.joinMode);
+  return {
+    sequence,
+    message: message as TranscriptMessage | null,
+    ...(operation ? { operation } : {}),
+    ...(joinMode ? { joinMode } : {}),
+  };
+}
+
+function createRealtimeTranscriptPatchProjectionState(): RealtimeTranscriptPatchProjectionState {
+  return {
+    seenAssistantDeltaReplayKeys: new Set<string>(),
+    assistantDeltaMirrorCounts: createAssistantDeltaPatchMirrorCounts(),
+    pendingAssistantDelta: false,
+  };
+}
+
+function createAssistantDeltaPatchMirrorCounts(): AssistantDeltaMirrorCounts {
+  return { runtime: new Map<string, number>(), harness: new Map<string, number>() };
+}
+
+function resetRealtimeTranscriptAssistantDeltaGroup(state: RealtimeTranscriptPatchProjectionState): void {
+  state.pendingAssistantDelta = false;
+  state.assistantDeltaMirrorCounts.runtime.clear();
+  state.assistantDeltaMirrorCounts.harness.clear();
+}
+
+function assistantDeltaPatchReplayKey(event: TranscriptEvent, text: string): string {
+  return `${event.runId}:${event.sequence}:${normalizeToken(event.eventType)}:${text}`;
+}
+
+function assistantDeltaPatchMirrorSource(event: TranscriptEvent): AssistantDeltaMirrorSource | null {
+  const eventType = normalizeToken(event.eventType);
+  const payload = transcriptEventPayloadRecord(event);
+  if (event.source === "runtime" && eventType === "message_delta") return "runtime";
+  if (event.source === "harness" && eventType === "progress" && normalizedOptionalToken(payload.activitySource) === "delta") return "harness";
+  return null;
+}
+
+function consumeAssistantDeltaPatchMirror(
+  source: AssistantDeltaMirrorSource,
+  text: string,
+  counts: AssistantDeltaMirrorCounts,
+): boolean {
+  const opposite = source === "runtime" ? "harness" : "runtime";
+  const sourceCount = counts[source].get(text) ?? 0;
+  const oppositeCount = counts[opposite].get(text) ?? 0;
+  counts[source].set(text, sourceCount + 1);
+  return oppositeCount > sourceCount;
+}
+
+function transcriptPatchOperation(value: unknown): RealtimeTranscriptPatchMessage["operation"] | null {
+  return value === "append" || value === "merge-assistant-delta" || value === "replace-assistant" ? value : null;
+}
+
+function transcriptPatchJoinMode(value: unknown): RealtimeTranscriptPatchMessage["joinMode"] | null {
+  return value === "spaced" || value === "exact" || value === "token" ? value : null;
+}
+
+function isAssistantDeltaPatchEvent(event: TranscriptEvent): boolean {
+  const eventType = normalizeToken(event.eventType);
+  const payload = transcriptEventPayloadRecord(event);
+  const payloadKind = normalizedPayloadKind(payload);
+  return (
+    eventType === "message_delta" ||
+    eventType === "assistant_delta" ||
+    eventType === "assistant_message_delta" ||
+    eventType === "response_delta" ||
+    payloadKind === "assistant_delta" ||
+    payloadKind === "assistant_message_delta" ||
+    payloadKind === "response_delta" ||
+    (payloadKind === "progress" && normalizedOptionalToken(payload.actor) === "assistant" && payload.delta === true)
+  );
+}
+
+function isAssistantCompletePatchEvent(event: TranscriptEvent): boolean {
+  const eventType = normalizeToken(event.eventType);
+  return (
+    eventType === "message_complete" ||
+    eventType === "assistant_complete" ||
+    eventType === "assistant_message_completed" ||
+    eventType === "response_complete" ||
+    eventType === "completed"
+  );
+}
+
+function assistantDeltaPatchJoinMode(event: TranscriptEvent): NonNullable<RealtimeTranscriptPatchMessage["joinMode"]> {
+  const eventType = normalizeToken(event.eventType);
+  const payload = transcriptEventPayloadRecord(event);
+  if (eventType === "assistant_message_delta") return "exact";
+  if (eventType === "progress" && normalizedOptionalToken(payload.activitySource) === "delta") return "exact";
+  if (eventType === "message_delta" && isHermesRuntimeMessageDelta(event, payload)) return "exact";
+  if (eventType === "message_delta") return "token";
+  return "spaced";
+}
+
+function isHermesRuntimeMessageDelta(event: TranscriptEvent, payload: Record<string, unknown>): boolean {
+  return event.source === "runtime" && (typeof payload.harnessId === "string" || (typeof event.message === "string" && normalizeToken(event.message) === "hermes_message_delta"));
+}
+
+function normalizedPayloadKind(payload: Record<string, unknown>): string | null {
+  const kind = firstStringValue(payload.kind, payload.type);
+  return kind ? normalizeToken(kind) : null;
+}
+
+function normalizedOptionalToken(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? normalizeToken(value) : null;
+}
+
+function firstStringValue(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) return value;
+  }
+  return null;
+}
+
+function transcriptEventPayloadRecord(event: TranscriptEvent): Record<string, unknown> {
+  return isRecordValue(event.payload) ? event.payload : {};
+}
+
+function normalizeToken(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "status";
+}
+
+function readTranscriptEventsDetail(detail: RealtimeProjectionEventDetail | null, key: string): readonly TranscriptEvent[] {
+  const value = detail?.[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter(isTranscriptEventLike);
+}
+
+function isTranscriptEventLike(value: unknown): value is TranscriptEvent {
+  return (
+    isRecordValue(value) &&
+    typeof value.runId === "string" &&
+    typeof value.sequence === "number" &&
+    Number.isFinite(value.sequence) &&
+    typeof value.at === "string" &&
+    typeof value.source === "string" &&
+    typeof value.eventType === "string"
+  );
+}
+
+function readChatPatchMessages(detail: RealtimeProjectionEventDetail | null): readonly ChatMessage[] | null {
+  const rawMessages = detail?.messages;
+  const values = Array.isArray(rawMessages) ? rawMessages : detail && "message" in detail ? [detail.message] : [];
+  if (values.length === 0) return null;
+  const messages = values.map(readChatPatchMessage).filter((message): message is ChatMessage => message !== null);
+  return messages.length === values.length ? messages : null;
+}
+
+function readChatPatchMessage(value: unknown): ChatMessage | null {
+  if (!isRecordValue(value)) return null;
+  if (typeof value.text === "string" && (value.who === "agent" || value.who === "user")) {
+    const message: ChatMessage = { who: value.who, text: value.text };
+    const id = stringField(value, "id");
+    const conversationId = stringField(value, "conversationId");
+    const role = stringField(value, "role");
+    const status = stringField(value, "status");
+    const createdAt = stringField(value, "createdAt");
+    const updatedAt = stringField(value, "updatedAt");
+    if (id) message.id = id;
+    if (conversationId) message.conversationId = conversationId;
+    if (role) message.role = role as NonNullable<ChatMessage["role"]>;
+    if (status) message.status = status as NonNullable<ChatMessage["status"]>;
+    if (createdAt) message.createdAt = createdAt;
+    if (updatedAt) message.updatedAt = updatedAt;
+    if (isRecordValue(value.metadata)) message.metadata = value.metadata as Record<string, unknown>;
+    if (Array.isArray(value.suggestions)) {
+      const suggestions = value.suggestions.filter((suggestion): suggestion is string => typeof suggestion === "string");
+      if (suggestions.length > 0) message.suggestions = suggestions;
+    }
+    return message;
+  }
+  if (typeof value.body === "string" && typeof value.role === "string") {
+    return projectWebOrchestratorChat([value as never])[0] ?? null;
+  }
+  return null;
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
 }
 
 function readRecordDetail(detail: RealtimeProjectionEventDetail | null, key: string): Readonly<Record<string, unknown>> | null {
@@ -629,6 +992,10 @@ function readStringRecordField(record: Readonly<Record<string, unknown>> | null,
   if (typeof value !== "string") return null;
   const normalized = value.trim();
   return normalized.length > 0 ? normalized : null;
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function realtimeEventTypesForSourceRevision(revision: WebProjectionSourceRevision): readonly RealtimeProjectionEventType[] {

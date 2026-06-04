@@ -146,6 +146,9 @@ function dataSourceForDashboard(dashboard: DashboardModel): SymphonyDataSource {
     async sendOrchestratorMessage(input: string) {
       return [...dashboard.chat, { who: "user", text: input }];
     },
+    async triggerPoll() {
+      return { queued: true, coalesced: false, requested_at: "2026-06-03T13:30:00.000Z", operations: ["poll", "reconcile"] };
+    },
   };
 }
 
@@ -186,7 +189,6 @@ function expectNoFabricatedDashboardMetrics(markup: string) {
     "7 days remaining",
     "May 15",
     "May 29",
-    "projected",
     "96%",
     "oldest 24m",
     "nominal",
@@ -203,6 +205,17 @@ function expectNoFabricatedDashboardMetrics(markup: string) {
   for (const forbidden of forbiddenStrings) {
     expect(markup).not.toContain(forbidden);
   }
+}
+
+function expectNoDashboardBodyLiveIndicators(markup: string, expectedProjectionLabel: string) {
+  expect(markup).toContain(expectedProjectionLabel);
+  expect(markup).toContain("Projected running sessions");
+  expect(markup).toContain("projected · concurrency cap");
+  expect(markup).toContain("projected event");
+  expect(markup).not.toContain("Active sessions");
+  expect(markup).not.toContain("active · concurrency cap");
+  expect(markup).not.toContain('class="spinner"');
+  expect(markup).not.toContain("animation:pulse");
 }
 
 describe("dashboard API presentation", () => {
@@ -232,6 +245,7 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("tracker stale · 4 cached issues");
     expect(markup).toContain("Using a cached tracker source while refresh catches up");
     expect(markup).toContain("tracker fetched 2026-05-29T20:04:00.000Z");
+    expectNoDashboardBodyLiveIndicators(markup, "stale dashboard projection · 2/9 agents");
     expect(markup).toContain("API hello");
     expect(markup).toContain("API suggestion");
     expect(markup).toContain("unavailable: no durable throughput or ETA source");
@@ -255,6 +269,16 @@ describe("dashboard API presentation", () => {
     expectNoFabricatedDashboardMetrics(markup);
   });
 
+  it("renders unknown freshness explicitly when dashboard source metadata is absent", () => {
+    const markup = renderDashboard({ ...apiDashboard, source: null });
+
+    expect(markup).toContain("source unavailable");
+    expect(markup).toContain("Dashboard payload did not include freshness metadata");
+    expectNoDashboardBodyLiveIndicators(markup, "dashboard projection freshness unknown · 2/9 agents");
+    expect(markup).not.toContain("tracker fresh");
+    expectNoFabricatedDashboardMetrics(markup);
+  });
+
   it("uses API totals in the grid progress panel without mock chart or velocity labels", () => {
     const markup = renderDashboard(apiDashboard, "grid");
 
@@ -272,7 +296,7 @@ describe("dashboard API presentation", () => {
     const markup = renderDashboard(apiDashboard, "command-center");
 
     expect(markup).toContain("./symphony status --branch api-branch");
-    expect(markup).toContain("current durable dashboard projection");
+    expect(markup).toContain("non-live dashboard projection");
     expect(markup).toContain("73%");
     expect(markup).toContain("8/32");
     expect(markup).toContain("11 open");
@@ -280,7 +304,7 @@ describe("dashboard API presentation", () => {
     expect(markup).toContain("3 in progress");
     expect(markup).toContain("5 in review");
     expect(markup).toContain("2/9 agents");
-    expect(markup).toContain("2 running / 9 cap");
+    expect(markup).toContain("2 projected / 9 cap");
     expect(markup).toContain("poll 5s");
     expect(markup).toContain("cycle unavailable · schedule unavailable ·");
     expect(markup).toContain('projection <span style="color:var(--text-3)">unavailable</span>');
@@ -354,7 +378,7 @@ describe("dashboard API presentation", () => {
           chat: [],
           totals: zeroTotals,
         }),
-        expected: ["0/0 agents", "0/0 done", "total 0"],
+        expected: ["0/0 agents", "0/0 done", "total 0", "0 projected events", "No activity entries are available from the current dashboard projection."],
       },
       {
         name: "active runs",

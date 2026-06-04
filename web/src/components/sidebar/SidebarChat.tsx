@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { orchestratorChatStateNotice } from "../../data/orchestratorChat";
+import { orchestratorChatCommandUnavailableNotice, orchestratorChatStateNotice } from "../../data/orchestratorChat";
 import type { ChatMessage, OrchestratorChatModel } from "../../types/symphony";
 import { Icon, UnavailableButton } from "../common";
 import { formatInlineText } from "../messages/messageFormat";
@@ -25,14 +25,26 @@ export function SidebarChat({
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const recent = messages.slice(-3);
+  const chatError = error
+    ? recent.length === 0
+      ? `Orchestrator chat unavailable: ${error}`
+      : `Could not refresh orchestrator chat: ${error}. Showing previous messages.`
+    : null;
   const stateNotice = projection ? orchestratorChatStateNotice(projection, true) : null;
+  const commandUnavailableNotice = orchestratorChatCommandUnavailableNotice(projection, true);
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this compact chat is not supported yet; no orchestrator action will be dispatched.";
-  const contextLabel = readOnly ? "read-only API mode" : sending ? "sending command..." : (subtitle?.trim() || "agent context unavailable");
+  const contextLabel = readOnly
+    ? "read-only API mode"
+    : commandUnavailableNotice
+      ? "chat commands unavailable"
+      : sending
+        ? "sending command..."
+        : (subtitle?.trim() || "agent context unavailable");
 
   async function submit(input = draft) {
     const trimmed = input.trim();
-    if (readOnly || !trimmed || sending) return;
+    if (readOnly || commandUnavailableNotice || !trimmed || sending) return;
     setSending(true);
     setSendError(null);
     try {
@@ -65,7 +77,8 @@ export function SidebarChat({
 
       <div style={{ overflow: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 14 }}>
         {loading && recent.length === 0 ? <div className="view-loading">Loading orchestrator chat...</div> : null}
-        {error ? <div className="view-error">Orchestrator chat unavailable: {error}</div> : null}
+        {loading && recent.length > 0 ? <div className="transcript-status">Refreshing orchestrator chat... showing previous messages.</div> : null}
+        {chatError ? <div className="view-error">{chatError}</div> : null}
         {sendError ? <div className="view-error">Orchestrator command failed: {sendError}</div> : null}
         {!loading && !error && stateNotice ? (
           <div className="view-empty" data-orchestrator-chat-state={projection?.state}>{stateNotice}</div>
@@ -84,7 +97,7 @@ export function SidebarChat({
                   {message.suggestions.map((suggestion, suggestionIndex) => (
                     <button
                       className="chat__suggestion"
-                      disabled={readOnly || sending}
+                      disabled={readOnly || Boolean(commandUnavailableNotice) || sending}
                       key={suggestion}
                       onClick={() => submit(suggestion)}
                       style={{ marginBottom: 4 }}
@@ -101,9 +114,9 @@ export function SidebarChat({
         ))}
       </div>
 
-      {readOnly ? (
+      {readOnly || commandUnavailableNotice ? (
         <div className="chat__input chat__input--readonly" role="status" aria-live="polite">
-          <div className="view-empty">{readOnlyNotice}</div>
+          <div className="view-empty">{readOnly ? readOnlyNotice : commandUnavailableNotice}</div>
         </div>
       ) : (
         <form
