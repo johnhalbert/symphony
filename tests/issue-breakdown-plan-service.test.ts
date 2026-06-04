@@ -312,6 +312,82 @@ describe("IssueBreakdownPlanService", () => {
     expect(accepted.replayed).toBe(false);
   });
 
+  it("ignores protected-path mentions outside Touched Surfaces when validating proposed issues", async () => {
+    const config = testConfig(root);
+    config.agent.protectedPaths = ["docs/dogfood-runbook.md"];
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    const accepted = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-out-of-scope-protected",
+        issueId: candidate.id,
+        summary: "Only explicit touched surfaces should drive protected-path handling.",
+        proposedIssues: [
+          {
+            title: "Task",
+            description: agentEligibleIssueContract({
+              touchedSurfaces: ["- [X] API/projection"],
+              outOfScope: ["- Do not modify docs/dogfood-runbook.md in this slice."],
+            }),
+            acceptanceCriteria: ["Done"],
+            dependencies: [],
+            labels: [],
+          },
+        ],
+        idempotencyKey: "plan-out-of-scope-protected",
+      },
+      { issue: candidate, activeRunId: "run-plan-out-of-scope-protected", role: "worker", phase: "issue_breakdown" },
+    );
+
+    expect(accepted.accepted).toBe(true);
+    expect(accepted.replayed).toBe(false);
+  });
+
+  it.each(["none", "n/a"])(
+    "rejects placeholder blockers for protected-surface proposed issues (%s)",
+    async (remainingBlocker) => {
+      const config = testConfig(root);
+      config.agent.protectedPaths = ["docs/dogfood-runbook.md"];
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const candidate = issue();
+      const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+      const suffix = remainingBlocker.replace(/[^a-z0-9]+/gi, "-");
+
+      await expect(
+        service.submit_issue_breakdown_plan(
+          {
+            runId: `run-plan-protected-placeholder-${suffix}`,
+            issueId: candidate.id,
+            summary: "Protected path needs a real operator blocker.",
+            proposedIssues: [
+              {
+                title: "Task",
+                description: agentEligibleIssueContract({
+                  touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+                  readyForDogfoodReady: "no",
+                  remainingBlocker,
+                }),
+                acceptanceCriteria: ["Done"],
+                dependencies: [],
+                labels: [],
+              },
+            ],
+            idempotencyKey: `plan-protected-placeholder-${suffix}`,
+          },
+          {
+            issue: candidate,
+            activeRunId: `run-plan-protected-placeholder-${suffix}`,
+            role: "worker",
+            phase: "issue_breakdown",
+          },
+        ),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+    },
+  );
+
   it("rejects invalid schema and mismatched active run context", async () => {
     const config = testConfig(root);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);

@@ -4,6 +4,7 @@ import type { ServiceConfig } from "./config/Config.js";
 import {
   AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS,
   analyzeIssueContractDescription,
+  hasMeaningfulRemainingBlocker,
   missingRequiredIssueContractSections,
 } from "./IssueContractLint.js";
 import { SymphonyError } from "./errors.js";
@@ -320,10 +321,10 @@ function validateProposedIssues(plan: IssueBreakdownPlanInput, config: ServiceCo
           { proposedIssueIndex: index, protectedSurfaceMatches: analysis.protectedSurfaceMatches },
         );
       }
-      if (!analysis.remainingBlocker || analysis.remainingBlocker.trim().length === 0) {
+      if (!hasMeaningfulRemainingBlocker(analysis.remainingBlocker)) {
         throw new SymphonyError(
           "invalid_request",
-          `${descriptor} touches protected paths (${analysis.protectedSurfaceMatches.join(", ")}) and must record a non-empty remaining blocker for manual handling`,
+          `${descriptor} touches protected paths (${analysis.protectedSurfaceMatches.join(", ")}) and must record a substantive manual/operator blocker for manual handling`,
           { proposedIssueIndex: index, protectedSurfaceMatches: analysis.protectedSurfaceMatches },
         );
       }

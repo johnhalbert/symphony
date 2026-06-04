@@ -3,6 +3,21 @@ import type { Issue } from "./types.js";
 
 const TOUCHED_SURFACES_HEADING = "Touched Surfaces";
 const PROMOTION_READINESS_HEADING = "Promotion Readiness";
+const BLOCKER_PLACEHOLDER_VALUES = new Set([
+  "n/a",
+  "na",
+  "none",
+  "nil",
+  "no blocker",
+  "no remaining blocker",
+  "not applicable",
+  "nothing",
+  "tbd",
+  "todo",
+  "unknown",
+]);
+const MANUAL_BLOCKER_KEYWORDS =
+  /\b(manual(?:-only)?|operator|human|protected|owner-authored|owner authored|follow-up pr|separate pr)\b/i;
 
 export const AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS = [
   "Problem / Goal",
@@ -54,13 +69,22 @@ export function analyzeIssueContractDescription(
   const sections = markdownSections(content);
   const touchedSurfaces = sections.get(normalizeHeading(TOUCHED_SURFACES_HEADING)) ?? "";
   const promotionReadiness = sections.get(normalizeHeading(PROMOTION_READINESS_HEADING)) ?? "";
-  const scanText = touchedSurfaces.length > 0 ? `${touchedSurfaces}\n${content}` : content;
   return {
     missingSections: missingRequiredIssueContractSections(content),
-    protectedSurfaceMatches: findProtectedSurfaceMatches(scanText, protectedPaths),
+    protectedSurfaceMatches: findProtectedSurfaceMatches(touchedSurfaces, protectedPaths),
     readyForDogfoodReady: parseReadyForDogfoodReady(promotionReadiness),
     remainingBlocker: parseRemainingBlocker(promotionReadiness),
   };
+}
+
+export function hasMeaningfulRemainingBlocker(remainingBlocker: string | null | undefined): boolean {
+  if (!remainingBlocker) return false;
+
+  const normalized = normalizeBlockerText(remainingBlocker);
+  if (normalized.length === 0) return false;
+  if (BLOCKER_PLACEHOLDER_VALUES.has(normalized)) return false;
+  if (normalized.split(" ").length < 3) return false;
+  return MANUAL_BLOCKER_KEYWORDS.test(normalized);
 }
 
 export function missingRequiredIssueContractSections(description: string | null | undefined): string[] {
@@ -147,19 +171,13 @@ function parseRemainingBlocker(section: string): string | null {
 }
 
 function findProtectedSurfaceMatches(text: string, protectedPaths: readonly string[]): string[] {
-  const normalized = normalizePathLikeText(text);
+  const candidates = extractTouchedSurfacePathCandidates(text);
   const matches = new Set<string>();
 
   for (const protectedPath of protectedPaths) {
     const normalizedPath = normalizePathLikeText(protectedPath);
     if (normalizedPath.length === 0) continue;
-    if (normalized.includes(normalizedPath)) {
-      matches.add(protectedPath);
-      continue;
-    }
-    if (!normalizedPath.endsWith("/**")) continue;
-    const prefix = normalizedPath.slice(0, -3).replace(/\/+$/, "");
-    if (prefix.length > 0 && (normalized.includes(`${prefix}/`) || normalized.includes(prefix))) {
+    if (candidates.some((candidate) => protectedPathMatchesCandidate(candidate, normalizedPath))) {
       matches.add(protectedPath);
     }
   }
@@ -167,8 +185,34 @@ function findProtectedSurfaceMatches(text: string, protectedPaths: readonly stri
   return [...matches];
 }
 
+function extractTouchedSurfacePathCandidates(text: string): string[] {
+  const normalized = normalizePathLikeText(text);
+  const candidates = new Set<string>();
+
+  for (const match of normalized.matchAll(/(?:^|[^a-z0-9._\/-])([a-z0-9._\/*-]+(?:\/[a-z0-9._\/*-]+)*)(?=$|[^a-z0-9._\/-])/g)) {
+    const candidate = match[1] ?? "";
+    if (!candidate.includes("/") && !candidate.includes(".") && !candidate.includes("*")) continue;
+    candidates.add(candidate);
+  }
+
+  return [...candidates];
+}
+
+function protectedPathMatchesCandidate(candidate: string, normalizedProtectedPath: string): boolean {
+  if (normalizedProtectedPath.endsWith("/**")) {
+    const prefix = normalizedProtectedPath.slice(0, -3).replace(/\/+$/, "");
+    return prefix.length > 0 && (candidate === prefix || candidate.startsWith(`${prefix}/`));
+  }
+
+  return candidate === normalizedProtectedPath;
+}
+
 function normalizePathLikeText(value: string): string {
   return value.replace(/\\/g, "/").toLowerCase();
+}
+
+function normalizeBlockerText(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!,;:]+$/g, "");
 }
 
 function normalizeHeading(value: string): string {
