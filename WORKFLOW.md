@@ -102,7 +102,7 @@ hermes:
   upstream_root: ./hermes/upstream-src
   templates_dir: ./hermes/templates
   provider: openai-codex
-  model: gpt-5.4
+  model: gpt-5.3-codex-spark
   auth:
     mode: managed_root
     providers:
@@ -111,7 +111,7 @@ hermes:
   keep_profiles: failed
 
 server:
-  host: 127.0.0.1
+  host: 0.0.0.0
   port: 7331
   open_workspace_token: $SYMPHONY_WORKSPACE_TOKEN
   web_assets_root: ./web/dist
@@ -128,7 +128,12 @@ github:
   head_owner: johnhalbert
   publish_pull_requests: true
   pr_handoff:
-    enabled: false
+    enabled: true
+    target_state: Manual Review
+    required_checks: []
+    no_ci:
+      allowed: true
+      evidence: "I said so -John"
   operator_approval:
     required_for_publication: false
     reject_policy: cancel
