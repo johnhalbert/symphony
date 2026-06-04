@@ -49,6 +49,17 @@ export interface RealtimeProjectionRecoveryHint {
   endpoints: readonly string[];
 }
 
+const MISSED_EVENTS_RECOVERY_RESOURCES: readonly RealtimeProjectionResource[] = [
+  { kind: "source", href: "/api/v1/web/reference-data?refresh=1", relation: "refetch" },
+  { kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" },
+  { kind: "issue-board", href: "/api/v1/web/issues", relation: "refetch" },
+  { kind: "sidebar", href: "/api/v1/web/sidebar", relation: "refetch" },
+  { kind: "history", href: "/api/v1/web/history", relation: "refetch" },
+  { kind: "orchestrator-chat", href: "/api/v1/web/orchestrator-chat", relation: "refetch" },
+];
+
+const MISSED_EVENTS_RECOVERY_RESOURCE_KINDS = [...REALTIME_RESOURCE_KINDS] satisfies readonly RealtimeResourceKind[];
+
 interface RealtimePayloadBase {
   source: string;
   sourceRevision: string | number;
@@ -340,11 +351,14 @@ export class RealtimeProjectionEventBus {
     const event = this.createEvent({
       type: "projection.updated",
       source: this.realtimeSourceRevision("realtime-recovery"),
-      resources: realtimeResourcesForEventType("projection.updated"),
+      resources: MISSED_EVENTS_RECOVERY_RESOURCES,
       recoveryReason: "missed-events",
       lastEventId,
       missedEvents: true,
-      detail: { lastEventId },
+      detail: {
+        lastEventId,
+        resourcesChanged: MISSED_EVENTS_RECOVERY_RESOURCE_KINDS,
+      },
     });
     this.rememberRecoveryCursor(event);
     return event;

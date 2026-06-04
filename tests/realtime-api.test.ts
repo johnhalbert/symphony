@@ -1045,11 +1045,37 @@ describe("StatusServer realtime SSE API", () => {
           type: "projection.updated",
           missedEvents: true,
           recovery: { strategy: "refetch", reason: "missed-events", lastEventId: "200" },
+          payload: {
+            resourcesChanged: [
+              "dashboard",
+              "issue-board",
+              "issue-detail",
+              "history",
+              "sidebar",
+              "session-transcript",
+              "orchestrator-chat",
+              "source",
+            ],
+          },
         });
         expect((recovery.data as RealtimeProjectionEvent).recovery.endpoints).toEqual(
-          expect.arrayContaining(["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/history"]),
+          expect.arrayContaining([
+            "/api/v1/web/reference-data?refresh=1",
+            "/api/v1/web/dashboard",
+            "/api/v1/web/issues",
+            "/api/v1/web/sidebar",
+            "/api/v1/web/history",
+            "/api/v1/web/orchestrator-chat",
+          ]),
         );
-        for (const endpoint of ["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/history"]) {
+        for (const endpoint of [
+          "/api/v1/web/reference-data?refresh=1",
+          "/api/v1/web/dashboard",
+          "/api/v1/web/issues",
+          "/api/v1/web/sidebar",
+          "/api/v1/web/history",
+          "/api/v1/web/orchestrator-chat",
+        ]) {
           const refetch = await fetch(`${baseUrl}${endpoint}`);
           expect(refetch.status, `missed-event recovery refetch ${endpoint} should use normal GET semantics`).toBe(200);
           expect(refetch.headers.get("content-type")).toContain("application/json");

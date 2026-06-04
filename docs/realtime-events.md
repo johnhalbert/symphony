@@ -23,10 +23,12 @@ events can be replayed through the query-param cursor path. If the server can
 replay from its short in-memory history, it emits the missed events after the
 known id. If the id is unknown or history has been truncated, the stream emits a
 `projection.updated` recovery event with `missedEvents: true` and
-`recovery.reason: "missed-events"` so clients can refetch the listed resources.
-Recovery event ids are remembered as resume cursors while the following history is
-still replayable, preventing an immediate reconnect from receiving the same
-synthetic recovery frame again.
+`recovery.reason: "missed-events"` so clients can refetch the listed routes and
+use `resourcesChanged` to refresh any active transcript, issue-detail, or
+orchestrator-chat views that lack a fixed global recovery URL. Recovery event ids
+are remembered as resume cursors while the following history is still replayable,
+preventing an immediate reconnect from receiving the same synthetic recovery
+frame again.
 
 SSE `id`, `event`, and comment fields are newline-sanitized before writing.
 
@@ -68,7 +70,10 @@ with current consumers but new consumers should prefer `payload`.
 Scope: `global`, `key: null`.
 
 Published when one or more web projections should be treated as stale. Clients
-should refetch the resources listed in `resources`/`recovery.endpoints`.
+should refetch the routes listed in `resources`/`recovery.endpoints`; on
+generic missed-event recovery, `resourcesChanged` may be broader than the fixed
+route list so active template-bound resources can refresh through live-resource
+tokens.
 
 ```ts
 interface RealtimeProjectionUpdatedPayload {
