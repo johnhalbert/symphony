@@ -165,6 +165,66 @@ describe("IssueBreakdownPlanService", () => {
     expect(issueBreakdownPlanFingerprintsMatch(first.plan, drifted, config)).toBe(false);
   });
 
+  it("replays same-run submissions after config drift and leaves the stored plan stale", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ updatedAt: "2026-01-02T00:00:00Z" });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+    const input = {
+      runId: "run-plan-config-drift",
+      issueId: candidate.id,
+      summary: "Split the work into child issues.",
+      proposedIssues: [
+        {
+          title: "Task",
+          description: agentEligibleIssueContract({
+            touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+            readyForDogfoodReady: "yes",
+          }),
+          acceptanceCriteria: ["Done"],
+          dependencies: [],
+          labels: [],
+        },
+      ],
+      idempotencyKey: "plan-config-drift",
+    };
+
+    const first = await service.submit_issue_breakdown_plan(input, {
+      issue: candidate,
+      activeRunId: "run-plan-config-drift",
+      role: "worker",
+      phase: "issue_breakdown",
+    });
+
+    config.agent.protectedPaths = ["docs/dogfood-runbook.md"];
+
+    const replay = await service.submit_issue_breakdown_plan(input, {
+      issue: candidate,
+      activeRunId: "run-plan-config-drift",
+      role: "worker",
+      phase: "issue_breakdown",
+    });
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(replay.replayed).toBe(true);
+    expect(replay.plan.id).toBe(first.plan.id);
+    expect(lifecycle?.issueBreakdownPlans).toHaveLength(1);
+    expect(issueBreakdownPlanFingerprintsMatch(first.plan, candidate, config)).toBe(false);
+    expect(latestFreshIssueBreakdownPlan(lifecycle, candidate, config)).toBeNull();
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        { ...input, summary: "Changed summary." },
+        {
+          issue: candidate,
+          activeRunId: "run-plan-config-drift",
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
   it("only treats the current non-stale plan as fresh", async () => {
     const config = testConfig(root);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);

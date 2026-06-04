@@ -72,7 +72,6 @@ export class IssueBreakdownPlanService {
   async submitIssueBreakdownPlan(input: unknown, context: IssueBreakdownPlanActiveContext): Promise<IssueBreakdownPlanResult> {
     const parsed = parseIssueBreakdownPlan(input);
     validateCaller(parsed, context);
-    validateProposedIssues(parsed, this.options.config);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
     const configFingerprint = issueBreakdownConfigFingerprint(this.options.config);
@@ -101,6 +100,8 @@ export class IssueBreakdownPlanService {
         issueContentFingerprint: contentFingerprint,
       });
     }
+
+    validateProposedIssues(parsed, this.options.config);
 
     const acceptedAt = new Date().toISOString();
     const plan: IssueBreakdownPlanRecord = {

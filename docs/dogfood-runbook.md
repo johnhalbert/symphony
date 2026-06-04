@@ -78,6 +78,8 @@ npm run smoke:hermes-acp -- --source-profile <host-profile>
 
 The smoke strips vendored/managed Hermes environment overrides (`HERMES_HOME`, `HERMES_AUTH_HOME`, `HERMES_PYTHON_SRC_ROOT`, `PYTHONPATH`, `HERMES_MODEL`, and `HERMES_TUI_PROVIDER`), honors `hermes_acp.profile_prefix` for generated disposable profile names unless `--profile-prefix` is provided, verifies `hermes --version`, `hermes acp --check`, verifies the source profile with `hermes -p <source> acp --check`, creates a disposable cloned profile, verifies `hermes -p <clone> acp --check`, sends one small ACP prompt through the clone, deletes the clone by default, and confirms the active host profile selection did not change. Use `--keep-profile` or `--keep-temp` only for troubleshooting; delete retained smoke profiles before promoting more work. If the host Hermes binary or profile prerequisite is unavailable, the smoke reports `SKIPPED` with `status: "skipped"` and actionable diagnostics instead of failing the validation command; fix the host prerequisite and rerun before treating host ACP as validated.
 
+For the deeper ACP contract behind this operator checklist, cross-reference [`hermes-acp-integration-spec.md`](./hermes-acp-integration-spec.md#hermes-acp-process), especially [`#profile-lifecycle`](./hermes-acp-integration-spec.md#profile-lifecycle), [`#launch-environment`](./hermes-acp-integration-spec.md#launch-environment), and [`#validation-plan`](./hermes-acp-integration-spec.md#validation-plan). This runbook section is the operator-facing follow-up for the Linear implementation slices `ENG-136`, `ENG-143`, and `ENG-143C`.
+
 Troubleshooting:
 
 - Missing binary or active source profile: install host Hermes, set `hermes_acp.binary_path`/`--binary-path`, or set `hermes_acp.source_profile`/`--source-profile`; legacy `hermes.acp_binary_path` and `hermes.acp_source_profile` remain accepted. The smoke treats these host prerequisites as an actionable skip, not a failed repository validation. Do not point the binary at `hermes/upstream-src`.
@@ -120,6 +122,8 @@ Before removing `dogfood-blocked` from Hermes ACP dogfood issues, record the fol
 - Default validation remains non-ACP unless the operator explicitly runs this smoke; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
 
 Only unblock `dogfood-blocked` after the checklist passes for the same host environment that will run the dogfood worker. If any item fails, leave the issue blocked, fix the host Hermes installation/auth/profile setup, and rerun the ACP smoke before promotion.
+
+When you record the unblock evidence, link the operator note back to [`hermes-acp-integration-spec.md#validation-plan`](./hermes-acp-integration-spec.md#validation-plan) and note which Linear ACP follow-up it satisfies (`ENG-136`, `ENG-143`, or `ENG-143C`) so the spec, runbook, and implementation history stay connected.
 
 ## 5. Promotion Policy
 
