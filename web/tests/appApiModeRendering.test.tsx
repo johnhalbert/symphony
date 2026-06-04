@@ -533,7 +533,7 @@ function buttonMatchesLabel(button: string, label: string): boolean {
 
 function buttonIsUnavailable(button: string, label: string): boolean {
   return (
-    button.includes("disabled") &&
+    /\sdisabled(?:=(?:""|"disabled"))?(?=[\s>])/.test(button) &&
     button.includes('aria-disabled="true"') &&
     button.includes(`data-unavailable-action="${label}"`)
   );
@@ -583,6 +583,14 @@ function expectNoDashboardBodyLiveIndicators(markup: string, expectedProjectionL
   expect(markup).not.toContain("Active sessions");
   expect(markup).not.toContain('class="spinner"');
   expect(markup).not.toContain("animation:pulse");
+}
+
+function expectNoApiDashboardMockFallback(markup: string) {
+  expect(markup).not.toContain("openai/symphony@main");
+  expect(markup).not.toContain("poll 22s");
+  expect(markup).not.toContain("dashboard embedded fallback should not render");
+  expect(markup).not.toContain("dashboard stale suggestion");
+  expect(markup).not.toContain("Restart SYM-42");
 }
 
 afterEach(() => {
@@ -708,11 +716,7 @@ describe("App API-mode rendering", () => {
     expectUnavailableButton(markup, "Search");
     expectUnavailableButton(markup, "More");
 
-    expect(markup).not.toContain("openai/symphony@main");
-    expect(markup).not.toContain("poll 22s");
-    expect(markup).not.toContain("dashboard embedded fallback should not render");
-    expect(markup).not.toContain("dashboard stale suggestion");
-    expect(markup).not.toContain("Restart SYM-42");
+    expectNoApiDashboardMockFallback(markup);
     expect(markup).not.toContain('class="badge"');
     expect(markup).not.toContain("4 live");
     expect(markup).not.toMatch(/target\s+\d/);
@@ -933,6 +937,7 @@ describe("App API-mode rendering", () => {
       expect(rendered.markup).toContain(testCase.projectionLabel);
       expectNoDashboardBodyLiveIndicators(rendered.markup, testCase.projectionLabel);
       expectApiDashboardActionAffordances(rendered.markup);
+      expectNoApiDashboardMockFallback(rendered.markup);
       expect(rendered.markup).not.toContain('class="pulse"');
     }
   });
