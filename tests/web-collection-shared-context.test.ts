@@ -144,11 +144,11 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
     try {
       const { response, body } = await getJson(`${baseUrlFor(address)}/api/v1/web/sessions/run-1/transcript`);
       expect(response.status).toBe(200);
-      expect(body).toEqual(
-        expect.arrayContaining([
+      expect(body).toMatchObject({
+        messages: expect.arrayContaining([
           expect.objectContaining({ kind: "assistant", text: "transcript message" }),
         ]),
-      );
+      });
       expect(contextBuilds).toBe(0);
       expect(calls).toMatchObject({ getRun: 1, listRuns: 0, readTranscript: 0, readTranscriptTail: 1 });
     } finally {
@@ -259,18 +259,19 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
     const coldAddress = await coldServer.start();
     const coldBaseUrl = baseUrlFor(coldAddress);
     const coldUrl = `${coldBaseUrl}/api/v1/web/sessions/${runId}/transcript`;
-    let coldBody: Array<{ kind?: string; text?: string }> = [];
+    let coldBody: { messages: Array<{ kind?: string; text?: string }> } = { messages: [] };
     let coldDelta: SourceCalls;
 
     try {
       const coldBefore = copySourceCalls(calls);
       const coldResult = await getJson(coldUrl);
       coldDelta = diffSourceCalls(coldBefore, calls);
-      coldBody = coldResult.body as Array<{ kind?: string; text?: string }>;
+      coldBody = coldResult.body as { messages: Array<{ kind?: string; text?: string }> };
+      const coldMessages = coldBody.messages;
       expect(coldResult.response.status).toBe(200);
-      expect(coldBody.length).toBeLessThanOrEqual(502);
-      expect(coldBody.slice(0, 2).map((message) => message.kind ?? null)).toEqual(["system", "user"]);
-      expect(coldBody.some((message) => message.kind === "assistant")).toBe(true);
+      expect(coldMessages.length).toBeLessThanOrEqual(502);
+      expect(coldMessages.slice(0, 2).map((message) => message.kind ?? null)).toEqual(["system", "user"]);
+      expect(coldMessages.some((message) => message.kind === "assistant")).toBe(true);
     } finally {
       await coldServer.stop();
     }
@@ -302,28 +303,30 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
       const warmBefore = copySourceCalls(calls);
       const warmResult = await getJson(warmTranscriptUrl);
       const warmDelta = diffSourceCalls(warmBefore, calls);
-      const warmBody = warmResult.body as Array<{ kind?: string; text?: string }>;
+      const warmBody = warmResult.body as { messages: Array<{ kind?: string; text?: string }> };
+      const warmMessages = warmBody.messages;
 
       const refreshBefore = copySourceCalls(calls);
       const refreshResult = await getJson(`${warmTranscriptUrl}&refresh=1`);
       const refreshDelta = diffSourceCalls(refreshBefore, calls);
-      const refreshBody = refreshResult.body as Array<{ kind?: string; text?: string }>;
+      const refreshBody = refreshResult.body as { messages: Array<{ kind?: string; text?: string }> };
+      const refreshMessages = refreshBody.messages;
 
       const transcriptDiagnostics = {
         cold: {
           status: 200,
-          messageCount: coldBody.length,
+          messageCount: coldBody.messages.length,
           delta: coldDelta,
         },
         warm: {
           status: warmResult.response.status,
-          messageCount: warmBody.length,
+          messageCount: warmMessages.length,
           delta: warmDelta,
           selectors: durableReader.selectors.map((selector) => selector.scopeKey),
         },
         refresh: {
           status: refreshResult.response.status,
-          messageCount: refreshBody.length,
+          messageCount: refreshMessages.length,
           delta: refreshDelta,
         },
       };
@@ -343,8 +346,8 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
           delta: { getRun: 2, listRuns: 0, readTranscript: 1, readTranscriptTail: 0, readTranscriptEventCount: 1 },
         },
       });
-      expect(warmBody).toEqual(coldBody);
-      expect(refreshBody).toEqual(coldBody);
+      expect(warmMessages).toEqual(coldBody.messages);
+      expect(refreshMessages).toEqual(coldBody.messages);
     } finally {
       await warmServer.stop();
     }

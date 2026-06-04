@@ -56,13 +56,13 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const directResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/shared-id/transcript`);
       expect(directResponse.status).toBe(200);
-      const directBody = (await directResponse.json()) as Array<Record<string, unknown>>;
+      const directBody = transcriptMessages(await directResponse.json());
       expectRunPrelude(directBody, { session: "direct-session", issue: "TEST-1" });
       expect(directBody.at(-1)).toMatchObject({ kind: "assistant", text: "direct run transcript" });
 
       const fallbackResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/direct-session/transcript`);
       expect(fallbackResponse.status).toBe(200);
-      const fallbackBody = (await fallbackResponse.json()) as Array<Record<string, unknown>>;
+      const fallbackBody = transcriptMessages(await fallbackResponse.json());
       expectRunPrelude(fallbackBody, { session: "direct-session", issue: "TEST-1" });
       expect(fallbackBody.at(-1)).toMatchObject({ kind: "assistant", text: "direct run transcript" });
     } finally {
@@ -70,7 +70,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
-  it("returns exact empty arrays for missing, blank, or unavailable transcript stores", async () => {
+  it("returns empty transcript windows for missing, blank, or unavailable transcript stores", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const server = createServer(config, runStore);
@@ -78,11 +78,11 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const missingResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/missing-run/transcript`);
       expect(missingResponse.status).toBe(200);
-      expect(await missingResponse.json()).toEqual([]);
+      expectEmptyTranscriptWindow(await missingResponse.json(), { kind: "tail", limit: 500 });
 
       const blankResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/%20/transcript`);
       expect(blankResponse.status).toBe(200);
-      expect(await blankResponse.json()).toEqual([]);
+      expectEmptyTranscriptWindow(await blankResponse.json(), { kind: "tail", limit: 500 });
     } finally {
       await server.stop();
     }
@@ -92,7 +92,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(noStoreAddress)}/api/v1/web/sessions/anything/transcript`);
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual([]);
+      expectEmptyTranscriptWindow(await response.json(), { kind: "tail", limit: 500 });
     } finally {
       await noStoreServer.stop();
     }
@@ -134,7 +134,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/paged-run/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = transcriptMessages(await response.json());
       expectRunPrelude(body, { session: "paged-session", issue: "TEST-1" });
       expect(body.slice(2)).toHaveLength(500);
       expect(body[2]).toMatchObject({ kind: "assistant", text: "event 101" });
@@ -173,10 +173,24 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const liveResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/active-run/transcript`);
       expect(liveResponse.status).toBe(200);
-      const liveBody = (await liveResponse.json()) as Array<Record<string, unknown>>;
+      const liveBodyJson = await liveResponse.json();
+      const liveBody = transcriptMessages(liveBodyJson);
       expectRunPrelude(liveBody, { session: "active-session", issue: "TEST-1" });
       expect(liveBody.slice(2).map((message) => message.text)).toEqual(["live event 1", "live event 2"]);
       expect(liveBody.map((message) => message.text)).not.toContain("stale durable transcript");
+      expect(liveBodyJson).toMatchObject({
+        window: {
+          kind: "tail",
+          requested: { offset: null, limit: 500 },
+          tailLimit: 500,
+        },
+        activeTail: {
+          enabled: true,
+          canAppend: true,
+          tailLimit: 500,
+          runStatus: "running",
+        },
+      });
       expect(projectionReader.selectors).toEqual([]);
       expect(projectionWriter.writes.at(-1)).toMatchObject({
         projectionName: "transcript_projection",
@@ -187,9 +201,88 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
 
       const explicitResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/active-run/transcript?offset=0&limit=1`);
       expect(explicitResponse.status).toBe(200);
-      expect(await explicitResponse.json()).toEqual(durablePayload);
+      const explicitBody = await explicitResponse.json();
+      expect(transcriptMessages(explicitBody)).toEqual(durablePayload);
+      expect(explicitBody).toMatchObject({
+        window: {
+          kind: "page",
+          requested: { offset: 0, limit: 1 },
+          tailLimit: 1,
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          tailLimit: 1,
+          runStatus: "running",
+        },
+      });
       expect(projectionReader.selectors).toEqual([
         { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "active-run:offset:0:limit:1" },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("normalizes incomplete durable transcript window envelopes before returning explicit pages", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "envelope-run", sessionId: "envelope-session", issueIdentifier: "TEST-1" });
+    const durableMessages = [{ kind: "assistant", text: "durable page event" }];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 0,
+          limit: 1,
+          size: 1,
+          total: 1,
+          nextOffset: null,
+          previousOffset: null,
+          hasNext: false,
+          hasPrevious: false,
+          firstSequence: null,
+          lastSequence: null,
+          lastEventAt: null,
+        },
+        window: {
+          kind: "page",
+          tailLimit: 1,
+          messageCount: 1,
+          requested: { offset: 0, limit: 1 },
+        },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [{ source: "runStore", revision: runStore.projectionRevision(), observedAt: null }],
+    );
+    const server = createServer(config, runStore, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/envelope-run/transcript?offset=0&limit=1`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(body).toMatchObject({
+        window: {
+          kind: "page",
+          requested: { offset: 0, limit: 1 },
+          tailLimit: 1,
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          afterSequence: null,
+          tailLimit: 1,
+          runStatus: "running",
+        },
+        recovery: {
+          strategy: "refetch",
+          reason: "tail-gap",
+        },
+      });
+      expect(projectionReader.selectors).toEqual([
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "envelope-run:offset:0:limit:1" },
       ]);
     } finally {
       await server.stop();
@@ -234,14 +327,40 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/query-run/transcript?offset=2&limit=9999`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const responseBody = await response.json();
+      const body = transcriptMessages(responseBody);
       expectRunPrelude(body, { session: "query-session", issue: "TEST-1" });
       expect(body.slice(2).map((message) => message.text)).toEqual(["query event 3", "query event 4", "query event 5"]);
+      expect(responseBody).toMatchObject({
+        window: {
+          kind: "page",
+          requested: { offset: 2, limit: 1000 },
+          tailLimit: 1000,
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          tailLimit: 1000,
+          runStatus: "running",
+        },
+      });
 
       for (const query of ["?offset=&limit=", "?offset=bogus&limit=0", "?offset=-2&limit=-1"]) {
         const invalidResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/query-run/transcript${query}`);
         expect(invalidResponse.status).toBe(200);
-        const invalidBody = (await invalidResponse.json()) as Array<Record<string, unknown>>;
+        const invalidBodyJson = await invalidResponse.json();
+        const invalidBody = transcriptMessages(invalidBodyJson);
+        expect(invalidBodyJson).toMatchObject({
+          window: {
+            requested: { offset: 0, limit: 500 },
+            tailLimit: 500,
+          },
+          activeTail: {
+            enabled: false,
+            canAppend: false,
+            tailLimit: 500,
+          },
+        });
         expectRunPrelude(invalidBody, { session: "query-session", issue: "TEST-1" });
         expect(invalidBody.slice(2).map((message) => message.text)).toEqual([
           "query event 1",
@@ -336,7 +455,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/cursor-run/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = transcriptMessages(await response.json());
       expectRunPrelude(body, { session: "cursor-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "actual assistant text" },
@@ -416,7 +535,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-run/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = transcriptMessages(await response.json());
       expectRunPrelude(body, { session: "hermes-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "final assistant text" },
@@ -486,7 +605,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-acp-run/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = transcriptMessages(await response.json());
       expectRunPrelude(body, { session: "hermes-acp-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
@@ -554,7 +673,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/${runId}/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = transcriptMessages(await response.json());
       expectRunPrelude(body, { session: "mapped-acp-delta-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello world token=[redacted]" },
@@ -632,7 +751,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-dual-run/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = transcriptMessages(await response.json());
       expectRunPrelude(body, { session: "hermes-dual-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
@@ -701,7 +820,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/hermes-whitespace-run/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = transcriptMessages(await response.json());
       expectRunPrelude(body, { session: "hermes-whitespace-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello world Safe [redacted]" },
@@ -746,7 +865,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/stream-progress-run/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = transcriptMessages(await response.json());
       expectRunPrelude(body, { session: "stream-progress-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "hello from stream" },
@@ -794,7 +913,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/cursor-nonassistant-run/transcript`);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as Array<Record<string, unknown>>;
+      const body = transcriptMessages(await response.json());
       expect(body).toEqual([
         {
           kind: "user",
@@ -978,6 +1097,50 @@ function transcriptEvent(overrides: Partial<TranscriptEvent>): TranscriptEvent {
 
 function baseUrl(address: { host: string; port: number }): string {
   return `http://${address.host}:${address.port}`;
+}
+
+function transcriptMessages(body: unknown): Array<Record<string, unknown>> {
+  expect(body).toMatchObject({
+    schemaVersion: 1,
+    messages: expect.any(Array),
+    page: expect.any(Object),
+    window: expect.any(Object),
+    activeTail: expect.any(Object),
+    recovery: expect.any(Object),
+    compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+  });
+  return (body as { messages: Array<Record<string, unknown>> }).messages;
+}
+
+function expectEmptyTranscriptWindow(body: unknown, expected: { kind: "page" | "tail"; limit: number }): void {
+  expect(transcriptMessages(body)).toEqual([]);
+  expect(body).toMatchObject({
+    page: {
+      offset: 0,
+      limit: expected.limit,
+      size: 0,
+      total: 0,
+      nextOffset: null,
+      previousOffset: null,
+      hasNext: false,
+      hasPrevious: false,
+      firstSequence: null,
+      lastSequence: null,
+      lastEventAt: null,
+    },
+    window: {
+      kind: expected.kind,
+      requested: { offset: expected.kind === "tail" ? null : 0, limit: expected.limit },
+      tailLimit: expected.limit,
+      messageCount: 0,
+    },
+    activeTail: {
+      enabled: false,
+      canAppend: false,
+      afterSequence: null,
+      tailLimit: expected.limit,
+    },
+  });
 }
 
 function expectRunPrelude(body: Array<Record<string, unknown>>, expected: { session: string; issue: string }): void {

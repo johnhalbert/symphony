@@ -211,6 +211,67 @@ describe("realtime active-view patch reducers", () => {
     expect(mirrored.action === "applied" ? mirrored.data : []).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:04.000Z", text: "Hello" }]);
   });
 
+  it("treats prelude-only transcript state as uncovered until the first transcript sequence arrives", () => {
+    const preludeOnly: TranscriptMessage[] = [
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.000Z",
+        model: "gpt-5.4",
+        cwd: "/workspace",
+        workspace: "/workspace",
+        session: "session-1",
+        tools: ["terminal"],
+        note: "System prelude",
+      },
+      {
+        kind: "user",
+        ts: "2026-01-01T00:00:00.500Z",
+        from: "worker",
+        issue: "ENG-225",
+        text: "Fix the transcript gap.",
+      },
+    ];
+
+    const firstTranscriptDelta = applyTranscriptDeltaEvent({
+      event: transcriptEvent({
+        id: "1",
+        revision: 1,
+        payload: {
+          ...transcriptEvent().payload,
+          sourceRevision: 1,
+          afterSequence: 0,
+          messages: [{ sequence: 1, message: { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "first delta" } }],
+        },
+      }),
+      sessionId: "session-1",
+      current: preludeOnly,
+      lastSequence: null,
+      lastRevision: null,
+    });
+
+    expect(firstTranscriptDelta).toMatchObject({ action: "applied", lastSequence: 1, lastRevision: 1 });
+    expect(firstTranscriptDelta.action === "applied" ? firstTranscriptDelta.data : []).toEqual([
+      ...preludeOnly,
+      { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "first delta" },
+    ]);
+
+    expect(
+      applyTranscriptDeltaEvent({
+        event: transcriptEvent({
+          payload: {
+            ...transcriptEvent().payload,
+            afterSequence: 1,
+            messages: [{ sequence: 2, message: { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "gap delta" } }],
+          },
+        }),
+        sessionId: "session-1",
+        current: preludeOnly,
+        lastSequence: null,
+        lastRevision: null,
+      }),
+    ).toMatchObject({ action: "fallback", reason: "gap" });
+  });
+
   it("falls back for missed, missing, stale/gapped, or incompatible transcript deltas and ignores inactive sessions", () => {
     const current: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "loaded" }];
 

@@ -6,10 +6,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RealtimeEventListener, RealtimeProjectionEvent, SymphonyDataSource } from "../src/data/dataSource";
 import { DataSourceProvider } from "../src/data/dataSourceContext";
 import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
+import { createTranscriptWindowResponse } from "../src/data/transcriptWindow";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
 import { combineLiveResourceTokens, useLiveResourceTokens } from "../src/hooks/useLiveResource";
 import { useOrchestratorChat, useTranscript } from "../src/hooks/useSymphonyData";
-import type { ChatMessage, Loadable, OrchestratorChatModel, TranscriptMessage } from "../src/types/symphony";
+import type {
+  ChatMessage,
+  Loadable,
+  OrchestratorChatModel,
+  TranscriptMessage,
+  TranscriptWindowResponse,
+} from "../src/types/symphony";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -255,9 +262,17 @@ describe("useSymphonyData realtime direct patching", () => {
     const invalidateCachedReads = vi.fn();
     const initial: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "loaded" }];
     const refetched: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:05.000Z", text: "refetched after gap" }];
-    const getTranscript = vi.fn<(_: string, signal?: AbortSignal) => Promise<TranscriptMessage[]>>()
-      .mockResolvedValueOnce(initial)
-      .mockResolvedValueOnce(refetched);
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(initial, {
+          runStatus: "running",
+          lastSequence: 1,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      )
+      .mockResolvedValueOnce(createTranscriptWindowResponse(refetched, { runStatus: "running", lastSequence: 5 }));
+
     const dataSource = testDataSource({
       getTranscript,
       invalidateCachedReads,
@@ -289,11 +304,50 @@ describe("useSymphonyData realtime direct patching", () => {
     expect(probe.result().data).toEqual(refetched);
   });
 
-  it("ignores transcript deltas for other sessions without refetching or corrupting selected state", async () => {
+  it("refetches instead of appending when a running transcript tail still contains only run prelude messages", async () => {
     let listener: RealtimeEventListener | null = null;
     const invalidateCachedReads = vi.fn();
-    const initial: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "selected session" }];
-    const getTranscript = vi.fn<(_: string, signal?: AbortSignal) => Promise<TranscriptMessage[]>>().mockResolvedValueOnce(initial);
+    const preludeOnly: TranscriptMessage[] = [
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.000Z",
+        model: "gpt-5.4",
+        cwd: "/workspace",
+        workspace: "/workspace",
+        session: "session-1",
+        tools: ["terminal"],
+        note: "System prelude",
+      },
+      {
+        kind: "user",
+        ts: "2026-01-01T00:00:00.500Z",
+        from: "worker",
+        issue: "ENG-225",
+        text: "Fix the transcript gap.",
+      },
+    ];
+    const refetched: TranscriptMessage[] = [
+      ...preludeOnly,
+      { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "missed earlier row" },
+      { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "visible after gap" },
+    ];
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(preludeOnly, {
+          runStatus: "running",
+          lastSequence: null,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      )
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(refetched, {
+          runStatus: "running",
+          lastSequence: 2,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      );
+
     const dataSource = testDataSource({
       getTranscript,
       invalidateCachedReads,
@@ -304,6 +358,45 @@ describe("useSymphonyData realtime direct patching", () => {
     });
     const probe = renderTranscriptProbe(dataSource);
     await flushPromises();
+
+    expect(probe.result()).toMatchObject({ data: preludeOnly, loading: false, error: null });
+    expect(getTranscript).toHaveBeenCalledTimes(1);
+
+    act(() => listener?.(transcriptEvent(2, 1, "visible after gap")));
+    await flushPromises();
+
+    expect(invalidateCachedReads).toHaveBeenCalledWith({ forceRefreshHrefs: ["/api/v1/web/sessions/session-1/transcript?refresh=1"] });
+    expect(getTranscript).toHaveBeenCalledTimes(2);
+    expect(probe.result().data).toEqual(refetched);
+  });
+
+  it("ignores transcript deltas for other sessions without refetching or corrupting selected state", async () => {
+    let listener: RealtimeEventListener | null = null;
+    const invalidateCachedReads = vi.fn();
+    const initial: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "selected session" }];
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(initial, {
+          runStatus: "running",
+          lastSequence: 1,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      );
+
+    const dataSource = testDataSource({
+      getTranscript,
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(nextListener) {
+        listener = nextListener;
+        return () => undefined;
+      },
+    });
+    const probe = renderTranscriptProbe(dataSource);
+    await flushPromises();
+
+    expect(probe.result()).toMatchObject({ data: initial, loading: false, error: null });
+    expect(getTranscript).toHaveBeenCalledTimes(1);
 
     const otherSessionPayload: RealtimeProjectionEvent<"transcript.delta">["payload"] = {
       source: "runs",
@@ -335,9 +428,22 @@ describe("useSymphonyData realtime direct patching", () => {
     const invalidateCachedReads = vi.fn();
     const initial: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "loaded" }];
     const refetched: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:03.000Z", text: "refetched after reconnect gap" }];
-    const getTranscript = vi.fn<(_: string, signal?: AbortSignal) => Promise<TranscriptMessage[]>>()
-      .mockResolvedValueOnce(initial)
-      .mockResolvedValueOnce(refetched);
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(initial, {
+          runStatus: "running",
+          lastSequence: 1,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      )
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(refetched, {
+          runStatus: "running",
+          lastSequence: 2,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      );
     const dataSource = testDataSource({
       getTranscript,
       invalidateCachedReads,
@@ -348,6 +454,9 @@ describe("useSymphonyData realtime direct patching", () => {
     });
     const probe = renderTranscriptProbe(dataSource);
     await flushPromises();
+
+    expect(probe.result()).toMatchObject({ data: initial, loading: false, error: null });
+    expect(getTranscript).toHaveBeenCalledTimes(1);
 
     act(() =>
       listener?.(
@@ -372,7 +481,10 @@ describe("useSymphonyData realtime direct patching", () => {
       ts: `2026-01-01T00:00:${String(index % 60).padStart(2, "0")}.000Z`,
       text: `event-${index + 1}`,
     }));
-    const getTranscript = vi.fn<(_: string, signal?: AbortSignal) => Promise<TranscriptMessage[]>>().mockResolvedValueOnce(initial);
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(createTranscriptWindowResponse(initial, { runStatus: "running", lastSequence: 500 }));
+
     const dataSource = testDataSource({
       getTranscript,
       invalidateCachedReads: vi.fn(),
@@ -392,6 +504,32 @@ describe("useSymphonyData realtime direct patching", () => {
     expect(patched[0]?.kind === "assistant" ? patched[0].text : null).toBe("event-2");
     const last = patched.at(-1);
     expect(last?.kind === "assistant" ? last.text : null).toBe("event-501");
+  });
+
+  it("ignores transcript deltas when the loaded transcript window is not an active appendable tail", async () => {
+    let listener: RealtimeEventListener | null = null;
+    const invalidateCachedReads = vi.fn();
+    const initial: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "completed tail" }];
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(createTranscriptWindowResponse(initial, { runStatus: "succeeded", lastSequence: 1, refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1" }));
+
+    const dataSource = testDataSource({
+      getTranscript,
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(nextListener) {
+        listener = nextListener;
+        return () => undefined;
+      },
+    });
+    const probe = renderTranscriptProbe(dataSource);
+    await flushPromises();
+
+    act(() => listener?.(transcriptEvent(2, 1, "unexpected live delta")));
+
+    expect(probe.result()).toMatchObject({ data: initial, loading: false, error: null });
+    expect(getTranscript).toHaveBeenCalledTimes(1);
+    expect(invalidateCachedReads).not.toHaveBeenCalled();
   });
 
   it("patches orchestrator chat from message SSE payloads without refetching and refetches on missing messages", async () => {

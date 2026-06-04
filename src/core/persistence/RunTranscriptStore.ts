@@ -225,6 +225,42 @@ export interface TranscriptPage {
   limit: number;
   nextOffset: number | null;
   events: TranscriptEvent[];
+  /** Total event count when the source can provide it without unbounded scanning. */
+  total?: number | null;
+  /** Number of source events represented by this window. Defaults to events.length. */
+  eventCount?: number;
+  /** Previous page/window offset for UI/API navigation, or null when this is the first window. */
+  previousOffset?: number | null;
+  hasPrevious?: boolean;
+  hasNext?: boolean;
+  windowKind?: "page" | "tail";
+  firstSequence?: number | null;
+  lastSequence?: number | null;
+  lastEventAt?: string | null;
+}
+
+function transcriptPage(input: {
+  runId: string;
+  offset: number;
+  limit: number;
+  nextOffset: number | null;
+  total: number;
+  events: TranscriptEvent[];
+  windowKind: "page" | "tail";
+}): TranscriptPage {
+  const firstEvent = input.events[0] ?? null;
+  const lastEvent = input.events.at(-1) ?? null;
+  const previousOffset = input.offset > 0 ? Math.max(0, input.offset - input.limit) : null;
+  return {
+    ...input,
+    eventCount: input.events.length,
+    previousOffset,
+    hasPrevious: previousOffset !== null,
+    hasNext: input.nextOffset !== null,
+    firstSequence: firstEvent?.sequence ?? null,
+    lastSequence: lastEvent?.sequence ?? null,
+    lastEventAt: lastEvent?.at ?? null,
+  };
 }
 
 export interface StartRunInput {
@@ -517,7 +553,7 @@ export class FileRunTranscriptStore {
     const total = await this.readTranscriptEventCount(runId);
     const events = (await readJsonlPage<TranscriptEvent>(this.eventsPath(runId), offset, limit)).map(projectTranscriptEventForPublicRead);
     const nextOffset = offset + events.length < total ? offset + events.length : null;
-    return { runId, offset, limit, nextOffset, events };
+    return transcriptPage({ runId, offset, limit, nextOffset, total, events, windowKind: "page" });
   }
 
   async readTranscriptTail(runId: string, options: { limit?: number } = {}): Promise<TranscriptPage> {
@@ -525,7 +561,7 @@ export class FileRunTranscriptStore {
     const total = await this.readTranscriptEventCount(runId);
     const events = (await readJsonlTailPage<TranscriptEvent>(this.eventsPath(runId), limit)).map(projectTranscriptEventForPublicRead);
     const offset = Math.max(0, total - events.length);
-    return { runId, offset, limit, nextOffset: null, events };
+    return transcriptPage({ runId, offset, limit, nextOffset: null, total, events, windowKind: "tail" });
   }
 
   async readTranscriptEventCount(runId: string): Promise<number> {

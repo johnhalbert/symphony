@@ -82,8 +82,8 @@ function createLazyMockDataSource(loadMockDataSource: DataSourceFactoryOptions["
     async getSessions(signal) {
       return (await dataSource()).getSessions(signal);
     },
-    async getTranscript(sessionId, signal) {
-      return (await dataSource()).getTranscript(sessionId, signal);
+    async getTranscript(sessionId, signal, options) {
+      return (await dataSource()).getTranscript(sessionId, signal, options);
     },
     async getSidebar(signal) {
       return (await dataSource()).getSidebar(signal);

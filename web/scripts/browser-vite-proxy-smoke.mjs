@@ -159,6 +159,76 @@ const session = {
 
 const transcript = [{ kind: "assistant", ts: session.updatedAt, text: "Dedicated session transcript from API endpoint" }];
 const staleTranscript = [{ kind: "assistant", ts: staleSession.updatedAt, text: "STALE embedded history transcript should not render" }];
+const transcriptWindow = createTranscriptWindowResponse(transcript, {
+  runStatus: "running",
+  lastSequence: 1,
+  lastEventAt: session.updatedAt,
+  refetchHref: "/api/v1/web/sessions/smoke-session/transcript?refresh=1",
+});
+const staleTranscriptWindow = createTranscriptWindowResponse(staleTranscript, {
+  runStatus: "succeeded",
+  lastSequence: 1,
+  lastEventAt: staleSession.updatedAt,
+  refetchHref: "/api/v1/web/sessions/stale-session/transcript?refresh=1",
+});
+
+function createTranscriptWindowResponse(messages, input = {}) {
+  const limit = Number.isFinite(input.limit) ? input.limit : 500;
+  const offset = Number.isFinite(input.offset) ? input.offset : 0;
+  const total = Number.isFinite(input.total) ? input.total : messages.length;
+  const previousOffset = input.previousOffset !== undefined && input.previousOffset !== null
+    ? input.previousOffset
+    : offset > 0
+      ? Math.max(0, offset - limit)
+      : null;
+  const nextOffset = input.nextOffset ?? null;
+  const kind = input.kind === "page" ? "page" : "tail";
+  const lastSequence = Number.isFinite(input.lastSequence) ? input.lastSequence : null;
+  const firstSequence = Number.isFinite(input.firstSequence) ? input.firstSequence : lastSequence;
+  const lastEventAt = typeof input.lastEventAt === "string" && input.lastEventAt.trim().length > 0
+    ? input.lastEventAt
+    : messages.at(-1)?.ts ?? null;
+  const refetchHref = typeof input.refetchHref === "string" && input.refetchHref.trim().length > 0 ? input.refetchHref : null;
+  const runStatus = typeof input.runStatus === "string" && input.runStatus.trim().length > 0 ? input.runStatus : null;
+  const activeTailEnabled = kind === "tail" && runStatus === "running";
+  const page = {
+    offset,
+    limit,
+    size: messages.length,
+    total,
+    nextOffset,
+    previousOffset,
+    hasNext: input.hasNext ?? nextOffset !== null,
+    hasPrevious: input.hasPrevious ?? previousOffset !== null,
+    firstSequence,
+    lastSequence,
+    lastEventAt,
+  };
+  return {
+    schemaVersion: 1,
+    messages: [...messages],
+    page,
+    window: {
+      ...page,
+      kind,
+      tailLimit: limit,
+      messageCount: messages.length,
+      requested: { offset: kind === "tail" ? null : offset, limit },
+    },
+    activeTail: {
+      enabled: activeTailEnabled,
+      canAppend: activeTailEnabled,
+      runStatus,
+      tailLimit: limit,
+      afterSequence: lastSequence,
+      lastEventAt,
+      refetchHref,
+      gapFallback: { strategy: "refetch", reason: "tail-gap", href: refetchHref },
+    },
+    recovery: { strategy: "refetch", reason: "tail-gap", href: refetchHref },
+    compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+  };
+}
 
 const referenceData = {
   users: {
@@ -577,8 +647,8 @@ async function handleFakeApiRequest(request, response, url) {
   if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-0") {
     return sendJson(response, 200, { issue: staleIssueDetail, activity: [], runs: [staleSession], transcript: staleTranscript });
   }
-  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/smoke-session/transcript") return sendJson(response, 200, transcript);
-  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/stale-session/transcript") return sendJson(response, 200, staleTranscript);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/smoke-session/transcript") return sendJson(response, 200, transcriptWindow);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/stale-session/transcript") return sendJson(response, 200, staleTranscriptWindow);
   if (request.method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
     const bodyText = await readRequestBody(request);
     const input = parseChatInput(bodyText) ?? "browser smoke input";

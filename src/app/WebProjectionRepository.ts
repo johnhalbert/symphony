@@ -1,6 +1,6 @@
 import type { projectWebDashboard, projectWebIssueBoard, projectWebSidebar, ChatMessage } from "./webProjection.js";
 import type { projectWebHistory } from "./WebHistoryProjection.js";
-import type { projectWebTranscript } from "./WebTranscriptProjection.js";
+import type { WebTranscriptProjectionPayload } from "./WebTranscriptProjection.js";
 import { DEFAULT_ORCHESTRATOR_CONVERSATION_ID } from "../core/persistence/OrchestratorConversationStore.js";
 import type {
   ProjectionPayloadRecord,
@@ -170,7 +170,7 @@ export class WebTranscriptProjectionRepository {
   readRunPage(
     page: WebTranscriptProjectionPageSelector,
     options: WebProjectionReadOptions = {},
-  ): Promise<WebProjectionReadResult<ReturnType<typeof projectWebTranscript>>> {
+  ): Promise<WebProjectionReadResult<WebTranscriptProjectionPayload>> {
     return this.reads.read(
       { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: webTranscriptProjectionScopeKey(page) },
       options,
@@ -180,7 +180,7 @@ export class WebTranscriptProjectionRepository {
   readRunDefaultPage(
     page: WebTranscriptProjectionDefaultPageSelector,
     options: WebProjectionReadOptions = {},
-  ): Promise<WebProjectionReadResult<ReturnType<typeof projectWebTranscript>>> {
+  ): Promise<WebProjectionReadResult<WebTranscriptProjectionPayload>> {
     return this.reads.readTranscriptDefaultPage(page, options);
   }
 }

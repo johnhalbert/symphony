@@ -1,7 +1,8 @@
 import { redactTranscriptText, sanitizeCommandPolicyPayloadForPublicOutput, sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
-import type { RunRecord, TranscriptEvent } from "../core/persistence/RunTranscriptStore.js";
+import type { RunRecord, TranscriptEvent, TranscriptPage } from "../core/persistence/RunTranscriptStore.js";
 
 const USER_PROMPT_MAX_LENGTH = 5_000;
+export const WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION = 1;
 
 export interface CommandPolicyStatusDetails {
   outcome?: string;
@@ -48,9 +49,73 @@ export type TranscriptMessage =
   | { kind: "task"; ts: string; title: string; desc: string }
   | { kind: "request"; ts: string; reason: string; q: string; actions: string[] };
 
+export interface WebTranscriptWindowPageModel {
+  offset: number;
+  limit: number;
+  size: number;
+  total: number | null;
+  nextOffset: number | null;
+  previousOffset: number | null;
+  hasNext: boolean;
+  hasPrevious: boolean;
+  firstSequence: number | null;
+  lastSequence: number | null;
+  lastEventAt: string | null;
+}
+
+export interface WebTranscriptWindowModel extends WebTranscriptWindowPageModel {
+  kind: "page" | "tail";
+  tailLimit: number;
+  messageCount: number;
+  requested: {
+    offset: number | null;
+    limit: number;
+  };
+}
+
+export interface WebTranscriptActiveTailModel {
+  enabled: boolean;
+  canAppend: boolean;
+  runStatus: RunRecord["status"] | null;
+  tailLimit: number;
+  afterSequence: number | null;
+  lastEventAt: string | null;
+  refetchHref: string | null;
+  gapFallback: {
+    strategy: "refetch";
+    reason: "tail-gap";
+    href: string | null;
+  };
+}
+
+export interface WebTranscriptProjectionPayload {
+  schemaVersion: typeof WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION;
+  messages: TranscriptMessage[];
+  page: WebTranscriptWindowPageModel;
+  window: WebTranscriptWindowModel;
+  activeTail: WebTranscriptActiveTailModel;
+  recovery: {
+    strategy: "refetch";
+    reason: "tail-gap";
+    href: string | null;
+  };
+  compatibility: {
+    responseShape: "transcript_window";
+    messagesField: "messages";
+  };
+}
+
 export interface WebTranscriptProjectionOptions {
   run?: RunRecord | null;
   includeRunPrelude?: boolean;
+}
+
+export interface WebTranscriptWindowProjectionOptions {
+  run?: RunRecord | null;
+  kind?: "page" | "tail";
+  requestedPage?: { offset: number; limit: number } | null;
+  tailLimit: number;
+  refetchHref?: string | null;
 }
 
 export function projectWebTranscript(
@@ -60,6 +125,128 @@ export function projectWebTranscript(
   const messages = projectTranscriptEvents(events);
   if (!options.run || options.includeRunPrelude === false) return messages;
   return [...projectRunPreludeMessages(options.run, messages), ...messages];
+}
+
+export function projectWebTranscriptWindow(
+  page: TranscriptPage,
+  messages: readonly TranscriptMessage[],
+  options: WebTranscriptWindowProjectionOptions,
+): WebTranscriptProjectionPayload {
+  const pageModel = webTranscriptWindowPageModel(page);
+  const windowKind = options.kind ?? page.windowKind ?? (options.requestedPage ? "page" : "tail");
+  const refetchHref = options.refetchHref ?? webTranscriptRefetchHref(options.run ?? null);
+  const window: WebTranscriptWindowModel = {
+    ...pageModel,
+    kind: windowKind,
+    tailLimit: options.tailLimit,
+    messageCount: messages.length,
+    requested: {
+      offset: options.requestedPage?.offset ?? null,
+      limit: options.requestedPage?.limit ?? page.limit,
+    },
+  };
+  const active = windowKind === "tail" && options.run?.status === "running";
+  const recovery = { strategy: "refetch" as const, reason: "tail-gap" as const, href: refetchHref };
+  return {
+    schemaVersion: WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION,
+    messages: [...messages],
+    page: pageModel,
+    window,
+    activeTail: {
+      enabled: active,
+      canAppend: active,
+      runStatus: options.run?.status ?? null,
+      tailLimit: options.tailLimit,
+      afterSequence: pageModel.lastSequence,
+      lastEventAt: pageModel.lastEventAt,
+      refetchHref,
+      gapFallback: recovery,
+    },
+    recovery,
+    compatibility: {
+      responseShape: "transcript_window",
+      messagesField: "messages",
+    },
+  };
+}
+
+export function emptyWebTranscriptProjectionPayload(input: {
+  runId: string;
+  limit: number;
+  kind?: "page" | "tail";
+  refetchHref?: string | null;
+}): WebTranscriptProjectionPayload {
+  return projectWebTranscriptWindow(
+    {
+      runId: input.runId,
+      offset: 0,
+      limit: input.limit,
+      nextOffset: null,
+      events: [],
+      total: 0,
+      eventCount: 0,
+      previousOffset: null,
+      hasPrevious: false,
+      hasNext: false,
+      windowKind: input.kind ?? "tail",
+      firstSequence: null,
+      lastSequence: null,
+      lastEventAt: null,
+    },
+    [],
+    { tailLimit: input.limit, kind: input.kind ?? "tail", refetchHref: input.refetchHref ?? null },
+  );
+}
+
+export function isWebTranscriptProjectionPayload(value: unknown): value is WebTranscriptProjectionPayload {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.schemaVersion === WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION &&
+    Array.isArray(record.messages) &&
+    isObjectRecord(record.page) &&
+    isObjectRecord(record.window) &&
+    isObjectRecord(record.activeTail) &&
+    isObjectRecord(record.recovery) &&
+    isObjectRecord(record.compatibility)
+  );
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function webTranscriptWindowPageModel(page: TranscriptPage): WebTranscriptWindowPageModel {
+  const firstEvent = page.events[0] ?? null;
+  const lastEvent = page.events.at(-1) ?? null;
+  const size = finiteNumberOrNull(page.eventCount) ?? page.events.length;
+  const total = finiteNumberOrNull(page.total);
+  const previousOffset = page.previousOffset !== undefined ? page.previousOffset : page.offset > 0 ? Math.max(0, page.offset - page.limit) : null;
+  const hasNext = page.hasNext ?? page.nextOffset !== null;
+  const hasPrevious = page.hasPrevious ?? previousOffset !== null;
+  return {
+    offset: page.offset,
+    limit: page.limit,
+    size,
+    total,
+    nextOffset: page.nextOffset,
+    previousOffset,
+    hasNext,
+    hasPrevious,
+    firstSequence: page.firstSequence ?? firstEvent?.sequence ?? null,
+    lastSequence: page.lastSequence ?? lastEvent?.sequence ?? null,
+    lastEventAt: page.lastEventAt ?? lastEvent?.at ?? null,
+  };
+}
+
+function webTranscriptRefetchHref(run: RunRecord | null): string | null {
+  if (!run) return null;
+  const transcriptId = run.sessionId?.trim() || run.runId;
+  return `/api/v1/web/sessions/${encodeURIComponent(transcriptId)}/transcript?refresh=1`;
+}
+
+function finiteNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function projectTranscriptEvents(events: readonly TranscriptEvent[]): TranscriptMessage[] {

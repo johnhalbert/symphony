@@ -124,9 +124,8 @@ describe("/api/v1/web route contracts", () => {
         },
         {
           path: webRouteContractPaths.transcript,
-          assert: (body, text) => {
-            expect(body).toEqual([]);
-            expect(text.trim()).toBe("[]");
+          assert: (body) => {
+            expectTranscriptWindowPayload(body, [], { kind: "tail", limit: 500 });
           },
         },
         {
@@ -625,10 +624,11 @@ describe("/api/v1/web route contracts", () => {
       });
 
       const durableTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/session-large-1/transcript`);
-      expect(durableTranscript.body).toEqual(largeTranscript);
-      expect((durableTranscript.body as unknown[])).toHaveLength(500);
-      expect((durableTranscript.body as Array<{ text: string }>)[0]).toMatchObject({ text: "Durable transcript tail event 9501" });
-      expect((durableTranscript.body as Array<{ text: string }>).at(-1)).toMatchObject({ text: "Durable transcript tail event 10000" });
+      expectTranscriptWindowPayload(durableTranscript.body, largeTranscript, { kind: "tail", limit: 500 });
+      const durableTranscriptMessages = (durableTranscript.body as { messages: Array<{ text: string }> }).messages;
+      expect(durableTranscriptMessages).toHaveLength(500);
+      expect(durableTranscriptMessages[0]).toMatchObject({ text: "Durable transcript tail event 9501" });
+      expect(durableTranscriptMessages.at(-1)).toMatchObject({ text: "Durable transcript tail event 10000" });
       expectProjectionHeaders(durableTranscript.response, {
         name: "transcript_projection",
         scopeKind: "run_page",
@@ -1058,7 +1058,7 @@ describe("/api/v1/web route contracts", () => {
       expect(detailWithTranscript.response.headers.get("x-symphony-projection-status")).toBe("hit");
 
       const transcript = await getJson(`${baseUrl}/api/v1/web/sessions/session-1/transcript`);
-      expect(transcript.body).toEqual(durableTranscript);
+      expectTranscriptWindowPayload(transcript.body, durableTranscript, { kind: "tail", limit: 500 });
       expect(transcript.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(transcript.response.headers.get("x-symphony-projection-cache")).toBe("hit");
       expect(JSON.parse(decodeURIComponent(transcript.response.headers.get("x-symphony-projection-source-revisions") ?? "[]"))).toEqual(
@@ -1106,28 +1106,30 @@ describe("/api/v1/web route contracts", () => {
     const baseUrl = baseUrlFor(address);
     try {
       const defaultPage = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript`);
-      expect(defaultPage.body).toEqual(defaultTranscript);
+      expectTranscriptWindowPayload(defaultPage.body, defaultTranscript, { kind: "tail", limit: 500 });
       expect(defaultPage.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(defaultPage.response.headers.get("x-symphony-projection-cache")).toBe("hit");
       expect(defaultPage.response.headers.get("x-symphony-projection-scope-key")).toBe("run-1:offset:700:limit:500");
-      expect((defaultPage.body as unknown[])[0]).toMatchObject({ text: "default tail event 701" });
-      expect((defaultPage.body as unknown[]).at(-1)).toMatchObject({ text: "default tail event 1200" });
-      expect((defaultPage.body as unknown[])).toHaveLength(500);
+      const defaultMessages = (defaultPage.body as { messages: Array<{ text: string }> }).messages;
+      expect(defaultMessages[0]).toMatchObject({ text: "default tail event 701" });
+      expect(defaultMessages.at(-1)).toMatchObject({ text: "default tail event 1200" });
+      expect(defaultMessages).toHaveLength(500);
 
       const explicitPage = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?offset=2&limit=3`);
-      expect(explicitPage.body).toEqual(pagedTranscript);
+      expectTranscriptWindowPayload(explicitPage.body, pagedTranscript, { kind: "page", limit: 3 });
       expect(explicitPage.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(explicitPage.response.headers.get("x-symphony-projection-cache")).toBe("hit");
       expect(explicitPage.response.headers.get("x-symphony-projection-scope-key")).toBe("run-1:offset:2:limit:3");
 
       const refreshDefault = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?refresh=1`);
-      expect(refreshDefault.body).toEqual([]);
+      expectTranscriptWindowPayload(refreshDefault.body, [], { kind: "tail", limit: 500 });
       expect(refreshDefault.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
       expect(refreshDefault.response.headers.get("x-symphony-projection-cache")).toBe("miss");
       expect(refreshDefault.response.headers.get("x-symphony-projection-scope-key")).toBe("run-1:tail:limit:500");
 
       const refreshBypass = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?offset=2&limit=3&refresh=1`);
-      expect(refreshBypass.body).toEqual([]);
+      expectTranscriptWindowPayload(refreshBypass.body, [], { kind: "page", limit: 3 });
+      expect((refreshBypass.body as { messages: unknown[] }).messages).toEqual([]);
       expect(refreshBypass.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
       expect(refreshBypass.response.headers.get("x-symphony-projection-cache")).toBe("miss");
     } finally {
@@ -1416,8 +1418,9 @@ describe("/api/v1/web route contracts", () => {
       expect(chat.response.headers.get("x-symphony-projection-revision")).toBe("12");
 
       const transcript = await getJson(`${baseUrl}/api/v1/web/sessions/run-1/transcript?offset=2&limit=3`);
-      expect(transcript.body).toEqual([]);
-      expect(transcript.body).not.toEqual(expiredTranscript);
+      expectTranscriptWindowPayload(transcript.body, [], { kind: "page", limit: 3 });
+      expect((transcript.body as { messages: unknown[] }).messages).toEqual([]);
+      expect((transcript.body as { messages: unknown[] }).messages).not.toEqual(expiredTranscript);
       expect(transcript.response.headers.get("x-symphony-projection-status")).toBe("expired");
       expect(transcript.response.headers.get("x-symphony-projection-scope-key")).toBe("run-1:offset:2:limit:3");
       expect(transcript.response.headers.get("x-symphony-projection-revision")).toBe("13");
@@ -2489,10 +2492,84 @@ function expectTopLevelKeys(body: unknown, keys: string[]): void {
   expect(Object.keys(body as Record<string, unknown>).sort()).toEqual([...keys].sort());
 }
 
+function expectTranscriptWindowPayload(
+  body: unknown,
+  expectedMessages: readonly Record<string, unknown>[],
+  expected: { kind: "page" | "tail"; limit: number },
+): void {
+  const payload = body as {
+    schemaVersion: number;
+    messages: readonly Record<string, unknown>[];
+    page: {
+      offset: number;
+      limit: number;
+      size: number;
+      total: number | null;
+      nextOffset: number | null;
+      previousOffset: number | null;
+      hasNext: boolean;
+      hasPrevious: boolean;
+      firstSequence: number | null;
+      lastSequence: number | null;
+      lastEventAt: string | null;
+    };
+    window: {
+      kind: "page" | "tail";
+      limit: number;
+      size: number;
+      total: number | null;
+      hasNext: boolean;
+      hasPrevious: boolean;
+      firstSequence: number | null;
+      lastSequence: number | null;
+      lastEventAt: string | null;
+      tailLimit: number;
+      messageCount: number;
+      requested: { offset: number | null; limit: number };
+    };
+    activeTail: {
+      enabled: boolean;
+      canAppend: boolean;
+      runStatus: unknown;
+      tailLimit: number;
+      afterSequence: number | null;
+      lastEventAt: string | null;
+      refetchHref: string | null;
+    };
+    recovery: {
+      strategy: "refetch";
+      reason: "tail-gap";
+      href: string | null;
+    };
+    compatibility: { responseShape: "transcript_window"; messagesField: "messages" };
+  };
+
+  expect(payload).not.toBeNull();
+  expect(payload.schemaVersion).toBe(1);
+  expect(Array.isArray(payload.messages)).toBe(true);
+  expect(payload.messages).toEqual(expectedMessages);
+  expect(payload.page).toMatchObject({
+    limit: expected.limit,
+    size: expectedMessages.length,
+  });
+  expect(payload.window).toMatchObject({
+    kind: expected.kind,
+    limit: expected.limit,
+    size: expectedMessages.length,
+    messageCount: expectedMessages.length,
+  });
+  expect(payload.activeTail).toMatchObject({
+    enabled: expected.kind === "tail" ? expect.any(Boolean) : false,
+    canAppend: expected.kind === "tail" ? expect.any(Boolean) : false,
+    tailLimit: expect.any(Number),
+  });
+  expect(payload.recovery).toMatchObject({ strategy: "refetch", reason: "tail-gap" });
+  expect(payload.compatibility).toMatchObject({ responseShape: "transcript_window", messagesField: "messages" });
+}
+
 function emptyTotals(): Record<string, number> {
   return { backlog: 0, todo: 0, progress: 0, review: 0, done: 0, cancelled: 0, open: 0, all: 0, completeness: 0 };
 }
-
 function unavailableDashboardSource(): Record<string, unknown> {
   return {
     status: "unavailable",
