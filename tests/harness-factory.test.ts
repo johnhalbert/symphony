@@ -54,9 +54,20 @@ describe("createAgentHarness", () => {
 
     const input = permissionResolverInput(editPermissionRequest());
 
-    await expect(permissionResolver(input)).resolves.toEqual({
+    await expect(permissionResolver(input)).resolves.toMatchObject({
       optionId: "deny",
       reason: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON,
+      policyDecision: {
+        outcome: "deny",
+        reasonKind: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON,
+        commandClass: "acp_file_edit_approval_bridge",
+        audit: {
+          redacted: true,
+          surface: "file_edit",
+          outcome: "deny",
+          reasonKind: DEFAULT_AGENT_COMMAND_POLICY_ACP_FILE_EDIT_APPROVAL_BRIDGE_MISSING_REASON,
+        },
+      },
     });
   });
 

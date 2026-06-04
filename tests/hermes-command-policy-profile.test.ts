@@ -6,9 +6,11 @@ import YAML from "yaml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HermesHarness } from "../hermes/src/HermesHarness.js";
 import {
+  buildHermesAgentCommandPolicyDecisionJournalPath,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
 } from "../hermes/src/HermesMcpConfig.js";
+import { buildAgentCommandPolicyHookDecisionJournalFallbackPath } from "../src/core/harness/AgentCommandPolicyHookRunner.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 import { parseServiceConfig, type ServiceConfig } from "../src/core/config/Config.js";
 import type { AgentEvent, AgentRunContext } from "../src/core/harness/AgentHarness.js";
@@ -81,6 +83,207 @@ describe("Hermes command policy profile hooks", () => {
 
     await harness.dispose();
   });
+  it("emits durable command_policy_decision activity from journaled hook decisions", async () => {
+    const cliPath = path.join(root, "cli.js");
+    const harness = new HermesHarness({
+      cliPath,
+      commandPolicyHookVerifier: async () => undefined,
+      gatewayFactory: (env) =>
+        new FakeGatewayClient(env, "gw-journal", {
+          onPromptSubmit: async (client) => {
+            const entry = {
+              version: 1,
+              recordedAt: "2026-06-04T10:00:00.000Z",
+              runId: "test-session",
+              issueId: "issue-1",
+              requestKind: "terminal_execute",
+              toolCallId: "tool-call-1",
+              permissionOutcome: "denied",
+              hookAction: "block",
+              decision: {
+                outcome: "deny",
+                reasonKind: "direct_upstream_github",
+                commandClass: "direct_upstream_git_operation",
+                message: "blocked by test policy",
+                audit: {
+                  redacted: true,
+                  role: "worker",
+                  phase: "implementation",
+                  surface: "terminal",
+                  upstreamContactAttempted: false,
+                },
+              },
+            };
+            await writeFile(
+              buildHermesAgentCommandPolicyDecisionJournalPath(client.env.hermesHome),
+              `${JSON.stringify(entry)}\n`,
+              "utf8",
+            );
+          },
+        }),
+    });
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(
+      harness.run(context(config, { workspacePath, role: "worker", runPhase: "implementation", turnNumber: 1 }), "worker"),
+    );
+
+    const decisionEvent = events.find((event) => event.type === "run_diagnostic" && event.code === "command_policy_decision");
+    expect(decisionEvent).toMatchObject({
+      type: "run_diagnostic",
+      code: "command_policy_decision",
+      message: expect.stringContaining("direct_upstream_github") as string,
+      runActivity: {
+        kind: "command_policy_decision",
+        payload: {
+          requestKind: "terminal_execute",
+          toolCallId: "tool-call-1",
+          hookAction: "block",
+          permissionOutcome: "denied",
+          outcome: "deny",
+          reasonKind: "direct_upstream_github",
+        },
+      },
+    });
+
+    await harness.dispose();
+  });
+
+  it("emits blocked hook-path command_policy_decision activity before any follow-up gateway event arrives", async () => {
+    const cliPath = path.join(root, "cli.js");
+    let client: FakeGatewayClient | null = null;
+    const harness = new HermesHarness({
+      cliPath,
+      commandPolicyHookVerifier: async () => undefined,
+      gatewayFactory: (env) => {
+        client = new FakeGatewayClient(env, "gw-blocked-without-followup", {
+          emitPromptCompleteEvent: false,
+          onPromptSubmit: async (gatewayClient) => {
+            const entry = hookJournalEntry("direct_upstream_github", "deny", {
+              permissionOutcome: "denied",
+              hookAction: "block",
+            });
+            await writeFile(
+              buildHermesAgentCommandPolicyDecisionJournalPath(gatewayClient.env.hermesHome),
+              `${JSON.stringify(entry)}\n`,
+              "utf8",
+            );
+          },
+        });
+        return client;
+      },
+    });
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const iterator = harness
+      .run(context(config, { workspacePath, role: "worker", runPhase: "implementation", turnNumber: 1 }), "worker")
+      [Symbol.asyncIterator]();
+
+    const started = await iterator.next();
+    expect(started.value).toMatchObject({ type: "session_started" });
+
+    const blockedDecision = await Promise.race([
+      iterator.next(),
+      new Promise<IteratorResult<AgentEvent>>((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for blocked hook decision")), 200)),
+    ]);
+    expect(blockedDecision.done).toBe(false);
+    expect(blockedDecision.value).toMatchObject({
+      type: "run_diagnostic",
+      code: "command_policy_decision",
+      payload: expect.objectContaining({
+        outcome: "deny",
+        reasonKind: "direct_upstream_github",
+        permissionOutcome: "denied",
+        hookAction: "block",
+      }),
+    });
+
+    expect(client).not.toBeNull();
+    client!.emit("event", {
+      type: "message.complete",
+      session_id: "gw-blocked-without-followup",
+      payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
+    } satisfies GatewayEvent);
+
+    const nextEvents = [await iterator.next(), await iterator.next()];
+    expect(nextEvents.map((entry) => entry.value?.type)).toEqual(expect.arrayContaining(["tokens", "completed"]));
+    const done = await iterator.next();
+    expect(done.done).toBe(true);
+
+    await harness.dispose();
+  });
+
+  it("emits durable command_policy_decision activity from fallback hook journals when primary journaling fails", async () => {
+    const cliPath = path.join(root, "cli.js");
+    const harness = new HermesHarness({
+      cliPath,
+      commandPolicyHookVerifier: async () => undefined,
+      gatewayFactory: (env) =>
+        new FakeGatewayClient(env, "gw-fallback-journal", {
+          onPromptSubmit: async (client) => {
+            const journalPath = buildHermesAgentCommandPolicyDecisionJournalPath(client.env.hermesHome);
+            await mkdir(journalPath, { recursive: true });
+            const fallbackPath = buildAgentCommandPolicyHookDecisionJournalFallbackPath(journalPath);
+            const entries = [
+              hookJournalEntry("local_only_inspection", "allow", {
+                permissionOutcome: "allowed",
+                hookAction: null,
+              }),
+              hookJournalEntry("direct_upstream_github", "deny", {
+                permissionOutcome: "denied",
+                hookAction: "block",
+              }),
+              hookJournalEntry("malformed_hook_payload", "deny", {
+                requestKind: null,
+                surface: "unknown",
+                permissionOutcome: "fail_closed",
+                hookAction: "block",
+              }),
+            ];
+            await writeFile(fallbackPath, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+          },
+        }),
+    });
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(
+      harness.run(context(config, { workspacePath, role: "worker", runPhase: "implementation", turnNumber: 1 }), "worker"),
+    );
+
+    const decisionEvents = events.filter((event) => event.type === "run_diagnostic" && event.code === "command_policy_decision");
+    expect(decisionEvents).toHaveLength(3);
+    expect(decisionEvents.map((event) => event.runActivity?.payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          outcome: "allow",
+          reasonKind: "local_only_inspection",
+          surface: "terminal_execute",
+          audit: expect.objectContaining({ surface: "terminal_execute" }),
+        }),
+        expect.objectContaining({
+          outcome: "deny",
+          reasonKind: "direct_upstream_github",
+          surface: "terminal_execute",
+          audit: expect.objectContaining({ surface: "terminal_execute" }),
+        }),
+        expect.objectContaining({
+          outcome: "deny",
+          reasonKind: "malformed_hook_payload",
+          surface: "unknown",
+          permissionOutcome: "fail_closed",
+        }),
+      ]),
+    );
+
+    await harness.dispose();
+  });
+
   it("fails closed before creating a gateway client when command-policy hook validation is unverifiable", async () => {
     const clients: FakeGatewayClient[] = [];
     const cliPath = path.join(root, "cli.js");
@@ -108,6 +311,41 @@ describe("Hermes command policy profile hooks", () => {
   });
 });
 
+function hookJournalEntry(
+  reasonKind: string,
+  outcome: "allow" | "deny",
+  options: {
+    requestKind?: string | null;
+    surface?: string;
+    permissionOutcome: string;
+    hookAction: string | null;
+  },
+): Record<string, unknown> {
+  return {
+    version: 1,
+    recordedAt: "2026-06-04T10:00:00.000Z",
+    runId: "test-session",
+    issueId: "issue-1",
+    requestKind: options.requestKind === undefined ? "terminal_execute" : options.requestKind,
+    toolCallId: "tool-call-1",
+    permissionOutcome: options.permissionOutcome,
+    hookAction: options.hookAction,
+    decision: {
+      outcome,
+      reasonKind,
+      commandClass: reasonKind,
+      message: `${outcome} by fallback test policy`,
+      audit: {
+        redacted: true,
+        role: "worker",
+        phase: "implementation",
+        surface: options.surface ?? "terminal",
+        upstreamContactAttempted: false,
+      },
+    },
+  };
+}
+
 class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   readonly requests: Array<{ method: string; params: Record<string, unknown> }> = [];
   readonly killed: string[] = [];
@@ -115,6 +353,10 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   constructor(
     readonly env: HermesGatewayEnvironment,
     private readonly sessionId: string,
+    private readonly options: {
+      onPromptSubmit?: (client: FakeGatewayClient) => Promise<void> | void;
+      emitPromptCompleteEvent?: boolean;
+    } = {},
   ) {
     super();
   }
@@ -139,13 +381,16 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
     this.requests.push({ method, params });
     if (method === "session.create") return { session_id: this.sessionId } as T;
     if (method === "prompt.submit") {
-      queueMicrotask(() => {
-        this.emit("event", {
-          type: "message.complete",
-          session_id: this.sessionId,
-          payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
-        } satisfies GatewayEvent);
-      });
+      await this.options.onPromptSubmit?.(this);
+      if (this.options.emitPromptCompleteEvent !== false) {
+        queueMicrotask(() => {
+          this.emit("event", {
+            type: "message.complete",
+            session_id: this.sessionId,
+            payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
+          } satisfies GatewayEvent);
+        });
+      }
       return { ok: true } as T;
     }
     return { ok: true } as T;
@@ -223,5 +468,7 @@ function expectPolicyHook(
   expect(hook.command).toContain(`--role ${expected.role}`);
   expect(hook.command).toContain(`--phase ${expected.phase}`);
   expect(hook.command).toContain(`--issue-id ${expected.issueId}`);
+  expect(hook.command).toContain("--decision-journal");
+  expect(hook.command).toContain("agent-command-policy-decisions.ndjson");
   expect(hook.command).toContain(expected.cliPath);
 }

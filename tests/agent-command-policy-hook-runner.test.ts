@@ -1,7 +1,11 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
   AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES,
+  buildAgentCommandPolicyHookDecisionJournalFallbackPath,
   evaluateAgentCommandPolicyHookPayload,
   runAgentCommandPolicyHookStdio,
   type AgentCommandPolicyHookRunnerContext,
@@ -37,7 +41,7 @@ describe("AgentCommandPolicyHookRunner", () => {
       phase: "implementation",
       issueId: "issue-1",
       runId: "test-session",
-      surface: "terminal",
+      surface: "terminal_execute",
       workingDirectory: "/repo/worktree",
       rawInput: { command: "git push origin main" },
       environment: { keysOnly: ["GITHUB_TOKEN", "PATH"] },
@@ -66,7 +70,7 @@ describe("AgentCommandPolicyHookRunner", () => {
       role: "reviewer",
       phase: "review",
       runId: "run-from-context",
-      surface: "terminal",
+      surface: "terminal_execute",
       rawInput: { command: "git status --short" },
     });
     expect(evaluation.hookResponse).toBeNull();
@@ -88,7 +92,7 @@ describe("AgentCommandPolicyHookRunner", () => {
     expect(evaluation.policyInput).toMatchObject({
       role: "worker",
       phase: "implementation",
-      surface: "terminal",
+      surface: "terminal_execute",
       rawInput: toolInput,
     });
     expect(evaluation.decision).toMatchObject({
@@ -224,6 +228,150 @@ subprocess.run(["gh", "pr", "create", "--fill"])`;
 
     expect(evaluation.hookResponse).toEqual({ action: "block", message: "blocked through stdio" });
     expect(output.text).toBe(`${JSON.stringify({ action: "block", message: "blocked through stdio" })}\n`);
+  });
+
+  it("writes structured journal entries for hook stdio decisions", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-journal-"));
+    const journalPath = path.join(tempRoot, "policy-decisions.ndjson");
+    try {
+      const evaluation = await runAgentCommandPolicyHookStdio({
+        input: Readable.from([JSON.stringify(hermesPayload({ command: "git push origin main" }))]),
+        output: new CapturingWritable(),
+        role: "worker",
+        phase: "implementation",
+        issueId: "issue-1",
+        runId: "run-1",
+        journalPath,
+        classify: (input) =>
+          decisionFor(input, "deny", {
+            reasonKind: "direct_upstream_github",
+            commandClass: "direct_upstream_git_operation",
+            message: "blocked through stdio",
+          }),
+      });
+
+      const lines = (await readFile(journalPath, "utf8")).trim().split(/\r?\n/g);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0] as string) as unknown).toMatchObject({
+        version: 1,
+        runId: "run-1",
+        issueId: "issue-1",
+        requestKind: "terminal_execute",
+        toolCallId: "tool-call-1",
+        permissionOutcome: "denied",
+        hookAction: "block",
+        decision: {
+          outcome: "deny",
+          reasonKind: "direct_upstream_github",
+          commandClass: "direct_upstream_git_operation",
+          message: "blocked through stdio",
+          audit: {
+            role: "worker",
+            phase: "implementation",
+            surface: "terminal_execute",
+            redacted: true,
+          },
+        },
+      });
+      expect(evaluation.journalEntry).toMatchObject({
+        requestKind: "terminal_execute",
+        toolCallId: "tool-call-1",
+        permissionOutcome: "denied",
+        hookAction: "block",
+      });
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: "allow",
+      input: JSON.stringify(hermesPayload({ command: "git status --short" })),
+      classify: (input: Parameters<typeof decisionFor>[0]) =>
+        decisionFor(input, "allow", {
+          reasonKind: "local_only_inspection",
+          commandClass: "local_git_inspection",
+          message: "allowed through stdio",
+        }),
+    },
+    {
+      name: "deny",
+      input: JSON.stringify(hermesPayload({ command: "git push origin main" })),
+      classify: (input: Parameters<typeof decisionFor>[0]) =>
+        decisionFor(input, "deny", {
+          reasonKind: "direct_upstream_github",
+          commandClass: "direct_upstream_git_operation",
+          message: "blocked through stdio",
+        }),
+    },
+    {
+      name: "fail-closed malformed payload",
+      input: '{"tool_name":"terminal","tool_input":',
+      classify: (input: Parameters<typeof decisionFor>[0]) =>
+        decisionFor(input, "deny", {
+          reasonKind: "malformed_hook_payload",
+          commandClass: "malformed_hermes_hook_payload",
+          message: "blocked malformed payload",
+        }),
+    },
+  ])("writes fallback journal evidence when primary journaling fails for $name stdio decisions", async ({ name, input, classify }) => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-journal-error-"));
+    const output = new CapturingWritable();
+    const errorOutput = new CapturingWritable();
+    try {
+      const evaluation = await runAgentCommandPolicyHookStdio({
+        input: Readable.from([input]),
+        output,
+        errorOutput,
+        role: "worker",
+        phase: "implementation",
+        issueId: "issue-1",
+        runId: "run-1",
+        journalPath: tempRoot,
+        classify,
+      });
+
+      const fallbackPath = buildAgentCommandPolicyHookDecisionJournalFallbackPath(tempRoot);
+      const lines = (await readFile(fallbackPath, "utf8")).trim().split(/\r?\n/g);
+      expect(lines).toHaveLength(1);
+      const entry = JSON.parse(lines[0] as string) as {
+        permissionOutcome: string;
+        hookAction: string;
+        decision: { outcome: string; reasonKind: string; audit: { surface: string } };
+      };
+      expect(errorOutput.text).toContain("wrote fallback journal");
+      expect(entry.hookAction).toBe("block");
+      expect(entry.decision.audit.surface).toBe(name === "fail-closed malformed payload" ? "unknown" : "terminal_execute");
+      expect(output.text).toContain("\"action\":\"block\"");
+
+      if (name === "allow") {
+        expect(evaluation.decision).toMatchObject({
+          outcome: "deny",
+          reasonKind: "command_policy_journal_error",
+          commandClass: "command_policy_journal_append_failure",
+        });
+        expect(entry).toMatchObject({
+          permissionOutcome: "fail_closed",
+          decision: { outcome: "deny", reasonKind: "command_policy_journal_error" },
+        });
+      } else if (name === "deny") {
+        expect(evaluation.decision).toMatchObject({ outcome: "deny", reasonKind: "direct_upstream_github" });
+        expect(entry).toMatchObject({
+          permissionOutcome: "denied",
+          decision: { outcome: "deny", reasonKind: "direct_upstream_github" },
+        });
+      } else {
+        expect(evaluation.decision).toMatchObject({ outcome: "deny", reasonKind: "malformed_hook_payload" });
+        expect(entry).toMatchObject({
+          permissionOutcome: "fail_closed",
+          decision: { outcome: "deny", reasonKind: "malformed_hook_payload" },
+        });
+      }
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+      await rm(buildAgentCommandPolicyHookDecisionJournalFallbackPath(tempRoot), { force: true });
+    }
   });
 
   it("keeps stdout empty for allowed stdio evaluations", async () => {

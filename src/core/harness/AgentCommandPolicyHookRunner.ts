@@ -12,6 +12,7 @@ import {
 } from "./AgentCommandPolicy.js";
 
 export const AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES = 1024 * 1024;
+export const AGENT_COMMAND_POLICY_HOOK_DECISION_JOURNAL_FALLBACK_SUFFIX = ".fallback.ndjson";
 
 const TOOL_INPUT_WORKING_DIRECTORY_KEYS = [
   "workdir",
@@ -35,6 +36,7 @@ export interface AgentCommandPolicyHookRunnerContext {
   phase?: string | undefined;
   issueId?: string | undefined;
   runId?: string | undefined;
+  journalPath?: string | undefined;
   workingDirectory?: string | undefined;
   environment?: Record<string, string | undefined> | undefined;
   classify?: AgentCommandPolicyClassifier | undefined;
@@ -61,11 +63,37 @@ export interface HermesHookBlockResponse {
   message: string;
 }
 
+export interface AgentCommandPolicyHookDecisionJournalEntry {
+  version: 1;
+  recordedAt: string;
+  runId: string | null;
+  issueId: string | null;
+  requestKind: string | null;
+  toolCallId: string | null;
+  permissionOutcome: string | null;
+  hookAction: string | null;
+  decision: AgentCommandPolicyDecision;
+}
+
 export interface AgentCommandPolicyHookEvaluation {
   decision: AgentCommandPolicyDecision;
   policyInput: AgentCommandPolicyInput | null;
   hookResponse: HermesHookBlockResponse | null;
+  journalEntry: AgentCommandPolicyHookDecisionJournalEntry | null;
   stdout: string;
+}
+
+export function buildAgentCommandPolicyHookDecisionJournalFallbackPath(journalPath: string): string {
+  return `${journalPath}${AGENT_COMMAND_POLICY_HOOK_DECISION_JOURNAL_FALLBACK_SUFFIX}`;
+}
+
+interface AgentCommandPolicyHookDecisionMetadata {
+  runId: string | null;
+  issueId: string | null;
+  requestKind: string | null;
+  toolCallId: string | null;
+  permissionOutcome: string | null;
+  hookAction: string | null;
 }
 
 export async function evaluateAgentCommandPolicyHookPayload(
@@ -73,10 +101,12 @@ export async function evaluateAgentCommandPolicyHookPayload(
   context: AgentCommandPolicyHookRunnerContext = {},
 ): Promise<AgentCommandPolicyHookEvaluation> {
   const parsed = parseHookPayload(stdinText, context);
-  if (parsed.status === "error") return evaluationFromDecision(parsed.decision, null);
+  if (parsed.status === "error") return evaluationFromDecision(parsed.decision, null, defaultHookDecisionMetadata(context, parsed.decision));
+
+  const metadata = hookDecisionMetadata(parsed.payload, context);
 
   const policyInput = buildPolicyInput(parsed.payload, context);
-  if (policyInput.status === "error") return evaluationFromDecision(policyInput.decision, null);
+  if (policyInput.status === "error") return evaluationFromDecision(policyInput.decision, null, withHookDecisionOutcome(metadata, policyInput.decision));
 
   const classify = context.classify ?? classifyAgentCommand;
   try {
@@ -84,7 +114,7 @@ export async function evaluateAgentCommandPolicyHookPayload(
       await classify(policyInput.input),
       policyInput.input,
     );
-    return evaluationFromDecision(decision, policyInput.input);
+    return evaluationFromDecision(decision, policyInput.input, withHookDecisionOutcome(metadata, decision));
   } catch {
     const decision = buildFailClosedAgentCommandPolicyDecision({
       role: policyInput.input.role,
@@ -96,7 +126,7 @@ export async function evaluateAgentCommandPolicyHookPayload(
       message:
         "Blocked worker/reviewer command: the Symphony agent command policy classifier failed before this tool call could be verified. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
     });
-    return evaluationFromDecision(decision, policyInput.input);
+    return evaluationFromDecision(decision, policyInput.input, withHookDecisionOutcome(metadata, decision));
   }
 }
 
@@ -105,18 +135,43 @@ export async function runAgentCommandPolicyHookStdio(
 ): Promise<AgentCommandPolicyHookEvaluation> {
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
+  const errorOutput = options.errorOutput ?? process.stderr;
   const stdinPayload = await readBounded(
     input,
     options.maxStdinBytes ?? AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES,
   );
   const evaluation =
     stdinPayload.status === "oversized"
-      ? evaluationFromDecision(buildOversizedHookPayloadDecision(options, stdinPayload.maxBytes), null)
+      ? evaluationFromDecision(
+          buildOversizedHookPayloadDecision(options, stdinPayload.maxBytes),
+          null,
+          defaultHookDecisionMetadata(options, buildOversizedHookPayloadDecision(options, stdinPayload.maxBytes)),
+        )
       : await evaluateAgentCommandPolicyHookPayload(stdinPayload.text, options);
+  let finalEvaluation = evaluation;
   if (evaluation.stdout.length > 0) {
     output.write(evaluation.stdout);
   }
-  return evaluation;
+  if (options.journalPath && evaluation.journalEntry) {
+    try {
+      appendHookDecisionJournalEntry(options.journalPath, evaluation.journalEntry);
+    } catch (error) {
+      const fallbackPath = buildAgentCommandPolicyHookDecisionJournalFallbackPath(options.journalPath);
+      finalEvaluation =
+        evaluation.decision.outcome === "allow"
+          ? journalAppendFailureEvaluation(evaluation, options)
+          : evaluation;
+      if (evaluation.decision.outcome === "allow" && finalEvaluation.stdout.length > 0) {
+        output.write(finalEvaluation.stdout);
+      }
+      if (!finalEvaluation.journalEntry) throw error;
+      appendHookDecisionJournalEntry(fallbackPath, finalEvaluation.journalEntry);
+      errorOutput.write(
+        `Failed to append command policy decision journal at ${options.journalPath}; wrote fallback journal at ${fallbackPath}: ${errorMessage(error)}\n`,
+      );
+    }
+  }
+  return finalEvaluation;
 }
 
 export function mapAgentCommandPolicyDecisionToHermesHookResponse(
@@ -269,7 +324,7 @@ function buildPolicyInput(
   const input: AgentCommandPolicyInput = {
     role,
     phase,
-    surface: toolName,
+    surface: hookPolicySurface(toolName, hookEventName),
     workingDirectory: workingDirectory.workingDirectory,
     rawInput,
     environment: buildHookPolicyEnvironment(hookEnvironment),
@@ -279,6 +334,8 @@ function buildPolicyInput(
   if (runId !== null) input.runId = runId;
   const issueId = nonEmptyString(context.issueId);
   if (issueId !== null) input.issueId = issueId;
+  const toolCallId = hookToolCallId(payload.extra);
+  if (toolCallId !== null) input.attemptId = toolCallId;
 
   return {
     status: "ok",
@@ -462,14 +519,130 @@ function missingContextDecision(input: {
 function evaluationFromDecision(
   decision: AgentCommandPolicyDecision,
   policyInput: AgentCommandPolicyInput | null,
+  metadata: AgentCommandPolicyHookDecisionMetadata,
 ): AgentCommandPolicyHookEvaluation {
   const hookResponse = mapAgentCommandPolicyDecisionToHermesHookResponse(decision);
   return {
     decision,
     policyInput,
     hookResponse,
+    journalEntry: {
+      version: 1,
+      recordedAt: new Date().toISOString(),
+      runId: metadata.runId,
+      issueId: metadata.issueId,
+      requestKind: metadata.requestKind,
+      toolCallId: metadata.toolCallId,
+      permissionOutcome: metadata.permissionOutcome,
+      hookAction: metadata.hookAction,
+      decision,
+    },
     stdout: hookResponse === null ? "" : `${JSON.stringify(hookResponse)}\n`,
   };
+}
+
+function appendHookDecisionJournalEntry(journalPath: string, entry: AgentCommandPolicyHookDecisionJournalEntry): void {
+  try {
+    fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+    fs.appendFileSync(journalPath, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to append command policy decision journal at ${journalPath}: ${message}`);
+  }
+}
+
+function journalAppendFailureEvaluation(
+  evaluation: AgentCommandPolicyHookEvaluation,
+  context: AgentCommandPolicyHookRunnerContext,
+): AgentCommandPolicyHookEvaluation {
+  const entry = evaluation.journalEntry;
+  if (!entry) return evaluation;
+  const decision = buildFailClosedAgentCommandPolicyDecision({
+    role: entry.decision.audit.role,
+    phase: entry.decision.audit.phase,
+    surface: entry.decision.audit.surface,
+    workingDirectory: context.workingDirectory,
+    reasonKind: "command_policy_journal_error",
+    commandClass: "command_policy_journal_append_failure",
+    message:
+      "Blocked worker/reviewer command: Symphony could not durably record the command-policy decision before allowing this hook action. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
+  });
+  return evaluationFromDecision(decision, evaluation.policyInput, {
+    runId: entry.runId,
+    issueId: entry.issueId,
+    requestKind: entry.requestKind,
+    toolCallId: entry.toolCallId,
+    permissionOutcome: "fail_closed",
+    hookAction: "block",
+  });
+}
+
+function hookDecisionMetadata(
+  payload: HermesPreToolCallHookPayload,
+  context: AgentCommandPolicyHookRunnerContext,
+): AgentCommandPolicyHookDecisionMetadata {
+  return {
+    runId: nonEmptyString(context.runId) ?? stringValue(payload.session_id),
+    issueId: nonEmptyString(context.issueId),
+    requestKind: hookRequestKind(stringValue(payload.tool_name), stringValue(payload.hook_event_name)),
+    toolCallId: hookToolCallId(payload.extra),
+    permissionOutcome: null,
+    hookAction: null,
+  };
+}
+
+function defaultHookDecisionMetadata(
+  context: AgentCommandPolicyHookRunnerContext,
+  decision: AgentCommandPolicyDecision,
+): AgentCommandPolicyHookDecisionMetadata {
+  return withHookDecisionOutcome(
+    {
+      runId: nonEmptyString(context.runId),
+      issueId: nonEmptyString(context.issueId),
+      requestKind: null,
+      toolCallId: null,
+      permissionOutcome: null,
+      hookAction: null,
+    },
+    decision,
+  );
+}
+
+function withHookDecisionOutcome(
+  metadata: AgentCommandPolicyHookDecisionMetadata,
+  decision: AgentCommandPolicyDecision,
+): AgentCommandPolicyHookDecisionMetadata {
+  return {
+    ...metadata,
+    permissionOutcome: hookPermissionOutcome(decision),
+    hookAction: decision.outcome === "deny" ? "block" : null,
+  };
+}
+
+function hookPermissionOutcome(decision: AgentCommandPolicyDecision): string {
+  if (decision.outcome === "allow") return "allowed";
+  return decision.reasonKind === "malformed_hook_payload" ||
+    decision.reasonKind === "oversized_hook_payload" ||
+    decision.reasonKind === "missing_hook_context" ||
+    decision.reasonKind === "command_policy_journal_error" ||
+    decision.reasonKind === "classifier_error"
+    ? "fail_closed"
+    : "denied";
+}
+
+function hookRequestKind(toolName: string | null, hookEventName: string | null): string | null {
+  if (toolName === "terminal") return "terminal_execute";
+  if (toolName === "execute_code") return "execute_code";
+  return hookEventName;
+}
+
+function hookPolicySurface(toolName: string, hookEventName: string | null): string {
+  return hookRequestKind(toolName, hookEventName) ?? toolName;
+}
+
+function hookToolCallId(extra: unknown): string | null {
+  if (!isRecord(extra)) return null;
+  return stringValue(extra.tool_call_id) ?? stringValue(extra.toolCallId);
 }
 
 type BoundedStdinReadResult =
@@ -511,4 +684,8 @@ function nonEmptyString(value: string | undefined): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

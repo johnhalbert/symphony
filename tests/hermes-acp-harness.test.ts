@@ -35,6 +35,8 @@ import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue } from "../src/core/types.js";
 import { mapAgentEventToRunActivityEvent } from "../src/core/transcript/RunActivityEventMapper.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
+import { createAgentCommandPolicyAcpResolver } from "../src/core/harness/AgentCommandPolicyAcpResolver.js";
+import { allowPolicyDecision } from "./agent-command-policy-fixtures.js";
 
 interface RecordedRequest {
   method: string;
@@ -538,6 +540,83 @@ describe("HermesAcpHarness", () => {
     expect(text).not.toContain(secret);
     expect(client.requests.some((request) => request.method === "session/new")).toBe(false);
     expect(leases[0]?.disposeStatuses).toEqual(["failed"]);
+  });
+
+  it("normalizes ACP permissionOutcome to allowed/denied/fail_closed semantics, including mapper failures", async () => {
+    const scenarios = [
+      {
+        name: "allow",
+        requestId: "permission-outcome-allow",
+        permissionResolver: vi.fn(() => ({ optionId: "allow_once" })),
+        expectedResponse: { outcome: { outcome: "selected", optionId: "allow_once" } },
+        expected: {
+          outcome: "allow" as const,
+          reasonKind: "permission_option_selected",
+          permissionOutcome: "allowed",
+          selectedOptionId: "allow_once",
+        },
+      },
+      {
+        name: "explicit deny",
+        requestId: "permission-outcome-deny",
+        permissionResolver: vi.fn(() => ({ optionId: "deny" })),
+        expectedResponse: { outcome: { outcome: "selected", optionId: "deny" } },
+        expected: {
+          outcome: "deny" as const,
+          reasonKind: "permission_option_selected",
+          permissionOutcome: "denied",
+          selectedOptionId: undefined,
+        },
+      },
+      {
+        name: "mapper fail closed",
+        requestId: "permission-outcome-mapper-fail-closed",
+        permissionResolver: createAgentCommandPolicyAcpResolver({
+          allowOptionId: "deny" as never,
+          classify: () => allowPolicyDecision({ reasonKind: "local_only_inspection", commandClass: "local_git_inspection" }),
+          environment: { PATH: "/usr/bin" },
+        }),
+        expectedResponse: { outcome: { outcome: "cancelled" } },
+        expected: {
+          outcome: "deny" as const,
+          reasonKind: "unsupported_agent_command_policy_acp_allow_option",
+          permissionOutcome: "fail_closed",
+          selectedOptionId: undefined,
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const client = new FakeAcpClient();
+      client.promptDeferred = deferred<Record<string, unknown> | null>();
+      client.promptStarted = deferred<void>();
+      client.promptNotificationParams = null;
+      const { ctx, harness } = await fixture({ client, permissionResolver: scenario.permissionResolver });
+      const { runPromise } = await startPendingRun({ client, ctx, harness });
+
+      const responses = await client.invokeClientRequest("session/request_permission", terminalPermissionRequest(), scenario.requestId);
+      client.promptDeferred.resolve({ stopReason: "end_turn" });
+      const events = await runPromise;
+      const transcriptEvents = transcriptEventsFromAgentEvents(events);
+
+      expect(responses).toEqual([scenario.expectedResponse]);
+      expectAcpPolicyDecisionEvent(events, {
+        outcome: scenario.expected.outcome,
+        reasonKind: scenario.expected.reasonKind,
+        requestKind: "terminal_execute",
+        permissionOutcome: scenario.expected.permissionOutcome,
+        selectedOptionId: scenario.expected.selectedOptionId,
+      });
+      expectAcpPolicyDecisionTranscriptEvent(transcriptEvents, {
+        outcome: scenario.expected.outcome,
+        reasonKind: scenario.expected.reasonKind,
+        requestKind: "terminal_execute",
+        permissionOutcome: scenario.expected.permissionOutcome,
+        selectedOptionId: scenario.expected.selectedOptionId,
+      });
+
+      await harness.dispose();
+    }
   });
 
   it.each([
@@ -1663,7 +1742,8 @@ describe("HermesAcpHarness", () => {
       assistant_message_delta: 2,
       runtime_status_update: 3,
       available_commands_update: 1,
-      runtime_diagnostic: 4,
+      runtime_diagnostic: 3,
+      command_policy_decision: 1,
       token_usage_reported: 1,
       run_succeeded: 1,
     });
@@ -1711,9 +1791,9 @@ describe("HermesAcpHarness", () => {
         expect.objectContaining({ code: "hermes_acp_lease_reuse_decision" }),
         expect.objectContaining({ code: "hermes_acp_unknown_session_update" }),
         expect.objectContaining({ code: "host_hermes_notice", severity: "info" }),
-        expect.objectContaining({ code: "hermes_acp_permission_denied", severity: "warning" }),
       ]),
     );
+    expectAcpPolicyDecisionTranscriptEvent(transcript.events, { reasonKind: "missing_permission_tool_call_kind" });
 
     const projected = projectWebTranscript(transcript.events, { includeRunPrelude: false });
     expect(projected.flatMap((message) => message.kind === "assistant" ? [message.text] : [])).toEqual(["hello world"]);
@@ -1764,43 +1844,15 @@ describe("HermesAcpHarness", () => {
     const transcriptEvents = transcriptEventsFromAgentEvents(events);
 
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          message: "Host Hermes ACP permission request denied: permission_bridge_not_configured",
-          payload: expect.objectContaining({
-            acpJsonRpcRequestId: requestId,
-            requestedOptionIds,
-            requestKind: "terminal_execute",
-            toolCallId: "perm-tool-1",
-            outcome: "cancelled",
-            selectedOptionId: null,
-            reason: "permission_bridge_not_configured",
-          }),
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionEvent(events, { reasonKind: "permission_bridge_not_configured" });
     expect(transcriptEvents.map((event) => event.eventType)).toEqual(
-      expect.arrayContaining(["runtime_ready", "runtime_diagnostic", "runtime_diagnostic"]),
+      expect.arrayContaining(["runtime_ready", "runtime_diagnostic", "command_policy_decision"]),
     );
     expect(transcriptEvents.map((event) => event.eventType)).not.toEqual(expect.arrayContaining(["acp_permission_denied", "acp_diagnostic"]));
     expect(transcriptEvents.map((event) => event.payload)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ kind: "runtime_diagnostic", code: "host_hermes_notice", severity: "info" }),
-        expect.objectContaining({
-          kind: "runtime_diagnostic",
-          code: "hermes_acp_permission_denied",
-          severity: "warning",
-          acpJsonRpcRequestId: requestId,
-          requestedOptionIds,
-          requestKind: "terminal_execute",
-          toolCallId: "perm-tool-1",
-          outcome: "cancelled",
-          selectedOptionId: null,
-          reason: "permission_bridge_not_configured",
-        }),
+        expect.objectContaining({ kind: "command_policy_decision", outcome: "deny", reasonKind: "permission_bridge_not_configured" }),
       ]),
     );
     const projectedStates = projectWebTranscript(transcriptEvents).flatMap((message) => message.kind === "status" ? [message.state] : []);
@@ -1836,33 +1888,9 @@ describe("HermesAcpHarness", () => {
 
     expect(permissionResolver).toHaveBeenCalledTimes(1);
     expect(responses).toEqual([{ outcome: { outcome: "selected", optionId: "allow_once" } }]);
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "progress",
-          activitySource: "tool",
-          message: "Host Hermes ACP permission allow_once for terminal_execute",
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionEvent(events, { outcome: "allow", reasonKind: "permission_option_selected", selectedOptionId: "allow_once" });
     expect(events).not.toEqual(expect.arrayContaining([expect.objectContaining({ code: "hermes_acp_permission_denied" })]));
-    expect(transcriptEvents).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          eventType: "runtime_status_update",
-          message: "Host Hermes ACP permission allow_once for terminal_execute",
-          payload: expect.objectContaining({
-            kind: "runtime_status_update",
-            status: "permission_selected",
-            acpJsonRpcRequestId: requestId,
-            requestedOptionIds,
-            outcome: "selected",
-            selectedOptionId: "allow_once",
-            requestKind: "terminal_execute",
-          }),
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionTranscriptEvent(transcriptEvents, { outcome: "allow", reasonKind: "permission_option_selected", selectedOptionId: "allow_once" });
     expect(transcriptEvents.map((event) => event.eventType)).not.toEqual(
       expect.arrayContaining(["acp_permission_selected", "acp_permission_denied"]),
     );
@@ -1899,31 +1927,9 @@ describe("HermesAcpHarness", () => {
 
       expect(permissionResolver).toHaveBeenCalledTimes(1);
       expect(responses).toEqual([{ outcome: { outcome: "selected", optionId } }]);
-      expect(events).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            type: "progress",
-            activitySource: "tool",
-            message: `Host Hermes ACP permission ${optionId} for ${requestKind}`,
-          }),
-        ]),
-      );
-      expect(transcriptEvents).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            eventType: "runtime_status_update",
-            message: `Host Hermes ACP permission ${optionId} for ${requestKind}`,
-            payload: expect.objectContaining({
-              kind: "runtime_status_update",
-              status: "permission_selected",
-              acpJsonRpcRequestId: requestId,
-              requestedOptionIds,
-              selectedOptionId: optionId,
-              requestKind,
-            }),
-          }),
-        ]),
-      );
+      const policyOutcome = optionId.startsWith("allow") ? "allow" : "deny";
+      expectAcpPolicyDecisionEvent(events, { outcome: policyOutcome, reasonKind: "permission_option_selected", requestKind, selectedOptionId: policyOutcome === "allow" ? optionId : undefined });
+      expectAcpPolicyDecisionTranscriptEvent(transcriptEvents, { outcome: policyOutcome, reasonKind: "permission_option_selected", requestKind, selectedOptionId: policyOutcome === "allow" ? optionId : undefined });
       expect(transcriptEvents.map((event) => event.eventType)).not.toEqual(
         expect.arrayContaining(["acp_permission_selected", "acp_permission_denied"]),
       );
@@ -1948,15 +1954,7 @@ describe("HermesAcpHarness", () => {
 
     expect(permissionResolver).not.toHaveBeenCalled();
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          message: "Host Hermes ACP permission request denied: missing_permission_options",
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionEvent(events, { reasonKind: "missing_permission_options" });
   });
 
   it.each([
@@ -2049,15 +2047,7 @@ describe("HermesAcpHarness", () => {
 
     expect(permissionResolver).not.toHaveBeenCalled();
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          message: `Host Hermes ACP permission request denied: ${reason}`,
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionEvent(events, { reasonKind: reason });
   });
 
   it("rejects unknown permission option shapes before consulting the bridge", async () => {
@@ -2081,40 +2071,8 @@ describe("HermesAcpHarness", () => {
 
     expect(permissionResolver).not.toHaveBeenCalled();
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          message: "Host Hermes ACP permission request denied: unsupported_permission_options",
-          payload: expect.objectContaining({
-            acpJsonRpcRequestId: requestId,
-            requestedOptionIds,
-            requestKind: "terminal_execute",
-            toolCallId: "perm-tool-1",
-            outcome: "cancelled",
-            selectedOptionId: null,
-            reason: "unsupported_permission_options",
-          }),
-        }),
-      ]),
-    );
-    expect(transcriptEvents.map((event) => event.payload)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: "runtime_diagnostic",
-          code: "hermes_acp_permission_denied",
-          severity: "warning",
-          acpJsonRpcRequestId: requestId,
-          requestedOptionIds,
-          requestKind: "terminal_execute",
-          toolCallId: "perm-tool-1",
-          outcome: "cancelled",
-          selectedOptionId: null,
-          reason: "unsupported_permission_options",
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionEvent(events, { reasonKind: "unsupported_permission_options" });
+    expectAcpPolicyDecisionTranscriptEvent(transcriptEvents, { reasonKind: "unsupported_permission_options" });
   });
 
   it.each([
@@ -2153,40 +2111,8 @@ describe("HermesAcpHarness", () => {
 
     expect(permissionResolver).not.toHaveBeenCalled();
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          message: `Host Hermes ACP permission request denied: ${reason}`,
-          payload: expect.objectContaining({
-            acpJsonRpcRequestId: requestId,
-            requestedOptionIds,
-            requestKind: "terminal_execute",
-            toolCallId: "perm-tool-1",
-            outcome: "cancelled",
-            selectedOptionId: null,
-            reason,
-          }),
-        }),
-      ]),
-    );
-    expect(transcriptEvents.map((event) => event.payload)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: "runtime_diagnostic",
-          code: "hermes_acp_permission_denied",
-          severity: "warning",
-          acpJsonRpcRequestId: requestId,
-          requestedOptionIds,
-          requestKind: "terminal_execute",
-          toolCallId: "perm-tool-1",
-          outcome: "cancelled",
-          selectedOptionId: null,
-          reason,
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionEvent(events, { reasonKind: reason });
+    expectAcpPolicyDecisionTranscriptEvent(transcriptEvents, { reasonKind: reason });
   });
 
   it.each([
@@ -2235,36 +2161,8 @@ describe("HermesAcpHarness", () => {
 
     expect(permissionResolver).toHaveBeenCalledTimes(1);
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          message: `Host Hermes ACP permission request denied: ${reason}`,
-          payload: expect.objectContaining({
-            acpJsonRpcRequestId: requestId,
-            requestedOptionIds,
-            outcome: "cancelled",
-            selectedOptionId: null,
-            reason,
-          }),
-        }),
-      ]),
-    );
-    expect(transcriptEvents.map((event) => event.payload)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: "runtime_diagnostic",
-          code: "hermes_acp_permission_denied",
-          severity: "warning",
-          acpJsonRpcRequestId: requestId,
-          requestedOptionIds,
-          outcome: "cancelled",
-          selectedOptionId: null,
-          reason,
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionEvent(events, { reasonKind: reason, requestKind: reason === "permission_option_not_offered" ? "file_edit" : "terminal_execute" });
+    expectAcpPolicyDecisionTranscriptEvent(transcriptEvents, { reasonKind: reason, requestKind: reason === "permission_option_not_offered" ? "file_edit" : "terminal_execute" });
   });
 
   it("ignores approvals that arrive after the permission request timeout", async () => {
@@ -2293,17 +2191,9 @@ describe("HermesAcpHarness", () => {
           activitySource: "tool",
           message: "Host Hermes ACP permission requested for terminal_execute",
         }),
-        expect.objectContaining({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          payload: expect.objectContaining({
-            acpJsonRpcRequestId: requestId,
-            reason: "permission_request_timeout",
-            selectedOptionId: null,
-          }),
-        }),
       ]),
     );
+    expectAcpPolicyDecisionEvent(events, { reasonKind: "permission_request_timeout" });
     expect(transcriptEvents).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -2313,16 +2203,9 @@ describe("HermesAcpHarness", () => {
             acpJsonRpcRequestId: requestId,
           }),
         }),
-        expect.objectContaining({
-          eventType: "runtime_diagnostic",
-          payload: expect.objectContaining({
-            code: "hermes_acp_permission_denied",
-            reason: "permission_request_timeout",
-            acpJsonRpcRequestId: requestId,
-          }),
-        }),
       ]),
     );
+    expectAcpPolicyDecisionTranscriptEvent(transcriptEvents, { reasonKind: "permission_request_timeout" });
     expect(transcriptEvents).not.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -2359,15 +2242,7 @@ describe("HermesAcpHarness", () => {
     expect(client.cancelledParams).toEqual([{ sessionId: "acp-session-1" }]);
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
     expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "cancelled" })]));
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          payload: expect.objectContaining({ reason: "run_cancelled", selectedOptionId: null }),
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionEvent(events, { reasonKind: "run_cancelled" });
     expect(transcriptEvents).not.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -2408,30 +2283,11 @@ describe("HermesAcpHarness", () => {
     expect(responses).toEqual([{ outcome: { outcome: "cancelled" } }]);
     expect(events).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
-          type: "run_diagnostic",
-          code: "hermes_acp_permission_denied",
-          payload: expect.objectContaining({
-            acpJsonRpcRequestId: requestId,
-            reason: "acp_process_exited",
-            selectedOptionId: null,
-          }),
-        }),
         expect.objectContaining({ type: "failed", error: expect.stringContaining("Host Hermes ACP process exited") }),
       ]),
     );
-    expect(transcriptEvents).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          eventType: "runtime_diagnostic",
-          payload: expect.objectContaining({
-            code: "hermes_acp_permission_denied",
-            reason: "acp_process_exited",
-            acpJsonRpcRequestId: requestId,
-          }),
-        }),
-      ]),
-    );
+    expectAcpPolicyDecisionEvent(events, { reasonKind: "acp_process_exited" });
+    expectAcpPolicyDecisionTranscriptEvent(transcriptEvents, { reasonKind: "acp_process_exited" });
     expect(transcriptEvents).not.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -2681,6 +2537,66 @@ function transcriptEventsFromAgentEvents(events: AgentEvent[]): TranscriptEvent[
     source: "harness",
     ...mapAgentEventToRunActivityEvent(event),
   }));
+}
+
+function expectAcpPolicyDecisionEvent(
+  events: AgentEvent[],
+  input: {
+    outcome?: "allow" | "deny";
+    reasonKind: string;
+    requestKind?: string;
+    toolCallId?: string;
+    permissionOutcome?: string;
+    selectedOptionId?: string | undefined;
+  },
+): void {
+  const outcome = input.outcome ?? "deny";
+  expect(events).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        type: "run_diagnostic",
+        code: "command_policy_decision",
+        payload: expect.objectContaining({
+          outcome,
+          reasonKind: input.reasonKind,
+          ...(input.requestKind === undefined ? {} : { requestKind: input.requestKind }),
+          ...(input.toolCallId === undefined ? {} : { toolCallId: input.toolCallId }),
+          ...(input.permissionOutcome === undefined ? {} : { permissionOutcome: input.permissionOutcome }),
+          ...(outcome === "allow" && input.selectedOptionId ? { selectedOptionId: input.selectedOptionId } : {}),
+        }),
+      }),
+    ]),
+  );
+}
+
+function expectAcpPolicyDecisionTranscriptEvent(
+  events: TranscriptEvent[],
+  input: {
+    outcome?: "allow" | "deny";
+    reasonKind: string;
+    requestKind?: string;
+    toolCallId?: string;
+    permissionOutcome?: string;
+    selectedOptionId?: string | undefined;
+  },
+): void {
+  const outcome = input.outcome ?? "deny";
+  expect(events).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        eventType: "command_policy_decision",
+        payload: expect.objectContaining({
+          kind: "command_policy_decision",
+          outcome,
+          reasonKind: input.reasonKind,
+          ...(input.requestKind === undefined ? {} : { requestKind: input.requestKind }),
+          ...(input.toolCallId === undefined ? {} : { toolCallId: input.toolCallId }),
+          ...(input.permissionOutcome === undefined ? {} : { permissionOutcome: input.permissionOutcome }),
+          ...(outcome === "allow" && input.selectedOptionId ? { selectedOptionId: input.selectedOptionId } : {}),
+        }),
+      }),
+    ]),
+  );
 }
 
 function leaseDecisionPayloads(events: AgentEvent[]): unknown[] {

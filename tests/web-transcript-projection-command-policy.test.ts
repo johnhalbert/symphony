@@ -49,7 +49,7 @@ describe("command-policy public transcript projection", () => {
       phase: "publication",
       requestKind: "service_boundary",
       hookAction: "allow",
-      permissionOutcome: "allow_once",
+      permissionOutcome: "allowed",
       upstreamContactAttempted: true,
       expectedText: "Command policy allow: service_owned_github_operation (worker · publication · symphony_service_publication)",
     },

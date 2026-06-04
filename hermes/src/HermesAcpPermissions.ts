@@ -1,3 +1,5 @@
+import type { AgentCommandPolicyDecision } from "../../src/core/harness/AgentCommandPolicy.js";
+
 export type HermesAcpPermissionOptionId = "allow_once" | "allow_session" | "allow_always" | "deny" | "deny_always";
 
 export type HermesAcpPermissionRequestKind = "terminal_execute" | "file_edit" | "unknown";
@@ -23,7 +25,12 @@ export interface HermesAcpPermissionRequest {
 export type HermesAcpPermissionDecision =
   | HermesAcpPermissionOptionId
   | string
-  | { optionId?: string | null; option_id?: string | null; reason?: string | null }
+  | {
+      optionId?: string | null;
+      option_id?: string | null;
+      reason?: string | null;
+      policyDecision?: AgentCommandPolicyDecision | null;
+    }
   | null
   | undefined;
 
@@ -35,6 +42,9 @@ export interface HermesAcpPermissionResolution {
   outcome: HermesAcpPermissionOutcome;
   selectedOptionId: string | null;
   reason: string;
+  policyDecision?: AgentCommandPolicyDecision | null;
+  runId?: string | null;
+  issueId?: string | null;
 }
 
 const TERMINAL_PERMISSION_OPTION_IDS = new Set<string>(["allow_once", "allow_session", "allow_always", "deny", "deny_always"]);
@@ -80,28 +90,33 @@ export function resolveHermesAcpPermissionDecision(
   request: HermesAcpPermissionRequest,
   decision: HermesAcpPermissionDecision,
 ): HermesAcpPermissionResolution {
-  if (request.malformedReason) return denyHermesAcpPermission(request, request.malformedReason);
+  if (request.malformedReason) return denyHermesAcpPermission(request, request.malformedReason, decision);
 
   const selectedOptionId = permissionDecisionOptionId(decision);
   const decisionReason = permissionDecisionReason(decision);
-  if (!selectedOptionId) return denyHermesAcpPermission(request, decisionReason ?? "no_permission_policy");
+  if (!selectedOptionId) return denyHermesAcpPermission(request, decisionReason ?? "no_permission_policy", decision);
   if (!request.options.some((option) => option.optionId === selectedOptionId)) {
-    return denyHermesAcpPermission(request, "permission_option_not_offered");
+    return denyHermesAcpPermission(request, "permission_option_not_offered", decision);
   }
   if (!isSupportedOptionForRequestKind(request.requestKind, selectedOptionId)) {
-    return denyHermesAcpPermission(request, "permission_option_not_supported");
+    return denyHermesAcpPermission(request, "permission_option_not_supported", decision);
   }
 
-  return selectHermesAcpPermissionOption(request, selectedOptionId, decisionReason ?? "permission_option_selected");
+  return selectHermesAcpPermissionOption(request, selectedOptionId, decisionReason ?? "permission_option_selected", decision);
 }
 
-export function denyHermesAcpPermission(request: HermesAcpPermissionRequest, reason: string): HermesAcpPermissionResolution {
+export function denyHermesAcpPermission(
+  request: HermesAcpPermissionRequest,
+  reason: string,
+  decision?: HermesAcpPermissionDecision,
+): HermesAcpPermissionResolution {
   return {
     request,
     response: { outcome: { outcome: "cancelled" } },
     outcome: "cancelled",
     selectedOptionId: null,
     reason,
+    policyDecision: permissionDecisionPolicyDecision(decision),
   };
 }
 
@@ -109,6 +124,7 @@ export function selectHermesAcpPermissionOption(
   request: HermesAcpPermissionRequest,
   optionId: string,
   reason: string,
+  decision?: HermesAcpPermissionDecision,
 ): HermesAcpPermissionResolution {
   return {
     request,
@@ -116,6 +132,7 @@ export function selectHermesAcpPermissionOption(
     outcome: "selected",
     selectedOptionId: optionId,
     reason,
+    policyDecision: permissionDecisionPolicyDecision(decision),
   };
 }
 
@@ -128,6 +145,12 @@ export function permissionDecisionOptionId(decision: HermesAcpPermissionDecision
 export function permissionDecisionReason(decision: HermesAcpPermissionDecision): string | null {
   if (!isRecord(decision)) return null;
   return nonEmptyString(decision.reason);
+}
+
+export function permissionDecisionPolicyDecision(decision: HermesAcpPermissionDecision): AgentCommandPolicyDecision | null {
+  if (!isRecord(decision)) return null;
+  const policyDecision = decision.policyDecision;
+  return isAgentCommandPolicyDecision(policyDecision) ? policyDecision : null;
 }
 
 function permissionOptionFromUnknown(value: unknown): HermesAcpPermissionOption | null {
@@ -262,4 +285,15 @@ function nonEmptyString(value: unknown): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAgentCommandPolicyDecision(value: unknown): value is AgentCommandPolicyDecision {
+  return (
+    isRecord(value) &&
+    (value.outcome === "allow" || value.outcome === "deny") &&
+    typeof value.reasonKind === "string" &&
+    typeof value.commandClass === "string" &&
+    typeof value.message === "string" &&
+    isRecord(value.audit)
+  );
 }
