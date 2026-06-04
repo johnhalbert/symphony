@@ -154,6 +154,18 @@ function realtimePayloadForTestEvent(
       lastMessageId: null,
       lastMessageStatus: null,
       lastMessageAt: null,
+      state: null,
+      conversationStatus: null,
+      active: null,
+      terminal: null,
+      empty: null,
+      latestMessageSequence: null,
+      latestMessageUpdatedAt: null,
+      conversation: null,
+      statusSummary: null,
+      statusCounts: null,
+      sourceSummary: null,
+      chat: null,
     };
   }
   if (type === "source.status") {

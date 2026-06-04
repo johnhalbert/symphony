@@ -2,6 +2,7 @@ import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { ProjectionChangeEvent } from "../src/core/persistence/ProjectionRevision.js";
 import {
   DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
   FileOrchestratorConversationStore,
@@ -150,6 +151,20 @@ describe("FileOrchestratorConversationStore", () => {
       { role: "system", status: "disabled", body: "chat disabled" },
       { role: "server", status: "unavailable", body: "service unavailable" },
     ]);
+  });
+
+  it("caps realtime projection chat text to the public 10,000-character preview", async () => {
+    const store = new FileOrchestratorConversationStore(root);
+    const events: ProjectionChangeEvent[] = [];
+    store.onProjectionChanged((event) => events.push(event));
+
+    const longBody = `operator ${"x".repeat(10_200)}`;
+    await store.appendMessage({ role: "assistant", body: longBody, status: "streaming" });
+
+    const latestEvent = events.at(-1);
+    const text = (latestEvent?.detail as { chat?: Array<{ text?: string }> } | undefined)?.chat?.[0]?.text;
+    expect(text).toBe(`${longBody.slice(0, 9_985)}...[truncated]`);
+    expect(text).toContain("...[truncated]");
   });
 
   it("keeps independent durable histories per conversation id, including ids that would collide in lossy filenames", async () => {

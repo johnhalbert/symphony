@@ -548,7 +548,7 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
-  it("emits typed realtime events and freshness payloads from durable transcript and orchestrator projection publications", async () => {
+  it("emits typed realtime events and freshness payloads from durable transcript publications and suppresses patchless durable orchestrator chat events", async () => {
     const projectionWriter = fakeProjectionWriter();
     const server = createRealtimeServer({ projectionWriter });
     const address = await server.start();
@@ -679,7 +679,11 @@ describe("StatusServer realtime SSE API", () => {
           ],
           sourceCursors: {
             conversationKey: "operator-room",
+            conversationStatus: "completed",
+            state: "completed",
             messageCount: 3,
+            latestMessageSequence: 3,
+            latestMessageUpdatedAt: "2026-01-01T00:00:03.500Z",
             lastMessageId: "message-3",
             lastMessageStatus: "completed",
             lastMessageAt: "2026-01-01T00:00:03.500Z",
@@ -701,7 +705,6 @@ describe("StatusServer realtime SSE API", () => {
 
       const chatProjection = await client.nextEventOfType("projection.updated");
       const chatSource = await client.nextEventOfType("source.status");
-      const chat = await client.nextEventOfType("orchestrator.message");
 
       expect(chatProjection.data).toMatchObject({
         type: "projection.updated",
@@ -725,19 +728,7 @@ describe("StatusServer realtime SSE API", () => {
           ]),
         },
       });
-      expect(chat.data).toMatchObject({
-        type: "orchestrator.message",
-        scope: "orchestrator",
-        key: "operator-room",
-        source: { source: "orchestrator_chat_projection:conversation:operator-room", revision: 12 },
-        payload: {
-          conversationId: "operator-room",
-          messageCount: 3,
-          lastMessageId: "message-3",
-          lastMessageStatus: "completed",
-          lastMessageAt: "2026-01-01T00:00:03.500Z",
-        },
-      });
+      await expect(client.nextEventOfType("orchestrator.message", 150)).rejects.toThrow(/Timed out waiting for SSE event/);
     } finally {
       await client.close();
       await waitFor(() => server.activeRealtimeSubscriberCount() === 0, "SSE subscriber to disconnect");
@@ -1054,11 +1045,37 @@ describe("StatusServer realtime SSE API", () => {
           type: "projection.updated",
           missedEvents: true,
           recovery: { strategy: "refetch", reason: "missed-events", lastEventId: "200" },
+          payload: {
+            resourcesChanged: [
+              "dashboard",
+              "issue-board",
+              "issue-detail",
+              "history",
+              "sidebar",
+              "session-transcript",
+              "orchestrator-chat",
+              "source",
+            ],
+          },
         });
         expect((recovery.data as RealtimeProjectionEvent).recovery.endpoints).toEqual(
-          expect.arrayContaining(["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/history"]),
+          expect.arrayContaining([
+            "/api/v1/web/reference-data?refresh=1",
+            "/api/v1/web/dashboard",
+            "/api/v1/web/issues",
+            "/api/v1/web/sidebar",
+            "/api/v1/web/history",
+            "/api/v1/web/orchestrator-chat",
+          ]),
         );
-        for (const endpoint of ["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/history"]) {
+        for (const endpoint of [
+          "/api/v1/web/reference-data?refresh=1",
+          "/api/v1/web/dashboard",
+          "/api/v1/web/issues",
+          "/api/v1/web/sidebar",
+          "/api/v1/web/history",
+          "/api/v1/web/orchestrator-chat",
+        ]) {
           const refetch = await fetch(`${baseUrl}${endpoint}`);
           expect(refetch.status, `missed-event recovery refetch ${endpoint} should use normal GET semantics`).toBe(200);
           expect(refetch.headers.get("content-type")).toContain("application/json");
@@ -1206,6 +1223,29 @@ describe("StatusServer realtime SSE API", () => {
       expect(assistantAppend.data).toMatchObject({
         type: "orchestrator.message",
         source: { source: "orchestrator_conversations", revision: 1 },
+        scope: "orchestrator",
+        key: "operator-room",
+        payload: {
+          conversationId: "operator-room",
+          conversationStatus: "streaming",
+          state: "streaming",
+          active: true,
+          messageCount: 1,
+          latestMessageSequence: 1,
+          latestMessageUpdatedAt: "2026-01-01T00:00:00.000Z",
+          lastMessageId: assistant.id,
+          lastMessageStatus: "streaming",
+          chat: [
+            expect.objectContaining({
+              id: assistant.id,
+              conversationId: "operator-room",
+              role: "assistant",
+              text: "I can help inspect the queue.",
+              status: "streaming",
+            }),
+          ],
+          statusSummary: expect.objectContaining({ state: "streaming", active: true, messageCount: 1 }),
+        },
         recovery: { strategy: "refetch", reason: "event" },
       });
       expect((assistantAppend.data as RealtimeProjectionEvent).payload).toMatchObject({
@@ -1235,6 +1275,26 @@ describe("StatusServer realtime SSE API", () => {
       expect(assistantUpdate.data).toMatchObject({
         type: "orchestrator.message",
         source: { source: "orchestrator_conversations", revision: 2 },
+        key: "operator-room",
+        payload: {
+          conversationId: "operator-room",
+          conversationStatus: "completed",
+          state: "completed",
+          active: false,
+          terminal: true,
+          messageCount: 1,
+          latestMessageSequence: 1,
+          latestMessageUpdatedAt: "2026-01-01T00:00:01.000Z",
+          lastMessageId: assistant.id,
+          lastMessageStatus: "completed",
+          chat: [
+            expect.objectContaining({
+              id: assistant.id,
+              text: "I found the queue summary.",
+              status: "completed",
+            }),
+          ],
+        },
         recovery: { strategy: "refetch", reason: "event" },
       });
       expect((assistantUpdate.data as RealtimeProjectionEvent).payload).toMatchObject({
@@ -1261,6 +1321,19 @@ describe("StatusServer realtime SSE API", () => {
       expect(systemAppend.data).toMatchObject({
         type: "orchestrator.message",
         source: { source: "orchestrator_conversations", revision: 3 },
+        key: "operator-room",
+        payload: {
+          conversationId: "operator-room",
+          conversationStatus: "completed",
+          state: "completed",
+          messageCount: 2,
+          latestMessageSequence: 2,
+          latestMessageUpdatedAt: "2026-01-01T00:00:02.000Z",
+          chat: [
+            expect.objectContaining({ id: assistant.id, text: "I found the queue summary." }),
+            expect.objectContaining({ role: "system", text: "System note: summary persisted.", status: "completed" }),
+          ],
+        },
         recovery: { strategy: "refetch", reason: "event" },
       });
       expect((systemAppend.data as RealtimeProjectionEvent).resources).toEqual(
@@ -1274,7 +1347,7 @@ describe("StatusServer realtime SSE API", () => {
 
   it("emits missed-event recovery hints, replays post-recovery publications, and orchestrator chat message events", async () => {
     const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state"));
-    const projectionWriter = fakeProjectionWriter();
+    const projectionWriter = fakeProjectionWriterPublishingWrites();
     const server = createRealtimeServer({ orchestratorConversationStore, projectionWriter });
     const address = await server.start();
     const baseUrl = `http://${address.host}:${address.port}`;
@@ -1363,6 +1436,28 @@ describe("StatusServer realtime SSE API", () => {
           "/api/v1/web/orchestrator-chat",
         );
 
+        const projectionSource = "orchestrator_chat_projection:conversation:orchestrator-default";
+        const persistedProjection = await nextEventOfTypeFromSource(chatClient, "projection.updated", projectionSource);
+        expect(persistedProjection.data).toMatchObject({
+          type: "projection.updated",
+          source: { source: projectionSource, revision: expect.any(Number) },
+          payload: { resourcesChanged: ["orchestrator-chat", "sidebar", "dashboard"] },
+        });
+
+        const persistedFreshness = await nextEventOfTypeFromSource(chatClient, "source.status", projectionSource);
+        expect(persistedFreshness.data).toMatchObject({
+          type: "source.status",
+          source: { source: projectionSource, revision: expect.any(Number) },
+          payload: {
+            sourceCursors: {
+              conversationKey: "orchestrator-default",
+              messageCount: 1,
+              lastMessageId: expect.any(String),
+              lastMessageStatus: "pending",
+            },
+          },
+        });
+
         const chat = await nextEventOfTypeFromSource(chatClient, "orchestrator.message", "orchestrator-chat");
         expect(chat.data).toMatchObject({
           type: "orchestrator.message",
@@ -1381,12 +1476,41 @@ describe("StatusServer realtime SSE API", () => {
             inputLength: "hello from the operator".length,
             messageCount: 1,
             status: 202,
-            message: { text: "hello from the operator" },
-            messages: [{ text: "hello from the operator" }],
+            state: "pending",
+            conversationStatus: "pending",
+            active: true,
+            latestMessageSequence: 1,
+            latestMessageUpdatedAt: expect.any(String),
+            message: expect.objectContaining({
+              conversationId: "orchestrator-default",
+              role: "user",
+              text: "hello from the operator",
+              status: "pending",
+            }),
+            messages: [
+              expect.objectContaining({
+                conversationId: "orchestrator-default",
+                role: "user",
+                text: "hello from the operator",
+                status: "pending",
+              }),
+            ],
+            chat: [
+              expect.objectContaining({
+                conversationId: "orchestrator-default",
+                role: "user",
+                text: "hello from the operator",
+                status: "pending",
+              }),
+            ],
+            statusSummary: expect.objectContaining({ state: "pending", active: true, messageCount: 1 }),
           },
           recovery: { strategy: "refetch", reason: "event" },
         });
         expect((chat.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/orchestrator-chat");
+        await expect(nextEventOfTypeFromSource(chatClient, "orchestrator.message", projectionSource, 150)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
       } finally {
         await chatClient.close();
       }
@@ -1394,6 +1518,251 @@ describe("StatusServer realtime SSE API", () => {
       await server.stop();
     }
   });
+
+  it.each(["pending", "dispatching"] as const)(
+    "does not publish orchestrator.message for idempotent %s web chat POST replays",
+    async (commandStatus) => {
+      const orchestratorConversationStore = new FileOrchestratorConversationStore(
+        path.join(root, `chat-state-replay-${commandStatus}`),
+      );
+      const messageId = `operator-replay-${commandStatus}`;
+      await orchestratorConversationStore.appendMessage({
+        conversationId: "operator-room",
+        id: messageId,
+        role: "user",
+        body: "please retry safely",
+        status: "pending",
+        at: "2026-01-01T00:00:00.000Z",
+        metadata: {
+          source: "web_orchestrator_chat",
+          action: "orchestrator.chat.post",
+          actionDispatched: commandStatus === "dispatching",
+          commandStatus,
+        },
+      });
+
+      let dispatchCalls = 0;
+      const orchestrator = fakeOrchestrator();
+      orchestrator.dispatchOrchestratorChatCommand = async () => {
+        dispatchCalls += 1;
+        return { status: "accepted", reason: "accepted", acceptedAt: "2026-01-01T00:00:00.000Z" };
+      };
+      const server = createRealtimeServer({ orchestratorConversationStore, orchestrator });
+      const address = await server.start();
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+      try {
+        await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+        const replayResponse = await fetch(`${baseUrl}/api/v1/web/orchestrator-chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            conversationId: "operator-room",
+            messageId,
+            input: "please retry safely",
+          }),
+        });
+        expect(replayResponse.status).toBe(202);
+        await expect(replayResponse.json()).resolves.toMatchObject([
+          {
+            id: messageId,
+            conversationId: "operator-room",
+            role: "user",
+            text: "please retry safely",
+            status: "pending",
+          },
+        ]);
+        expect(dispatchCalls).toBe(0);
+        await expect(client.nextEventOfType("orchestrator.message", 200)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
+      } finally {
+        await client.close();
+        await server.stop();
+      }
+    },
+  );
+
+  it("replays orchestrator chat events after Last-Event-ID without duplicating the cursor event", async () => {
+    const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state-replay-cursor"));
+    const server = createRealtimeServer({ orchestratorConversationStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      await orchestratorConversationStore.appendMessage({
+        conversationId: "operator-room",
+        role: "assistant",
+        body: "First chat event",
+        status: "streaming",
+        at: "2026-01-01T00:00:00.000Z",
+      });
+      const first = await client.nextEventOfType("orchestrator.message");
+      await orchestratorConversationStore.appendMessage({
+        conversationId: "operator-room",
+        role: "assistant",
+        body: "Second chat event",
+        status: "completed",
+        at: "2026-01-01T00:00:01.000Z",
+      });
+      const second = await client.nextEventOfType("orchestrator.message");
+
+      const replayClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": first.id });
+      try {
+        const replayed = await replayClient.nextEventOfType("orchestrator.message");
+        expect(replayed.id).toBe(second.id);
+        expect(replayed.data).toMatchObject({
+          type: "orchestrator.message",
+          source: { source: "orchestrator_conversations" },
+          payload: {
+            conversationId: "operator-room",
+            messageCount: 2,
+            chat: [
+              expect.objectContaining({ text: "First chat event" }),
+              expect.objectContaining({ text: "Second chat event", status: "completed" }),
+            ],
+          },
+        });
+        await expect(replayClient.nextEventOfType("orchestrator.message", 200)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
+      } finally {
+        await replayClient.close();
+      }
+
+      const cursorClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": second.id });
+      try {
+        await expect(cursorClient.nextEventOfType("orchestrator.message", 200)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
+      } finally {
+        await cursorClient.close();
+      }
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it.each([
+    { resultStatus: "failed" as const, httpStatus: 500 },
+    { resultStatus: "unavailable" as const, httpStatus: 503 },
+  ])(
+    "publishes $resultStatus orchestrator chat POST results as orchestrator.message SSE status events",
+    async ({ resultStatus, httpStatus }) => {
+      const orchestratorConversationStore = new FileOrchestratorConversationStore(
+        path.join(root, `chat-state-${resultStatus}`),
+      );
+      const projectionWriter = fakeProjectionWriterPublishingWrites();
+      const orchestrator = fakeOrchestrator();
+      orchestrator.dispatchOrchestratorChatCommand = async () => ({
+        status: resultStatus,
+        reason: `test_${resultStatus}`,
+      });
+      const server = createRealtimeServer({ orchestratorConversationStore, orchestrator, projectionWriter });
+      const address = await server.start();
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+      try {
+        await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+        const response = await fetch(`${baseUrl}/api/v1/web/orchestrator-chat`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ input: `trigger ${resultStatus}` }),
+        });
+        expect(response.status).toBe(httpStatus);
+        await expect(response.json()).resolves.toMatchObject({
+          error: {
+            code: resultStatus === "failed" ? "orchestrator_chat_dispatch_failed" : "orchestrator_chat_unavailable",
+          },
+          chat: [
+            expect.objectContaining({
+              conversationId: "orchestrator-default",
+              role: "user",
+              text: `trigger ${resultStatus}`,
+              status: resultStatus,
+            }),
+          ],
+        });
+
+        const projectionSource = "orchestrator_chat_projection:conversation:orchestrator-default";
+        const persistedProjection = await nextEventOfTypeFromSource(client, "projection.updated", projectionSource);
+        expect(persistedProjection.data).toMatchObject({
+          type: "projection.updated",
+          source: { source: projectionSource, revision: expect.any(Number) },
+          payload: { resourcesChanged: ["orchestrator-chat", "sidebar", "dashboard"] },
+        });
+
+        const persistedFreshness = await nextEventOfTypeFromSource(client, "source.status", projectionSource);
+        expect(persistedFreshness.data).toMatchObject({
+          type: "source.status",
+          source: { source: projectionSource, revision: expect.any(Number) },
+          payload: {
+            sourceCursors: {
+              conversationKey: "orchestrator-default",
+              messageCount: 1,
+              lastMessageId: expect.any(String),
+              lastMessageStatus: resultStatus,
+            },
+          },
+        });
+
+        const chat = await nextEventOfTypeFromSource(client, "orchestrator.message", "orchestrator-chat");
+        expect(chat.data).toMatchObject({
+          type: "orchestrator.message",
+          scope: "orchestrator",
+          key: "orchestrator-default",
+          source: { source: "orchestrator-chat" },
+          detail: {
+            inputLength: `trigger ${resultStatus}`.length,
+            messageCount: 1,
+            conversationId: "orchestrator-default",
+            status: httpStatus,
+            state: resultStatus,
+            conversationStatus: resultStatus,
+            active: false,
+            terminal: true,
+            lastMessageStatus: resultStatus,
+          },
+          payload: {
+            source: "orchestrator-chat",
+            conversationId: "orchestrator-default",
+            inputLength: `trigger ${resultStatus}`.length,
+            messageCount: 1,
+            status: httpStatus,
+            state: resultStatus,
+            conversationStatus: resultStatus,
+            active: false,
+            terminal: true,
+            lastMessageStatus: resultStatus,
+            chat: [
+              expect.objectContaining({
+                conversationId: "orchestrator-default",
+                role: "user",
+                text: `trigger ${resultStatus}`,
+                status: resultStatus,
+              }),
+            ],
+          },
+          recovery: { strategy: "refetch", reason: "event" },
+        });
+        expect((chat.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/orchestrator-chat");
+        await expect(nextEventOfTypeFromSource(client, "orchestrator.message", projectionSource, 150)).rejects.toThrow(
+          /Timed out waiting for SSE event/,
+        );
+      } finally {
+        await client.close();
+        await server.stop();
+      }
+    },
+  );
 });
 
 interface ParsedSseEvent {
@@ -1487,6 +1856,75 @@ function fakeProjectionWriter(): FakeProjectionWriter {
       for (const listener of Array.from(listeners)) listener(publication);
     },
   };
+}
+
+function fakeProjectionWriterPublishingWrites(): FakeProjectionWriter {
+  const writer = fakeProjectionWriter();
+  let nextRevision = 100;
+  return {
+    ...writer,
+    async writeProjection(input: ProjectionPayloadWriteInput): Promise<ProjectionWriteResult> {
+      const revision = nextRevision;
+      nextRevision += 1;
+      const generatedAt = normalizeProjectionWriteTimestamp(input.generatedAt, revision);
+      const publication = projectionPublication({
+        projectionName: input.projectionName,
+        scopeKind: input.scopeKind ?? "global",
+        scopeKey: input.scopeKey ?? "global",
+        projectionRevisionId: `projection-revision-write-${revision}`,
+        revision,
+        buildMode: input.buildMode ?? "incremental",
+        contentSha256: input.contentSha256 ?? `projection-sha-${revision}`,
+        generatedAt,
+        expiresAt: normalizeOptionalProjectionWriteTimestamp(input.expiresAt),
+        sourceRevisions: (input.sourceRevisions ?? []).map((sourceRevision) => ({
+          source: sourceRevision.source,
+          revision: sourceRevision.revision,
+          observedAt: normalizeOptionalProjectionWriteTimestamp(sourceRevision.observedAt),
+        })),
+        sourceCursors: (input.sourceCursors ?? {}) as ProjectionRevisionPublication["sourceCursors"],
+        sourceFreshness: [],
+      });
+      writer.publish(publication);
+      return {
+        status: "written",
+        revision: {
+          projectionRevisionId: publication.projectionRevisionId,
+          projectionName: publication.projectionName,
+          scopeKind: publication.scopeKind,
+          scopeKey: publication.scopeKey,
+          revision: publication.revision,
+          buildMode: publication.buildMode,
+          sourceRevisions: publication.sourceRevisions,
+          sourceCursors: publication.sourceCursors,
+          sourceFreshness: publication.sourceFreshness,
+          contentSha256: publication.contentSha256,
+          generatedAt: publication.generatedAt,
+          expiresAt: publication.expiresAt,
+          supersededAt: null,
+          createdAt: publication.generatedAt,
+        },
+        previousRevision: null,
+        requestedBuildMode: input.buildMode ?? "incremental",
+        buildMode: publication.buildMode,
+        contentSha256: publication.contentSha256,
+        payloadSha256: input.payloadSha256 ?? publication.contentSha256,
+        event: publication,
+      };
+    },
+  };
+}
+
+function normalizeProjectionWriteTimestamp(value: Date | string | undefined, revision: number): string {
+  if (typeof value === "string") return value;
+  if (value instanceof Date) return value.toISOString();
+  return new Date(Date.UTC(2026, 0, 1, 0, 0, revision)).toISOString();
+}
+
+function normalizeOptionalProjectionWriteTimestamp(value: Date | string | null | undefined): string | null {
+  if (typeof value === "string") return value;
+  if (value instanceof Date) return value.toISOString();
+  return value ?? null;
 }
 
 function fakeOrchestrator(): Orchestrator {

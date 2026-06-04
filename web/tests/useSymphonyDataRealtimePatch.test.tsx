@@ -7,6 +7,7 @@ import type { RealtimeEventListener, RealtimeProjectionEvent, SymphonyDataSource
 import { DataSourceProvider } from "../src/data/dataSourceContext";
 import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
+import { combineLiveResourceTokens, useLiveResourceTokens } from "../src/hooks/useLiveResource";
 import { useOrchestratorChat, useTranscript } from "../src/hooks/useSymphonyData";
 import type { ChatMessage, Loadable, OrchestratorChatModel, TranscriptMessage } from "../src/types/symphony";
 
@@ -73,6 +74,72 @@ function chatEvent(revision: number, message: ChatMessage, messageCount: number,
   } as RealtimeProjectionEvent;
 }
 
+function missedEventsRecoveryEvent(revision: number, overrides: Partial<RealtimeProjectionEvent> = {}): RealtimeProjectionEvent {
+  return {
+    schema: REALTIME_EVENT_SCHEMA,
+    schemaVersion: REALTIME_EVENT_SCHEMA_VERSION,
+    id: `recovery-${revision}`,
+    type: "projection.updated",
+    revision,
+    createdAt: `2026-01-01T00:00:${String(revision).padStart(2, "0")}.000Z`,
+    scope: "global",
+    key: null,
+    source: { source: "realtime-recovery", revision, observedAt: null },
+    resources: [
+      { kind: "source", href: "/api/v1/web/reference-data?refresh=1", relation: "refetch" },
+      { kind: "dashboard", href: "/api/v1/web/dashboard", relation: "refetch" },
+      { kind: "issue-board", href: "/api/v1/web/issues", relation: "refetch" },
+      { kind: "sidebar", href: "/api/v1/web/sidebar", relation: "refetch" },
+      { kind: "history", href: "/api/v1/web/history", relation: "refetch" },
+      { kind: "orchestrator-chat", href: "/api/v1/web/orchestrator-chat", relation: "refetch" },
+    ],
+    recovery: {
+      strategy: "refetch",
+      reason: "missed-events",
+      lastEventId: `stale-${revision - 1}`,
+      endpoints: [
+        "/api/v1/web/reference-data?refresh=1",
+        "/api/v1/web/dashboard",
+        "/api/v1/web/issues",
+        "/api/v1/web/sidebar",
+        "/api/v1/web/history",
+        "/api/v1/web/orchestrator-chat",
+      ],
+    },
+    missedEvents: true,
+    payload: {
+      source: "realtime-recovery",
+      sourceRevision: revision,
+      detail: null,
+      resourceKinds: ["source", "dashboard", "issue-board", "sidebar", "history", "orchestrator-chat"],
+      resourcesChanged: [
+        "dashboard",
+        "issue-board",
+        "issue-detail",
+        "history",
+        "sidebar",
+        "session-transcript",
+        "orchestrator-chat",
+        "source",
+      ],
+    },
+    detail: {
+      lastEventId: `stale-${revision - 1}`,
+      resourcesChanged: [
+        "dashboard",
+        "issue-board",
+        "issue-detail",
+        "history",
+        "sidebar",
+        "session-transcript",
+        "orchestrator-chat",
+        "source",
+      ],
+    },
+    ...overrides,
+  } as RealtimeProjectionEvent;
+}
+
 function testDataSource(overrides: Partial<SymphonyDataSource>): SymphonyDataSource {
   const notImplemented = async () => {
     throw new Error("test data source method was not implemented");
@@ -135,6 +202,32 @@ function renderChatProbe(dataSource: SymphonyDataSource) {
   return {
     result() {
       if (!latest) throw new Error("chat probe did not render");
+      return latest;
+    },
+  };
+}
+
+function renderLiveRecoveryChatProbe(dataSource: SymphonyDataSource) {
+  let latest: Loadable<OrchestratorChatModel> | null = null;
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  mountedRoots.push(root);
+
+  function Probe() {
+    const liveTokens = useLiveResourceTokens(true);
+    const refreshToken = combineLiveResourceTokens(liveTokens, ["orchestratorChat"]);
+    latest = useOrchestratorChat(refreshToken > 0 ? { enabled: true, refreshToken } : { enabled: true });
+    return null;
+  }
+
+  act(() => {
+    root.render(createElement(DataSourceProvider, { value: dataSource, children: createElement(Probe) }));
+  });
+
+  return {
+    result() {
+      if (!latest) throw new Error("live recovery chat probe did not render");
       return latest;
     },
   };
@@ -383,5 +476,53 @@ describe("useSymphonyData realtime direct patching", () => {
     expect(invalidateCachedReads).toHaveBeenCalledWith({ forceRefreshHrefs: ["/api/v1/web/orchestrator-chat?refresh=1"] });
     expect(getOrchestratorChat).toHaveBeenCalledTimes(2);
     expect(probe.result().data?.chat).toEqual(refetched);
+  });
+
+  it("refetches orchestrator chat after projection recovery hints mark a missed-events reconnect stale", async () => {
+    const listeners: RealtimeEventListener[] = [];
+    const invalidateCachedReads = vi.fn();
+    const initial: ChatMessage[] = [{ id: "msg-1", conversationId: "orchestrator-default", who: "user", text: "status" }];
+    const recovered: ChatMessage[] = [
+      ...initial,
+      { id: "msg-2", conversationId: "orchestrator-default", who: "agent", text: "recovered after reconnect" },
+    ];
+    const getOrchestratorChat = vi.fn<(_: AbortSignal | undefined) => Promise<OrchestratorChatModel>>()
+      .mockResolvedValueOnce(orchestratorChatModelFromMessages(initial))
+      .mockResolvedValueOnce(orchestratorChatModelFromMessages(recovered));
+    const dataSource = testDataSource({
+      getOrchestratorChat,
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(nextListener) {
+        listeners.push(nextListener);
+        return () => {
+          const index = listeners.indexOf(nextListener);
+          if (index >= 0) listeners.splice(index, 1);
+        };
+      },
+    });
+    const probe = renderLiveRecoveryChatProbe(dataSource);
+    await flushPromises();
+
+    expect(probe.result().data?.chat).toEqual(initial);
+    expect(getOrchestratorChat).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      const event = missedEventsRecoveryEvent(2);
+      for (const listener of [...listeners]) listener(event);
+    });
+    await flushPromises();
+
+    expect(invalidateCachedReads).toHaveBeenCalledWith({
+      forceRefreshHrefs: expect.arrayContaining([
+        "/api/v1/web/reference-data?refresh=1",
+        "/api/v1/web/dashboard",
+        "/api/v1/web/issues",
+        "/api/v1/web/sidebar",
+        "/api/v1/web/history",
+        "/api/v1/web/orchestrator-chat",
+      ]),
+    });
+    expect(getOrchestratorChat).toHaveBeenCalledTimes(2);
+    expect(probe.result().data?.chat).toEqual(recovered);
   });
 });
