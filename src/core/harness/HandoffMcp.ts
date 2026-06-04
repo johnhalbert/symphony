@@ -118,6 +118,7 @@ export function renderIssueBreakdownMcpHandoffPrompt(input: RuntimeHandoffPrompt
     "- Before ending the run, call the submit_issue_breakdown_plan MCP tool with summary, proposedIssues, and idempotencyKey.",
     "- Each proposed issue must include title, description, acceptanceCriteria, dependencies, and labels.",
     "- Each proposed issue description must use the required agent-eligible section headings: `Problem / Goal`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.",
+    "- In `Touched Surfaces`, list the exact repo paths or globs for any protected or high-risk workflow areas. If a proposed issue touches protected workflow areas, keep \"Ready for `dogfood-ready`: no\", record a non-empty remaining blocker that explains the manual-only requirement, and do not include `dogfood-ready` in labels.",
     "- Use the same section names for docs-only and implementation issue drafts; do not include secrets, tokens, private keys, or credential values.",
     "- Do not include `dogfood-ready` automatically in proposed labels. Operators add readiness labels only after reviewing the contract checklist and validation plan.",
     "- Do not call submit_completion_report, comment on Linear, transition Linear state, or create child issues.",

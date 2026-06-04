@@ -14,6 +14,8 @@ describe("MCP handoff prompt rendering", () => {
     expect(prompt).toContain("Problem / Goal");
     expect(prompt).toContain("Contract Checklist");
     expect(prompt).toContain("Validation Requirements");
+    expect(prompt).toContain("exact repo paths or globs");
+    expect(prompt).toContain("manual-only requirement");
     expect(prompt).toContain("Do not include `dogfood-ready` automatically");
     expect(prompt).toContain("do not include secrets, tokens, private keys, or credential values");
   });

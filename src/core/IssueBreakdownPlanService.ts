@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
+import {
+  AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS,
+  analyzeIssueContractDescription,
+  missingRequiredIssueContractSections,
+} from "./IssueContractLint.js";
 import { SymphonyError } from "./errors.js";
 import type {
   IssueBreakdownPlanRecord,
@@ -66,6 +71,7 @@ export class IssueBreakdownPlanService {
   async submitIssueBreakdownPlan(input: unknown, context: IssueBreakdownPlanActiveContext): Promise<IssueBreakdownPlanResult> {
     const parsed = parseIssueBreakdownPlan(input);
     validateCaller(parsed, context);
+    validateProposedIssues(parsed, this.options.config);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
     const configFingerprint = issueBreakdownConfigFingerprint(this.options.config);
@@ -178,6 +184,9 @@ export function issueBreakdownConfigFingerprint(config: ServiceConfig): string {
         planningLabels: config.issueBreakdown.planningLabels,
         applyToLinear: config.issueBreakdown.applyToLinear,
         workspaceMode: config.issueBreakdown.workspaceMode,
+        requireLabels: config.agent.requireLabels,
+        excludeLabels: config.agent.excludeLabels,
+        protectedPaths: config.agent.protectedPaths,
       }),
     )
     .digest("hex");
@@ -278,6 +287,62 @@ export function renderIssueBreakdownPlanSummary(plan: IssueBreakdownPlanRecord):
       `   Labels: ${item.labels.length === 0 ? "None" : item.labels.join(", ")}`,
     ]),
   ].join("\n");
+}
+
+function validateProposedIssues(plan: IssueBreakdownPlanInput, config: ServiceConfig): void {
+  for (const [index, proposedIssue] of plan.proposedIssues.entries()) {
+    const descriptor = describeProposedIssue(index, proposedIssue.title);
+    assertProposedIssueLabels(proposedIssue.labels, descriptor);
+
+    const missingSections = missingRequiredIssueContractSections(proposedIssue.description);
+    if (missingSections.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${descriptor} must include the required issue contract headings: ${AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS.join(", ")}`,
+        { proposedIssueIndex: index, missingSections },
+      );
+    }
+
+    const analysis = analyzeIssueContractDescription(proposedIssue.description, config.agent.protectedPaths);
+    if (analysis.readyForDogfoodReady === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${descriptor} must declare "Ready for \`dogfood-ready\`: yes/no" in Promotion Readiness`,
+        { proposedIssueIndex: index, title: proposedIssue.title },
+      );
+    }
+
+    if (analysis.protectedSurfaceMatches.length > 0) {
+      if (analysis.readyForDogfoodReady !== false) {
+        throw new SymphonyError(
+          "invalid_request",
+          `${descriptor} touches protected paths (${analysis.protectedSurfaceMatches.join(", ")}) and must keep "Ready for \`dogfood-ready\`: no"`,
+          { proposedIssueIndex: index, protectedSurfaceMatches: analysis.protectedSurfaceMatches },
+        );
+      }
+      if (!analysis.remainingBlocker || analysis.remainingBlocker.trim().length === 0) {
+        throw new SymphonyError(
+          "invalid_request",
+          `${descriptor} touches protected paths (${analysis.protectedSurfaceMatches.join(", ")}) and must record a non-empty remaining blocker for manual handling`,
+          { proposedIssueIndex: index, protectedSurfaceMatches: analysis.protectedSurfaceMatches },
+        );
+      }
+    }
+  }
+}
+
+function assertProposedIssueLabels(labels: readonly string[], descriptor: string): void {
+  if (labels.some((label) => label.toLowerCase() === "dogfood-ready")) {
+    throw new SymphonyError(
+      "invalid_request",
+      `${descriptor} must not include the dogfood-ready label; operators add readiness labels after review`,
+      { labels },
+    );
+  }
+}
+
+function describeProposedIssue(index: number, title: string): string {
+  return `Proposed issue ${index + 1} (${JSON.stringify(title)})`;
 }
 
 function validateCaller(plan: IssueBreakdownPlanInput, context: IssueBreakdownPlanActiveContext): void {

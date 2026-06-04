@@ -47,3 +47,51 @@ export function issue(overrides: Partial<Issue> = {}): Issue {
     ...overrides,
   };
 }
+
+export function agentEligibleIssueContract(
+  overrides: {
+    problemGoal?: string;
+    touchedSurfaces?: string[];
+    acceptanceCriteria?: string[];
+    contractChecklist?: string[];
+    validationRequirements?: string[];
+    outOfScope?: string[];
+    readyForDogfoodReady?: "yes" | "no";
+    remainingBlocker?: string;
+  } = {},
+): string {
+  const {
+    problemGoal = "Do the work.",
+    touchedSurfaces = ["- [X] Docs only"],
+    acceptanceCriteria = ["- Done."],
+    contractChecklist = ["- Happy path: covered.", "- Negative/error path: covered."],
+    validationRequirements = ["- Run the narrow test."],
+    outOfScope = ["- Nothing else."],
+    readyForDogfoodReady = "yes",
+    remainingBlocker = readyForDogfoodReady === "yes" ? "none" : "Manual operator implementation required.",
+  } = overrides;
+
+  return [
+    "## Problem / Goal",
+    problemGoal,
+    "",
+    "## Touched Surfaces",
+    ...touchedSurfaces,
+    "",
+    "## Acceptance Criteria",
+    ...acceptanceCriteria,
+    "",
+    "## Contract Checklist",
+    ...contractChecklist,
+    "",
+    "## Validation Requirements",
+    ...validationRequirements,
+    "",
+    "## Out Of Scope",
+    ...outOfScope,
+    "",
+    "## Promotion Readiness",
+    `- Ready for \`dogfood-ready\`: ${readyForDogfoodReady}`,
+    `- Remaining blocker: ${remainingBlocker}`,
+  ].join("\n");
+}

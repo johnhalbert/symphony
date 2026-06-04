@@ -25,7 +25,7 @@ import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbo
 import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "../src/core/writeback/WritebackOutbox.js";
 import type { Issue } from "../src/core/types.js";
 import type { ServiceConfig } from "../src/core/config/Config.js";
-import { issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 
@@ -54,7 +54,7 @@ describe("IssueBreakdownPlanApplyService", () => {
         proposedIssues: [
           {
             title: "Build child",
-            description: "Implement the child issue.",
+            description: agentEligibleIssueContract(),
             acceptanceCriteria: ["Done"],
             dependencies: [],
             labels: ["planning"],
@@ -109,7 +109,7 @@ describe("IssueBreakdownPlanApplyService", () => {
         issueId: candidate.id,
         summary: "Split into child issues.",
         proposedIssues: [
-          { title: "Build child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+          { title: "Build child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
         ],
         idempotencyKey: "plan-1",
       },
@@ -199,7 +199,7 @@ describe("IssueBreakdownPlanApplyService", () => {
         issueId: candidate.id,
         summary: "Split into child issues.",
         proposedIssues: [
-          { title: "Build child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: ["Missing"], labels: [] },
+          { title: "Build child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: ["Missing"], labels: [] },
         ],
         idempotencyKey: "plan-1",
       },
@@ -230,7 +230,7 @@ describe("IssueBreakdownPlanApplyService", () => {
         proposedIssues: [
           {
             title: "Build child",
-            description: "Implement the child issue.",
+            description: agentEligibleIssueContract(),
             acceptanceCriteria: ["Done"],
             dependencies: [],
             labels: ["planning"],
@@ -610,7 +610,7 @@ async function submitSingleChildPlan(
       proposedIssues: [
         {
           title: "Build child",
-          description: "Implement the child issue.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Done"],
           dependencies: [],
           labels: ["planning"],
@@ -632,14 +632,14 @@ async function submitTwoChildPlan(config: ServiceConfig, lifecycleStore: FileIss
       proposedIssues: [
         {
           title: "Build child",
-          description: "Implement the child issue.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Done"],
           dependencies: [],
           labels: ["planning"],
         },
         {
           title: "Build dependent child",
-          description: "Implement the dependent child issue.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Done"],
           dependencies: ["Build child"],
           labels: ["planning"],

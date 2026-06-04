@@ -9,7 +9,7 @@ import {
 } from "../src/core/IssueBreakdownPlanService.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
-import { issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 describe("IssueBreakdownPlanService", () => {
   let root: string;
@@ -34,7 +34,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: "Add validated structured issue breakdown output.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -88,7 +88,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: "Add validated structured issue breakdown output.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -130,7 +130,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: "Add validated structured issue breakdown output.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -181,7 +181,7 @@ describe("IssueBreakdownPlanService", () => {
         issueId: original.id,
         summary: "Split original work.",
         proposedIssues: [
-          { title: "Build original child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+          { title: "Build original child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
         ],
         idempotencyKey: "plan-a",
       },
@@ -193,7 +193,7 @@ describe("IssueBreakdownPlanService", () => {
         issueId: changed.id,
         summary: "Split changed work.",
         proposedIssues: [
-          { title: "Build changed child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+          { title: "Build changed child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
         ],
         idempotencyKey: "plan-b",
       },
@@ -222,6 +222,94 @@ describe("IssueBreakdownPlanService", () => {
     });
     const nullPointerLifecycle = await lifecycleStore.get(original.id);
     expect(latestFreshIssueBreakdownPlan(nullPointerLifecycle, original, config)).toBeNull();
+  });
+
+  it("rejects proposed issues that add dogfood-ready labels before persistence", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-ready-label",
+          issueId: candidate.id,
+          summary: "Readiness labels are operator-owned.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: agentEligibleIssueContract(),
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+              labels: ["dogfood-ready"],
+            },
+          ],
+          idempotencyKey: "plan-ready-label",
+        },
+        { issue: candidate, activeRunId: "run-plan-ready-label", role: "worker", phase: "issue_breakdown" },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+  });
+
+  it("requires protected-surface proposed issues to stay manual-only with a blocker", async () => {
+    const config = testConfig(root);
+    config.agent.protectedPaths = ["docs/dogfood-runbook.md"];
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-protected-ready",
+          issueId: candidate.id,
+          summary: "Protected path must not be agent-ready.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: agentEligibleIssueContract({
+                touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+                readyForDogfoodReady: "yes",
+              }),
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+              labels: [],
+            },
+          ],
+          idempotencyKey: "plan-protected-ready",
+        },
+        { issue: candidate, activeRunId: "run-plan-protected-ready", role: "worker", phase: "issue_breakdown" },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+
+    const accepted = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-protected-manual",
+        issueId: candidate.id,
+        summary: "Protected path stays manual-only.",
+        proposedIssues: [
+          {
+            title: "Task",
+            description: agentEligibleIssueContract({
+              touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+              readyForDogfoodReady: "no",
+              remainingBlocker: "Manual operator implementation required for protected surface.",
+            }),
+            acceptanceCriteria: ["Done"],
+            dependencies: [],
+            labels: [],
+          },
+        ],
+        idempotencyKey: "plan-protected-manual",
+      },
+      { issue: candidate, activeRunId: "run-plan-protected-manual", role: "worker", phase: "issue_breakdown" },
+    );
+
+    expect(accepted.accepted).toBe(true);
+    expect(accepted.replayed).toBe(false);
   });
 
   it("rejects invalid schema and mismatched active run context", async () => {
