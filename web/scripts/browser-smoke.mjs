@@ -4,6 +4,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createServer as createViteServer } from "vite";
 
+import { createOrchestratorChatProjection } from "./orchestrator-chat-smoke-fixture.mjs";
+
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export const fixtureData = {
@@ -115,10 +117,18 @@ export async function startFixtureBackend() {
       body = { issue: fixtureData.issue, activity: dashboard().activity, runs: history().sessions, transcript: fixtureData.transcript };
     } else if (method === "GET" && url.pathname === "/api/v1/web/history") body = history();
     else if (method === "GET" && url.pathname === "/api/v1/web/sessions/run-fixture/transcript") body = fixtureData.transcript;
-    else if (method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") body = dashboard().chat;
+    else if (method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") {
+      body = createOrchestratorChatProjection(dashboard().chat, {
+        revisionPrefix: "browser-smoke-get",
+        observedAt: "2026-05-29T00:01:00.000Z",
+      });
+    }
     else if (method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
       const input = await readJsonBody(request).then((payload) => payload.input ?? "");
-      body = [...dashboard().chat, { who: "user", text: String(input) }];
+      body = createOrchestratorChatProjection([...dashboard().chat, { who: "user", text: String(input) }], {
+        revisionPrefix: "browser-smoke-post",
+        observedAt: "2026-05-29T00:02:00.000Z",
+      });
     } else {
       status = 404;
       body = { error: { code: "not_found", message: `${method} ${url.pathname}` } };

@@ -8,6 +8,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 
+import { createOrchestratorChatProjection } from "./orchestrator-chat-smoke-fixture.mjs";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(__dirname, "..");
 const webDistRoot = path.resolve(webRoot, "dist");
@@ -632,7 +634,16 @@ async function handleFakeApiRequest(request, response, url) {
   if (request.method === "GET" && url.pathname === "/api/v1/web/issues") return sendJson(response, 200, issueBoard);
   if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") return sendJson(response, 200, sidebar);
   if (request.method === "GET" && url.pathname === "/api/v1/web/history") return sendJson(response, 200, history);
-  if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") return sendJson(response, 200, orchestratorChat);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") {
+    return sendJson(
+      response,
+      200,
+      createOrchestratorChatProjection(orchestratorChat, {
+        revisionPrefix: "vite-browser-smoke-get",
+        observedAt: "2026-06-03T13:30:00.000Z",
+      }),
+    );
+  }
   if (request.method === "POST" && url.pathname === "/api/v1/refresh") {
     return sendJson(response, 202, {
       queued: true,
@@ -652,11 +663,15 @@ async function handleFakeApiRequest(request, response, url) {
   if (request.method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
     const bodyText = await readRequestBody(request);
     const input = parseChatInput(bodyText) ?? "browser smoke input";
-    return sendJson(response, 200, [
-      ...orchestratorChat,
-      { who: "user", text: input },
-      { who: "agent", text: "Dedicated chat POST acknowledgement from API", suggestions: ["POST guard observed"] },
-    ]);
+    return sendJson(
+      response,
+      200,
+      createOrchestratorChatProjection([
+        ...orchestratorChat,
+        { who: "user", text: input },
+        { who: "agent", text: "Dedicated chat POST acknowledgement from API", suggestions: ["POST guard observed"] },
+      ], { revisionPrefix: "vite-browser-smoke-post", observedAt: "2026-06-03T13:31:00.000Z" }),
+    );
   }
 
   return sendJson(response, 404, { error: { code: "not_found", path: url.pathname } });
