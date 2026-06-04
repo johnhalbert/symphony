@@ -235,12 +235,10 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
         listWritebacks: 1,
         getConversation: 1,
         listMessages: 1,
+        readTranscript: 0,
         readTranscriptTail: 0,
+        readTranscriptEventCount: 0,
       });
-      expect(calls.readTranscript).toBeGreaterThan(0);
-      expect(calls.readTranscript).toBeLessThan(manifest.counts.runs);
-      expect(calls.readTranscriptEventCount).toBeGreaterThanOrEqual(calls.readTranscript);
-      expect(calls.readTranscriptEventCount).toBeLessThan(manifest.counts.runs * 2);
     } finally {
       await server.stop();
     }
@@ -484,7 +482,7 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
   });
 
   it("reuses the completed large fixture projection context until explicit refresh requests a rebuild", async () => {
-    const { calls, tracker, runStore, lifecycleStore, writebackOutbox, orchestratorConversationStore, manifest } = await largeFixtureSources({
+    const { calls, tracker, runStore, lifecycleStore, writebackOutbox, orchestratorConversationStore } = await largeFixtureSources({
       issueCount: 12,
       runsPerIssue: 4,
       eventsPerRun: 12,
@@ -535,12 +533,10 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
         listLifecycles: 2,
         listWritebacks: 2,
         listMessages: 1,
+        readTranscript: 0,
         readTranscriptTail: 0,
+        readTranscriptEventCount: 0,
       });
-      expect(calls.readTranscript).toBeGreaterThan(0);
-      expect(calls.readTranscript).toBeLessThan(manifest.counts.runs);
-      expect(calls.readTranscriptEventCount).toBeGreaterThanOrEqual(calls.readTranscript);
-      expect(calls.readTranscriptEventCount).toBeLessThan(manifest.counts.runs * 2);
     } finally {
       await server.stop();
     }

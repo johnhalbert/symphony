@@ -76,6 +76,11 @@ describe("generateLargeHistoryFixture", () => {
     const transcriptTail = await runStore.readTranscriptTail("fixture-run-0001-01", { limit: 3 });
     expect(transcriptTail.offset).toBe(5);
     expect(transcriptTail.events.map((event) => event.sequence)).toEqual([6, 7, 8]);
+    expect(await runStore.getRun("fixture-run-0001-02")).toMatchObject({
+      activitySnapshot: {
+        lastHarnessActivityAt: expect.any(String),
+      },
+    });
 
     const orchestratorConversation = await orchestratorConversationStore.getConversation(DEFAULT_ORCHESTRATOR_CONVERSATION_ID);
     expect(orchestratorConversation).toMatchObject({

@@ -9,7 +9,7 @@ import { PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON } from "../src/core/Compl
 import type { OperatorApprovalRecord, OperatorApprovalStatus } from "../src/core/approval/OperatorApprovalService.js";
 import { buildIssueHandoffState, type IssueCompletionReportRecord, type IssueLifecyclePhase, type IssueLifecycleRecord, type IssueLifecycleSummaryPointers, type IssueReviewVerdictRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import { DEFAULT_ORCHESTRATOR_CONVERSATION_ID, FileOrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
-import type { RunRecord, RunStatus, TranscriptEvent, WorkspaceRecord } from "../src/core/persistence/RunTranscriptStore.js";
+import type { RunActivitySnapshot, RunRecord, RunStatus, TranscriptEvent, WorkspaceRecord } from "../src/core/persistence/RunTranscriptStore.js";
 import type { ProviderLimitSignal } from "../src/core/provider/ProviderLimits.js";
 import type { WritebackOperation, WritebackStatus } from "../src/core/writeback/WritebackOutbox.js";
 import { runKindForPhase, type AgentRunPhase, type AgentRunRole } from "../src/core/types.js";
@@ -271,8 +271,10 @@ async function writeFixtureIssue(
       eventCount: options.eventsPerRun,
       startedAtMs: issueStartMs + runIndex * 15 * 60 * 1000,
     });
-    runs.push(run);
     const events = buildTranscriptEvents(run, options.eventsPerRun);
+    const activitySnapshot = buildRunActivitySnapshot(events);
+    if (activitySnapshot !== undefined) run.activitySnapshot = activitySnapshot;
+    runs.push(run);
     runEvents.push({ run, events });
     transcriptEvents += events.length;
   }
@@ -579,6 +581,41 @@ function buildTranscriptEvents(run: RunRecord, eventCount: number): TranscriptEv
       payload: { type: "progress", message: `Fixture progress event ${sequence}` },
     };
   });
+}
+
+function buildRunActivitySnapshot(events: readonly TranscriptEvent[]): RunActivitySnapshot | undefined {
+  let snapshot: RunActivitySnapshot | undefined;
+  for (const event of events) {
+    const isHarnessActivity = event.source === "harness" || event.source === "runtime" || event.source === "cursor";
+    if (!snapshot && !isHarnessActivity) continue;
+    snapshot ??= emptyRunActivitySnapshot();
+    if (isHarnessActivity) snapshot.lastHarnessActivityAt = event.at;
+    if (event.eventType !== "progress") continue;
+    const activitySource = activitySourceForFixtureEvent(event);
+    if (activitySource === "stream") snapshot.lastStreamActivityAt = event.at;
+    if (activitySource === "delta" || activitySource === "tool") snapshot.lastDeltaOrToolActivityAt = event.at;
+    if (activitySource === "tool") snapshot.lastToolActivityAt = event.at;
+  }
+  return snapshot;
+}
+
+function activitySourceForFixtureEvent(event: TranscriptEvent): "stream" | "delta" | "tool" {
+  const payload = isRecord(event.payload) ? event.payload : null;
+  const source = payload?.activitySource;
+  return source === "delta" || source === "tool" || source === "stream" ? source : "stream";
+}
+
+function emptyRunActivitySnapshot(): RunActivitySnapshot {
+  return {
+    lastHarnessActivityAt: null,
+    lastStreamActivityAt: null,
+    lastDeltaOrToolActivityAt: null,
+    lastToolActivityAt: null,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function runStatusTranscriptEvent(
