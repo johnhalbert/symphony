@@ -1272,9 +1272,10 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
-  it("emits missed-event recovery hints and orchestrator chat message events", async () => {
+  it("emits missed-event recovery hints, replays post-recovery publications, and orchestrator chat message events", async () => {
     const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state"));
-    const server = createRealtimeServer({ orchestratorConversationStore });
+    const projectionWriter = fakeProjectionWriter();
+    const server = createRealtimeServer({ orchestratorConversationStore, projectionWriter });
     const address = await server.start();
     const baseUrl = `http://${address.host}:${address.port}`;
 
@@ -1302,6 +1303,44 @@ describe("StatusServer realtime SSE API", () => {
         await expect(recoveryCursorClient.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
       } finally {
         await recoveryCursorClient.close();
+      }
+
+      projectionWriter.publish(
+        projectionPublication({
+          projectionName: "history_projection",
+          scopeKind: "global",
+          scopeKey: "global",
+          projectionRevisionId: "projection-revision-after-recovery",
+          revision: 23,
+          contentSha256: "history-after-recovery-sha",
+          generatedAt: "2026-01-01T00:00:23.000Z",
+        }),
+      );
+
+      const recoveryReplayClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": recoveryId });
+      try {
+        const replayedProjection = await recoveryReplayClient.nextEvent();
+        expect(replayedProjection.event).toBe("projection.updated");
+        expect(replayedProjection.data).toMatchObject({
+          type: "projection.updated",
+          missedEvents: false,
+          source: { source: "history_projection:global:global", revision: 23, observedAt: "2026-01-01T00:00:23.000Z" },
+          recovery: { strategy: "refetch", reason: "event", lastEventId: null },
+          payload: { resourcesChanged: ["history"] },
+        });
+        expect((replayedProjection.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/history");
+
+        const replayedSource = await recoveryReplayClient.nextEvent();
+        expect(replayedSource.event).toBe("source.status");
+        expect(replayedSource.data).toMatchObject({
+          type: "source.status",
+          missedEvents: false,
+          source: { source: "history_projection:global:global", revision: 23 },
+          recovery: { strategy: "refetch", reason: "event", lastEventId: null },
+        });
+        await expect(recoveryReplayClient.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
+      } finally {
+        await recoveryReplayClient.close();
       }
 
       const chatClient = await openSseClient(`${baseUrl}/api/v1/realtime`);
