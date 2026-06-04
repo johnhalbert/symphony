@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyzeIssueContractDescription } from "../src/core/IssueContractLint.js";
+import { analyzeIssueContractDescription, hasMeaningfulRemainingBlocker } from "../src/core/IssueContractLint.js";
 import { agentEligibleIssueContract } from "./helpers.js";
 
 describe("IssueContractLint", () => {
@@ -47,5 +47,81 @@ describe("IssueContractLint", () => {
     );
 
     expect(analysis.protectedSurfaceMatches).toEqual(["WORKFLOW.md"]);
+  });
+
+  it("matches exact protected paths with terminal sentence punctuation", () => {
+    const analysis = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        touchedSurfaces: ["- docs/dogfood-runbook.md.", "- WORKFLOW.md."],
+        readyForDogfoodReady: "no",
+        remainingBlocker: "Manual operator-authored update required for the protected workflow files.",
+      }),
+      ["docs/dogfood-runbook.md", "WORKFLOW.md"],
+    );
+
+    expect(analysis.protectedSurfaceMatches).toEqual(["docs/dogfood-runbook.md", "WORKFLOW.md"]);
+  });
+
+  it("normalizes leading dot-slash before matching protected paths", () => {
+    const analysis = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        touchedSurfaces: ["- ./docs/dogfood-runbook.md", "- ./src/core/config/runtime.ts"],
+        readyForDogfoodReady: "no",
+        remainingBlocker: "Manual operator-authored update required for protected workflow surfaces.",
+      }),
+      ["docs/dogfood-runbook.md", "src/core/config/**"],
+    );
+
+    expect(analysis.protectedSurfaceMatches).toEqual(["docs/dogfood-runbook.md", "src/core/config/**"]);
+  });
+
+  it("honors configured protected globs and broad touched-surface globs", () => {
+    const configuredGlob = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        touchedSurfaces: ["- docs/dogfood-runbook.md", "- src/core/config/runtime.ts"],
+        readyForDogfoodReady: "no",
+        remainingBlocker: "Manual operator-authored update required for protected workflow surfaces.",
+      }),
+      ["docs/*.md", "src/core/*/runtime.ts"],
+    );
+    expect(configuredGlob.protectedSurfaceMatches).toEqual(["docs/*.md", "src/core/*/runtime.ts"]);
+
+    const touchedGlob = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        touchedSurfaces: ["- docs/**"],
+        readyForDogfoodReady: "no",
+        remainingBlocker: "Manual operator-authored update required for protected workflow surfaces.",
+      }),
+      ["docs/dogfood-runbook.md"],
+    );
+    expect(touchedGlob.protectedSurfaceMatches).toEqual(["docs/dogfood-runbook.md"]);
+  });
+
+  it("treats the yes/no readiness placeholder as unresolved", () => {
+    const description = agentEligibleIssueContract().replace(
+      "Ready for `dogfood-ready`: yes",
+      "Ready for `dogfood-ready`: yes/no",
+    );
+
+    const analysis = analyzeIssueContractDescription(description, []);
+
+    expect(analysis.readyForDogfoodReady).toBeNull();
+  });
+
+  it("rejects blocker boilerplate but accepts nested substantive blocker bullets", () => {
+    const boilerplate =
+      'If any protected path is listed above, keep this issue manual-only with "Ready for `dogfood-ready`: no" and explain the operator blocker here.';
+    expect(hasMeaningfulRemainingBlocker(boilerplate)).toBe(false);
+
+    const analysis = analyzeIssueContractDescription(
+      agentEligibleIssueContract({ readyForDogfoodReady: "no", remainingBlocker: "" }).replace(
+        "- Remaining blocker: ",
+        "- Remaining blocker:\n  - Manual operator-authored update required for the protected workflow file.",
+      ),
+      ["docs/dogfood-runbook.md"],
+    );
+
+    expect(analysis.remainingBlocker).toBe("Manual operator-authored update required for the protected workflow file.");
+    expect(hasMeaningfulRemainingBlocker(analysis.remainingBlocker)).toBe(true);
   });
 });

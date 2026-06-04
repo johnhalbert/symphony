@@ -4,6 +4,7 @@ import type { Issue } from "./types.js";
 const TOUCHED_SURFACES_HEADING = "Touched Surfaces";
 const PROMOTION_READINESS_HEADING = "Promotion Readiness";
 const BLOCKER_PLACEHOLDER_VALUES = new Set([
+  'if any protected path is listed above, keep this issue manual-only with "ready for `dogfood-ready`: no" and explain the operator blocker here',
   "n/a",
   "na",
   "none",
@@ -139,7 +140,7 @@ function markdownSections(description: string): Map<string, string> {
 }
 
 function parseReadyForDogfoodReady(section: string): boolean | null {
-  const match = section.match(/ready\s+for\s+`?dogfood-ready`?\s*:\s*(yes|no)\b/i);
+  const match = section.match(/^\s*-?\s*ready\s+for\s+`?dogfood-ready`?\s*:\s*(yes|no)\s*$/im);
   if (!match) return null;
   return match[1]?.toLowerCase() === "yes";
 }
@@ -147,20 +148,23 @@ function parseReadyForDogfoodReady(section: string): boolean | null {
 function parseRemainingBlocker(section: string): string | null {
   const lines = section.split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
-    const match = lines[index]?.match(/^\s*-\s*Remaining blocker:\s*(.*)$/i);
+    const match = lines[index]?.match(/^(\s*)-\s*Remaining blocker:\s*(.*)$/i);
     if (!match) continue;
 
-    const inline = match[1]?.trim();
+    const labelIndent = match[1]?.length ?? 0;
+    const inline = match[2]?.trim();
     if (inline) return inline;
 
     const following: string[] = [];
     for (let next = index + 1; next < lines.length; next += 1) {
-      const trimmed = lines[next]?.trim() ?? "";
+      const rawLine = lines[next] ?? "";
+      const trimmed = rawLine.trim();
       if (trimmed.length === 0) {
         if (following.length > 0) break;
         continue;
       }
-      if (/^\s*-\s+/.test(trimmed)) break;
+      const lineIndent = rawLine.match(/^\s*/)?.[0].length ?? 0;
+      if (/^\s*-\s+/.test(rawLine) && lineIndent <= labelIndent) break;
       following.push(trimmed.replace(/^\s*[-*]\s+/, ""));
     }
 
@@ -186,11 +190,11 @@ function findProtectedSurfaceMatches(text: string, protectedPaths: readonly stri
 }
 
 function extractTouchedSurfacePathCandidates(text: string): string[] {
-  const normalized = normalizePathLikeText(text);
+  const normalized = normalizeScanText(text);
   const candidates = new Set<string>();
 
   for (const match of normalized.matchAll(/(?:^|[^a-z0-9._\/-])([a-z0-9._\/*-]+(?:\/[a-z0-9._\/*-]+)*)(?=$|[^a-z0-9._\/-])/g)) {
-    const candidate = match[1] ?? "";
+    const candidate = normalizePathLikeText(match[1] ?? "");
     if (!candidate.includes("/") && !candidate.includes(".") && !candidate.includes("*")) continue;
     candidates.add(candidate);
   }
@@ -199,15 +203,54 @@ function extractTouchedSurfacePathCandidates(text: string): string[] {
 }
 
 function protectedPathMatchesCandidate(candidate: string, normalizedProtectedPath: string): boolean {
-  if (normalizedProtectedPath.endsWith("/**")) {
-    const prefix = normalizedProtectedPath.slice(0, -3).replace(/\/+$/, "");
-    return prefix.length > 0 && (candidate === prefix || candidate.startsWith(`${prefix}/`));
-  }
+  if (pathPatternMatches(normalizedProtectedPath, candidate)) return true;
+  if (pathPatternMatches(candidate, normalizedProtectedPath)) return true;
+  return false;
+}
 
-  return candidate === normalizedProtectedPath;
+function pathPatternMatches(pattern: string, value: string): boolean {
+  if (!pathPatternHasGlob(pattern)) return pattern === value;
+  return globPatternToRegExp(pattern).test(value);
+}
+
+function pathPatternHasGlob(value: string): boolean {
+  return value.includes("*");
+}
+
+function globPatternToRegExp(pattern: string): RegExp {
+  let source = "^";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index] ?? "";
+    if (char === "*") {
+      if (pattern[index + 1] === "*") {
+        source += ".*";
+        index += 1;
+      } else {
+        source += "[^/]*";
+      }
+      continue;
+    }
+    source += escapeRegExp(char);
+  }
+  source += "$";
+  return new RegExp(source);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[\\^$+?.()|[\]{}]/g, "\\$&");
 }
 
 function normalizePathLikeText(value: string): string {
+  return normalizeScanText(value)
+    .trim()
+    .replace(/^[`"'(<[{]+/g, "")
+    .replace(/[`"')>\]}]+$/g, "")
+    .replace(/[.!?,;:]+$/g, "")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+/g, "/");
+}
+
+function normalizeScanText(value: string): string {
   return value.replace(/\\/g, "/").toLowerCase();
 }
 
