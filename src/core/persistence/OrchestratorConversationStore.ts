@@ -7,7 +7,7 @@ import {
   type ProjectionChangeListener,
   type ProjectionChangeUnsubscribe,
 } from "./ProjectionRevision.js";
-import { redactTranscriptText, sanitizePublicJson } from "../transcript/TranscriptProjection.js";
+import { redactTranscriptText, sanitizePublicJson, sanitizedPreviewValue } from "../transcript/TranscriptProjection.js";
 
 export const DEFAULT_ORCHESTRATOR_CONVERSATION_ID = "orchestrator-default";
 
@@ -299,7 +299,7 @@ function projectOrchestratorConversationRealtimeMessage(message: OrchestratorCon
     conversationId: message.conversationId,
     who: message.role === "user" ? "user" : "agent",
     role: message.role,
-    text: message.body,
+    text: sanitizedPreviewValue(message.body, 10_000).preview ?? "",
     status: message.status,
     createdAt: message.createdAt,
     updatedAt: message.updatedAt,
