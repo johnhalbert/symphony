@@ -316,11 +316,16 @@ async function* tapEvents(
 class InstrumentedGatewayClient implements HermesGatewayClient {
   private readonly client = new UpstreamGatewayClient();
   private readonly seenProcesses = new WeakSet<ChildProcess>();
+  private closed = false;
 
   constructor(
     private readonly env: HermesGatewayEnvironment,
     private readonly diagnostics: DiagnosticLog,
-  ) {}
+  ) {
+    this.client.on("exit", () => {
+      this.closed = true;
+    });
+  }
 
   on(event: "event", listener: (event: GatewayEvent) => void): this;
   on(event: "exit", listener: (code: number | null) => void): this;
@@ -360,6 +365,7 @@ class InstrumentedGatewayClient implements HermesGatewayClient {
   }
 
   kill(reason?: string): void {
+    this.closed = true;
     this.diagnostics.write(`[gw] kill reason=${reason ?? "none"} ${this.transportState()}`);
     this.client.kill(reason);
     this.diagnostics.write(`[gw] kill returned ${this.transportState()}`);
@@ -367,6 +373,10 @@ class InstrumentedGatewayClient implements HermesGatewayClient {
 
   getLogTail(limit?: number): string {
     return this.client.getLogTail(limit);
+  }
+
+  isClosed(): boolean {
+    return this.closed;
   }
 
   private attachProcess(reason: string): void {

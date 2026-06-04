@@ -7,7 +7,8 @@ tracker:
   active_states:
     - Todo
     - In Progress
-  handoff_states: []
+  handoff_states:
+    - Manual Review
   terminal_states:
     - Done
     - Closed
@@ -62,7 +63,7 @@ workspace:
   source:
     kind: git_worktree
     repository: .
-    base_ref: main
+    base_ref: origin/main
     branch_template: "symphony/{{ issue.identifier }}"
     cleanup: refuse_dirty
 
@@ -71,6 +72,7 @@ agent:
   max_concurrent_agents: 5
   max_turns: 1
   max_retry_backoff_ms: 300000
+  max_infra_failures: 1
   require_labels:
     - dogfood-ready
   exclude_labels:
@@ -100,7 +102,7 @@ hermes:
   upstream_root: ./hermes/upstream-src
   templates_dir: ./hermes/templates
   provider: openai-codex
-  model: gpt-5.5
+  model: gpt-5.4
   auth:
     mode: managed_root
     providers:

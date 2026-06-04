@@ -229,6 +229,8 @@ export class HermesHarness implements AgentHarness {
       if (!lease.reusable) {
         await this.disposeLease(lease, "run_finished");
         await this.cleanupProfileAfterRun(ctx, lease, terminalStatus);
+      } else if (lease.client.isClosed()) {
+        this.retireLeaseAfterTransportExit(lease);
       }
     }
   }
@@ -250,7 +252,10 @@ export class HermesHarness implements AgentHarness {
     const freshLeaseId = reusable ? null : randomUUID();
     const key = reusable ? reusableLeaseKey(ctx) : `fresh:${freshLeaseId}`;
     const existing = reusable ? this.leases.get(key) : undefined;
-    if (existing && !existing.disposed) return existing;
+    if (existing && !existing.disposed) {
+      if (!existing.client.isClosed()) return existing;
+      this.retireLeaseAfterTransportExit(existing);
+    }
 
     const manager = this.effectiveProfileManager(ctx);
     const phase = currentRunPhase(ctx);
@@ -345,6 +350,10 @@ export class HermesHarness implements AgentHarness {
   }
 
   private async ensureGatewaySession(lease: HermesLease): Promise<string> {
+    if (lease.client.isClosed()) {
+      this.retireLeaseAfterTransportExit(lease);
+      throw new SymphonyError("agent_error", "Hermes gateway is closed");
+    }
     if (lease.gatewaySessionId) return lease.gatewaySessionId;
     const response = await this.gatewayRequest<{ session_id?: unknown }>(lease, "session.create", { cols: 120 }, lease.startupTimeoutMs);
     const gatewaySessionId = typeof response.session_id === "string" ? response.session_id : "";

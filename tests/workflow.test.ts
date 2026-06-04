@@ -242,22 +242,33 @@ Work on {{ issue.identifier }}.
     }
   });
 
-  it("parses bounded SDK error retry configuration", () => {
+  it("parses bounded SDK retry and infrastructure failure configuration", () => {
     const config = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
-        agent: { max_sdk_error_retries: 4 },
+        agent: { max_sdk_error_retries: 4, max_infra_failures: 1 },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
     );
 
     expect(config.agent.maxSdkErrorRetries).toBe(4);
+    expect(config.agent.maxInfraFailures).toBe(1);
     expect(() =>
       parseServiceConfig(
         {
           tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
           agent: { max_sdk_error_retries: -1 },
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow(SymphonyError);
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          agent: { max_infra_failures: 0 },
         },
         "/repo/WORKFLOW.md",
         { LINEAR_API_KEY: "secret" },
@@ -1354,7 +1365,7 @@ Work on {{ issue.identifier }}.
     expect(config.github.app?.privateKeyPath?.replace(/\\/g, "/")).toMatch(/\/tmp\/github-app-private-key\.pem$/);
     expect(config.server.openWorkspaceToken).toBe("workspace-secret");
     expect(config.hermes.provider).toBe("openai-codex");
-    expect(config.hermes.model).toBe("gpt-5.5");
+    expect(config.hermes.model).toBe("gpt-5.4");
     expect(config.hermes.auth).toMatchObject({
       mode: "managed_root",
       providers: ["openai-codex"],
@@ -1362,11 +1373,16 @@ Work on {{ issue.identifier }}.
     expect(config.hermes.workerSessionLifecycle).toBe("reuse_by_issue");
     expect(config.hermes.keepProfiles).toBe("failed");
     expect(config.agent.protectedPaths).toContain("hermes/src/**");
-    for (const template of ["worker", "reviewer", "planner"]) {
+    const expectedReasoningEffortByTemplate = new Map([
+      ["worker", "high"],
+      ["reviewer", "xhigh"],
+      ["planner", "xhigh"],
+    ]);
+    for (const [template, expectedReasoningEffort] of expectedReasoningEffortByTemplate) {
       const templateConfig = YAML.parse(
         await readFile(path.resolve("hermes", "templates", template, "config.yaml"), "utf8"),
       ) as { agent?: { reasoning_effort?: unknown } };
-      expect(templateConfig.agent?.reasoning_effort).toBe("xhigh");
+      expect(templateConfig.agent?.reasoning_effort).toBe(expectedReasoningEffort);
     }
   });
 

@@ -161,6 +161,10 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   getLogTail(): string {
     return "";
   }
+
+  isClosed(): boolean {
+    return false;
+  }
 }
 
 async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {

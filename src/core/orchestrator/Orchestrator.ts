@@ -2000,6 +2000,15 @@ export class Orchestrator {
         this.claimed.delete(issueId);
         return;
       }
+      const infraFailures = await this.consecutiveInfraFailures(entry.issue);
+      if (infraFailures >= this.config.agent.maxInfraFailures) {
+        await this.escalateEntryBlocked(
+          entry,
+          `consecutive harness infrastructure failures reached limit (${infraFailures} failures; max_infra_failures=${this.config.agent.maxInfraFailures})`,
+        );
+        this.claimed.delete(issueId);
+        return;
+      }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
       this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error, entry.runPhase);
@@ -2070,6 +2079,20 @@ export class Orchestrator {
     let count = 0;
     for (const run of workerRuns.slice().reverse()) {
       if (!isCountedSdkWaitErrorFailure(run)) break;
+      count += 1;
+    }
+    return count;
+  }
+
+  private async consecutiveInfraFailures(issue: Issue): Promise<number> {
+    const runs = (await this.options.runStore?.listRunsForIssue(issue.id)) ?? [];
+    const seen = new Set<string>();
+    const workerRuns = runs
+      .filter((run) => run.role === "worker" && !seen.has(run.runId) && seen.add(run.runId))
+      .sort(compareRunChronology);
+    let count = 0;
+    for (const run of workerRuns.slice().reverse()) {
+      if (!isCountedInfraFailure(run)) break;
       count += 1;
     }
     return count;
@@ -3687,6 +3710,33 @@ function isCountedSdkWaitErrorFailure(run: RunRecord): boolean {
     run.cancelFailed !== true &&
     run.error !== OPERATOR_REJECTED_PUBLICATION_ERROR
   );
+}
+
+const INFRA_FAILURE_DIAGNOSTIC_CODES = new Set([
+  "hermes_gateway_exit",
+  "hermes_run_error",
+  "hermes_gateway_start_timeout",
+  "hermes_gateway_protocol_error",
+  "hermes_gateway_error",
+  "hermes_acp_run_error",
+]);
+
+function isCountedInfraFailure(run: RunRecord): boolean {
+  return (
+    run.role === "worker" &&
+    run.status === "failed" &&
+    run.completedAt !== null &&
+    run.cancellationRequestedAt == null &&
+    (run.cancellationOutcome ?? "none") === "none" &&
+    run.cancelFailed !== true &&
+    run.error !== OPERATOR_REJECTED_PUBLICATION_ERROR &&
+    run.failureKind === "harness_diagnostic" &&
+    isInfraFailureDiagnosticCode(run.failureDiagnosticCode)
+  );
+}
+
+function isInfraFailureDiagnosticCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && INFRA_FAILURE_DIAGNOSTIC_CODES.has(code);
 }
 
 function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {

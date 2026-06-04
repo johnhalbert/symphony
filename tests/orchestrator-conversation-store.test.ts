@@ -104,6 +104,27 @@ describe("FileOrchestratorConversationStore", () => {
     });
   });
 
+  it("bounds realtime projection message text to the public chat preview limit", async () => {
+    const store = new FileOrchestratorConversationStore(root);
+    const changes: unknown[] = [];
+    const unsubscribe = store.onProjectionChanged((event) => changes.push(event.detail));
+
+    await store.appendMessage({
+      id: "large-message",
+      role: "assistant",
+      body: "A".repeat(12_000),
+      status: "completed",
+    });
+    unsubscribe();
+
+    const detail = changes.at(-1) as { chat?: Array<{ text?: unknown }> } | undefined;
+    const text = detail?.chat?.[0]?.text;
+    expect(typeof text).toBe("string");
+    expect((text as string).length).toBeLessThanOrEqual(10_000);
+    expect(text).toMatch(/\.\.\.\[truncated\]$/);
+    expect(text).not.toBe("A".repeat(12_000));
+  });
+
   it("supports status changes and server/system roles", async () => {
     const store = new FileOrchestratorConversationStore(root);
 

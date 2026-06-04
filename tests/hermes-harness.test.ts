@@ -255,6 +255,33 @@ describe("HermesHarness", () => {
     delete process.env.HERMES_TEST_TOKEN;
   });
 
+  it("does not reuse a reusable worker lease after the gateway exits between runs", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
+        clients.push(client);
+        return client;
+      },
+    });
+
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const first = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "first worker prompt"));
+    clients[0]?.closeTransport(0);
+    const second = await collect(harness.run(context(config, { workspacePath, turnNumber: 2 }), "second worker prompt"));
+
+    expect(first.map((event) => event.type)).toContain("completed");
+    expect(second.map((event) => event.type)).toContain("completed");
+    expect(clients).toHaveLength(2);
+    expect(clients[0]?.requests.filter((request) => request.method === "prompt.submit")).toHaveLength(1);
+    expect(clients[1]?.requests.find((request) => request.method === "prompt.submit")?.params.session_id).toBe("gw-2");
+  });
+
   it("submits the prompt before yielding session_started to avoid the Hermes deferred-build race", async () => {
     const clients: FakeGatewayClient[] = [];
     const harness = new HermesHarness({
@@ -432,6 +459,7 @@ describe("HermesHarness", () => {
 class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   readonly requests: Array<{ method: string; params: Record<string, unknown> }> = [];
   readonly killed: string[] = [];
+  private closed = false;
 
   constructor(
     readonly env: HermesGatewayEnvironment,
@@ -464,12 +492,13 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   }
 
   async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+    if (this.closed) throw new Error("gateway exited (0)");
     this.requests.push({ method, params });
     if (method === "session.create") return { session_id: this.sessionId } as T;
     if (method === "prompt.submit") {
       if (this.options.promptError) throw this.options.promptError;
       if (this.options.exitOnPrompt) {
-        queueMicrotask(() => this.emit("exit", 0));
+        queueMicrotask(() => this.closeTransport(0));
         return { ok: true } as T;
       }
       queueMicrotask(() => {
@@ -495,11 +524,21 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   }
 
   kill(reason?: string): void {
+    this.closed = true;
     this.killed.push(reason ?? "");
   }
 
   getLogTail(): string {
     return this.options.logTail ?? "";
+  }
+
+  isClosed(): boolean {
+    return this.closed;
+  }
+
+  closeTransport(code: number | null): void {
+    this.closed = true;
+    this.emit("exit", code);
   }
 }
 

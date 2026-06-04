@@ -2022,6 +2022,74 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("blocks after consecutive worker infrastructure failures reach the configured cap", async () => {
+    const config = testConfig(root);
+    config.agent.maxInfraFailures = 1;
+    config.agent.maxRetryBackoffMs = 0;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 0);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const harness = new InfraFailureHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => currentState === "Blocked" && orchestrator.snapshot().counts.retrying === 0, "infra failure escalation");
+    } finally {
+      await orchestrator.stop();
+    }
+
+    expect(harness.runs).toEqual(["infra-error-run-1"]);
+    const runs = await runStore.listRunsForIssue(candidate.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      runId: "infra-error-run-1",
+      status: "failed",
+      failureKind: "harness_diagnostic",
+      failureDiagnosticCode: "hermes_gateway_exit",
+    });
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Blocked"]);
+    expect(writer.comments.at(-1)?.body).toContain(
+      "consecutive harness infrastructure failures reached limit (1 failures; max_infra_failures=1)",
+    );
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "consecutive harness infrastructure failures reached limit (1 failures; max_infra_failures=1)",
+    });
+  });
+
   it.each([
     ["setup-incomplete", PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON],
     ["awaiting operator", PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON],
@@ -2282,7 +2350,7 @@ describe("Orchestrator", () => {
 
     try {
       await orchestrator.refreshNow();
-      await waitFor(() => orchestrator.snapshot().running[0]?.runId !== null, "worker run start");
+      await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
       await lifecycleStore.ensureIssue(
         candidate,
@@ -7334,6 +7402,24 @@ class SdkWaitErrorHarness implements AgentHarness {
       payload: { runId },
     };
     yield { type: "failed", error: "Cursor run failed" };
+  }
+}
+
+class InfraFailureHarness implements AgentHarness {
+  readonly id = "infra-failure";
+  readonly runs: string[] = [];
+
+  async *run(): AsyncIterable<AgentEvent> {
+    const runId = `infra-error-run-${this.runs.length + 1}`;
+    this.runs.push(runId);
+    yield { type: "session_started", sessionId: `session-${runId}`, runId };
+    yield {
+      type: "run_diagnostic",
+      code: "hermes_gateway_exit",
+      message: "Hermes gateway exited before the run completed (code 0)",
+      payload: { runId, gatewayExitCode: 0 },
+    };
+    yield { type: "failed", error: "Hermes gateway exited before the run completed (code 0)" };
   }
 }
 
