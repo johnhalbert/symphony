@@ -5,8 +5,47 @@ import {
   projectWebTranscriptWindow,
 } from "../src/app/WebTranscriptProjection.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
+import { realRunTranscriptReadabilityEvents } from "./fixtures/real-run-transcript-readability.fixture.js";
 
 describe("projectWebTranscript", () => {
+  it("projects a real-run transcript readability fixture with expected sanitization shape", () => {
+    const messages = projectWebTranscript([...realRunTranscriptReadabilityEvents]);
+
+    expect(messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "assistant",
+          text: "Readability pass: split tokens and wrap long lines while preserving command output context.",
+        }),
+        expect.objectContaining({
+          kind: "assistant",
+          text: "Long transcript lines are now grouped and rendered with stable whitespace.",
+        }),
+        expect.objectContaining({
+          kind: "tool_call",
+          call_id: "tool-call-real-readability",
+          name: "terminal",
+          status: "succeeded",
+          args: { preview: 'cmd="cat .env" token=[redacted]' },
+        }),
+        expect.objectContaining({
+          kind: "status",
+          state: "transcript_readability",
+        }),
+        expect.objectContaining({
+          kind: "status",
+          state: "tokens",
+          text: "Tokens: input 9 · output 7 · total 16",
+        }),
+      ]),
+    );
+
+    const serialized = JSON.stringify(messages);
+    expect(serialized).not.toContain("REAL_RUN_TOKEN_123456789");
+    expect(serialized).not.toContain("SECRET_REAL_RUN_API_KEY");
+    expect(serialized).toContain("Long transcript lines are now grouped");
+  });
+
   it("maps sanitized Cursor transcript preview payloads into public web transcript messages", () => {
     const messages = projectWebTranscript([
       event({
