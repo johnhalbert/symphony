@@ -71,7 +71,7 @@ export function applyTranscriptDeltaEvent({
     }
     expectedSequence = Math.max(expectedSequence, afterSequence);
   } else if (expectedSequence === null && afterSequence !== null) {
-    if (current.length === 0 && afterSequence > 0) return { action: "fallback", reason: "gap", lastRevision: event.revision, lastSequence };
+    if (afterSequence > 0) return { action: "fallback", reason: "gap", lastRevision: event.revision, lastSequence };
     expectedSequence = afterSequence;
   }
 

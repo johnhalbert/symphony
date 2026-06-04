@@ -211,6 +211,72 @@ describe("useSymphonyData realtime direct patching", () => {
     expect(probe.result().data).toEqual(refetched);
   });
 
+  it("refetches instead of appending when a running transcript tail still contains only run prelude messages", async () => {
+    let listener: RealtimeEventListener | null = null;
+    const invalidateCachedReads = vi.fn();
+    const preludeOnly: TranscriptMessage[] = [
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.000Z",
+        model: "gpt-5.4",
+        cwd: "/workspace",
+        workspace: "/workspace",
+        session: "session-1",
+        tools: ["terminal"],
+        note: "System prelude",
+      },
+      {
+        kind: "user",
+        ts: "2026-01-01T00:00:00.500Z",
+        from: "worker",
+        issue: "ENG-225",
+        text: "Fix the transcript gap.",
+      },
+    ];
+    const refetched: TranscriptMessage[] = [
+      ...preludeOnly,
+      { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "missed earlier row" },
+      { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "visible after gap" },
+    ];
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(preludeOnly, {
+          runStatus: "running",
+          lastSequence: null,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      )
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(refetched, {
+          runStatus: "running",
+          lastSequence: 2,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      );
+
+    const dataSource = testDataSource({
+      getTranscript,
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(nextListener) {
+        listener = nextListener;
+        return () => undefined;
+      },
+    });
+    const probe = renderTranscriptProbe(dataSource);
+    await flushPromises();
+
+    expect(probe.result()).toMatchObject({ data: preludeOnly, loading: false, error: null });
+    expect(getTranscript).toHaveBeenCalledTimes(1);
+
+    act(() => listener?.(transcriptEvent(2, 1, "visible after gap")));
+    await flushPromises();
+
+    expect(invalidateCachedReads).toHaveBeenCalledWith({ forceRefreshHrefs: ["/api/v1/web/sessions/session-1/transcript?refresh=1"] });
+    expect(getTranscript).toHaveBeenCalledTimes(2);
+    expect(probe.result().data).toEqual(refetched);
+  });
+
   it("keeps a selected 500-event transcript tail live patched without shrinking or refetching", async () => {
     let listener: RealtimeEventListener | null = null;
     const initial: TranscriptMessage[] = Array.from({ length: 500 }, (_, index) => ({
