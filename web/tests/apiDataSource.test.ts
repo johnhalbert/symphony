@@ -665,6 +665,38 @@ describe("API data source", () => {
     expect(resumedEventSource?.closed).toBe(true);
   });
 
+  it("ignores stale events from a closed realtime EventSource after reconnecting", () => {
+    vi.useFakeTimers();
+    FakeEventSource.instances = [];
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    const events: RealtimeProjectionEvent[] = [];
+    const dataSource = createApiDataSource("/status-server/");
+
+    const unsubscribe = dataSource.subscribeToRealtimeEvents?.((event) => events.push(event));
+    const firstEventSource = FakeEventSource.instances[0];
+    firstEventSource?.emitOpen();
+    const firstEvent = realtimeEvent({ id: "first-1", revision: 1 });
+    firstEventSource?.emit("projection.updated", JSON.stringify(firstEvent), { lastEventId: "first-1" });
+    expect(events).toEqual([firstEvent]);
+
+    firstEventSource?.emitError(FakeEventSource.CLOSED);
+    vi.advanceTimersByTime(5_000);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    const resumedEventSource = FakeEventSource.instances[1];
+    expect(resumedEventSource?.url).toBe("/status-server/api/v1/realtime?lastEventId=first-1");
+
+    const staleClosedSourceEvent = realtimeEvent({ id: "stale-2", revision: 2 });
+    firstEventSource?.emit("projection.updated", JSON.stringify(staleClosedSourceEvent), { lastEventId: "stale-2" });
+    expect(events).toEqual([firstEvent]);
+
+    const resumedEvent = realtimeEvent({ id: "resumed-2", revision: 2 });
+    resumedEventSource?.emit("projection.updated", JSON.stringify(resumedEvent), { lastEventId: "resumed-2" });
+    unsubscribe?.();
+
+    expect(events).toEqual([firstEvent, resumedEvent]);
+    expect(resumedEventSource?.closed).toBe(true);
+  });
+
   it("cancels pending realtime reconnect when the final subscriber unsubscribes", () => {
     vi.useFakeTimers();
     FakeEventSource.instances = [];

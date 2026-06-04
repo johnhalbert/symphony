@@ -277,6 +277,110 @@ describe("useSymphonyData realtime direct patching", () => {
     expect(probe.result().data).toEqual(refetched);
   });
 
+  it("ignores transcript deltas for other sessions without refetching or corrupting selected state", async () => {
+    let listener: RealtimeEventListener | null = null;
+    const invalidateCachedReads = vi.fn();
+    const initial: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "selected session" }];
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(initial, {
+          runStatus: "running",
+          lastSequence: 1,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      );
+
+    const dataSource = testDataSource({
+      getTranscript,
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(nextListener) {
+        listener = nextListener;
+        return () => undefined;
+      },
+    });
+    const probe = renderTranscriptProbe(dataSource);
+    await flushPromises();
+
+    expect(probe.result()).toMatchObject({ data: initial, loading: false, error: null });
+    expect(getTranscript).toHaveBeenCalledTimes(1);
+
+    const otherSessionPayload: RealtimeProjectionEvent<"transcript.delta">["payload"] = {
+      source: "runs",
+      sourceRevision: 2,
+      detail: null,
+      runId: "run-2",
+      sessionId: "session-2",
+      afterSequence: 1,
+      eventCount: 1,
+      messages: [{ sequence: 2, message: { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "other session" } }],
+    };
+    act(() =>
+      listener?.(
+        transcriptEvent(2, 1, "other session", {
+          id: "transcript-other-session",
+          key: "session-2",
+          payload: otherSessionPayload,
+        }),
+      ),
+    );
+
+    expect(probe.result().data).toEqual(initial);
+    expect(getTranscript).toHaveBeenCalledTimes(1);
+    expect(invalidateCachedReads).not.toHaveBeenCalled();
+  });
+
+  it("refetches the selected transcript when a direct-patch SSE event reports missed events", async () => {
+    let listener: RealtimeEventListener | null = null;
+    const invalidateCachedReads = vi.fn();
+    const initial: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "loaded" }];
+    const refetched: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:03.000Z", text: "refetched after reconnect gap" }];
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(initial, {
+          runStatus: "running",
+          lastSequence: 1,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      )
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse(refetched, {
+          runStatus: "running",
+          lastSequence: 2,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      );
+    const dataSource = testDataSource({
+      getTranscript,
+      invalidateCachedReads,
+      subscribeToRealtimeEvents(nextListener) {
+        listener = nextListener;
+        return () => undefined;
+      },
+    });
+    const probe = renderTranscriptProbe(dataSource);
+    await flushPromises();
+
+    expect(probe.result()).toMatchObject({ data: initial, loading: false, error: null });
+    expect(getTranscript).toHaveBeenCalledTimes(1);
+
+    act(() =>
+      listener?.(
+        transcriptEvent(2, 1, "missed delta", {
+          id: "transcript-missed-2",
+          missedEvents: true,
+          recovery: { strategy: "refetch", reason: "missed-events", lastEventId: "transcript-1", endpoints: ["/api/v1/web/sessions/{sessionId}/transcript"] },
+        }),
+      ),
+    );
+    await flushPromises();
+
+    expect(invalidateCachedReads).toHaveBeenCalledWith({ forceRefreshHrefs: ["/api/v1/web/sessions/session-1/transcript?refresh=1"] });
+    expect(getTranscript).toHaveBeenCalledTimes(2);
+    expect(probe.result().data).toEqual(refetched);
+  });
+
   it("keeps a selected 500-event transcript tail live patched without shrinking or refetching", async () => {
     let listener: RealtimeEventListener | null = null;
     const initial: TranscriptMessage[] = Array.from({ length: 500 }, (_, index) => ({

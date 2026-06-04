@@ -627,6 +627,7 @@ describe("HermesAcpHarness", () => {
         cwd: ctx.workspace.path,
         timeoutMs: 1_000,
         sourceProfile: "host-source",
+        reservedProfileNames: ["host-source"],
         keepProfiles: "never",
         nameInput: expect.objectContaining({
           workspaceKey: "ENG-139",

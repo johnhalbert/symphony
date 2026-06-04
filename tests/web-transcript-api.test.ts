@@ -224,6 +224,71 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("normalizes incomplete durable transcript window envelopes before returning explicit pages", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "envelope-run", sessionId: "envelope-session", issueIdentifier: "TEST-1" });
+    const durableMessages = [{ kind: "assistant", text: "durable page event" }];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 0,
+          limit: 1,
+          size: 1,
+          total: 1,
+          nextOffset: null,
+          previousOffset: null,
+          hasNext: false,
+          hasPrevious: false,
+          firstSequence: null,
+          lastSequence: null,
+          lastEventAt: null,
+        },
+        window: {
+          kind: "page",
+          tailLimit: 1,
+          messageCount: 1,
+          requested: { offset: 0, limit: 1 },
+        },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [{ source: "runStore", revision: runStore.projectionRevision(), observedAt: null }],
+    );
+    const server = createServer(config, runStore, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/envelope-run/transcript?offset=0&limit=1`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(body).toMatchObject({
+        window: {
+          kind: "page",
+          requested: { offset: 0, limit: 1 },
+          tailLimit: 1,
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          afterSequence: null,
+          tailLimit: 1,
+          runStatus: "running",
+        },
+        recovery: {
+          strategy: "refetch",
+          reason: "tail-gap",
+        },
+      });
+      expect(projectionReader.selectors).toEqual([
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "envelope-run:offset:0:limit:1" },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("honors explicit bounded transcript pagination", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);

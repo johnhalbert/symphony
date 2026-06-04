@@ -186,7 +186,19 @@ export function emptyWebTranscriptProjectionPayload(input: {
 export function isWebTranscriptProjectionPayload(value: unknown): value is WebTranscriptProjectionPayload {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return record.schemaVersion === WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION && Array.isArray(record.messages) && record.compatibility !== undefined;
+  return (
+    record.schemaVersion === WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION &&
+    Array.isArray(record.messages) &&
+    isObjectRecord(record.page) &&
+    isObjectRecord(record.window) &&
+    isObjectRecord(record.activeTail) &&
+    isObjectRecord(record.recovery) &&
+    isObjectRecord(record.compatibility)
+  );
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function webTranscriptWindowPageModel(page: TranscriptPage): WebTranscriptWindowPageModel {

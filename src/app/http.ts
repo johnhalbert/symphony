@@ -3391,28 +3391,43 @@ function webTranscriptProjectionResponseBody(
   },
 ): WebTranscriptProjectionPayload {
   if (isWebTranscriptProjectionPayload(body)) return body;
-  const messages = Array.isArray(body) ? (body as WebTranscriptMessage[]) : [];
+  const record = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
+  const pageRecord = record?.page && typeof record.page === "object" && !Array.isArray(record.page) ? (record.page as Record<string, unknown>) : null;
+  const windowRecord = record?.window && typeof record.window === "object" && !Array.isArray(record.window) ? (record.window as Record<string, unknown>) : null;
+  const messages = Array.isArray(body)
+    ? (body as WebTranscriptMessage[])
+    : Array.isArray(record?.messages)
+      ? (record.messages as WebTranscriptMessage[])
+      : [];
   const cursor = input.sourceCursors ?? {};
-  const offset = optionalNumber(cursor.offset) ?? input.requestedPage?.offset ?? 0;
-  const limit = optionalNumber(cursor.limit) ?? input.limit;
-  const nextOffset = optionalNumber(cursor.nextOffset);
-  const previousOffset = optionalNumber(cursor.previousOffset) ?? (offset > 0 ? Math.max(0, offset - limit) : null);
-  const kind = cursor.windowKind === "tail" || cursor.windowKind === "page" ? cursor.windowKind : input.requestedPage ? "page" : "tail";
+  const offset = optionalNumber(pageRecord?.offset) ?? optionalNumber(cursor.offset) ?? input.requestedPage?.offset ?? 0;
+  const limit = optionalNumber(pageRecord?.limit) ?? optionalNumber(cursor.limit) ?? input.limit;
+  const nextOffset = optionalNumber(pageRecord?.nextOffset) ?? optionalNumber(cursor.nextOffset);
+  const previousOffset =
+    optionalNumber(pageRecord?.previousOffset) ??
+    optionalNumber(cursor.previousOffset) ??
+    (offset > 0 ? Math.max(0, offset - limit) : null);
+  const kind =
+    (windowRecord?.kind === "tail" || windowRecord?.kind === "page"
+      ? windowRecord.kind
+      : cursor.windowKind === "tail" || cursor.windowKind === "page"
+        ? cursor.windowKind
+        : null) ?? (input.requestedPage ? "page" : "tail");
   const page: TranscriptPage = {
     runId: input.run?.runId ?? input.runId,
     offset,
     limit,
     nextOffset,
     events: [],
-    total: optionalNumber(cursor.total),
-    eventCount: optionalNumber(cursor.eventCount) ?? messages.length,
+    total: optionalNumber(pageRecord?.total) ?? optionalNumber(cursor.total),
+    eventCount: optionalNumber(pageRecord?.size) ?? optionalNumber(cursor.eventCount) ?? messages.length,
     previousOffset,
-    hasNext: optionalBoolean(cursor.hasNext) ?? nextOffset !== null,
-    hasPrevious: optionalBoolean(cursor.hasPrevious) ?? previousOffset !== null,
+    hasNext: optionalBoolean(pageRecord?.hasNext) ?? optionalBoolean(cursor.hasNext) ?? nextOffset !== null,
+    hasPrevious: optionalBoolean(pageRecord?.hasPrevious) ?? optionalBoolean(cursor.hasPrevious) ?? previousOffset !== null,
     windowKind: kind,
-    firstSequence: optionalNumber(cursor.firstSequence),
-    lastSequence: optionalNumber(cursor.lastSequence),
-    lastEventAt: optionalString(cursor.lastEventAt),
+    firstSequence: optionalNumber(pageRecord?.firstSequence) ?? optionalNumber(cursor.firstSequence),
+    lastSequence: optionalNumber(pageRecord?.lastSequence) ?? optionalNumber(cursor.lastSequence),
+    lastEventAt: optionalString(pageRecord?.lastEventAt) ?? optionalString(cursor.lastEventAt),
   };
   return projectWebTranscriptWindow(page, messages, {
     run: input.run,
