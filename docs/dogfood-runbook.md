@@ -68,7 +68,7 @@ hermes profile
 hermes acp --check
 ```
 
-Configure `hermes_acp.binary_path` when the intended host `hermes` is not first on `PATH`. Configure `hermes_acp.source_profile` when the source profile should be a specific host profile rather than the active profile, and optionally configure `hermes_acp.profile_prefix` to identify Symphony-created clones. The older `hermes.acp_binary_path`, `hermes.acp_source_profile`, and `hermes.acp_profile_prefix` aliases remain accepted for compatibility, but new workflows should use the `hermes_acp` section. The source profile must already be authenticated for the configured provider/model, must pass `hermes acp --check` without interactive terminal setup, and must be safe to clone with `hermes profile create <disposable> --clone --clone-from <source> --no-alias`.
+Configure `hermes_acp.binary_path` when the intended host `hermes` is not first on `PATH`. Configure `hermes_acp.source_profile` when the source profile should be a specific host profile rather than the active profile, and optionally configure `hermes_acp.profile_prefix` to identify Symphony-created clones. The older `hermes.acp_binary_path`, `hermes.acp_source_profile`, and `hermes.acp_profile_prefix` aliases remain accepted for compatibility, but new workflows should use the `hermes_acp` section. The source profile must already be authenticated for the configured provider/model, must pass `hermes acp --check` without interactive terminal setup, and must be safe to clone with `hermes profile create <disposable> --clone --clone-from <source> --no-alias`. For the deeper source-profile selection/creation contract, see the [Hermes ACP integration spec profile lifecycle](./hermes-acp-integration-spec.md#profile-lifecycle), its [ACP validation plan](./hermes-acp-integration-spec.md#validation-plan), and the related implementation issues [ENG-136](https://linear.app/john-halbert/issue/ENG-136) (host ACP runtime harness) and [ENG-143](https://linear.app/john-halbert/issue/ENG-143) (ACP smoke coverage and operator docs).
 
 #### Operator setup checklist (before ACP dispatch)
 
@@ -173,7 +173,7 @@ Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable 
 
 ### ACP final live validation checklist
 
-Before removing `dogfood-blocked` from Hermes ACP dogfood issues, record the following evidence in the operator notes or issue comments:
+Before removing `dogfood-blocked` from Hermes ACP dogfood issues, record the following evidence in the operator notes or issue comments. This checklist is the operator-facing condensation of the [Hermes ACP integration spec validation plan](./hermes-acp-integration-spec.md#validation-plan) and the earlier implementation tickets [ENG-136](https://linear.app/john-halbert/issue/ENG-136) / [ENG-143](https://linear.app/john-halbert/issue/ENG-143).
 
 - `hermes --version`, `hermes profile`, `hermes acp --check`, and `hermes -p <source> acp --check` succeeded for the intended host source profile.
 - `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded and reported a deleted disposable profile.
