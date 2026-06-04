@@ -126,9 +126,11 @@ Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable 
 
 Before removing `dogfood-blocked` from Hermes ACP dogfood issues, record the following evidence in the operator notes or issue comments:
 
+- `npm run typecheck`, `npm test`, `npm run doctor -- --strict`, `npm run doctor -- --strict --live-runtime`, and `npm run smoke:hermes-local` succeeded for the same checkout/host environment so the default Hermes TUI path is still healthy before any ACP-only unblock decision.
 - `hermes --version`, `hermes profile`, `hermes acp --check`, and `hermes -p <source> acp --check` succeeded for the intended host source profile.
 - `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded and reported a deleted disposable profile.
 - The smoke response contained the expected text, the prompt stopped with a normal stop reason, and the ACP session id was recorded.
+- Any terminal/edit permission request raised during the ACP smoke was captured with the observed allow/deny result, and unexpected requests stayed fail-closed until an operator explicitly approved them.
 - The active host profile before and after the smoke matched; the source profile was not renamed, selected, deleted, or used directly as the disposable smoke profile.
 - No retained disposable profile with the configured `hermes_acp.profile_prefix` (or the operator-selected `--profile-prefix`/`--profile-name`) remains unless an operator intentionally used `--keep-profile` for troubleshooting and tracked the cleanup.
 - Default validation remains non-ACP unless the operator explicitly runs this smoke; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
