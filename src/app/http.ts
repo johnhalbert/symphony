@@ -780,7 +780,7 @@ export class StatusServer {
         const transcriptPayload = projectWebTranscriptWindow(transcriptPage, transcript, {
           run,
           requestedPage: requestedTranscriptPage,
-          tailLimit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT,
+          tailLimit: transcriptPage.limit,
           kind: requestedTranscriptPage ? "page" : "tail",
         });
         await this.persistWebTranscriptProjection(run, transcriptPage, transcriptPayload);
@@ -1600,7 +1600,7 @@ export class StatusServer {
     const transcript = projectWebTranscript(page.events, { run });
     const transcriptPayload = projectWebTranscriptWindow(page, transcript, {
       run,
-      tailLimit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT,
+      tailLimit: page.limit,
       kind: page.windowKind ?? "page",
       requestedPage: page.windowKind === "tail" ? null : { offset: page.offset, limit: page.limit },
     });
@@ -3417,7 +3417,7 @@ function webTranscriptProjectionResponseBody(
   return projectWebTranscriptWindow(page, messages, {
     run: input.run,
     requestedPage: input.requestedPage,
-    tailLimit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT,
+    tailLimit: limit,
     kind,
   });
 }

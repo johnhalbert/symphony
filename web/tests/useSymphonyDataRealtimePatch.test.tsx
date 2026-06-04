@@ -9,7 +9,14 @@ import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat"
 import { createTranscriptWindowResponse } from "../src/data/transcriptWindow";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
 import { useOrchestratorChat, useTranscript } from "../src/hooks/useSymphonyData";
-import type { ChatMessage, Loadable, OrchestratorChatModel, TranscriptMessage, TranscriptWindowResponse } from "../src/types/symphony";
+import type {
+  ChatMessage,
+  Loadable,
+  OrchestratorChatModel,
+  TranscriptMessage,
+  TranscriptRequestOptions,
+  TranscriptWindowResponse,
+} from "../src/types/symphony";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -163,7 +170,11 @@ describe("useSymphonyData realtime direct patching", () => {
     const invalidateCachedReads = vi.fn();
     const initial: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "loaded" }];
     const refetched: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:05.000Z", text: "refetched after gap" }];
-    const getTranscript = vi.fn<(_: string, signal?: AbortSignal) => Promise<TranscriptWindowResponse>>()
+    const getTranscript = vi.fn<(
+      _: string,
+      signal?: AbortSignal,
+      __options?: TranscriptRequestOptions,
+    ) => Promise<TranscriptWindowResponse>>()
       .mockResolvedValueOnce(
         createTranscriptWindowResponse(initial, {
           runStatus: "running",
@@ -210,7 +221,11 @@ describe("useSymphonyData realtime direct patching", () => {
       ts: `2026-01-01T00:00:${String(index % 60).padStart(2, "0")}.000Z`,
       text: `event-${index + 1}`,
     }));
-    const getTranscript = vi.fn<(_: string, signal?: AbortSignal) => Promise<TranscriptWindowResponse>>().mockResolvedValueOnce(
+    const getTranscript = vi.fn<(
+      _: string,
+      signal?: AbortSignal,
+      __options?: TranscriptRequestOptions,
+    ) => Promise<TranscriptWindowResponse>>().mockResolvedValueOnce(
       createTranscriptWindowResponse(initial, { runStatus: "running", lastSequence: 500 }),
     );
     const dataSource = testDataSource({
@@ -238,7 +253,11 @@ describe("useSymphonyData realtime direct patching", () => {
     let listener: RealtimeEventListener | null = null;
     const invalidateCachedReads = vi.fn();
     const initial: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "completed tail" }];
-    const getTranscript = vi.fn<(_: string, signal?: AbortSignal) => Promise<TranscriptWindowResponse>>().mockResolvedValueOnce(
+    const getTranscript = vi.fn<(
+      _: string,
+      signal?: AbortSignal,
+      __options?: TranscriptRequestOptions,
+    ) => Promise<TranscriptWindowResponse>>().mockResolvedValueOnce(
       createTranscriptWindowResponse(initial, { runStatus: "succeeded", lastSequence: 1, refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1" }),
     );
     const dataSource = testDataSource({

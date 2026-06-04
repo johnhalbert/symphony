@@ -53,7 +53,7 @@ export function createTranscriptWindowResponse(
     window: {
       ...page,
       kind,
-      tailLimit: DEFAULT_TRANSCRIPT_TAIL_LIMIT,
+      tailLimit: limit,
       messageCount: messages.length,
       requested: { offset: kind === "tail" ? null : offset, limit },
     },
@@ -61,7 +61,7 @@ export function createTranscriptWindowResponse(
       enabled: activeTailEnabled,
       canAppend: activeTailEnabled,
       runStatus: input.runStatus ?? null,
-      tailLimit: DEFAULT_TRANSCRIPT_TAIL_LIMIT,
+      tailLimit: limit,
       afterSequence: lastSequence,
       lastEventAt,
       refetchHref,

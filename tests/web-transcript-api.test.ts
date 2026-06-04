@@ -173,10 +173,24 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const liveResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/active-run/transcript`);
       expect(liveResponse.status).toBe(200);
-      const liveBody = transcriptMessages(await liveResponse.json());
+      const liveBodyJson = await liveResponse.json();
+      const liveBody = transcriptMessages(liveBodyJson);
       expectRunPrelude(liveBody, { session: "active-session", issue: "TEST-1" });
       expect(liveBody.slice(2).map((message) => message.text)).toEqual(["live event 1", "live event 2"]);
       expect(liveBody.map((message) => message.text)).not.toContain("stale durable transcript");
+      expect(liveBodyJson).toMatchObject({
+        window: {
+          kind: "tail",
+          requested: { offset: null, limit: 500 },
+          tailLimit: 500,
+        },
+        activeTail: {
+          enabled: true,
+          canAppend: true,
+          tailLimit: 500,
+          runStatus: "running",
+        },
+      });
       expect(projectionReader.selectors).toEqual([]);
       expect(projectionWriter.writes.at(-1)).toMatchObject({
         projectionName: "transcript_projection",
@@ -187,7 +201,21 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
 
       const explicitResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/active-run/transcript?offset=0&limit=1`);
       expect(explicitResponse.status).toBe(200);
-      expect(transcriptMessages(await explicitResponse.json())).toEqual(durablePayload);
+      const explicitBody = await explicitResponse.json();
+      expect(transcriptMessages(explicitBody)).toEqual(durablePayload);
+      expect(explicitBody).toMatchObject({
+        window: {
+          kind: "page",
+          requested: { offset: 0, limit: 1 },
+          tailLimit: 1,
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          tailLimit: 1,
+          runStatus: "running",
+        },
+      });
       expect(projectionReader.selectors).toEqual([
         { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "active-run:offset:0:limit:1" },
       ]);
@@ -234,14 +262,40 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     try {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/query-run/transcript?offset=2&limit=9999`);
       expect(response.status).toBe(200);
-      const body = transcriptMessages(await response.json());
+      const responseBody = await response.json();
+      const body = transcriptMessages(responseBody);
       expectRunPrelude(body, { session: "query-session", issue: "TEST-1" });
       expect(body.slice(2).map((message) => message.text)).toEqual(["query event 3", "query event 4", "query event 5"]);
+      expect(responseBody).toMatchObject({
+        window: {
+          kind: "page",
+          requested: { offset: 2, limit: 1000 },
+          tailLimit: 1000,
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          tailLimit: 1000,
+          runStatus: "running",
+        },
+      });
 
       for (const query of ["?offset=&limit=", "?offset=bogus&limit=0", "?offset=-2&limit=-1"]) {
         const invalidResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/query-run/transcript${query}`);
         expect(invalidResponse.status).toBe(200);
-        const invalidBody = transcriptMessages(await invalidResponse.json());
+        const invalidBodyJson = await invalidResponse.json();
+        const invalidBody = transcriptMessages(invalidBodyJson);
+        expect(invalidBodyJson).toMatchObject({
+          window: {
+            requested: { offset: 0, limit: 500 },
+            tailLimit: 500,
+          },
+          activeTail: {
+            enabled: false,
+            canAppend: false,
+            tailLimit: 500,
+          },
+        });
         expectRunPrelude(invalidBody, { session: "query-session", issue: "TEST-1" });
         expect(invalidBody.slice(2).map((message) => message.text)).toEqual([
           "query event 1",
@@ -1012,9 +1066,15 @@ function expectEmptyTranscriptWindow(body: unknown, expected: { kind: "page" | "
     window: {
       kind: expected.kind,
       requested: { offset: expected.kind === "tail" ? null : 0, limit: expected.limit },
+      tailLimit: expected.limit,
       messageCount: 0,
     },
-    activeTail: { enabled: false, canAppend: false, afterSequence: null },
+    activeTail: {
+      enabled: false,
+      canAppend: false,
+      afterSequence: null,
+      tailLimit: expected.limit,
+    },
   });
 }
 
