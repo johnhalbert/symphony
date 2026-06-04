@@ -1356,6 +1356,9 @@ Work on {{ issue.identifier }}.
     expect(config.mergePolicy.mode).toBe("gated");
     expect(config.continuationContext.searchEnabled).toBe(false);
     expect(config.github.prHandoff.enabled).toBe(false);
+    expect(config.github.prHandoff.targetState).toBe("Manual Review");
+    expect(config.github.prHandoff.noCiAllowed).toBe(false);
+    expect(config.github.prHandoff.noCiEvidence).toBeNull();
     expect(config.github.token).toBeNull();
     expect(config.github.app).toMatchObject({
       appId: "12345",
