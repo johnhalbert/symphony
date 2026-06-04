@@ -23,7 +23,13 @@ import {
   runtimeHarnessDoctorChecks,
   trackerHandoffDoctorCheck,
 } from "../src/doctor.js";
-import { issue, testConfig } from "./helpers.js";
+import {
+  agentEligibleIssueContract,
+  fencedAuthoringSectionSpoof,
+  issue,
+  nestedFencedIssueContractSpoof,
+  testConfig,
+} from "./helpers.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 import type { HostHermesCommandRunner } from "../hermes/src/HostHermesDiscovery.js";
 
@@ -42,14 +48,29 @@ describe("doctor review-loop checks", () => {
       issueContractDoctorCheck(config, [
         issue({
           labels: ["dogfood-ready"],
-          description: completeAgentIssueContract(),
+          description: agentEligibleIssueContract(),
         }),
       ]),
     ).toEqual({
       id: "linear.issue_contract",
       status: "ok",
       message:
-        "1 agent-eligible candidate issue(s) include required authoring sections: Problem / Goal, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+        "1 agent-eligible candidate issue(s) include required authoring sections: Problem / Goal, Issue Contract, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+    });
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: fencedAuthoringSectionSpoof(),
+        }),
+      ]),
+    ).toMatchObject({
+      id: "linear.issue_contract",
+      status: "warn",
+      message: expect.stringContaining(
+        "TEST-1 missing Issue Contract, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+      ),
     });
 
     expect(
@@ -72,7 +93,66 @@ describe("doctor review-loop checks", () => {
       id: "linear.issue_contract",
       status: "warn",
       message:
-        "Agent-eligible issue(s) are missing required authoring sections: TEST-1 missing Touched Surfaces, Contract Checklist, Validation Requirements, Promotion Readiness",
+        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 missing Issue Contract, Touched Surfaces, Contract Checklist, Validation Requirements, Promotion Readiness",
+    });
+  });
+
+  it("warns when an agent-eligible issue has an invalid fenced JSON Issue Contract", () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.excludeLabels = ["dogfood-blocked"];
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: agentEligibleIssueContract({ issueContractRequirements: [{ id: "1", requirement: "   " }] }),
+        }),
+      ]),
+    ).toEqual({
+      id: "linear.issue_contract",
+      status: "warn",
+      message:
+        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 has an invalid Issue Contract (Issue Contract requirement ids must be stable non-empty identifiers (for example `REQ-001`); Issue Contract requirements must include non-empty `requirement` text)",
+    });
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: nestedFencedIssueContractSpoof(),
+        }),
+      ]),
+    ).toEqual({
+      id: "linear.issue_contract",
+      status: "warn",
+      message:
+        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 has an invalid Issue Contract (Issue Contract must contain a fenced `json` block)",
+    });
+  });
+
+  it("warns when an agent-eligible candidate issue declares protected workflow paths", () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.excludeLabels = ["dogfood-blocked"];
+    config.agent.protectedPaths = ["docs/dogfood-runbook.md", "src/core/workflow/**"];
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: agentEligibleIssueContract({
+            touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+            readyForDogfoodReady: "no",
+            remainingBlocker: "Manual operator implementation required for protected surface.",
+          }),
+        }),
+      ]),
+    ).toEqual({
+      id: "linear.issue_contract",
+      status: "warn",
+      message:
+        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 touches protected paths docs/dogfood-runbook.md and must remain manual-only instead of agent-eligible",
     });
   });
 
@@ -87,7 +167,7 @@ describe("doctor review-loop checks", () => {
       id: "linear.issue_contract",
       status: "warn",
       message:
-        "Agent-eligible issue(s) are missing required authoring sections: TEST-1 missing Problem / Goal, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 missing Problem / Goal, Issue Contract, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
     });
 
     expect(
@@ -1254,32 +1334,6 @@ async function withHostHermesAcpDoctorConfig(
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}
-
-function completeAgentIssueContract(): string {
-  return [
-    "## Problem / Goal",
-    "Do the work.",
-    "",
-    "## Touched Surfaces",
-    "- [X] Docs only",
-    "",
-    "## Acceptance Criteria",
-    "- Done.",
-    "",
-    "## Contract Checklist",
-    "- Happy path: covered.",
-    "- Negative/error path: covered.",
-    "",
-    "## Validation Requirements",
-    "- Run the narrow test.",
-    "",
-    "## Out Of Scope",
-    "- Nothing else.",
-    "",
-    "## Promotion Readiness",
-    "- Ready for `dogfood-ready`: no.",
-  ].join("\n");
 }
 
 function mcpToolsFor(command: string): string[] {

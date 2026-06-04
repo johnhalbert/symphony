@@ -47,3 +47,123 @@ export function issue(overrides: Partial<Issue> = {}): Issue {
     ...overrides,
   };
 }
+
+export function agentEligibleIssueContract(
+  overrides: {
+    problemGoal?: string;
+    includeIssueContract?: boolean;
+    issueContractJson?: string;
+    issueContractFenceLanguage?: string;
+    issueContractSchemaVersion?: number;
+    issueContractContractVersion?: string;
+    issueContractRequirements?: Array<{
+      id: string;
+      requirement: string;
+      proofHint?: string;
+    }>;
+    touchedSurfaces?: string[];
+    acceptanceCriteria?: string[];
+    contractChecklist?: string[];
+    validationRequirements?: string[];
+    outOfScope?: string[];
+    readyForDogfoodReady?: "yes" | "no";
+    remainingBlocker?: string;
+  } = {},
+): string {
+  const {
+    problemGoal = "Do the work.",
+    includeIssueContract = true,
+    issueContractJson,
+    issueContractFenceLanguage = "json",
+    issueContractSchemaVersion = 1,
+    issueContractContractVersion = "2026-06-04.1",
+    issueContractRequirements = [
+      {
+        id: "REQ-001",
+        requirement: "Complete the documented work.",
+        proofHint: "Focused validation covers the acceptance criteria.",
+      },
+    ],
+    touchedSurfaces = ["- [X] Docs only"],
+    acceptanceCriteria = ["- Done."],
+    contractChecklist = ["- Happy path: covered.", "- Negative/error path: covered."],
+    validationRequirements = ["- Run the narrow test."],
+    outOfScope = ["- Nothing else."],
+    readyForDogfoodReady = "yes",
+    remainingBlocker = readyForDogfoodReady === "yes" ? "none" : "Manual operator implementation required.",
+  } = overrides;
+
+  const renderedIssueContractJson =
+    issueContractJson ??
+    JSON.stringify(
+      {
+        schemaVersion: issueContractSchemaVersion,
+        contractVersion: issueContractContractVersion,
+        requirements: issueContractRequirements,
+      },
+      null,
+      2,
+    );
+
+  return [
+    "## Problem / Goal",
+    problemGoal,
+    "",
+    ...(includeIssueContract
+      ? ["## Issue Contract", "", "```" + issueContractFenceLanguage, renderedIssueContractJson, "```", ""]
+      : []),
+    "## Touched Surfaces",
+    ...touchedSurfaces,
+    "",
+    "## Acceptance Criteria",
+    ...acceptanceCriteria,
+    "",
+    "## Contract Checklist",
+    ...contractChecklist,
+    "",
+    "## Validation Requirements",
+    ...validationRequirements,
+    "",
+    "## Out Of Scope",
+    ...outOfScope,
+    "",
+    "## Promotion Readiness",
+    `- Ready for \`dogfood-ready\`: ${readyForDogfoodReady}`,
+    `- Remaining blocker: ${remainingBlocker}`,
+  ].join("\n");
+}
+
+export function fencedAuthoringSectionSpoof(
+  overrides: Parameters<typeof agentEligibleIssueContract>[0] = {},
+): string {
+  const lines = agentEligibleIssueContract(overrides).split("\n");
+  const secondHeadingIndex = lines.findIndex((line, index) => index > 0 && line.startsWith("## "));
+  if (secondHeadingIndex === -1) return lines.join("\n");
+
+  return [...lines.slice(0, secondHeadingIndex), "````md", ...lines.slice(secondHeadingIndex), "````"].join("\n");
+}
+
+export function nestedFencedIssueContractSpoof(
+  overrides: Parameters<typeof agentEligibleIssueContract>[0] = {},
+): string {
+  const lines = agentEligibleIssueContract(overrides).split("\n");
+  const issueContractHeadingIndex = lines.findIndex((line) => line === "## Issue Contract");
+  const nextHeadingIndex = lines.findIndex(
+    (line, index) => index > issueContractHeadingIndex && line.startsWith("## "),
+  );
+  if (issueContractHeadingIndex === -1 || nextHeadingIndex === -1) return lines.join("\n");
+
+  const issueContractBody = lines.slice(issueContractHeadingIndex + 1, nextHeadingIndex);
+  const trimmedBody =
+    issueContractBody[0]?.trim().length === 0 ? issueContractBody.slice(1) : issueContractBody;
+
+  return [
+    ...lines.slice(0, issueContractHeadingIndex + 1),
+    "",
+    "````md",
+    ...trimmedBody,
+    "````",
+    "",
+    ...lines.slice(nextHeadingIndex),
+  ].join("\n");
+}

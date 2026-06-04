@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
+import {
+  AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS,
+  analyzeIssueContractDescription,
+  hasMeaningfulRemainingBlocker,
+  missingRequiredIssueContractSections,
+} from "./IssueContractLint.js";
 import { SymphonyError } from "./errors.js";
 import type {
   IssueBreakdownPlanRecord,
@@ -33,6 +39,7 @@ const issueBreakdownPlanSchema = z.object({
 });
 
 export type IssueBreakdownPlanInput = z.infer<typeof issueBreakdownPlanSchema>;
+type IssueBreakdownProposedIssue = IssueBreakdownPlanInput["proposedIssues"][number];
 
 export interface IssueBreakdownPlanActiveContext {
   issue: Issue;
@@ -94,6 +101,8 @@ export class IssueBreakdownPlanService {
         issueContentFingerprint: contentFingerprint,
       });
     }
+
+    validateProposedIssues(parsed.proposedIssues, this.options.config);
 
     const acceptedAt = new Date().toISOString();
     const plan: IssueBreakdownPlanRecord = {
@@ -178,6 +187,9 @@ export function issueBreakdownConfigFingerprint(config: ServiceConfig): string {
         planningLabels: config.issueBreakdown.planningLabels,
         applyToLinear: config.issueBreakdown.applyToLinear,
         workspaceMode: config.issueBreakdown.workspaceMode,
+        requireLabels: config.agent.requireLabels,
+        excludeLabels: config.agent.excludeLabels,
+        protectedPaths: config.agent.protectedPaths,
       }),
     )
     .digest("hex");
@@ -215,7 +227,21 @@ export function issueBreakdownPlanFingerprintsMatch(
 ): boolean {
   if (plan.configFingerprint !== issueBreakdownConfigFingerprint(config)) return false;
   if (plan.issueContentFingerprint.length === 0) return false;
-  return plan.issueContentFingerprint === issueContentFingerprint(issue);
+  if (plan.issueContentFingerprint !== issueContentFingerprint(issue)) return false;
+  return issueBreakdownPlanSatisfiesCurrentValidation(plan, config);
+}
+
+export function issueBreakdownPlanSatisfiesCurrentValidation(
+  plan: Pick<IssueBreakdownPlanRecord, "proposedIssues">,
+  config: ServiceConfig,
+): boolean {
+  try {
+    validateProposedIssues(plan.proposedIssues, config);
+    return true;
+  } catch (error) {
+    if (error instanceof SymphonyError && error.code === "invalid_request") return false;
+    throw error;
+  }
 }
 
 export function isCurrentFreshIssueBreakdownPlan(
@@ -278,6 +304,72 @@ export function renderIssueBreakdownPlanSummary(plan: IssueBreakdownPlanRecord):
       `   Labels: ${item.labels.length === 0 ? "None" : item.labels.join(", ")}`,
     ]),
   ].join("\n");
+}
+
+function validateProposedIssues(proposedIssues: readonly IssueBreakdownProposedIssue[], config: ServiceConfig): void {
+  for (const [index, proposedIssue] of proposedIssues.entries()) {
+    const descriptor = describeProposedIssue(index, proposedIssue.title);
+    assertProposedIssueLabels(proposedIssue.labels, descriptor, config.agent.requireLabels);
+
+    const missingSections = missingRequiredIssueContractSections(proposedIssue.description);
+    if (missingSections.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${descriptor} must include the required issue contract headings: ${AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS.join(", ")}`,
+        { proposedIssueIndex: index, missingSections },
+      );
+    }
+
+    const analysis = analyzeIssueContractDescription(proposedIssue.description, config.agent.protectedPaths);
+    if (analysis.issueContractErrors.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${descriptor} has an invalid Issue Contract: ${analysis.issueContractErrors.join("; ")}`,
+        { proposedIssueIndex: index, issueContractErrors: analysis.issueContractErrors },
+      );
+    }
+    if (analysis.readyForDogfoodReady === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${descriptor} must declare "Ready for \`dogfood-ready\`: yes/no" in Promotion Readiness`,
+        { proposedIssueIndex: index, title: proposedIssue.title },
+      );
+    }
+
+    if (analysis.protectedSurfaceMatches.length > 0) {
+      if (analysis.readyForDogfoodReady !== false) {
+        throw new SymphonyError(
+          "invalid_request",
+          `${descriptor} touches protected paths (${analysis.protectedSurfaceMatches.join(", ")}) and must keep "Ready for \`dogfood-ready\`: no"`,
+          { proposedIssueIndex: index, protectedSurfaceMatches: analysis.protectedSurfaceMatches },
+        );
+      }
+      if (!hasMeaningfulRemainingBlocker(analysis.remainingBlocker)) {
+        throw new SymphonyError(
+          "invalid_request",
+          `${descriptor} touches protected paths (${analysis.protectedSurfaceMatches.join(", ")}) and must record a substantive manual/operator blocker for manual handling`,
+          { proposedIssueIndex: index, protectedSurfaceMatches: analysis.protectedSurfaceMatches },
+        );
+      }
+    }
+  }
+}
+
+function assertProposedIssueLabels(labels: readonly string[], descriptor: string, requiredDispatchLabels: readonly string[]): void {
+  const forbiddenLabels = new Set(["dogfood-ready", ...requiredDispatchLabels.map((label) => label.toLowerCase())]);
+  const offendingLabels = labels.filter((label) => forbiddenLabels.has(label.toLowerCase()));
+  if (offendingLabels.length > 0) {
+    const uniqueOffendingLabels = [...new Set(offendingLabels)];
+    throw new SymphonyError(
+      "invalid_request",
+      `${descriptor} must not include worker dispatch labels (${uniqueOffendingLabels.join(", ")}); operators add readiness labels after review`,
+      { labels, forbiddenLabels: [...forbiddenLabels] },
+    );
+  }
+}
+
+function describeProposedIssue(index: number, title: string): string {
+  return `Proposed issue ${index + 1} (${JSON.stringify(title)})`;
 }
 
 function validateCaller(plan: IssueBreakdownPlanInput, context: IssueBreakdownPlanActiveContext): void {

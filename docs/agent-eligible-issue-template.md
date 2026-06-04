@@ -35,7 +35,7 @@ within the issue. Update `contractVersion` when obligations materially change.
 
 ## Touched Surfaces
 
-Mark every surface that the issue is expected to touch.
+Mark every surface that the issue is expected to touch. When a protected or high-risk workflow surface is involved, list the exact repo path or glob in this section (for example `docs/dogfood-runbook.md` or `src/core/workflow/**`) so doctor and planning validation can keep the issue manual-only.
 
 - [ ] API/projection
 - [ ] UI
@@ -79,7 +79,7 @@ plan. It is not a substitute for the fenced JSON contract.
 ## Promotion Readiness
 
 - Ready for `dogfood-ready`: yes/no
-- Remaining blocker:
+- Remaining blocker: If any protected path is listed above, keep this issue manual-only with "Ready for `dogfood-ready`: no" and explain the operator blocker here.
 ````
 
 ## Promotion Rules
@@ -91,5 +91,7 @@ issue is still blocked, leave `dogfood-blocked` in place. Remove
 required JSON and prose sections are present, each JSON requirement has a
 stable unique ID and non-empty text, the validation plan is concrete, and no
 open blockers remain.
+
+If the issue touches a protected workflow surface, keep `dogfood-ready` off, leave a concrete manual/operator blocker in `Promotion Readiness`, and route the implementation through a human instead of Symphony worker dispatch.
 
 The template does not authorize automatic label changes. AI issue drafters should propose the contract and readiness recommendation, then leave promotion labels for operator review.

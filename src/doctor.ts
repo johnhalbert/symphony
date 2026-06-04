@@ -160,7 +160,21 @@ export function formatDoctorResult(result: DoctorResult): string {
 
 export function issueContractDoctorCheck(config: ServiceConfig, issues: readonly Issue[]): DoctorCheck {
   const results = lintAgentEligibleIssueContracts(issues, config);
-  const failures = results.filter((result) => result.missingSections.length > 0);
+  const failures = results.flatMap((result) => {
+    const reasons: string[] = [];
+    if (result.missingSections.length > 0) {
+      reasons.push(`missing ${result.missingSections.join(", ")}`);
+    }
+    if (result.issueContractErrors.length > 0) {
+      reasons.push(`has an invalid Issue Contract (${result.issueContractErrors.join("; ")})`);
+    }
+    if (result.protectedSurfaceMatches.length > 0) {
+      reasons.push(
+        `touches protected paths ${result.protectedSurfaceMatches.join(", ")} and must remain manual-only instead of agent-eligible`,
+      );
+    }
+    return reasons.length > 0 ? [`${result.issue.identifier} ${reasons.join("; ")}`] : [];
+  });
   if (failures.length === 0) {
     return {
       id: "linear.issue_contract",
@@ -175,9 +189,7 @@ export function issueContractDoctorCheck(config: ServiceConfig, issues: readonly
   return {
     id: "linear.issue_contract",
     status: "warn",
-    message: `Agent-eligible issue(s) are missing required authoring sections: ${failures
-      .map((failure) => `${failure.issue.identifier} missing ${failure.missingSections.join(", ")}`)
-      .join("; ")}`,
+    message: `Agent-eligible issue(s) violate authoring or protected-surface rules: ${failures.join("; ")}`,
   };
 }
 

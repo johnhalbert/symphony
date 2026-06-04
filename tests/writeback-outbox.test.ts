@@ -36,7 +36,7 @@ import {
   WritebackProcessor,
 } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
-import { issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
@@ -620,7 +620,7 @@ describe("FileWritebackOutboxStore", () => {
       payload: {
         parentIssueId: "issue-1",
         title: "Child issue",
-        description: "Description",
+        description: agentEligibleIssueContract(),
         acceptanceCriteria: ["Done"],
         requestedLabels: ["planning"],
         dependencies: [],
@@ -656,7 +656,7 @@ describe("FileWritebackOutboxStore", () => {
       payload: {
         parentIssueId: "issue-1",
         title: "Child issue",
-        description: "Description",
+        description: agentEligibleIssueContract(),
         acceptanceCriteria: ["Done"],
         requestedLabels: ["planning"],
         dependencies: [],
@@ -1141,14 +1141,14 @@ async function submitTwoChildPlan(
       proposedIssues: [
         {
           title: "Build child",
-          description: "Implement the child issue.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Done"],
           dependencies: [],
           labels: ["planning"],
         },
         {
           title: "Build dependent child",
-          description: "Implement the dependent child issue.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Done"],
           dependencies: ["Build child"],
           labels: ["planning"],
@@ -1198,7 +1198,7 @@ function lifecycleWithIssueBreakdownPlan(overrides: {
         proposedIssues: [
           {
             title: "Child issue",
-            description: "Description",
+            description: agentEligibleIssueContract(),
             acceptanceCriteria: ["Done"],
             dependencies: [],
             labels: ["planning"],
@@ -1237,7 +1237,7 @@ function issueCreateOperation(idempotencyKey: string) {
     payload: {
       parentIssueId: "issue-1",
       title: "Child issue",
-      description: "Description",
+      description: agentEligibleIssueContract(),
       acceptanceCriteria: ["Done"],
       requestedLabels: ["planning"],
       dependencies: [],

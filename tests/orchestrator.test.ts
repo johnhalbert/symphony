@@ -63,7 +63,7 @@ import {
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import type { Issue, TokenCounts, TrackerStateLists } from "../src/core/types.js";
-import { issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
@@ -6697,14 +6697,14 @@ async function submitTwoChildPlan(
       proposedIssues: [
         {
           title: "Build child",
-          description: "Implement the child issue.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Done"],
           dependencies: [],
           labels: ["planning"],
         },
         {
           title: "Build dependent child",
-          description: "Implement the dependent child issue.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Done"],
           dependencies: ["Build child"],
           labels: ["planning"],
@@ -7248,7 +7248,7 @@ class IssueBreakdownAcceptingHarness implements AgentHarness {
           proposedIssues: [
             {
               title: "Create implementation task",
-              description: "Implement the requested behavior.",
+              description: agentEligibleIssueContract(),
               acceptanceCriteria: ["Behavior is implemented and tested."],
               dependencies: [],
               labels: ["planning"],
@@ -7296,7 +7296,7 @@ class IssueBreakdownHandoffHarness implements AgentHarness {
         proposedIssues: [
           {
             title: "Create implementation task",
-            description: "Implement the requested behavior.",
+            description: agentEligibleIssueContract(),
             acceptanceCriteria: ["Behavior is implemented and tested."],
             dependencies: [],
             labels: ["planning"],

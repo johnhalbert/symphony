@@ -6,9 +6,12 @@ describe("issue-breakdown planner prompt", () => {
     const config = testConfig("/tmp/symphony-issue-breakdown-prompt");
 
     expect(config.issueBreakdown.promptTemplate).toContain("Problem / Goal");
+    expect(config.issueBreakdown.promptTemplate).toContain("Issue Contract");
     expect(config.issueBreakdown.promptTemplate).toContain("Touched Surfaces");
     expect(config.issueBreakdown.promptTemplate).toContain("Contract Checklist");
     expect(config.issueBreakdown.promptTemplate).toContain("Validation Requirements");
+    expect(config.issueBreakdown.promptTemplate).toContain("fenced `json` block");
+    expect(config.issueBreakdown.promptTemplate).toContain("stable unique `id` values");
     expect(config.issueBreakdown.promptTemplate).toContain("Do not include secrets, tokens, private keys, or credential values");
     expect(config.issueBreakdown.promptTemplate).toContain("Do not add `dogfood-ready` automatically");
   });

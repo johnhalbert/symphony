@@ -5,11 +5,19 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   IssueBreakdownPlanService,
   issueBreakdownPlanFingerprintsMatch,
+  issueBreakdownPlanRequestHash,
   latestFreshIssueBreakdownPlan,
 } from "../src/core/IssueBreakdownPlanService.js";
+import type { IssueBreakdownPlanInput } from "../src/core/IssueBreakdownPlanService.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
-import { issue, testConfig } from "./helpers.js";
+import {
+  agentEligibleIssueContract,
+  fencedAuthoringSectionSpoof,
+  issue,
+  nestedFencedIssueContractSpoof,
+  testConfig,
+} from "./helpers.js";
 
 describe("IssueBreakdownPlanService", () => {
   let root: string;
@@ -34,7 +42,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: "Add validated structured issue breakdown output.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -88,7 +96,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: "Add validated structured issue breakdown output.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -130,7 +138,7 @@ describe("IssueBreakdownPlanService", () => {
       proposedIssues: [
         {
           title: "Build planning schema",
-          description: "Add validated structured issue breakdown output.",
+          description: agentEligibleIssueContract(),
           acceptanceCriteria: ["Plans persist proposed issues."],
           dependencies: [],
           labels: ["planning"],
@@ -165,6 +173,138 @@ describe("IssueBreakdownPlanService", () => {
     expect(issueBreakdownPlanFingerprintsMatch(first.plan, drifted, config)).toBe(false);
   });
 
+  it("replays same-run submissions after config drift and leaves the stored plan stale", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ updatedAt: "2026-01-02T00:00:00Z" });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+    const input = {
+      runId: "run-plan-config-drift",
+      issueId: candidate.id,
+      summary: "Split the work into child issues.",
+      proposedIssues: [
+        {
+          title: "Task",
+          description: agentEligibleIssueContract({
+            touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+            readyForDogfoodReady: "yes",
+          }),
+          acceptanceCriteria: ["Done"],
+          dependencies: [],
+          labels: [],
+        },
+      ],
+      idempotencyKey: "plan-config-drift",
+    };
+
+    const first = await service.submit_issue_breakdown_plan(input, {
+      issue: candidate,
+      activeRunId: "run-plan-config-drift",
+      role: "worker",
+      phase: "issue_breakdown",
+    });
+
+    config.agent.protectedPaths = ["docs/dogfood-runbook.md"];
+
+    const replay = await service.submit_issue_breakdown_plan(input, {
+      issue: candidate,
+      activeRunId: "run-plan-config-drift",
+      role: "worker",
+      phase: "issue_breakdown",
+    });
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(replay.replayed).toBe(true);
+    expect(replay.plan.id).toBe(first.plan.id);
+    expect(lifecycle?.issueBreakdownPlans).toHaveLength(1);
+    expect(issueBreakdownPlanFingerprintsMatch(first.plan, candidate, config)).toBe(false);
+    expect(latestFreshIssueBreakdownPlan(lifecycle, candidate, config)).toBeNull();
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        { ...input, summary: "Changed summary." },
+        {
+          issue: candidate,
+          activeRunId: "run-plan-config-drift",
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("replays same-run submissions after validation drift but no longer treats the stored plan as fresh", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ updatedAt: "2026-01-02T00:00:00Z" });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+    const context = {
+      issue: candidate,
+      activeRunId: "run-plan-validation-drift",
+      role: "worker" as const,
+      phase: "issue_breakdown" as const,
+    };
+    const validInput: IssueBreakdownPlanInput = {
+      runId: "run-plan-validation-drift",
+      issueId: candidate.id,
+      summary: "Split the work into child issues.",
+      proposedIssues: [
+        {
+          title: "Task",
+          description: agentEligibleIssueContract(),
+          acceptanceCriteria: ["Done"],
+          dependencies: [],
+          labels: [],
+        },
+      ],
+      idempotencyKey: "plan-validation-drift",
+    };
+
+    const first = await service.submit_issue_breakdown_plan(validInput, context);
+    const originalProposal = validInput.proposedIssues[0]!;
+    const legacyInput: IssueBreakdownPlanInput = {
+      ...validInput,
+      proposedIssues: [
+        {
+          title: originalProposal.title,
+          description: ["## Problem / Goal", "Legacy proposal missing current contract headings."].join("\n"),
+          acceptanceCriteria: [...originalProposal.acceptanceCriteria],
+          dependencies: [...originalProposal.dependencies],
+          labels: [...originalProposal.labels],
+        },
+      ],
+    };
+    const seeded = await lifecycleStore.get(candidate.id);
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans:
+        seeded?.issueBreakdownPlans.map((plan) =>
+          plan.id === first.plan.id
+            ? {
+                ...plan,
+                requestHash: issueBreakdownPlanRequestHash(legacyInput),
+                proposedIssues: legacyInput.proposedIssues,
+              }
+            : plan,
+        ) ?? [],
+      lastIssueBreakdownPlanId: first.plan.id,
+    });
+
+    const replay = await service.submit_issue_breakdown_plan(legacyInput, context);
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(replay.replayed).toBe(true);
+    expect(replay.plan.proposedIssues[0]?.description).toBe(legacyInput.proposedIssues[0]?.description);
+    expect(issueBreakdownPlanFingerprintsMatch(replay.plan, candidate, config)).toBe(false);
+    expect(latestFreshIssueBreakdownPlan(lifecycle, candidate, config)).toBeNull();
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        { ...legacyInput, summary: "Changed summary after validation drift." },
+        context,
+      ),
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
   it("only treats the current non-stale plan as fresh", async () => {
     const config = testConfig(root);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
@@ -181,7 +321,7 @@ describe("IssueBreakdownPlanService", () => {
         issueId: original.id,
         summary: "Split original work.",
         proposedIssues: [
-          { title: "Build original child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+          { title: "Build original child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
         ],
         idempotencyKey: "plan-a",
       },
@@ -193,7 +333,7 @@ describe("IssueBreakdownPlanService", () => {
         issueId: changed.id,
         summary: "Split changed work.",
         proposedIssues: [
-          { title: "Build changed child", description: "Implement.", acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
+          { title: "Build changed child", description: agentEligibleIssueContract(), acceptanceCriteria: ["Done"], dependencies: [], labels: [] },
         ],
         idempotencyKey: "plan-b",
       },
@@ -222,6 +362,342 @@ describe("IssueBreakdownPlanService", () => {
     });
     const nullPointerLifecycle = await lifecycleStore.get(original.id);
     expect(latestFreshIssueBreakdownPlan(nullPointerLifecycle, original, config)).toBeNull();
+  });
+
+  it("rejects proposed issues that add dogfood-ready labels before persistence", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-ready-label",
+          issueId: candidate.id,
+          summary: "Readiness labels are operator-owned.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: agentEligibleIssueContract(),
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+              labels: ["dogfood-ready"],
+            },
+          ],
+          idempotencyKey: "plan-ready-label",
+        },
+        { issue: candidate, activeRunId: "run-plan-ready-label", role: "worker", phase: "issue_breakdown" },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+  });
+
+  it("rejects proposed issues that omit or invalidate the fenced JSON Issue Contract", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    const invalidDescriptions = [
+      agentEligibleIssueContract({ includeIssueContract: false }),
+      agentEligibleIssueContract({ issueContractFenceLanguage: "yaml" }),
+      agentEligibleIssueContract({ issueContractJson: "{ not valid json" }),
+      nestedFencedIssueContractSpoof(),
+      agentEligibleIssueContract({ issueContractRequirements: [] }),
+      agentEligibleIssueContract({
+        issueContractRequirements: [
+          { id: "1", requirement: "First requirement." },
+          { id: "REQ-001", requirement: "Duplicate requirement." },
+          { id: "REQ-001", requirement: "Repeated requirement." },
+        ],
+      }),
+      agentEligibleIssueContract({ issueContractRequirements: [{ id: "REQ-001", requirement: "   " }] }),
+    ];
+
+    for (const [index, description] of invalidDescriptions.entries()) {
+      await expect(
+        service.submit_issue_breakdown_plan(
+          {
+            runId: `run-plan-invalid-issue-contract-${index + 1}`,
+            issueId: candidate.id,
+            summary: "Every proposed issue must provide a valid fenced JSON contract.",
+            proposedIssues: [
+              {
+                title: `Task ${index + 1}`,
+                description,
+                acceptanceCriteria: ["Done"],
+                dependencies: [],
+                labels: [],
+              },
+            ],
+            idempotencyKey: `plan-invalid-issue-contract-${index + 1}`,
+          },
+          {
+            issue: candidate,
+            activeRunId: `run-plan-invalid-issue-contract-${index + 1}`,
+            role: "worker",
+            phase: "issue_breakdown",
+          },
+        ),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+    }
+
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+  });
+
+  it("rejects proposed issues that hide required authoring sections inside fenced code blocks", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-fenced-heading-spoof",
+          issueId: candidate.id,
+          summary: "Real markdown headings must exist outside fenced code blocks.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: fencedAuthoringSectionSpoof(),
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+              labels: [],
+            },
+          ],
+          idempotencyKey: "plan-fenced-heading-spoof",
+        },
+        {
+          issue: candidate,
+          activeRunId: "run-plan-fenced-heading-spoof",
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      details: {
+        missingSections: expect.arrayContaining([
+          "Issue Contract",
+          "Touched Surfaces",
+          "Acceptance Criteria",
+          "Contract Checklist",
+          "Validation Requirements",
+          "Out Of Scope",
+          "Promotion Readiness",
+        ]),
+      },
+      message: expect.stringContaining("must include the required issue contract headings"),
+    });
+
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+  });
+
+  it("rejects configured worker dispatch labels before persistence", async () => {
+    const config = testConfig(root);
+    config.agent.requireLabels = ["agent-ready"];
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-custom-ready-label",
+          issueId: candidate.id,
+          summary: "Dispatch labels remain operator-owned.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: agentEligibleIssueContract(),
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+              labels: ["Agent-Ready"],
+            },
+          ],
+          idempotencyKey: "plan-custom-ready-label",
+        },
+        { issue: candidate, activeRunId: "run-plan-custom-ready-label", role: "worker", phase: "issue_breakdown" },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+  });
+
+  it("requires protected-surface proposed issues to stay manual-only with a blocker", async () => {
+    const config = testConfig(root);
+    config.agent.protectedPaths = ["docs/dogfood-runbook.md"];
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-protected-ready",
+          issueId: candidate.id,
+          summary: "Protected path must not be agent-ready.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: agentEligibleIssueContract({
+                touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+                readyForDogfoodReady: "yes",
+              }),
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+              labels: [],
+            },
+          ],
+          idempotencyKey: "plan-protected-ready",
+        },
+        { issue: candidate, activeRunId: "run-plan-protected-ready", role: "worker", phase: "issue_breakdown" },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+
+    const accepted = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-protected-manual",
+        issueId: candidate.id,
+        summary: "Protected path stays manual-only.",
+        proposedIssues: [
+          {
+            title: "Task",
+            description: agentEligibleIssueContract({
+              touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+              readyForDogfoodReady: "no",
+              remainingBlocker: "Manual operator implementation required for protected surface.",
+            }),
+            acceptanceCriteria: ["Done"],
+            dependencies: [],
+            labels: [],
+          },
+        ],
+        idempotencyKey: "plan-protected-manual",
+      },
+      { issue: candidate, activeRunId: "run-plan-protected-manual", role: "worker", phase: "issue_breakdown" },
+    );
+
+    expect(accepted.accepted).toBe(true);
+    expect(accepted.replayed).toBe(false);
+  });
+
+  it("ignores protected-path mentions outside Touched Surfaces when validating proposed issues", async () => {
+    const config = testConfig(root);
+    config.agent.protectedPaths = ["docs/dogfood-runbook.md"];
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    const accepted = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-out-of-scope-protected",
+        issueId: candidate.id,
+        summary: "Only explicit touched surfaces should drive protected-path handling.",
+        proposedIssues: [
+          {
+            title: "Task",
+            description: agentEligibleIssueContract({
+              touchedSurfaces: ["- [X] API/projection"],
+              outOfScope: ["- Do not modify docs/dogfood-runbook.md in this slice."],
+            }),
+            acceptanceCriteria: ["Done"],
+            dependencies: [],
+            labels: [],
+          },
+        ],
+        idempotencyKey: "plan-out-of-scope-protected",
+      },
+      { issue: candidate, activeRunId: "run-plan-out-of-scope-protected", role: "worker", phase: "issue_breakdown" },
+    );
+
+    expect(accepted.accepted).toBe(true);
+    expect(accepted.replayed).toBe(false);
+  });
+
+  it.each(["none", "n/a"])(
+    "rejects placeholder blockers for protected-surface proposed issues (%s)",
+    async (remainingBlocker) => {
+      const config = testConfig(root);
+      config.agent.protectedPaths = ["docs/dogfood-runbook.md"];
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const candidate = issue();
+      const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+      const suffix = remainingBlocker.replace(/[^a-z0-9]+/gi, "-");
+
+      await expect(
+        service.submit_issue_breakdown_plan(
+          {
+            runId: `run-plan-protected-placeholder-${suffix}`,
+            issueId: candidate.id,
+            summary: "Protected path needs a real operator blocker.",
+            proposedIssues: [
+              {
+                title: "Task",
+                description: agentEligibleIssueContract({
+                  touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+                  readyForDogfoodReady: "no",
+                  remainingBlocker,
+                }),
+                acceptanceCriteria: ["Done"],
+                dependencies: [],
+                labels: [],
+              },
+            ],
+            idempotencyKey: `plan-protected-placeholder-${suffix}`,
+          },
+          {
+            issue: candidate,
+            activeRunId: `run-plan-protected-placeholder-${suffix}`,
+            role: "worker",
+            phase: "issue_breakdown",
+          },
+        ),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+    },
+  );
+
+  it("rejects the protected-path blocker boilerplate template for manual-only proposals", async () => {
+    const config = testConfig(root);
+    config.agent.protectedPaths = ["docs/dogfood-runbook.md"];
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-protected-template-blocker",
+          issueId: candidate.id,
+          summary: "Protected path needs a real manual-only blocker.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: agentEligibleIssueContract({
+                touchedSurfaces: ["- [X] Docs only", "- docs/dogfood-runbook.md"],
+                readyForDogfoodReady: "no",
+                remainingBlocker:
+                  'If any protected path is listed above, keep this issue manual-only with "Ready for `dogfood-ready`: no" and explain the operator blocker here.',
+              }),
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+              labels: [],
+            },
+          ],
+          idempotencyKey: "plan-protected-template-blocker",
+        },
+        {
+          issue: candidate,
+          activeRunId: "run-plan-protected-template-blocker",
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
   });
 
   it("rejects invalid schema and mismatched active run context", async () => {
