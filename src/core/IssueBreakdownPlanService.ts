@@ -39,6 +39,7 @@ const issueBreakdownPlanSchema = z.object({
 });
 
 export type IssueBreakdownPlanInput = z.infer<typeof issueBreakdownPlanSchema>;
+type IssueBreakdownProposedIssue = IssueBreakdownPlanInput["proposedIssues"][number];
 
 export interface IssueBreakdownPlanActiveContext {
   issue: Issue;
@@ -101,7 +102,7 @@ export class IssueBreakdownPlanService {
       });
     }
 
-    validateProposedIssues(parsed, this.options.config);
+    validateProposedIssues(parsed.proposedIssues, this.options.config);
 
     const acceptedAt = new Date().toISOString();
     const plan: IssueBreakdownPlanRecord = {
@@ -226,7 +227,21 @@ export function issueBreakdownPlanFingerprintsMatch(
 ): boolean {
   if (plan.configFingerprint !== issueBreakdownConfigFingerprint(config)) return false;
   if (plan.issueContentFingerprint.length === 0) return false;
-  return plan.issueContentFingerprint === issueContentFingerprint(issue);
+  if (plan.issueContentFingerprint !== issueContentFingerprint(issue)) return false;
+  return issueBreakdownPlanSatisfiesCurrentValidation(plan, config);
+}
+
+export function issueBreakdownPlanSatisfiesCurrentValidation(
+  plan: Pick<IssueBreakdownPlanRecord, "proposedIssues">,
+  config: ServiceConfig,
+): boolean {
+  try {
+    validateProposedIssues(plan.proposedIssues, config);
+    return true;
+  } catch (error) {
+    if (error instanceof SymphonyError && error.code === "invalid_request") return false;
+    throw error;
+  }
 }
 
 export function isCurrentFreshIssueBreakdownPlan(
@@ -291,8 +306,8 @@ export function renderIssueBreakdownPlanSummary(plan: IssueBreakdownPlanRecord):
   ].join("\n");
 }
 
-function validateProposedIssues(plan: IssueBreakdownPlanInput, config: ServiceConfig): void {
-  for (const [index, proposedIssue] of plan.proposedIssues.entries()) {
+function validateProposedIssues(proposedIssues: readonly IssueBreakdownProposedIssue[], config: ServiceConfig): void {
+  for (const [index, proposedIssue] of proposedIssues.entries()) {
     const descriptor = describeProposedIssue(index, proposedIssue.title);
     assertProposedIssueLabels(proposedIssue.labels, descriptor);
 

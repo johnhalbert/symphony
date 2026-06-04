@@ -5,8 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   IssueBreakdownPlanService,
   issueBreakdownPlanFingerprintsMatch,
+  issueBreakdownPlanRequestHash,
   latestFreshIssueBreakdownPlan,
 } from "../src/core/IssueBreakdownPlanService.js";
+import type { IssueBreakdownPlanInput } from "../src/core/IssueBreakdownPlanService.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
@@ -221,6 +223,78 @@ describe("IssueBreakdownPlanService", () => {
           role: "worker",
           phase: "issue_breakdown",
         },
+      ),
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("replays same-run submissions after validation drift but no longer treats the stored plan as fresh", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ updatedAt: "2026-01-02T00:00:00Z" });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+    const context = {
+      issue: candidate,
+      activeRunId: "run-plan-validation-drift",
+      role: "worker" as const,
+      phase: "issue_breakdown" as const,
+    };
+    const validInput: IssueBreakdownPlanInput = {
+      runId: "run-plan-validation-drift",
+      issueId: candidate.id,
+      summary: "Split the work into child issues.",
+      proposedIssues: [
+        {
+          title: "Task",
+          description: agentEligibleIssueContract(),
+          acceptanceCriteria: ["Done"],
+          dependencies: [],
+          labels: [],
+        },
+      ],
+      idempotencyKey: "plan-validation-drift",
+    };
+
+    const first = await service.submit_issue_breakdown_plan(validInput, context);
+    const originalProposal = validInput.proposedIssues[0]!;
+    const legacyInput: IssueBreakdownPlanInput = {
+      ...validInput,
+      proposedIssues: [
+        {
+          title: originalProposal.title,
+          description: ["## Problem / Goal", "Legacy proposal missing current contract headings."].join("\n"),
+          acceptanceCriteria: [...originalProposal.acceptanceCriteria],
+          dependencies: [...originalProposal.dependencies],
+          labels: [...originalProposal.labels],
+        },
+      ],
+    };
+    const seeded = await lifecycleStore.get(candidate.id);
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans:
+        seeded?.issueBreakdownPlans.map((plan) =>
+          plan.id === first.plan.id
+            ? {
+                ...plan,
+                requestHash: issueBreakdownPlanRequestHash(legacyInput),
+                proposedIssues: legacyInput.proposedIssues,
+              }
+            : plan,
+        ) ?? [],
+      lastIssueBreakdownPlanId: first.plan.id,
+    });
+
+    const replay = await service.submit_issue_breakdown_plan(legacyInput, context);
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(replay.replayed).toBe(true);
+    expect(replay.plan.proposedIssues[0]?.description).toBe(legacyInput.proposedIssues[0]?.description);
+    expect(issueBreakdownPlanFingerprintsMatch(replay.plan, candidate, config)).toBe(false);
+    expect(latestFreshIssueBreakdownPlan(lifecycle, candidate, config)).toBeNull();
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        { ...legacyInput, summary: "Changed summary after validation drift." },
+        context,
       ),
     ).rejects.toMatchObject({ code: "conflict" });
   });

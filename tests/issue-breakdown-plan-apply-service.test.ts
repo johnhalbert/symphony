@@ -8,7 +8,7 @@ import {
   planIssueBreakdownApplicationWritebacks,
   planIssueBreakdownFinalizationWritebacks,
 } from "../src/core/IssueBreakdownPlanApplyService.js";
-import { IssueBreakdownPlanService } from "../src/core/IssueBreakdownPlanService.js";
+import { IssueBreakdownPlanService, issueBreakdownPlanRequestHash } from "../src/core/IssueBreakdownPlanService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { IssueBreakdownCreatedIssueRef } from "../src/core/persistence/IssueLifecycleStore.js";
 import type {
@@ -334,6 +334,54 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(after?.issueBreakdownPlans[0]).toEqual(before?.issueBreakdownPlans[0]);
   });
 
+  it("returns no_fresh_plan when previewing a legacy plan that fails current proposed-issue validation", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    await seedLegacyValidationDriftPlan(config, lifecycleStore, candidate);
+    const before = await lifecycleStore.get(candidate.id);
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore }).previewLatestFreshPlan(candidate);
+    const after = await lifecycleStore.get(candidate.id);
+
+    expect(result).toMatchObject({ status: "no_fresh_plan", reason: "no_fresh_plan" });
+    expect(after?.issueBreakdownPlans).toEqual(before?.issueBreakdownPlans);
+    expect(after?.lastIssueBreakdownPlanId).toBe(before?.lastIssueBreakdownPlanId ?? null);
+  });
+
+  it("marks pending legacy plans stale when live apply encounters validation drift", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const seeded = await seedLegacyValidationDriftPlan(config, lifecycleStore, candidate);
+    const operation = planIssueBreakdownApplicationWritebacks(candidate, seeded.plan)[0]!;
+    await lifecycleStore.updateIssue(candidate, {
+      issueBreakdownPlans: [
+        {
+          ...seeded.plan,
+          applicationStatus: "pending",
+          applicationOperationKeys: [operation.idempotencyKey],
+          applicationBlockedReason: null,
+        },
+      ],
+      lastIssueBreakdownPlanId: seeded.plan.id,
+    });
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore }).applyLatestFreshPlan(candidate);
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(result).toMatchObject({ status: "no_fresh_plan", reason: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
+    expect(lifecycle?.issueBreakdownPlans[0]).toMatchObject({
+      applicationStatus: "stale",
+      applicationBlockedReason: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+      applicationOperationKeys: [operation.idempotencyKey],
+    });
+  });
+
   it("preserves a null current plan pointer when marking drifted legacy work stale", async () => {
     const config = testConfig(root);
     config.issueBreakdown.applyToLinear.enabled = true;
@@ -621,6 +669,45 @@ async function submitSingleChildPlan(
     { issue: candidate, activeRunId: runId, role: "worker", phase: "issue_breakdown" },
   );
   return result.plan;
+}
+
+async function seedLegacyValidationDriftPlan(
+  config: ServiceConfig,
+  lifecycleStore: FileIssueLifecycleStore,
+  candidate: Issue,
+) {
+  const runId = "run-plan-validation-drift";
+  const idempotencyKey = "plan-validation-drift";
+  const plan = await submitSingleChildPlan(config, lifecycleStore, candidate, { runId, idempotencyKey });
+  const legacyInput = {
+    runId,
+    issueId: candidate.id,
+    summary: "Split into child issues.",
+    proposedIssues: [
+      {
+        title: "Build child",
+        description: ["## Problem / Goal", "Legacy proposal missing current contract headings."].join("\n"),
+        acceptanceCriteria: ["Done"],
+        dependencies: [],
+        labels: ["planning"],
+      },
+    ],
+    idempotencyKey,
+  };
+  const lifecycle = await lifecycleStore.get(candidate.id);
+  const updatedPlan = {
+    ...plan,
+    requestHash: issueBreakdownPlanRequestHash(legacyInput),
+    proposedIssues: legacyInput.proposedIssues,
+  };
+  await lifecycleStore.updateIssue(candidate, {
+    issueBreakdownPlans:
+      lifecycle?.issueBreakdownPlans.map((existingPlan) =>
+        existingPlan.id === plan.id ? updatedPlan : existingPlan,
+      ) ?? [],
+    lastIssueBreakdownPlanId: plan.id,
+  });
+  return { plan: updatedPlan, legacyInput };
 }
 
 async function submitTwoChildPlan(config: ServiceConfig, lifecycleStore: FileIssueLifecycleStore, candidate: Issue) {
