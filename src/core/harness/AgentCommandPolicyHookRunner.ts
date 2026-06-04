@@ -35,6 +35,7 @@ export interface AgentCommandPolicyHookRunnerContext {
   phase?: string | undefined;
   issueId?: string | undefined;
   runId?: string | undefined;
+  journalPath?: string | undefined;
   workingDirectory?: string | undefined;
   environment?: Record<string, string | undefined> | undefined;
   classify?: AgentCommandPolicyClassifier | undefined;
@@ -61,11 +62,33 @@ export interface HermesHookBlockResponse {
   message: string;
 }
 
+export interface AgentCommandPolicyHookDecisionJournalEntry {
+  version: 1;
+  recordedAt: string;
+  runId: string | null;
+  issueId: string | null;
+  requestKind: string | null;
+  toolCallId: string | null;
+  permissionOutcome: string | null;
+  hookAction: string | null;
+  decision: AgentCommandPolicyDecision;
+}
+
 export interface AgentCommandPolicyHookEvaluation {
   decision: AgentCommandPolicyDecision;
   policyInput: AgentCommandPolicyInput | null;
   hookResponse: HermesHookBlockResponse | null;
+  journalEntry: AgentCommandPolicyHookDecisionJournalEntry | null;
   stdout: string;
+}
+
+interface AgentCommandPolicyHookDecisionMetadata {
+  runId: string | null;
+  issueId: string | null;
+  requestKind: string | null;
+  toolCallId: string | null;
+  permissionOutcome: string | null;
+  hookAction: string | null;
 }
 
 export async function evaluateAgentCommandPolicyHookPayload(
@@ -73,10 +96,12 @@ export async function evaluateAgentCommandPolicyHookPayload(
   context: AgentCommandPolicyHookRunnerContext = {},
 ): Promise<AgentCommandPolicyHookEvaluation> {
   const parsed = parseHookPayload(stdinText, context);
-  if (parsed.status === "error") return evaluationFromDecision(parsed.decision, null);
+  if (parsed.status === "error") return evaluationFromDecision(parsed.decision, null, defaultHookDecisionMetadata(context, parsed.decision));
+
+  const metadata = hookDecisionMetadata(parsed.payload, context);
 
   const policyInput = buildPolicyInput(parsed.payload, context);
-  if (policyInput.status === "error") return evaluationFromDecision(policyInput.decision, null);
+  if (policyInput.status === "error") return evaluationFromDecision(policyInput.decision, null, withHookDecisionOutcome(metadata, policyInput.decision));
 
   const classify = context.classify ?? classifyAgentCommand;
   try {
@@ -84,7 +109,7 @@ export async function evaluateAgentCommandPolicyHookPayload(
       await classify(policyInput.input),
       policyInput.input,
     );
-    return evaluationFromDecision(decision, policyInput.input);
+    return evaluationFromDecision(decision, policyInput.input, withHookDecisionOutcome(metadata, decision));
   } catch {
     const decision = buildFailClosedAgentCommandPolicyDecision({
       role: policyInput.input.role,
@@ -96,7 +121,7 @@ export async function evaluateAgentCommandPolicyHookPayload(
       message:
         "Blocked worker/reviewer command: the Symphony agent command policy classifier failed before this tool call could be verified. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
     });
-    return evaluationFromDecision(decision, policyInput.input);
+    return evaluationFromDecision(decision, policyInput.input, withHookDecisionOutcome(metadata, decision));
   }
 }
 
@@ -111,8 +136,15 @@ export async function runAgentCommandPolicyHookStdio(
   );
   const evaluation =
     stdinPayload.status === "oversized"
-      ? evaluationFromDecision(buildOversizedHookPayloadDecision(options, stdinPayload.maxBytes), null)
+      ? evaluationFromDecision(
+          buildOversizedHookPayloadDecision(options, stdinPayload.maxBytes),
+          null,
+          defaultHookDecisionMetadata(options, buildOversizedHookPayloadDecision(options, stdinPayload.maxBytes)),
+        )
       : await evaluateAgentCommandPolicyHookPayload(stdinPayload.text, options);
+  if (options.journalPath && evaluation.journalEntry) {
+    appendHookDecisionJournalEntry(options.journalPath, evaluation.journalEntry);
+  }
   if (evaluation.stdout.length > 0) {
     output.write(evaluation.stdout);
   }
@@ -279,6 +311,8 @@ function buildPolicyInput(
   if (runId !== null) input.runId = runId;
   const issueId = nonEmptyString(context.issueId);
   if (issueId !== null) input.issueId = issueId;
+  const toolCallId = hookToolCallId(payload.extra);
+  if (toolCallId !== null) input.attemptId = toolCallId;
 
   return {
     status: "ok",
@@ -462,14 +496,98 @@ function missingContextDecision(input: {
 function evaluationFromDecision(
   decision: AgentCommandPolicyDecision,
   policyInput: AgentCommandPolicyInput | null,
+  metadata: AgentCommandPolicyHookDecisionMetadata,
 ): AgentCommandPolicyHookEvaluation {
   const hookResponse = mapAgentCommandPolicyDecisionToHermesHookResponse(decision);
   return {
     decision,
     policyInput,
     hookResponse,
+    journalEntry: {
+      version: 1,
+      recordedAt: new Date().toISOString(),
+      runId: metadata.runId,
+      issueId: metadata.issueId,
+      requestKind: metadata.requestKind,
+      toolCallId: metadata.toolCallId,
+      permissionOutcome: metadata.permissionOutcome,
+      hookAction: metadata.hookAction,
+      decision,
+    },
     stdout: hookResponse === null ? "" : `${JSON.stringify(hookResponse)}\n`,
   };
+}
+
+function appendHookDecisionJournalEntry(journalPath: string, entry: AgentCommandPolicyHookDecisionJournalEntry): void {
+  try {
+    fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+    fs.appendFileSync(journalPath, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch {
+    // Preserve the hook's allow/block decision even if best-effort journaling fails.
+  }
+}
+
+function hookDecisionMetadata(
+  payload: HermesPreToolCallHookPayload,
+  context: AgentCommandPolicyHookRunnerContext,
+): AgentCommandPolicyHookDecisionMetadata {
+  return {
+    runId: nonEmptyString(context.runId) ?? stringValue(payload.session_id),
+    issueId: nonEmptyString(context.issueId),
+    requestKind: hookRequestKind(stringValue(payload.tool_name), stringValue(payload.hook_event_name)),
+    toolCallId: hookToolCallId(payload.extra),
+    permissionOutcome: null,
+    hookAction: null,
+  };
+}
+
+function defaultHookDecisionMetadata(
+  context: AgentCommandPolicyHookRunnerContext,
+  decision: AgentCommandPolicyDecision,
+): AgentCommandPolicyHookDecisionMetadata {
+  return withHookDecisionOutcome(
+    {
+      runId: nonEmptyString(context.runId),
+      issueId: nonEmptyString(context.issueId),
+      requestKind: null,
+      toolCallId: null,
+      permissionOutcome: null,
+      hookAction: null,
+    },
+    decision,
+  );
+}
+
+function withHookDecisionOutcome(
+  metadata: AgentCommandPolicyHookDecisionMetadata,
+  decision: AgentCommandPolicyDecision,
+): AgentCommandPolicyHookDecisionMetadata {
+  return {
+    ...metadata,
+    permissionOutcome: hookPermissionOutcome(decision),
+    hookAction: decision.outcome === "deny" ? "block" : null,
+  };
+}
+
+function hookPermissionOutcome(decision: AgentCommandPolicyDecision): string {
+  if (decision.outcome === "allow") return "allowed";
+  return decision.reasonKind === "malformed_hook_payload" ||
+    decision.reasonKind === "oversized_hook_payload" ||
+    decision.reasonKind === "missing_hook_context" ||
+    decision.reasonKind === "classifier_error"
+    ? "fail_closed"
+    : "denied";
+}
+
+function hookRequestKind(toolName: string | null, hookEventName: string | null): string | null {
+  if (toolName === "terminal") return "terminal_execute";
+  if (toolName === "execute_code") return "execute_code";
+  return hookEventName;
+}
+
+function hookToolCallId(extra: unknown): string | null {
+  if (!isRecord(extra)) return null;
+  return stringValue(extra.tool_call_id) ?? stringValue(extra.toolCallId);
 }
 
 type BoundedStdinReadResult =

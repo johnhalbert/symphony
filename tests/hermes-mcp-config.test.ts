@@ -5,6 +5,7 @@ import YAML from "yaml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   assertHermesAgentCommandPolicyHookProfileConfig,
+  buildHermesAgentCommandPolicyDecisionJournalPath,
   buildHermesAgentCommandPolicyHookConfig,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
@@ -136,6 +137,7 @@ describe("Hermes MCP config", () => {
       role: "worker",
       phase: "implementation",
       issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profileDir),
     });
     await writeHermesMcpConfig({
       profileDir,
@@ -172,7 +174,14 @@ describe("Hermes MCP config", () => {
   it("validates the generated command-policy hook profile config and runnable hook command", async () => {
     const profileDir = path.join(root, "profile");
     const cliPath = await writeFakeHookCli(path.join(root, "fake-hook-cli.js"));
-    const options = { profileDir, cliPath, role: "worker", phase: "implementation", issueId: "issue-1" };
+    const options = {
+      profileDir,
+      cliPath,
+      role: "worker",
+      phase: "implementation",
+      issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profileDir),
+    };
 
     await writeHermesMcpConfig({
       profileDir,
@@ -227,7 +236,14 @@ describe("Hermes MCP config", () => {
   ])("rejects invalid command-policy hook profile config: $name", async ({ mutate, message }) => {
     const profileDir = path.join(root, "profile");
     const cliPath = await writeFakeHookCli(path.join(root, "fake-hook-cli.js"));
-    const options = { profileDir, cliPath, role: "worker", phase: "implementation", issueId: "issue-1" };
+    const options = {
+      profileDir,
+      cliPath,
+      role: "worker",
+      phase: "implementation",
+      issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profileDir),
+    };
     await writeHermesMcpConfig({
       profileDir,
       servers: {},
@@ -245,7 +261,14 @@ describe("Hermes MCP config", () => {
   it("rejects a generated command-policy hook whose CLI command is not runnable", async () => {
     const profileDir = path.join(root, "profile");
     const cliPath = path.join(root, "missing-cli.js");
-    const options = { profileDir, cliPath, role: "worker", phase: "implementation", issueId: "issue-1" };
+    const options = {
+      profileDir,
+      cliPath,
+      role: "worker",
+      phase: "implementation",
+      issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profileDir),
+    };
     await writeHermesMcpConfig({
       profileDir,
       servers: {},
@@ -261,7 +284,14 @@ describe("Hermes MCP config", () => {
   it("fails closed when Hermes shell-hook registration cannot be verified", async () => {
     const profileDir = path.join(root, "profile");
     const cliPath = await writeFakeHookCli(path.join(root, "fake-hook-cli.js"));
-    const options = { profileDir, cliPath, role: "reviewer", phase: "review", issueId: "issue-1" };
+    const options = {
+      profileDir,
+      cliPath,
+      role: "reviewer",
+      phase: "review",
+      issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profileDir),
+    };
     await writeHermesMcpConfig({
       profileDir,
       servers: {},

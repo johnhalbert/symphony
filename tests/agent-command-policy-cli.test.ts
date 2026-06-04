@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES } from "../src/core/harness/AgentCommandPolicyHookRunner.js";
@@ -16,6 +18,46 @@ describe("agent-command-policy-hook CLI", () => {
       action: "block",
       message: expect.stringContaining("upstream GitHub contact") as string,
     });
+  });
+
+  it("writes a structured decision journal when the CLI is given --decision-journal", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-cli-journal-"));
+    const journalPath = path.join(tempRoot, "policy-decisions.ndjson");
+    try {
+      const result = await runPolicyHookCli({
+        args: [
+          "--role",
+          "worker",
+          "--phase",
+          "implementation",
+          "--issue-id",
+          "issue-1",
+          "--run-id",
+          "run-1",
+          "--decision-journal",
+          journalPath,
+        ],
+        input: JSON.stringify(hermesPayload("git push origin main")),
+      });
+
+      expect(result.exitCode).toBe(0);
+      const lines = (await readFile(journalPath, "utf8")).trim().split(/\r?\n/g);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0] as string) as unknown).toMatchObject({
+        version: 1,
+        runId: "run-1",
+        issueId: "issue-1",
+        requestKind: "terminal_execute",
+        toolCallId: "tool-call-1",
+        hookAction: "block",
+        decision: {
+          outcome: "deny",
+          reasonKind: "upstream_github",
+        },
+      });
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it("uses environment context and keeps stdout empty for allowed local Git inspection", async () => {

@@ -6,6 +6,7 @@ import YAML from "yaml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HermesHarness } from "../hermes/src/HermesHarness.js";
 import {
+  buildHermesAgentCommandPolicyDecisionJournalPath,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
 } from "../hermes/src/HermesMcpConfig.js";
@@ -81,6 +82,74 @@ describe("Hermes command policy profile hooks", () => {
 
     await harness.dispose();
   });
+  it("emits durable command_policy_decision activity from journaled hook decisions", async () => {
+    const cliPath = path.join(root, "cli.js");
+    const harness = new HermesHarness({
+      cliPath,
+      commandPolicyHookVerifier: async () => undefined,
+      gatewayFactory: (env) =>
+        new FakeGatewayClient(env, "gw-journal", {
+          onPromptSubmit: async (client) => {
+            const entry = {
+              version: 1,
+              recordedAt: "2026-06-04T10:00:00.000Z",
+              runId: "test-session",
+              issueId: "issue-1",
+              requestKind: "terminal_execute",
+              toolCallId: "tool-call-1",
+              permissionOutcome: "denied",
+              hookAction: "block",
+              decision: {
+                outcome: "deny",
+                reasonKind: "direct_upstream_github",
+                commandClass: "direct_upstream_git_operation",
+                message: "blocked by test policy",
+                audit: {
+                  redacted: true,
+                  role: "worker",
+                  phase: "implementation",
+                  surface: "terminal",
+                  upstreamContactAttempted: false,
+                },
+              },
+            };
+            await writeFile(
+              buildHermesAgentCommandPolicyDecisionJournalPath(client.env.hermesHome),
+              `${JSON.stringify(entry)}\n`,
+              "utf8",
+            );
+          },
+        }),
+    });
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(
+      harness.run(context(config, { workspacePath, role: "worker", runPhase: "implementation", turnNumber: 1 }), "worker"),
+    );
+
+    const decisionEvent = events.find((event) => event.type === "run_diagnostic" && event.code === "command_policy_decision");
+    expect(decisionEvent).toMatchObject({
+      type: "run_diagnostic",
+      code: "command_policy_decision",
+      message: expect.stringContaining("direct_upstream_github") as string,
+      runActivity: {
+        kind: "command_policy_decision",
+        payload: {
+          requestKind: "terminal_execute",
+          toolCallId: "tool-call-1",
+          hookAction: "block",
+          permissionOutcome: "denied",
+          outcome: "deny",
+          reasonKind: "direct_upstream_github",
+        },
+      },
+    });
+
+    await harness.dispose();
+  });
+
   it("fails closed before creating a gateway client when command-policy hook validation is unverifiable", async () => {
     const clients: FakeGatewayClient[] = [];
     const cliPath = path.join(root, "cli.js");
@@ -115,6 +184,7 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   constructor(
     readonly env: HermesGatewayEnvironment,
     private readonly sessionId: string,
+    private readonly options: { onPromptSubmit?: (client: FakeGatewayClient) => Promise<void> | void } = {},
   ) {
     super();
   }
@@ -139,6 +209,7 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
     this.requests.push({ method, params });
     if (method === "session.create") return { session_id: this.sessionId } as T;
     if (method === "prompt.submit") {
+      await this.options.onPromptSubmit?.(this);
       queueMicrotask(() => {
         this.emit("event", {
           type: "message.complete",
@@ -219,5 +290,7 @@ function expectPolicyHook(
   expect(hook.command).toContain(`--role ${expected.role}`);
   expect(hook.command).toContain(`--phase ${expected.phase}`);
   expect(hook.command).toContain(`--issue-id ${expected.issueId}`);
+  expect(hook.command).toContain("--decision-journal");
+  expect(hook.command).toContain("agent-command-policy-decisions.ndjson");
   expect(hook.command).toContain(expected.cliPath);
 }

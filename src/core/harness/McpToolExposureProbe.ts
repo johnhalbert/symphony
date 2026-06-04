@@ -32,6 +32,7 @@ import {
 import { ScopedGatewayClient, type HermesGatewayClient, type HermesGatewayEnvironment } from "../../../hermes/src/GatewayFacade.js";
 import { hermesOwnedAuthProvidersForRuntime } from "../../../hermes/src/HermesAuthManager.js";
 import {
+  buildHermesAgentCommandPolicyDecisionJournalPath,
   buildHermesAgentCommandPolicyHookConfig,
   type HermesAgentCommandPolicyHookVerifier,
   verifyHermesAgentCommandPolicyHookInstallation,
@@ -40,6 +41,7 @@ import {
 import { HermesProfileManager, safeProfileKey } from "../../../hermes/src/HermesProfileManager.js";
 
 export type McpToolExposureStage = "subprocess" | "sdk" | "hermes_gateway";
+
 export type McpToolExposureStatus = "success" | "failure" | "skipped";
 export type SdkRoleStatus = "success" | "failure" | "partial" | "skipped";
 export type McpToolExposureFailureCode =
@@ -364,6 +366,7 @@ export async function runHermesGatewayMcpToolExposureProbe(
       const servers = symphonyRoleMcpServers(ctx, { cliPath: options.cliPath, mcpCwd });
       const commandPolicyHookOptions = {
         cliPath: options.cliPath,
+        decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profile.profileDir),
         role: target.role,
         phase: target.runPhase,
         issueId: ctx.issue.id || ctx.issue.identifier,

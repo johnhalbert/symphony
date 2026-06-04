@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
+import fsSync, { promises as fs } from "node:fs";
 import path from "node:path";
+import type { AgentCommandPolicyDecision } from "../../src/core/harness/AgentCommandPolicy.js";
+import type { AgentCommandPolicyHookDecisionJournalEntry } from "../../src/core/harness/AgentCommandPolicyHookRunner.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
 import type { ProviderLimitKind, ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
+import type { RunActivityEvent, RunActivityCommandPolicyDecisionPayload } from "../../src/core/runActivity/RunActivityEvent.js";
 import {
   symphonyRoleMcpServers,
   writeActiveHandoffMcpContexts,
@@ -21,6 +24,7 @@ import {
   normalizeHermesAuthProvider,
 } from "./HermesAuthManager.js";
 import {
+  buildHermesAgentCommandPolicyDecisionJournalPath,
   buildHermesAgentCommandPolicyHookConfig,
   SYMPHONY_HERMES_AGENT_MAX_TURNS,
   type BuildHermesAgentCommandPolicyHookOptions,
@@ -48,6 +52,7 @@ interface HermesLease {
   requestTimeoutMs: number;
   shutdownGraceMs: number;
   gatewaySessionId: string | null;
+  commandPolicyDecisionJournalPath: string | null;
   disposed: boolean;
 }
 
@@ -83,6 +88,7 @@ export class HermesHarness implements AgentHarness {
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     await writeInitialHandoffMcpContexts(ctx);
     const lease = await this.getOrCreateLease(ctx);
+    resetHookDecisionJournal(lease.commandPolicyDecisionJournalPath);
     const runId = `hermes-${randomUUID()}`;
     this.activeRuns.set(runId, lease);
 
@@ -91,8 +97,22 @@ export class HermesHarness implements AgentHarness {
     let sessionStarted = false;
     let terminalStatus: TerminalStatus = null;
     let symphonySessionId: string | null = null;
+    let hookDecisionSequence = 0;
 
     const enqueue = (event: AgentEvent) => queue.push({ ...event, at: event.at ?? new Date().toISOString() });
+    const enqueueHookDecisionJournal = () => {
+      if (!lease.commandPolicyDecisionJournalPath) return;
+      for (const entry of drainHookDecisionJournal(lease.commandPolicyDecisionJournalPath, ctx.logger.warn.bind(ctx.logger))) {
+        enqueue(
+          hookDecisionAgentEvent(entry, {
+            runId,
+            runSessionId: symphonySessionId ?? `${lease.profile.profileKey}:pending:${runId}`,
+            harnessId: this.id,
+            sequence: ++hookDecisionSequence,
+          }),
+        );
+      }
+    };
     const persistRuntimeEvent = (event: GatewayEvent): void => {
       const transcriptEvent = hermesTranscriptEvent(event, this.id);
       if (!transcriptEvent) return;
@@ -112,6 +132,7 @@ export class HermesHarness implements AgentHarness {
     };
     const onGatewayEvent = (event: GatewayEvent) => {
       if (!acceptGatewayEvent(event, lease.gatewaySessionId)) return;
+      enqueueHookDecisionJournal();
       appendRuntimeEvent(event);
       for (const mapped of mapHermesGatewayEvent(event, {
         cancelled: ctx.abortSignal.aborted || this.cancelledRuns.has(runId),
@@ -123,10 +144,14 @@ export class HermesHarness implements AgentHarness {
         if (mapped.type === "cancelled") terminalStatus = "cancelled";
         enqueue(mapped);
       }
-      if (terminalStatus !== null) queue.close();
+      if (terminalStatus !== null) {
+        enqueueHookDecisionJournal();
+        queue.close();
+      }
     };
     const onExit = (code: number | null) => {
       this.retireLeaseAfterTransportExit(lease);
+      enqueueHookDecisionJournal();
       if (terminalStatus !== null) return;
       terminalStatus = ctx.abortSignal.aborted || this.cancelledRuns.has(runId) ? "cancelled" : "failed";
       enqueue(
@@ -255,9 +280,6 @@ export class HermesHarness implements AgentHarness {
     const manager = this.effectiveProfileManager(ctx);
     const phase = currentRunPhase(ctx);
     const cliPath = this.cliPath();
-    const commandPolicyHookOptions = agentCommandPolicyHookOptionsForRun(ctx, phase, cliPath);
-    const commandPolicyHooks =
-      commandPolicyHookOptions === undefined ? undefined : buildHermesAgentCommandPolicyHookConfig(commandPolicyHookOptions);
     const profileKey = hermesRunProfileKey(ctx, phase, reusable, freshLeaseId);
     const profile = await manager.materialize({
       workspaceKey: ctx.workspace.workspaceKey,
@@ -267,6 +289,9 @@ export class HermesHarness implements AgentHarness {
       profileKey,
       mode: reusable ? "reuse" : "fresh",
     });
+    const commandPolicyHookOptions = agentCommandPolicyHookOptionsForRun(ctx, phase, cliPath, profile.profileDir);
+    const commandPolicyHooks =
+      commandPolicyHookOptions === undefined ? undefined : buildHermesAgentCommandPolicyHookConfig(commandPolicyHookOptions);
     await writeHermesMcpConfig({
       profileDir: profile.profileDir,
       servers: symphonyRoleMcpServers(ctx, { cliPath, mcpCwd: ctx.workspace.path }),
@@ -318,6 +343,7 @@ export class HermesHarness implements AgentHarness {
       requestTimeoutMs: ctx.config.hermes.requestTimeoutMs,
       shutdownGraceMs: ctx.config.hermes.shutdownGraceMs,
       gatewaySessionId: null,
+      commandPolicyDecisionJournalPath: commandPolicyHookOptions?.decisionJournalPath ?? null,
       disposed: false,
     };
     if (reusable) this.leases.set(key, lease);
@@ -497,10 +523,12 @@ function agentCommandPolicyHookOptionsForRun(
   ctx: AgentRunContext,
   phase: AgentRunPhase,
   cliPath: string,
+  profileDir: string,
 ): BuildHermesAgentCommandPolicyHookOptions | undefined {
   if (!shouldInstallAgentCommandPolicyHook(ctx, phase)) return undefined;
   return {
     cliPath,
+    decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profileDir),
     role: ctx.role,
     phase,
     issueId: ctx.issue.id || ctx.issue.identifier,
@@ -536,6 +564,170 @@ function hermesRunDiagnostic(code: string, message: string, payload: Record<stri
     message,
     payload,
   };
+}
+
+function resetHookDecisionJournal(journalPath: string | null): void {
+  if (!journalPath) return;
+  try {
+    fsSync.rmSync(journalPath, { force: true });
+  } catch {
+    // Best-effort cleanup for reused profiles.
+  }
+}
+
+function drainHookDecisionJournal(
+  journalPath: string,
+  warn: (message: string, payload?: Record<string, unknown>) => void,
+): AgentCommandPolicyHookDecisionJournalEntry[] {
+  if (!fsSync.existsSync(journalPath)) return [];
+  const drainedPath = `${journalPath}.${randomUUID()}.drain`;
+  try {
+    fsSync.renameSync(journalPath, drainedPath);
+  } catch (error) {
+    if (isMissingFileError(error)) return [];
+    warn("hermes command-policy journal drain failed", { journal_path: journalPath, error: errorMessage(error) });
+    return [];
+  }
+
+  try {
+    const text = fsSync.readFileSync(drainedPath, "utf8");
+    const entries: AgentCommandPolicyHookDecisionJournalEntry[] = [];
+    for (const line of text.split(/\r?\n/g)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (!isHookDecisionJournalEntry(parsed)) {
+          warn("hermes command-policy journal entry was invalid", {
+            journal_path: journalPath,
+            entry_preview: preview(trimmed, 400),
+          });
+          continue;
+        }
+        entries.push(parsed);
+      } catch (error) {
+        warn("hermes command-policy journal entry could not be parsed", {
+          journal_path: journalPath,
+          error: errorMessage(error),
+          entry_preview: preview(trimmed, 400),
+        });
+      }
+    }
+    return entries;
+  } catch (error) {
+    warn("hermes command-policy journal read failed", { journal_path: journalPath, error: errorMessage(error) });
+    return [];
+  } finally {
+    try {
+      fsSync.rmSync(drainedPath, { force: true });
+    } catch {
+      // best effort
+    }
+  }
+}
+
+function hookDecisionAgentEvent(
+  entry: AgentCommandPolicyHookDecisionJournalEntry,
+  context: { runId: string; runSessionId: string; harnessId: string; sequence: number },
+): AgentEvent {
+  const message = `Command policy ${entry.decision.outcome}: ${entry.decision.reasonKind} (${entry.decision.audit.role} · ${entry.decision.audit.phase} · ${entry.decision.audit.surface})`;
+  return {
+    type: "run_diagnostic",
+    code: "command_policy_decision",
+    message,
+    payload: {
+      outcome: entry.decision.outcome,
+      reasonKind: entry.decision.reasonKind,
+      requestKind: entry.requestKind,
+      toolCallId: entry.toolCallId,
+      permissionOutcome: entry.permissionOutcome,
+      hookAction: entry.hookAction,
+      redacted: true,
+    },
+    runActivity: hookDecisionRunActivity(entry, context, message),
+  };
+}
+
+function hookDecisionRunActivity(
+  entry: AgentCommandPolicyHookDecisionJournalEntry,
+  context: { runId: string; runSessionId: string; harnessId: string; sequence: number },
+  text: string,
+): RunActivityEvent {
+  const payload: RunActivityCommandPolicyDecisionPayload = {
+    decisionId: entry.decision.decisionId ?? null,
+    attemptId: entry.decision.attemptId ?? entry.toolCallId ?? null,
+    runId: entry.runId,
+    issueId: entry.issueId,
+    surface: entry.decision.audit.surface,
+    role: entry.decision.audit.role,
+    phase: entry.decision.audit.phase,
+    outcome: entry.decision.outcome,
+    reasonKind: entry.decision.reasonKind,
+    commandClass: entry.decision.commandClass,
+    message: entry.decision.message,
+    upstreamContactAttempted: entry.decision.audit.upstreamContactAttempted,
+    ...(entry.decision.requiresCodeChange === undefined ? {} : { requiresCodeChange: entry.decision.requiresCodeChange }),
+    ...(entry.decision.requiresUserOrServiceFix === undefined
+      ? {}
+      : { requiresUserOrServiceFix: entry.decision.requiresUserOrServiceFix }),
+    ...(entry.decision.normalizedCommand === undefined ? {} : { normalizedCommand: entry.decision.normalizedCommand }),
+    audit: entry.decision.audit,
+    requestKind: entry.requestKind,
+    toolCallId: entry.toolCallId,
+    permissionOutcome: entry.permissionOutcome,
+    hookAction: entry.hookAction,
+    redacted: true,
+  };
+  return {
+    eventId: `${context.runId}:command-policy:${context.sequence}`,
+    runSessionId: context.runSessionId,
+    occurredAt: entry.recordedAt,
+    sequence: context.sequence,
+    sequenceSource: "harness",
+    externalEventId: null,
+    protocol: "symphony",
+    harness: context.harnessId,
+    actor: "harness",
+    channel: "diagnostic",
+    kind: "command_policy_decision",
+    text,
+    payload,
+  };
+}
+
+function isHookDecisionJournalEntry(value: unknown): value is AgentCommandPolicyHookDecisionJournalEntry {
+  if (!isRecord(value)) return false;
+  if (value.version !== 1 || typeof value.recordedAt !== "string") return false;
+  if (!nullableString(value.runId) || !nullableString(value.issueId)) return false;
+  if (!nullableString(value.requestKind) || !nullableString(value.toolCallId)) return false;
+  if (!nullableString(value.permissionOutcome) || !nullableString(value.hookAction)) return false;
+  return isHookDecision(value.decision);
+}
+
+function isHookDecision(value: unknown): value is AgentCommandPolicyDecision {
+  if (!isRecord(value)) return false;
+  if (value.outcome !== "allow" && value.outcome !== "deny") return false;
+  if (typeof value.reasonKind !== "string" || typeof value.commandClass !== "string" || typeof value.message !== "string") return false;
+  return isHookDecisionAudit(value.audit);
+}
+
+function isHookDecisionAudit(value: unknown): value is AgentCommandPolicyDecision["audit"] {
+  return (
+    isRecord(value) &&
+    value.redacted === true &&
+    typeof value.role === "string" &&
+    typeof value.phase === "string" &&
+    typeof value.surface === "string" &&
+    typeof value.upstreamContactAttempted === "boolean"
+  );
+}
+
+function nullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return isRecord(error) && error.code === "ENOENT";
 }
 
 export interface HermesLimitMappingDefaults {

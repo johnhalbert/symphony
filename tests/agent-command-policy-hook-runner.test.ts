@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
@@ -224,6 +227,60 @@ subprocess.run(["gh", "pr", "create", "--fill"])`;
 
     expect(evaluation.hookResponse).toEqual({ action: "block", message: "blocked through stdio" });
     expect(output.text).toBe(`${JSON.stringify({ action: "block", message: "blocked through stdio" })}\n`);
+  });
+
+  it("writes structured journal entries for hook stdio decisions", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-journal-"));
+    const journalPath = path.join(tempRoot, "policy-decisions.ndjson");
+    try {
+      const evaluation = await runAgentCommandPolicyHookStdio({
+        input: Readable.from([JSON.stringify(hermesPayload({ command: "git push origin main" }))]),
+        output: new CapturingWritable(),
+        role: "worker",
+        phase: "implementation",
+        issueId: "issue-1",
+        runId: "run-1",
+        journalPath,
+        classify: (input) =>
+          decisionFor(input, "deny", {
+            reasonKind: "direct_upstream_github",
+            commandClass: "direct_upstream_git_operation",
+            message: "blocked through stdio",
+          }),
+      });
+
+      const lines = (await readFile(journalPath, "utf8")).trim().split(/\r?\n/g);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0] as string) as unknown).toMatchObject({
+        version: 1,
+        runId: "run-1",
+        issueId: "issue-1",
+        requestKind: "terminal_execute",
+        toolCallId: "tool-call-1",
+        permissionOutcome: "denied",
+        hookAction: "block",
+        decision: {
+          outcome: "deny",
+          reasonKind: "direct_upstream_github",
+          commandClass: "direct_upstream_git_operation",
+          message: "blocked through stdio",
+          audit: {
+            role: "worker",
+            phase: "implementation",
+            surface: "terminal",
+            redacted: true,
+          },
+        },
+      });
+      expect(evaluation.journalEntry).toMatchObject({
+        requestKind: "terminal_execute",
+        toolCallId: "tool-call-1",
+        permissionOutcome: "denied",
+        hookAction: "block",
+      });
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it("keeps stdout empty for allowed stdio evaluations", async () => {
