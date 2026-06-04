@@ -1142,7 +1142,7 @@ async function assertButtonUnavailableByLabel(page, label, description) {
   const result = await buttonStateByLabel(page, label);
   assert(result?.found, `Could not find ${description} in the browser`);
   assert(
-    result.disabled || result.ariaDisabled === "true" || result.unavailableAction === label,
+    result.disabled && result.ariaDisabled === "true" && result.unavailableAction === label,
     `Expected ${description} to remain honestly unavailable, got ${JSON.stringify(result)}`,
   );
 }
