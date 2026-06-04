@@ -23,7 +23,13 @@ import {
   runtimeHarnessDoctorChecks,
   trackerHandoffDoctorCheck,
 } from "../src/doctor.js";
-import { agentEligibleIssueContract, fencedAuthoringSectionSpoof, issue, testConfig } from "./helpers.js";
+import {
+  agentEligibleIssueContract,
+  fencedAuthoringSectionSpoof,
+  issue,
+  nestedFencedIssueContractSpoof,
+  testConfig,
+} from "./helpers.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 import type { HostHermesCommandRunner } from "../hermes/src/HostHermesDiscovery.js";
 
@@ -108,6 +114,20 @@ describe("doctor review-loop checks", () => {
       status: "warn",
       message:
         "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 has an invalid Issue Contract (Issue Contract requirement ids must be stable non-empty identifiers (for example `REQ-001`); Issue Contract requirements must include non-empty `requirement` text)",
+    });
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: nestedFencedIssueContractSpoof(),
+        }),
+      ]),
+    ).toEqual({
+      id: "linear.issue_contract",
+      status: "warn",
+      message:
+        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 has an invalid Issue Contract (Issue Contract must contain a fenced `json` block)",
     });
   });
 

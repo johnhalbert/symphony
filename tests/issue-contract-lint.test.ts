@@ -4,7 +4,7 @@ import {
   hasMeaningfulRemainingBlocker,
   missingRequiredIssueContractSections,
 } from "../src/core/IssueContractLint.js";
-import { agentEligibleIssueContract, fencedAuthoringSectionSpoof } from "./helpers.js";
+import { agentEligibleIssueContract, fencedAuthoringSectionSpoof, nestedFencedIssueContractSpoof } from "./helpers.js";
 
 describe("IssueContractLint", () => {
   it("requires the Issue Contract heading in required sections", () => {
@@ -30,6 +30,14 @@ describe("IssueContractLint", () => {
     expect(analysis.missingSections).not.toContain("Problem / Goal");
     expect(analysis.readyForDogfoodReady).toBeNull();
     expect(analysis.remainingBlocker).toBeNull();
+  });
+
+  it("rejects fenced JSON Issue Contracts hidden inside larger fenced code blocks", () => {
+    const analysis = analyzeIssueContractDescription(nestedFencedIssueContractSpoof(), []);
+
+    expect(analysis.missingSections).toEqual([]);
+    expect(analysis.issueContractErrors).toEqual(["Issue Contract must contain a fenced `json` block"]);
+    expect(analysis.readyForDogfoodReady).toBe(true);
   });
 
   it.each([

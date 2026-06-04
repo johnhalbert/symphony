@@ -11,7 +11,13 @@ import {
 import type { IssueBreakdownPlanInput } from "../src/core/IssueBreakdownPlanService.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
-import { agentEligibleIssueContract, fencedAuthoringSectionSpoof, issue, testConfig } from "./helpers.js";
+import {
+  agentEligibleIssueContract,
+  fencedAuthoringSectionSpoof,
+  issue,
+  nestedFencedIssueContractSpoof,
+  testConfig,
+} from "./helpers.js";
 
 describe("IssueBreakdownPlanService", () => {
   let root: string;
@@ -397,6 +403,7 @@ describe("IssueBreakdownPlanService", () => {
       agentEligibleIssueContract({ includeIssueContract: false }),
       agentEligibleIssueContract({ issueContractFenceLanguage: "yaml" }),
       agentEligibleIssueContract({ issueContractJson: "{ not valid json" }),
+      nestedFencedIssueContractSpoof(),
       agentEligibleIssueContract({ issueContractRequirements: [] }),
       agentEligibleIssueContract({
         issueContractRequirements: [

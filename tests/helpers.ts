@@ -142,3 +142,28 @@ export function fencedAuthoringSectionSpoof(
 
   return [...lines.slice(0, secondHeadingIndex), "````md", ...lines.slice(secondHeadingIndex), "````"].join("\n");
 }
+
+export function nestedFencedIssueContractSpoof(
+  overrides: Parameters<typeof agentEligibleIssueContract>[0] = {},
+): string {
+  const lines = agentEligibleIssueContract(overrides).split("\n");
+  const issueContractHeadingIndex = lines.findIndex((line) => line === "## Issue Contract");
+  const nextHeadingIndex = lines.findIndex(
+    (line, index) => index > issueContractHeadingIndex && line.startsWith("## "),
+  );
+  if (issueContractHeadingIndex === -1 || nextHeadingIndex === -1) return lines.join("\n");
+
+  const issueContractBody = lines.slice(issueContractHeadingIndex + 1, nextHeadingIndex);
+  const trimmedBody =
+    issueContractBody[0]?.trim().length === 0 ? issueContractBody.slice(1) : issueContractBody;
+
+  return [
+    ...lines.slice(0, issueContractHeadingIndex + 1),
+    "",
+    "````md",
+    ...trimmedBody,
+    "````",
+    "",
+    ...lines.slice(nextHeadingIndex),
+  ].join("\n");
+}

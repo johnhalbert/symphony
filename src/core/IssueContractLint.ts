@@ -399,8 +399,38 @@ function normalizeScanText(value: string): string {
 }
 
 function extractFencedJsonBlock(section: string): string | null {
-  const match = section.match(/```json\b\s*([\s\S]*?)```/i);
-  return match?.[1]?.trim() || null;
+  let activeFence: MarkdownFenceDelimiter | null = null;
+  let activeFenceContent: string[] = [];
+
+  for (const line of section.split(/\r?\n/)) {
+    const fence = parseMarkdownFenceDelimiter(line);
+    if (activeFence) {
+      if (
+        fence &&
+        fence.marker === activeFence.marker &&
+        fence.length >= activeFence.length &&
+        fence.trailing.trim().length === 0
+      ) {
+        if (isJsonFence(activeFence)) return activeFenceContent.join("\n").trim() || null;
+        activeFence = null;
+        activeFenceContent = [];
+        continue;
+      }
+
+      if (isJsonFence(activeFence)) activeFenceContent.push(line);
+      continue;
+    }
+
+    if (!fence) continue;
+    activeFence = fence;
+    activeFenceContent = [];
+  }
+
+  return null;
+}
+
+function isJsonFence(fence: MarkdownFenceDelimiter): boolean {
+  return fence.trailing.trim().toLowerCase() === "json";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
