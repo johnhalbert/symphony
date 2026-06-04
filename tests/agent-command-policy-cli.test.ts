@@ -3,7 +3,10 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES } from "../src/core/harness/AgentCommandPolicyHookRunner.js";
+import {
+  AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES,
+  buildAgentCommandPolicyHookDecisionJournalFallbackPath,
+} from "../src/core/harness/AgentCommandPolicyHookRunner.js";
 
 describe("agent-command-policy-hook CLI", () => {
   it("emits Hermes block JSON for a worker upstream Git command", async () => {
@@ -64,7 +67,7 @@ describe("agent-command-policy-hook CLI", () => {
     { name: "allow", input: JSON.stringify(hermesPayload("git status --short")) },
     { name: "deny", input: JSON.stringify(hermesPayload("git push origin main")) },
     { name: "fail-closed malformed payload", input: '{"tool_name":"terminal","tool_input":' },
-  ])("exits non-zero when decision journaling fails for $name outcomes", async ({ input }) => {
+  ])("writes fallback audit and blocks when decision journaling fails for $name outcomes", async ({ name, input }) => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-cli-journal-error-"));
     try {
       const result = await runPolicyHookCli({
@@ -83,11 +86,37 @@ describe("agent-command-policy-hook CLI", () => {
         input,
       });
 
-      expect(result.exitCode).not.toBe(0);
-      expect(result.stdout).toBe("");
-      expect(result.stderr).toContain("Failed to append command policy decision journal");
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout) as unknown).toMatchObject({ action: "block" });
+      expect(result.stderr).toContain("wrote fallback journal");
+      const fallbackPath = buildAgentCommandPolicyHookDecisionJournalFallbackPath(tempRoot);
+      const lines = (await readFile(fallbackPath, "utf8")).trim().split(/\r?\n/g);
+      expect(lines).toHaveLength(1);
+      const entry = JSON.parse(lines[0] as string) as {
+        permissionOutcome: string;
+        hookAction: string;
+        decision: { outcome: string; reasonKind: string };
+      };
+      expect(entry.hookAction).toBe("block");
+      if (name === "allow") {
+        expect(entry).toMatchObject({
+          permissionOutcome: "fail_closed",
+          decision: { outcome: "deny", reasonKind: "command_policy_journal_error" },
+        });
+      } else if (name === "deny") {
+        expect(entry).toMatchObject({
+          permissionOutcome: "denied",
+          decision: { outcome: "deny", reasonKind: "upstream_github" },
+        });
+      } else {
+        expect(entry).toMatchObject({
+          permissionOutcome: "fail_closed",
+          decision: { outcome: "deny", reasonKind: "malformed_hook_payload" },
+        });
+      }
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
+      await rm(buildAgentCommandPolicyHookDecisionJournalFallbackPath(tempRoot), { force: true });
     }
   });
 

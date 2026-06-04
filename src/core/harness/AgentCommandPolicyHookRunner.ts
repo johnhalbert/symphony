@@ -12,6 +12,7 @@ import {
 } from "./AgentCommandPolicy.js";
 
 export const AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES = 1024 * 1024;
+export const AGENT_COMMAND_POLICY_HOOK_DECISION_JOURNAL_FALLBACK_SUFFIX = ".fallback.ndjson";
 
 const TOOL_INPUT_WORKING_DIRECTORY_KEYS = [
   "workdir",
@@ -82,6 +83,10 @@ export interface AgentCommandPolicyHookEvaluation {
   stdout: string;
 }
 
+export function buildAgentCommandPolicyHookDecisionJournalFallbackPath(journalPath: string): string {
+  return `${journalPath}${AGENT_COMMAND_POLICY_HOOK_DECISION_JOURNAL_FALLBACK_SUFFIX}`;
+}
+
 interface AgentCommandPolicyHookDecisionMetadata {
   runId: string | null;
   issueId: string | null;
@@ -130,6 +135,7 @@ export async function runAgentCommandPolicyHookStdio(
 ): Promise<AgentCommandPolicyHookEvaluation> {
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
+  const errorOutput = options.errorOutput ?? process.stderr;
   const stdinPayload = await readBounded(
     input,
     options.maxStdinBytes ?? AGENT_COMMAND_POLICY_HOOK_STDIN_MAX_BYTES,
@@ -142,13 +148,30 @@ export async function runAgentCommandPolicyHookStdio(
           defaultHookDecisionMetadata(options, buildOversizedHookPayloadDecision(options, stdinPayload.maxBytes)),
         )
       : await evaluateAgentCommandPolicyHookPayload(stdinPayload.text, options);
-  if (options.journalPath && evaluation.journalEntry) {
-    appendHookDecisionJournalEntry(options.journalPath, evaluation.journalEntry);
-  }
+  let finalEvaluation = evaluation;
   if (evaluation.stdout.length > 0) {
     output.write(evaluation.stdout);
   }
-  return evaluation;
+  if (options.journalPath && evaluation.journalEntry) {
+    try {
+      appendHookDecisionJournalEntry(options.journalPath, evaluation.journalEntry);
+    } catch (error) {
+      const fallbackPath = buildAgentCommandPolicyHookDecisionJournalFallbackPath(options.journalPath);
+      finalEvaluation =
+        evaluation.decision.outcome === "allow"
+          ? journalAppendFailureEvaluation(evaluation, options)
+          : evaluation;
+      if (evaluation.decision.outcome === "allow" && finalEvaluation.stdout.length > 0) {
+        output.write(finalEvaluation.stdout);
+      }
+      if (!finalEvaluation.journalEntry) throw error;
+      appendHookDecisionJournalEntry(fallbackPath, finalEvaluation.journalEntry);
+      errorOutput.write(
+        `Failed to append command policy decision journal at ${options.journalPath}; wrote fallback journal at ${fallbackPath}: ${errorMessage(error)}\n`,
+      );
+    }
+  }
+  return finalEvaluation;
 }
 
 export function mapAgentCommandPolicyDecisionToHermesHookResponse(
@@ -301,7 +324,7 @@ function buildPolicyInput(
   const input: AgentCommandPolicyInput = {
     role,
     phase,
-    surface: toolName,
+    surface: hookPolicySurface(toolName, hookEventName),
     workingDirectory: workingDirectory.workingDirectory,
     rawInput,
     environment: buildHookPolicyEnvironment(hookEnvironment),
@@ -528,6 +551,32 @@ function appendHookDecisionJournalEntry(journalPath: string, entry: AgentCommand
   }
 }
 
+function journalAppendFailureEvaluation(
+  evaluation: AgentCommandPolicyHookEvaluation,
+  context: AgentCommandPolicyHookRunnerContext,
+): AgentCommandPolicyHookEvaluation {
+  const entry = evaluation.journalEntry;
+  if (!entry) return evaluation;
+  const decision = buildFailClosedAgentCommandPolicyDecision({
+    role: entry.decision.audit.role,
+    phase: entry.decision.audit.phase,
+    surface: entry.decision.audit.surface,
+    workingDirectory: context.workingDirectory,
+    reasonKind: "command_policy_journal_error",
+    commandClass: "command_policy_journal_append_failure",
+    message:
+      "Blocked worker/reviewer command: Symphony could not durably record the command-policy decision before allowing this hook action. Use Symphony service-owned GitHub workflow actions for upstream GitHub activity.",
+  });
+  return evaluationFromDecision(decision, evaluation.policyInput, {
+    runId: entry.runId,
+    issueId: entry.issueId,
+    requestKind: entry.requestKind,
+    toolCallId: entry.toolCallId,
+    permissionOutcome: "fail_closed",
+    hookAction: "block",
+  });
+}
+
 function hookDecisionMetadata(
   payload: HermesPreToolCallHookPayload,
   context: AgentCommandPolicyHookRunnerContext,
@@ -575,6 +624,7 @@ function hookPermissionOutcome(decision: AgentCommandPolicyDecision): string {
   return decision.reasonKind === "malformed_hook_payload" ||
     decision.reasonKind === "oversized_hook_payload" ||
     decision.reasonKind === "missing_hook_context" ||
+    decision.reasonKind === "command_policy_journal_error" ||
     decision.reasonKind === "classifier_error"
     ? "fail_closed"
     : "denied";
@@ -584,6 +634,10 @@ function hookRequestKind(toolName: string | null, hookEventName: string | null):
   if (toolName === "terminal") return "terminal_execute";
   if (toolName === "execute_code") return "execute_code";
   return hookEventName;
+}
+
+function hookPolicySurface(toolName: string, hookEventName: string | null): string {
+  return hookRequestKind(toolName, hookEventName) ?? toolName;
 }
 
 function hookToolCallId(extra: unknown): string | null {
@@ -630,4 +684,8 @@ function nonEmptyString(value: string | undefined): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

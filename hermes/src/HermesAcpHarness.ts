@@ -2968,6 +2968,7 @@ function permissionResolutionReasonKind(
     case "permission_option_not_supported":
     case "permission_option_selected":
     case "no_permission_policy":
+    case "classifier_error":
     case "file_edit_permission_allowed":
     case "file_edit_permission_denied":
     case "file_edit_approval_bridge_not_configured":
@@ -3017,6 +3018,8 @@ function permissionResolutionCommandClass(
       return "acp_permission_bridge";
     case "permission_request_timeout":
       return "acp_permission_timeout";
+    case "classifier_error":
+      return "agent_command_policy_classifier_error";
     case "run_cancelled":
       return "acp_permission_cancelled";
     case "acp_process_exited":
@@ -3074,6 +3077,8 @@ function permissionResolutionMessage(
       return "Blocked ACP permission request because the Symphony permission bridge failed closed.";
     case "permission_request_timeout":
       return "Blocked ACP permission request because the Symphony permission bridge timed out.";
+    case "classifier_error":
+      return "Blocked ACP permission request because the Symphony agent command policy classifier failed closed.";
     case "run_cancelled":
       return "Blocked ACP permission request because the active Symphony run was cancelled.";
     case "acp_process_exited":
@@ -3090,6 +3095,7 @@ function permissionResolutionRequiresUserOrServiceFix(reasonKind: AgentCommandPo
     reasonKind === "permission_bridge_not_configured" ||
     reasonKind === "permission_bridge_error" ||
     reasonKind === "permission_request_timeout" ||
+    reasonKind === "classifier_error" ||
     reasonKind === "acp_process_exited"
   );
 }

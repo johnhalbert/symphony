@@ -10,6 +10,7 @@ import {
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
 } from "../hermes/src/HermesMcpConfig.js";
+import { buildAgentCommandPolicyHookDecisionJournalFallbackPath } from "../src/core/harness/AgentCommandPolicyHookRunner.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
 import { parseServiceConfig, type ServiceConfig } from "../src/core/config/Config.js";
 import type { AgentEvent, AgentRunContext } from "../src/core/harness/AgentHarness.js";
@@ -150,6 +151,73 @@ describe("Hermes command policy profile hooks", () => {
     await harness.dispose();
   });
 
+  it("emits durable command_policy_decision activity from fallback hook journals when primary journaling fails", async () => {
+    const cliPath = path.join(root, "cli.js");
+    const harness = new HermesHarness({
+      cliPath,
+      commandPolicyHookVerifier: async () => undefined,
+      gatewayFactory: (env) =>
+        new FakeGatewayClient(env, "gw-fallback-journal", {
+          onPromptSubmit: async (client) => {
+            const journalPath = buildHermesAgentCommandPolicyDecisionJournalPath(client.env.hermesHome);
+            await mkdir(journalPath, { recursive: true });
+            const fallbackPath = buildAgentCommandPolicyHookDecisionJournalFallbackPath(journalPath);
+            const entries = [
+              hookJournalEntry("local_only_inspection", "allow", {
+                permissionOutcome: "allowed",
+                hookAction: null,
+              }),
+              hookJournalEntry("direct_upstream_github", "deny", {
+                permissionOutcome: "denied",
+                hookAction: "block",
+              }),
+              hookJournalEntry("malformed_hook_payload", "deny", {
+                requestKind: null,
+                surface: "unknown",
+                permissionOutcome: "fail_closed",
+                hookAction: "block",
+              }),
+            ];
+            await writeFile(fallbackPath, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+          },
+        }),
+    });
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(
+      harness.run(context(config, { workspacePath, role: "worker", runPhase: "implementation", turnNumber: 1 }), "worker"),
+    );
+
+    const decisionEvents = events.filter((event) => event.type === "run_diagnostic" && event.code === "command_policy_decision");
+    expect(decisionEvents).toHaveLength(3);
+    expect(decisionEvents.map((event) => event.runActivity?.payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          outcome: "allow",
+          reasonKind: "local_only_inspection",
+          surface: "terminal_execute",
+          audit: expect.objectContaining({ surface: "terminal_execute" }),
+        }),
+        expect.objectContaining({
+          outcome: "deny",
+          reasonKind: "direct_upstream_github",
+          surface: "terminal_execute",
+          audit: expect.objectContaining({ surface: "terminal_execute" }),
+        }),
+        expect.objectContaining({
+          outcome: "deny",
+          reasonKind: "malformed_hook_payload",
+          surface: "unknown",
+          permissionOutcome: "fail_closed",
+        }),
+      ]),
+    );
+
+    await harness.dispose();
+  });
+
   it("fails closed before creating a gateway client when command-policy hook validation is unverifiable", async () => {
     const clients: FakeGatewayClient[] = [];
     const cliPath = path.join(root, "cli.js");
@@ -176,6 +244,41 @@ describe("Hermes command policy profile hooks", () => {
     await harness.dispose();
   });
 });
+
+function hookJournalEntry(
+  reasonKind: string,
+  outcome: "allow" | "deny",
+  options: {
+    requestKind?: string | null;
+    surface?: string;
+    permissionOutcome: string;
+    hookAction: string | null;
+  },
+): Record<string, unknown> {
+  return {
+    version: 1,
+    recordedAt: "2026-06-04T10:00:00.000Z",
+    runId: "test-session",
+    issueId: "issue-1",
+    requestKind: options.requestKind === undefined ? "terminal_execute" : options.requestKind,
+    toolCallId: "tool-call-1",
+    permissionOutcome: options.permissionOutcome,
+    hookAction: options.hookAction,
+    decision: {
+      outcome,
+      reasonKind,
+      commandClass: reasonKind,
+      message: `${outcome} by fallback test policy`,
+      audit: {
+        redacted: true,
+        role: "worker",
+        phase: "implementation",
+        surface: options.surface ?? "terminal",
+        upstreamContactAttempted: false,
+      },
+    },
+  };
+}
 
 class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   readonly requests: Array<{ method: string; params: Record<string, unknown> }> = [];

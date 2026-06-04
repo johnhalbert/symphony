@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import fsSync, { promises as fs } from "node:fs";
 import path from "node:path";
 import type { AgentCommandPolicyDecision } from "../../src/core/harness/AgentCommandPolicy.js";
-import type { AgentCommandPolicyHookDecisionJournalEntry } from "../../src/core/harness/AgentCommandPolicyHookRunner.js";
+import {
+  buildAgentCommandPolicyHookDecisionJournalFallbackPath,
+  type AgentCommandPolicyHookDecisionJournalEntry,
+} from "../../src/core/harness/AgentCommandPolicyHookRunner.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
 import type { ProviderLimitKind, ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
 import type { RunActivityEvent, RunActivityCommandPolicyDecisionPayload } from "../../src/core/runActivity/RunActivityEvent.js";
@@ -102,7 +105,7 @@ export class HermesHarness implements AgentHarness {
     const enqueue = (event: AgentEvent) => queue.push({ ...event, at: event.at ?? new Date().toISOString() });
     const enqueueHookDecisionJournal = () => {
       if (!lease.commandPolicyDecisionJournalPath) return;
-      for (const entry of drainHookDecisionJournal(lease.commandPolicyDecisionJournalPath, ctx.logger.warn.bind(ctx.logger))) {
+      for (const entry of drainHookDecisionJournals(lease.commandPolicyDecisionJournalPath, ctx.logger.warn.bind(ctx.logger))) {
         enqueue(
           hookDecisionAgentEvent(entry, {
             runId,
@@ -568,11 +571,24 @@ function hermesRunDiagnostic(code: string, message: string, payload: Record<stri
 
 function resetHookDecisionJournal(journalPath: string | null): void {
   if (!journalPath) return;
-  try {
-    fsSync.rmSync(journalPath, { force: true });
-  } catch {
-    // Best-effort cleanup for reused profiles.
+  for (const candidate of hookDecisionJournalPaths(journalPath)) {
+    try {
+      fsSync.rmSync(candidate, { force: true });
+    } catch {
+      // Best-effort cleanup for reused profiles.
+    }
   }
+}
+
+function drainHookDecisionJournals(
+  journalPath: string,
+  warn: (message: string, payload?: Record<string, unknown>) => void,
+): AgentCommandPolicyHookDecisionJournalEntry[] {
+  return hookDecisionJournalPaths(journalPath).flatMap((candidate) => drainHookDecisionJournal(candidate, warn));
+}
+
+function hookDecisionJournalPaths(journalPath: string): string[] {
+  return [journalPath, buildAgentCommandPolicyHookDecisionJournalFallbackPath(journalPath)];
 }
 
 function drainHookDecisionJournal(
@@ -580,6 +596,17 @@ function drainHookDecisionJournal(
   warn: (message: string, payload?: Record<string, unknown>) => void,
 ): AgentCommandPolicyHookDecisionJournalEntry[] {
   if (!fsSync.existsSync(journalPath)) return [];
+  try {
+    const stat = fsSync.statSync(journalPath);
+    if (!stat.isFile()) {
+      warn("hermes command-policy journal path was not a file", { journal_path: journalPath });
+      return [];
+    }
+  } catch (error) {
+    if (isMissingFileError(error)) return [];
+    warn("hermes command-policy journal stat failed", { journal_path: journalPath, error: errorMessage(error) });
+    return [];
+  }
   const drainedPath = `${journalPath}.${randomUUID()}.drain`;
   try {
     fsSync.renameSync(journalPath, drainedPath);
@@ -630,7 +657,8 @@ function hookDecisionAgentEvent(
   entry: AgentCommandPolicyHookDecisionJournalEntry,
   context: { runId: string; runSessionId: string; harnessId: string; sequence: number },
 ): AgentEvent {
-  const message = `Command policy ${entry.decision.outcome}: ${entry.decision.reasonKind} (${entry.decision.audit.role} · ${entry.decision.audit.phase} · ${entry.decision.audit.surface})`;
+  const audit = hookDecisionAudit(entry);
+  const message = `Command policy ${entry.decision.outcome}: ${entry.decision.reasonKind} (${audit.role} · ${audit.phase} · ${audit.surface})`;
   return {
     type: "run_diagnostic",
     code: "command_policy_decision",
@@ -653,14 +681,15 @@ function hookDecisionRunActivity(
   context: { runId: string; runSessionId: string; harnessId: string; sequence: number },
   text: string,
 ): RunActivityEvent {
+  const audit = hookDecisionAudit(entry);
   const payload: RunActivityCommandPolicyDecisionPayload = {
     decisionId: entry.decision.decisionId ?? null,
     attemptId: entry.decision.attemptId ?? entry.toolCallId ?? null,
     runId: context.runId,
     issueId: entry.issueId,
-    surface: entry.decision.audit.surface,
-    role: entry.decision.audit.role,
-    phase: entry.decision.audit.phase,
+    surface: audit.surface,
+    role: audit.role,
+    phase: audit.phase,
     outcome: entry.decision.outcome,
     reasonKind: entry.decision.reasonKind,
     commandClass: entry.decision.commandClass,
@@ -671,7 +700,7 @@ function hookDecisionRunActivity(
       ? {}
       : { requiresUserOrServiceFix: entry.decision.requiresUserOrServiceFix }),
     ...(entry.decision.normalizedCommand === undefined ? {} : { normalizedCommand: entry.decision.normalizedCommand }),
-    audit: entry.decision.audit,
+    audit,
     requestKind: entry.requestKind,
     toolCallId: entry.toolCallId,
     permissionOutcome: entry.permissionOutcome,
@@ -693,6 +722,14 @@ function hookDecisionRunActivity(
     text,
     payload,
   };
+}
+
+function hookDecisionAudit(entry: AgentCommandPolicyHookDecisionJournalEntry): AgentCommandPolicyDecision["audit"] {
+  const surface =
+    entry.requestKind === "terminal_execute" && entry.decision.audit.surface === "terminal"
+      ? "terminal_execute"
+      : entry.decision.audit.surface;
+  return surface === entry.decision.audit.surface ? entry.decision.audit : { ...entry.decision.audit, surface };
 }
 
 function isHookDecisionJournalEntry(value: unknown): value is AgentCommandPolicyHookDecisionJournalEntry {

@@ -145,6 +145,7 @@ export type AgentCommandPolicyReasonKind =
   | "malformed_hook_payload"
   | "oversized_hook_payload"
   | "missing_hook_context"
+  | "command_policy_journal_error"
   | "classifier_error"
   | "permission_bridge_not_configured"
   | "permission_bridge_error"
@@ -1492,7 +1493,11 @@ export function buildFailClosedAgentCommandPolicyDecision(input: {
   workingDirectory?: string | undefined;
   reasonKind: Extract<
     AgentCommandPolicyReasonKind,
-    "malformed_hook_payload" | "oversized_hook_payload" | "missing_hook_context" | "classifier_error"
+    | "malformed_hook_payload"
+    | "oversized_hook_payload"
+    | "missing_hook_context"
+    | "command_policy_journal_error"
+    | "classifier_error"
   >;
   commandClass: string;
   message: string;

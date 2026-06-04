@@ -26,6 +26,7 @@ const RUN_ACTIVITY_COMMAND_POLICY_REASON_KINDS = [
   "malformed_hook_payload",
   "oversized_hook_payload",
   "missing_hook_context",
+  "command_policy_journal_error",
   "classifier_error",
   "permission_bridge_not_configured",
   "permission_bridge_error",
