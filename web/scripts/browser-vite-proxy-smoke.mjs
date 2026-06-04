@@ -159,11 +159,28 @@ const session = {
 
 const transcript = [{ kind: "assistant", ts: session.updatedAt, text: "Dedicated session transcript from API endpoint" }];
 const staleTranscript = [{ kind: "assistant", ts: staleSession.updatedAt, text: "STALE embedded history transcript should not render" }];
+const staleDurableTranscript = [
+  { kind: "assistant", ts: session.updatedAt, text: "STALE dedicated transcript from durable projection cache" },
+];
 const transcriptWindow = createTranscriptWindowResponse(transcript, {
   runStatus: "running",
   lastSequence: 1,
   lastEventAt: session.updatedAt,
   refetchHref: "/api/v1/web/sessions/smoke-session/transcript?refresh=1",
+});
+const durableTranscriptWindow = createTranscriptWindowResponse(staleDurableTranscript, {
+  kind: "page",
+  runStatus: "running",
+  offset: 0,
+  limit: 1,
+  total: 1,
+  lastSequence: 1,
+  nextOffset: null,
+  hasNext: false,
+  hasPrevious: false,
+  firstSequence: 1,
+  lastEventAt: session.updatedAt,
+  refetchHref: "/api/v1/web/sessions/smoke-session/transcript?offset=0&limit=1&refresh=1",
 });
 const staleTranscriptWindow = createTranscriptWindowResponse(staleTranscript, {
   runStatus: "succeeded",
@@ -346,7 +363,7 @@ async function runViteProxySmoke() {
     browserProcess = browser.process;
     const page = browser.page;
     await prepareBrowserPage(page, `${viteOrigin}/`);
-    await runBrowserSmokeAssertions(page);
+    await runBrowserSmokeAssertions(page, viteOrigin);
 
     await page.close();
     await stopBrowserProcess(browserProcess);
@@ -386,7 +403,7 @@ async function runProductionServingSmoke() {
     browserProcess = browser.process;
     const page = browser.page;
     await prepareBrowserPage(page, `${productionOrigin}/web/issues/PROXY-1`);
-    await runBrowserSmokeAssertions(page);
+    await runBrowserSmokeAssertions(page, productionOrigin);
 
     await page.close();
     await stopBrowserProcess(browserProcess);
@@ -408,7 +425,55 @@ async function prepareBrowserPage(page, url) {
   await page.waitForEvent("Page.loadEventFired", 10_000).catch(() => undefined);
 }
 
-async function runBrowserSmokeAssertions(page) {
+function extractTranscriptText(windowPayload) {
+  const messages = Array.isArray(windowPayload?.messages) ? windowPayload.messages : [];
+  return messages.map((message) => (typeof message?.text === "string" ? message.text : "")).filter(Boolean);
+}
+
+async function assertRunningTranscriptUsesLiveTail(origin) {
+  const defaultTranscriptWindow = await fetchJson(`${origin}/api/v1/web/sessions/smoke-session/transcript`);
+  const explicitTranscriptWindow = await fetchJson(`${origin}/api/v1/web/sessions/smoke-session/transcript?offset=0&limit=1`);
+
+  const defaultMessages = extractTranscriptText(defaultTranscriptWindow);
+  const explicitMessages = extractTranscriptText(explicitTranscriptWindow);
+
+  assert(
+    defaultTranscriptWindow.activeTail?.enabled === true,
+    `Expected default transcript request to expose active-tail behavior, got ${JSON.stringify(defaultTranscriptWindow.activeTail)}`,
+  );
+  assert(
+    defaultTranscriptWindow.window?.kind === "tail",
+    `Expected default transcript response to be a tail window, got ${JSON.stringify(defaultTranscriptWindow.window?.kind)}`,
+  );
+  assert(
+    explicitTranscriptWindow.activeTail?.enabled === false,
+    `Expected explicit page transcript request to disable active-tail behavior, got ${JSON.stringify(explicitTranscriptWindow.activeTail)}`,
+  );
+  assert(
+    explicitTranscriptWindow.window?.kind === "page",
+    `Expected explicit transcript response to be a page window, got ${JSON.stringify(explicitTranscriptWindow.window?.kind)}`,
+  );
+
+  assert(
+    defaultMessages.includes("Dedicated session transcript from API endpoint"),
+    `Expected default transcript to include dedicated live data, got ${JSON.stringify(defaultMessages)}`,
+  );
+  assert(
+    !defaultMessages.includes("STALE dedicated transcript from durable projection cache"),
+    `Expected default transcript to not include durable cache-only text, got ${JSON.stringify(defaultMessages)}`,
+  );
+
+  assert(
+    explicitMessages.includes("STALE dedicated transcript from durable projection cache"),
+    `Expected explicit transcript projection to expose durable cache payload, got ${JSON.stringify(explicitMessages)}`,
+  );
+  assert(
+    !explicitMessages.includes("Dedicated session transcript from API endpoint"),
+    `Expected explicit page request to be durable projection-only in this smoke fixture, got ${JSON.stringify(explicitMessages)}`,
+  );
+}
+
+async function runBrowserSmokeAssertions(page, origin) {
   const staleChatMarkers = [
     "STALE dashboard embedded chat should not render",
     "STALE dashboard suggestion should not render",
@@ -512,6 +577,7 @@ async function runBrowserSmokeAssertions(page) {
     include: ["Browser proxy smoke session", "smoke-session", "Dedicated session transcript from API endpoint"],
     exclude: forbiddenSelectedTranscriptMarkers,
   });
+  await assertRunningTranscriptUsesLiveTail(origin);
 
   await clickButtonByAriaLabel(page, "Sidebars", "Sidebars tab");
   await waitForBrowserText(page, "sidebar summary rendered from API data", {
@@ -647,7 +713,13 @@ async function handleFakeApiRequest(request, response, url) {
   if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-0") {
     return sendJson(response, 200, { issue: staleIssueDetail, activity: [], runs: [staleSession], transcript: staleTranscript });
   }
-  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/smoke-session/transcript") return sendJson(response, 200, transcriptWindow);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/smoke-session/transcript") {
+    const hasExplicitOffsetOrLimit = url.searchParams.has("offset") || url.searchParams.has("limit");
+    if (hasExplicitOffsetOrLimit) {
+      return sendJson(response, 200, durableTranscriptWindow);
+    }
+    return sendJson(response, 200, transcriptWindow);
+  }
   if (request.method === "GET" && url.pathname === "/api/v1/web/sessions/stale-session/transcript") return sendJson(response, 200, staleTranscriptWindow);
   if (request.method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
     const bodyText = await readRequestBody(request);
