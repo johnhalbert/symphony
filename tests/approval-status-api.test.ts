@@ -107,6 +107,96 @@ describe("approval status API", () => {
     }
   });
 
+  it("redacts command-policy metadata from public run status responses", async () => {
+    await runStore.updateRun("run-1", {
+      metadata: {
+        commandPolicy: {
+          decisionCount: 1,
+          malformedEventCount: 0,
+          lastDecisionAt: "2026-01-01T00:00:02.000Z",
+          lastMalformedAt: null,
+          decisions: [
+            {
+              sequence: 2,
+              at: "2026-01-01T00:00:02.000Z",
+              source: "harness",
+              decisionId: "decision-status-redaction",
+              attemptId: "attempt-status-redaction",
+              activityId: "command-policy:decision-status-redaction",
+              runId: "run-1",
+              issueId: "issue-1",
+              surface: "terminal_execute",
+              role: "worker",
+              phase: "implementation",
+              outcome: "deny",
+              reasonKind: "upstream_github",
+              commandClass: "direct_upstream_git_operation",
+              message: "Blocked worker/reviewer upstream GitHub activity.",
+              upstreamContactAttempted: false,
+              redacted: true,
+              requiresUserOrServiceFix: true,
+              normalizedCommand: {
+                executable: "git",
+                executableKind: "git",
+                argumentsPreview: "push https://user:SECRET_STATUS_PASSWORD@github.com/owner/repo.git HEAD",
+                gitSubcommand: "push",
+                targetHosts: ["github.com"],
+                hasNestedCommand: false,
+                hasInlineEnvironment: true,
+                hasUnsafeGitConfig: true,
+              },
+              audit: {
+                redacted: true,
+                surface: "terminal_execute",
+                role: "worker",
+                phase: "implementation",
+                outcome: "deny",
+                reasonKind: "upstream_github",
+                commandClass: "direct_upstream_git_operation",
+                rawInputPreview: "GIT_ASKPASS=/tmp/secret-askpass git push https://user:SECRET_STATUS_PASSWORD@github.com/owner/repo.git HEAD",
+                rawInputPreviewRedacted: true,
+                commandPreview: "git push https://user:SECRET_STATUS_PASSWORD@github.com/owner/repo.git HEAD",
+                inheritedEnvironmentKeys: ["HOME", "PATH"],
+                inlineEnvironmentKeys: ["GIT_ASKPASS"],
+                unsafeConfigCategories: ["credential_helper"],
+                helperPath: "/tmp/secret-credential-helper",
+                upstreamContactAttempted: false,
+              },
+            },
+          ],
+          malformedEvents: [],
+        },
+      },
+    });
+
+    const server = statusServer();
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/runs/run-1`);
+      const body = (await response.json()) as { commandPolicy: { decisions: Array<Record<string, unknown>> } };
+      const serialized = JSON.stringify(body);
+      const decision = body.commandPolicy.decisions[0]!;
+      const audit = decision.audit as Record<string, unknown>;
+      const normalizedCommand = decision.normalizedCommand as Record<string, unknown>;
+
+      expect(response.status).toBe(200);
+      expect(decision).toMatchObject({ outcome: "deny", reasonKind: "upstream_github", commandClass: "direct_upstream_git_operation" });
+      expect(audit).toMatchObject({
+        rawInputPreview: "[redacted command payload]",
+        rawInputPreviewRedacted: true,
+        commandPreview: "[redacted command payload]",
+        helperPath: "[redacted helper path]",
+      });
+      expect(normalizedCommand.argumentsPreview).toBe("[redacted command payload]");
+      expect(serialized).not.toContain("SECRET_");
+      expect(serialized).not.toContain("git push");
+      expect(serialized).not.toContain("/tmp/secret");
+      expect(serialized).not.toContain("user:SECRET_STATUS_PASSWORD");
+    } finally {
+      await server.stop();
+    }
+  });
+
   it.each([
     ["false", false],
     ["null", null],

@@ -4,6 +4,7 @@ import type {
   ProjectionChangeListener,
   ProjectionChangeUnsubscribe,
   SymphonyDataSource,
+  TriggerPollResult,
 } from "./dataSource";
 import { createRealtimeEventSourceClient } from "./eventSourceClient";
 import { normalizeOrchestratorChatModel } from "./orchestratorChat";
@@ -20,6 +21,7 @@ interface ApiReferenceData {
 }
 
 const GET_SUCCESS_CACHE_MS = 5_000;
+const TRIGGER_POLL_REFRESH_HREFS = ["/api/v1/web/dashboard?refresh=1", "/api/v1/web/sidebar?refresh=1", "/api/v1/web/issues?refresh=1", "/api/v1/web/history?refresh=1"] as const;
 
 interface CachedGetResponse {
   data: unknown;
@@ -312,6 +314,16 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       return normalizeOrchestratorChatModel(
         await fetchJson<unknown>(normalizedBaseUrl, "/api/v1/web/orchestrator-chat", { signal }),
       );
+    },
+    async triggerPoll() {
+      const response = await fetch(`${normalizedBaseUrl}/api/v1/refresh`, {
+        method: "POST",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) throw new Error(`Symphony API returned HTTP ${response.status}`);
+      const result = (await response.json()) as TriggerPollResult;
+      getJsonFetcher.invalidateCache({ forceRefreshHrefs: TRIGGER_POLL_REFRESH_HREFS });
+      return result;
     },
     async sendOrchestratorMessage(input) {
       const response = await fetch(`${normalizedBaseUrl}/api/v1/web/orchestrator-chat`, {

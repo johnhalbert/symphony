@@ -35,13 +35,19 @@ export interface ProjectionChangeEvent {
   revision?: number;
   observedAt?: string;
 }
-
 export type ProjectionChangeListener = (event: ProjectionChangeEvent) => void;
 export type ProjectionChangeUnsubscribe = () => void;
 
 export interface CacheInvalidationOptions {
   /** API hrefs affected by a realtime update. Listed paths are invalidated selectively; refresh=1 hints are replayed on the next GET. */
   forceRefreshHrefs?: readonly string[];
+}
+
+export interface TriggerPollResult {
+  queued: boolean;
+  coalesced?: boolean;
+  requested_at?: string;
+  operations?: readonly string[];
 }
 
 export interface SymphonyDataSource {
@@ -55,6 +61,7 @@ export interface SymphonyDataSource {
   getSidebar(signal?: AbortSignal): Promise<SidebarModel>;
   getOrchestratorChat(signal?: AbortSignal): Promise<OrchestratorChatModel>;
   sendOrchestratorMessage(input: string): Promise<ChatMessage[]>;
+  triggerPoll?(): Promise<TriggerPollResult>;
   invalidateCachedReads?(options?: CacheInvalidationOptions): void;
   subscribeToProjectionChanges?(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe;
   subscribeToRealtimeEvents?(listener: RealtimeEventListener, options?: RealtimeSubscriptionOptions): RealtimeEventUnsubscribe;

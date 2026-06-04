@@ -23,10 +23,12 @@ events can be replayed through the query-param cursor path. If the server can
 replay from its short in-memory history, it emits the missed events after the
 known id. If the id is unknown or history has been truncated, the stream emits a
 `projection.updated` recovery event with `missedEvents: true` and
-`recovery.reason: "missed-events"` so clients can refetch the listed resources.
-Recovery event ids are remembered as resume cursors while the following history is
-still replayable, preventing an immediate reconnect from receiving the same
-synthetic recovery frame again.
+`recovery.reason: "missed-events"` so clients can refetch the listed routes and
+use `resourcesChanged` to refresh any active transcript, issue-detail, or
+orchestrator-chat views that lack a fixed global recovery URL. Recovery event ids
+are remembered as resume cursors while the following history is still replayable,
+preventing an immediate reconnect from receiving the same synthetic recovery
+frame again.
 
 SSE `id`, `event`, and comment fields are newline-sanitized before writing.
 
@@ -68,7 +70,10 @@ with current consumers but new consumers should prefer `payload`.
 Scope: `global`, `key: null`.
 
 Published when one or more web projections should be treated as stale. Clients
-should refetch the resources listed in `resources`/`recovery.endpoints`.
+should refetch the routes listed in `resources`/`recovery.endpoints`; on
+generic missed-event recovery, `resourcesChanged` may be broader than the fixed
+route list so active template-bound resources can refresh through live-resource
+tokens.
 
 ```ts
 interface RealtimeProjectionUpdatedPayload {
@@ -125,7 +130,13 @@ interface RealtimeTranscriptDeltaPayload {
 Scope: `orchestrator`; `key` is the conversation id when known.
 
 Published for durable orchestrator conversation appends/updates and accepted
-operator chat posts.
+operator chat posts. Conversation-store and accepted-post events carry a current,
+sanitized chat-state snapshot in the payload so clients can apply the live state
+or continue to use the resource/recovery hints to refetch
+`/api/v1/web/orchestrator-chat`. Durable projection-publication events may carry
+only cursor-level state metadata (`state`, `conversationStatus`, message counts,
+and latest-message fields) when the projection payload itself is not available on
+the publication event.
 
 ```ts
 interface RealtimeOrchestratorMessagePayload {
@@ -134,7 +145,22 @@ interface RealtimeOrchestratorMessagePayload {
   conversationId: string | null;
   messageCount: number | null;
   inputLength: number | null;
-  status: number | null;
+  status: number | null; // HTTP status for accepted operator chat posts, otherwise null.
+  lastMessageId: string | null;
+  lastMessageStatus: string | null;
+  lastMessageAt: string | null;
+  state: string | null;
+  conversationStatus: string | null;
+  active: boolean | null;
+  terminal: boolean | null;
+  empty: boolean | null;
+  latestMessageSequence: number | null;
+  latestMessageUpdatedAt: string | null;
+  conversation: Record<string, unknown> | null;
+  statusSummary: Record<string, unknown> | null;
+  statusCounts: Record<string, unknown> | null;
+  sourceSummary: Record<string, unknown> | null;
+  chat: readonly Record<string, unknown>[] | null;
   detail: Record<string, unknown> | null;
 }
 ```

@@ -441,6 +441,25 @@ async function runBrowserSmokeAssertions(page) {
     ],
     exclude: forbiddenMarkers,
   });
+  await assertButtonUnavailableByLabel(page, "Status totals", "dashboard Status totals button");
+  await assertButtonEnabledByLabel(page, "Trigger poll", "dashboard Trigger poll button");
+  await assertButtonUnavailableByLabel(page, "New issue", "dashboard New issue button");
+  await assertButtonUnavailableByLabel(page, "Search", "dashboard Search button");
+  await assertButtonUnavailableByLabel(page, "More", "dashboard More button");
+  const refreshPostCountBefore = countObservedEndpoint("POST /api/v1/refresh");
+  await clickButtonByText(page, "Trigger poll", "dashboard Trigger poll button");
+  await waitFor(
+    async () => (countObservedEndpoint("POST /api/v1/refresh") >= refreshPostCountBefore + 1 ? true : null),
+    5_000,
+    100,
+    "dashboard trigger poll POST request",
+    () => `refresh POST count=${countObservedEndpoint("POST /api/v1/refresh")}`,
+  );
+  await waitForBrowserText(page, "dashboard API-mode data after trigger poll", {
+    include: ["api source · api", "proxy/symphony", "Trigger poll"],
+    exclude: forbiddenMarkers,
+  });
+  await assertButtonEnabledByLabel(page, "Trigger poll", "dashboard Trigger poll button after refresh");
 
   await waitForBrowserText(page, "dashboard orchestrator chat functional API-mode controls", {
     include: [
@@ -538,8 +557,10 @@ async function runBrowserSmokeAssertions(page) {
     "GET /api/v1/web/sessions/smoke-session/transcript",
     "GET /api/v1/web/sidebar",
     "GET /api/v1/web/orchestrator-chat",
+    "POST /api/v1/refresh",
     "POST /api/v1/web/orchestrator-chat",
   ]);
+  assertObservedEndpointCountAtLeast("POST /api/v1/refresh", 1);
   assertObservedEndpointCountAtLeast("POST /api/v1/web/orchestrator-chat", 2);
 }
 
@@ -612,6 +633,14 @@ async function handleFakeApiRequest(request, response, url) {
   if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") return sendJson(response, 200, sidebar);
   if (request.method === "GET" && url.pathname === "/api/v1/web/history") return sendJson(response, 200, history);
   if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") return sendJson(response, 200, orchestratorChat);
+  if (request.method === "POST" && url.pathname === "/api/v1/refresh") {
+    return sendJson(response, 202, {
+      queued: true,
+      coalesced: false,
+      requested_at: "2026-06-03T13:30:00.000Z",
+      operations: ["poll", "reconcile"],
+    });
+  }
   if (request.method === "GET" && url.pathname === "/api/v1/web/issues/PROXY-1") {
     return sendJson(response, 200, { issue: issueDetail, activity: issueDetail.activity, runs: [session], transcript });
   }
@@ -1136,6 +1165,55 @@ async function clickButtonByText(page, text, description) {
       return Array.from(document.querySelectorAll("button")).find((button) => normalize(button.innerText || button.textContent).includes(expected));
     })()`,
     description,
+  );
+}
+
+function buttonLabelExpression(label) {
+  return `(() => {
+    const expected = ${JSON.stringify(label)};
+    const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
+    return Array.from(document.querySelectorAll("button")).find((candidate) => {
+      const text = normalize(candidate.innerText || candidate.textContent);
+      return (
+        text.includes(expected) ||
+        String(candidate.getAttribute("aria-label") ?? "").includes(expected) ||
+        String(candidate.getAttribute("title") ?? "").includes(expected) ||
+        String(candidate.getAttribute("data-unavailable-action") ?? "").includes(expected)
+      );
+    }) ?? null;
+  })()`;
+}
+
+async function buttonStateByLabel(page, label) {
+  return page.evaluate(`(() => {
+    const button = ${buttonLabelExpression(label)};
+    if (!button) return { found: false };
+    const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
+    return {
+      found: true,
+      disabled: Boolean(button.disabled),
+      ariaDisabled: button.getAttribute("aria-disabled"),
+      unavailableAction: button.getAttribute("data-unavailable-action"),
+      text: normalize(button.innerText || button.textContent).slice(0, 160),
+    };
+  })()`);
+}
+
+async function assertButtonEnabledByLabel(page, label, description) {
+  const result = await buttonStateByLabel(page, label);
+  assert(result?.found, `Could not find ${description} in the browser`);
+  assert(
+    !result.disabled && result.ariaDisabled !== "true",
+    `Expected ${description} to be enabled for the API-mode send path, got ${JSON.stringify(result)}`,
+  );
+}
+
+async function assertButtonUnavailableByLabel(page, label, description) {
+  const result = await buttonStateByLabel(page, label);
+  assert(result?.found, `Could not find ${description} in the browser`);
+  assert(
+    result.disabled && result.ariaDisabled === "true" && result.unavailableAction === label,
+    `Expected ${description} to remain honestly unavailable, got ${JSON.stringify(result)}`,
   );
 }
 

@@ -74,7 +74,7 @@ import {
   type WritebackOperation,
 } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
-import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
+import { sanitizedPreviewValue, sanitizeCommandPolicyReplayStateForPublicOutput, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
 import {
   DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
   type OrchestratorConversationMessage,
@@ -250,6 +250,12 @@ interface WebProjectionJsonResponse<TBody> {
   body: TBody;
   headers?: Record<string, string>;
 }
+
+type WebOrchestratorChatPostResult = {
+  status: number;
+  body: unknown;
+  stateChanged: boolean;
+};
 
 type DurableProjectionReadResult<TPayload> = WebProjectionReadResult<TPayload>;
 
@@ -864,23 +870,25 @@ export class StatusServer {
           });
           const chatProjection = webOrchestratorChatProjectionFromResponseBody(result.body, postConversationId);
           if (chatProjection) {
+            let currentChatProjection: Pick<WebOrchestratorChatProjectionResponse, "conversation" | "state" | "status" | "chat" | "source"> =
+              chatProjection;
             if (this.options.orchestratorConversationStore) {
-              await this.persistWebOrchestratorChatProjection(await this.fetchWebOrchestratorChatProjection(postConversationId));
+              const durableChatProjection = await this.fetchWebOrchestratorChatProjection(postConversationId);
+              await this.persistWebOrchestratorChatProjection(durableChatProjection);
+              currentChatProjection = durableChatProjection;
             }
-            if (chatProjection.chat.length > 0 && result.status !== 200) {
-              this.realtimeEvents.publishOrchestratorMessage({
-                inputLength: input.input.length,
-                messageCount: chatProjection.chat.length,
-                conversationId: postConversationId ?? DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
-                status: result.status,
-                lastMessageId: chatProjection.chat.at(-1)?.id ?? null,
-                lastMessageStatus: chatProjection.chat.at(-1)?.status ?? null,
-                lastMessageAt: chatProjection.chat.at(-1)?.updatedAt ?? chatProjection.chat.at(-1)?.createdAt ?? null,
-                messages: chatProjection.chat,
-                message: chatProjection.chat.at(-1) ?? null,
-              });
+            if (result.stateChanged && currentChatProjection.chat.length > 0 && result.status !== 200) {
+              const directPatchMessage = chatProjection.chat.at(-1) ?? currentChatProjection.chat.at(-1) ?? null;
+              this.realtimeEvents.publishOrchestratorMessage(
+                orchestratorChatRealtimeDetailFromProjection(currentChatProjection, {
+                  inputLength: input.input.length,
+                  status: result.status,
+                  ...(directPatchMessage ? { message: directPatchMessage, messages: [directPatchMessage] } : {}),
+                }),
+              );
             }
           }
+
           sendJson(response, result.status, result.body);
           return;
         }
@@ -2001,15 +2009,18 @@ export class StatusServer {
     conversationId?: string | null;
     messageId?: string;
     input: string;
-  }): Promise<{ status: number; body: unknown }> {
+  }): Promise<WebOrchestratorChatPostResult> {
     const store = this.options.orchestratorConversationStore;
     if (!store) {
-      return webOrchestratorChatErrorResponse(
-        503,
-        "orchestrator_chat_unavailable",
-        "Web orchestrator chat is unavailable because durable conversation storage is not configured",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          503,
+          "orchestrator_chat_unavailable",
+          "Web orchestrator chat is unavailable because durable conversation storage is not configured",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
 
     if (input.messageId !== undefined) {
@@ -2042,17 +2053,20 @@ export class StatusServer {
   private async acceptWebOrchestratorChatPostWithStore(
     store: OrchestratorConversationStore,
     input: { conversationId?: string | null; messageId?: string; input: string },
-  ): Promise<{ status: number; body: unknown }> {
+  ): Promise<WebOrchestratorChatPostResult> {
     let existingMessages: OrchestratorConversationMessage[] = [];
     try {
       existingMessages = input.messageId === undefined ? [] : await store.listMessages(input.conversationId);
     } catch {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not inspect existing messages",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not inspect existing messages",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
     const existingMessage =
       input.messageId === undefined ? undefined : existingMessages.find((message) => message.id === input.messageId);
@@ -2081,12 +2095,15 @@ export class StatusServer {
         },
       });
     } catch {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the user message",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the user message",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
 
     if (!webOrchestratorChatMessageMatchesClaim(message, commandClaimId)) {
@@ -2120,12 +2137,15 @@ export class StatusServer {
         metadata: webOrchestratorChatCommandDispatchingMetadata(commandClaimId, new Date().toISOString()),
       });
     } catch {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the command dispatch claim",
-        projectWebOrchestratorChatPost(input.input, [message]),
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the command dispatch claim",
+          projectWebOrchestratorChatPost(input.input, [message]),
+        ),
+        stateChanged: true,
+      };
     }
 
     let result: OrchestratorChatCommandResult;
@@ -2158,15 +2178,18 @@ export class StatusServer {
     input: { conversationId?: string | null; input: string };
     actionDispatched: boolean;
     result: OrchestratorChatCommandResult;
-  }): Promise<{ status: number; body: unknown }> {
+  }): Promise<WebOrchestratorChatPostResult> {
     const message = input.message;
     if (!message) {
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the user message",
-        [],
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the user message",
+          [],
+        ),
+        stateChanged: false,
+      };
     }
     let messages: OrchestratorConversationMessage[];
     try {
@@ -2205,23 +2228,29 @@ export class StatusServer {
       } catch {
         messages = [recoveryMessage];
       }
-      return webOrchestratorChatErrorResponse(
-        500,
-        "orchestrator_chat_persistence_failed",
-        "Web orchestrator chat could not persist the command state update",
-        projectWebOrchestratorChatPost(input.input.input, messages),
-      );
+      return {
+        ...webOrchestratorChatErrorResponse(
+          500,
+          "orchestrator_chat_persistence_failed",
+          "Web orchestrator chat could not persist the command state update",
+          projectWebOrchestratorChatPost(input.input.input, messages),
+        ),
+        stateChanged: true,
+      };
     }
 
     if (input.result.status === "accepted") {
-      return { status: 202, body: projectWebOrchestratorChatPost(input.input.input, messages) };
+      return { status: 202, body: projectWebOrchestratorChatPost(input.input.input, messages), stateChanged: true };
     }
-    return webOrchestratorChatErrorResponse(
-      webOrchestratorChatHttpStatusFromCommandResult(input.result.status),
-      webOrchestratorChatErrorCodeFromCommandResult(input.result.status),
-      webOrchestratorChatErrorMessageFromCommandResult(input.result.status),
-      projectWebOrchestratorChatPost(input.input.input, messages),
-    );
+    return {
+      ...webOrchestratorChatErrorResponse(
+        webOrchestratorChatHttpStatusFromCommandResult(input.result.status),
+        webOrchestratorChatErrorCodeFromCommandResult(input.result.status),
+        webOrchestratorChatErrorMessageFromCommandResult(input.result.status),
+        projectWebOrchestratorChatPost(input.input.input, messages),
+      ),
+      stateChanged: true,
+    };
   }
 
   private async fetchWebSidebar(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebSidebar>>> {
@@ -2840,7 +2869,12 @@ function orchestratorChatProjectionRealtimeDetail(
   const conversationId =
     recordStringValue(sourceCursors, "conversationId") ?? recordStringValue(sourceCursors, "conversationKey") ?? publication.scopeKey;
   const detail: Record<string, unknown> = { conversationId, conversationKey: conversationId };
+  copyStringRecordField(detail, sourceCursors, "conversationStatus");
+  copyStringRecordField(detail, sourceCursors, "state");
   copyNumberRecordField(detail, sourceCursors, "messageCount");
+  copyNumberRecordField(detail, sourceCursors, "latestMessageSequence");
+  copyStringRecordField(detail, sourceCursors, "latestMessageUpdatedAt");
+  copyStringRecordField(detail, sourceCursors, "sourceRevision");
   copyStringRecordField(detail, sourceCursors, "lastMessageId");
   copyStringRecordField(detail, sourceCursors, "lastMessageStatus");
   copyStringRecordField(detail, sourceCursors, "lastMessageAt");
@@ -3487,6 +3521,37 @@ function orchestratorChatProjectionSourceCursors(
     lastMessageId: lastMessage?.id ?? null,
     lastMessageStatus: lastMessage?.status ?? null,
     lastMessageAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null,
+  };
+}
+
+function orchestratorChatRealtimeDetailFromProjection(
+  projection: Pick<WebOrchestratorChatProjectionResponse, "conversation" | "state" | "status" | "chat" | "source">,
+  extras: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const chat = selectChatMessageTail(projection.chat);
+  const lastMessage = chat.at(-1) ?? null;
+  const latestMessageAt = lastMessage?.updatedAt ?? lastMessage?.createdAt ?? null;
+  const messageCount = typeof projection.conversation.messageCount === "number" ? projection.conversation.messageCount : projection.chat.length;
+  return {
+    conversationId: projection.conversation.id,
+    conversationKey: orchestratorChatProjectionScopeKey(projection.conversation.id),
+    conversation: projection.conversation,
+    conversationStatus: projection.conversation.status,
+    state: projection.state,
+    statusSummary: projection.status,
+    statusCounts: projection.status.statusCounts,
+    active: projection.status.active,
+    terminal: projection.status.terminal,
+    empty: projection.status.empty,
+    messageCount,
+    latestMessageSequence: projection.source.latestMessageSequence,
+    latestMessageUpdatedAt: projection.source.latestMessageUpdatedAt,
+    sourceSummary: projection.source,
+    lastMessageId: lastMessage?.id ?? null,
+    lastMessageStatus: lastMessage?.status ?? null,
+    lastMessageAt: latestMessageAt,
+    chat,
+    ...extras,
   };
 }
 
@@ -4305,13 +4370,14 @@ function webOrchestratorChatReplayResponse(
   input: string,
   message: OrchestratorConversationMessage,
   messages: readonly OrchestratorConversationMessage[],
-): { status: number; body: unknown } {
+): WebOrchestratorChatPostResult {
   return {
     status: webOrchestratorChatReplayStatus(message),
     body: projectWebOrchestratorChatPost(
       input,
       selectOrchestratorConversationMessageTail(messages, { includeMessageId: message.id }),
     ),
+    stateChanged: false,
   };
 }
 
@@ -6067,6 +6133,9 @@ function publicRunRecord(run: RunRecord): RunRecord {
   const record: RunRecord = {
     ...run,
     error: publicDiagnosticText(run.error),
+    ...(run.commandPolicy === undefined
+      ? {}
+      : { commandPolicy: sanitizeCommandPolicyReplayStateForPublicOutput(run.commandPolicy) }),
   };
   if (run.cancelFailedReason !== undefined) record.cancelFailedReason = publicDiagnosticText(run.cancelFailedReason);
   if (run.harnessStopFailedReason !== undefined) record.harnessStopFailedReason = publicDiagnosticText(run.harnessStopFailedReason);

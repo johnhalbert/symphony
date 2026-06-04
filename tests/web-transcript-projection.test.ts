@@ -117,6 +117,80 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("Cursor task event");
   });
 
+  it("projects command-policy decisions as public status details without exposing hook payloads or command secrets", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "command_policy_decision",
+        source: "harness",
+        message: "Blocked command containing SECRET_POLICY_MESSAGE for https://user:pass@github.com/owner/repo.git",
+        payload: {
+          kind: "command_policy_decision",
+          redacted: true,
+          decisionId: "decision-public-policy",
+          surface: "terminal_execute",
+          role: "worker",
+          phase: "implementation",
+          outcome: "deny",
+          reasonKind: "upstream_github",
+          commandClass: "direct_upstream_git_operation",
+          message: "Blocked command containing SECRET_POLICY_MESSAGE for https://user:pass@github.com/owner/repo.git",
+          upstreamContactAttempted: false,
+          requiresUserOrServiceFix: true,
+          requestKind: "pre_tool_call",
+          permissionOutcome: "denied",
+          hookAction: "block",
+          commandPreview: "git push https://user:pass@github.com/owner/repo.git",
+          raw: { params: { command: "git push origin HEAD", token: "SECRET_RAW_TOKEN" } },
+          env: { GIT_ASKPASS: "/tmp/secret-askpass", GITHUB_TOKEN: "SECRET_ENV_TOKEN" },
+          audit: {
+            redacted: true,
+            surface: "terminal_execute",
+            role: "worker",
+            phase: "implementation",
+            outcome: "deny",
+            reasonKind: "upstream_github",
+            commandClass: "direct_upstream_git_operation",
+            rawInputPreview: "GIT_ASKPASS=/tmp/secret-askpass git push origin HEAD",
+            commandPreview: "git push https://user:pass@github.com/owner/repo.git",
+            inlineEnvironmentKeys: ["GIT_ASKPASS"],
+            unsafeConfigCategories: ["credential_helper"],
+            helperPath: "/tmp/secret-credential-helper",
+            upstreamContactAttempted: false,
+          },
+        },
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      {
+        kind: "status",
+        state: "command_policy_decision",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Command policy deny: upstream_github (worker · implementation · terminal_execute)",
+        policy: {
+          outcome: "deny",
+          reasonKind: "upstream_github",
+          role: "worker",
+          phase: "implementation",
+          surface: "terminal_execute",
+          commandClass: "direct_upstream_git_operation",
+          upstreamContactAttempted: false,
+          requiresUserOrServiceFix: true,
+          requestKind: "pre_tool_call",
+          hookAction: "block",
+          permissionOutcome: "denied",
+        },
+      },
+    ]);
+    const serialized = JSON.stringify(messages);
+    expect(serialized).not.toContain("SECRET_");
+    expect(serialized).not.toContain("git push");
+    expect(serialized).not.toContain("/tmp/secret");
+    expect(serialized).not.toContain("user:pass");
+    expect(serialized).not.toContain("raw");
+    expect(serialized).not.toContain("GITHUB_TOKEN");
+  });
+
   it("preserves persisted harness stream progress text while routing explicit progress status", () => {
     const messages = projectWebTranscript([
       event({

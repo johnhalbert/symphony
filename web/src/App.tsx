@@ -106,6 +106,7 @@ function AppShell({
   lazyReferenceData?: boolean;
 }) {
   const [activeTab, setActiveTab] = useState<AppTab>("dashboard");
+  const [manualDashboardRefreshToken, setManualDashboardRefreshToken] = useState(0);
   const [dashboardVariant, setDashboardVariant] = useState<DashboardVariant>("cards");
   const [issuesVariant, setIssuesVariant] = useState<IssuesVariant>("balanced");
   const [historyVariant, setHistoryVariant] = useState<HistoryVariant>("list");
@@ -115,7 +116,7 @@ function AppShell({
   const liveState = useLiveResourceState(apiMode);
   const liveTokens = liveState.tokens;
   const referenceRefreshToken = liveRefreshToken(liveTokens, ["referenceData"]);
-  const dashboardRefreshToken = liveRefreshToken(liveTokens, ["dashboard"]);
+  const dashboardRefreshToken = liveRefreshToken(liveTokens, ["dashboard"]) + manualDashboardRefreshToken;
   const issueBoardRefreshToken = liveRefreshToken(liveTokens, ["issueBoard"]);
   const issueDetailRefreshToken = liveRefreshToken(liveTokens, ["issueDetail", "issueBoard"]);
   const historyRefreshToken = liveRefreshToken(liveTokens, ["history"]);
@@ -182,6 +183,7 @@ function AppShell({
                   orchestratorChat={orchestratorChat.data ?? []}
                   orchestratorChatError={orchestratorChat.error}
                   orchestratorChatLoading={orchestratorChat.loading}
+                  onPollTriggered={() => setManualDashboardRefreshToken((token) => token + 1)}
                 />
               ))
             : null}
