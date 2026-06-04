@@ -51,6 +51,16 @@ export function issue(overrides: Partial<Issue> = {}): Issue {
 export function agentEligibleIssueContract(
   overrides: {
     problemGoal?: string;
+    includeIssueContract?: boolean;
+    issueContractJson?: string;
+    issueContractFenceLanguage?: string;
+    issueContractSchemaVersion?: number;
+    issueContractContractVersion?: string;
+    issueContractRequirements?: Array<{
+      id: string;
+      requirement: string;
+      proofHint?: string;
+    }>;
     touchedSurfaces?: string[];
     acceptanceCriteria?: string[];
     contractChecklist?: string[];
@@ -62,6 +72,18 @@ export function agentEligibleIssueContract(
 ): string {
   const {
     problemGoal = "Do the work.",
+    includeIssueContract = true,
+    issueContractJson,
+    issueContractFenceLanguage = "json",
+    issueContractSchemaVersion = 1,
+    issueContractContractVersion = "2026-06-04.1",
+    issueContractRequirements = [
+      {
+        id: "REQ-001",
+        requirement: "Complete the documented work.",
+        proofHint: "Focused validation covers the acceptance criteria.",
+      },
+    ],
     touchedSurfaces = ["- [X] Docs only"],
     acceptanceCriteria = ["- Done."],
     contractChecklist = ["- Happy path: covered.", "- Negative/error path: covered."],
@@ -71,10 +93,25 @@ export function agentEligibleIssueContract(
     remainingBlocker = readyForDogfoodReady === "yes" ? "none" : "Manual operator implementation required.",
   } = overrides;
 
+  const renderedIssueContractJson =
+    issueContractJson ??
+    JSON.stringify(
+      {
+        schemaVersion: issueContractSchemaVersion,
+        contractVersion: issueContractContractVersion,
+        requirements: issueContractRequirements,
+      },
+      null,
+      2,
+    );
+
   return [
     "## Problem / Goal",
     problemGoal,
     "",
+    ...(includeIssueContract
+      ? ["## Issue Contract", "", "```" + issueContractFenceLanguage, renderedIssueContractJson, "```", ""]
+      : []),
     "## Touched Surfaces",
     ...touchedSurfaces,
     "",

@@ -115,7 +115,12 @@ function issueBreakdownPlanInputSchema(): Record<string, unknown> {
           required: ["title", "description", "acceptanceCriteria", "dependencies", "labels"],
           properties: {
             title: { type: "string", minLength: 1 },
-            description: { type: "string", minLength: 1 },
+            description: {
+              type: "string",
+              minLength: 1,
+              description:
+                "Agent-eligible issue description using the required headings, including an `Issue Contract` fenced `json` block with schemaVersion, contractVersion, and requirements.",
+            },
             acceptanceCriteria: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
             dependencies: { type: "array", items: { type: "string", minLength: 1 } },
             labels: { type: "array", items: { type: "string", minLength: 1 } },

@@ -309,7 +309,7 @@ export function renderIssueBreakdownPlanSummary(plan: IssueBreakdownPlanRecord):
 function validateProposedIssues(proposedIssues: readonly IssueBreakdownProposedIssue[], config: ServiceConfig): void {
   for (const [index, proposedIssue] of proposedIssues.entries()) {
     const descriptor = describeProposedIssue(index, proposedIssue.title);
-    assertProposedIssueLabels(proposedIssue.labels, descriptor);
+    assertProposedIssueLabels(proposedIssue.labels, descriptor, config.agent.requireLabels);
 
     const missingSections = missingRequiredIssueContractSections(proposedIssue.description);
     if (missingSections.length > 0) {
@@ -321,6 +321,13 @@ function validateProposedIssues(proposedIssues: readonly IssueBreakdownProposedI
     }
 
     const analysis = analyzeIssueContractDescription(proposedIssue.description, config.agent.protectedPaths);
+    if (analysis.issueContractErrors.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${descriptor} has an invalid Issue Contract: ${analysis.issueContractErrors.join("; ")}`,
+        { proposedIssueIndex: index, issueContractErrors: analysis.issueContractErrors },
+      );
+    }
     if (analysis.readyForDogfoodReady === null) {
       throw new SymphonyError(
         "invalid_request",
@@ -348,12 +355,15 @@ function validateProposedIssues(proposedIssues: readonly IssueBreakdownProposedI
   }
 }
 
-function assertProposedIssueLabels(labels: readonly string[], descriptor: string): void {
-  if (labels.some((label) => label.toLowerCase() === "dogfood-ready")) {
+function assertProposedIssueLabels(labels: readonly string[], descriptor: string, requiredDispatchLabels: readonly string[]): void {
+  const forbiddenLabels = new Set(["dogfood-ready", ...requiredDispatchLabels.map((label) => label.toLowerCase())]);
+  const offendingLabels = labels.filter((label) => forbiddenLabels.has(label.toLowerCase()));
+  if (offendingLabels.length > 0) {
+    const uniqueOffendingLabels = [...new Set(offendingLabels)];
     throw new SymphonyError(
       "invalid_request",
-      `${descriptor} must not include the dogfood-ready label; operators add readiness labels after review`,
-      { labels },
+      `${descriptor} must not include worker dispatch labels (${uniqueOffendingLabels.join(", ")}); operators add readiness labels after review`,
+      { labels, forbiddenLabels: [...forbiddenLabels] },
     );
   }
 }

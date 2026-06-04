@@ -49,7 +49,7 @@ describe("doctor review-loop checks", () => {
       id: "linear.issue_contract",
       status: "ok",
       message:
-        "1 agent-eligible candidate issue(s) include required authoring sections: Problem / Goal, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+        "1 agent-eligible candidate issue(s) include required authoring sections: Problem / Goal, Issue Contract, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
     });
 
     expect(
@@ -72,7 +72,27 @@ describe("doctor review-loop checks", () => {
       id: "linear.issue_contract",
       status: "warn",
       message:
-        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 missing Touched Surfaces, Contract Checklist, Validation Requirements, Promotion Readiness",
+        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 missing Issue Contract, Touched Surfaces, Contract Checklist, Validation Requirements, Promotion Readiness",
+    });
+  });
+
+  it("warns when an agent-eligible issue has an invalid fenced JSON Issue Contract", () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.excludeLabels = ["dogfood-blocked"];
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: agentEligibleIssueContract({ issueContractRequirements: [{ id: "1", requirement: "   " }] }),
+        }),
+      ]),
+    ).toEqual({
+      id: "linear.issue_contract",
+      status: "warn",
+      message:
+        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 has an invalid Issue Contract (Issue Contract requirement ids must be stable non-empty identifiers (for example `REQ-001`); Issue Contract requirements must include non-empty `requirement` text)",
     });
   });
 
@@ -112,7 +132,7 @@ describe("doctor review-loop checks", () => {
       id: "linear.issue_contract",
       status: "warn",
       message:
-        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 missing Problem / Goal, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
+        "Agent-eligible issue(s) violate authoring or protected-surface rules: TEST-1 missing Problem / Goal, Issue Contract, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
     });
 
     expect(

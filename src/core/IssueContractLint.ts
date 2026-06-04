@@ -1,8 +1,10 @@
 import type { ServiceConfig } from "./config/Config.js";
 import type { Issue } from "./types.js";
 
+const ISSUE_CONTRACT_HEADING = "Issue Contract";
 const TOUCHED_SURFACES_HEADING = "Touched Surfaces";
 const PROMOTION_READINESS_HEADING = "Promotion Readiness";
+const STABLE_REQUIREMENT_ID_PATTERN = /^[a-z][a-z0-9._:-]*$/i;
 const BLOCKER_PLACEHOLDER_VALUES = new Set([
   'if any protected path is listed above, keep this issue manual-only with "ready for `dogfood-ready`: no" and explain the operator blocker here',
   "n/a",
@@ -22,6 +24,7 @@ const MANUAL_BLOCKER_KEYWORDS =
 
 export const AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS = [
   "Problem / Goal",
+  ISSUE_CONTRACT_HEADING,
   TOUCHED_SURFACES_HEADING,
   "Acceptance Criteria",
   "Contract Checklist",
@@ -32,6 +35,7 @@ export const AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS = [
 
 export interface IssueContractAnalysis {
   missingSections: string[];
+  issueContractErrors: string[];
   protectedSurfaceMatches: string[];
   readyForDogfoodReady: boolean | null;
   remainingBlocker: string | null;
@@ -68,10 +72,12 @@ export function analyzeIssueContractDescription(
 ): IssueContractAnalysis {
   const content = description ?? "";
   const sections = markdownSections(content);
+  const issueContract = sections.get(normalizeHeading(ISSUE_CONTRACT_HEADING));
   const touchedSurfaces = sections.get(normalizeHeading(TOUCHED_SURFACES_HEADING)) ?? "";
   const promotionReadiness = sections.get(normalizeHeading(PROMOTION_READINESS_HEADING)) ?? "";
   return {
     missingSections: missingRequiredIssueContractSections(content),
+    issueContractErrors: validateIssueContractSection(issueContract),
     protectedSurfaceMatches: findProtectedSurfaceMatches(touchedSurfaces, protectedPaths),
     readyForDogfoodReady: parseReadyForDogfoodReady(promotionReadiness),
     remainingBlocker: parseRemainingBlocker(promotionReadiness),
@@ -93,6 +99,84 @@ export function missingRequiredIssueContractSections(description: string | null 
   return AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS.filter((section) => !headings.has(normalizeHeading(section)));
 }
 
+function validateIssueContractSection(section: string | undefined): string[] {
+  if (section === undefined) return [];
+
+  const fencedJson = extractFencedJsonBlock(section);
+  if (!fencedJson) {
+    return ["Issue Contract must contain a fenced `json` block"];
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fencedJson);
+  } catch {
+    return ["Issue Contract fenced `json` must parse as valid JSON"];
+  }
+
+  if (!isRecord(parsed)) {
+    return ["Issue Contract JSON must be an object"];
+  }
+
+  const errors: string[] = [];
+  const schemaVersion = parsed.schemaVersion;
+  if (typeof schemaVersion !== "number" || !Number.isInteger(schemaVersion) || schemaVersion <= 0) {
+    errors.push("Issue Contract must include a positive integer `schemaVersion`");
+  }
+
+  const contractVersion = typeof parsed.contractVersion === "string" ? parsed.contractVersion.trim() : "";
+  if (contractVersion.length === 0) {
+    errors.push("Issue Contract must include a non-empty `contractVersion`");
+  }
+
+  const requirements = parsed.requirements;
+  if (!Array.isArray(requirements) || requirements.length === 0) {
+    errors.push("Issue Contract must include a non-empty `requirements` array");
+    return errors;
+  }
+
+  const seenRequirementIds = new Set<string>();
+  let hasInvalidRequirementId = false;
+  let hasDuplicateRequirementId = false;
+  let hasEmptyRequirementText = false;
+
+  for (const requirement of requirements) {
+    if (!isRecord(requirement)) {
+      hasInvalidRequirementId = true;
+      hasEmptyRequirementText = true;
+      continue;
+    }
+
+    const rawId = typeof requirement.id === "string" ? requirement.id.trim() : "";
+    if (!STABLE_REQUIREMENT_ID_PATTERN.test(rawId)) {
+      hasInvalidRequirementId = true;
+    } else {
+      const normalizedId = rawId.toLowerCase();
+      if (seenRequirementIds.has(normalizedId)) {
+        hasDuplicateRequirementId = true;
+      }
+      seenRequirementIds.add(normalizedId);
+    }
+
+    const requirementText = typeof requirement.requirement === "string" ? requirement.requirement.trim() : "";
+    if (requirementText.length === 0) {
+      hasEmptyRequirementText = true;
+    }
+  }
+
+  if (hasInvalidRequirementId) {
+    errors.push("Issue Contract requirement ids must be stable non-empty identifiers (for example `REQ-001`)");
+  }
+  if (hasDuplicateRequirementId) {
+    errors.push("Issue Contract requirement ids must be unique");
+  }
+  if (hasEmptyRequirementText) {
+    errors.push("Issue Contract requirements must include non-empty `requirement` text");
+  }
+
+  return errors;
+}
+
 export function requiresAgentEligibleIssueContract(issue: Issue, config: ServiceConfig): boolean {
   if (!issue.assignedToWorker) return false;
   if (!containsName(config.tracker.activeStates, issue.state)) return false;
@@ -104,6 +188,7 @@ export function requiresAgentEligibleIssueContract(issue: Issue, config: Service
 function emptyIssueContractAnalysis(): IssueContractAnalysis {
   return {
     missingSections: [],
+    issueContractErrors: [],
     protectedSurfaceMatches: [],
     readyForDogfoodReady: null,
     remainingBlocker: null,
@@ -175,13 +260,17 @@ function parseRemainingBlocker(section: string): string | null {
 }
 
 function findProtectedSurfaceMatches(text: string, protectedPaths: readonly string[]): string[] {
+  const normalizedText = normalizeScanText(text);
   const candidates = extractTouchedSurfacePathCandidates(text);
   const matches = new Set<string>();
 
   for (const protectedPath of protectedPaths) {
     const normalizedPath = normalizePathLikeText(protectedPath);
     if (normalizedPath.length === 0) continue;
-    if (candidates.some((candidate) => protectedPathMatchesCandidate(candidate, normalizedPath))) {
+    if (
+      candidates.some((candidate) => protectedPathMatchesCandidate(candidate, normalizedPath)) ||
+      bareRootProtectedPathMentioned(normalizedText, normalizedPath)
+    ) {
       matches.add(protectedPath);
     }
   }
@@ -223,8 +312,13 @@ function globPatternToRegExp(pattern: string): RegExp {
     const char = pattern[index] ?? "";
     if (char === "*") {
       if (pattern[index + 1] === "*") {
-        source += ".*";
-        index += 1;
+        if (pattern[index + 2] === "/") {
+          source += "(?:[^/]+/)*";
+          index += 2;
+        } else {
+          source += ".*";
+          index += 1;
+        }
       } else {
         source += "[^/]*";
       }
@@ -240,6 +334,14 @@ function escapeRegExp(value: string): string {
   return value.replace(/[\\^$+?.()|[\]{}]/g, "\\$&");
 }
 
+function bareRootProtectedPathMentioned(normalizedText: string, normalizedProtectedPath: string): boolean {
+  if (pathPatternHasGlob(normalizedProtectedPath)) return false;
+  if (normalizedProtectedPath.includes("/") || normalizedProtectedPath.includes(".")) return false;
+  return new RegExp(`(?:^|[^a-z0-9._\\/-])${escapeRegExp(normalizedProtectedPath)}(?=$|[^a-z0-9._\\/-])`).test(
+    normalizedText,
+  );
+}
+
 function normalizePathLikeText(value: string): string {
   return normalizeScanText(value)
     .trim()
@@ -252,6 +354,15 @@ function normalizePathLikeText(value: string): string {
 
 function normalizeScanText(value: string): string {
   return value.replace(/\\/g, "/").toLowerCase();
+}
+
+function extractFencedJsonBlock(section: string): string | null {
+  const match = section.match(/```json\b\s*([\s\S]*?)```/i);
+  return match?.[1]?.trim() || null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function normalizeBlockerText(value: string): string {

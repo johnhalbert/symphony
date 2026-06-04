@@ -1,8 +1,44 @@
 import { describe, expect, it } from "vitest";
-import { analyzeIssueContractDescription, hasMeaningfulRemainingBlocker } from "../src/core/IssueContractLint.js";
+import {
+  analyzeIssueContractDescription,
+  hasMeaningfulRemainingBlocker,
+  missingRequiredIssueContractSections,
+} from "../src/core/IssueContractLint.js";
 import { agentEligibleIssueContract } from "./helpers.js";
 
 describe("IssueContractLint", () => {
+  it("requires the Issue Contract heading in required sections", () => {
+    expect(missingRequiredIssueContractSections(agentEligibleIssueContract({ includeIssueContract: false }))).toContain(
+      "Issue Contract",
+    );
+  });
+
+  it.each([
+    ["non-json fence", agentEligibleIssueContract({ issueContractFenceLanguage: "yaml" }), "fenced `json` block"],
+    ["malformed JSON", agentEligibleIssueContract({ issueContractJson: "{ not valid json" }), "valid JSON"],
+    ["empty requirements", agentEligibleIssueContract({ issueContractRequirements: [] }), "non-empty `requirements` array"],
+    [
+      "duplicate or unstable ids",
+      agentEligibleIssueContract({
+        issueContractRequirements: [
+          { id: "1", requirement: "First requirement." },
+          { id: "REQ-001", requirement: "Second requirement." },
+          { id: "REQ-001", requirement: "Duplicate requirement." },
+        ],
+      }),
+      "stable non-empty identifiers",
+    ],
+    [
+      "empty requirement text",
+      agentEligibleIssueContract({ issueContractRequirements: [{ id: "REQ-001", requirement: "   " }] }),
+      "non-empty `requirement` text",
+    ],
+  ])("reports invalid Issue Contract content for %s", (_label, description, expectedError) => {
+    const analysis = analyzeIssueContractDescription(description, []);
+
+    expect(analysis.issueContractErrors).toEqual(expect.arrayContaining([expect.stringContaining(expectedError)]));
+  });
+
   it("only matches protected paths explicitly declared in Touched Surfaces", () => {
     const analysis = analyzeIssueContractDescription(
       agentEligibleIssueContract({
@@ -49,6 +85,19 @@ describe("IssueContractLint", () => {
     expect(analysis.protectedSurfaceMatches).toEqual(["WORKFLOW.md"]);
   });
 
+  it("matches protected root paths without extensions when explicitly declared in Touched Surfaces", () => {
+    const analysis = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        touchedSurfaces: ["- Dockerfile"],
+        readyForDogfoodReady: "no",
+        remainingBlocker: "Manual operator-authored update required for the protected container definition.",
+      }),
+      ["Dockerfile"],
+    );
+
+    expect(analysis.protectedSurfaceMatches).toEqual(["Dockerfile"]);
+  });
+
   it("matches exact protected paths with terminal sentence punctuation", () => {
     const analysis = analyzeIssueContractDescription(
       agentEligibleIssueContract({
@@ -85,6 +134,16 @@ describe("IssueContractLint", () => {
       ["docs/*.md", "src/core/*/runtime.ts"],
     );
     expect(configuredGlob.protectedSurfaceMatches).toEqual(["docs/*.md", "src/core/*/runtime.ts"]);
+
+    const recursiveRootGlob = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        touchedSurfaces: ["- docs/dogfood-runbook.md"],
+        readyForDogfoodReady: "no",
+        remainingBlocker: "Manual operator-authored update required for protected workflow surfaces.",
+      }),
+      ["docs/**/*.md"],
+    );
+    expect(recursiveRootGlob.protectedSurfaceMatches).toEqual(["docs/**/*.md"]);
 
     const touchedGlob = analyzeIssueContractDescription(
       agentEligibleIssueContract({

@@ -165,6 +165,9 @@ export function issueContractDoctorCheck(config: ServiceConfig, issues: readonly
     if (result.missingSections.length > 0) {
       reasons.push(`missing ${result.missingSections.join(", ")}`);
     }
+    if (result.issueContractErrors.length > 0) {
+      reasons.push(`has an invalid Issue Contract (${result.issueContractErrors.join("; ")})`);
+    }
     if (result.protectedSurfaceMatches.length > 0) {
       reasons.push(
         `touches protected paths ${result.protectedSurfaceMatches.join(", ")} and must remain manual-only instead of agent-eligible`,

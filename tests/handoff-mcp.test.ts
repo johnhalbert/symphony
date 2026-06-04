@@ -12,8 +12,11 @@ describe("MCP handoff prompt rendering", () => {
 
     expect(prompt).toContain("Symphony MCP issue-breakdown handoff:");
     expect(prompt).toContain("Problem / Goal");
+    expect(prompt).toContain("Issue Contract");
     expect(prompt).toContain("Contract Checklist");
     expect(prompt).toContain("Validation Requirements");
+    expect(prompt).toContain("fenced `json` block");
+    expect(prompt).toContain("stable unique `id` values");
     expect(prompt).toContain("exact repo paths or globs");
     expect(prompt).toContain("manual-only requirement");
     expect(prompt).toContain("Do not include `dogfood-ready` automatically");
