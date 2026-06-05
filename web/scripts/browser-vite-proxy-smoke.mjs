@@ -12,6 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(__dirname, "..");
 const webDistRoot = path.resolve(webRoot, "dist");
 const requestLog = [];
+const realtimeClients = new Set();
 const browserDevtoolsTimeoutMs = parsePositiveInteger(process.env.SYMPHONY_WEB_BROWSER_DEVTOOLS_TIMEOUT_MS, 30_000);
 
 const totals = {
@@ -188,6 +189,82 @@ const staleTranscriptWindow = createTranscriptWindowResponse(staleTranscript, {
   lastEventAt: staleSession.updatedAt,
   refetchHref: "/api/v1/web/sessions/stale-session/transcript?refresh=1",
 });
+const smokeRealtimeTranscriptAppend = {
+  kind: "assistant",
+  ts: "2026-05-29T00:00:02.000Z",
+  text: "Realtime transcript append from SSE rendered in place",
+};
+
+function applySmokeRealtimeTranscriptAppend() {
+  if (transcriptWindow.messages.some((message) => message?.text === smokeRealtimeTranscriptAppend.text)) return;
+
+  transcript.push(smokeRealtimeTranscriptAppend);
+  transcriptWindow.messages.push(smokeRealtimeTranscriptAppend);
+
+  session.updatedAt = smokeRealtimeTranscriptAppend.ts;
+  session.msgCount = transcriptWindow.messages.length;
+  session.lastEvent = "Realtime transcript append from SSE";
+  history.defaultSessionId = session.id;
+  history.transcriptBySession[session.id] = transcriptWindow.messages;
+
+  history.timeline.unshift({
+    t: smokeRealtimeTranscriptAppend.ts,
+    sess: session.id,
+    kind: "message",
+    text: smokeRealtimeTranscriptAppend.text,
+    state: session.state,
+  });
+
+  transcriptWindow.page.size = transcriptWindow.messages.length;
+  transcriptWindow.page.total = transcriptWindow.messages.length;
+  transcriptWindow.page.lastSequence = 2;
+  transcriptWindow.page.lastEventAt = smokeRealtimeTranscriptAppend.ts;
+
+  transcriptWindow.window.size = transcriptWindow.messages.length;
+  transcriptWindow.window.total = transcriptWindow.messages.length;
+  transcriptWindow.window.lastSequence = 2;
+  transcriptWindow.window.lastEventAt = smokeRealtimeTranscriptAppend.ts;
+  transcriptWindow.window.messageCount = transcriptWindow.messages.length;
+
+  transcriptWindow.activeTail.afterSequence = 2;
+  transcriptWindow.activeTail.lastEventAt = smokeRealtimeTranscriptAppend.ts;
+}
+
+function smokeTranscriptDeltaEvent() {
+  return {
+    schema: "symphony.realtime.v1",
+    schemaVersion: 1,
+    id: "smoke-transcript-delta-2",
+    type: "transcript.delta",
+    revision: 2,
+    createdAt: smokeRealtimeTranscriptAppend.ts,
+    scope: "session",
+    key: session.id,
+    source: { source: "runs", revision: 2, observedAt: smokeRealtimeTranscriptAppend.ts },
+    resources: [
+      { kind: "history", href: "/api/v1/web/history", relation: "refetch" },
+      { kind: "session-transcript", href: "/api/v1/web/sessions/{sessionId}/transcript", relation: "template" },
+    ],
+    recovery: {
+      strategy: "refetch",
+      reason: "event",
+      lastEventId: null,
+      endpoints: ["/api/v1/web/history", "/api/v1/web/sessions/{sessionId}/transcript"],
+    },
+    missedEvents: false,
+    payload: {
+      source: "runs",
+      sourceRevision: 2,
+      detail: null,
+      runId: "smoke-run",
+      sessionId: session.id,
+      afterSequence: 1,
+      eventCount: 1,
+      messages: [{ sequence: 2, operation: "append", message: smokeRealtimeTranscriptAppend }],
+    },
+    detail: null,
+  };
+}
 
 function createTranscriptWindowResponse(messages, input = {}) {
   const limit = Number.isFinite(input.limit) ? input.limit : 500;
@@ -430,7 +507,40 @@ function extractTranscriptText(windowPayload) {
   return messages.map((message) => (typeof message?.text === "string" ? message.text : "")).filter(Boolean);
 }
 
-async function assertRunningTranscriptUsesLiveTail(origin) {
+async function assertRunningTranscriptUsesLiveTail(page, origin) {
+  const beforeRealtimeUpdate = await readTranscriptPaneState(page);
+  assert(
+    beforeRealtimeUpdate.transcriptText.includes("Dedicated session transcript from API endpoint"),
+    `Expected the selected transcript pane to render the dedicated live-tail payload before realtime updates, got ${JSON.stringify(beforeRealtimeUpdate)}`,
+  );
+  assert(
+    !beforeRealtimeUpdate.transcriptText.includes(smokeRealtimeTranscriptAppend.text),
+    `Expected the selected transcript pane to not include the realtime append before the SSE event, got ${JSON.stringify(beforeRealtimeUpdate)}`,
+  );
+  assert(
+    !beforeRealtimeUpdate.transcriptText.includes("STALE dedicated transcript from durable projection cache"),
+    `Expected the selected transcript pane to hide the durable-only transcript payload before realtime updates, got ${JSON.stringify(beforeRealtimeUpdate)}`,
+  );
+
+  await waitForBrowserRenderTurn(page);
+  await waitForActiveRealtimeClient();
+
+  applySmokeRealtimeTranscriptAppend();
+  emitRealtimeEvent(smokeTranscriptDeltaEvent());
+
+  const afterRealtimeUpdate = await waitForTranscriptPaneText(page, "selected history transcript realtime update", {
+    include: ["Dedicated session transcript from API endpoint", smokeRealtimeTranscriptAppend.text],
+    exclude: ["STALE dedicated transcript from durable projection cache"],
+  });
+  assert(
+    afterRealtimeUpdate.href === beforeRealtimeUpdate.href && afterRealtimeUpdate.timeOrigin === beforeRealtimeUpdate.timeOrigin,
+    `Expected the selected transcript pane to update in place without reload or navigation, got before=${JSON.stringify(beforeRealtimeUpdate)} after=${JSON.stringify(afterRealtimeUpdate)}`,
+  );
+  assert(
+    afterRealtimeUpdate.itemCount > beforeRealtimeUpdate.itemCount,
+    `Expected the realtime transcript append to add a visible browser transcript item, got before=${JSON.stringify(beforeRealtimeUpdate)} after=${JSON.stringify(afterRealtimeUpdate)}`,
+  );
+
   const defaultTranscriptWindow = await fetchJson(`${origin}/api/v1/web/sessions/smoke-session/transcript`);
   const explicitTranscriptWindow = await fetchJson(`${origin}/api/v1/web/sessions/smoke-session/transcript?offset=0&limit=1`);
 
@@ -459,8 +569,8 @@ async function assertRunningTranscriptUsesLiveTail(origin) {
     `Expected default transcript to include dedicated live data, got ${JSON.stringify(defaultMessages)}`,
   );
   assert(
-    !defaultMessages.includes("STALE dedicated transcript from durable projection cache"),
-    `Expected default transcript to not include durable cache-only text, got ${JSON.stringify(defaultMessages)}`,
+    defaultMessages.includes(smokeRealtimeTranscriptAppend.text),
+    `Expected default transcript to expose the realtime SSE append on the live tail route, got ${JSON.stringify(defaultMessages)}`,
   );
 
   assert(
@@ -468,8 +578,8 @@ async function assertRunningTranscriptUsesLiveTail(origin) {
     `Expected explicit transcript projection to expose durable cache payload, got ${JSON.stringify(explicitMessages)}`,
   );
   assert(
-    !explicitMessages.includes("Dedicated session transcript from API endpoint"),
-    `Expected explicit page request to be durable projection-only in this smoke fixture, got ${JSON.stringify(explicitMessages)}`,
+    !explicitMessages.includes(smokeRealtimeTranscriptAppend.text) && !explicitMessages.includes("Dedicated session transcript from API endpoint"),
+    `Expected explicit page request to remain durable projection-only in this smoke fixture, got ${JSON.stringify(explicitMessages)}`,
   );
 }
 
@@ -577,7 +687,7 @@ async function runBrowserSmokeAssertions(page, origin) {
     include: ["Browser proxy smoke session", "smoke-session", "Dedicated session transcript from API endpoint"],
     exclude: forbiddenSelectedTranscriptMarkers,
   });
-  await assertRunningTranscriptUsesLiveTail(origin);
+  await assertRunningTranscriptUsesLiveTail(page, origin);
 
   await clickButtonByAriaLabel(page, "Sidebars", "Sidebars tab");
   await waitForBrowserText(page, "sidebar summary rendered from API data", {
@@ -620,6 +730,7 @@ async function runBrowserSmokeAssertions(page, origin) {
     "GET /api/v1/web/issues",
     "GET /api/v1/web/issues/PROXY-1",
     "GET /api/v1/web/history",
+    "GET /api/v1/realtime",
     "GET /api/v1/web/sessions/smoke-session/transcript",
     "GET /api/v1/web/sidebar",
     "GET /api/v1/web/orchestrator-chat",
@@ -641,6 +752,7 @@ async function assertProductionStaticServing(origin) {
   assert(!html.includes('/src/main.tsx'), "Production /web/ returned a dev-server HTML entry instead of built assets");
 
   const assetPaths = Array.from(html.matchAll(/(?:src|href)="(\/web\/assets\/[^"]+)"/g), (match) => match[1]);
+
   assert(assetPaths.length > 0, "Production /web/ shell did not include built asset URLs");
   for (const assetPath of assetPaths.slice(0, 2)) {
     const asset = await fetch(`${origin}${assetPath}`);
@@ -699,6 +811,7 @@ async function handleFakeApiRequest(request, response, url) {
   if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") return sendJson(response, 200, sidebar);
   if (request.method === "GET" && url.pathname === "/api/v1/web/history") return sendJson(response, 200, history);
   if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") return sendJson(response, 200, orchestratorChat);
+  if (request.method === "GET" && url.pathname === "/api/v1/realtime") return openRealtimeStream(request, response);
   if (request.method === "POST" && url.pathname === "/api/v1/refresh") {
     return sendJson(response, 202, {
       queued: true,
@@ -896,6 +1009,42 @@ function parseChatInput(bodyText) {
     return typeof body.input === "string" && body.input.trim() ? body.input.trim() : null;
   } catch {
     return null;
+  }
+}
+
+function openRealtimeStream(request, response) {
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  response.flushHeaders?.();
+  response.socket?.setNoDelay?.(true);
+  response.socket?.setKeepAlive?.(true);
+  response.write(": connected\n\n");
+
+  realtimeClients.add(response);
+  const cleanup = () => {
+    realtimeClients.delete(response);
+    request.off("aborted", cleanup);
+    request.off("close", cleanup);
+    response.off("close", cleanup);
+  };
+  request.on("aborted", cleanup);
+  request.on("close", cleanup);
+  response.on("close", cleanup);
+}
+
+function emitRealtimeEvent(event) {
+  assert(realtimeClients.size > 0, "Expected an active /api/v1/realtime client before emitting a smoke realtime event");
+  const payload = [`id: ${event.id}`, `event: ${event.type}`, `data: ${JSON.stringify(event)}`, "", ""].join("\n");
+  for (const client of realtimeClients) {
+    if (client.writableEnded || client.destroyed) {
+      realtimeClients.delete(client);
+      continue;
+    }
+    client.write(payload);
   }
 }
 
@@ -1205,6 +1354,32 @@ async function waitForBrowserText(page, description, { include = [], exclude = [
   }, 10_000, 250, `browser to render ${description}`, () => describeBrowserTextState(lastBrowserState));
 }
 
+async function waitForBrowserRenderTurn(page) {
+  await page.evaluate(`new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))`);
+}
+
+async function waitForActiveRealtimeClient() {
+  await waitFor(
+    async () => (countObservedEndpoint("GET /api/v1/realtime") >= 1 && realtimeClients.size >= 1 ? true : null),
+    5_000,
+    100,
+    "browser realtime EventSource subscription",
+    () => `realtimeRequests=${countObservedEndpoint("GET /api/v1/realtime")} activeClients=${realtimeClients.size}`,
+  );
+}
+
+async function waitForTranscriptPaneText(page, description, { include = [], exclude = [] }) {
+  let lastTranscriptState = null;
+  return waitFor(async () => {
+    const state = await readTranscriptPaneState(page);
+    lastTranscriptState = state;
+    if (include.every((marker) => state.transcriptText.includes(marker)) && exclude.every((marker) => !state.transcriptText.includes(marker))) {
+      return state;
+    }
+    return null;
+  }, 10_000, 250, `browser transcript pane to render ${description}`, () => describeTranscriptPaneState(lastTranscriptState));
+}
+
 async function readBrowserTextState(page, include, exclude) {
   const snapshot = await page.evaluate(`(() => {
     const body = document.body?.innerText ?? "";
@@ -1218,6 +1393,18 @@ async function readBrowserTextState(page, include, exclude) {
     missing: include.filter((marker) => !combinedText.includes(marker)),
     presentForbidden: exclude.filter((marker) => combinedText.includes(marker)),
   };
+}
+
+async function readTranscriptPaneState(page) {
+  return page.evaluate(`(() => {
+    const transcript = document.querySelector(".transcript");
+    return {
+      href: window.location.href,
+      timeOrigin: window.performance?.timeOrigin ?? null,
+      transcriptText: transcript?.innerText ?? "",
+      itemCount: transcript?.children?.length ?? 0,
+    };
+  })()`);
 }
 
 async function clickButtonByAriaLabel(page, label, description) {
@@ -1440,6 +1627,12 @@ function describeBrowserTextState(state) {
   const statusbar = typeof state.statusbar === "string" ? state.statusbar.replace(/\s+/g, " ").slice(0, 240) : "";
   const body = typeof state.body === "string" ? state.body.replace(/\s+/g, " ").slice(0, 800) : "";
   return `${missing}${forbidden}${errors} statusbar=${JSON.stringify(statusbar)} body=${JSON.stringify(body)}`;
+}
+
+function describeTranscriptPaneState(state) {
+  if (!state) return "no transcript pane state captured";
+  const transcriptText = typeof state.transcriptText === "string" ? state.transcriptText.replace(/\s+/g, " ").slice(0, 800) : "";
+  return `href=${JSON.stringify(state.href)} timeOrigin=${JSON.stringify(state.timeOrigin)} itemCount=${JSON.stringify(state.itemCount)} transcript=${JSON.stringify(transcriptText)}`;
 }
 
 async function waitFor(probe, timeoutMs, intervalMs, description, describeLast = null) {
