@@ -1365,7 +1365,7 @@ Work on {{ issue.identifier }}.
     expect(config.github.app?.privateKeyPath?.replace(/\\/g, "/")).toMatch(/\/tmp\/github-app-private-key\.pem$/);
     expect(config.server.openWorkspaceToken).toBe("workspace-secret");
     expect(config.hermes.provider).toBe("openai-codex");
-    expect(config.hermes.model).toBe("gpt-5.4");
+    expect(config.hermes.model).toBe("gpt-5.3-codex-spark");
     expect(config.hermes.auth).toMatchObject({
       mode: "managed_root",
       providers: ["openai-codex"],
