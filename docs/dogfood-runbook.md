@@ -15,10 +15,12 @@ Agent-eligible issue descriptions must use the durable template in
 [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md) before
 promotion. The required sections are `Problem / Goal`, `Issue Contract`,
 `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation
-Requirements`, `Out Of Scope`, and `Promotion Readiness`. The `Issue Contract`
-section MUST contain a fenced `json` block with positive `schemaVersion`,
-non-empty `contractVersion`, and a non-empty `requirements` array of stable
-unique IDs and non-empty requirement text. Use the same section names for
+Requirements`, `Out Of Scope`, and `Promotion Readiness`. The canonical heading
+is `Out Of Scope`; lint/review also accept legacy `Non-goals` as equivalent so
+older issues do not need a rename-only edit. The `Issue Contract` section MUST
+contain a fenced `json` block with positive `schemaVersion`, non-empty
+`contractVersion`, and a non-empty `requirements` array of stable unique IDs
+and non-empty requirement text. Prefer the canonical section names for new
 docs-only drafting and implementation drafting so workers, reviewers, and
 doctor lint evaluate one contract.
 
@@ -146,7 +148,7 @@ Promote through `Backlog -> Todo`. Do not move issues directly to `In Progress` 
 
 Before promotion, verify:
 
-- The issue has the required agent-eligible authoring sections from [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md): `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.
+- The issue has the required agent-eligible authoring sections from [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md): `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope` (or legacy `Non-goals`), and `Promotion Readiness`.
 - The issue has the required fenced JSON issue contract in `Issue Contract`,
   with `schemaVersion`, `contractVersion`, and at least one `requirements`
   entry whose `id` is stable and unique and whose `requirement` text is

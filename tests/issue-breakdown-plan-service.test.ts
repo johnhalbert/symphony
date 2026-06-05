@@ -84,6 +84,40 @@ describe("IssueBreakdownPlanService", () => {
     });
   });
 
+  it("accepts `Non-goals` as an alias for the `Out Of Scope` section in proposed issue descriptions", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ updatedAt: "2026-01-02T00:00:00Z" });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    const result = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-non-goals",
+        issueId: candidate.id,
+        summary: "Split the work into child issues.",
+        proposedIssues: [
+          {
+            title: "Build planning schema",
+            description: agentEligibleIssueContract({ outOfScopeHeading: "Non-goals" }),
+            acceptanceCriteria: ["Plans persist proposed issues."],
+            dependencies: [],
+            labels: ["planning"],
+          },
+        ],
+        idempotencyKey: "plan-non-goals",
+      },
+      {
+        issue: candidate,
+        activeRunId: "run-plan-non-goals",
+        role: "worker",
+        phase: "issue_breakdown",
+      },
+    );
+
+    expect(result.replayed).toBe(false);
+    expect(result.plan.proposedIssues[0]?.description).toContain("## Non-goals");
+  });
+
   it("rejects idempotency key reuse across runs or changed payloads", async () => {
     const config = testConfig(root);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);

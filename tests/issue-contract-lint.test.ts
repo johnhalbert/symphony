@@ -13,6 +13,13 @@ describe("IssueContractLint", () => {
     );
   });
 
+  it("accepts `Non-goals` as an alias for the `Out Of Scope` heading", () => {
+    const description = agentEligibleIssueContract({ outOfScopeHeading: "Non-goals" });
+
+    expect(missingRequiredIssueContractSections(description)).not.toContain("Out Of Scope");
+    expect(analyzeIssueContractDescription(description, []).missingSections).toEqual([]);
+  });
+
   it("ignores required authoring headings hidden inside fenced code blocks", () => {
     const analysis = analyzeIssueContractDescription(fencedAuthoringSectionSpoof(), []);
 

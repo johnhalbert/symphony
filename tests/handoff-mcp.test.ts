@@ -15,6 +15,7 @@ describe("MCP handoff prompt rendering", () => {
     expect(prompt).toContain("Issue Contract");
     expect(prompt).toContain("Contract Checklist");
     expect(prompt).toContain("Validation Requirements");
+    expect(prompt).toContain("Non-goals");
     expect(prompt).toContain("fenced `json` block");
     expect(prompt).toContain("stable unique `id` values");
     expect(prompt).toContain("exact repo paths or globs");

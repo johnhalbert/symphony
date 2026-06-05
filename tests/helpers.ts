@@ -65,6 +65,7 @@ export function agentEligibleIssueContract(
     acceptanceCriteria?: string[];
     contractChecklist?: string[];
     validationRequirements?: string[];
+    outOfScopeHeading?: string;
     outOfScope?: string[];
     readyForDogfoodReady?: "yes" | "no";
     remainingBlocker?: string;
@@ -88,6 +89,7 @@ export function agentEligibleIssueContract(
     acceptanceCriteria = ["- Done."],
     contractChecklist = ["- Happy path: covered.", "- Negative/error path: covered."],
     validationRequirements = ["- Run the narrow test."],
+    outOfScopeHeading = "Out Of Scope",
     outOfScope = ["- Nothing else."],
     readyForDogfoodReady = "yes",
     remainingBlocker = readyForDogfoodReady === "yes" ? "none" : "Manual operator implementation required.",
@@ -124,7 +126,7 @@ export function agentEligibleIssueContract(
     "## Validation Requirements",
     ...validationRequirements,
     "",
-    "## Out Of Scope",
+    `## ${outOfScopeHeading}`,
     ...outOfScope,
     "",
     "## Promotion Readiness",

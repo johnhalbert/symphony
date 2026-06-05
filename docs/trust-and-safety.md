@@ -39,8 +39,10 @@ agent-eligible issue until the issue uses the required authoring sections from
 [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md):
 `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`,
 `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and
-`Promotion Readiness`. The `Issue Contract` section MUST contain a fenced
-`json` block with positive `schemaVersion`, non-empty `contractVersion`, and a
+`Promotion Readiness`. The canonical heading is `Out Of Scope`; lint/review
+also accept legacy `Non-goals` as equivalent so older issues do not need a
+rename-only edit. The `Issue Contract` section MUST contain a fenced `json`
+block with positive `schemaVersion`, non-empty `contractVersion`, and a
 non-empty `requirements` array whose entries have stable unique `id` values and
 non-empty `requirement` text. The `Validation Requirements` section must
 include a concrete validation plan, and the `Contract Checklist` must be
