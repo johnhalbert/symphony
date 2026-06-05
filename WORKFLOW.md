@@ -128,7 +128,7 @@ github:
   head_owner: johnhalbert
   publish_pull_requests: true
   pr_handoff:
-    enabled: false
+    enabled: true
     target_state: Manual Review
     required_checks: []
     no_ci:
