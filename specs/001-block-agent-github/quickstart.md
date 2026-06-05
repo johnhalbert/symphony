@@ -65,6 +65,12 @@ npm test -- tests/mcp-subprocess-environment-command-policy.test.ts tests/comple
 npm test -- tests/run-activity-event-command-policy.test.ts tests/transcript-replay-command-policy.test.ts tests/web-transcript-projection-command-policy.test.ts
 ```
 
+Treat final validation as a three-part review packet:
+
+1. The automated deny/allow/service-boundary/audit suite above.
+2. One real worker run and one real reviewer run inspected through the status API or persisted run transcript for SC-004 evidence.
+3. The vendored Hermes no-touch check at the end of this document.
+
 Latency regression coverage should keep normal direct policy decisions under 50 ms and local Git config inspection decisions under 250 ms using deterministic local fixtures. Avoid flaky end-to-end timing assertions against real provider, network, or desktop credential behavior.
 
 After the full implementation, run the repo's CI-equivalent checks when time allows:
@@ -122,6 +128,8 @@ For each allow or deny scenario, inspect durable run activity or replayed transc
 - Evidence is redacted.
 - Upstream contact is false for denied scenarios.
 - Service-owned GitHub failures are not recorded as agent command policy denials.
+- Redacted audit records keep only bounded previews, structured metadata, and safe environment-key/category lists.
+- Public transcript and replay-state reads replace raw command text, helper paths, and environment values with redacted placeholders.
 
 ## Service Boundary Verification
 
@@ -134,9 +142,25 @@ Confirm service-owned GitHub workflow actions remain outside worker/reviewer com
 
 ## Dogfood Validation
 
-After rollout, validate SC-004 against real worker/reviewer dogfood runs by inspecting run activity, policy denial records, and desktop prompt observations. The expected result is zero desktop OAuth prompts, SSH key confirmation prompts, or GitHub credential prompts caused by agent-owned command attempts.
+After rollout, capture one real worker run and one real reviewer run from the live dogfood loop. For each run:
+
+1. Inspect `/api/v1/runs/<runId>` and record `role`, `runPhase`, `status`, `harnessId`, `runtimeModel`, `startedAt`, and `completedAt`.
+2. Inspect `/api/v1/runs/<runId>/transcript` or the persisted `events.jsonl` and summarize every `Hermes tool terminal:` command. Expected commands remain local-only, such as `git status`, `git diff`, `git log`, `git show`, `git branch`, `git blame`, local `node`/`python` inspection, local tests, and workspace-local smoke commands.
+3. Search the same transcript/events for `oauth`, `ssh key confirmation`, `github credential`, `gh auth`, `git-credential`, and `ssh-askpass`. Expected result: zero hits caused by agent-owned command attempts.
+4. If the run includes a `command_policy_decision` event, record the redacted snippet with `outcome`, `reasonKind`, `commandClass`, `surface`, `role`, `phase`, and `upstreamContactAttempted: false`.
+5. If the live runs do not contain a denial event, pair the live zero-prompt scan with the automated denial/audit suite and cite the exact test files that prove upstream deny behavior, service-owned GitHub boundaries, and public redaction.
+
+A review-ready SC-004 evidence packet contains:
+
+- One worker run ID and one reviewer run ID.
+- Transcript scan output showing only local-only terminal commands.
+- Zero-hit prompt scan results.
+- One redacted `command_policy_decision` or public-read transcript example.
+- The vendored Hermes no-touch check output.
 
 Do not intentionally trigger real credential prompts as the validation mechanism. Use local fixtures, fake helpers, run evidence, and operator observation instead.
+
+See `docs/smoke/eng-243-sc-004-no-upstream-prompts.md` for a recorded evidence packet built from live worker/reviewer runs plus the supporting redaction/service-boundary tests.
 
 ## Process Notes
 
