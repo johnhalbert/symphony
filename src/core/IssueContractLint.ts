@@ -3,10 +3,8 @@ import type { Issue } from "./types.js";
 
 const ISSUE_CONTRACT_HEADING = "Issue Contract";
 const TOUCHED_SURFACES_HEADING = "Touched Surfaces";
-const OUT_OF_SCOPE_HEADING = "Out Of Scope";
 const PROMOTION_READINESS_HEADING = "Promotion Readiness";
 const STABLE_REQUIREMENT_ID_PATTERN = /^[a-z][a-z0-9._:-]*$/i;
-
 const BLOCKER_PLACEHOLDER_VALUES = new Set([
   'if any protected path is listed above, keep this issue manual-only with "ready for `dogfood-ready`: no" and explain the operator blocker here',
   "n/a",
@@ -21,7 +19,6 @@ const BLOCKER_PLACEHOLDER_VALUES = new Set([
   "todo",
   "unknown",
 ]);
-
 const MANUAL_BLOCKER_KEYWORDS =
   /\b(manual(?:-only)?|operator|human|protected|owner-authored|owner authored|follow-up pr|separate pr)\b/i;
 
@@ -32,7 +29,7 @@ export const AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS = [
   "Acceptance Criteria",
   "Contract Checklist",
   "Validation Requirements",
-  OUT_OF_SCOPE_HEADING,
+  "Out Of Scope",
   PROMOTION_READINESS_HEADING,
 ] as const;
 
@@ -445,14 +442,12 @@ function normalizeBlockerText(value: string): string {
 }
 
 function normalizeHeading(value: string): string {
-  const normalized = value
+  return value
     .toLowerCase()
     .replace(/&amp;/g, "and")
     .replace(/[^a-z0-9]+/g, " ")
     .trim()
     .replace(/\s+/g, " ");
-
-  return normalized === "non goals" ? normalizeHeading(OUT_OF_SCOPE_HEADING) : normalized;
 }
 
 function containsName(values: readonly string[], expected: string): boolean {

@@ -75,7 +75,6 @@ plan. It is not a substitute for the fenced JSON contract.
 ## Out Of Scope
 
 - List related behavior that should not be implemented in this slice.
-- Prefer this canonical heading in new issues. `## Non-goals` is accepted as an equivalent legacy heading during lint/review so older issues do not need a rename-only edit.
 
 ## Promotion Readiness
 

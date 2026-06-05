@@ -15,12 +15,10 @@ Agent-eligible issue descriptions must use the durable template in
 [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md) before
 promotion. The required sections are `Problem / Goal`, `Issue Contract`,
 `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation
-Requirements`, `Out Of Scope`, and `Promotion Readiness`. The canonical heading
-is `Out Of Scope`; lint/review also accept legacy `Non-goals` as equivalent so
-older issues do not need a rename-only edit. The `Issue Contract` section MUST
-contain a fenced `json` block with positive `schemaVersion`, non-empty
-`contractVersion`, and a non-empty `requirements` array of stable unique IDs
-and non-empty requirement text. Prefer the canonical section names for new
+Requirements`, `Out Of Scope`, and `Promotion Readiness`. The `Issue Contract`
+section MUST contain a fenced `json` block with positive `schemaVersion`,
+non-empty `contractVersion`, and a non-empty `requirements` array of stable
+unique IDs and non-empty requirement text. Use the same section names for
 docs-only drafting and implementation drafting so workers, reviewers, and
 doctor lint evaluate one contract.
 
@@ -70,7 +68,7 @@ Native Windows is supported for Symphony's stdio gateway path when Node 22+ and 
 
 Hermes owns OpenAI Codex auth. Symphony bootstraps selected provider state from the local Hermes auth store into `hermes.auth.managed_root`; it does not read Codex CLI auth directly and does not require `runtime.hermes` API-key credentials for `openai-codex`.
 
-The reference workflow configures Hermes with `provider: openai-codex` and `model: gpt-5.5`. The generated worker, reviewer, and planner profile templates set Hermes `agent.reasoning_effort: xhigh`.
+The reference workflow configures Hermes with `provider: openai-codex` and `model: gpt-5.3-codex-spark`. The generated worker profile template sets Hermes `agent.reasoning_effort: high`, while the reviewer and planner templates remain `agent.reasoning_effort: xhigh`.
 
 ### Host Hermes ACP harness setup
 
@@ -128,12 +126,43 @@ Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable 
 
 Before removing `dogfood-blocked` from Hermes ACP dogfood issues, record the following evidence in the operator notes or issue comments:
 
+Keep ACP opt-in by running the live issue validation from a disposable workflow copy instead of editing the checked-in default:
+
+```powershell
+Copy-Item WORKFLOW.md WORKFLOW.hermes-acp.md
+# In WORKFLOW.hermes-acp.md change only:
+# agent:
+#   harness: hermes_acp
+# Optionally pin the validated host profile in the workflow copy:
+# hermes_acp:
+#   source_profile: <host-profile>
+npm run dev -- --port 7331 WORKFLOW.hermes-acp.md
+```
+
+Use the normal `WORKFLOW.md` again after ACP validation and delete `WORKFLOW.hermes-acp.md` so the default checked-in `agent.harness: hermes` path remains unchanged.
+
+For the live-run items below, collect issue/run evidence with:
+
+```powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/state"
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123"
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/runs"
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/runs/<runId>"
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/runs/<runId>/transcript?offset=0&limit=200"
+```
+
 - `npm run typecheck`, `npm test`, `npm run doctor -- --strict`, `npm run doctor -- --strict --live-runtime`, and `npm run smoke:hermes-local` succeeded for the same checkout/host environment, and the live-runtime/local-smoke evidence still showed the required Symphony handoff MCP tools, so the default Hermes TUI path is still healthy before any ACP-only unblock decision.
 - `hermes --version`, `hermes profile`, `hermes acp --check`, and `hermes -p <source> acp --check` succeeded for the intended host source profile.
-- `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded, verified the disposable cloned profile, and its success JSON recorded the emitted `promptExpectedText`, matching `promptResponseText`, a normal `promptStopReason`, the ACP `promptSessionId`, and `disposableProfileDeleted: true` unless an operator intentionally retained the disposable profile for troubleshooting.
-- One tiny local issue then ran with `agent.harness: hermes_acp` in the same host environment, and the worker reached a normal `submit_completion_report` handoff so the Symphony handoff MCP tools were visible to Hermes in a real ACP-backed run.
-- ACP permission handling was deliberately exercised during live validation: at least one safe terminal or edit request was observed with the intended allow/deny result, and any unapproved or unexpected request stayed fail-closed until an operator explicitly approved it.
-- A separate intentionally cancelled `agent.harness: hermes_acp` run produced operator evidence of `cancelling` -> `cancelled` (for example in `/api/v1/state`, run detail, or transcript output) instead of hanging or reporting success.
+- `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded, verified the disposable cloned profile, and its success JSON recorded `configuredHarness: "hermes_acp"`, `hostHermesBinary`, `sourceProfile`, `disposableProfile`, `disposableProfileDeleted: true`, `activeProfileUnchanged: true`, `promptExpectedText`, matching `promptResponseText`, a normal `promptStopReason`, and the ACP `promptSessionId` unless an operator intentionally retained the disposable profile for troubleshooting.
+- One tiny unprotected issue then ran from `WORKFLOW.hermes-acp.md` in the same host environment. Choose or author the issue so it requires one safe repository edit and one targeted validation command, which forces an ACP permission request on a bounded surface. Passing handoff evidence is `/api/v1/issues/<issue>` showing `reviewLoop.phase: "review"` and `reviewLoop.lastCompletionReport.runId`, `/api/v1/runs/<handoffWorkerRunId>` showing `status: "succeeded"` and `terminalReason: "succeeded"`, and `/api/v1/runs/<handoffWorkerRunId>/transcript` showing a `tool_call_completed` entry whose payload `toolName` or public tool preview names `submit_completion_report`.
+- Deliberately exercise both deny and allow on the first safe ACP permission request from that tiny issue. First deny the request and confirm the run stays fail-closed until operator action; passing evidence is `/api/v1/runs/<runId>/transcript` showing `command_policy_decision` with payload fields such as `outcome: "deny"`, `surface`/`requestKind`, and `permissionOutcome` or `selectedOptionId`. Then rerun the same issue and allow the equivalent safe request; passing evidence is a later `command_policy_decision` for the same surface with `outcome: "allow"` plus the successful completion-report handoff evidence from the previous bullet.
+- Start a separate intentionally cancelled `agent.harness: hermes_acp` run after the worker is active in `operatorView.running`, then cancel it with:
+
+  ```powershell
+  Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/cancel"
+  ```
+
+  Passing cancellation evidence is `/api/v1/state` showing `operatorView.running[].liveness.status: "cancelling"` before terminal resolution, `/api/v1/runs/<runId>` ending with `status: "cancelled"` and `terminalReason: "cancelled"`, and `/api/v1/runs/<runId>/transcript` containing the terminal `cancelled` event instead of a completion-report handoff.
 - The active host profile before and after the ACP smoke/issue runs matched; the source profile was not renamed, selected, deleted, or used directly as the disposable run profile, and any retained session/profile artifacts belonged to the disposable clone rather than the source profile.
 - No retained disposable profile with the configured `hermes_acp.profile_prefix` (or the operator-selected `--profile-prefix`/`--profile-name`) remains unless an operator intentionally used `--keep-profile` for troubleshooting and tracked the cleanup.
 - Default validation remains non-ACP unless the operator explicitly runs this ACP evidence set; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
@@ -148,7 +177,7 @@ Promote through `Backlog -> Todo`. Do not move issues directly to `In Progress` 
 
 Before promotion, verify:
 
-- The issue has the required agent-eligible authoring sections from [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md): `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope` (or legacy `Non-goals`), and `Promotion Readiness`.
+- The issue has the required agent-eligible authoring sections from [`agent-eligible-issue-template.md`](./agent-eligible-issue-template.md): `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.
 - The issue has the required fenced JSON issue contract in `Issue Contract`,
   with `schemaVersion`, `contractVersion`, and at least one `requirements`
   entry whose `id` is stable and unique and whose `requirement` text is

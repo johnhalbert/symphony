@@ -97,26 +97,6 @@ describe("doctor review-loop checks", () => {
     });
   });
 
-  it("accepts legacy `Non-goals` as equivalent to `Out Of Scope` in doctor checks", () => {
-    const config = testConfig("/tmp/symphony-doctor");
-    config.agent.requireLabels = ["dogfood-ready"];
-    config.agent.excludeLabels = ["dogfood-blocked"];
-
-    expect(
-      issueContractDoctorCheck(config, [
-        issue({
-          labels: ["dogfood-ready"],
-          description: agentEligibleIssueContract({ outOfScopeHeading: "Non-goals" }),
-        }),
-      ]),
-    ).toEqual({
-      id: "linear.issue_contract",
-      status: "ok",
-      message:
-        "1 agent-eligible candidate issue(s) include required authoring sections: Problem / Goal, Issue Contract, Touched Surfaces, Acceptance Criteria, Contract Checklist, Validation Requirements, Out Of Scope, Promotion Readiness",
-    });
-  });
-
   it("warns when an agent-eligible issue has an invalid fenced JSON Issue Contract", () => {
     const config = testConfig("/tmp/symphony-doctor");
     config.agent.requireLabels = ["dogfood-ready"];
