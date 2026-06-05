@@ -96,6 +96,25 @@ export interface HermesAcpSmokeSkipReport {
 
 export type HermesAcpSmokeHostResolution = HermesAcpSmokeHostSettings | HermesAcpSmokeSkipReport;
 
+export interface HermesAcpSmokeSuccessReport {
+  workflowPath: string;
+  configuredHarness: string;
+  hostHermesBinary: string;
+  hostHermesBinarySource: string | null;
+  sourceProfile: string;
+  sourceProfileSource: string | null;
+  disposableProfile: string;
+  disposableProfileDeleted: boolean;
+  activeProfileUnchanged: boolean;
+  promptExpectedText: string;
+  promptResponseText: string;
+  promptSessionId: string;
+  promptStopReason: string | null;
+  promptDiagnosticCount: number;
+  promptUpdateCount: number;
+  tempRoot?: string;
+}
+
 export interface HermesAcpSmokeFailureContext {
   phase: string;
   hostHermesBinary?: string | null;
@@ -259,7 +278,7 @@ export async function main(workflow: string, rawOptions: RawOptions): Promise<vo
     console.log("[smoke:hermes-acp] OK");
     console.log(
       JSON.stringify(
-        {
+        buildHermesAcpSmokeSuccessReport({
           workflowPath,
           configuredHarness: config.agent.harness,
           hostHermesBinary: host.binaryPath,
@@ -269,12 +288,10 @@ export async function main(workflow: string, rawOptions: RawOptions): Promise<vo
           disposableProfile: profileName,
           disposableProfileDeleted: profileDeleted,
           activeProfileUnchanged: true,
-          promptSessionId: promptResult.sessionId,
-          promptStopReason: promptResult.stopReason,
-          promptDiagnosticCount: promptResult.diagnosticCount,
-          promptUpdateCount: promptResult.updateCount,
-          tempRoot: rawOptions.keepTemp ? tempRoot : undefined,
-        },
+          expectedText,
+          promptResult,
+          tempRoot: rawOptions.keepTemp ? tempRoot : null,
+        }),
         null,
         2,
       ),
@@ -367,6 +384,40 @@ export function formatHermesAcpSmokeSkipReport(report: HermesAcpSmokeSkipReport)
     `stderr tail: ${report.stderrTail}`,
     JSON.stringify(report, null, 2),
   ].join("\n");
+}
+
+export function buildHermesAcpSmokeSuccessReport(input: {
+  workflowPath: string;
+  configuredHarness: string;
+  hostHermesBinary: string;
+  hostHermesBinarySource: string | null;
+  sourceProfile: string;
+  sourceProfileSource: string | null;
+  disposableProfile: string;
+  disposableProfileDeleted: boolean;
+  activeProfileUnchanged: boolean;
+  expectedText: string;
+  promptResult: HermesAcpPromptSmokeResult;
+  tempRoot?: string | null;
+}): HermesAcpSmokeSuccessReport {
+  return {
+    workflowPath: input.workflowPath,
+    configuredHarness: input.configuredHarness,
+    hostHermesBinary: input.hostHermesBinary,
+    hostHermesBinarySource: input.hostHermesBinarySource,
+    sourceProfile: input.sourceProfile,
+    sourceProfileSource: input.sourceProfileSource,
+    disposableProfile: input.disposableProfile,
+    disposableProfileDeleted: input.disposableProfileDeleted,
+    activeProfileUnchanged: input.activeProfileUnchanged,
+    promptExpectedText: sanitizedPreviewValue(redactForLog(input.expectedText), 500).preview ?? "",
+    promptResponseText: sanitizedPreviewValue(redactForLog(input.promptResult.responseText), 500).preview ?? "",
+    promptSessionId: input.promptResult.sessionId,
+    promptStopReason: input.promptResult.stopReason,
+    promptDiagnosticCount: input.promptResult.diagnosticCount,
+    promptUpdateCount: input.promptResult.updateCount,
+    ...(input.tempRoot ? { tempRoot: input.tempRoot } : {}),
+  };
 }
 
 function emitHermesAcpSmokeSkip(report: HermesAcpSmokeSkipReport): void {
