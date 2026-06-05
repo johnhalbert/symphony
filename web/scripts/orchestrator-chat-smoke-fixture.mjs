@@ -2,6 +2,8 @@ export function createOrchestratorChatProjection(chat, {
   conversationId = "orchestrator-default",
   observedAt = "2026-01-01T00:00:00.000Z",
   revisionPrefix = "browser-smoke",
+  state: stateOverride,
+  conversationStatus: conversationStatusOverride,
 } = {}) {
   const statusCounts = {
     pending: 0,
@@ -25,8 +27,8 @@ export function createOrchestratorChatProjection(chat, {
   });
   const latestMessage = normalizedChat.at(-1) ?? null;
   const latestMessageStatus = latestMessage?.status ?? null;
-  const conversationStatus = latestMessageStatus === "pending" || latestMessageStatus === "streaming" ? latestMessageStatus : "completed";
-  const state = normalizedChat.length === 0 ? "empty" : conversationStatus;
+  const conversationStatus = conversationStatusOverride ?? conversationStatusFromState(stateOverride) ?? deriveConversationStatus(latestMessageStatus, statusCounts);
+  const state = stateOverride ?? (normalizedChat.length === 0 && conversationStatus === "completed" ? "empty" : deriveState(conversationStatus, latestMessageStatus, statusCounts));
   return {
     schemaVersion: 1,
     conversation: {
@@ -62,4 +64,36 @@ export function createOrchestratorChatProjection(chat, {
       sourceShape: "reducer_envelope",
     },
   };
+}
+
+function conversationStatusFromState(state) {
+  if (!state || state === "empty") return null;
+  return state;
+}
+
+function deriveConversationStatus(latestMessageStatus, statusCounts) {
+  if (isConversationStatus(latestMessageStatus)) return latestMessageStatus;
+  if (statusCounts.streaming > 0) return "streaming";
+  if (statusCounts.pending > 0) return "pending";
+  if (statusCounts.failed > 0) return "failed";
+  if (statusCounts.unavailable > 0) return "unavailable";
+  if (statusCounts.disabled > 0) return "disabled";
+  return "completed";
+}
+
+function deriveState(conversationStatus, latestMessageStatus, statusCounts) {
+  if (latestMessageStatus === "pending" || latestMessageStatus === "streaming") return latestMessageStatus;
+  if (conversationStatus === "pending" || conversationStatus === "streaming") return conversationStatus;
+  if (latestMessageStatus === "failed" || latestMessageStatus === "unavailable" || latestMessageStatus === "disabled") return latestMessageStatus;
+  if (conversationStatus === "failed" || conversationStatus === "unavailable" || conversationStatus === "disabled") return conversationStatus;
+  if (statusCounts.streaming > 0) return "streaming";
+  if (statusCounts.pending > 0) return "pending";
+  if (statusCounts.failed > 0) return "failed";
+  if (statusCounts.unavailable > 0) return "unavailable";
+  if (statusCounts.disabled > 0) return "disabled";
+  return "completed";
+}
+
+function isConversationStatus(status) {
+  return status === "pending" || status === "streaming" || status === "completed" || status === "failed" || status === "disabled" || status === "unavailable";
 }
