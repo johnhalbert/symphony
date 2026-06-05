@@ -1355,7 +1355,7 @@ Work on {{ issue.identifier }}.
     expect(config.agent.maxTurns).toBe(1);
     expect(config.mergePolicy.mode).toBe("gated");
     expect(config.continuationContext.searchEnabled).toBe(false);
-    expect(config.github.prHandoff.enabled).toBe(true);
+    expect(config.github.prHandoff.enabled).toBe(false);
     expect(config.github.token).toBeNull();
     expect(config.github.app).toMatchObject({
       appId: "12345",
@@ -1365,7 +1365,7 @@ Work on {{ issue.identifier }}.
     expect(config.github.app?.privateKeyPath?.replace(/\\/g, "/")).toMatch(/\/tmp\/github-app-private-key\.pem$/);
     expect(config.server.openWorkspaceToken).toBe("workspace-secret");
     expect(config.hermes.provider).toBe("openai-codex");
-    expect(config.hermes.model).toBe("gpt-5.3-codex-spark");
+    expect(config.hermes.model).toBe("gpt-5.4");
     expect(config.hermes.auth).toMatchObject({
       mode: "managed_root",
       providers: ["openai-codex"],
