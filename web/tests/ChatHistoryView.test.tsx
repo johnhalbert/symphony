@@ -10,6 +10,8 @@ import type { HistoryModel, Loadable, SessionModel, TranscriptMessage } from "..
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const mountedRoots: Root[] = [];
+const readabilityBaseTimestampMs = Date.parse("2026-03-01T09:00:00.000Z");
+const largeRealRunTranscriptCycleCount = 18;
 
 const { useTranscriptMock } = vi.hoisted(() => ({
   useTranscriptMock: vi.fn<(sessionId: string | null, refreshToken?: unknown) => Loadable<TranscriptMessage[]>>(),
@@ -72,6 +74,55 @@ const apiTranscript: TranscriptMessage[] = [
     result: "tests passed",
   },
 ];
+
+const realRunTranscriptMessages: TranscriptMessage[] = [
+  {
+    kind: "assistant",
+    ts: "2026-03-01T09:00:00.000Z",
+    text: "Readability pass: split tokens and wrap long lines while preserving command output context.",
+  },
+  {
+    kind: "tool_call",
+    ts: "2026-03-01T09:00:01.000Z",
+    call_id: "tool-call-real-readability",
+    name: "terminal",
+    status: "succeeded",
+    args: { preview: 'cmd="cat .env" token=[redacted]' },
+    result: "tests passed",
+    output: "tests: 42 passed coverage: 98.8% runId: run-real-readability-01",
+  },
+  {
+    kind: "assistant",
+    ts: "2026-03-01T09:00:03.000Z",
+    text: "Long transcript lines are now grouped and rendered with stable whitespace.",
+  },
+  {
+    kind: "status",
+    state: "windowed_bucket_exhausted",
+    ts: "2026-03-01T09:00:03.500Z",
+    text: "Provider limit: Requests paused for provider window (openai · gpt-5.4 · resume 2026-03-01T09:01:00.000Z)",
+  },
+  {
+    kind: "status",
+    state: "transcript_readability",
+    ts: "2026-03-01T09:00:04.000Z",
+    text: "Recovered from a transient stream condition",
+  },
+  {
+    kind: "status",
+    state: "tokens",
+    ts: "2026-03-01T09:00:04.500Z",
+    text: "Tokens: input 9 · output 7 · total 16",
+  },
+  {
+    kind: "status",
+    state: "run_cancelled",
+    ts: "2026-03-01T09:00:05.000Z",
+    text: "Cancelled after operator stop request token=[redacted]",
+  },
+];
+
+const largeRealRunTranscriptMessages = buildLargeRealRunTranscriptMessages(largeRealRunTranscriptCycleCount);
 
 function history(overrides: Partial<HistoryModel> = {}): HistoryModel {
   return {
@@ -152,6 +203,56 @@ describe("ChatHistoryView", () => {
     expect(markup).toContain("Dedicated session transcript loaded from the API.");
     expect(markup).toContain("terminal");
     expect(markup).not.toContain("No transcript messages for this session.");
+  });
+
+  it("renders a projected real-run transcript fixture and keeps multiline command output visible in the transcript UI", () => {
+    useTranscriptMock.mockReturnValue(transcriptState({ data: realRunTranscriptMessages }));
+    const fixtureSession = {
+      ...sessions[1],
+      title: "Real run readability fixture",
+      msgCount: realRunTranscriptMessages.length,
+      toolCount: 1,
+      lastEvent: "Transcript readability fixture loaded",
+    };
+    const view = mountHistoryView(history({ sessions: [fixtureSession], defaultSessionId: fixtureSession.id }));
+
+    expect(view.container.textContent).toContain(
+      "Readability pass: split tokens and wrap long lines while preserving command output context.",
+    );
+    expect(view.container.textContent).toContain("Long transcript lines are now grouped and rendered with stable whitespace.");
+    expect(view.container.textContent).toContain("Requests paused for provider window");
+    expect(view.container.textContent).toContain("Cancelled after operator stop request token=[redacted]");
+    expect(view.container.textContent).not.toContain("REAL_RUN_TOKEN_123456789");
+
+    const toolCallButton = view.container.querySelector<HTMLButtonElement>(".toolcall__head");
+    if (!toolCallButton) throw new Error("expected tool call button to render");
+    act(() => {
+      toolCallButton.click();
+    });
+
+    expect(view.container.textContent).toContain("tests: 42 passed");
+    expect(view.container.textContent).toContain("coverage: 98.8%");
+    expect(view.container.textContent).not.toContain("SECRET_REAL_RUN_API_KEY");
+    expect(view.container.textContent).not.toContain("SECRET_PROVIDER_LIMIT_KEY");
+  });
+
+  it("renders the bounded projection of a generated large-session readability fixture without extra transcript rows", () => {
+    useTranscriptMock.mockReturnValue(transcriptState({ data: largeRealRunTranscriptMessages }));
+    const fixtureSession = {
+      ...sessions[1],
+      title: "Large transcript readability fixture",
+      msgCount: largeRealRunTranscriptMessages.length,
+      toolCount: largeRealRunTranscriptCycleCount,
+      lastEvent: "Large transcript fixture loaded",
+    };
+    const view = mountHistoryView(history({ sessions: [fixtureSession], defaultSessionId: fixtureSession.id }));
+
+    expect(view.container.querySelectorAll(".msg, .lifecycle")).toHaveLength(largeRealRunTranscriptMessages.length);
+    expect(view.container.querySelectorAll(".toolcall__head")).toHaveLength(largeRealRunTranscriptCycleCount);
+    expect(view.container.textContent).toContain("Cycle 01: merge transcript deltas and keep output previews readable.");
+    expect(view.container.textContent).toContain("Run failed after provider interruption token=[redacted]");
+    expect(view.container.textContent).not.toContain("LARGE_REAL_RUN_TOKEN_");
+    expect(view.container.textContent).not.toContain("SECRET_PROVIDER_LIMIT_");
   });
 
   it("keeps selected session and scroll context while refreshed history adds and updates sessions", () => {
@@ -278,3 +379,65 @@ describe("ChatHistoryView", () => {
     expect(useTranscriptMock).not.toHaveBeenCalled();
   });
 });
+
+function buildLargeRealRunTranscriptMessages(cycleCount: number): TranscriptMessage[] {
+  const messages: TranscriptMessage[] = [];
+
+  for (let cycle = 0; cycle < cycleCount; cycle += 1) {
+    const cycleNumber = cycle + 1;
+    const cycleLabel = String(cycleNumber).padStart(2, "0");
+    const offsetBaseMs = cycle * 15_000;
+
+    messages.push(
+      {
+        kind: "assistant",
+        ts: transcriptTimestamp(offsetBaseMs + 250),
+        text: `Cycle ${cycleLabel}: merge transcript deltas and keep output previews readable.`,
+      },
+      {
+        kind: "tool_call",
+        ts: transcriptTimestamp(offsetBaseMs + 1_000),
+        call_id: `tool-call-large-readability-${cycleLabel}`,
+        name: "terminal",
+        status: "succeeded",
+        args: { preview: `cmd="node cycle-${cycleLabel}.js" token=[redacted]` },
+        result: `cycle ${cycleLabel} completed`,
+        output: `cycle ${cycleLabel} output line 1 cycle ${cycleLabel} output line 2`,
+      },
+      {
+        kind: "status",
+        state: "tokens",
+        ts: transcriptTimestamp(offsetBaseMs + 2_500),
+        text: `Tokens: input ${50 + cycle} · output ${25 + cycle} · total ${75 + cycle * 2}`,
+      },
+      {
+        kind: "status",
+        state: `cycle_${cycleLabel}_diagnostic`,
+        ts: transcriptTimestamp(offsetBaseMs + 3_000),
+        text: `Cycle ${cycleLabel} recovered from stream backpressure`,
+      },
+    );
+
+    if (cycleNumber % 3 === 0) {
+      messages.push({
+        kind: "status",
+        state: "windowed_bucket_exhausted",
+        ts: transcriptTimestamp(offsetBaseMs + 3_500),
+        text: `Provider limit: Cycle ${cycleLabel} paused for provider window (openai · gpt-5.4 · resume 2026-03-01T09:${cycleLabel}:00.000Z)`,
+      });
+    }
+  }
+
+  messages.push({
+    kind: "status",
+    state: "run_failed",
+    ts: transcriptTimestamp(cycleCount * 15_000),
+    text: "Run failed after provider interruption token=[redacted]",
+  });
+
+  return messages;
+}
+
+function transcriptTimestamp(offsetMs: number): string {
+  return new Date(readabilityBaseTimestampMs + offsetMs).toISOString();
+}
