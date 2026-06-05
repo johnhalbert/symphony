@@ -126,16 +126,17 @@ Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable 
 
 Before removing `dogfood-blocked` from Hermes ACP dogfood issues, record the following evidence in the operator notes or issue comments:
 
-- `npm run typecheck`, `npm test`, `npm run doctor -- --strict`, `npm run doctor -- --strict --live-runtime`, and `npm run smoke:hermes-local` succeeded for the same checkout/host environment so the default Hermes TUI path is still healthy before any ACP-only unblock decision.
+- `npm run typecheck`, `npm test`, `npm run doctor -- --strict`, `npm run doctor -- --strict --live-runtime`, and `npm run smoke:hermes-local` succeeded for the same checkout/host environment, and the live-runtime/local-smoke evidence still showed the required Symphony handoff MCP tools, so the default Hermes TUI path is still healthy before any ACP-only unblock decision.
 - `hermes --version`, `hermes profile`, `hermes acp --check`, and `hermes -p <source> acp --check` succeeded for the intended host source profile.
-- `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded and reported a deleted disposable profile.
-- The smoke response contained the expected text, the prompt stopped with a normal stop reason, and the ACP session id was recorded.
-- Any terminal/edit permission request raised during the ACP smoke was captured with the observed allow/deny result, and unexpected requests stayed fail-closed until an operator explicitly approved them.
-- The active host profile before and after the smoke matched; the source profile was not renamed, selected, deleted, or used directly as the disposable smoke profile.
+- `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded, verified the disposable cloned profile, recorded the expected response text, a normal `promptStopReason`, the ACP `promptSessionId`, and reported the disposable profile was deleted unless an operator intentionally retained it for troubleshooting.
+- One tiny local issue then ran with `agent.harness: hermes_acp` in the same host environment, and the worker reached a normal `submit_completion_report` handoff so the Symphony handoff MCP tools were visible to Hermes in a real ACP-backed run.
+- ACP permission handling was deliberately exercised during live validation: at least one safe terminal or edit request was observed with the intended allow/deny result, and any unapproved or unexpected request stayed fail-closed until an operator explicitly approved it.
+- A separate intentionally cancelled `agent.harness: hermes_acp` run produced operator evidence of `cancelling` -> `cancelled` (for example in `/api/v1/state`, run detail, or transcript output) instead of hanging or reporting success.
+- The active host profile before and after the ACP smoke/issue runs matched; the source profile was not renamed, selected, deleted, or used directly as the disposable run profile, and any retained session/profile artifacts belonged to the disposable clone rather than the source profile.
 - No retained disposable profile with the configured `hermes_acp.profile_prefix` (or the operator-selected `--profile-prefix`/`--profile-name`) remains unless an operator intentionally used `--keep-profile` for troubleshooting and tracked the cleanup.
-- Default validation remains non-ACP unless the operator explicitly runs this smoke; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
+- Default validation remains non-ACP unless the operator explicitly runs this ACP evidence set; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
 
-Only unblock `dogfood-blocked` after the checklist passes for the same host environment that will run the dogfood worker. If any item fails, leave the issue blocked, fix the host Hermes installation/auth/profile setup, and rerun the ACP smoke before promotion.
+Only unblock `dogfood-blocked` after the checklist passes for the same host environment that will run the dogfood worker. If any item fails, leave the issue blocked, fix the host Hermes installation/auth/profile setup, and rerun the ACP evidence steps before promotion.
 
 When you record the unblock evidence, link the operator note back to [`hermes-acp-integration-spec.md#validation-plan`](./hermes-acp-integration-spec.md#validation-plan) and note which Linear ACP follow-up it satisfies (`ENG-136`, `ENG-143`, or `ENG-143C`) so the spec, runbook, and implementation history stay connected.
 
