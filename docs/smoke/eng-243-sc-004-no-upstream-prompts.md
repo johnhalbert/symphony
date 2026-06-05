@@ -80,9 +80,68 @@ The inspected worker and reviewer dogfood runs executed only workspace-local git
 
 The chosen live runs did not emit a `command_policy_decision` event because the agents stayed inside allowed local-only behavior. Redaction behavior is therefore supported by the automated contract tests that exercise denied policy decisions and public transcript projection.
 
-### Structured redacted audit example
+### Durable redacted audit example
 
-`tests/run-activity-event-command-policy.test.ts` and `tests/transcript-replay-command-policy.test.ts` verify the durable denied-event shape, including structured metadata and `upstreamContactAttempted: false`:
+`tests/run-activity-event-command-policy.test.ts` verifies the durable denied-event shape. The durable run-activity event keeps redacted command details in `payload.audit` and records the service-checkable decision metadata at the top level:
+
+```json
+{
+  "actor": "harness",
+  "channel": "diagnostic",
+  "kind": "command_policy_decision",
+  "payload": {
+    "redacted": true,
+    "decisionId": "decision-deny-upstream-1",
+    "attemptId": "tool-call-terminal-1",
+    "surface": "terminal_execute",
+    "role": "worker",
+    "phase": "implementation",
+    "outcome": "deny",
+    "reasonKind": "upstream_github",
+    "commandClass": "direct_upstream_git_operation",
+    "upstreamContactAttempted": false,
+    "requestKind": "terminal_execute",
+    "toolCallId": "tool-call-terminal-1",
+    "permissionOutcome": "denied",
+    "hookAction": "block",
+    "audit": {
+      "redacted": true,
+      "commandClass": "direct_upstream_git_operation",
+      "reasonKind": "upstream_github",
+      "upstreamContactAttempted": false,
+      "targetHosts": ["github.com"]
+    }
+  }
+}
+```
+
+`tests/transcript-replay-command-policy.test.ts` verifies that public transcript reads remove raw command payloads and expose only redacted public fields:
+
+```json
+{
+  "kind": "command_policy_decision",
+  "outcome": "deny",
+  "reasonKind": "upstream_github",
+  "commandClass": "direct_upstream_git_operation",
+  "permissionOutcome": "denied",
+  "hookAction": "block",
+  "redacted": true,
+  "env": "[redacted environment values]",
+  "helperPath": "[redacted helper path]",
+  "audit": {
+    "rawInputPreview": "[redacted command payload]",
+    "rawInputPreviewRedacted": true,
+    "commandPreview": "[redacted command payload]",
+    "helperPath": "[redacted helper path]",
+    "redacted": true
+  },
+  "normalizedCommand": {
+    "argumentsPreview": "[redacted command payload]"
+  }
+}
+```
+
+`tests/web-transcript-projection-command-policy.test.ts` verifies the public web projection shape. That projection intentionally includes top-level redacted display fields for UI rendering while preserving safe metadata:
 
 ```json
 {
@@ -90,12 +149,14 @@ The chosen live runs did not emit a `command_policy_decision` event because the 
   "payload": {
     "outcome": "deny",
     "reasonKind": "upstream_github",
+    "role": "worker",
+    "phase": "implementation",
+    "surface": "terminal_execute",
     "commandClass": "direct_upstream_git_operation",
-    "permissionOutcome": "denied",
-    "hookAction": "block",
-    "upstreamContactAttempted": false,
     "message": "[redacted command payload]",
     "text": "[redacted command payload]",
+    "textPreview": "[redacted command payload]",
+    "messagePreview": "[redacted command payload]",
     "commandPreview": "[redacted command payload]",
     "rawInputPreview": "[redacted command payload]",
     "env": "[redacted environment values]",
@@ -123,6 +184,20 @@ The chosen live runs did not emit a `command_policy_decision` event because the 
 - `tests/github-service-boundary-command-policy.test.ts`
   - mergeability / CI GitHub paths stay outside worker/reviewer command policy
 
+## Vendored Hermes No-Touch Check
+
+The ENG-281 branch did not modify vendored Hermes source. The protected-surface check output recorded for this packet is:
+
+```text
+> git diff --name-only -- hermes/upstream-src
+<no output>
+
+> git status --short -- hermes/upstream-src
+<no output>
+```
+
+Empty output from both commands is the expected passing result for REQ-005.
+
 ## Reviewer Checklist
 
 A reviewer can independently confirm this evidence packet by:
@@ -130,4 +205,5 @@ A reviewer can independently confirm this evidence packet by:
 1. Opening the four `/api/v1/runs/...` endpoints above and checking the stored status/phase/model/timestamps.
 2. Inspecting the two persisted `events.jsonl` files (or transcript API output) and confirming the listed `Hermes tool terminal:` commands are local-only.
 3. Re-running the transcript scan for the blocked-command and prompt-marker patterns listed in **Inspection Method** and confirming zero hits.
-4. Inspecting the cited automated tests to confirm denied-command audit events stay redacted and that service-owned GitHub paths remain allowed.
+4. Re-running the vendored Hermes no-touch commands listed above and confirming empty output.
+5. Inspecting the cited automated tests to confirm denied-command audit events stay redacted and that service-owned GitHub paths remain allowed.
