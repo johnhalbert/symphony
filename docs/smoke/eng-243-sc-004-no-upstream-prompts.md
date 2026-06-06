@@ -24,6 +24,9 @@ Independent inspection pointers:
 - Persisted run files under the workspace state directory:
   - `symphony_workspaces/.symphony/runs/hermes-37ff7bb2-c3e1-4990-b8d1-294e9d3fcc64/{meta.json,events.jsonl}`
   - `symphony_workspaces/.symphony/runs/hermes-a3f2234a-c6bf-454b-b3cf-6b49f8066500/{meta.json,events.jsonl}`
+- Matching worker profile artifacts and a preserved reviewer role/phase profile example:
+  - Worker same-run profile: `symphony_workspaces/.symphony/hermes/profiles/eng-241/worker/implementation/sym_eng-241_worker_eng-241_implementation_reuse_by_issue/{config.yaml,shell-hooks-allowlist.json}`
+  - Reviewer role/phase profile example: `symphony_workspaces/.symphony/hermes/profiles/eng-241/reviewer/review/sym_eng-241_reviewer_eng-241_review_fresh_per_r_e07489e456403225/{config.yaml,shell-hooks-allowlist.json}`
 
 ## Inspection Method
 
@@ -50,6 +53,8 @@ For each run, inspect the persisted `events.jsonl` stream and:
    - `gh auth`
    - `git-credential`
    - `ssh-askpass`
+4. Inspect the same run's `hermes_profile` event together with any preserved matching `config.yaml` / `shell-hooks-allowlist.json` artifacts to confirm the `pre_tool_call` `terminal|execute_code` hook was installed for that worker/reviewer session. If the exact run profile directory is no longer retained, use the `hermes_profile` event plus a preserved same-issue same-role profile example to show the role/phase hook wiring.
+5. Treat transcript/event scanning as proof of **terminal-visible** prompt markers only. GUI/browser dialogs that bypass transcript logging still require a same-run operator/desktop observation source when assembling the final SC-004 packet.
 
 ## Live Scan Results
 
@@ -83,13 +88,28 @@ For each run, inspect the persisted `events.jsonl` stream and:
   - `sleep 22`
 - The `node` / `npm` / `python` entries are again recorded as observed local activity, not as a claim that those wrapper surfaces are part of the helper-free local-inspection allow list.
 
+## Command-Policy Hook Materialization Evidence
+
+The chosen live runs do not expose a persisted `command_policy_decision` event, so the packet proves command-policy activation through the preserved profile materialization artifacts that are still available locally:
+
+- Worker run:
+  - `../.symphony/runs/hermes-37ff7bb2-c3e1-4990-b8d1-294e9d3fcc64/events.jsonl:5` records the materialized Hermes profile directory for the worker session.
+  - `../.symphony/hermes/profiles/eng-241/worker/implementation/sym_eng-241_worker_eng-241_implementation_reuse_by_issue/config.yaml:20-32` installs a `pre_tool_call` hook for `terminal|execute_code` that invokes `agent-command-policy-hook --role worker --phase implementation --decision-journal ...agent-command-policy-decisions.ndjson`.
+  - `../.symphony/hermes/profiles/eng-241/worker/implementation/sym_eng-241_worker_eng-241_implementation_reuse_by_issue/shell-hooks-allowlist.json:1-9` records approval of that exact `pre_tool_call` hook command.
+- Reviewer run:
+  - `../.symphony/runs/hermes-a3f2234a-c6bf-454b-b3cf-6b49f8066500/events.jsonl:5` records the live review session's Hermes profile directory.
+  - The exact archived reviewer profile directory from that event is no longer present in the workspace snapshot, so this packet cannot replay the same-run reviewer hook files directly from disk.
+  - `../.symphony/hermes/profiles/eng-241/reviewer/review/sym_eng-241_reviewer_eng-241_review_fresh_per_r_e07489e456403225/config.yaml:19-31` and `.../shell-hooks-allowlist.json:1-9` show the preserved reviewer role/phase profile wiring for the same issue, including the `pre_tool_call` `terminal|execute_code` hook that invokes `agent-command-policy-hook --role reviewer --phase review --decision-journal ...agent-command-policy-decisions.ndjson`.
+
+Taken together, those artifacts show the ENG-241 worker profile retained same-run hook materialization evidence, and the reviewer run plus preserved reviewer profile example still demonstrate that the Hermes review role/phase wiring used the command-policy hook path rather than treating the live zero-prompt scan as hook-free execution.
+
 ### SC-004 Conclusion From Live Runs
 
-The inspected worker and reviewer dogfood runs executed only workspace-local git inspection, local code inspection, local tests, and local smoke commands. The transcript scan found **zero** upstream Git/GitHub terminal commands and **zero** prompt-marker hits across the full persisted event stream. That satisfies the live dogfood portion of SC-004 for these runs: no desktop OAuth prompt, SSH key confirmation prompt, or GitHub credential prompt was observed from agent-owned command attempts. The automated evidence below supplies the separate allow/deny, redaction, and service-boundary proof that these live runs do not expose on their own.
+The inspected worker and reviewer dogfood runs executed only workspace-local git inspection, local code inspection, local tests, and local smoke commands. The transcript scan found **zero** upstream Git/GitHub terminal commands and **zero** prompt-marker hits across the full persisted event stream, and the preserved worker profile artifacts plus reviewer profile materialization evidence above show that command-policy hook wiring was in place for the ENG-241 worker/reviewer role path. That proves the recorded run pair avoided agent-owned upstream command attempts and emitted no **terminal-visible** OAuth / SSH / GitHub credential prompt markers. GUI/browser dialogs can bypass transcript logging, so the full desktop/browser-prompt claim still depends on a same-run operator/desktop observation source as described in `specs/001-block-agent-github/quickstart.md`. The automated evidence below supplies the separate allow/deny, redaction, and service-boundary proof that these live runs do not expose on their own.
 
 ## Redaction And Service-Boundary Support Evidence
 
-The chosen live runs did not emit a `command_policy_decision` event. This packet therefore uses the live runs only for the no-upstream / no-prompt claim and relies on the automated contract tests below for denied-decision redaction and service-boundary verification.
+The chosen live runs did not emit a persisted `command_policy_decision` event. This packet therefore uses the live runs for the no-upstream / no-terminal-prompt claim, uses the profile materialization evidence above to prove hook installation, and relies on the automated contract tests below for denied-decision redaction and service-boundary verification.
 
 ### Durable redacted audit example
 
@@ -218,6 +238,8 @@ A reviewer can independently confirm this evidence packet by:
 
 1. Opening the four `/api/v1/runs/...` endpoints above and checking the stored status/phase/model/timestamps.
 2. Inspecting the two persisted `events.jsonl` files (or transcript API output) and confirming the listed `Hermes tool terminal:` commands are local-only.
-3. Re-running the transcript scan for the blocked-command and prompt-marker patterns listed in **Inspection Method** and confirming zero hits.
-4. Comparing the recorded empty-stdout no-touch transcript above with a local rerun of `git diff --name-only origin/main...HEAD -- hermes/upstream-src` and `git status --short -- hermes/upstream-src`.
-5. Inspecting the cited automated tests to confirm denied-command audit events stay redacted and that service-owned GitHub paths remain allowed.
+3. Inspecting the worker same-run `config.yaml` / `shell-hooks-allowlist.json` files plus any preserved reviewer role/phase profile example and confirming the `pre_tool_call` `terminal|execute_code` hook invokes `agent-command-policy-hook` for the ENG-241 worker/reviewer profile wiring.
+4. Re-running the transcript scan for the blocked-command and prompt-marker patterns listed in **Inspection Method** and confirming zero upstream-command hits and zero terminal-visible prompt hits.
+5. Adding the same-run operator/desktop observation note if the reviewer needs to confirm GUI/browser prompt absence rather than only transcript-visible markers.
+6. Comparing the recorded empty-stdout no-touch transcript above with a local rerun of `git diff --name-only origin/main...HEAD -- hermes/upstream-src` and `git status --short -- hermes/upstream-src`.
+7. Inspecting the cited automated tests to confirm denied-command audit events stay redacted and that service-owned GitHub paths remain allowed.

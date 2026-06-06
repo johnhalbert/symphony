@@ -65,11 +65,12 @@ npm test -- tests/mcp-subprocess-environment-command-policy.test.ts tests/comple
 npm test -- tests/run-activity-event-command-policy.test.ts tests/transcript-replay-command-policy.test.ts tests/web-transcript-projection-command-policy.test.ts
 ```
 
-Treat final validation as a three-part review packet:
+Treat final validation as a four-part review packet:
 
 1. The automated deny/allow/service-boundary/audit suite above.
 2. One real worker run and one real reviewer run inspected through the status API or persisted run transcript for SC-004 evidence.
-3. The vendored Hermes base-diff plus worktree no-touch check at the end of this document.
+3. A same-run operator/desktop observation note for browser, OS, SSH, or Git credential prompts that may not appear in transcripts.
+4. The vendored Hermes base-diff plus worktree no-touch check at the end of this document.
 
 Latency regression coverage should keep normal direct policy decisions under 50 ms and local Git config inspection decisions under 250 ms using deterministic local fixtures. Avoid flaky end-to-end timing assertions against real provider, network, or desktop credential behavior.
 
@@ -147,18 +148,20 @@ After rollout, capture one real worker run and one real reviewer run from the li
 1. Inspect `/api/v1/runs/<runId>` and record `role`, `runPhase`, `status`, `harnessId`, `runtimeModel`, `startedAt`, and `completedAt`.
 2. Inspect `/api/v1/runs/<runId>/transcript` or the persisted `events.jsonl` and summarize every `Hermes tool terminal:` command. Expected commands must remain local-only. Helper-free Git inspection commands such as `git status`, `git diff`, `git log`, `git show`, `git branch`, and `git blame` are the clearest allow evidence; if the run also contains workspace-local `node`, `python`, package-script, or smoke-wrapper commands, record them as observed local activity rather than as standalone proof of the helper-free allow list.
 3. Search the same transcript/events with case-insensitive prompt markers such as `oauth`, `device code`, `open this url`, `ssh key confirmation`, `authenticity of host`, `github credential`, `credential prompt`, `username for`, `password for`, `passphrase`, `gh auth`, `git-credential`, and `ssh-askpass`. Expected result: zero hits caused by agent-owned command attempts.
-4. If the run includes a `command_policy_decision` event, record the redacted snippet with `outcome`, `reasonKind`, `commandClass`, `surface`, `role`, `phase`, and `upstreamContactAttempted: false`.
-5. If the live runs do not contain a denial event, pair the live zero-prompt scan with the automated denial/audit suite and cite the exact test files that prove upstream deny behavior, service-owned GitHub boundaries, and public redaction.
+4. Record a same-run operator/desktop observation source for prompt surfaces that may bypass transcript logging. At minimum capture who observed the run, what desktop/browser prompt classes were watched for, and the explicit result. If no same-run observation source exists, narrow the conclusion to **terminal-visible** prompt markers only and mark the packet insufficient for the full desktop/browser-prompt claim.
+5. Record command-policy activation evidence for the same run. Prefer a redacted `command_policy_decision` snippet with `outcome`, `reasonKind`, `commandClass`, `surface`, `role`, `phase`, and `upstreamContactAttempted: false`. If the run does not expose a `command_policy_decision` event, record the run's `hermes_profile` event plus the matching materialized `config.yaml` / `shell-hooks-allowlist.json` entries that show the `pre_tool_call` `terminal|execute_code` hook invoking `agent-command-policy-hook` with a decision-journal path.
+6. Pair the live run evidence with the automated denial/audit suite and cite the exact test files that prove upstream deny behavior, service-owned GitHub boundaries, and public redaction.
 
 A review-ready SC-004 evidence packet contains:
 
 - One worker run ID and one reviewer run ID.
 - Transcript scan output showing no upstream Git/GitHub attempts, with any wrapper/interpreter/package-script entries clearly labeled as observed local activity rather than allow-list proof.
 - Zero-hit prompt scan results.
-- One redacted `command_policy_decision` or public-read transcript example.
+- One same-run operator/desktop observation note, or an explicit statement that the packet is limited to terminal-visible prompt markers.
+- One redacted `command_policy_decision` snippet or same-run hook-installation snippet, plus the supporting automated deny/audit citations.
 - The vendored Hermes base-diff plus worktree no-touch check output.
 
-Do not intentionally trigger real credential prompts as the validation mechanism. Use local fixtures, fake helpers, run evidence, and operator observation instead.
+Do not intentionally trigger real credential prompts as the validation mechanism. Use local fixtures, fake helpers, live run evidence, and operator observation instead.
 
 See `docs/smoke/eng-243-sc-004-no-upstream-prompts.md` for a recorded evidence packet built from live worker/reviewer runs plus the supporting redaction/service-boundary tests.
 
