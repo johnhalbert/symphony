@@ -261,12 +261,14 @@ After the smoke:
 
 ## 8. Recovery
 
-Use the status API with `X-Symphony-Token` when a token is configured:
+Use the status API with `X-Symphony-Token` when a token is configured. Resolve the internal issue `id` from `/api/v1/issues/<issue-identifier>` first, then use that `id` in the mutation routes:
 
 ```powershell
-Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/pause"
-Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/cancel"
-Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/resume"
+$issue = Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123"
+$issueId = $issue.id
+Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/$issueId/pause"
+Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/$issueId/cancel"
+Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/$issueId/resume"
 ```
 
 If the process must stop, use Ctrl+C and inspect worktrees before cleanup.
