@@ -784,13 +784,16 @@ describe("App API-mode rendering", () => {
     expect(hookCalls.orchestratorChat.at(-1)).toEqual({ enabled: false, refreshToken: 17 });
   });
 
-  it("keeps a pending orchestrator chat POST projection visible after switching from dashboard to sidebar before hook refresh", async () => {
+  it("keeps a pending orchestrator chat POST projection visible after switching from dashboard to sidebar before hook refresh and clears it once the shared hook reaches a terminal state", async () => {
     const pendingMessage = "Shared pending app message";
+    const pendingMessageId = "shared-pending-1";
+    const hooks = appHookState();
     const sendOrchestratorMessage = vi.fn(async () =>
       orchestratorChatModelFromMessages(
         [
           ...apiChat,
           {
+            id: pendingMessageId,
             who: "user",
             text: pendingMessage,
             status: "pending",
@@ -805,7 +808,7 @@ describe("App API-mode rendering", () => {
         },
       ),
     );
-    await renderAppWithMocks({ dataSourceOverrides: { sendOrchestratorMessage } });
+    await renderAppWithMocks({ hooks, dataSourceOverrides: { sendOrchestratorMessage } });
 
     const { App } = await import("../src/App");
     const container = document.createElement("div");
@@ -845,6 +848,45 @@ describe("App API-mode rendering", () => {
     expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("aria-label")).toBe("Sidebars");
     expect(container.textContent).toContain(pendingMessage);
     expect(container.textContent).toContain("The chat is pending");
+    expect(container.textContent).not.toContain("Command accepted by orchestrator");
+
+    hooks.orchestratorChat = loaded(
+      orchestratorChatModelFromMessages(
+        [
+          ...apiChat,
+          {
+            id: pendingMessageId,
+            who: "user",
+            text: pendingMessage,
+            status: "completed",
+            createdAt: "2026-06-05T12:00:00.000Z",
+            updatedAt: "2026-06-05T12:05:00.000Z",
+          } satisfies ChatMessage,
+        ],
+        {
+          state: "completed",
+          conversationStatus: "completed",
+          sourceShape: "reducer_envelope",
+        },
+      ),
+    );
+    act(() => {
+      root.render(<App />);
+    });
+
+    expect(container.textContent).toContain(pendingMessage);
+    expect(container.textContent).not.toContain("The chat is pending");
+    expect(container.textContent).not.toContain("Command accepted by orchestrator");
+
+    const dashboardTab = container.querySelector<HTMLButtonElement>('button[role="tab"][aria-label="Dashboard"]');
+    if (!dashboardTab) throw new Error("expected dashboard tab to render");
+    act(() => {
+      dashboardTab.click();
+    });
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("aria-label")).toBe("Dashboard");
+    expect(container.textContent).toContain(pendingMessage);
+    expect(container.textContent).not.toContain("The orchestrator conversation is pending");
+
     expect(container.textContent).not.toContain("Command accepted by orchestrator");
   });
 
