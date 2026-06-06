@@ -5,6 +5,7 @@ import type { ServiceConfig } from "../src/core/config/Config.js";
 import {
   buildHermesAcpSmokeCommandPlan,
   buildHermesAcpSmokeProfileName,
+  buildHermesAcpSmokeSuccessReport,
   contextualizeHermesAcpSmokeError,
   formatHermesAcpSmokeSkipReport,
   isDirectRun,
@@ -280,6 +281,48 @@ describe("Hermes ACP smoke command construction", () => {
       expect(error.message).toContain("stderr tail: last stderr line");
     },
   );
+
+  it("builds the operator-facing success report with emitted ACP response text evidence", () => {
+    const report = buildHermesAcpSmokeSuccessReport({
+      workflowPath: "/repo/WORKFLOW.md",
+      configuredHarness: "hermes_acp",
+      hostHermesBinary: "/host/bin/hermes",
+      hostHermesBinarySource: "config",
+      sourceProfile: "operator-source",
+      sourceProfileSource: "config",
+      disposableProfile: "symphony-smoke-123",
+      disposableProfileDeleted: true,
+      activeProfileUnchanged: true,
+      expectedText: "Symphony Hermes ACP smoke OK",
+      promptResult: {
+        sessionId: "prompt-session-123",
+        responseText: "Symphony Hermes ACP smoke OK\nwith extra confirmation",
+        stopReason: "end_turn",
+        diagnosticCount: 0,
+        updateCount: 2,
+      },
+      tempRoot: null,
+    });
+
+    expect(report).toMatchObject({
+      workflowPath: "/repo/WORKFLOW.md",
+      configuredHarness: "hermes_acp",
+      hostHermesBinary: "/host/bin/hermes",
+      hostHermesBinarySource: "config",
+      sourceProfile: "operator-source",
+      sourceProfileSource: "config",
+      disposableProfile: "symphony-smoke-123",
+      disposableProfileDeleted: true,
+      activeProfileUnchanged: true,
+      promptExpectedText: "Symphony Hermes ACP smoke OK",
+      promptResponseText: "Symphony Hermes ACP smoke OK with extra confirmation",
+      promptSessionId: "prompt-session-123",
+      promptStopReason: "end_turn",
+      promptDiagnosticCount: 0,
+      promptUpdateCount: 2,
+    });
+    expect(report).not.toHaveProperty("tempRoot");
+  });
 
   it("does not treat test imports as direct CLI execution", () => {
     const scriptPath = path.resolve("scripts/hermes-acp-smoke.ts");

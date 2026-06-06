@@ -82,11 +82,13 @@ hermes acp --check
 
 Configure `hermes_acp.binary_path` when the intended host `hermes` is not first on `PATH`. Configure `hermes_acp.source_profile` when the source profile should be a specific host profile rather than the active profile, and optionally configure `hermes_acp.profile_prefix` to identify Symphony-created clones. The older `hermes.acp_binary_path`, `hermes.acp_source_profile`, and `hermes.acp_profile_prefix` aliases remain accepted for compatibility, but new workflows should use the `hermes_acp` section. The source profile must already be authenticated for the configured provider/model, must pass `hermes acp --check` without interactive terminal setup, and must be safe to clone with `hermes profile create <disposable> --clone --clone-from <source> --no-alias`.
 
-Run the opt-in ACP smoke only when host Hermes credentials are available:
+Run the opt-in ACP smoke preflight only when host Hermes credentials are available. This is a host-prerequisite check, not final dogfood-unblock evidence:
 
 ```powershell
-npm run smoke:hermes-acp -- --source-profile <host-profile>
+npm run smoke:hermes-acp -- WORKFLOW.md --source-profile <host-profile>
 ```
+
+This preflight runs against the checked-in `WORKFLOW.md`, so a success report still records the default `configuredHarness` value rather than `"hermes_acp"`. Use it only to prove the host binary/profile prerequisites. For final ACP unblock evidence, rerun the smoke later against `WORKFLOW.hermes-acp.md` so the recorded `configuredHarness` value comes from the disposable ACP workflow copy.
 
 The smoke strips vendored/managed Hermes environment overrides (`HERMES_HOME`, `HERMES_AUTH_HOME`, `HERMES_PYTHON_SRC_ROOT`, `PYTHONPATH`, `HERMES_MODEL`, and `HERMES_TUI_PROVIDER`), honors `hermes_acp.profile_prefix` for generated disposable profile names unless `--profile-prefix` is provided, verifies `hermes --version`, `hermes acp --check`, verifies the source profile with `hermes -p <source> acp --check`, creates a disposable cloned profile, verifies `hermes -p <clone> acp --check`, sends one small ACP prompt through the clone, deletes the clone by default, and confirms the active host profile selection did not change. Use `--keep-profile` or `--keep-temp` only for troubleshooting; delete retained smoke profiles before promoting more work. If the host Hermes binary or profile prerequisite is unavailable, the smoke reports `SKIPPED` with `status: "skipped"` and actionable diagnostics instead of failing the validation command; fix the host prerequisite and rerun before treating host ACP as validated.
 
@@ -112,28 +114,71 @@ npm test
 npm run doctor -- --strict
 npm run doctor -- --strict --live-runtime
 npm run smoke:hermes-local
-# Opt-in only when validating the host Hermes ACP harness with host credentials:
-npm run smoke:hermes-acp -- --source-profile <host-profile>
+# Optional host-ACP preflight only: this runs against the default WORKFLOW.md
+# and is not acceptable final dogfood-unblock evidence.
+npm run smoke:hermes-acp -- WORKFLOW.md --source-profile <host-profile>
 ```
 
 Set `LINEAR_API_KEY`, `SYMPHONY_WORKSPACE_TOKEN`, and the GitHub credential variables in the workflow root `.env` file or process environment as needed. The reference workflow uses app-backed credential profiles: existing `GITHUB_APP_*` variables identify the publication/merge app, and `GITHUB_REVIEW_APP_*` variables identify a separate reviewer app for PR approvals and change requests. Static-token profiles such as `GITHUB_PUBLICATION_TOKEN` and `GITHUB_FEEDBACK_TOKEN` remain supported for non-app deployments.
 
 Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable workspace paths, git availability, runtime harness/provider checks, Hermes paths, Python importability, managed auth readiness when `openai-codex` is selected, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, subprocess MCP tool availability, candidate isolation, and current Linear candidates.
 
-`doctor --live-runtime` is the opt-in live Hermes gateway readiness check. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory. `npm run smoke:hermes-acp` is a separate opt-in live host ACP check; it is not part of default unit tests and should only be run when host Hermes ACP credentials are available.
+`doctor --live-runtime` is the opt-in live Hermes gateway readiness check. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory. `npm run smoke:hermes-acp` is a separate opt-in live host ACP check; it is not part of default unit tests and should only be run when host Hermes ACP credentials are available. When you run it in this preflight block against `WORKFLOW.md`, treat it only as a prerequisite smoke for host Hermes setup. Final dogfood-unblock evidence must rerun the smoke against `WORKFLOW.hermes-acp.md` in the ACP checklist below so `configuredHarness: "hermes_acp"` is recorded.
 
 ### ACP final live validation checklist
 
 Before removing `dogfood-blocked` from Hermes ACP dogfood issues, record the following evidence in the operator notes or issue comments:
 
-- `hermes --version`, `hermes profile`, `hermes acp --check`, and `hermes -p <source> acp --check` succeeded for the intended host source profile.
-- `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded and reported a deleted disposable profile.
-- The smoke response contained the expected text, the prompt stopped with a normal stop reason, and the ACP session id was recorded.
-- The active host profile before and after the smoke matched; the source profile was not renamed, selected, deleted, or used directly as the disposable smoke profile.
-- No retained disposable profile with the configured `hermes_acp.profile_prefix` (or the operator-selected `--profile-prefix`/`--profile-name`) remains unless an operator intentionally used `--keep-profile` for troubleshooting and tracked the cleanup.
-- Default validation remains non-ACP unless the operator explicitly runs this smoke; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
+Keep ACP opt-in by running the live issue validation from a disposable workflow copy instead of editing the checked-in default:
 
-Only unblock `dogfood-blocked` after the checklist passes for the same host environment that will run the dogfood worker. If any item fails, leave the issue blocked, fix the host Hermes installation/auth/profile setup, and rerun the ACP smoke before promotion.
+```powershell
+Copy-Item WORKFLOW.md WORKFLOW.hermes-acp.md
+# In WORKFLOW.hermes-acp.md change only:
+# agent:
+#   harness: hermes_acp
+# Optionally pin the validated host profile in the workflow copy:
+# hermes_acp:
+#   source_profile: <host-profile>
+npm run dev -- --port 7331 WORKFLOW.hermes-acp.md
+```
+
+Use the normal `WORKFLOW.md` again after ACP validation and delete `WORKFLOW.hermes-acp.md` so the default checked-in `agent.harness: hermes` path remains unchanged.
+
+For the ACP smoke evidence below, run the smoke against that disposable workflow copy so the recorded `configuredHarness` value comes from `WORKFLOW.hermes-acp.md` rather than the checked-in default:
+
+```powershell
+npm run smoke:hermes-acp -- WORKFLOW.hermes-acp.md --source-profile <host-profile>
+```
+
+For the live-run items below, collect issue/run evidence with:
+
+```powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/state"
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123"
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/runs"
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/runs/<runId>"
+Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/runs/<runId>/transcript?offset=0&limit=200"
+```
+
+- `npm run typecheck`, `npm test`, `npm run doctor -- --strict`, `npm run doctor -- --strict --live-runtime`, and `npm run smoke:hermes-local` succeeded for the same checkout/host environment, and the live-runtime/local-smoke evidence still showed the required Symphony handoff MCP tools, so the default Hermes TUI path is still healthy before any ACP-only unblock decision.
+- `hermes --version`, `hermes profile`, `hermes acp --check`, and `hermes -p <source> acp --check` succeeded for the intended host source profile.
+- `npm run smoke:hermes-acp -- WORKFLOW.hermes-acp.md --source-profile <host-profile>` succeeded, verified the disposable cloned profile, and its success JSON recorded `configuredHarness: "hermes_acp"`, `hostHermesBinary`, `sourceProfile`, `disposableProfile`, `disposableProfileDeleted: true`, `activeProfileUnchanged: true`, `promptExpectedText`, matching `promptResponseText`, a normal `promptStopReason`, and the ACP `promptSessionId` unless an operator intentionally retained the disposable profile for troubleshooting.
+- One tiny unprotected issue then ran from `WORKFLOW.hermes-acp.md` in the same host environment. Choose or author the issue so it requires one safe repository edit and one targeted validation command, which forces an ACP permission request on a bounded surface. Passing handoff evidence is `/api/v1/issues/<issue-identifier>` showing `reviewLoop.phase: "review"` and `reviewLoop.lastCompletionReport.runId`, `/api/v1/runs/<handoffWorkerRunId>` showing `status: "succeeded"` and `terminalReason: "succeeded"`, and `/api/v1/runs/<handoffWorkerRunId>/transcript` showing a `tool_call_completed` entry whose payload `toolName` or public tool preview names `submit_completion_report`.
+- Deliberately exercise both deny and allow on the first safe ACP permission request from that tiny issue. First deny the request; passing evidence is `/api/v1/runs/<runId>/transcript` showing `command_policy_decision` with payload fields such as `outcome: "deny"`, `surface`/`requestKind`, and `permissionOutcome`. Then rerun the same issue and allow the equivalent safe request; passing evidence is a later `command_policy_decision` for the same surface with `outcome: "allow"`, `permissionOutcome: "allowed"`, and a recorded `selectedOptionId`, plus the successful completion-report handoff evidence from the previous bullet.
+- Start a separate intentionally cancelled `agent.harness: hermes_acp` run after the worker is active in `operatorView.running`, then fetch `/api/v1/issues/<issue-identifier>` and use the returned internal `id` value in the cancel route:
+
+  ```powershell
+  Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/<issueId>/cancel"
+  ```
+
+  Passing cancellation evidence is `/api/v1/state` showing `operatorView.running[].liveness.status: "cancelling"` before terminal resolution, `/api/v1/runs/<runId>` ending with `status: "cancelled"` and `terminalReason: "cancelled"`, and `/api/v1/runs/<runId>/transcript` containing the terminal `cancelled` event instead of a completion-report handoff.
+
+- The active host profile before and after the ACP smoke/issue runs matched; the source profile was not renamed, selected, deleted, or used directly as the disposable run profile, and any retained session/profile artifacts belonged to the disposable clone rather than the source profile.
+
+- No retained disposable profile with the configured `hermes_acp.profile_prefix` (or the operator-selected `--profile-prefix`/`--profile-name`) remains unless an operator intentionally used `--keep-profile` for troubleshooting and tracked the cleanup.
+- Default validation remains non-ACP unless the operator explicitly runs this ACP evidence set; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
+
+Only unblock `dogfood-blocked` after the checklist passes for the same host environment that will run the dogfood worker. If any item fails, leave the issue blocked, fix the host Hermes installation/auth/profile setup, and rerun the ACP evidence steps before promotion.
 
 When you record the unblock evidence, link the operator note back to [`hermes-acp-integration-spec.md#validation-plan`](./hermes-acp-integration-spec.md#validation-plan) and note which Linear ACP follow-up it satisfies (`ENG-136`, `ENG-143`, or `ENG-143C`) so the spec, runbook, and implementation history stay connected.
 
@@ -216,12 +261,14 @@ After the smoke:
 
 ## 8. Recovery
 
-Use the status API with `X-Symphony-Token` when a token is configured:
+Use the status API with `X-Symphony-Token` when a token is configured. Resolve the internal issue `id` from `/api/v1/issues/<issue-identifier>` first, then use that `id` in the mutation routes:
 
 ```powershell
-Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/pause"
-Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/cancel"
-Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/resume"
+$issue = Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123"
+$issueId = $issue.id
+Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/$issueId/pause"
+Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/$issueId/cancel"
+Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/$issueId/resume"
 ```
 
 If the process must stop, use Ctrl+C and inspect worktrees before cleanup.
