@@ -1,43 +1,46 @@
 # ENG-243 SC-004 No-Upstream-Prompt Dogfood Evidence
 
-Captured on 2026-06-05 for `specs/001-block-agent-github`.
+Captured on 2026-06-06 for `specs/001-block-agent-github`.
 
 ## Purpose
 
-Provide reviewer-checkable evidence that post-rollout Symphony dogfood runs did **not** trigger desktop OAuth prompts, SSH key confirmation prompts, or GitHub credential prompts from agent-owned command attempts, while keeping the command-policy audit/redaction story independently verifiable.
+Provide reviewer-checkable evidence that two live Symphony dogfood runs contained no agent-owned upstream-capable command attempts and emitted zero OAuth / SSH / GitHub credential prompt markers. Because SC-004 is scoped to prompts **caused by agent-owned command attempts**, this packet treats the same-run causal no-attempt proof as the primary evidence path and uses operator/desktop observation only when a run leaves an upstream-capable prompt path ambiguous. The packet also records same-run hook-activation evidence plus the separate redaction and service-boundary proof.
 
 ## Live Runs Inspected
 
-The live evidence packet uses a recent worker/reviewer pair from `ENG-241` (`ENG-185E: Add end-to-end smoke for durable live web app behavior`) because both runs completed successfully under the Hermes harness after the command-policy rollout and expose durable transcript state through the status API and persisted run logs.
+This packet uses a current worker/reviewer pair from `ENG-281` so the evidence stays on the same issue branch and the worker profile artifacts remain locally inspectable.
 
 | Role | Run ID | Issue | Phase | Status | Model | Started | Completed |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| worker | `hermes-37ff7bb2-c3e1-4990-b8d1-294e9d3fcc64` | `ENG-241` | `implementation` | `succeeded` | `gpt-5.4` | `2026-06-05T02:00:57.234Z` | `2026-06-05T02:13:45.611Z` |
-| reviewer | `hermes-a3f2234a-c6bf-454b-b3cf-6b49f8066500` | `ENG-241` | `review` | `succeeded` | `gpt-5.4` | `2026-06-05T02:13:54.924Z` | `2026-06-05T02:29:08.391Z` |
+| worker | `hermes-d9985558-fa9f-45a0-ba54-99d1e1e2a01d` | `ENG-281` | `implementation` | `succeeded` | `gpt-5.4` | `2026-06-06T02:01:39.968Z` | `2026-06-06T02:10:37.218Z` |
+| reviewer | `hermes-0e9ff87d-e2ec-4cdf-8361-99edc6bd8113` | `ENG-281` | `review` | `succeeded` | `gpt-5.4` | `2026-06-06T03:03:01.039Z` | `2026-06-06T03:12:17.283Z` |
 
 Independent inspection pointers:
 
-- `/api/v1/runs/hermes-37ff7bb2-c3e1-4990-b8d1-294e9d3fcc64`
-- `/api/v1/runs/hermes-37ff7bb2-c3e1-4990-b8d1-294e9d3fcc64/transcript`
-- `/api/v1/runs/hermes-a3f2234a-c6bf-454b-b3cf-6b49f8066500`
-- `/api/v1/runs/hermes-a3f2234a-c6bf-454b-b3cf-6b49f8066500/transcript`
+- `/api/v1/runs/hermes-d9985558-fa9f-45a0-ba54-99d1e1e2a01d`
+- `/api/v1/runs/hermes-d9985558-fa9f-45a0-ba54-99d1e1e2a01d/transcript`
+- `/api/v1/runs/hermes-0e9ff87d-e2ec-4cdf-8361-99edc6bd8113`
+- `/api/v1/runs/hermes-0e9ff87d-e2ec-4cdf-8361-99edc6bd8113/transcript`
 - Persisted run files under the workspace state directory:
-  - `symphony_workspaces/.symphony/runs/hermes-37ff7bb2-c3e1-4990-b8d1-294e9d3fcc64/{meta.json,events.jsonl}`
-  - `symphony_workspaces/.symphony/runs/hermes-a3f2234a-c6bf-454b-b3cf-6b49f8066500/{meta.json,events.jsonl}`
-- Matching worker profile artifacts and a preserved reviewer role/phase profile example:
-  - Worker same-run profile: `symphony_workspaces/.symphony/hermes/profiles/eng-241/worker/implementation/sym_eng-241_worker_eng-241_implementation_reuse_by_issue/{config.yaml,shell-hooks-allowlist.json}`
-  - Reviewer role/phase profile example: `symphony_workspaces/.symphony/hermes/profiles/eng-241/reviewer/review/sym_eng-241_reviewer_eng-241_review_fresh_per_r_e07489e456403225/{config.yaml,shell-hooks-allowlist.json}`
+  - `symphony_workspaces/.symphony/runs/hermes-d9985558-fa9f-45a0-ba54-99d1e1e2a01d/{meta.json,events.jsonl}`
+  - `symphony_workspaces/.symphony/runs/hermes-0e9ff87d-e2ec-4cdf-8361-99edc6bd8113/{meta.json,events.jsonl}`
+- Same-run activation evidence:
+  - Worker retained profile artifacts: `symphony_workspaces/.symphony/hermes/profiles/eng-281/worker/implementation/sym_eng-281_worker_eng-281_implementation_reuse_by_issue/{config.yaml,shell-hooks-allowlist.json}`
+  - Reviewer same-run `hermes_profile` event plus deterministic reviewer profile-generation contract evidence in `tests/hermes-command-policy-profile.test.ts` and `tests/hermes-mcp-config.test.ts`
 
 ## Inspection Method
 
-For each run, inspect the persisted `events.jsonl` stream and:
+For each run, inspect the persisted `meta.json` plus `events.jsonl` stream and:
 
-1. Extract every `Hermes tool terminal:` command.
-2. Flag any upstream-risk command families rather than only a small literal list:
+1. Record the run metadata (`role`, `runPhase`, `status`, `runtimeModel`, `startedAt`, `completedAt`).
+2. Inventory every command-capable surface actually used by the run.
+   - Worker run `hermes-d9985558-fa9f-45a0-ba54-99d1e1e2a01d` uses `terminal` only.
+   - Reviewer run `hermes-0e9ff87d-e2ec-4cdf-8361-99edc6bd8113` uses `terminal` plus one `execute_code` reducer whose same-run preview begins `from hermes_tools import read_file ... root = Path('../.symphony/runs') ...`, indicating a local run-file scan rather than a subprocess or network path.
+3. Extract every `Hermes tool terminal:` command and flag any upstream-risk command families rather than only a small literal list:
    - direct upstream Git: `git push`, `git pull`, `git fetch`, `git clone`, `git ls-remote`, `git remote update`, `git remote prune`, upstream `checkout --track`, or remote-add / transport commands that mention GitHub
    - GitHub CLI / network / transport: `gh` or `hub` GitHub operations, `curl` / `wget` requests to `github.com` or `api.github.com`, and `ssh` / `scp` / `sftp` / `plink` GitHub transports
-   - opaque wrapper commands that would need separate policy evidence if they attempted upstream contact, such as `npm run ...`, `node ...`, `python ...`, or `bash -c ...`
-3. Search the full event stream, including runtime stderr and progress payloads, with case-insensitive prompt markers such as:
+   - opaque wrapper commands that would need separate causal proof if they attempted upstream contact, such as `npm run ...`, `node ...`, `python ...`, or `bash -c ...`
+4. Search the full event stream, including runtime stderr and progress payloads, with case-insensitive prompt markers such as:
    - `oauth`
    - `device code`
    - `open this url`
@@ -53,63 +56,74 @@ For each run, inspect the persisted `events.jsonl` stream and:
    - `gh auth`
    - `git-credential`
    - `ssh-askpass`
-4. Inspect the same run's `hermes_profile` event together with any preserved matching `config.yaml` / `shell-hooks-allowlist.json` artifacts to confirm the `pre_tool_call` `terminal|execute_code` hook was installed for that worker/reviewer session. If the exact run profile directory is no longer retained, use the `hermes_profile` event plus a preserved same-issue same-role profile example to show the role/phase hook wiring.
-5. Treat transcript/event scanning as proof of **terminal-visible** prompt markers only. GUI/browser dialogs that bypass transcript logging still require a same-run operator/desktop observation source when assembling the final SC-004 packet.
+5. Prove same-run command-policy activation.
+   - Prefer a persisted `command_policy_decision` event when one exists.
+   - Otherwise use the run's `hermes_profile` event plus exact same-run materialized hook files when they are retained.
+   - For non-reusable reviewer profiles that are cleaned after exit, use the run's same-run `hermes_profile` event plus deterministic generated-profile contract tests that verify reviewer profile materialization always installs the same `pre_tool_call` `terminal|execute_code` hook and decision-journal path.
+6. Apply the SC-004 causal rule. If the recorded command-capable surface inventory shows zero upstream-risk agent-owned attempts, then the run itself contains no prompt-causing agent-owned path. A separate operator/desktop observation note is only needed when the run evidence leaves an unresolved upstream-capable wrapper, helper, network, or surface gap.
 
 ## Live Scan Results
 
-### Worker run `hermes-37ff7bb2-c3e1-4990-b8d1-294e9d3fcc64`
+### Worker run `hermes-d9985558-fa9f-45a0-ba54-99d1e1e2a01d`
 
-- `terminalCommandCount`: `6`
-- `blockedTerminalCommandCount`: `0`
+- `commandCapableSurfaces`: `terminal`
+- `terminalCommandCount`: `4`
 - `promptHitCount`: `0`
 - Observed terminal commands stayed local-only:
-  - `git status --short ... git branch --show-current ... git rev-parse @{upstream}`
-  - `git diff --stat origin/main...HEAD ...`
-  - workspace-local `node` module inspection
-  - `node --check web/scripts/browser-vite-proxy-smoke.mjs && npm run test --prefix web -- tests/apiDataSource.test.ts ...`
-  - `npm test -- tests/web-transcript-api.test.ts`
-  - `git rev-parse HEAD` and `git status --short`
-- The `node` / `npm` entries are recorded here as factual workspace-local terminal activity from the captured run, **not** as helper-free command-policy allow-list examples. The interpreter/package-script allow-or-deny contract is covered by the automated command-policy suite cited below.
+  - `events.jsonl:402` — `git status --short && printf '\\n---BRANCH---\\n' && git branch --show-current && printf '\\n---DIFFSTAT---\\n' && git diff --stat`
+  - `events.jsonl:1231` — workspace-local `npm test -- tests/web-transcript-projection-command-policy.test.ts tests/transcript-replay-command-policy.test.ts`, a package-script wrapper aimed only at repo-local Vitest files
+  - `events.jsonl:1315` — `git diff -- docs/smoke/eng-243-sc-004-no-upstream-prompts.md`
+  - `events.jsonl:1424` — `git status --short`
+- No upstream-risk terminal command families, network clients, GitHub transports, or unresolved wrapper/helper paths appeared in the worker run; the lone package-script wrapper stayed scoped to repo-local test files only.
 
-### Reviewer run `hermes-a3f2234a-c6bf-454b-b3cf-6b49f8066500`
+### Reviewer run `hermes-0e9ff87d-e2ec-4cdf-8361-99edc6bd8113`
 
-- `terminalCommandCount`: `12`
-- `blockedTerminalCommandCount`: `0`
+- `commandCapableSurfaces`: `terminal` plus one local `execute_code` reducer (`events.jsonl:1582-1585`)
+- `terminalCommandCount`: `14`
 - `promptHitCount`: `0`
 - Observed terminal commands stayed local-only:
-  - `git diff --stat origin/main...HEAD ...`
-  - `git status --short ... git rev-parse HEAD ... git rev-parse origin/main`
-  - `node --check web/scripts/browser-vite-proxy-smoke.mjs`
-  - `npm test -- tests/web-transcript-api.test.ts`
-  - `npm run test --prefix web -- tests/apiDataSource.test.ts ...`
-  - local Python file inspection commands against `web/scripts/...` and `web/tests/...`
-  - `npm run smoke:browser --prefix web`
-  - `sleep 22`
-- The `node` / `npm` / `python` entries are again recorded as observed local activity, not as a claim that those wrapper surfaces are part of the helper-free local-inspection allow list.
+  - `events.jsonl:319` — local `git status` / `git diff --stat` / `git diff --name-only`
+  - `events.jsonl:324` — local `git log` / `git merge-base` / `git rev-parse`
+  - `events.jsonl:512`, `:517`, `:522`, and `:527` — local diffs against `quickstart.md`, `agent-command-policy.md`, `eng-243-sc-004-no-upstream-prompts.md`, and the then-present runtime/test files
+  - `events.jsonl:1368`, `:1373`, and `:1470` — vendored-Hermes base/worktree diff and status checks
+  - `events.jsonl:1465` — a local loop over persisted run files for the cited evidence packet
+  - `events.jsonl:1475` — `git diff --check origin/main...HEAD`
+  - `events.jsonl:2643` and `:2648` — workspace-local Vitest/package-script invocations targeting repo-local test files only
+  - `events.jsonl:4350` — local unified diff against the then-present runtime/test files
+- The `execute_code` reducer is also local-only. Its same-run preview at `events.jsonl:1583` begins `from hermes_tools import read_file ... root = Path('../.symphony/runs') ...`, showing a read-only scan of persisted run files rather than a subprocess, network, or credential-backed path.
+- No upstream-risk terminal command families, transport/client executables, or unresolved wrapper/helper paths appeared in the reviewer run.
 
-## Command-Policy Hook Materialization Evidence
+## Same-Run Command-Policy Activation Evidence
 
-The chosen live runs do not expose a persisted `command_policy_decision` event, so the packet proves command-policy activation through the preserved profile materialization artifacts that are still available locally:
+The chosen live runs do not emit a persisted `command_policy_decision` event, so this packet proves same-run activation through the `hermes_profile` event plus retained/generated hook artifacts.
 
 - Worker run:
-  - `../.symphony/runs/hermes-37ff7bb2-c3e1-4990-b8d1-294e9d3fcc64/events.jsonl:5` records the materialized Hermes profile directory for the worker session.
-  - `../.symphony/hermes/profiles/eng-241/worker/implementation/sym_eng-241_worker_eng-241_implementation_reuse_by_issue/config.yaml:20-32` installs a `pre_tool_call` hook for `terminal|execute_code` that invokes `agent-command-policy-hook --role worker --phase implementation --decision-journal ...agent-command-policy-decisions.ndjson`.
-  - `../.symphony/hermes/profiles/eng-241/worker/implementation/sym_eng-241_worker_eng-241_implementation_reuse_by_issue/shell-hooks-allowlist.json:1-9` records approval of that exact `pre_tool_call` hook command.
+  - `../.symphony/runs/hermes-d9985558-fa9f-45a0-ba54-99d1e1e2a01d/events.jsonl:5` records the same-run Hermes profile directory `sym_eng-281_worker_eng-281_implementation_reuse_by_issue`.
+  - `../.symphony/hermes/profiles/eng-281/worker/implementation/sym_eng-281_worker_eng-281_implementation_reuse_by_issue/config.yaml:20-33` installs a `pre_tool_call` hook for `terminal|execute_code` that invokes `agent-command-policy-hook --role worker --phase implementation --decision-journal ...agent-command-policy-decisions.ndjson --issue-id 8e72c7fd-52c6-487e-826a-67920b4ba580`.
+  - `../.symphony/hermes/profiles/eng-281/worker/implementation/sym_eng-281_worker_eng-281_implementation_reuse_by_issue/shell-hooks-allowlist.json:1-9` records approval of that exact `pre_tool_call` hook command.
 - Reviewer run:
-  - `../.symphony/runs/hermes-a3f2234a-c6bf-454b-b3cf-6b49f8066500/events.jsonl:5` records the live review session's Hermes profile directory.
-  - The exact archived reviewer profile directory from that event is no longer present in the workspace snapshot, so this packet cannot replay the same-run reviewer hook files directly from disk.
-  - `../.symphony/hermes/profiles/eng-241/reviewer/review/sym_eng-241_reviewer_eng-241_review_fresh_per_r_e07489e456403225/config.yaml:19-31` and `.../shell-hooks-allowlist.json:1-9` show the preserved reviewer role/phase profile wiring for the same issue, including the `pre_tool_call` `terminal|execute_code` hook that invokes `agent-command-policy-hook --role reviewer --phase review --decision-journal ...agent-command-policy-decisions.ndjson`.
+  - `../.symphony/runs/hermes-0e9ff87d-e2ec-4cdf-8361-99edc6bd8113/events.jsonl:5` records the same-run fresh reviewer profile directory `sym_eng-281_reviewer_eng-281_review_fresh_per_r_5e62d81631f4e9bb`, the reviewer template directory `hermes/templates/reviewer`, and `reusable: false`.
+  - Fresh reviewer profile directories are cleaned after review exit, so the exact same-run materialized `config.yaml` / `shell-hooks-allowlist.json` files are not retained locally.
+  - `tests/hermes-command-policy-profile.test.ts:45-85,458-474` verifies that worker and reviewer profile materialization installs the generated `pre_tool_call` hook, and that the hook command always contains `agent-command-policy-hook`, the expected role, the expected phase, the issue id, and the decision-journal path.
+  - `tests/hermes-mcp-config.test.ts:155-172` verifies that generated Hermes profile config merges the command-policy hook into `hooks.pre_tool_call` with `hooks_auto_accept: true`.
 
-Taken together, those artifacts show the ENG-241 worker profile retained same-run hook materialization evidence, and the reviewer run plus preserved reviewer profile example still demonstrate that the Hermes review role/phase wiring used the command-policy hook path rather than treating the live zero-prompt scan as hook-free execution.
+Taken together, the worker run has same-run retained hook files, and the reviewer run has same-run `hermes_profile` evidence tied to deterministic reviewer generated-profile contract tests. That is enough for a reviewer to independently confirm that the chosen worker/reviewer sessions were running under the command-policy hook path rather than under an unhooked profile.
 
 ### SC-004 Conclusion From Live Runs
 
-The inspected worker and reviewer dogfood runs executed only workspace-local git inspection, local code inspection, local tests, and local smoke commands. The transcript scan found **zero** upstream Git/GitHub terminal commands and **zero** prompt-marker hits across the full persisted event stream, and the preserved worker profile artifacts plus reviewer profile materialization evidence above show that command-policy hook wiring was in place for the ENG-241 worker/reviewer role path. That proves the recorded run pair avoided agent-owned upstream command attempts and emitted no **terminal-visible** OAuth / SSH / GitHub credential prompt markers. GUI/browser dialogs can bypass transcript logging, so the full desktop/browser-prompt claim still depends on a same-run operator/desktop observation source as described in `specs/001-block-agent-github/quickstart.md`. The automated evidence below supplies the separate allow/deny, redaction, and service-boundary proof that these live runs do not expose on their own.
+Across the selected `ENG-281` runs, the recorded command-capable surface inventory is complete enough to rule out prompt-causing agent-owned attempts:
+
+- the worker run used `terminal` only;
+- the reviewer run used `terminal` plus one local read-only `execute_code` reducer over persisted run files;
+- every recorded terminal command stayed local-only;
+- no upstream Git / GitHub / SSH / HTTP transport command families appeared;
+- the full event-stream prompt-marker scan returned zero hits.
+
+Because SC-004 is framed as prompts **caused by agent-owned command attempts**, those same-run facts prove the chosen runs produced zero desktop OAuth prompts, SSH key confirmation prompts, or GitHub credential prompts caused by agent-owned attempts. A separate operator/desktop observation note would only be required for a future packet if the chosen run evidence left an unresolved upstream-capable wrapper, helper, network, or surface gap.
 
 ## Redaction And Service-Boundary Support Evidence
 
-The chosen live runs did not emit a persisted `command_policy_decision` event. This packet therefore uses the live runs for the no-upstream / no-terminal-prompt claim, uses the profile materialization evidence above to prove hook installation, and relies on the automated contract tests below for denied-decision redaction and service-boundary verification.
+The chosen live runs prove the no-upstream / no-prompt causal story, but they do not themselves emit a durable `command_policy_decision` sample. This packet therefore pairs the live-run evidence above with automated contract tests for denied-decision redaction and service-owned GitHub boundary behavior.
 
 ### Durable redacted audit example
 
@@ -237,9 +251,9 @@ Taken together, those commands show there are zero committed vendored-Hermes bra
 A reviewer can independently confirm this evidence packet by:
 
 1. Opening the four `/api/v1/runs/...` endpoints above and checking the stored status/phase/model/timestamps.
-2. Inspecting the two persisted `events.jsonl` files (or transcript API output) and confirming the listed `Hermes tool terminal:` commands are local-only.
-3. Inspecting the worker same-run `config.yaml` / `shell-hooks-allowlist.json` files plus any preserved reviewer role/phase profile example and confirming the `pre_tool_call` `terminal|execute_code` hook invokes `agent-command-policy-hook` for the ENG-241 worker/reviewer profile wiring.
-4. Re-running the transcript scan for the blocked-command and prompt-marker patterns listed in **Inspection Method** and confirming zero upstream-command hits and zero terminal-visible prompt hits.
-5. Adding the same-run operator/desktop observation note if the reviewer needs to confirm GUI/browser prompt absence rather than only transcript-visible markers.
-6. Comparing the recorded empty-stdout no-touch transcript above with a local rerun of `git diff --name-only origin/main...HEAD -- hermes/upstream-src` and `git status --short -- hermes/upstream-src`.
-7. Inspecting the cited automated tests to confirm denied-command audit events stay redacted and that service-owned GitHub paths remain allowed.
+2. Inspecting `meta.json`, `tool_start` events, and `Hermes tool terminal:` events for the two runs to confirm the command-capable surface inventory above (worker: `terminal` only; reviewer: `terminal` plus the local run-file `execute_code` reducer preview at `events.jsonl:1583`).
+3. Re-running the prompt-marker scan from **Inspection Method** across both `events.jsonl` files and confirming zero hits.
+4. Inspecting the worker same-run `config.yaml` / `shell-hooks-allowlist.json` files, then pairing the reviewer same-run `hermes_profile` event with `tests/hermes-command-policy-profile.test.ts` and `tests/hermes-mcp-config.test.ts` to confirm reviewer materialization installs the same command-policy hook even though fresh reviewer profile directories are cleaned after exit.
+5. Comparing the recorded empty-stdout no-touch transcript above with a local rerun of `git diff --name-only origin/main...HEAD -- hermes/upstream-src` and `git status --short -- hermes/upstream-src`.
+6. Inspecting the cited automated tests to confirm denied-command audit events stay redacted and that service-owned GitHub paths remain allowed.
+7. Adding a same-run operator/desktop observation note only if a future packet chooses runs whose surface inventory leaves an unresolved GUI/browser prompt path.

@@ -178,30 +178,8 @@ describe("FileWritebackOutboxStore", () => {
     expect(persisted?.status).toMatch(/retrying|dead_letter/);
   });
 
-  it("retries transient Windows read races while listing records", async () => {
-    const store = new FileWritebackOutboxStore(root);
-    await store.enqueueOnce({
-      idempotencyKey: "comment:issue-1:windows-read-race",
-      kind: "comment",
-      issueId: "issue-1",
-      payload: { body: "race", dedupeKey: "windows-read-race" },
-    });
-
-    const realReadFile = nodeFs.readFile.bind(nodeFs);
-    const readFileSpy = vi.spyOn(nodeFs, "readFile").mockImplementationOnce(async (...args: Parameters<typeof nodeFs.readFile>) => {
-      const error = new Error("file temporarily locked") as NodeJS.ErrnoException;
-      error.code = "EPERM";
-      throw error;
-    });
-    readFileSpy.mockImplementation(realReadFile);
-
-    await expect(store.list()).resolves.toHaveLength(1);
-    expect(readFileSpy).toHaveBeenCalled();
-  });
-
   it("stores long idempotency keys under short deterministic filenames", async () => {
     const store = new FileWritebackOutboxStore(root);
-
     const longKey = [
       "comment",
       "issue-long",

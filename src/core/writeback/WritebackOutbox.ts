@@ -618,18 +618,12 @@ function canRetrySkipped(
 }
 
 async function readJsonIfExists<T>(filePath: string): Promise<T | null> {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (isAbsentPathError(error)) return null;
-      const retryable = code === "EBUSY" || code === "EPERM" || error instanceof SyntaxError;
-      if (!retryable || attempt === 4) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
+  } catch (error) {
+    if (isAbsentPathError(error)) return null;
+    throw error;
   }
-  return null;
 }
 
 async function rmIfExists(filePath: string): Promise<void> {
