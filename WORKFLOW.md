@@ -102,7 +102,7 @@ hermes:
   upstream_root: ./hermes/upstream-src
   templates_dir: ./hermes/templates
   provider: openai-codex
-  model: gpt-5.3-codex-spark
+  model: gpt-5.4
   auth:
     mode: managed_root
     providers:
@@ -128,12 +128,7 @@ github:
   head_owner: johnhalbert
   publish_pull_requests: true
   pr_handoff:
-    enabled: true
-    target_state: Manual Review
-    required_checks: []
-    no_ci:
-      allowed: true
-      evidence: "I said so -John"
+    enabled: false
   operator_approval:
     required_for_publication: false
     reject_policy: cancel
