@@ -173,7 +173,7 @@ function ToolCallMsg({
             <div className="toolcall__body">
               <div className="toolcall__sec">
                 <div className="lbl">Arguments</div>
-                <div>{JSON.stringify(message.args, null, 2)}</div>
+                <div style={{ whiteSpace: "pre-wrap", fontFamily: "var(--font-mono)" }}>{JSON.stringify(message.args, null, 2)}</div>
               </div>
               {message.result !== null ? (
                 <div className="toolcall__sec">
@@ -181,7 +181,7 @@ function ToolCallMsg({
                     Result
                     {message.truncated ? <span className="trunc">truncated</span> : null}
                   </div>
-                  <div>{message.result}</div>
+                  <div style={{ whiteSpace: "pre-wrap", fontFamily: "var(--font-mono)" }}>{message.result}</div>
                 </div>
               ) : (
                 <div className="toolcall__sec">
@@ -192,6 +192,18 @@ function ToolCallMsg({
                   </div>
                 </div>
               )}
+              {message.output ? (
+                <div className="toolcall__sec">
+                  <div className="lbl">Output</div>
+                  <div style={{ whiteSpace: "pre-wrap", fontFamily: "var(--font-mono)" }}>{message.output}</div>
+                </div>
+              ) : null}
+              {message.error ? (
+                <div className="toolcall__sec">
+                  <div className="lbl">Error</div>
+                  <div style={{ whiteSpace: "pre-wrap", fontFamily: "var(--font-mono)" }}>{message.error}</div>
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>
