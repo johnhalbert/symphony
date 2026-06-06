@@ -793,7 +793,7 @@ describe("API data source", () => {
         Accept: "application/json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ input: "status" }),
+      body: expect.any(String),
     });
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/status-server/api/v1/web/orchestrator-chat", {
       method: "POST",
@@ -801,7 +801,15 @@ describe("API data source", () => {
         Accept: "application/json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ input: "status" }),
+      body: expect.any(String),
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body))).toMatchObject({
+      input: "status",
+      messageId: expect.stringMatching(/^web-/),
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body))).toMatchObject({
+      input: "status",
+      messageId: expect.stringMatching(/^web-/),
     });
   });
 
@@ -1108,7 +1116,11 @@ describe("API data source", () => {
         Accept: "application/json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ input: "pause ENG-108" }),
+      body: expect.any(String),
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body))).toMatchObject({
+      input: "pause ENG-108",
+      messageId: expect.stringMatching(/^web-/),
     });
   });
 
@@ -1127,7 +1139,11 @@ describe("API data source", () => {
         Accept: "application/json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ input: "inspect ENG-115" }),
+      body: expect.any(String),
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body))).toMatchObject({
+      input: "inspect ENG-115",
+      messageId: expect.stringMatching(/^web-/),
     });
   });
 
@@ -1185,7 +1201,11 @@ describe("API data source", () => {
         Accept: "application/json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ input: "pause ENG-115" }),
+      body: expect.any(String),
+    });
+    expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body))).toMatchObject({
+      input: "pause ENG-115",
+      messageId: expect.stringMatching(/^web-/),
     });
   });
 

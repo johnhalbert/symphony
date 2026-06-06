@@ -33,6 +33,7 @@ import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
 import { runIssueBreakdownPlanMcpServer } from "./core/harness/IssueBreakdownPlanMcpServer.js";
 import { runMergeConflictResolutionMcpServer } from "./core/harness/MergeConflictResolutionMcpServer.js";
+import { runOperatorChatMcpServer } from "./core/harness/OperatorChatMcpServer.js";
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
 import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer.js";
 import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcpServer.js";
@@ -174,6 +175,18 @@ program
   });
 
 program
+  .command("operator-chat-mcp")
+  .description("Run the internal Symphony operator chat MCP server")
+  .requiredOption("--workflow <path>", "path to WORKFLOW.md")
+  .requiredOption("--context-file <path>", "path to the active operator chat context file")
+  .action(async (options: { workflow: string; contextFile: string }) => {
+    await runOperatorChatMcpServer({
+      workflowPath: path.resolve(process.cwd(), options.workflow),
+      contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
+  });
+
+program
   .command("agent-command-policy-hook")
   .description("Evaluate a Hermes pre_tool_call payload against the Symphony agent command policy")
   .option("--role <role>", "agent role for this hook invocation; falls back to SYMPHONY_AGENT_ROLE")
@@ -229,6 +242,8 @@ program
     const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
     const operatorApproval = new OperatorApprovalService({ config, store: operatorApprovalStore, runStore });
     const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger);
+    const statusMutationToken = resolveStatusMutationToken(config);
+    let statusServerBaseUrl: string | null = null;
     const workspaceManager = new WorkspaceManager({
       workspace: config.workspace,
       hooks: config.hooks,
@@ -245,6 +260,9 @@ program
       promptTemplate: loaded.definition.promptTemplate,
       runStore,
       lifecycleStore,
+      orchestratorConversationStore,
+      statusServerBaseUrl: () => statusServerBaseUrl,
+      statusMutationToken,
       ...(writeback === undefined ? {} : { writeback }),
       operatorApproval,
     });
@@ -278,7 +296,7 @@ program
             operatorApproval,
             host: config.server.host,
             port: config.server.port,
-            openWorkspaceToken: resolveStatusMutationToken(config),
+            openWorkspaceToken: statusMutationToken,
             tracker,
             trackerStateLists: resolveTrackerStateLists(config),
             issueBoardColumns: config.issueBoard.columns,
@@ -296,6 +314,7 @@ program
 
     if (statusServer) {
       const address = await statusServer.start();
+      statusServerBaseUrl = `http://${localStatusHost(address.host)}:${address.port}`;
       logger.info("status server started", { host: address.host, port: address.port });
     }
 
@@ -322,6 +341,10 @@ program.parseAsync().catch((error) => {
 
 function currentCliPath(): string {
   return path.resolve(process.argv[1] ?? "dist/cli.js");
+}
+
+function localStatusHost(host: string): string {
+  return host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
 }
 
 interface RuntimeProjectionPersistence {

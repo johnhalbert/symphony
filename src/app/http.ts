@@ -4702,7 +4702,7 @@ interface ActivityItem {
   };
   run: {
     runId: string;
-    role: AgentRunRole;
+    role: RunRecord["role"];
     runPhase: AgentRunPhase | null;
     runKind: string | null;
     status: RunRecord["status"];

@@ -1228,7 +1228,7 @@ function providerLimitSignalFor(
       issueIdentifier: run.issueIdentifier,
       runId: run.runId,
       sessionId: run.sessionId,
-      role: run.role,
+      role: run.role === "planner" ? null : run.role,
       runPhase: run.runPhase ?? null,
     },
     raw: {

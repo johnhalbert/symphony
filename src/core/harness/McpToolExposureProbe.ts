@@ -1738,6 +1738,8 @@ function mcpSdkServerNameForCommand(command: McpSubprocessCommand): string {
       return "symphony-merge-conflict-resolution";
     case "issue-breakdown-plan-mcp":
       return "symphony-issue-breakdown-plan";
+    case "operator-chat-mcp":
+      return "symphony-operator-chat";
     case "review-verdict-mcp":
       return "symphony-review-verdict";
     case "review-feedback-mcp":

@@ -9,6 +9,7 @@ export type McpSubprocessCommand =
   | "completion-report-mcp"
   | "merge-conflict-resolution-mcp"
   | "issue-breakdown-plan-mcp"
+  | "operator-chat-mcp"
   | "review-verdict-mcp"
   | "review-feedback-mcp"
   | "transcript-recall-mcp";

@@ -9,7 +9,7 @@ import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat"
 import { createTranscriptWindowResponse } from "../src/data/transcriptWindow";
 import { REALTIME_EVENT_SCHEMA, REALTIME_EVENT_SCHEMA_VERSION } from "../src/data/realtimeEvents";
 import { combineLiveResourceTokens, useLiveResourceTokens } from "../src/hooks/useLiveResource";
-import { useOrchestratorChat, useTranscript } from "../src/hooks/useSymphonyData";
+import { useOrchestratorChat, useTranscript, type TranscriptLoadable } from "../src/hooks/useSymphonyData";
 import type {
   ChatMessage,
   Loadable,
@@ -167,7 +167,7 @@ function testDataSource(overrides: Partial<SymphonyDataSource>): SymphonyDataSou
 }
 
 function renderTranscriptProbe(dataSource: SymphonyDataSource) {
-  let latest: Loadable<TranscriptMessage[]> | null = null;
+  let latest: TranscriptLoadable | null = null;
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
@@ -257,6 +257,79 @@ afterEach(() => {
 });
 
 describe("useSymphonyData realtime direct patching", () => {
+  it("loads a selected transcript as a live tail and prepends previous pages on demand", async () => {
+    const prelude: TranscriptMessage[] = [
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.000Z",
+        model: "gpt-5.4",
+        cwd: "/workspace",
+        workspace: "/workspace",
+        session: "session-1",
+        tools: ["terminal"],
+        note: "System prelude",
+      },
+      {
+        kind: "user",
+        ts: "2026-01-01T00:00:00.500Z",
+        from: "worker",
+        issue: "ENG-225",
+        text: "Fix the transcript gap.",
+      },
+    ];
+    const earlier: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "earlier message" }];
+    const tail: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "latest message" }];
+    const getTranscript: SymphonyDataSource["getTranscript"] = vi
+      .fn()
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse([...prelude, ...tail], {
+          runStatus: "running",
+          offset: 100,
+          limit: 500,
+          total: 600,
+          previousOffset: 0,
+          hasPrevious: true,
+          lastSequence: 600,
+          refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+        }),
+      )
+      .mockResolvedValueOnce(
+        createTranscriptWindowResponse([...prelude, ...earlier], {
+          kind: "page",
+          runStatus: "running",
+          offset: 0,
+          limit: 100,
+          total: 600,
+          nextOffset: 100,
+          previousOffset: null,
+          hasPrevious: false,
+          lastSequence: 100,
+        }),
+      );
+
+    const probe = renderTranscriptProbe(testDataSource({ getTranscript }));
+    await flushPromises();
+
+    expect(getTranscript).toHaveBeenCalledTimes(1);
+    expect(getTranscript).toHaveBeenNthCalledWith(1, "session-1", expect.anything(), { tail: true });
+    expect(probe.result()).toMatchObject({ data: [...prelude, ...tail], loading: false, error: null, hasPrevious: true });
+
+    await act(async () => {
+      await probe.result().loadPrevious();
+    });
+
+    expect(getTranscript).toHaveBeenCalledTimes(2);
+    expect(getTranscript).toHaveBeenNthCalledWith(2, "session-1", expect.anything(), { offset: 0, limit: 100 });
+    expect(probe.result()).toMatchObject({
+      data: [...prelude, ...earlier, ...tail],
+      loading: false,
+      error: null,
+      hasPrevious: false,
+      loadingPrevious: false,
+      previousError: null,
+    });
+  });
+
   it("patches the selected transcript from ordered SSE deltas without refetching and refetches on gaps", async () => {
     let listener: RealtimeEventListener | null = null;
     const invalidateCachedReads = vi.fn();

@@ -48,7 +48,10 @@ describe("API data source contract fixture conformance", () => {
       ["GET", webRouteContractPaths.orchestratorChat],
       ["POST", webRouteContractPaths.orchestratorChat],
     ]);
-    expect(apiFixture.requests.at(-1)?.body).toEqual({ input: "show contract fixture status" });
+    expect(apiFixture.requests.at(-1)?.body).toMatchObject({
+      input: "show contract fixture status",
+      messageId: expect.stringMatching(/^web-/),
+    });
   });
 
   it("keeps selected issue and transcript identifiers encoded through the route contract", async () => {

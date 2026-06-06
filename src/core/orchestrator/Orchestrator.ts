@@ -1,13 +1,21 @@
+import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
-import type { AgentActivitySource, AgentEvent, AgentHarness, AgentRunSdkStatus } from "../harness/AgentHarness.js";
+import type {
+  AgentActivitySource,
+  AgentEvent,
+  AgentHarness,
+  AgentRunSdkStatus,
+  OperatorChatRunContext,
+} from "../harness/AgentHarness.js";
 import {
   harnessSupportsContinuation,
   harnessSupportsMcpHandoff,
   renderCompletionMcpHandoffPrompt,
   renderIssueBreakdownMcpHandoffPrompt,
   renderMergeConflictResolutionMcpHandoffPrompt,
+  renderOperatorChatMcpPrompt,
   renderReviewMcpHandoffPrompt,
 } from "../harness/HandoffMcp.js";
 import type { Logger } from "../logging/StructuredLogger.js";
@@ -54,6 +62,7 @@ import {
   type TranscriptEvent,
   type UpdateRunInput,
 } from "../persistence/RunTranscriptStore.js";
+import type { OrchestratorConversationMessage, OrchestratorConversationStore } from "../persistence/OrchestratorConversationStore.js";
 import { FileProviderGateStore, type ProviderGateStore } from "../persistence/ProviderGateStore.js";
 import {
   normalizeProviderLimitSignal,
@@ -129,6 +138,9 @@ export interface OrchestratorOptions {
   operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest"> &
     Partial<Pick<OperatorApprovalService, "get" | "getByDedupe">>;
   providerGateStore?: ProviderGateStore;
+  orchestratorConversationStore?: OrchestratorConversationStore;
+  statusServerBaseUrl?: () => string | null;
+  statusMutationToken?: string | null;
 }
 
 export interface PullRequestDiscoveryClient {
@@ -222,6 +234,18 @@ export interface RetryEntry {
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
 type TerminalUpdateResult = { updated: true; record: RunRecord | null } | { updated: false; record: RunRecord | null };
 type AcceptedHandoffKind = "completion_report" | "pull_request_handoff" | "issue_breakdown_plan" | "merge_conflict_resolution";
+
+interface OperatorChatQueueEntry {
+  conversationId: string;
+  messageId: string;
+  command: OrchestratorChatCommand;
+  abortController: AbortController;
+  worker: Promise<void>;
+  runId: string | null;
+  sessionId: string | null;
+  startedAt: Date;
+  tokens: TokenCounts;
+}
 
 const PLANNING_NO_PLAN_ERROR = "Planning run completed without submit_issue_breakdown_plan";
 const PLANNING_FAILURE_DIAGNOSTIC_CODE = "planning_run_failed";
@@ -430,6 +454,8 @@ export class Orchestrator {
   private readonly completed = new Set<string>();
   private readonly pausedIssues = new Set<string>();
   private readonly retryAttempts = new Map<string, RetryEntry>();
+  private readonly operatorChatQueues = new Map<string, Promise<void>>();
+  private readonly operatorChatRuns = new Map<string, OperatorChatQueueEntry>();
   private readonly totals: TokenCounts = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   private readonly providerGateStore: ProviderGateStore;
   private activeProviderGates: RuntimeProviderGate[] = [];
@@ -453,6 +479,19 @@ export class Orchestrator {
     this.stopped = true;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     for (const retry of this.retryAttempts.values()) clearTimeout(retry.timer);
+    for (const entry of this.operatorChatRuns.values()) {
+      entry.abortController.abort();
+      const stopRunId = entry.runId;
+      if (stopRunId) {
+        await this.options.harness.stop?.(stopRunId).catch((error: unknown) => {
+          this.options.logger.warn("operator chat harness stop failed", {
+            run_id: stopRunId,
+            conversation_id: entry.conversationId,
+            error: errorMessage(error),
+          });
+        });
+      }
+    }
     for (const [issueId, running] of this.running) {
       running.suppressRetryOnExit = true;
       const stopRunId = this.harnessStopRunId(running);
@@ -465,7 +504,12 @@ export class Orchestrator {
       running.abortController.abort();
       if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
     }
-    const workers = new Set([...this.activeWorkers, ...[...this.running.values()].map((entry) => entry.worker)]);
+    const workers = new Set([
+      ...this.activeWorkers,
+      ...[...this.running.values()].map((entry) => entry.worker),
+      ...[...this.operatorChatRuns.values()].map((entry) => entry.worker),
+      ...this.operatorChatQueues.values(),
+    ]);
     await Promise.allSettled([...workers]);
   }
 
@@ -482,13 +526,373 @@ export class Orchestrator {
     if (this.stopped) {
       return { status: "disabled", reason: "orchestrator_stopped" };
     }
+    if (!this.options.orchestratorConversationStore) {
+      return { status: "unavailable", reason: "orchestrator_conversation_store_unavailable" };
+    }
+    if (typeof this.options.harness.runOperatorChat !== "function") {
+      return { status: "unavailable", reason: `harness_${this.options.harness.id}_does_not_support_operator_chat` };
+    }
     this.options.logger.info("orchestrator chat command accepted", {
       action: command.action,
       conversation_id: command.conversationId,
       message_id: command.messageId,
       source: command.source,
     });
-    return { status: "accepted", reason: "accepted", acceptedAt: new Date().toISOString() };
+    const acceptedAt = new Date().toISOString();
+    const previous = this.operatorChatQueues.get(command.conversationId);
+    const queued = Boolean(previous);
+    const abortController = new AbortController();
+    const worker = (previous ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => this.runOperatorChatCommand(command, abortController));
+    const entry: OperatorChatQueueEntry = {
+      conversationId: command.conversationId,
+      messageId: command.messageId,
+      command,
+      abortController,
+      worker,
+      runId: null,
+      sessionId: null,
+      startedAt: new Date(acceptedAt),
+      tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    };
+    this.operatorChatRuns.set(command.messageId, entry);
+    this.operatorChatQueues.set(command.conversationId, worker);
+    void worker.finally(() => {
+      this.operatorChatRuns.delete(command.messageId);
+      if (this.operatorChatQueues.get(command.conversationId) === worker) {
+        this.operatorChatQueues.delete(command.conversationId);
+      }
+    });
+    return {
+      status: "accepted",
+      reason: queued ? "queued" : "accepted",
+      acceptedAt,
+      metadata: {
+        conversationId: command.conversationId,
+        messageId: command.messageId,
+        queued,
+        role: "planner",
+        runKind: "planning",
+        harnessId: this.options.harness.id,
+        model: runtimeModelForHarness(this.options.harness.id, this.config),
+      },
+    };
+  }
+
+  private async runOperatorChatCommand(command: OrchestratorChatCommand, abortController: AbortController): Promise<void> {
+    const store = this.options.orchestratorConversationStore;
+    const runOperatorChat = this.options.harness.runOperatorChat?.bind(this.options.harness);
+    if (!store || !runOperatorChat) return;
+
+    const queueEntry = this.operatorChatRuns.get(command.messageId) ?? null;
+    const workspace = await this.operatorChatWorkspace();
+    const messages = await store.listMessages(command.conversationId);
+    const turnNumber = Math.max(1, messages.filter((message) => message.role === "user").length);
+    const context: OperatorChatRunContext = {
+      conversationId: command.conversationId,
+      messageId: command.messageId,
+      workspace,
+      config: this.config,
+      turnNumber,
+      abortSignal: abortController.signal,
+      logger: this.options.logger,
+      statusServer: this.operatorChatStatusServer() ?? null,
+    };
+    const prompt = await this.renderOperatorChatPrompt(command, messages);
+    let assistant: OrchestratorConversationMessage | null = null;
+    let assistantText = "";
+    let runId: string | null = null;
+    let sessionId: string | null = null;
+    let tokens: TokenCounts = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    let terminalStatus: "succeeded" | "failed" | "cancelled" = "succeeded";
+    let terminalError: string | null = null;
+
+    try {
+      await store.updateMessage({
+        conversationId: command.conversationId,
+        messageId: command.messageId,
+        status: "completed",
+        metadata: {
+          dispatch: {
+            status: "running",
+            role: "planner",
+            harnessId: this.options.harness.id,
+            startedAt: new Date().toISOString(),
+          },
+        },
+      });
+    } catch (error) {
+      this.options.logger.warn("operator chat user message status update failed", {
+        conversation_id: command.conversationId,
+        message_id: command.messageId,
+        error: errorMessage(error),
+      });
+    }
+
+    try {
+      for await (const event of runOperatorChat(context, prompt)) {
+        if (event.type === "session_started") {
+          runId = event.runId ?? event.sessionId;
+          sessionId = event.sessionId;
+          if (queueEntry) {
+            queueEntry.runId = runId;
+            queueEntry.sessionId = sessionId;
+          }
+          const runtimeAllowLargeContext = runtimeAllowLargeContextForHarness(this.options.harness.id, this.config);
+          await this.options.runStore?.startRun({
+            runId,
+            sessionId,
+            agentId: event.threadId ?? null,
+            role: "planner",
+            runPhase: "issue_breakdown",
+            runKind: "planning",
+            issueId: operatorChatIssueId(command.conversationId),
+            issueIdentifier: "OPERATOR",
+            attempt: null,
+            turnNumber,
+            prompt,
+            harnessId: this.options.harness.id,
+            runtimeModel: event.model ?? runtimeModelForHarness(this.options.harness.id, this.config),
+            runtimeModelParams: runtimeModelParamsForHarness(this.options.harness.id, this.config),
+            runtimeSettingSources: runtimeSettingSourcesForHarness(this.options.harness.id, this.config),
+            runtimeMode: runtimeModeForHarness(this.options.harness.id, this.config),
+            ...(runtimeAllowLargeContext === undefined ? {} : { runtimeAllowLargeContext }),
+            runtimeAgentLifecycle: "reuse_by_conversation",
+            cursorModel: this.config.cursor.model,
+            cursorModelParams: this.config.cursor.modelParams,
+            cursorSettingSources: this.config.cursor.settingSources,
+            cursorMode: this.config.cursor.mode,
+            cursorAllowLargeContext: this.config.cursor.allowLargeContext,
+            cursorWorkerAgentLifecycle: this.config.cursor.workerAgentLifecycle,
+            workspaceKey: workspace.workspaceKey,
+            workspacePath: workspace.path,
+            ...(workspace.gitBranchName === undefined ? {} : { gitBranchName: workspace.gitBranchName }),
+            ...(workspace.repoPath === undefined ? {} : { repoPath: workspace.repoPath }),
+            ...(workspace.baseRef === undefined ? {} : { baseRef: workspace.baseRef }),
+          });
+          assistant = await store.appendMessage({
+            conversationId: command.conversationId,
+            role: "assistant",
+            body: "Starting operator session...",
+            status: "streaming",
+            metadata: operatorAssistantMetadata({
+              command,
+              event,
+              harnessId: this.options.harness.id,
+              model: event.model ?? runtimeModelForHarness(this.options.harness.id, this.config),
+            }),
+            transcriptLinks: [{ runId, eventType: "session_started" }],
+          });
+          await this.persistOperatorHarnessEvent(runId, event);
+          continue;
+        }
+
+        if (event.type === "tokens") {
+          tokens = mergeTokenCounts(tokens, event.tokens);
+          if (queueEntry) queueEntry.tokens = tokens;
+        }
+        if (runId) await this.persistOperatorHarnessEvent(runId, event);
+
+        if (event.type === "progress") {
+          if (event.activitySource === "tool") {
+            await store.appendMessage({
+              conversationId: command.conversationId,
+              role: "server",
+              body: event.message,
+              status: "completed",
+              metadata: {
+                source: "operator_chat_tool",
+                runId,
+                sessionId,
+                harnessId: this.options.harness.id,
+              },
+              transcriptLinks: runId ? [{ runId, eventType: "tool" }] : [],
+            });
+            continue;
+          }
+          assistantText = mergeOperatorAssistantText(assistantText, event.message, event.activitySource);
+          assistant = await this.upsertOperatorAssistantMessage(store, command, assistant, assistantText, "streaming", {
+            runId,
+            sessionId,
+            eventType: "progress",
+          });
+          continue;
+        }
+
+        if (event.type === "provider_limit") {
+          terminalStatus = "failed";
+          terminalError = event.signal.message;
+          assistantText = mergeOperatorAssistantText(assistantText, event.signal.message, "stream");
+          continue;
+        }
+
+        if (event.type === "completed") {
+          terminalStatus = "succeeded";
+          if (event.message && event.message.trim().length > 0) {
+            assistantText = mergeOperatorAssistantText(assistantText, event.message, "stream");
+          }
+          continue;
+        }
+
+        if (event.type === "failed") {
+          terminalStatus = "failed";
+          terminalError = event.error;
+          assistantText = assistantText.trim().length > 0 ? assistantText : event.error;
+          continue;
+        }
+
+        if (event.type === "cancelled") {
+          terminalStatus = "cancelled";
+          terminalError = "Operator chat run was cancelled";
+          assistantText = assistantText.trim().length > 0 ? assistantText : terminalError;
+        }
+      }
+    } catch (error) {
+      terminalStatus = abortController.signal.aborted ? "cancelled" : "failed";
+      terminalError = errorMessage(error);
+      assistantText = assistantText.trim().length > 0 ? assistantText : `Operator chat failed: ${terminalError}`;
+      if (runId) {
+        await this.options.runStore?.appendEvent({
+          runId,
+          at: new Date().toISOString(),
+          source: "orchestrator",
+          eventType: "operator_chat_error",
+          message: terminalError,
+          payload: { conversationId: command.conversationId, messageId: command.messageId },
+        });
+      }
+    } finally {
+      const completedAt = new Date().toISOString();
+      const finalStatus = terminalStatus === "succeeded" ? "completed" : "failed";
+      assistant = await this.upsertOperatorAssistantMessage(
+        store,
+        command,
+        assistant,
+        assistantText.trim().length > 0 ? assistantText : "Operator run completed.",
+        finalStatus,
+        {
+          runId,
+          sessionId,
+          eventType: terminalStatus,
+          completedAt,
+          error: terminalError,
+        },
+      );
+      if (runId) {
+        await this.options.runStore?.updateRun(runId, {
+          status: terminalStatus,
+          completedAt,
+          error: terminalError,
+          tokens,
+          metadata: {
+            activitySnapshot: {
+              lastHarnessActivityAt: completedAt,
+              lastStreamActivityAt: completedAt,
+              lastDeltaOrToolActivityAt: completedAt,
+              lastToolActivityAt: null,
+            },
+          },
+        });
+      }
+    }
+  }
+
+  private async upsertOperatorAssistantMessage(
+    store: OrchestratorConversationStore,
+    command: OrchestratorChatCommand,
+    existing: OrchestratorConversationMessage | null,
+    body: string,
+    status: "streaming" | "completed" | "failed",
+    metadata: Record<string, unknown>,
+  ): Promise<OrchestratorConversationMessage> {
+    if (existing) {
+      return store.updateMessage({
+        conversationId: command.conversationId,
+        messageId: existing.id,
+        body,
+        status,
+        metadata: { operatorRun: metadata },
+        ...(typeof metadata.runId === "string" && metadata.runId.length > 0
+          ? {
+              transcriptLinks: [
+                { runId: metadata.runId, eventType: typeof metadata.eventType === "string" ? metadata.eventType : null },
+              ],
+            }
+          : {}),
+      });
+    }
+    return store.appendMessage({
+      conversationId: command.conversationId,
+      role: "assistant",
+      body,
+      status,
+      metadata: {
+        source: "operator_chat",
+        commandMessageId: command.messageId,
+        operatorRun: metadata,
+      },
+      transcriptLinks:
+        typeof metadata.runId === "string" && metadata.runId.length > 0
+          ? [{ runId: metadata.runId, eventType: typeof metadata.eventType === "string" ? metadata.eventType : null }]
+          : [],
+    });
+  }
+
+  private async persistOperatorHarnessEvent(runId: string, event: AgentEvent): Promise<void> {
+    await this.options.runStore?.appendEvent({
+      runId: event.type === "run_status" ? event.runId : runId,
+      at: new Date(event.at ?? Date.now()).toISOString(),
+      source: "harness",
+      ...mapAgentEventToRunActivityEvent(event),
+    });
+  }
+
+  private async operatorChatWorkspace(): Promise<Workspace> {
+    const configuredPath = this.config.workspace.source.path;
+    const workspacePath = configuredPath && (await existingDirectory(configuredPath)) ? configuredPath : this.config.workflowDir;
+    await fs.mkdir(workspacePath, { recursive: true });
+    return {
+      path: workspacePath,
+      workspaceKey: "operator-chat",
+      createdNow: false,
+      issueId: "operator-chat",
+      issueIdentifier: "OPERATOR",
+      sourceKind: "operator_chat",
+      ...(configuredPath === undefined || workspacePath !== configuredPath ? {} : { repoPath: configuredPath }),
+      ...(this.config.workspace.source.baseRef === undefined ? {} : { baseRef: this.config.workspace.source.baseRef }),
+    };
+  }
+
+  private operatorChatStatusServer(): OperatorChatRunContext["statusServer"] {
+    const baseUrl = this.options.statusServerBaseUrl?.() ?? null;
+    return baseUrl ? { baseUrl, mutationToken: this.options.statusMutationToken ?? null } : null;
+  }
+
+  private async renderOperatorChatPrompt(
+    command: OrchestratorChatCommand,
+    messages: readonly OrchestratorConversationMessage[],
+  ): Promise<string> {
+    const recentMessages = messages.slice(-20).map((message) => {
+      const speaker = message.role === "user" ? "User" : message.role === "assistant" ? "Assistant" : "System";
+      return `${speaker}: ${message.body}`;
+    });
+    return [
+      "You are the persistent Symphony dashboard operator agent.",
+      "",
+      "You can inspect and operate Symphony through the provided service-owned MCP tools. Use those tools instead of asking for raw credentials or direct access.",
+      "When you take an action, be explicit about what you did and cite the tool result. Preserve useful formatting in your response.",
+      "",
+      "Current user message:",
+      command.input,
+      "",
+      "Recent conversation:",
+      recentMessages.length > 0 ? recentMessages.join("\n\n") : "No prior messages.",
+      renderOperatorChatMcpPrompt({
+        conversationId: command.conversationId,
+        statusBaseUrl: this.options.statusServerBaseUrl?.() ?? null,
+      }),
+    ].join("\n");
   }
 
   pauseIssue(issueId: string): void {
@@ -3357,6 +3761,96 @@ function runtimeModelForHarness(harnessId: string, config: ServiceConfig): strin
   if (harnessId === "hermes_acp") return null;
   if (harnessId === "cursor") return config.cursor.model;
   return null;
+}
+
+function runtimeModelParamsForHarness(
+  harnessId: string,
+  config: ServiceConfig,
+): NonNullable<StartRunInput["runtimeModelParams"]> {
+  return harnessId === "cursor" ? config.cursor.modelParams : [];
+}
+
+function runtimeSettingSourcesForHarness(harnessId: string, config: ServiceConfig): string[] {
+  if (harnessId === "cursor") return config.cursor.settingSources;
+  if (harnessId === "hermes") {
+    return [
+      `template:${config.hermes.roleTemplates.planner}`,
+      ...(config.hermes.provider === null ? [] : [`provider:${config.hermes.provider}`]),
+    ];
+  }
+  if (harnessId === "hermes_acp") {
+    return [
+      `host_hermes:${config.hermesAcp.binaryPath ?? "PATH:hermes"}`,
+      `source_profile:${config.hermesAcp.sourceProfile ?? "active"}`,
+      `profile_prefix:${config.hermesAcp.profilePrefix}`,
+    ];
+  }
+  return [];
+}
+
+function runtimeModeForHarness(harnessId: string, config: ServiceConfig): string | null {
+  if (harnessId === "cursor") return config.cursor.mode;
+  if (harnessId === "hermes") return config.cursor.mode;
+  return null;
+}
+
+function runtimeAllowLargeContextForHarness(harnessId: string, config: ServiceConfig): boolean | undefined {
+  return harnessId === "cursor" ? config.cursor.allowLargeContext : undefined;
+}
+
+function operatorChatIssueId(conversationId: string): string {
+  return `operator:${conversationId}`;
+}
+
+async function existingDirectory(candidate: string): Promise<boolean> {
+  try {
+    return (await fs.stat(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function mergeTokenCounts(current: TokenCounts, patch: Partial<TokenCounts>): TokenCounts {
+  return {
+    inputTokens: patch.inputTokens ?? current.inputTokens,
+    outputTokens: patch.outputTokens ?? current.outputTokens,
+    totalTokens: patch.totalTokens ?? current.totalTokens,
+  };
+}
+
+function mergeOperatorAssistantText(
+  current: string,
+  next: string,
+  activitySource: AgentActivitySource | undefined,
+): string {
+  if (next.trim().length === 0) return current;
+  if (activitySource === "delta") return `${current}${next}`;
+  if (current.trim().length === 0) return next;
+  if (next.startsWith(current)) return next;
+  if (current.includes(next)) return current;
+  return `${current.trimEnd()}\n\n${next}`;
+}
+
+function operatorAssistantMetadata(input: {
+  command: OrchestratorChatCommand;
+  event: Extract<AgentEvent, { type: "session_started" }>;
+  harnessId: string;
+  model: string | null;
+}): Record<string, unknown> {
+  return {
+    source: "operator_chat",
+    commandMessageId: input.command.messageId,
+    operatorRun: {
+      runId: input.event.runId ?? input.event.sessionId,
+      sessionId: input.event.sessionId,
+      threadId: input.event.threadId ?? null,
+      harnessId: input.harnessId,
+      model: input.model,
+      role: "planner",
+      runKind: "planning",
+      status: "streaming",
+    },
+  };
 }
 
 function providerGateDispatchBlockedMessage(gate: RuntimeProviderGate): string {

@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Icon, UnavailableButton } from "../common";
 import { orchestratorChatCommandUnavailableNotice, orchestratorChatStateNotice } from "../../data/orchestratorChat";
 import type { ChatMessage, OrchestratorChatModel } from "../../types/symphony";
-import { formatInlineText } from "../messages/messageFormat";
+import { Paragraphs } from "../messages/messageFormat";
 
 export function OrchestratorChat({
   error = null,
@@ -26,6 +26,7 @@ export function OrchestratorChat({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
   const hasNoMessages = messages.length === 0;
   const chatError = error
     ? hasNoMessages
@@ -37,6 +38,12 @@ export function OrchestratorChat({
   const readOnlyNotice =
     "API mode shows durable chat history only. Sending commands from this web chat is not supported yet; no orchestrator action will be dispatched.";
   const agentContextLabel = agentLabel?.trim() || "agent unavailable";
+
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (!body) return;
+    body.scrollTop = body.scrollHeight;
+  }, [messages.length, messages.at(-1)?.id, messages.at(-1)?.text, messages.at(-1)?.status]);
 
   async function submit(input = draft) {
     const trimmed = input.trim();
@@ -66,7 +73,7 @@ export function OrchestratorChat({
           {Icon.more()}
         </UnavailableButton>
       </div>
-      <div className="chat__body">
+      <div className="chat__body" ref={bodyRef}>
         {loading && hasNoMessages ? <div className="view-loading">Loading orchestrator chat...</div> : null}
         {loading && !hasNoMessages ? <div className="transcript-status">Refreshing orchestrator chat... showing previous messages.</div> : null}
         {chatError ? <div className="view-error">{chatError}</div> : null}
@@ -76,7 +83,7 @@ export function OrchestratorChat({
         ) : null}
         {!loading && !error && !stateNotice && hasNoMessages ? <div className="view-empty">No durable orchestrator chat messages are available yet.</div> : null}
         {messages.map((message, index) => (
-          <div className="chat__msg" key={`${message.who}-${index}-${message.text}`}>
+          <div className="chat__msg" key={message.id ?? `${message.who}-${index}-${message.createdAt ?? message.text}`}>
             <div className={`who ${message.who === "user" ? "who--user" : ""}`}>
               <span className="av-tiny">{message.who === "user" ? "You" : "SY"}</span>
               {message.who === "user" ? "You" : "Orchestrator"}
@@ -84,7 +91,7 @@ export function OrchestratorChat({
               <span style={{ color: "var(--text-4)" }}>just now</span>
             </div>
             <div className="body">
-              <p>{formatInlineText(message.text)}</p>
+              <Paragraphs text={message.text} />
               {message.suggestions ? (
                 <div style={{ marginTop: 4 }}>
                   {message.suggestions.map((suggestion, suggestionIndex) => (

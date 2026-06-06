@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { AgentHarness, AgentRunContext } from "./AgentHarness.js";
+import type { AgentHarness, AgentRunContext, OperatorChatRunContext } from "./AgentHarness.js";
 import { writeCompletionReportMcpContext } from "./CompletionReportMcpServer.js";
 import { writeIssueBreakdownPlanMcpContext } from "./IssueBreakdownPlanMcpServer.js";
 import { writeMergeConflictResolutionMcpContext } from "./MergeConflictResolutionMcpServer.js";
@@ -7,6 +7,7 @@ import {
   buildMcpSubprocessServerConfig,
   type McpSubprocessServerConfig,
 } from "./McpSubprocessEnvironment.js";
+import { writeOperatorChatMcpContext } from "./OperatorChatMcpServer.js";
 import { writeReviewFeedbackMcpContext } from "./ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "./ReviewVerdictMcpServer.js";
 import { writeTranscriptRecallMcpContext } from "./TranscriptRecallMcpServer.js";
@@ -33,6 +34,9 @@ export function symphonyRoleMcpServers(
   ctx: AgentRunContext,
   options: { cliPath: string; mcpCwd?: string },
 ): Record<string, McpSubprocessServerConfig> {
+  if (ctx.operatorChat) {
+    return symphonyOperatorChatMcpServers(operatorChatRunContextFromAgentContext(ctx), options);
+  }
   const applyCwd = (server: McpSubprocessServerConfig): McpSubprocessServerConfig =>
     options.mcpCwd === undefined ? server : { ...server, cwd: options.mcpCwd };
   if (ctx.role === "worker" && currentRunPhase(ctx) === "implementation") {
@@ -62,6 +66,16 @@ export function symphonyRoleMcpServers(
   };
 }
 
+export function symphonyOperatorChatMcpServers(
+  ctx: OperatorChatRunContext,
+  options: { cliPath: string; mcpCwd?: string },
+): Record<string, McpSubprocessServerConfig> {
+  const server = operatorChatMcpServerConfig(ctx, operatorChatContextFilePath(ctx), options);
+  return {
+    symphony_operator: options.mcpCwd === undefined ? server : { ...server, cwd: options.mcpCwd },
+  };
+}
+
 export async function writeInitialHandoffMcpContexts(ctx: AgentRunContext): Promise<void> {
   await writeHandoffMcpContexts(ctx, { activeRunId: null, sessionId: null });
 }
@@ -71,6 +85,42 @@ export async function writeActiveHandoffMcpContexts(
   input: { activeRunId: string; sessionId: string },
 ): Promise<void> {
   await writeHandoffMcpContexts(ctx, input);
+}
+
+export async function writeInitialOperatorChatMcpContext(ctx: OperatorChatRunContext): Promise<void> {
+  await writeOperatorChatMcpContext(operatorChatContextFilePath(ctx), {
+    conversationId: ctx.conversationId,
+    activeRunId: null,
+    sessionId: null,
+    statusBaseUrl: ctx.statusServer?.baseUrl ?? null,
+    mutationToken: ctx.statusServer?.mutationToken ?? null,
+  });
+}
+
+export async function writeActiveOperatorChatMcpContext(
+  ctx: OperatorChatRunContext,
+  input: { activeRunId: string; sessionId: string },
+): Promise<void> {
+  await writeOperatorChatMcpContext(operatorChatContextFilePath(ctx), {
+    conversationId: ctx.conversationId,
+    activeRunId: input.activeRunId,
+    sessionId: input.sessionId,
+    statusBaseUrl: ctx.statusServer?.baseUrl ?? null,
+    mutationToken: ctx.statusServer?.mutationToken ?? null,
+  });
+}
+
+export function renderOperatorChatMcpPrompt(input: { conversationId: string; statusBaseUrl: string | null }): string {
+  return [
+    "",
+    "Symphony MCP operator tools:",
+    `- Conversation: ${input.conversationId}`,
+    `- Status API: ${input.statusBaseUrl ?? "unavailable"}`,
+    "- Use the service-owned Symphony MCP tools for dashboard reads and lifecycle actions.",
+    "- Mutating tools require an idempotencyKey. Reuse a key only when retrying the exact same intended action.",
+    "- Do not request raw Linear, GitHub, filesystem, or host credentials. Symphony performs lifecycle operations through these tools.",
+    "- For risky or irreversible operations, explain the intended action in the chat before using the tool.",
+  ].join("\n");
 }
 
 export function renderCompletionMcpHandoffPrompt(input: RuntimeHandoffPromptInput): string {
@@ -151,6 +201,16 @@ async function writeHandoffMcpContexts(
   ctx: AgentRunContext,
   input: { activeRunId: string | null; sessionId: string | null },
 ): Promise<void> {
+  if (ctx.operatorChat) {
+    await writeOperatorChatMcpContext(operatorChatContextFilePath(operatorChatRunContextFromAgentContext(ctx)), {
+      conversationId: ctx.operatorChat.conversationId,
+      activeRunId: input.activeRunId,
+      sessionId: input.sessionId,
+      statusBaseUrl: ctx.operatorChat.statusServer?.baseUrl ?? null,
+      mutationToken: ctx.operatorChat.statusServer?.mutationToken ?? null,
+    });
+    return;
+  }
   const phase = currentRunPhase(ctx);
   if (ctx.config.continuationContext.searchEnabled) {
     await writeTranscriptRecallMcpContext(transcriptRecallContextFilePath(ctx), {
@@ -316,6 +376,20 @@ export function transcriptRecallMcpServerConfig(
   });
 }
 
+export function operatorChatMcpServerConfig(
+  ctx: OperatorChatRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "operator-chat-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
+}
+
 export function completionReportContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
@@ -364,8 +438,30 @@ export function transcriptRecallContextFilePath(ctx: AgentRunContext): string {
   );
 }
 
+export function operatorChatContextFilePath(ctx: OperatorChatRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "operator-chat-mcp",
+    `${safeFileName(ctx.conversationId)}-${ctx.turnNumber}.json`,
+  );
+}
+
 export function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
   return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
+}
+
+function operatorChatRunContextFromAgentContext(ctx: AgentRunContext): OperatorChatRunContext {
+  if (!ctx.operatorChat) throw new Error("Agent context is not an operator chat context");
+  return {
+    conversationId: ctx.operatorChat.conversationId,
+    messageId: ctx.operatorChat.messageId,
+    workspace: ctx.workspace,
+    config: ctx.config,
+    turnNumber: ctx.turnNumber,
+    abortSignal: ctx.abortSignal,
+    logger: ctx.logger,
+    statusServer: ctx.operatorChat.statusServer ?? null,
+  };
 }
 
 function safeFileName(value: string): string {

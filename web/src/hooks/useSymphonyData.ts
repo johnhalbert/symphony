@@ -8,7 +8,16 @@ import {
   applyOrchestratorMessageEvent,
   applyTranscriptDeltaEvent,
 } from "../data/realtimePatches";
-import type { ChatMessage, IssueDetailModel, Loadable, OrchestratorChatModel, TranscriptMessage } from "../types/symphony";
+import type {
+  ChatMessage,
+  IssueDetailModel,
+  Loadable,
+  OrchestratorChatModel,
+  TranscriptActiveTailModel,
+  TranscriptMessage,
+  TranscriptWindowModel,
+  TranscriptWindowPageModel,
+} from "../types/symphony";
 
 interface SymphonyResourceOptions {
   enabled?: boolean;
@@ -126,17 +135,46 @@ function createTranscriptPatchCursor(sessionId: string | null = null): Transcrip
   };
 }
 
-export function useTranscript(sessionId: string | null, refreshToken?: unknown): Loadable<TranscriptMessage[]> {
+interface TranscriptState extends Loadable<TranscriptMessage[]> {
+  sessionId: string | null;
+  page: TranscriptWindowPageModel | null;
+  window: TranscriptWindowModel | null;
+  activeTail: TranscriptActiveTailModel | null;
+  loadingPrevious: boolean;
+  previousError: string | null;
+}
+
+export interface TranscriptLoadable extends Loadable<TranscriptMessage[]> {
+  page: TranscriptWindowPageModel | null;
+  window: TranscriptWindowModel | null;
+  activeTail: TranscriptActiveTailModel | null;
+  hasPrevious: boolean;
+  loadingPrevious: boolean;
+  previousError: string | null;
+  loadPrevious: () => Promise<void>;
+}
+
+function createTranscriptState(sessionId: string | null, loading = Boolean(sessionId)): TranscriptState {
+  return {
+    sessionId,
+    data: sessionId ? null : [],
+    loading,
+    error: null,
+    page: null,
+    window: null,
+    activeTail: null,
+    loadingPrevious: false,
+    previousError: null,
+  };
+}
+
+export function useTranscript(sessionId: string | null, refreshToken?: unknown): TranscriptLoadable {
   const dataSource = useDataSource();
   const normalizedSessionId = sessionId || null;
   const [patchRefreshToken, setPatchRefreshToken] = useState(0);
   const patchCursor = useRef<TranscriptPatchCursor>(createTranscriptPatchCursor());
-  const [state, setState] = useState<Loadable<TranscriptMessage[]> & { sessionId: string | null }>({
-    sessionId: normalizedSessionId,
-    data: normalizedSessionId ? null : [],
-    loading: Boolean(normalizedSessionId),
-    error: null,
-  });
+  const previousLoadRef = useRef<{ sessionId: string; controller: AbortController } | null>(null);
+  const [state, setState] = useState<TranscriptState>(() => createTranscriptState(normalizedSessionId));
   const stateRef = useRef(state);
 
   useEffect(() => {
@@ -147,7 +185,9 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
     let active = true;
     if (!normalizedSessionId) {
       patchCursor.current = createTranscriptPatchCursor();
-      const nextState = { sessionId: null, data: [], loading: false, error: null };
+      previousLoadRef.current?.controller.abort();
+      previousLoadRef.current = null;
+      const nextState = createTranscriptState(null, false);
       stateRef.current = nextState;
       setState(nextState);
       return () => {
@@ -162,16 +202,19 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
     const controller = new AbortController();
     setState((current) => {
       const nextState = {
+        ...current,
         sessionId: normalizedSessionId,
         data: current.sessionId === normalizedSessionId ? current.data : null,
         loading: true,
         error: null,
+        loadingPrevious: false,
+        previousError: null,
       };
       stateRef.current = nextState;
       return nextState;
     });
     dataSource
-      .getTranscript(normalizedSessionId, controller.signal, { full: true })
+      .getTranscript(normalizedSessionId, controller.signal, { tail: true })
       .then((transcriptWindow) => {
         if (!active) return;
         patchCursor.current = {
@@ -182,7 +225,17 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
           refetchHref: transcriptWindow.activeTail.refetchHref ?? transcriptWindow.recovery.href,
           canAppend: transcriptWindow.activeTail.canAppend === true,
         };
-        const nextState = { sessionId: normalizedSessionId, data: transcriptWindow.messages, loading: false, error: null };
+        const nextState = {
+          sessionId: normalizedSessionId,
+          data: transcriptWindow.messages,
+          loading: false,
+          error: null,
+          page: transcriptWindow.page,
+          window: transcriptWindow.window,
+          activeTail: transcriptWindow.activeTail,
+          loadingPrevious: false,
+          previousError: null,
+        };
         stateRef.current = nextState;
         setState(nextState);
       })
@@ -191,6 +244,7 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
         const message = error instanceof Error ? error.message : String(error);
         setState((current) => {
           const nextState = {
+            ...current,
             sessionId: normalizedSessionId,
             data: current.sessionId === normalizedSessionId ? current.data : null,
             loading: false,
@@ -204,6 +258,10 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
     return () => {
       active = false;
       controller.abort();
+      if (previousLoadRef.current?.sessionId === normalizedSessionId) {
+        previousLoadRef.current.controller.abort();
+        previousLoadRef.current = null;
+      }
     };
   }, [dataSource, normalizedSessionId, refreshToken, patchRefreshToken]);
 
@@ -219,7 +277,7 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
         current: stateRef.current.sessionId === normalizedSessionId ? stateRef.current.data : null,
         lastSequence: cursor.lastSequence,
         lastRevision: cursor.lastRevision,
-        tailLimit: cursor.tailLimit,
+        tailLimit: transcriptRealtimeTailLimit(cursor.tailLimit, stateRef.current.data),
       });
       if (outcome.action === "ignored") return;
       const nextCursor: TranscriptPatchCursor = {
@@ -235,17 +293,148 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
         setPatchRefreshToken((current) => current + 1);
         return;
       }
-      const nextState = { sessionId: normalizedSessionId, data: outcome.data, loading: false, error: null };
+      const currentState = stateRef.current;
+      const nextActiveTail = currentState.activeTail
+        ? { ...currentState.activeTail, afterSequence: outcome.lastSequence ?? currentState.activeTail.afterSequence }
+        : currentState.activeTail;
+      const nextState = {
+        ...currentState,
+        sessionId: normalizedSessionId,
+        data: outcome.data,
+        loading: false,
+        error: null,
+        activeTail: nextActiveTail,
+      };
       stateRef.current = nextState;
       setState(nextState);
     });
   }, [dataSource, normalizedSessionId]);
 
+  const loadPrevious = useCallback(async () => {
+    const current = stateRef.current;
+    if (!normalizedSessionId || current.sessionId !== normalizedSessionId || current.loadingPrevious) return;
+    const previousPage = previousTranscriptPageRequest(current.page);
+    if (!previousPage) return;
+
+    previousLoadRef.current?.controller.abort();
+    const controller = new AbortController();
+    previousLoadRef.current = { sessionId: normalizedSessionId, controller };
+    setState((latest) => {
+      if (latest.sessionId !== normalizedSessionId) return latest;
+      const nextState = { ...latest, loadingPrevious: true, previousError: null };
+      stateRef.current = nextState;
+      return nextState;
+    });
+
+    try {
+      const transcriptWindow = await dataSource.getTranscript(normalizedSessionId, controller.signal, previousPage);
+      if (controller.signal.aborted) return;
+      setState((latest) => {
+        if (latest.sessionId !== normalizedSessionId) return latest;
+        const merged = mergeBackfilledTranscriptMessages(transcriptWindow.messages, latest.data ?? []);
+        const nextState = {
+          ...latest,
+          data: merged,
+          page: mergeBackfilledTranscriptPage(transcriptWindow.page, latest.page),
+          window: latest.window
+            ? { ...latest.window, messageCount: merged.length }
+            : { ...transcriptWindow.window, messageCount: merged.length },
+          loadingPrevious: false,
+          previousError: null,
+        };
+        stateRef.current = nextState;
+        return nextState;
+      });
+    } catch (error: unknown) {
+      if (controller.signal.aborted) return;
+      const message = error instanceof Error ? error.message : String(error);
+      setState((latest) => {
+        if (latest.sessionId !== normalizedSessionId) return latest;
+        const nextState = { ...latest, loadingPrevious: false, previousError: message };
+        stateRef.current = nextState;
+        return nextState;
+      });
+    } finally {
+      if (previousLoadRef.current?.controller === controller) previousLoadRef.current = null;
+    }
+  }, [dataSource, normalizedSessionId]);
+
   if (state.sessionId !== normalizedSessionId) {
-    return { data: normalizedSessionId ? null : [], loading: Boolean(normalizedSessionId), error: null };
+    return {
+      ...createTranscriptState(normalizedSessionId),
+      hasPrevious: false,
+      loadPrevious,
+    };
   }
 
-  return { data: state.data, loading: state.loading, error: state.error };
+  return {
+    data: state.data,
+    loading: state.loading,
+    error: state.error,
+    page: state.page,
+    window: state.window,
+    activeTail: state.activeTail,
+    hasPrevious: state.page?.hasPrevious === true,
+    loadingPrevious: state.loadingPrevious,
+    previousError: state.previousError,
+    loadPrevious,
+  };
+}
+
+function previousTranscriptPageRequest(page: TranscriptWindowPageModel | null): { offset: number; limit: number } | null {
+  if (!page?.hasPrevious) return null;
+  const previousOffset = page.previousOffset;
+  if (typeof previousOffset !== "number" || !Number.isFinite(previousOffset)) return null;
+  if (previousOffset < 0 || previousOffset >= page.offset) return null;
+  return { offset: previousOffset, limit: Math.max(1, page.offset - previousOffset) };
+}
+
+function transcriptRealtimeTailLimit(defaultTailLimit: number, current: readonly TranscriptMessage[] | null): number {
+  if (!current || current.length <= defaultTailLimit) return defaultTailLimit;
+  return current.length + 50;
+}
+
+function mergeBackfilledTranscriptMessages(
+  backfillMessages: readonly TranscriptMessage[],
+  currentMessages: readonly TranscriptMessage[],
+): TranscriptMessage[] {
+  const currentPreludeLength = leadingRunPreludeLength(currentMessages);
+  if (currentPreludeLength === 0) return [...backfillMessages, ...currentMessages];
+  const backfillPreludeLength = leadingRunPreludeLength(backfillMessages);
+  if (!sameTranscriptPrelude(backfillMessages.slice(0, backfillPreludeLength), currentMessages.slice(0, currentPreludeLength))) {
+    return [...backfillMessages, ...currentMessages];
+  }
+  return [
+    ...currentMessages.slice(0, currentPreludeLength),
+    ...backfillMessages.slice(backfillPreludeLength),
+    ...currentMessages.slice(currentPreludeLength),
+  ];
+}
+
+function leadingRunPreludeLength(messages: readonly TranscriptMessage[]): number {
+  let length = 0;
+  if (messages[length]?.kind === "system") length += 1;
+  if (messages[length]?.kind === "user") length += 1;
+  return length;
+}
+
+function sameTranscriptPrelude(left: readonly TranscriptMessage[], right: readonly TranscriptMessage[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((message, index) => JSON.stringify(message) === JSON.stringify(right[index]));
+}
+
+function mergeBackfilledTranscriptPage(
+  backfillPage: TranscriptWindowPageModel,
+  currentPage: TranscriptWindowPageModel | null,
+): TranscriptWindowPageModel {
+  if (!currentPage) return backfillPage;
+  return {
+    ...backfillPage,
+    nextOffset: currentPage.nextOffset,
+    hasNext: currentPage.hasNext,
+    lastSequence: currentPage.lastSequence,
+    lastEventAt: currentPage.lastEventAt,
+  };
 }
 
 export function useSidebar(options: SymphonyResourceOptions = {}) {

@@ -6,9 +6,11 @@ import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRo
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import { isRunActivityCommandPolicyDecisionPayload } from "../runActivity/RunActivityEvent.js";
+import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
+export type PersistedRunRole = AgentRunRole | "planner";
 export type PersistedRunCancellationSource = "operator" | "state_change" | "stalled" | "service_stop";
 export type PersistedCancelFailedSource = "harness_stop" | "cancel_ignored";
 export type PersistedCancellationOutcome = "none" | "requested" | "cancelled" | "harness_stop_failed" | "cancel_ignored";
@@ -138,7 +140,7 @@ export interface RunRecord {
   runId: string;
   sessionId: string | null;
   agentId: string | null;
-  role: AgentRunRole;
+  role: PersistedRunRole;
   runPhase?: AgentRunPhase;
   runKind?: AgentRunKind;
   issueId: string;
@@ -267,7 +269,7 @@ export interface StartRunInput {
   runId: string;
   sessionId?: string | null;
   agentId?: string | null;
-  role: AgentRunRole;
+  role: PersistedRunRole;
   runPhase?: AgentRunPhase;
   runKind?: AgentRunKind;
   issueId: string;
@@ -535,7 +537,7 @@ export class FileRunTranscriptStore {
 
   async latestRunForIssue(
     issueIdOrIdentifier: string,
-    options: { role?: AgentRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
+    options: { role?: PersistedRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
   ): Promise<RunRecord | null> {
     const records = await this.listRunsForIssue(issueIdOrIdentifier);
     const filtered = records.filter(
@@ -577,7 +579,7 @@ export class FileRunTranscriptStore {
   async listRuns(): Promise<RunRecord[]> {
     await fs.mkdir(this.runsDir(), { recursive: true });
     const entries = await fs.readdir(this.runsDir());
-    const records = await Promise.all(entries.map((entry) => readJsonIfExists<RunRecord>(this.metaPath(entry))));
+    const records = await mapWithFileReadConcurrency(entries, (entry) => readJsonIfExists<RunRecord>(this.metaPath(entry)));
     return records.filter((record): record is RunRecord => record !== null).map(normalizeRunRecord);
   }
 
@@ -726,7 +728,8 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
   };
 }
 
-function defaultRunPhase(role: AgentRunRole): AgentRunPhase {
+function defaultRunPhase(role: PersistedRunRole): AgentRunPhase {
+  if (role === "planner") return "issue_breakdown";
   return role === "reviewer" ? "review" : "implementation";
 }
 

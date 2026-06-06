@@ -67,6 +67,11 @@ function SelectedTranscript({
       messages={messages}
       loading={transcript.loading}
       error={transcript.error}
+      activeTail={transcript.activeTail}
+      hasPrevious={transcript.hasPrevious}
+      loadingPrevious={transcript.loadingPrevious}
+      previousError={transcript.previousError}
+      onLoadPrevious={transcript.loadPrevious}
     />
   );
 }

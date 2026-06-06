@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ChatHistoryView, resolveSelectedSessionId } from "../src/components/history/ChatHistoryView";
+import { TranscriptPane } from "../src/components/history/TranscriptPane";
 import type { HistoryModel, Loadable, SessionModel, TranscriptMessage } from "../src/types/symphony";
 import {
   buildProjectedLargeRealRunTranscriptReadabilityFixture,
@@ -131,6 +132,51 @@ function mountHistoryView(initialHistory: HistoryModel, refreshToken?: unknown) 
   };
 }
 
+function mountTranscriptPane({
+  session = sessions[1],
+  messages = apiTranscript,
+  hasPrevious = false,
+  loadingPrevious = false,
+  onLoadPrevious,
+}: {
+  session?: SessionModel;
+  messages?: TranscriptMessage[];
+  hasPrevious?: boolean;
+  loadingPrevious?: boolean;
+  onLoadPrevious?: () => Promise<void>;
+} = {}) {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  mountedRoots.push(root);
+
+  function render(nextMessages = messages, nextHasPrevious = hasPrevious, nextLoadingPrevious = loadingPrevious) {
+    act(() => {
+      root.render(
+        <TranscriptPane
+          session={session}
+          messages={nextMessages}
+          hasPrevious={nextHasPrevious}
+          loadingPrevious={nextLoadingPrevious}
+          onLoadPrevious={onLoadPrevious}
+        />,
+      );
+    });
+  }
+
+  render();
+
+  return {
+    container,
+    render,
+    transcriptElement() {
+      const transcript = container.querySelector<HTMLDivElement>(".transcript");
+      if (!transcript) throw new Error("expected transcript container to render");
+      return transcript;
+    },
+  };
+}
+
 afterEach(() => {
   for (const root of mountedRoots.splice(0)) {
     act(() => {
@@ -245,6 +291,67 @@ describe("ChatHistoryView", () => {
     expect(paragraphs[0]?.textContent).toBe("Line one\n  indented line");
     expect(paragraphs[0]?.style.whiteSpace).toBe("pre-wrap");
     expect(paragraphs[1]?.textContent).toBe("Line three");
+  });
+
+  it("focuses selected transcripts at the latest message and stays pinned for live appends", () => {
+    const view = mountTranscriptPane({ messages: [] });
+    const transcript = view.transcriptElement();
+    Object.defineProperties(transcript, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 1000 },
+    });
+
+    view.render(apiTranscript);
+    expect(transcript.scrollTop).toBe(900);
+
+    act(() => {
+      transcript.scrollTop = 900;
+      transcript.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    Object.defineProperty(transcript, "scrollHeight", { configurable: true, value: 1200 });
+    view.render([
+      ...apiTranscript,
+      {
+        kind: "assistant",
+        ts: "2026-05-29T00:14:00.000Z",
+        text: "Live appended worker output.",
+      },
+    ]);
+
+    expect(transcript.scrollTop).toBe(1100);
+  });
+
+  it("loads earlier transcript pages near the top and preserves the visible scroll anchor after prepend", async () => {
+    const onLoadPrevious = vi.fn().mockResolvedValue(undefined);
+    const view = mountTranscriptPane({ messages: apiTranscript, hasPrevious: true, onLoadPrevious });
+    const transcript = view.transcriptElement();
+    Object.defineProperties(transcript, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 1000 },
+    });
+
+    await act(async () => {
+      transcript.scrollTop = 0;
+      transcript.dispatchEvent(new Event("scroll", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(onLoadPrevious).toHaveBeenCalledTimes(1);
+
+    Object.defineProperty(transcript, "scrollHeight", { configurable: true, value: 1400 });
+    view.render(
+      [
+        {
+          kind: "assistant",
+          ts: "2026-05-29T00:10:00.000Z",
+          text: "Earlier backfilled worker output.",
+        },
+        ...apiTranscript,
+      ],
+      false,
+    );
+
+    expect(transcript.scrollTop).toBe(400);
   });
 
   it("renders the bounded projection of a generated large-session readability fixture without extra transcript rows", () => {

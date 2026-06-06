@@ -22,7 +22,12 @@ import {
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
-import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
+import type {
+  AgentEvent,
+  AgentHarness,
+  AgentRunContext,
+  OperatorChatRunContext,
+} from "../src/core/harness/AgentHarness.js";
 import type { RunActivityEvent } from "../src/core/runActivity/RunActivityEvent.js";
 import {
   planIssueBreakdownApplicationWritebacks,
@@ -45,6 +50,7 @@ import type {
   RemotePullRequestReviewEvidence,
 } from "../src/core/review/PullRequestReviewEvidenceService.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileOrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
@@ -134,6 +140,85 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
     expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
+  });
+
+  it("runs dashboard operator chat through the configured harness and persists assistant output", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const tracker = idleTracker();
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const conversationStore = new FileOrchestratorConversationStore(config.workspace.stateDir);
+    const harness = new FakeOperatorChatHarness([
+      { type: "session_started", sessionId: "operator-session-1", runId: "operator-run-1", model: "test-planner" },
+      { type: "progress", activitySource: "delta", message: "Hello " },
+      { type: "progress", activitySource: "delta", message: "operator" },
+      { type: "completed" },
+    ]);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "unused",
+      runStore,
+      orchestratorConversationStore: conversationStore,
+      statusServerBaseUrl: () => "http://127.0.0.1:7331",
+      statusMutationToken: "secret",
+    });
+    await conversationStore.appendMessage({
+      conversationId: "operator-room",
+      id: "client-message-1",
+      role: "user",
+      body: "what is running?",
+      status: "pending",
+    });
+
+    const result = await orchestrator.dispatchOrchestratorChatCommand({
+      action: "orchestrator.chat.post",
+      source: "web",
+      conversationId: "operator-room",
+      messageId: "client-message-1",
+      input: "what is running?",
+      requestedAt: "2026-06-06T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      status: "accepted",
+      metadata: {
+        conversationId: "operator-room",
+        messageId: "client-message-1",
+        role: "planner",
+        harnessId: "fake-operator",
+      },
+    });
+
+    await eventually(async () => {
+      const messages = await conversationStore.listMessages("operator-room");
+      expect(messages.map((message) => [message.role, message.status, message.body])).toEqual([
+        ["user", "completed", "what is running?"],
+        ["assistant", "completed", "Hello operator"],
+      ]);
+    });
+    expect(harness.operatorContexts).toHaveLength(1);
+    expect(harness.operatorContexts[0]).toMatchObject({
+      conversationId: "operator-room",
+      messageId: "client-message-1",
+      statusServer: { baseUrl: "http://127.0.0.1:7331", mutationToken: "secret" },
+    });
+    const run = await runStore.getRun("operator-run-1");
+    expect(run).toMatchObject({
+      runId: "operator-run-1",
+      role: "planner",
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+      status: "succeeded",
+      runtimeModel: "test-planner",
+      runtimeAgentLifecycle: "reuse_by_conversation",
+    });
+    const transcript = await runStore.readTranscript("operator-run-1");
+    expect(transcript.events.map((event) => event.eventType)).toContain("completed");
   });
 
   it("persists distinct Hermes ACP runtime metadata on started runs", async () => {
@@ -7681,6 +7766,51 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
     );
     yield { type: "completed" };
   }
+}
+
+class FakeOperatorChatHarness implements AgentHarness {
+  readonly id = "fake-operator";
+  readonly operatorContexts: OperatorChatRunContext[] = [];
+
+  constructor(private readonly events: AgentEvent[]) {}
+
+  async *run(_ctx: AgentRunContext, _prompt: string): AsyncIterable<AgentEvent> {
+    throw new Error("issue run is not implemented by FakeOperatorChatHarness");
+  }
+
+  async *runOperatorChat(ctx: OperatorChatRunContext, _prompt: string): AsyncIterable<AgentEvent> {
+    this.operatorContexts.push(ctx);
+    for (const event of this.events) yield event;
+  }
+}
+
+function idleTracker(): TrackerClient {
+  return {
+    async fetchCandidateIssues() {
+      return [];
+    },
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssueStatesByIds() {
+      return [];
+    },
+  };
+}
+
+async function eventually(assertion: () => Promise<void> | void, timeoutMs = 1000): Promise<void> {
+  const startedAt = Date.now();
+  let lastError: unknown = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      await assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  if (lastError) throw lastError;
 }
 
 class FakeCompletionReportPublisher implements CompletionReportPullRequestPublisher {

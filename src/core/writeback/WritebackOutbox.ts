@@ -4,6 +4,7 @@ import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
 import { latestFreshIssueBreakdownPlan } from "../IssueBreakdownPlanService.js";
+import { mapWithFileReadConcurrency } from "../persistence/FileReadConcurrency.js";
 import type { IssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "../persistence/ProjectionRevision.js";
 import type { TrackerWriteEvidence, TrackerWriteResult, TrackerWriter } from "../tracker/TrackerWriter.js";
@@ -263,8 +264,9 @@ export class FileWritebackOutboxStore {
   async list(): Promise<WritebackOperation[]> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
     const entries = await fs.readdir(this.recordsDir());
-    const records = await Promise.all(
-      entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<WritebackOperation>(path.join(this.recordsDir(), entry))),
+    const records = await mapWithFileReadConcurrency(
+      entries.filter((entry) => entry.endsWith(".json")).map((entry) => path.join(this.recordsDir(), entry)),
+      (filePath) => readJsonIfExists<WritebackOperation>(filePath),
     );
     return dedupeWritebackRecords(records.filter((record): record is WritebackOperation => record !== null));
   }

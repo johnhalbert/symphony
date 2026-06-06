@@ -8,6 +8,7 @@ import {
   type ProviderLimitSignal,
   type RuntimeProviderGate,
 } from "../provider/ProviderLimits.js";
+import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
 
 export interface ProviderGateStore {
   upsert(signal: ProviderLimitSignal): Promise<RuntimeProviderGate>;
@@ -67,8 +68,9 @@ export class FileProviderGateStore implements ProviderGateStore {
   private async readAllGates(): Promise<RuntimeProviderGate[]> {
     try {
       const entries = await fs.readdir(this.providerGatesDir());
-      const records = await Promise.all(
-        entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<RuntimeProviderGate>(path.join(this.providerGatesDir(), entry))),
+      const records = await mapWithFileReadConcurrency(
+        entries.filter((entry) => entry.endsWith(".json")).map((entry) => path.join(this.providerGatesDir(), entry)),
+        (filePath) => readJsonIfExists<RuntimeProviderGate>(filePath),
       );
       return records.filter((record): record is RuntimeProviderGate => record !== null && typeof record.id === "string");
     } catch (error) {

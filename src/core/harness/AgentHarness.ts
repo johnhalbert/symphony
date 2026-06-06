@@ -22,8 +22,27 @@ export interface AgentRunContext {
   config: ServiceConfig;
   turnNumber: number;
   runModeOverride?: AgentRunMode | null;
+  operatorChat?: {
+    conversationId: string;
+    messageId: string;
+    statusServer?: OperatorChatRunContext["statusServer"];
+  };
   abortSignal: AbortSignal;
   logger: Logger;
+}
+
+export interface OperatorChatRunContext {
+  conversationId: string;
+  messageId: string;
+  workspace: Workspace;
+  config: ServiceConfig;
+  turnNumber: number;
+  abortSignal: AbortSignal;
+  logger: Logger;
+  statusServer?: {
+    baseUrl: string;
+    mutationToken: string | null;
+  } | null;
 }
 
 export type AgentActivitySource = "stream" | "delta" | "tool";
@@ -106,6 +125,7 @@ export interface AgentHarness {
   readonly supportsContinuation?: boolean;
   prepare?(ctx: AgentRunContext): Promise<void>;
   run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent>;
+  runOperatorChat?(ctx: OperatorChatRunContext, prompt: string): AsyncIterable<AgentEvent>;
   reload?(ctx: AgentRunContext): Promise<void>;
   stop?(runId: string): Promise<void>;
 }

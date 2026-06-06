@@ -6,7 +6,7 @@ import {
   buildAgentCommandPolicyHookDecisionJournalFallbackPath,
   type AgentCommandPolicyHookDecisionJournalEntry,
 } from "../../src/core/harness/AgentCommandPolicyHookRunner.js";
-import type { AgentEvent, AgentHarness, AgentRunContext } from "../../src/core/harness/AgentHarness.js";
+import type { AgentEvent, AgentHarness, AgentRunContext, OperatorChatRunContext } from "../../src/core/harness/AgentHarness.js";
 import type { ProviderLimitKind, ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
 import type { RunActivityEvent, RunActivityCommandPolicyDecisionPayload } from "../../src/core/runActivity/RunActivityEvent.js";
 import {
@@ -440,6 +440,10 @@ export class HermesHarness implements AgentHarness {
     return gatewaySessionId;
   }
 
+  async *runOperatorChat(ctx: OperatorChatRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    yield* this.run(operatorChatAgentRunContext(ctx), prompt);
+  }
+
   private async gatewayRequest<T = unknown>(
     lease: HermesLease,
     method: string,
@@ -595,6 +599,7 @@ class AsyncEventQueue<T> implements AsyncIterable<T> {
 }
 
 function shouldReuseLease(ctx: AgentRunContext): boolean {
+  if (ctx.operatorChat) return true;
   return (
     ctx.role === "worker" &&
     currentRunPhase(ctx) === "implementation" &&
@@ -603,10 +608,12 @@ function shouldReuseLease(ctx: AgentRunContext): boolean {
 }
 
 function reusableLeaseKey(ctx: AgentRunContext): string {
+  if (ctx.operatorChat) return `${ctx.workspace.path}:operator:${ctx.operatorChat.conversationId}`;
   return `${ctx.workspace.path}:worker:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
 }
 
 function templateForRun(ctx: AgentRunContext): string {
+  if (ctx.operatorChat) return ctx.config.hermes.roleTemplates.planner;
   const phase = currentRunPhase(ctx);
   if (ctx.role === "reviewer") return ctx.config.hermes.roleTemplates.reviewer;
   if (phase === "issue_breakdown") return ctx.config.hermes.roleTemplates.planner;
@@ -640,6 +647,16 @@ function shouldInstallAgentCommandPolicyHook(ctx: AgentRunContext, phase: AgentR
 }
 
 function hermesRunProfileKey(ctx: AgentRunContext, phase: AgentRunPhase, reusable: boolean, freshLeaseId: string | null): string {
+  if (ctx.operatorChat) {
+    return hermesAcpProfileName({
+      workspaceKey: ctx.workspace.workspaceKey,
+      role: "planner",
+      issueIdentifier: ctx.operatorChat.conversationId,
+      phase: "operator_chat",
+      reuseMode: "reuse_by_issue",
+      freshLeaseId: null,
+    });
+  }
   return hermesAcpProfileName({
     workspaceKey: ctx.workspace.workspaceKey,
     role: ctx.role,
@@ -648,6 +665,41 @@ function hermesRunProfileKey(ctx: AgentRunContext, phase: AgentRunPhase, reusabl
     reuseMode: reusable ? "reuse_by_issue" : "fresh_per_run",
     freshLeaseId,
   });
+}
+
+function operatorChatAgentRunContext(ctx: OperatorChatRunContext): AgentRunContext {
+  return {
+    issue: {
+      id: `operator:${ctx.conversationId}`,
+      identifier: "OPERATOR",
+      title: "Dashboard operator chat",
+      description: null,
+      priority: null,
+      state: "operator_chat",
+      branchName: null,
+      url: null,
+      assigneeId: null,
+      delegateId: null,
+      assignedToWorker: false,
+      labels: [],
+      blockedBy: [],
+      createdAt: null,
+      updatedAt: null,
+    },
+    role: "worker",
+    runPhase: "implementation",
+    attempt: null,
+    workspace: ctx.workspace,
+    config: ctx.config,
+    turnNumber: ctx.turnNumber,
+    abortSignal: ctx.abortSignal,
+    logger: ctx.logger,
+    operatorChat: {
+      conversationId: ctx.conversationId,
+      messageId: ctx.messageId,
+      statusServer: ctx.statusServer ?? null,
+    },
+  };
 }
 
 function acceptGatewayEvent(event: GatewayEvent, sessionId: string | null): boolean {

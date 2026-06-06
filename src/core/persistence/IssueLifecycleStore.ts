@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue } from "../types.js";
+import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 
 export type IssueLifecyclePhase =
@@ -524,10 +525,11 @@ export class FileIssueLifecycleStore {
   async list(): Promise<IssueLifecycleRecord[]> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
     const entries = await fs.readdir(this.recordsDir());
-    const records = await Promise.all(
+    const records = await mapWithFileReadConcurrency(
       entries
         .filter((entry) => entry.endsWith(".json"))
-        .map((entry) => readLifecycleJsonIfExists(path.join(this.recordsDir(), entry))),
+        .map((entry) => path.join(this.recordsDir(), entry)),
+      (filePath) => readLifecycleJsonIfExists(filePath),
     );
     return records.filter((record): record is IssueLifecycleRecord => record !== null);
   }

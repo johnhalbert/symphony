@@ -333,7 +333,7 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
           Accept: "application/json",
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ input }),
+        body: JSON.stringify({ input, messageId: createClientMessageId() }),
       });
       if (!response.ok) throw new Error(`Symphony API returned HTTP ${response.status}`);
       const body = (await response.json()) as unknown;
@@ -349,4 +349,10 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       return realtimeEventSourceClient.subscribe(listener, options);
     },
   };
+}
+
+function createClientMessageId(): string {
+  const randomId = globalThis.crypto?.randomUUID?.();
+  if (randomId) return `web-${randomId}`;
+  return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }

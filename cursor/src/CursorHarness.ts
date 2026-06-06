@@ -1,12 +1,21 @@
 import { Agent, type Run, type SDKAgent, type SDKMessage, type SettingSource } from "@cursor/sdk";
 import path from "node:path";
 import type { ModelSelection } from "@cursor/sdk";
-import type { AgentEvent, AgentHarness, AgentRunContext, AgentRunSdkStatus } from "../../src/core/harness/AgentHarness.js";
+import type {
+  AgentEvent,
+  AgentHarness,
+  AgentRunContext,
+  AgentRunSdkStatus,
+  OperatorChatRunContext,
+} from "../../src/core/harness/AgentHarness.js";
 import type { AgentRunPhase } from "../../src/core/types.js";
 import {
   symphonyRoleMcpServers,
+  symphonyOperatorChatMcpServers,
+  writeActiveOperatorChatMcpContext,
   writeActiveHandoffMcpContexts,
   writeInitialHandoffMcpContexts,
+  writeInitialOperatorChatMcpContext,
 } from "../../src/core/harness/HandoffMcp.js";
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
@@ -366,6 +375,270 @@ export class CursorHarness implements AgentHarness {
     }
   }
 
+  async *runOperatorChat(ctx: OperatorChatRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    await writeInitialOperatorChatMcpContext(ctx);
+    const lease = await this.getOrCreateOperatorAgentLease(ctx);
+    const agent = lease.agent;
+    const deltaEvents: AgentEvent[] = [];
+    const cliPath = currentSymphonyCliPath();
+    const mcpServers = symphonyOperatorChatMcpServers(ctx, { cliPath });
+    const runOptions = cursorOperatorAgentSendOptions(ctx, {
+      mcpServers,
+      onDelta: ({ update }) => {
+        deltaEvents.push(...mapCursorDelta(update));
+      },
+    });
+    let run: Run;
+    try {
+      run = await agent.send(prompt, runOptions);
+    } catch (error) {
+      throw new SymphonyError("agent_error", `Cursor operator chat send failed: ${errorMessage(error)}`, error);
+    }
+
+    this.activeRuns.set(run.id, run);
+    const abort = () => {
+      void run.cancel().catch((error) => {
+        ctx.logger.warn("cursor operator chat run cancel failed", {
+          run_id: run.id,
+          conversation_id: ctx.conversationId,
+          message_id: ctx.messageId,
+          error: errorMessage(error),
+        });
+      });
+    };
+    ctx.abortSignal.addEventListener("abort", abort, { once: true });
+    if (ctx.abortSignal.aborted) abort();
+
+    const queue = new AsyncEventQueue<AgentEvent>();
+    const enqueueEvent = (event: AgentEvent) => queue.push(sanitizeAgentEventForPublicOutput(event));
+    let sessionStarted = false;
+    let waitStarted = false;
+    let waitSettled = false;
+    let streamSettled = false;
+    let terminalByStatusObserved = false;
+    let pendingTerminalEvents: AgentEvent[] | null = null;
+    let streamIterator: AsyncIterator<unknown> | null = null;
+    let lastToolContext: CursorLastToolContext | null = null;
+    const bufferedStatusEvents: AgentEvent[] = [];
+    const observableRun = run as Run & {
+      readonly status?: unknown;
+      onDidChangeStatus?: (listener: (status: AgentRunSdkStatus) => void) => () => void;
+    };
+    const enqueueStatus = (status: AgentRunSdkStatus, source: "initial" | "onDidChangeStatus" | "wait") => {
+      const event: AgentEvent = {
+        type: "run_status",
+        runId: run.id,
+        sdkStatus: status,
+        source,
+        at: new Date().toISOString(),
+      };
+      if (sessionStarted) {
+        enqueueEvent(event);
+      } else {
+        bufferedStatusEvents.push(event);
+      }
+      if (source !== "wait" && isTerminalSdkStatus(status)) {
+        terminalByStatusObserved = true;
+        if (sessionStarted) void finalizeFromWait();
+      }
+    };
+    const contextualizeTerminalEvents = (events: AgentEvent[]) =>
+      events.map((event) => {
+        if (
+          event.type !== "run_diagnostic" ||
+          (event.code !== "cursor_run_wait_terminal_error" && event.code !== "cursor_run_wait_threw") ||
+          typeof event.payload !== "object" ||
+          event.payload === null ||
+          Array.isArray(event.payload)
+        ) {
+          return event;
+        }
+        return {
+          ...event,
+          payload: {
+            ...event.payload,
+            streamSettled,
+            terminalByStatusObserved,
+            cancellationRequested: ctx.abortSignal.aborted,
+            lastTool: lastToolContext,
+          },
+        };
+      });
+    const emitTerminalEvents = (events: AgentEvent[]) => {
+      for (const event of contextualizeTerminalEvents(events)) enqueueEvent(event);
+      queue.close();
+    };
+    const finalizeFromWait = async () => {
+      if (waitStarted) return;
+      waitStarted = true;
+      try {
+        const result = await run.wait();
+        waitSettled = true;
+        const status = normalizeSdkRunStatus(result.status) ?? "error";
+        const terminalEvents: AgentEvent[] = [
+          {
+            type: "run_status",
+            runId: run.id,
+            sdkStatus: status,
+            source: "wait",
+            at: new Date().toISOString(),
+          },
+        ];
+        if (result.status === "finished") {
+          terminalEvents.push(result.result === undefined ? { type: "completed" } : { type: "completed", message: result.result });
+        } else if (result.status === "cancelled") {
+          terminalEvents.push({ type: "cancelled" });
+        } else {
+          terminalEvents.push({
+            type: "run_diagnostic",
+            code: "cursor_run_wait_terminal_error",
+            message: "Cursor operator chat run wait returned terminal SDK error",
+            payload: {
+              runId: run.id,
+              agentId: agent.agentId,
+              sdkStatus: status,
+              sdkStatusSource: "wait",
+              waitResultStatus: previewValue(result.status, 160),
+              waitResultMessage: previewValue(result.result, 500),
+              streamSettled,
+              terminalByStatusObserved,
+              cancellationRequested: ctx.abortSignal.aborted,
+              lastTool: lastToolContext,
+            },
+          });
+          terminalEvents.push({ type: "failed", error: result.result ?? "Cursor operator chat run failed" });
+        }
+        if (streamSettled || terminalByStatusObserved) emitTerminalEvents(terminalEvents);
+        else pendingTerminalEvents = terminalEvents;
+      } catch (error) {
+        waitSettled = true;
+        const terminalEvents: AgentEvent[] = [
+          {
+            type: "run_status",
+            runId: run.id,
+            sdkStatus: "error",
+            source: "wait",
+            at: new Date().toISOString(),
+          },
+          {
+            type: "run_diagnostic",
+            code: "cursor_run_wait_threw",
+            message: `Cursor operator chat run wait threw: ${errorMessage(error)}`,
+            payload: {
+              runId: run.id,
+              agentId: agent.agentId,
+              sdkStatus: "error",
+              sdkStatusSource: "wait",
+              errorPreview: previewValue(errorMessage(error), 500),
+              streamSettled,
+              terminalByStatusObserved,
+              cancellationRequested: ctx.abortSignal.aborted,
+              lastTool: lastToolContext,
+            },
+          },
+          { type: "failed", error: `Cursor operator chat run wait failed: ${errorMessage(error)}` },
+        ];
+        if (streamSettled || terminalByStatusObserved) emitTerminalEvents(terminalEvents);
+        else pendingTerminalEvents = terminalEvents;
+      }
+    };
+    const unsubscribeStatus =
+      typeof observableRun.onDidChangeStatus === "function"
+        ? observableRun.onDidChangeStatus((status) => {
+            const normalized = normalizeSdkRunStatus(status) ?? normalizeSdkRunStatus(observableRun.status);
+            if (normalized) enqueueStatus(normalized, "onDidChangeStatus");
+          })
+        : null;
+    const initialStatus = normalizeSdkRunStatus(observableRun.status);
+    if (initialStatus) enqueueStatus(initialStatus, "initial");
+
+    try {
+      await writeActiveOperatorChatMcpContext(ctx, { activeRunId: run.id, sessionId: `${agent.agentId}:${run.id}` });
+      yield {
+        type: "session_started",
+        sessionId: `${agent.agentId}:${run.id}`,
+        threadId: agent.agentId,
+        runId: run.id,
+      };
+      await this.options.runStore?.updateRun(run.id, {
+        sessionId: `${agent.agentId}:${run.id}`,
+        agentId: agent.agentId,
+      });
+      await this.options.runStore?.appendEvent({
+        runId: run.id,
+        at: new Date().toISOString(),
+        source: "cursor",
+        eventType: "cursor_operator_agent_lifecycle",
+        message: `Cursor operator agent ${lease.outcome}; resumeUsed=${lease.resumeUsed}`,
+        payload: {
+          harnessId: this.id,
+          agentId: agent.agentId,
+          conversationId: ctx.conversationId,
+          reusable: true,
+          created: lease.created,
+          resumeAttempted: lease.resumeAttempted,
+          resumeUsed: lease.resumeUsed,
+          outcome: lease.outcome,
+        },
+      });
+
+      sessionStarted = true;
+      for (const event of bufferedStatusEvents.splice(0, bufferedStatusEvents.length)) enqueueEvent(event);
+      void finalizeFromWait();
+      const streamTask = (async () => {
+        try {
+          streamIterator = run.stream()[Symbol.asyncIterator]();
+          while (true) {
+            const next = await streamIterator.next();
+            if (next.done) break;
+            const message = next.value;
+            const toolContext = cursorLastToolContext(message);
+            if (toolContext) lastToolContext = toolContext;
+            const transcriptEvent = cursorTranscriptEvent(message);
+            if (transcriptEvent) {
+              await this.options.runStore?.appendEvent({
+                runId: run.id,
+                at: new Date().toISOString(),
+                source: "cursor",
+                ...transcriptEvent,
+                payload: runtimeTranscriptPayload(transcriptEvent.payload, this.id),
+              });
+            }
+            for (const event of flush(deltaEvents)) enqueueEvent(event);
+            for (const event of mapCursorMessage(message as SDKMessage)) enqueueEvent(event);
+          }
+        } catch (error) {
+          enqueueEvent({
+            type: "run_diagnostic",
+            code: "cursor_stream_error",
+            message: `Cursor operator chat stream failed: ${errorMessage(error)}`,
+            payload: { error: errorMessage(error) },
+          });
+          void run.cancel().catch(() => undefined);
+        } finally {
+          streamSettled = true;
+          for (const event of flush(deltaEvents)) enqueueEvent(event);
+          if (pendingTerminalEvents) emitTerminalEvents(pendingTerminalEvents);
+        }
+      })();
+
+      try {
+        for await (const event of queue) yield event;
+      } finally {
+        if (!waitSettled) queue.close();
+        const iterator = streamIterator as ({ return?: () => Promise<IteratorResult<unknown>> } & AsyncIterator<unknown>) | null;
+        if (typeof iterator?.return === "function") void iterator.return().catch(() => undefined);
+        void streamTask.catch(() => undefined);
+      }
+    } catch (error) {
+      throw new SymphonyError("agent_error", `Cursor operator chat run failed: ${errorMessage(error)}`, error);
+    } finally {
+      unsubscribeStatus?.();
+      ctx.abortSignal.removeEventListener("abort", abort);
+      this.activeRuns.delete(run.id);
+    }
+  }
+
   async stop(runId: string): Promise<void> {
     const run = this.activeRuns.get(runId);
     if (run) await run.cancel();
@@ -378,6 +651,22 @@ export class CursorHarness implements AgentHarness {
 
   private async getOrCreateAgent(ctx: AgentRunContext): Promise<SDKAgent> {
     return (await this.getOrCreateAgentLease(ctx)).agent;
+  }
+
+  private async getOrCreateOperatorAgentLease(ctx: OperatorChatRunContext): Promise<CursorAgentLease> {
+    const key = operatorAgentKey(ctx);
+    const existing = this.agents.get(key);
+    if (existing) return { agent: existing, created: false, resumeAttempted: false, resumeUsed: false, outcome: "reused" };
+
+    const cliPath = currentSymphonyCliPath();
+    await writeInitialOperatorChatMcpContext(ctx);
+    const mcpServers = symphonyOperatorChatMcpServers(ctx, { cliPath });
+    const createOptions = cursorOperatorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, "worker"), {
+      mcpServers,
+    });
+    const agent = await Agent.create(createOptions);
+    this.agents.set(key, agent);
+    return { agent, created: true, resumeAttempted: false, resumeUsed: false, outcome: "created" };
   }
 
   private async getOrCreateAgentLease(ctx: AgentRunContext): Promise<CursorAgentLease> {
@@ -644,6 +933,17 @@ export function cursorAgentCreateOptions(
   };
 }
 
+export function cursorOperatorAgentCreateOptions(
+  ctx: OperatorChatRunContext,
+  apiKey: string | null | undefined = resolveCursorRuntimeApiKey(ctx.config, "worker"),
+  options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
+): Parameters<typeof Agent.create>[0] {
+  return {
+    ...cursorOperatorAgentBaseOptions(ctx, apiKey, options),
+    ...cursorOperatorConversationModeOption(ctx),
+  };
+}
+
 function cursorAgentBaseOptions(
   ctx: AgentRunContext,
   apiKey: string | null | undefined,
@@ -656,6 +956,23 @@ function cursorAgentBaseOptions(
       settingSources: ctx.config.cursor.settingSources as SettingSource[],
     },
     name: cursorAgentName(ctx),
+    ...(apiKey ? { apiKey } : {}),
+    ...(options.mcpServers === undefined ? {} : { mcpServers: options.mcpServers }),
+  };
+}
+
+function cursorOperatorAgentBaseOptions(
+  ctx: OperatorChatRunContext,
+  apiKey: string | null | undefined,
+  options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
+): Parameters<typeof Agent.create>[0] {
+  return {
+    model: cursorOperatorModelSelection(ctx),
+    local: {
+      cwd: ctx.workspace.path,
+      settingSources: ctx.config.cursor.settingSources as SettingSource[],
+    },
+    name: cursorOperatorAgentName(ctx),
     ...(apiKey ? { apiKey } : {}),
     ...(options.mcpServers === undefined ? {} : { mcpServers: options.mcpServers }),
   };
@@ -677,13 +994,38 @@ export function cursorAgentSendOptions(
   };
 }
 
+export function cursorOperatorAgentSendOptions(
+  ctx: OperatorChatRunContext,
+  options: {
+    mcpServers?: Record<string, McpSubprocessServerConfig>;
+    onDelta?: NonNullable<Parameters<SDKAgent["send"]>[1]>["onDelta"];
+  } = {},
+): NonNullable<Parameters<SDKAgent["send"]>[1]> {
+  return {
+    model: cursorOperatorModelSelection(ctx),
+    ...cursorOperatorConversationModeOption(ctx),
+    local: { force: true },
+    ...(options.onDelta === undefined ? {} : { onDelta: options.onDelta }),
+    ...(options.mcpServers === undefined ? {} : { mcpServers: options.mcpServers }),
+  };
+}
+
 function cursorConversationModeOption(ctx: AgentRunContext): { mode?: "agent" | "plan" } {
   const mode = ctx.runModeOverride ?? ctx.config.cursor.mode;
   return mode === null ? {} : { mode };
 }
 
+function cursorOperatorConversationModeOption(ctx: OperatorChatRunContext): { mode?: "agent" | "plan" } {
+  const mode = ctx.config.cursor.mode;
+  return mode === null ? {} : { mode };
+}
+
 export function cursorAgentName(ctx: AgentRunContext): string {
   return ctx.role === "reviewer" ? `Symphony reviewer ${ctx.issue.identifier}` : `Symphony ${ctx.issue.identifier}`;
+}
+
+export function cursorOperatorAgentName(ctx: OperatorChatRunContext): string {
+  return `Symphony operator ${ctx.conversationId}`;
 }
 
 export function cursorModelSelection(ctx: AgentRunContext): ModelSelection {
@@ -692,8 +1034,18 @@ export function cursorModelSelection(ctx: AgentRunContext): ModelSelection {
     : { id: ctx.config.cursor.model, params: ctx.config.cursor.modelParams };
 }
 
+export function cursorOperatorModelSelection(ctx: OperatorChatRunContext): ModelSelection {
+  return ctx.config.cursor.modelParams.length === 0
+    ? { id: ctx.config.cursor.model }
+    : { id: ctx.config.cursor.model, params: ctx.config.cursor.modelParams };
+}
+
 function agentKey(ctx: AgentRunContext): string {
   return ctx.role === "reviewer" ? `${ctx.workspace.path}:reviewer` : `${ctx.workspace.path}:worker:${cursorRunPhase(ctx)}`;
+}
+
+function operatorAgentKey(ctx: OperatorChatRunContext): string {
+  return `${ctx.workspace.path}:operator:${ctx.conversationId}`;
 }
 
 function cursorRunPhase(ctx: AgentRunContext): AgentRunPhase {
