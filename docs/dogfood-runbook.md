@@ -82,11 +82,13 @@ hermes acp --check
 
 Configure `hermes_acp.binary_path` when the intended host `hermes` is not first on `PATH`. Configure `hermes_acp.source_profile` when the source profile should be a specific host profile rather than the active profile, and optionally configure `hermes_acp.profile_prefix` to identify Symphony-created clones. The older `hermes.acp_binary_path`, `hermes.acp_source_profile`, and `hermes.acp_profile_prefix` aliases remain accepted for compatibility, but new workflows should use the `hermes_acp` section. The source profile must already be authenticated for the configured provider/model, must pass `hermes acp --check` without interactive terminal setup, and must be safe to clone with `hermes profile create <disposable> --clone --clone-from <source> --no-alias`.
 
-Run the opt-in ACP smoke only when host Hermes credentials are available:
+Run the opt-in ACP smoke preflight only when host Hermes credentials are available. This is a host-prerequisite check, not final dogfood-unblock evidence:
 
 ```powershell
-npm run smoke:hermes-acp -- --source-profile <host-profile>
+npm run smoke:hermes-acp -- WORKFLOW.md --source-profile <host-profile>
 ```
+
+This preflight runs against the checked-in `WORKFLOW.md`, so a success report still records the default `configuredHarness` value rather than `"hermes_acp"`. Use it only to prove the host binary/profile prerequisites. For final ACP unblock evidence, rerun the smoke later against `WORKFLOW.hermes-acp.md` so the recorded `configuredHarness` value comes from the disposable ACP workflow copy.
 
 The smoke strips vendored/managed Hermes environment overrides (`HERMES_HOME`, `HERMES_AUTH_HOME`, `HERMES_PYTHON_SRC_ROOT`, `PYTHONPATH`, `HERMES_MODEL`, and `HERMES_TUI_PROVIDER`), honors `hermes_acp.profile_prefix` for generated disposable profile names unless `--profile-prefix` is provided, verifies `hermes --version`, `hermes acp --check`, verifies the source profile with `hermes -p <source> acp --check`, creates a disposable cloned profile, verifies `hermes -p <clone> acp --check`, sends one small ACP prompt through the clone, deletes the clone by default, and confirms the active host profile selection did not change. Use `--keep-profile` or `--keep-temp` only for troubleshooting; delete retained smoke profiles before promoting more work. If the host Hermes binary or profile prerequisite is unavailable, the smoke reports `SKIPPED` with `status: "skipped"` and actionable diagnostics instead of failing the validation command; fix the host prerequisite and rerun before treating host ACP as validated.
 
@@ -112,15 +114,16 @@ npm test
 npm run doctor -- --strict
 npm run doctor -- --strict --live-runtime
 npm run smoke:hermes-local
-# Opt-in only when validating the host Hermes ACP harness with host credentials:
-npm run smoke:hermes-acp -- --source-profile <host-profile>
+# Optional host-ACP preflight only: this runs against the default WORKFLOW.md
+# and is not acceptable final dogfood-unblock evidence.
+npm run smoke:hermes-acp -- WORKFLOW.md --source-profile <host-profile>
 ```
 
 Set `LINEAR_API_KEY`, `SYMPHONY_WORKSPACE_TOKEN`, and the GitHub credential variables in the workflow root `.env` file or process environment as needed. The reference workflow uses app-backed credential profiles: existing `GITHUB_APP_*` variables identify the publication/merge app, and `GITHUB_REVIEW_APP_*` variables identify a separate reviewer app for PR approvals and change requests. Static-token profiles such as `GITHUB_PUBLICATION_TOKEN` and `GITHUB_FEEDBACK_TOKEN` remain supported for non-app deployments.
 
 Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable workspace paths, git availability, runtime harness/provider checks, Hermes paths, Python importability, managed auth readiness when `openai-codex` is selected, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, subprocess MCP tool availability, candidate isolation, and current Linear candidates.
 
-`doctor --live-runtime` is the opt-in live Hermes gateway readiness check. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory. `npm run smoke:hermes-acp` is a separate opt-in live host ACP check; it is not part of default unit tests and should only be run when host Hermes ACP credentials are available.
+`doctor --live-runtime` is the opt-in live Hermes gateway readiness check. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory. `npm run smoke:hermes-acp` is a separate opt-in live host ACP check; it is not part of default unit tests and should only be run when host Hermes ACP credentials are available. When you run it in this preflight block against `WORKFLOW.md`, treat it only as a prerequisite smoke for host Hermes setup. Final dogfood-unblock evidence must rerun the smoke against `WORKFLOW.hermes-acp.md` in the ACP checklist below so `configuredHarness: "hermes_acp"` is recorded.
 
 ### ACP final live validation checklist
 
