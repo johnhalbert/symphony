@@ -1,8 +1,9 @@
-#!/usr/bin/env node
 import { createServer as createHttpServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createServer as createViteServer } from "vite";
+
+import { createOrchestratorChatProjection } from "./orchestrator-chat-smoke-fixture.mjs";
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -38,7 +39,18 @@ export const fixtureData = {
   transcript: [{ kind: "assistant", ts: "2026-05-29T00:01:00.000Z", text: "Fixture transcript." }],
 };
 
-function dashboard() {
+const initialOrchestratorChat = [
+  {
+    id: "browser-smoke-agent-1",
+    who: "agent",
+    text: "Fixture chat from local backend.",
+    status: "completed",
+    createdAt: "2026-05-29T00:01:00.000Z",
+    updatedAt: "2026-05-29T00:01:00.000Z",
+  },
+];
+
+function dashboard(chat = initialOrchestratorChat) {
   return {
     projectName: "Symphony",
     repoLabel: "johnhalbert/symphony",
@@ -60,7 +72,7 @@ function dashboard() {
       },
     ],
     activity: [{ t: "now", who: "symphony", verb: "started", id: fixtureData.issue.id, extra: "browser fixture" }],
-    chat: [{ who: "agent", text: "Fixture chat from local backend." }],
+    chat,
     totals: fixtureData.totals,
   };
 }
@@ -99,6 +111,7 @@ function issueBoard() {
 }
 
 export async function startFixtureBackend() {
+  let orchestratorChat = initialOrchestratorChat.map((message) => ({ ...message }));
   const server = createHttpServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://fixture.local");
     const method = request.method ?? "GET";
@@ -106,19 +119,41 @@ export async function startFixtureBackend() {
     let status = 200;
     let body;
     if (method === "GET" && url.pathname === "/api/v1/web/reference-data") body = fixtureData.referenceData;
-    else if (method === "GET" && url.pathname === "/api/v1/web/dashboard") body = dashboard();
+    else if (method === "GET" && url.pathname === "/api/v1/web/dashboard") body = dashboard(orchestratorChat);
     else if (method === "GET" && url.pathname === "/api/v1/web/sidebar") {
-      const d = dashboard();
+      const d = dashboard(orchestratorChat);
       body = { providerGates: [], runningAgents: d.runningAgents, reviewIssues: [], activity: d.activity, sessions: history().sessions, chat: d.chat, totals: fixtureData.totals };
     } else if (method === "GET" && url.pathname === "/api/v1/web/issues") body = issueBoard();
     else if (method === "GET" && url.pathname === `/api/v1/web/issues/${encodeURIComponent(fixtureData.issue.id)}`) {
-      body = { issue: fixtureData.issue, activity: dashboard().activity, runs: history().sessions, transcript: fixtureData.transcript };
+      const d = dashboard(orchestratorChat);
+      body = { issue: fixtureData.issue, activity: d.activity, runs: history().sessions, transcript: fixtureData.transcript };
     } else if (method === "GET" && url.pathname === "/api/v1/web/history") body = history();
     else if (method === "GET" && url.pathname === "/api/v1/web/sessions/run-fixture/transcript") body = fixtureData.transcript;
-    else if (method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") body = dashboard().chat;
+    else if (method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") {
+      body = createOrchestratorChatProjection(orchestratorChat, {
+        revisionPrefix: "browser-smoke-get",
+        observedAt: "2026-05-29T00:01:00.000Z",
+      });
+    }
     else if (method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
       const input = await readJsonBody(request).then((payload) => payload.input ?? "");
-      body = [...dashboard().chat, { who: "user", text: String(input) }];
+      const submittedAt = "2026-05-29T00:02:00.000Z";
+      orchestratorChat = [
+        ...orchestratorChat,
+        {
+          id: `browser-smoke-user-${orchestratorChat.length + 1}`,
+          who: "user",
+          text: String(input),
+          status: "pending",
+          createdAt: submittedAt,
+          updatedAt: submittedAt,
+        },
+      ];
+      status = 202;
+      body = createOrchestratorChatProjection(orchestratorChat, {
+        revisionPrefix: "browser-smoke-post",
+        observedAt: submittedAt,
+      });
     } else {
       status = 404;
       body = { error: { code: "not_found", message: `${method} ${url.pathname}` } };
@@ -142,6 +177,9 @@ export async function startViteProxy(backendBaseUrl) {
     root: webRoot,
     configFile: resolve(webRoot, "vite.config.ts"),
     logLevel: "error",
+    optimizeDeps: {
+      noDiscovery: true,
+    },
     server: {
       host: "127.0.0.1",
       port: 0,
@@ -178,11 +216,100 @@ export async function runBrowserSmokeHarness() {
       throw new Error("Vite /api proxy returned unexpected fixture reference data");
     }
 
+    const initialChatResponse = await fetch(`${vite.baseUrl}/api/v1/web/orchestrator-chat`);
+    if (!initialChatResponse.ok) {
+      throw new Error(`Initial orchestrator chat GET returned HTTP ${initialChatResponse.status}`);
+    }
+    const initialChat = await initialChatResponse.json();
+    if (initialChat.state !== "completed" || initialChat.chat?.length !== 1 || initialChat.chat?.[0]?.text !== "Fixture chat from local backend.") {
+      throw new Error("Initial orchestrator chat projection did not match the expected durable fixture state");
+    }
+
+    const submittedInput = "Browser smoke durable pending message";
+    const postChatResponse = await fetch(`${vite.baseUrl}/api/v1/web/orchestrator-chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input: submittedInput }),
+    });
+    if (postChatResponse.status !== 202) {
+      throw new Error(`Orchestrator chat POST returned HTTP ${postChatResponse.status} instead of 202`);
+    }
+    const postChat = await postChatResponse.json();
+    const postedMessage = postChat.chat?.at(-1);
+    if (
+      postChat.state !== "pending"
+      || postChat.conversation?.status !== "pending"
+      || postChat.chat?.length !== 2
+      || postedMessage?.who !== "user"
+      || postedMessage?.text !== submittedInput
+      || postedMessage?.status !== "pending"
+    ) {
+      throw new Error("Orchestrator chat POST did not return an honest pending durable projection");
+    }
+
+    const dashboardAfterPostResponse = await fetch(`${vite.baseUrl}/api/v1/web/dashboard`);
+    if (!dashboardAfterPostResponse.ok) {
+      throw new Error(`Dashboard GET after orchestrator chat POST returned HTTP ${dashboardAfterPostResponse.status}`);
+    }
+    const dashboardAfterPost = await dashboardAfterPostResponse.json();
+    const dashboardPostedMessage = dashboardAfterPost.chat?.at(-1);
+    if (
+      dashboardAfterPost.chat?.length !== 2
+      || dashboardPostedMessage?.who !== "user"
+      || dashboardPostedMessage?.text !== submittedInput
+      || dashboardPostedMessage?.status !== "pending"
+    ) {
+      throw new Error("Dashboard chat did not preserve the submitted pending durable message after orchestrator chat POST");
+    }
+
+    const sidebarAfterPostResponse = await fetch(`${vite.baseUrl}/api/v1/web/sidebar`);
+    if (!sidebarAfterPostResponse.ok) {
+      throw new Error(`Sidebar GET after orchestrator chat POST returned HTTP ${sidebarAfterPostResponse.status}`);
+    }
+    const sidebarAfterPost = await sidebarAfterPostResponse.json();
+    const sidebarPostedMessage = sidebarAfterPost.chat?.at(-1);
+    if (
+      sidebarAfterPost.chat?.length !== 2
+      || sidebarPostedMessage?.who !== "user"
+      || sidebarPostedMessage?.text !== submittedInput
+      || sidebarPostedMessage?.status !== "pending"
+    ) {
+      throw new Error("Sidebar chat did not preserve the submitted pending durable message after orchestrator chat POST");
+    }
+
+    const reloadRoot = await fetch(`${vite.baseUrl}/`);
+    if (!reloadRoot.ok) throw new Error(`Reloaded Vite root returned HTTP ${reloadRoot.status}`);
+
+    const followUpChatResponse = await fetch(`${vite.baseUrl}/api/v1/web/orchestrator-chat`);
+    if (!followUpChatResponse.ok) {
+      throw new Error(`Follow-up orchestrator chat GET returned HTTP ${followUpChatResponse.status}`);
+    }
+    const followUpChat = await followUpChatResponse.json();
+    const followUpMessage = followUpChat.chat?.at(-1);
+    if (
+      followUpChat.state !== "pending"
+      || followUpChat.conversation?.status !== "pending"
+      || followUpChat.chat?.length !== 2
+      || followUpMessage?.who !== "user"
+      || followUpMessage?.text !== submittedInput
+      || followUpMessage?.status !== "pending"
+    ) {
+      throw new Error("Orchestrator chat follow-up GET did not preserve durable pending projection state across reload");
+    }
+
     return {
       status: "ok",
       backendBaseUrl: backend.baseUrl,
       viteBaseUrl: vite.baseUrl,
-      checked: ["GET /", "GET /api/v1/web/reference-data"],
+      checked: [
+        "GET /",
+        "GET /api/v1/web/reference-data",
+        "GET /api/v1/web/orchestrator-chat",
+        "POST /api/v1/web/orchestrator-chat",
+        "GET /api/v1/web/dashboard",
+        "GET /api/v1/web/sidebar",
+        "GET /api/v1/web/orchestrator-chat (after reload)",
+      ],
     };
   } finally {
     await Promise.allSettled([vite.close(), backend.close()]);

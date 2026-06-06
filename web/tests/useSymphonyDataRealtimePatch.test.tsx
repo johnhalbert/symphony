@@ -579,6 +579,94 @@ describe("useSymphonyData realtime direct patching", () => {
     expect(probe.result().data?.chat).toEqual(refetched);
   });
 
+  it.each([
+    ["pending", "completed"],
+    ["pending", "failed"],
+    ["streaming", "completed"],
+    ["streaming", "disabled"],
+    ["streaming", "unavailable"],
+  ] as const)(
+    "derives direct orchestrator message updates from %s to %s without a refetch or fake assistant reply",
+    async (initialStatus, terminalStatus) => {
+      let listener: RealtimeEventListener | null = null;
+      const invalidateCachedReads = vi.fn();
+      const initialMessage: ChatMessage = {
+        id: "msg-1",
+        conversationId: "orchestrator-default",
+        who: "user",
+        text: `command in ${initialStatus}`,
+        status: initialStatus,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      };
+      const terminalMessage: ChatMessage = {
+        ...initialMessage,
+        status: terminalStatus,
+        updatedAt: "2026-01-01T00:00:02.000Z",
+      };
+      const getOrchestratorChat = vi.fn<(_: AbortSignal | undefined) => Promise<OrchestratorChatModel>>().mockResolvedValueOnce(
+        orchestratorChatModelFromMessages([initialMessage], {
+          state: initialStatus,
+          conversationStatus: initialStatus,
+          sourceShape: "reducer_envelope",
+        }),
+      );
+      const dataSource = testDataSource({
+        getOrchestratorChat,
+        invalidateCachedReads,
+        subscribeToRealtimeEvents(nextListener) {
+          listener = nextListener;
+          return () => undefined;
+        },
+      });
+      const probe = renderChatProbe(dataSource);
+      await flushPromises();
+
+      expect(probe.result().data?.state).toBe(initialStatus);
+      expect(probe.result().data?.conversation.status).toBe(initialStatus);
+
+      const terminalEvent = chatEvent(2, terminalMessage, 1);
+      act(() =>
+        listener?.({
+          ...terminalEvent,
+          payload: {
+            ...terminalEvent.payload,
+            operation: "update",
+            lastMessageId: terminalMessage.id ?? null,
+            lastMessageStatus: terminalStatus,
+            lastMessageAt: terminalMessage.updatedAt ?? null,
+            state: null,
+            conversationStatus: null,
+            active: null,
+            terminal: null,
+            empty: null,
+            latestMessageSequence: 2,
+            latestMessageUpdatedAt: terminalMessage.updatedAt ?? null,
+          },
+        }),
+      );
+
+      expect(getOrchestratorChat).toHaveBeenCalledTimes(1);
+      expect(invalidateCachedReads).not.toHaveBeenCalled();
+      expect(probe.result()).toMatchObject({ loading: false, error: null });
+      expect(probe.result().data?.state).toBe(terminalStatus);
+      expect(probe.result().data?.conversation.status).toBe(terminalStatus);
+      expect(probe.result().data?.status).toMatchObject({
+        state: terminalStatus,
+        conversationStatus: terminalStatus,
+        latestMessageStatus: terminalStatus,
+        active: false,
+        terminal: true,
+      });
+      expect(probe.result().data?.source.latestMessageSequence).toBe(2);
+      expect(probe.result().data?.source.latestMessageUpdatedAt).toBe(terminalMessage.updatedAt);
+      expect(probe.result().data?.chat).toEqual([expect.objectContaining(terminalMessage)]);
+      expect(probe.result().data?.chat).toHaveLength(1);
+      expect(probe.result().data?.chat[0]?.who).toBe("user");
+      expect(probe.result().data?.chat[0]?.text).toBe(initialMessage.text);
+    },
+  );
+
   it("refetches orchestrator chat instead of appending updates for ids outside the active bounded tail", async () => {
     let listener: RealtimeEventListener | null = null;
     const invalidateCachedReads = vi.fn();

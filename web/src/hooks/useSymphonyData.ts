@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDataSource } from "../data/dataSourceContext";
 import { normalizeOrchestratorChatModel } from "../data/orchestratorChat";
+import type { RealtimeOrchestratorMessagePayload } from "../data/realtimeEvents";
 import { useAsyncResource } from "./useAsyncResource";
 import {
   DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
@@ -312,6 +313,7 @@ export function useOrchestratorChat(options: SymphonyResourceOptions = {}): Load
     if (!enabled || !dataSource.subscribeToRealtimeEvents) return undefined;
     return dataSource.subscribeToRealtimeEvents((event) => {
       if (event.type !== "orchestrator.message") return;
+      const payload = event.payload as RealtimeOrchestratorMessagePayload;
       const outcome = applyOrchestratorMessageEvent({
         event,
         conversationId: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
@@ -326,7 +328,7 @@ export function useOrchestratorChat(options: SymphonyResourceOptions = {}): Load
         return;
       }
       const nextState = {
-        data: mergeOrchestratorChatPatchModel(stateRef.current.data, outcome.data, outcome.lastRevision),
+        data: mergeOrchestratorChatPatchModel(stateRef.current.data, outcome.data, outcome.lastRevision, payload),
         loading: false,
         error: null,
         enabled: true,
@@ -344,21 +346,45 @@ function mergeOrchestratorChatPatchModel(
   current: OrchestratorChatModel | null,
   chat: ChatMessage[],
   revision: number,
+  payload: RealtimeOrchestratorMessagePayload,
 ): OrchestratorChatModel {
   if (!current) return normalizeOrchestratorChatModel(chat);
   const latestMessage = chat.at(-1) ?? null;
-  const latestMessageUpdatedAt = latestMessage?.updatedAt ?? latestMessage?.createdAt ?? current.source.latestMessageUpdatedAt;
+  const latestMessageStatus = payload.lastMessageStatus ?? latestMessage?.status ?? null;
+  const latestMessageUpdatedAt = payload.latestMessageUpdatedAt ?? latestMessage?.updatedAt ?? latestMessage?.createdAt ?? current.source.latestMessageUpdatedAt;
+  const conversationStatus = payload.conversationStatus ?? payload.state ?? latestMessageStatus ?? current.conversation.status;
+  const nextState = payload.state ?? latestMessageStatus ?? undefined;
+  const messageCount = typeof payload.messageCount === "number" && Number.isInteger(payload.messageCount) && payload.messageCount >= 0
+    ? payload.messageCount
+    : Math.max(current.conversation.messageCount, chat.length);
+  const statusSummary: Record<string, unknown> = {
+    conversationStatus,
+    latestMessageStatus,
+    messageCount,
+  };
+  if (nextState) statusSummary.state = nextState;
+  if (typeof payload.active === "boolean") statusSummary.active = payload.active;
+  if (typeof payload.terminal === "boolean") statusSummary.terminal = payload.terminal;
+  if (typeof payload.empty === "boolean") statusSummary.empty = payload.empty;
+  if (payload.statusCounts) statusSummary.statusCounts = payload.statusCounts;
   return normalizeOrchestratorChatModel({
     schemaVersion: current.schemaVersion,
+    ...(nextState ? { state: nextState } : {}),
     conversation: {
       ...current.conversation,
+      status: conversationStatus,
       updatedAt: latestMessageUpdatedAt ?? current.conversation.updatedAt,
-      messageCount: Math.max(current.conversation.messageCount, chat.length),
+      messageCount,
     },
+    status: statusSummary,
     chat,
     source: {
       ...current.source,
       revision: `${current.source.revision}:live:${revision}`,
+      latestMessageSequence:
+        typeof payload.latestMessageSequence === "number" && Number.isInteger(payload.latestMessageSequence)
+          ? payload.latestMessageSequence
+          : current.source.latestMessageSequence,
       latestMessageUpdatedAt,
     },
     compatibility: current.compatibility,

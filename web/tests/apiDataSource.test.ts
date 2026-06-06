@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiDataSource, normalizeReferenceData } from "../src/data/apiDataSource";
+import { orchestratorChatModelFromMessages } from "../src/data/orchestratorChat";
 import { createTranscriptWindowResponse } from "../src/data/transcriptWindow";
 import type { ProjectionChangeEvent, RealtimeConnectionStatus, RealtimeProjectionEvent } from "../src/data/dataSource";
 import { createDataSource, resolveDataSourceConfig } from "../src/data/dataSourceConfig";
@@ -778,8 +779,12 @@ describe("API data source", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => jsonResponse(chatResponse));
     const dataSource = createApiDataSource("/status-server/");
 
-    await expect(dataSource.sendOrchestratorMessage("status")).resolves.toEqual(chatResponse);
-    await expect(dataSource.sendOrchestratorMessage("status")).resolves.toEqual(chatResponse);
+    await expect(dataSource.sendOrchestratorMessage("status")).resolves.toEqual(
+      orchestratorChatModelFromMessages(chatResponse, { sourceShape: "legacy_chat_array" }),
+    );
+    await expect(dataSource.sendOrchestratorMessage("status")).resolves.toEqual(
+      orchestratorChatModelFromMessages(chatResponse, { sourceShape: "legacy_chat_array" }),
+    );
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/status-server/api/v1/web/orchestrator-chat", {
@@ -1083,11 +1088,13 @@ describe("API data source", () => {
     await expect(createApiDataSource("").getOrchestratorChat()).resolves.toEqual(reducerEnvelope);
   });
 
-  it("posts orchestrator chat input to the same relative API boundary and returns the response chat", async () => {
+  it("posts orchestrator chat input to the same relative API boundary and normalizes the response projection", async () => {
     const responseChat: ChatMessage[] = [{ who: "user", text: "pause ENG-108" }];
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(responseChat));
 
-    await expect(createApiDataSource("").sendOrchestratorMessage("pause ENG-108")).resolves.toEqual(responseChat);
+    await expect(createApiDataSource("").sendOrchestratorMessage("pause ENG-108")).resolves.toEqual(
+      orchestratorChatModelFromMessages(responseChat, { sourceShape: "legacy_chat_array" }),
+    );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/orchestrator-chat", {
@@ -1105,7 +1112,7 @@ describe("API data source", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(responseChat));
 
     await expect(createApiDataSource("https://symphony.example///").sendOrchestratorMessage("inspect ENG-115")).resolves.toEqual(
-      responseChat,
+      orchestratorChatModelFromMessages(responseChat, { sourceShape: "legacy_chat_array" }),
     );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -1116,6 +1123,64 @@ describe("API data source", () => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ input: "inspect ENG-115" }),
+    });
+  });
+
+  it("preserves a projection-shaped orchestrator POST response", async () => {
+    const responseProjection = {
+      schemaVersion: 1,
+      conversation: {
+        id: "orchestrator-default",
+        status: "completed",
+        createdAt: "2026-06-03T00:00:00.000Z",
+        updatedAt: "2026-06-03T00:00:01.000Z",
+        messageCount: 2,
+        metadata: { runId: "run-115" },
+      },
+      state: "completed",
+      status: {
+        state: "completed",
+        conversationStatus: "completed",
+        latestMessageStatus: "completed",
+        active: false,
+        terminal: true,
+        empty: false,
+        messageCount: 2,
+        statusCounts: {
+          pending: 0,
+          streaming: 0,
+          completed: 2,
+          failed: 0,
+          disabled: 0,
+          unavailable: 0,
+        },
+      },
+      chat: [
+        { who: "agent", text: "Status acknowledged" },
+        { who: "user", text: "pause ENG-115" },
+      ],
+      source: {
+        source: "orchestrator_conversations",
+        revision: "chat-1",
+        observedAt: "2026-06-03T00:00:01.000Z",
+        conversationId: "orchestrator-default",
+        latestMessageSequence: 2,
+        latestMessageUpdatedAt: "2026-06-03T00:00:01.000Z",
+      },
+    };
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(responseProjection));
+
+    await expect(createApiDataSource("").sendOrchestratorMessage("pause ENG-115")).resolves.toEqual(responseProjection);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/web/orchestrator-chat", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ input: "pause ENG-115" }),
     });
   });
 

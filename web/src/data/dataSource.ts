@@ -1,5 +1,4 @@
 import type {
-  ChatMessage,
   DashboardModel,
   HistoryModel,
   IssueBoardModel,
@@ -60,7 +59,7 @@ export interface SymphonyDataSource {
   getTranscript(sessionId: string, signal?: AbortSignal, options?: TranscriptRequestOptions): Promise<TranscriptWindowResponse>;
   getSidebar(signal?: AbortSignal): Promise<SidebarModel>;
   getOrchestratorChat(signal?: AbortSignal): Promise<OrchestratorChatModel>;
-  sendOrchestratorMessage(input: string): Promise<ChatMessage[]>;
+  sendOrchestratorMessage(input: string): Promise<OrchestratorChatModel>;
   triggerPoll?(): Promise<TriggerPollResult>;
   invalidateCachedReads?(options?: CacheInvalidationOptions): void;
   subscribeToProjectionChanges?(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe;

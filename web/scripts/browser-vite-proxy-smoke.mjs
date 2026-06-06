@@ -8,6 +8,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 
+import { createOrchestratorChatProjection } from "./orchestrator-chat-smoke-fixture.mjs";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(__dirname, "..");
 const webDistRoot = path.resolve(webRoot, "dist");
@@ -80,7 +82,7 @@ const staleSidebarChat = [
   },
 ];
 
-const orchestratorChat = [
+let orchestratorChat = [
   {
     who: "agent",
     text: "Dedicated orchestrator chat from API endpoint",
@@ -654,10 +656,10 @@ async function runBrowserSmokeAssertions(page, origin) {
   await waitForBrowserText(page, "dashboard orchestrator chat POST acknowledgement", {
     include: [
       "Dashboard browser smoke message",
-      "Dedicated chat POST acknowledgement from API",
-      "POST guard observed",
+      "The orchestrator conversation is pending",
+      "no invented completion message is being shown.",
     ],
-    exclude: forbiddenMarkers,
+    exclude: [...forbiddenMarkers, "Dedicated chat POST acknowledgement from API", "POST guard observed"],
   });
   assertObservedEndpointCountAtLeast("POST /api/v1/web/orchestrator-chat", dashboardPostCountBefore + 1);
 
@@ -703,11 +705,14 @@ async function runBrowserSmokeAssertions(page, origin) {
     exclude: forbiddenMarkers,
   });
   await selectOption(page, 'select[aria-label="Sidebar variant"]', "chat", "sidebar chat variant");
-  await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload and functional API-mode controls", {
+  await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload and preserves dashboard pending chat across navigation", {
     include: [
       "Dedicated orchestrator chat from API endpoint",
       "Dedicated smoke suggestion",
       "sidebar-summary-agent · PROXY-1",
+      "Dashboard browser smoke message",
+      "The chat is pending",
+      "no invented completion message is being shown.",
     ],
     exclude: forbiddenMarkers,
   });
@@ -717,10 +722,10 @@ async function runBrowserSmokeAssertions(page, origin) {
   await waitForBrowserText(page, "sidebar orchestrator chat POST acknowledgement", {
     include: [
       "Sidebar browser smoke message",
-      "Dedicated chat POST acknowledgement from API",
-      "POST guard observed",
+      "The chat is pending",
+      "no invented completion message is being shown.",
     ],
-    exclude: forbiddenMarkers,
+    exclude: [...forbiddenMarkers, "Dedicated chat POST acknowledgement from API", "POST guard observed"],
   });
   assertObservedEndpointCountAtLeast("POST /api/v1/web/orchestrator-chat", sidebarPostCountBefore + 1);
 
@@ -810,7 +815,16 @@ async function handleFakeApiRequest(request, response, url) {
   if (request.method === "GET" && url.pathname === "/api/v1/web/issues") return sendJson(response, 200, issueBoard);
   if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") return sendJson(response, 200, sidebar);
   if (request.method === "GET" && url.pathname === "/api/v1/web/history") return sendJson(response, 200, history);
-  if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") return sendJson(response, 200, orchestratorChat);
+  if (request.method === "GET" && url.pathname === "/api/v1/web/orchestrator-chat") {
+    return sendJson(
+      response,
+      200,
+      createOrchestratorChatProjection(orchestratorChat, {
+        revisionPrefix: "vite-browser-smoke-get",
+        observedAt: "2026-06-03T13:30:00.000Z",
+      }),
+    );
+  }
   if (request.method === "GET" && url.pathname === "/api/v1/realtime") return openRealtimeStream(request, response);
   if (request.method === "POST" && url.pathname === "/api/v1/refresh") {
     return sendJson(response, 202, {
@@ -837,11 +851,15 @@ async function handleFakeApiRequest(request, response, url) {
   if (request.method === "POST" && url.pathname === "/api/v1/web/orchestrator-chat") {
     const bodyText = await readRequestBody(request);
     const input = parseChatInput(bodyText) ?? "browser smoke input";
-    return sendJson(response, 200, [
-      ...orchestratorChat,
-      { who: "user", text: input },
-      { who: "agent", text: "Dedicated chat POST acknowledgement from API", suggestions: ["POST guard observed"] },
-    ]);
+    orchestratorChat = [...orchestratorChat, { who: "user", text: input, status: "pending" }];
+    return sendJson(
+      response,
+      202,
+      createOrchestratorChatProjection(orchestratorChat, {
+        revisionPrefix: "vite-browser-smoke-post",
+        observedAt: "2026-06-03T13:31:00.000Z",
+      }),
+    );
   }
 
   return sendJson(response, 404, { error: { code: "not_found", path: url.pathname } });

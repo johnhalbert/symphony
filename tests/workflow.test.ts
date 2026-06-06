@@ -1351,7 +1351,11 @@ Work on {{ issue.identifier }}.
     });
 
     const rawGithub = parsed.config.github as { pr_handoff?: { enabled?: unknown } } | undefined;
-    const rawHermes = parsed.config.hermes as { model?: unknown } | undefined;
+    const rawHermes = parsed.config.hermes as {
+      model?: unknown;
+      worker_session_lifecycle?: unknown;
+      keep_profiles?: unknown;
+    } | undefined;
 
     expect(config.agent.harness).toBe("hermes");
     expect(config.agent.maxConcurrentAgents).toBe(5);
@@ -1369,14 +1373,16 @@ Work on {{ issue.identifier }}.
     expect(config.github.app?.privateKeyPath?.replace(/\\/g, "/")).toMatch(/\/tmp\/github-app-private-key\.pem$/);
     expect(config.server.openWorkspaceToken).toBe("workspace-secret");
     expect(config.hermes.provider).toBe("openai-codex");
-    expect(rawHermes?.model).toBeTypeOf("string");
+    expect(rawHermes?.model).toBe("gpt-5.4");
     expect(config.hermes.model).toBe(rawHermes?.model);
     expect(config.hermes.auth).toMatchObject({
       mode: "managed_root",
       providers: ["openai-codex"],
     });
-    expect(config.hermes.workerSessionLifecycle).toBe("fresh_per_run");
-    expect(config.hermes.keepProfiles).toBe("failed");
+    expect(rawHermes?.worker_session_lifecycle).toBe("fresh_per_run");
+    expect(config.hermes.workerSessionLifecycle).toBe(rawHermes?.worker_session_lifecycle);
+    expect(rawHermes?.keep_profiles).toBe("failed");
+    expect(config.hermes.keepProfiles).toBe(rawHermes?.keep_profiles);
     expect(config.agent.protectedPaths).toContain("hermes/src/**");
     const expectedReasoningEffortByTemplate = new Map([
       ["worker", "xhigh"],

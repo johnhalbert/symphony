@@ -197,7 +197,7 @@ export function createApiModeDataSource(options: ApiModeDataSourceOptions = {}):
       return orchestratorChat;
     },
     async sendOrchestratorMessage(input) {
-      return [...orchestratorChat.chat, { who: "user", text: input }];
+      return orchestratorChatModelFromMessages([...orchestratorChat.chat, { who: "user", text: input }]);
     },
   };
 }
