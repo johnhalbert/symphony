@@ -172,7 +172,7 @@ The chosen live runs did not emit a `command_policy_decision` event. This packet
     "commandClass": "direct_upstream_git_operation",
     "upstreamContactAttempted": false,
     "requiresUserOrServiceFix": true,
-    "requestKind": "mcp_tool_call",
+    "requestKind": "pre_tool_call",
     "hookAction": "block",
     "permissionOutcome": "denied"
   }
