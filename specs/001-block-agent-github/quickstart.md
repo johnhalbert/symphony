@@ -145,15 +145,15 @@ Confirm service-owned GitHub workflow actions remain outside worker/reviewer com
 After rollout, capture one real worker run and one real reviewer run from the live dogfood loop. For each run:
 
 1. Inspect `/api/v1/runs/<runId>` and record `role`, `runPhase`, `status`, `harnessId`, `runtimeModel`, `startedAt`, and `completedAt`.
-2. Inspect `/api/v1/runs/<runId>/transcript` or the persisted `events.jsonl` and summarize every `Hermes tool terminal:` command. Expected commands remain local-only, such as `git status`, `git diff`, `git log`, `git show`, `git branch`, `git blame`, local `node`/`python` inspection, local tests, and workspace-local smoke commands.
-3. Search the same transcript/events for `oauth`, `ssh key confirmation`, `github credential`, `gh auth`, `git-credential`, and `ssh-askpass`. Expected result: zero hits caused by agent-owned command attempts.
+2. Inspect `/api/v1/runs/<runId>/transcript` or the persisted `events.jsonl` and summarize every `Hermes tool terminal:` command. Expected commands must remain local-only. Helper-free Git inspection commands such as `git status`, `git diff`, `git log`, `git show`, `git branch`, and `git blame` are the clearest allow evidence; if the run also contains workspace-local `node`, `python`, package-script, or smoke-wrapper commands, record them as observed local activity rather than as standalone proof of the helper-free allow list.
+3. Search the same transcript/events with case-insensitive prompt markers such as `oauth`, `device code`, `open this url`, `ssh key confirmation`, `authenticity of host`, `github credential`, `credential prompt`, `username for`, `password for`, `passphrase`, `gh auth`, `git-credential`, and `ssh-askpass`. Expected result: zero hits caused by agent-owned command attempts.
 4. If the run includes a `command_policy_decision` event, record the redacted snippet with `outcome`, `reasonKind`, `commandClass`, `surface`, `role`, `phase`, and `upstreamContactAttempted: false`.
 5. If the live runs do not contain a denial event, pair the live zero-prompt scan with the automated denial/audit suite and cite the exact test files that prove upstream deny behavior, service-owned GitHub boundaries, and public redaction.
 
 A review-ready SC-004 evidence packet contains:
 
 - One worker run ID and one reviewer run ID.
-- Transcript scan output showing only local-only terminal commands.
+- Transcript scan output showing no upstream Git/GitHub attempts, with any wrapper/interpreter/package-script entries clearly labeled as observed local activity rather than allow-list proof.
 - Zero-hit prompt scan results.
 - One redacted `command_policy_decision` or public-read transcript example.
 - The vendored Hermes no-touch check output.

@@ -45,16 +45,6 @@ Every decision is structured before execution. The final operator-facing example
   "commandClass": "local_git_inspection",
   "message": "Allowed helper-free local Git inspection command.",
   "requiresUserOrServiceFix": false,
-  "normalizedCommand": {
-    "executable": "git",
-    "executableKind": "git",
-    "argumentsPreview": "status --short",
-    "gitSubcommand": "status",
-    "targetHosts": [],
-    "hasNestedCommand": false,
-    "hasInlineEnvironment": false,
-    "hasUnsafeGitConfig": false
-  },
   "audit": {
     "redacted": true,
     "surface": "terminal_execute",
@@ -79,19 +69,9 @@ Every decision is structured before execution. The final operator-facing example
 {
   "outcome": "deny",
   "reasonKind": "upstream_github",
-  "commandClass": "direct_upstream_git_operation",
+  "commandClass": "git_push",
   "message": "Blocked worker/reviewer upstream GitHub activity. Use Symphony service-owned publication, review, and writeback workflow actions instead.",
   "requiresUserOrServiceFix": true,
-  "normalizedCommand": {
-    "executable": "git",
-    "executableKind": "git",
-    "argumentsPreview": "push origin HEAD",
-    "gitSubcommand": "push",
-    "targetHosts": ["github.com"],
-    "hasNestedCommand": false,
-    "hasInlineEnvironment": false,
-    "hasUnsafeGitConfig": false
-  },
   "audit": {
     "redacted": true,
     "surface": "terminal_execute",
@@ -99,13 +79,12 @@ Every decision is structured before execution. The final operator-facing example
     "phase": "implementation",
     "outcome": "deny",
     "reasonKind": "upstream_github",
-    "commandClass": "direct_upstream_git_operation",
+    "commandClass": "git_push",
     "rawInputPreview": "git push origin HEAD",
     "normalizedExecutable": "git",
     "executableKind": "git",
     "gitSubcommand": "push",
     "commandPreview": "git push origin HEAD",
-    "targetHosts": ["github.com"],
     "upstreamContactAttempted": false
   }
 }
@@ -120,16 +99,6 @@ Every decision is structured before execution. The final operator-facing example
   "commandClass": "github_cli",
   "message": "Blocked worker/reviewer upstream GitHub activity. Use Symphony service-owned publication, review, and writeback workflow actions instead.",
   "requiresUserOrServiceFix": true,
-  "normalizedCommand": {
-    "executable": "gh",
-    "executableKind": "github_cli",
-    "argumentsPreview": "pr create --fill",
-    "gitSubcommand": null,
-    "targetHosts": ["github.com"],
-    "hasNestedCommand": false,
-    "hasInlineEnvironment": false,
-    "hasUnsafeGitConfig": false
-  },
   "audit": {
     "redacted": true,
     "surface": "terminal_execute",
@@ -142,7 +111,6 @@ Every decision is structured before execution. The final operator-facing example
     "normalizedExecutable": "gh",
     "executableKind": "github_cli",
     "commandPreview": "gh pr create --fill",
-    "targetHosts": ["github.com"],
     "upstreamContactAttempted": false
   }
 }
@@ -153,27 +121,17 @@ Every decision is structured before execution. The final operator-facing example
 ```json
 {
   "outcome": "deny",
-  "reasonKind": "unsafe_environment",
+  "reasonKind": "unsafe_git_config",
   "commandClass": "git_local_inspection_with_helper",
   "message": "Blocked worker/reviewer Git command: local Git inspection would execute a configured helper. Use local inspection without helper configuration or rely on Symphony service-owned GitHub workflow actions.",
   "requiresUserOrServiceFix": true,
-  "normalizedCommand": {
-    "executable": "git",
-    "executableKind": "git",
-    "argumentsPreview": "diff",
-    "gitSubcommand": "diff",
-    "targetHosts": [],
-    "hasNestedCommand": false,
-    "hasInlineEnvironment": true,
-    "hasUnsafeGitConfig": true
-  },
   "audit": {
     "redacted": true,
     "surface": "terminal_execute",
     "role": "worker",
     "phase": "implementation",
     "outcome": "deny",
-    "reasonKind": "unsafe_environment",
+    "reasonKind": "unsafe_git_config",
     "commandClass": "git_local_inspection_with_helper",
     "rawInputPreview": "GIT_ASKPASS=[redacted] git diff",
     "rawInputPreviewRedacted": true,
@@ -192,6 +150,7 @@ Every decision is structured before execution. The final operator-facing example
 - Denial messages must be actionable, redacted, and point back to Symphony service-owned workflow actions when the user is trying to perform a service-owned GitHub task.
 - `allow` decisions must identify the command as local-only and helper-free.
 - `reasonKind`, `commandClass`, and `upstreamContactAttempted` must stay structured rather than inferred from freeform messages.
+- `normalizedCommand` is optional on the immediate policy decision object; consumers must not require it when the decision already provides the structured redacted `audit` metadata.
 
 ## Required Deny Classes
 
