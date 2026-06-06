@@ -666,7 +666,10 @@ class FakeHermesGatewayClient extends EventEmitter implements HermesGatewayClien
 
   async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     this.requests.push({ method, params });
-    if (method === "session.create") return { session_id: `session-${this.requests.length}` } as T;
+    if (method === "session.create") {
+      const sessionId = `session-${this.requests.length}`;
+      return { session_id: sessionId, session_key: `hermes-${sessionId}` } as T;
+    }
     if (method === "tools.list") {
       return {
         toolsets: [

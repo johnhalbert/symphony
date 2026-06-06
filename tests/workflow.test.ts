@@ -1375,7 +1375,7 @@ Work on {{ issue.identifier }}.
       mode: "managed_root",
       providers: ["openai-codex"],
     });
-    expect(config.hermes.workerSessionLifecycle).toBe("reuse_by_issue");
+    expect(config.hermes.workerSessionLifecycle).toBe("fresh_per_run");
     expect(config.hermes.keepProfiles).toBe("failed");
     expect(config.agent.protectedPaths).toContain("hermes/src/**");
     const expectedReasoningEffortByTemplate = new Map([

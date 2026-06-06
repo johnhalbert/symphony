@@ -2158,7 +2158,8 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
 
     server._sessions["sid"] = _session(agent=_Agent())
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
 
@@ -2172,6 +2173,8 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
 
     assert resp["result"]["status"] == "streaming"
     assert captured["session_key"] == "session-key"
+    complete = [args for args in emitted if args and args[0] == "message.complete"]
+    assert complete[-1][2]["session_key"] == "session-key"
 
 
 def test_prompt_submit_expands_context_refs(monkeypatch):
@@ -3430,6 +3433,7 @@ def test_session_create_continues_when_state_db_is_unavailable(monkeypatch):
         {"id": "1", "method": "session.create", "params": {"cols": 80}}
     )
     sid = resp["result"]["session_id"]
+    assert resp["result"]["session_key"] == server._sessions[sid]["session_key"]
     session = server._sessions[sid]
     session["agent_ready"].wait(timeout=2.0)
 
