@@ -1379,7 +1379,7 @@ Work on {{ issue.identifier }}.
     expect(config.hermes.keepProfiles).toBe("failed");
     expect(config.agent.protectedPaths).toContain("hermes/src/**");
     const expectedReasoningEffortByTemplate = new Map([
-      ["worker", "high"],
+      ["worker", "xhigh"],
       ["reviewer", "xhigh"],
       ["planner", "xhigh"],
     ]);

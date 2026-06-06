@@ -1202,6 +1202,81 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
+  it("bounds realtime assistant delta patch state without retaining raw delta text", () => {
+    const bus = new RealtimeProjectionEventBus({ clock: () => new Date("2026-01-01T00:00:00.000Z") });
+    const stateByRunId = (
+      bus as unknown as {
+        transcriptPatchStateByRunId: Map<
+          string,
+          {
+            seenAssistantDeltaReplayKeys: Set<string>;
+            seenAssistantDeltaReplayKeyOrder: string[];
+            assistantDeltaMirrorCounts: { runtime: Map<string, number>; harness: Map<string, number> };
+          }
+        >;
+      }
+    ).transcriptPatchStateByRunId;
+
+    for (let sequence = 1; sequence <= 4_200; sequence += 1) {
+      const text = `raw-delta-text-that-should-not-be-retained-${sequence}`;
+      bus.publish({
+        type: "transcript.delta",
+        source: { source: "runs", revision: sequence, observedAt: "2026-01-01T00:00:00.000Z" },
+        detail: {
+          runId: "run-bounded-delta-state",
+          sessionId: "session-bounded-delta-state",
+          afterSequence: sequence - 1,
+          eventCount: 1,
+          events: [
+            {
+              runId: "run-bounded-delta-state",
+              sequence,
+              at: "2026-01-01T00:00:00.000Z",
+              source: "runtime",
+              eventType: "message_delta",
+              message: "Hermes message delta",
+              payload: { harnessId: "hermes", textPreview: text, redacted: true },
+            },
+          ],
+        },
+      });
+    }
+
+    const state = stateByRunId.get("run-bounded-delta-state");
+    expect(state).toBeTruthy();
+    expect(state?.seenAssistantDeltaReplayKeys.size).toBeLessThanOrEqual(4_096);
+    expect(state?.seenAssistantDeltaReplayKeyOrder).toHaveLength(4_096);
+    expect(state?.assistantDeltaMirrorCounts.runtime.size).toBeLessThanOrEqual(4_096);
+    const retainedStateKeys = [
+      ...(state?.seenAssistantDeltaReplayKeys ?? []),
+      ...Array.from(state?.assistantDeltaMirrorCounts.runtime.keys() ?? []),
+    ];
+    expect(retainedStateKeys.join("\n")).not.toContain("raw-delta-text-that-should-not-be-retained");
+
+    bus.publish({
+      type: "transcript.delta",
+      source: { source: "runs", revision: 4_201, observedAt: "2026-01-01T00:00:01.000Z" },
+      detail: {
+        runId: "run-bounded-delta-state",
+        sessionId: "session-bounded-delta-state",
+        afterSequence: 4_200,
+        eventCount: 1,
+        events: [
+          {
+            runId: "run-bounded-delta-state",
+            sequence: 4_201,
+            at: "2026-01-01T00:00:01.000Z",
+            source: "harness",
+            eventType: "completed",
+            message: "done",
+            payload: {},
+          },
+        ],
+      },
+    });
+    expect(stateByRunId.has("run-bounded-delta-state")).toBe(false);
+  });
+
   it("publishes store-driven assistant and system conversation writes as orchestrator chat realtime events", async () => {
     const orchestratorConversationStore = new FileOrchestratorConversationStore(path.join(root, "chat-state"));
     const server = createRealtimeServer({ orchestratorConversationStore });
