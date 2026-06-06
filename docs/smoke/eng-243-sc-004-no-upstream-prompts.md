@@ -200,17 +200,17 @@ The chosen live runs did not emit a `command_policy_decision` event. This packet
 
 ## Vendored Hermes No-Touch Check
 
-The ENG-281 branch did not modify vendored Hermes source. The protected-surface check output captured for this packet is:
+The ENG-281 branch did not modify vendored Hermes source. The protected-surface check compares the branch diff against the PR base ref and separately checks for any remaining worktree/index changes:
 
 ```text
-$ git diff --name-only -- hermes/upstream-src
+$ git diff --name-only origin/main...HEAD -- hermes/upstream-src
 # stdout: <empty>
 
 $ git status --short -- hermes/upstream-src
 # stdout: <empty>
 ```
 
-Both commands produced zero changed paths, which is the expected passing result for REQ-005.
+Taken together, those commands show there are zero committed vendored-Hermes branch changes and zero uncommitted vendored-Hermes worktree/index changes, which is the expected passing result for REQ-005.
 
 ## Reviewer Checklist
 
@@ -219,5 +219,5 @@ A reviewer can independently confirm this evidence packet by:
 1. Opening the four `/api/v1/runs/...` endpoints above and checking the stored status/phase/model/timestamps.
 2. Inspecting the two persisted `events.jsonl` files (or transcript API output) and confirming the listed `Hermes tool terminal:` commands are local-only.
 3. Re-running the transcript scan for the blocked-command and prompt-marker patterns listed in **Inspection Method** and confirming zero hits.
-4. Comparing the recorded empty-stdout no-touch transcript above with a local rerun of the same vendored-Hermes commands.
+4. Comparing the recorded empty-stdout no-touch transcript above with a local rerun of `git diff --name-only origin/main...HEAD -- hermes/upstream-src` and `git status --short -- hermes/upstream-src`.
 5. Inspecting the cited automated tests to confirm denied-command audit events stay redacted and that service-owned GitHub paths remain allowed.

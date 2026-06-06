@@ -34,7 +34,7 @@ npm test -- tests/hermes-command-policy-profile.test.ts tests/hermes-delegated-c
 npm test -- tests/hermes-acp-harness.test.ts tests/hermes-mcp-config.test.ts tests/hermes-template-policy.test.ts
 ```
 
-This Checkpoint A subset validates direct and disguised upstream denials, `execute_code`, ACP permission resolution, Hermes hook/CLI behavior, gateway/TUI profile hook installation, delegated subagent and command reducer inheritance, and broader ACP harness wiring. Later US2 local-inspection/config, US3 service-boundary, and US4 audit/replay suites remain separate subissue validation until those files exist.
+This Checkpoint A subset validates direct and disguised upstream denials, `execute_code`, ACP permission resolution, Hermes hook/CLI behavior, gateway/TUI profile hook installation, delegated subagent and command reducer inheritance, and broader ACP harness wiring. The US2 local-inspection/config, US3 service-boundary, and US4 audit/replay suites have their own targeted commands below, and the final validation packet rolls all of them together.
 
 For the Checkpoint B / Issue 15 / T041 US2 local-inspection targeted validation subissue, run the present US2 command-policy suite:
 
@@ -54,7 +54,7 @@ npm test -- tests/mcp-subprocess-environment-command-policy.test.ts tests/comple
 
 This Checkpoint C subset validates service MCP credential slicing, completion-report publication boundaries, review-feedback writeback boundaries, mergeability and CI service-owned paths, and equivalent worker/reviewer terminal or `execute_code` direct-deny behavior.
 
-For final targeted validation after the later user-story test files exist, run the full policy-facing suite:
+For final targeted validation, run the full policy-facing suite:
 
 ```powershell
 npm run typecheck
@@ -69,7 +69,7 @@ Treat final validation as a three-part review packet:
 
 1. The automated deny/allow/service-boundary/audit suite above.
 2. One real worker run and one real reviewer run inspected through the status API or persisted run transcript for SC-004 evidence.
-3. The vendored Hermes no-touch check at the end of this document.
+3. The vendored Hermes base-diff plus worktree no-touch check at the end of this document.
 
 Latency regression coverage should keep normal direct policy decisions under 50 ms and local Git config inspection decisions under 250 ms using deterministic local fixtures. Avoid flaky end-to-end timing assertions against real provider, network, or desktop credential behavior.
 
@@ -156,7 +156,7 @@ A review-ready SC-004 evidence packet contains:
 - Transcript scan output showing no upstream Git/GitHub attempts, with any wrapper/interpreter/package-script entries clearly labeled as observed local activity rather than allow-list proof.
 - Zero-hit prompt scan results.
 - One redacted `command_policy_decision` or public-read transcript example.
-- The vendored Hermes no-touch check output.
+- The vendored Hermes base-diff plus worktree no-touch check output.
 
 Do not intentionally trigger real credential prompts as the validation mechanism. Use local fixtures, fake helpers, run evidence, and operator observation instead.
 
@@ -171,8 +171,8 @@ See `docs/smoke/eng-243-sc-004-no-upstream-prompts.md` for a recorded evidence p
 - Final validation must confirm vendored Hermes source is untouched:
 
 ```powershell
-git diff --name-only -- hermes/upstream-src
+git diff --name-only origin/main...HEAD -- hermes/upstream-src
 git status --short -- hermes/upstream-src
 ```
 
-Both commands must produce no changed paths.
+The first command must produce no changed paths relative to the PR base ref, and the second command must produce no changed worktree/index entries.

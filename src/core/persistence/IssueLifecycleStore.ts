@@ -439,7 +439,6 @@ export type IssueLifecycleStore = FileIssueLifecycleStore;
 
 export class FileIssueLifecycleStore {
   private readonly projectionNotifier = new ProjectionRevisionNotifier();
-  private readonly writeLocks = new Map<string, Promise<void>>();
 
   constructor(private readonly stateDir: string) {}
 
@@ -540,31 +539,12 @@ export class FileIssueLifecycleStore {
   }
 
   private async write(record: IssueLifecycleRecord): Promise<void> {
-    const target = this.recordPath(record.issueId);
-    const previous = this.writeLocks.get(target) ?? Promise.resolve();
-    let current!: Promise<void>;
-    current = (async () => {
-      await previous.catch(() => undefined);
-      try {
-        await this.writeUnlocked(record, target);
-      } finally {
-        if (this.writeLocks.get(target) === current) {
-          this.writeLocks.delete(target);
-        }
-      }
-    })();
-    this.writeLocks.set(target, current);
-    await current;
-  }
-
-  private async writeUnlocked(record: IssueLifecycleRecord, target: string): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
+    const target = this.recordPath(record.issueId);
     const temp = `${target}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
     if (process.platform === "win32") {
-      await fs.copyFile(temp, target);
-      await fs.rm(temp, { force: true });
-      return;
+      await fs.rm(target, { force: true });
     }
     await fs.rename(temp, target);
   }
@@ -906,24 +886,16 @@ function patchValue<K extends keyof IssueLifecyclePatch>(
 }
 
 async function readLifecycleJsonIfExists(filePath: string): Promise<IssueLifecycleRecord | null> {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-      return normalizeLifecycleRecord(parsed, filePath);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") return null;
-      if (error instanceof SymphonyError) throw error;
-      const retryable = code === "EBUSY" || code === "EPERM" || error instanceof SyntaxError;
-      if (!retryable || attempt === 4) {
-        throw new SymphonyError("lifecycle_store_corrupt", `Issue lifecycle record is unreadable: ${filePath}`, {
-          cause: errorMessage(error),
-        });
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+  try {
+    const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
+    return normalizeLifecycleRecord(parsed, filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (error instanceof SymphonyError) throw error;
+    throw new SymphonyError("lifecycle_store_corrupt", `Issue lifecycle record is unreadable: ${filePath}`, {
+      cause: errorMessage(error),
+    });
   }
-  return null;
 }
 
 function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecycleRecord {

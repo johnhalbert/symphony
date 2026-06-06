@@ -2351,9 +2351,8 @@ describe("Orchestrator", () => {
     try {
       await orchestrator.refreshNow();
       await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
-      await waitForAsync(async () => (await lifecycleStore.get(candidate.id)) !== null, "initial lifecycle record");
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
-      await lifecycleStore.updateIssue(
+      await lifecycleStore.ensureIssue(
         candidate,
         pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
       );

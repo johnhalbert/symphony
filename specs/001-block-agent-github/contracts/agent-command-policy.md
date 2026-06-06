@@ -44,7 +44,6 @@ Every decision is structured before execution. The final operator-facing example
   "reasonKind": "local_only_inspection",
   "commandClass": "local_git_inspection",
   "message": "Allowed helper-free local Git inspection command.",
-  "requiresUserOrServiceFix": false,
   "audit": {
     "redacted": true,
     "surface": "terminal_execute",
@@ -71,7 +70,6 @@ Every decision is structured before execution. The final operator-facing example
   "reasonKind": "upstream_github",
   "commandClass": "git_push",
   "message": "Blocked worker/reviewer upstream GitHub activity. Use Symphony service-owned publication, review, and writeback workflow actions instead.",
-  "requiresUserOrServiceFix": true,
   "audit": {
     "redacted": true,
     "surface": "terminal_execute",
@@ -98,7 +96,6 @@ Every decision is structured before execution. The final operator-facing example
   "reasonKind": "upstream_github",
   "commandClass": "github_cli",
   "message": "Blocked worker/reviewer upstream GitHub activity. Use Symphony service-owned publication, review, and writeback workflow actions instead.",
-  "requiresUserOrServiceFix": true,
   "audit": {
     "redacted": true,
     "surface": "terminal_execute",
@@ -124,7 +121,6 @@ Every decision is structured before execution. The final operator-facing example
   "reasonKind": "unsafe_git_config",
   "commandClass": "git_local_inspection_with_helper",
   "message": "Blocked worker/reviewer Git command: local Git inspection would execute a configured helper. Use local inspection without helper configuration or rely on Symphony service-owned GitHub workflow actions.",
-  "requiresUserOrServiceFix": true,
   "audit": {
     "redacted": true,
     "surface": "terminal_execute",
@@ -150,6 +146,7 @@ Every decision is structured before execution. The final operator-facing example
 - Denial messages must be actionable, redacted, and point back to Symphony service-owned workflow actions when the user is trying to perform a service-owned GitHub task.
 - `allow` decisions must identify the command as local-only and helper-free.
 - `reasonKind`, `commandClass`, and `upstreamContactAttempted` must stay structured rather than inferred from freeform messages.
+- `requiresUserOrServiceFix` is optional on downstream wrappers and projections, but direct policy decisions are valid without it when the structured `audit` payload is already present.
 - `normalizedCommand` is optional on the immediate policy decision object; consumers must not require it when the decision already provides the structured redacted `audit` metadata.
 
 ## Required Deny Classes
