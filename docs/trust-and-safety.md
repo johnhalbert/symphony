@@ -175,7 +175,7 @@ Hermes is the dogfood runtime harness in the reference workflow. Cursor remains 
 
 Workers run through the selected runtime harness in the assigned worktree. The Cursor provider uses the Cursor SDK local runtime. The Hermes provider uses the upstream TUI stdio gateway through a Symphony facade and mounts Symphony MCP handoff tools into each generated profile.
 
-Hermes dogfood requires a nonempty `hermes.model`, so the upstream gateway cannot fall back to an unrelated default model. The reference workflow uses `gpt-5.5`, while the generated worker, reviewer, and planner templates set Hermes `agent.reasoning_effort: xhigh`. Native Windows is supported for Symphony's stdio gateway path with Node 22+ and Python 3.11+; configure `hermes.python` when the desired Python executable is not the default `python`.
+Hermes dogfood requires a nonempty `hermes.model`, so the upstream gateway cannot fall back to an unrelated default model. The reference workflow uses `gpt-5.3-codex-spark`, while the generated worker template sets Hermes `agent.reasoning_effort: high` and the reviewer/planner templates set `agent.reasoning_effort: xhigh`. Native Windows is supported for Symphony's stdio gateway path with Node 22+ and Python 3.11+; configure `hermes.python` when the desired Python executable is not the default `python`.
 
 ## Non-Goals
 
