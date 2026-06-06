@@ -1,4 +1,5 @@
 import { redactTranscriptText, sanitizeCommandPolicyPayloadForPublicOutput, sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
+import { projectWebTranscript as projectSharedWebTranscript } from "./WebTranscriptProjectionCore.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage } from "../core/persistence/RunTranscriptStore.js";
 
 const USER_PROMPT_MAX_LENGTH = 5_000;
@@ -122,7 +123,7 @@ export function projectWebTranscript(
   events: readonly TranscriptEvent[],
   options: WebTranscriptProjectionOptions = {},
 ): TranscriptMessage[] {
-  const messages = projectTranscriptEvents(events);
+  const messages = projectSharedWebTranscript(events);
   if (!options.run || options.includeRunPrelude === false) return messages;
   return [...projectRunPreludeMessages(options.run, messages), ...messages];
 }

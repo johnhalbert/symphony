@@ -379,7 +379,7 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
 
   async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     this.requests.push({ method, params });
-    if (method === "session.create") return { session_id: this.sessionId } as T;
+    if (method === "session.create") return { session_id: this.sessionId, session_key: `hermes-${this.sessionId}` } as T;
     if (method === "prompt.submit") {
       await this.options.onPromptSubmit?.(this);
       if (this.options.emitPromptCompleteEvent !== false) {
@@ -387,7 +387,7 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
           this.emit("event", {
             type: "message.complete",
             session_id: this.sessionId,
-            payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
+            payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 }, session_key: `hermes-${this.sessionId}` },
           } satisfies GatewayEvent);
         });
       }

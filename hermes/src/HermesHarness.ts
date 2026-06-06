@@ -55,11 +55,15 @@ interface HermesLease {
   requestTimeoutMs: number;
   shutdownGraceMs: number;
   gatewaySessionId: string | null;
+  hermesSessionKey: string | null;
+  gatewaySessionResumed: boolean;
   commandPolicyDecisionJournalPath: string | null;
   disposed: boolean;
 }
 
 type TerminalStatus = "succeeded" | "failed" | "cancelled" | null;
+
+const HERMES_SESSION_STATE_FILENAME = ".symphony-hermes-session.json";
 
 export class HermesHarness implements AgentHarness {
   readonly id = "hermes";
@@ -72,6 +76,7 @@ export class HermesHarness implements AgentHarness {
   readonly supportsContinuation = true;
 
   private readonly leases = new Map<string, HermesLease>();
+  private readonly reusableSessionKeys = new Map<string, string>();
   private readonly activeRuns = new Map<string, HermesLease>();
   private readonly cancelledRuns = new Set<string>();
   private readonly gatewayFactory: (env: HermesGatewayEnvironment) => HermesGatewayClient;
@@ -135,6 +140,7 @@ export class HermesHarness implements AgentHarness {
     };
     const onGatewayEvent = (event: GatewayEvent) => {
       if (!acceptGatewayEvent(event, lease.gatewaySessionId)) return;
+      this.rememberHermesSessionKeyFromEvent(lease, event);
       enqueueHookDecisionJournal();
       appendRuntimeEvent(event);
       for (const mapped of mapHermesGatewayEvent(event, {
@@ -221,6 +227,8 @@ export class HermesHarness implements AgentHarness {
           profileDir: lease.profile.profileDir,
           templateDir: lease.profile.templateDir,
           gatewaySessionId,
+          hermesSessionKey: lease.hermesSessionKey,
+          sessionResumed: lease.gatewaySessionResumed,
           reusable: lease.reusable,
         },
       });
@@ -258,8 +266,9 @@ export class HermesHarness implements AgentHarness {
       if (!lease.reusable) {
         await this.disposeLease(lease, "run_finished");
         await this.cleanupProfileAfterRun(ctx, lease, terminalStatus);
-      } else if (lease.client.isClosed()) {
-        this.retireLeaseAfterTransportExit(lease);
+      } else {
+        await this.persistReusableHermesSessionKeyAfterRun(ctx, lease);
+        await this.disposeLease(lease, "run_finished");
       }
     }
   }
@@ -282,8 +291,7 @@ export class HermesHarness implements AgentHarness {
     const key = reusable ? reusableLeaseKey(ctx) : `fresh:${freshLeaseId}`;
     const existing = reusable ? this.leases.get(key) : undefined;
     if (existing && !existing.disposed) {
-      if (!existing.client.isClosed()) return existing;
-      this.retireLeaseAfterTransportExit(existing);
+      await this.disposeLease(existing, "superseded_reusable_run");
     }
 
     const manager = this.effectiveProfileManager(ctx);
@@ -328,6 +336,10 @@ export class HermesHarness implements AgentHarness {
       await this.effectiveAuthManager(ctx).requireProviders(requiredAuthProviders);
     }
 
+    const persistedHermesSessionKey = reusable ? await readHermesSessionKey(profile.profileDir, ctx.logger.warn.bind(ctx.logger)) : null;
+    const hermesSessionKey = reusable ? this.reusableSessionKeys.get(key) ?? persistedHermesSessionKey : null;
+    if (reusable && hermesSessionKey) this.reusableSessionKeys.set(key, hermesSessionKey);
+
     const credential = requiredAuthProviders.length > 0 ? null : resolveRuntimeCredential(ctx.config, ctx.role, this.id);
     const extraEnv: Record<string, string> = {};
     if (credential?.value) extraEnv[ctx.config.hermes.runtimeCredentialEnv] = credential.value;
@@ -352,6 +364,8 @@ export class HermesHarness implements AgentHarness {
       requestTimeoutMs: ctx.config.hermes.requestTimeoutMs,
       shutdownGraceMs: ctx.config.hermes.shutdownGraceMs,
       gatewaySessionId: null,
+      hermesSessionKey,
+      gatewaySessionResumed: false,
       commandPolicyDecisionJournalPath: commandPolicyHookOptions?.decisionJournalPath ?? null,
       disposed: false,
     };
@@ -385,10 +399,44 @@ export class HermesHarness implements AgentHarness {
       throw new SymphonyError("agent_error", "Hermes gateway is closed");
     }
     if (lease.gatewaySessionId) return lease.gatewaySessionId;
-    const response = await this.gatewayRequest<{ session_id?: unknown }>(lease, "session.create", { cols: 120 }, lease.startupTimeoutMs);
+
+    if (lease.reusable && lease.hermesSessionKey) {
+      try {
+        const response = await this.gatewayRequest<{ resumed?: unknown; session_id?: unknown }>(
+          lease,
+          "session.resume",
+          { cols: 120, session_id: lease.hermesSessionKey },
+          lease.startupTimeoutMs,
+        );
+        const gatewaySessionId = nonEmptyString(response.session_id);
+        if (!gatewaySessionId) throw new SymphonyError("agent_error", "Hermes gateway did not return a session_id");
+        lease.gatewaySessionId = gatewaySessionId;
+        lease.gatewaySessionResumed = true;
+        await this.rememberHermesSessionKey(lease, nonEmptyString(response.resumed) ?? lease.hermesSessionKey);
+        return gatewaySessionId;
+      } catch (error) {
+        if (!isMissingHermesSessionError(error)) throw error;
+        await this.forgetHermesSessionKey(lease);
+      }
+    }
+
+    const response = await this.gatewayRequest<{ session_id?: unknown; session_key?: unknown }>(
+      lease,
+      "session.create",
+      { cols: 120 },
+      lease.startupTimeoutMs,
+    );
     const gatewaySessionId = typeof response.session_id === "string" ? response.session_id : "";
     if (!gatewaySessionId) throw new SymphonyError("agent_error", "Hermes gateway did not return a session_id");
     lease.gatewaySessionId = gatewaySessionId;
+    lease.gatewaySessionResumed = false;
+    if (lease.reusable) {
+      const hermesSessionKey = nonEmptyString(response.session_key);
+      if (!hermesSessionKey) {
+        throw new SymphonyError("agent_error", "Hermes gateway did not return a session_key for reusable worker session");
+      }
+      await this.rememberHermesSessionKey(lease, hermesSessionKey);
+    }
     return gatewaySessionId;
   }
 
@@ -430,6 +478,8 @@ export class HermesHarness implements AgentHarness {
         // best effort; kill below is the hard boundary.
       }
     }
+    lease.gatewaySessionId = null;
+    lease.gatewaySessionResumed = false;
     lease.client.kill(`hermes.${reason}`);
   }
 
@@ -437,6 +487,7 @@ export class HermesHarness implements AgentHarness {
     if (lease.disposed) return;
     lease.disposed = true;
     lease.gatewaySessionId = null;
+    lease.gatewaySessionResumed = false;
     this.leases.delete(lease.key);
   }
 
@@ -444,8 +495,43 @@ export class HermesHarness implements AgentHarness {
     if (!lease.reusable || lease.disposed) return;
     lease.disposed = true;
     lease.gatewaySessionId = null;
+    lease.gatewaySessionResumed = false;
     this.leases.delete(lease.key);
     lease.client.kill(`hermes.${reason}`);
+  }
+
+  private async rememberHermesSessionKey(lease: HermesLease, hermesSessionKey: string): Promise<void> {
+    lease.hermesSessionKey = hermesSessionKey;
+    if (!lease.reusable) return;
+    this.reusableSessionKeys.set(lease.key, hermesSessionKey);
+    await writeHermesSessionKey(lease.profile.profileDir, hermesSessionKey);
+  }
+
+  private async forgetHermesSessionKey(lease: HermesLease): Promise<void> {
+    lease.hermesSessionKey = null;
+    if (!lease.reusable) return;
+    this.reusableSessionKeys.delete(lease.key);
+    await removeHermesSessionKey(lease.profile.profileDir);
+  }
+
+  private rememberHermesSessionKeyFromEvent(lease: HermesLease, event: GatewayEvent): void {
+    if (!lease.reusable || !isRecord(event.payload)) return;
+    const payload = event.payload as Record<string, unknown>;
+    const hermesSessionKey = nonEmptyString(payload.session_key) ?? nonEmptyString(payload.sessionKey);
+    if (!hermesSessionKey || hermesSessionKey === lease.hermesSessionKey) return;
+    void this.rememberHermesSessionKey(lease, hermesSessionKey).catch(() => undefined);
+  }
+
+  private async persistReusableHermesSessionKeyAfterRun(ctx: AgentRunContext, lease: HermesLease): Promise<void> {
+    if (!lease.hermesSessionKey) return;
+    try {
+      await writeHermesSessionKey(lease.profile.profileDir, lease.hermesSessionKey);
+    } catch (error) {
+      ctx.logger.warn("hermes reusable session state write failed", {
+        profile_dir: lease.profile.profileDir,
+        error: errorMessage(error),
+      });
+    }
   }
 
   private async cleanupProfileAfterRun(ctx: AgentRunContext, lease: HermesLease, terminalStatus: TerminalStatus): Promise<void> {
@@ -1176,6 +1262,45 @@ export function looksLikeProviderLimit(value: string): boolean {
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+async function readHermesSessionKey(
+  profileDir: string,
+  warn: (message: string, payload?: Record<string, unknown>) => void,
+): Promise<string | null> {
+  const statePath = path.join(profileDir, HERMES_SESSION_STATE_FILENAME);
+  try {
+    const parsed = JSON.parse(await fs.readFile(statePath, "utf8")) as unknown;
+    if (!isRecord(parsed)) return null;
+    return nonEmptyString(parsed.hermesSessionKey) ?? nonEmptyString(parsed.session_key);
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      warn("hermes reusable session state read failed", { state_path: statePath, error: errorMessage(error) });
+    }
+    return null;
+  }
+}
+
+async function writeHermesSessionKey(profileDir: string, hermesSessionKey: string): Promise<void> {
+  await fs.mkdir(profileDir, { recursive: true });
+  await fs.writeFile(
+    path.join(profileDir, HERMES_SESSION_STATE_FILENAME),
+    `${JSON.stringify({ hermesSessionKey, updatedAt: new Date().toISOString() }, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+async function removeHermesSessionKey(profileDir: string): Promise<void> {
+  await fs.rm(path.join(profileDir, HERMES_SESSION_STATE_FILENAME), { force: true });
+}
+
+function isMissingHermesSessionError(error: unknown): boolean {
+  const record = errorRecordWithProperties(error);
+  const data = isRecord(record.data) ? record.data : {};
+  const rpcError = isRecord(record.rpcError) ? record.rpcError : {};
+  const code = record.code ?? data.code ?? rpcError.code;
+  if (code === 4007 || code === "4007") return true;
+  return errorMessage(error).toLowerCase().includes("session not found");
 }
 
 function hasMeaningfulValue(value: unknown): boolean {

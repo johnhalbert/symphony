@@ -2354,6 +2354,7 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "session_id": sid,
+            "session_key": key,
             "info": {
                 "model": _resolve_model(),
                 "tools": {},
@@ -3843,7 +3844,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 raw = str(result)
                 status = "complete"
 
-            payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            payload = {
+                "text": raw,
+                "usage": _get_usage(agent),
+                "status": status,
+                "session_key": session.get("session_key") or sid,
+            }
             provider_limit = _provider_limit_payload_from_result(agent, result if isinstance(result, dict) else None)
             if provider_limit:
                 payload["provider_limit"] = provider_limit

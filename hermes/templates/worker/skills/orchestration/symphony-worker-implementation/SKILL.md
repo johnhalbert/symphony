@@ -17,7 +17,7 @@ Use this skill when acting as a Symphony worker for an implementation or merge-g
 6. **Build a scenario matrix before handoff.** Cover happy path, negative/error path, sibling/adjacent path, boundary/integration behavior, persistence or durability effects, authorization or credential variants when relevant, idempotency/replay behavior, already-terminal/repeated-operation behavior, and whether required side effects actually process rather than merely enqueue.
 7. **Validate with the smallest meaningful checks plus broader tests for shared code.** Run focused tests for the touched behavior. When touching orchestration, workflow, tracker, harness, persistence, approval, publication, or writeback code, add or run broader tests that exercise cross-boundary behavior.
 8. **For merge-gate repairs, reproduce the failing required check before changing anything, then repair the invariant that actually blocks CI.** If the failure is a stale test expectation after an accepted adjacent contract change, prefer updating the narrow expectation to the current documented contract over changing production code to satisfy obsolete behavior. Re-run the exact failing test/check first, then the required gate command(s) such as typecheck and full test when feasible.
-9. **Submit the Symphony MCP completion report before ending.** Include summary, validation evidence, acceptance checklist entries with concrete proof, changed files, branch name and any existing PR number/URL/head SHA only if already known from context or safe read-only inspection, risks, and a stable idempotency key. The natural-language final response is not the completion signal.
+9. **Submit the Symphony MCP completion report before ending.** Include summary, validation evidence, acceptance checklist entries with concrete proof, changed files, branch name and any existing PR number/URL/head SHA only if already known from context or safe read-only inspection, risks, and a stable idempotency key. When the issue has a fenced JSON Issue Contract, treat its `requirements` array as the authoritative acceptance contract: provide one checklist item per requirement `id`, prefix the item text with that ID, and mark it satisfied only when the cited evidence proves the exact behavior. The natural-language final response is not the completion signal.
 
 ## Delegated research discipline
 
@@ -84,7 +84,8 @@ Before calling the completion report tool, gather:
 
 - Concise implementation summary.
 - Validation commands and results, including any known pre-existing or out-of-scope failures.
-- Acceptance criteria mapped one-by-one to evidence.
+- Acceptance criteria mapped one-by-one to evidence. If a fenced JSON Issue Contract exists, map every requirement ID to proof and leave any unproven requirement unsatisfied.
+- For operator instructions or recorded artifacts, proof must verify the exact documented command invocation and the exact emitted fields, API responses, logs, or files. Do not claim a requirement is satisfied from inferred behavior or a nearby implementation path.
 - List of materially changed files.
 - Current branch name and any existing PR number/URL/head SHA only if already known from context or safe read-only inspection.
 - Risks, limitations, and intentionally unverified scenarios.

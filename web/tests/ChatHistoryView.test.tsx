@@ -6,10 +6,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ChatHistoryView, resolveSelectedSessionId } from "../src/components/history/ChatHistoryView";
 import type { HistoryModel, Loadable, SessionModel, TranscriptMessage } from "../src/types/symphony";
+import {
+  buildProjectedLargeRealRunTranscriptReadabilityFixture,
+  projectedRealRunTranscriptReadabilityMessages,
+} from "../../src/app/testing/real-run-transcript-readability.fixture.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const mountedRoots: Root[] = [];
+const largeRealRunTranscriptCycleCount = 18;
 
 const { useTranscriptMock } = vi.hoisted(() => ({
   useTranscriptMock: vi.fn<(sessionId: string | null, refreshToken?: unknown) => Loadable<TranscriptMessage[]>>(),
@@ -72,6 +77,12 @@ const apiTranscript: TranscriptMessage[] = [
     result: "tests passed",
   },
 ];
+
+const realRunTranscriptMessages = projectedRealRunTranscriptReadabilityMessages;
+const largeRealRunTranscriptFixture = buildProjectedLargeRealRunTranscriptReadabilityFixture({
+  cycleCount: largeRealRunTranscriptCycleCount,
+});
+const largeRealRunTranscriptMessages = largeRealRunTranscriptFixture.messages;
 
 function history(overrides: Partial<HistoryModel> = {}): HistoryModel {
   return {
@@ -152,6 +163,56 @@ describe("ChatHistoryView", () => {
     expect(markup).toContain("Dedicated session transcript loaded from the API.");
     expect(markup).toContain("terminal");
     expect(markup).not.toContain("No transcript messages for this session.");
+  });
+
+  it("renders a projected real-run transcript fixture and keeps multiline command output visible in the transcript UI", () => {
+    useTranscriptMock.mockReturnValue(transcriptState({ data: realRunTranscriptMessages }));
+    const fixtureSession = {
+      ...sessions[1],
+      title: "Real run readability fixture",
+      msgCount: realRunTranscriptMessages.length,
+      toolCount: 1,
+      lastEvent: "Transcript readability fixture loaded",
+    };
+    const view = mountHistoryView(history({ sessions: [fixtureSession], defaultSessionId: fixtureSession.id }));
+
+    expect(view.container.textContent).toContain(
+      "Readability pass: split tokens and wrap long lines while preserving command output context.",
+    );
+    expect(view.container.textContent).toContain("Long transcript lines are now grouped and rendered with stable whitespace.");
+    expect(view.container.textContent).toContain("Requests paused for provider window");
+    expect(view.container.textContent).toContain("Cancelled after operator stop request token=[redacted]");
+    expect(view.container.textContent).not.toContain("REAL_RUN_TOKEN_123456789");
+
+    const toolCallButton = view.container.querySelector<HTMLButtonElement>(".toolcall__head");
+    if (!toolCallButton) throw new Error("expected tool call button to render");
+    act(() => {
+      toolCallButton.click();
+    });
+
+    expect(view.container.textContent).toContain("tests: 42 passed");
+    expect(view.container.textContent).toContain("coverage: 98.8%");
+    expect(view.container.textContent).not.toContain("SECRET_REAL_RUN_API_KEY");
+    expect(view.container.textContent).not.toContain("SECRET_PROVIDER_LIMIT_KEY");
+  });
+
+  it("renders the bounded projection of a generated large-session readability fixture without extra transcript rows", () => {
+    useTranscriptMock.mockReturnValue(transcriptState({ data: largeRealRunTranscriptMessages }));
+    const fixtureSession = {
+      ...sessions[1],
+      title: "Large transcript readability fixture",
+      msgCount: largeRealRunTranscriptFixture.expectedMessageCount,
+      toolCount: largeRealRunTranscriptFixture.expectedToolCallCount,
+      lastEvent: "Large transcript fixture loaded",
+    };
+    const view = mountHistoryView(history({ sessions: [fixtureSession], defaultSessionId: fixtureSession.id }));
+
+    expect(view.container.querySelectorAll(".msg, .lifecycle")).toHaveLength(largeRealRunTranscriptFixture.expectedMessageCount);
+    expect(view.container.querySelectorAll(".toolcall__head")).toHaveLength(largeRealRunTranscriptFixture.expectedToolCallCount);
+    expect(view.container.textContent).toContain("Cycle 01: merge transcript deltas and keep output previews readable.");
+    expect(view.container.textContent).toContain("Run failed after provider interruption token=[redacted]");
+    expect(view.container.textContent).not.toContain("LARGE_REAL_RUN_TOKEN_");
+    expect(view.container.textContent).not.toContain("SECRET_PROVIDER_LIMIT_");
   });
 
   it("keeps selected session and scroll context while refreshed history adds and updates sessions", () => {

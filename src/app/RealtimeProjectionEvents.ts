@@ -184,6 +184,7 @@ type AssistantDeltaMirrorCounts = Record<AssistantDeltaMirrorSource, Map<string,
 
 interface RealtimeTranscriptPatchProjectionState {
   seenAssistantDeltaReplayKeys: Set<string>;
+  seenAssistantDeltaReplayKeyOrder: string[];
   assistantDeltaMirrorCounts: AssistantDeltaMirrorCounts;
   pendingAssistantDelta: boolean;
 }
@@ -201,6 +202,8 @@ export interface RealtimeSseStream {
 export const REALTIME_SSE_RETRY_MS = 5_000;
 export const REALTIME_SSE_KEEPALIVE_MS = 15_000;
 export const REALTIME_EVENT_HISTORY_LIMIT = 256;
+const REALTIME_TRANSCRIPT_PATCH_REPLAY_KEY_LIMIT = 4_096;
+const REALTIME_TRANSCRIPT_PATCH_MIRROR_KEY_LIMIT = 4_096;
 
 export class RealtimeProjectionEventBus {
   private readonly subscribers = new Map<number, (event: RealtimeProjectionEvent) => void>();
@@ -729,7 +732,7 @@ function projectRealtimeTranscriptPatchMessages(
         patches.push({ sequence: event.sequence, message: null });
         continue;
       }
-      state.seenAssistantDeltaReplayKeys.add(replayKey);
+      rememberAssistantDeltaPatchReplayKey(state, replayKey);
       const mirrorSource = assistantDeltaPatchMirrorSource(event);
       if (mirrorSource && consumeAssistantDeltaPatchMirror(mirrorSource, message.text, state.assistantDeltaMirrorCounts)) {
         patches.push({ sequence: event.sequence, message: null });
@@ -761,7 +764,13 @@ function projectRealtimeTranscriptPatchMessages(
     stateKnown = true;
   }
 
-  if (stateByRunId && stateKnown) stateByRunId.set(runId, state);
+  if (stateByRunId && stateKnown) {
+    if (events.some(isTerminalTranscriptPatchEvent)) {
+      stateByRunId.delete(runId);
+    } else {
+      stateByRunId.set(runId, state);
+    }
+  }
   return patches;
 }
 
@@ -794,6 +803,7 @@ function readTranscriptPatchMessage(value: unknown): RealtimeTranscriptPatchMess
 function createRealtimeTranscriptPatchProjectionState(): RealtimeTranscriptPatchProjectionState {
   return {
     seenAssistantDeltaReplayKeys: new Set<string>(),
+    seenAssistantDeltaReplayKeyOrder: [],
     assistantDeltaMirrorCounts: createAssistantDeltaPatchMirrorCounts(),
     pendingAssistantDelta: false,
   };
@@ -809,8 +819,20 @@ function resetRealtimeTranscriptAssistantDeltaGroup(state: RealtimeTranscriptPat
   state.assistantDeltaMirrorCounts.harness.clear();
 }
 
-function assistantDeltaPatchReplayKey(event: TranscriptEvent, text: string): string {
-  return `${event.runId}:${event.sequence}:${normalizeToken(event.eventType)}:${text}`;
+function rememberAssistantDeltaPatchReplayKey(
+  state: RealtimeTranscriptPatchProjectionState,
+  replayKey: string,
+): void {
+  state.seenAssistantDeltaReplayKeys.add(replayKey);
+  state.seenAssistantDeltaReplayKeyOrder.push(replayKey);
+  while (state.seenAssistantDeltaReplayKeyOrder.length > REALTIME_TRANSCRIPT_PATCH_REPLAY_KEY_LIMIT) {
+    const evicted = state.seenAssistantDeltaReplayKeyOrder.shift();
+    if (evicted !== undefined) state.seenAssistantDeltaReplayKeys.delete(evicted);
+  }
+}
+
+function assistantDeltaPatchReplayKey(event: TranscriptEvent, _text: string): string {
+  return `${event.runId}:${event.sequence}:${event.source}:${normalizeToken(event.eventType)}`;
 }
 
 function assistantDeltaPatchMirrorSource(event: TranscriptEvent): AssistantDeltaMirrorSource | null {
@@ -826,11 +848,40 @@ function consumeAssistantDeltaPatchMirror(
   text: string,
   counts: AssistantDeltaMirrorCounts,
 ): boolean {
+  const textKey = assistantDeltaPatchMirrorKey(text);
   const opposite = source === "runtime" ? "harness" : "runtime";
-  const sourceCount = counts[source].get(text) ?? 0;
-  const oppositeCount = counts[opposite].get(text) ?? 0;
-  counts[source].set(text, sourceCount + 1);
-  return oppositeCount > sourceCount;
+  const sourceCount = counts[source].get(textKey) ?? 0;
+  const oppositeCount = counts[opposite].get(textKey) ?? 0;
+  const nextSourceCount = sourceCount + 1;
+  rememberAssistantDeltaPatchMirrorCount(counts[source], textKey, nextSourceCount);
+  const mirrored = oppositeCount > sourceCount;
+  if (mirrored && oppositeCount === nextSourceCount) {
+    counts[source].delete(textKey);
+    counts[opposite].delete(textKey);
+  }
+  return mirrored;
+}
+
+function rememberAssistantDeltaPatchMirrorCount(counts: Map<string, number>, textKey: string, count: number): void {
+  counts.set(textKey, count);
+  while (counts.size > REALTIME_TRANSCRIPT_PATCH_MIRROR_KEY_LIMIT) {
+    const oldest = counts.keys().next().value;
+    if (oldest === undefined) return;
+    counts.delete(oldest);
+  }
+}
+
+function assistantDeltaPatchMirrorKey(text: string): string {
+  return `${text.length}:${hashString(text)}`;
+}
+
+function hashString(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
 }
 
 function transcriptPatchOperation(value: unknown): RealtimeTranscriptPatchMessage["operation"] | null {
@@ -866,6 +917,11 @@ function isAssistantCompletePatchEvent(event: TranscriptEvent): boolean {
     eventType === "response_complete" ||
     eventType === "completed"
   );
+}
+
+function isTerminalTranscriptPatchEvent(event: TranscriptEvent): boolean {
+  const eventType = normalizeToken(event.eventType);
+  return eventType === "completed" || eventType === "failed" || eventType === "cancelled";
 }
 
 function assistantDeltaPatchJoinMode(event: TranscriptEvent): NonNullable<RealtimeTranscriptPatchMessage["joinMode"]> {

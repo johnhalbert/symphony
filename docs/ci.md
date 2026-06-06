@@ -41,6 +41,6 @@ The hosted Linear smoke test is opt-in. Run the workflow manually with the `real
 
 The manual job sets `SYMPHONY_REAL_SMOKE=1` and runs only `tests/real-smoke.test.ts`. Normal pull request and push CI set `SYMPHONY_REAL_SMOKE=0`, so live smoke tests remain skipped.
 
-`npm run smoke:hermes-local` remains a local operator check because it requires local Hermes installation, Hermes-owned OpenAI Codex auth, Python dependencies, and the checked-in reference Hermes model from `WORKFLOW.md` (currently `gpt-5.3-codex-spark`) to be available to the authenticated provider. It is not run by the hosted CI workflow.
+`npm run smoke:hermes-local` remains a local operator check because it requires local Hermes installation, Hermes-owned OpenAI Codex auth, Python dependencies, and the reference Hermes `gpt-5.5` model to be available to the authenticated provider. It is not run by the hosted CI workflow.
 
 `npm run smoke:sdk-local` remains available for Cursor-provider checks, but Cursor is no longer the default dogfood runtime.

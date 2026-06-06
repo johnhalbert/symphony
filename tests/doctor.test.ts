@@ -1380,7 +1380,7 @@ class DoctorFakeHermesGatewayClient extends EventEmitter implements HermesGatewa
 
   async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     this.requests.push({ method, params });
-    if (method === "session.create") return { session_id: "doctor-session" } as T;
+    if (method === "session.create") return { session_id: "doctor-session", session_key: "hermes-doctor-session" } as T;
     if (method === "tools.list") {
       return {
         toolsets: [

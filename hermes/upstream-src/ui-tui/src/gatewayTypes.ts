@@ -112,6 +112,7 @@ export interface SetupStatusResponse {
 export interface SessionCreateResponse {
   info?: SessionInfo & { config_warning?: string; credential_warning?: string }
   session_id: string
+  session_key?: string
 }
 
 export interface SessionResumeResponse {
@@ -582,7 +583,15 @@ export type GatewayEvent =
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.complete' }
   | { payload: { rendered?: string; text?: string }; session_id?: string; type: 'message.delta' }
   | {
-      payload?: { provider_limit?: ProviderLimitPayload; reasoning?: string; rendered?: string; status?: string; text?: string; usage?: Usage }
+      payload?: {
+        provider_limit?: ProviderLimitPayload
+        reasoning?: string
+        rendered?: string
+        session_key?: string
+        status?: string
+        text?: string
+        usage?: Usage
+      }
       session_id?: string
       type: 'message.complete'
     }

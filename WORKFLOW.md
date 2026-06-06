@@ -102,12 +102,12 @@ hermes:
   upstream_root: ./hermes/upstream-src
   templates_dir: ./hermes/templates
   provider: openai-codex
-  model: gpt-5.3-codex-spark
+  model: gpt-5.4
   auth:
     mode: managed_root
     providers:
       - openai-codex
-  worker_session_lifecycle: reuse_by_issue
+  worker_session_lifecycle: fresh_per_run
   keep_profiles: failed
 
 server:
