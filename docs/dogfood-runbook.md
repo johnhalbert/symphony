@@ -68,7 +68,7 @@ Native Windows is supported for Symphony's stdio gateway path when Node 22+ and 
 
 Hermes owns OpenAI Codex auth. Symphony bootstraps selected provider state from the local Hermes auth store into `hermes.auth.managed_root`; it does not read Codex CLI auth directly and does not require `runtime.hermes` API-key credentials for `openai-codex`.
 
-The reference workflow configures Hermes with `provider: openai-codex` and `model: gpt-5.3-codex-spark`. The generated worker profile template sets Hermes `agent.reasoning_effort: high`, while the reviewer and planner templates remain `agent.reasoning_effort: xhigh`.
+The reference workflow configures Hermes with `provider: openai-codex` and `model: gpt-5.5`. The generated worker, reviewer, and planner profile templates set Hermes `agent.reasoning_effort: xhigh`.
 
 ### Host Hermes ACP harness setup
 

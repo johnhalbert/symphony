@@ -129,11 +129,6 @@ github:
   publish_pull_requests: true
   pr_handoff:
     enabled: false
-    target_state: Manual Review
-    required_checks: []
-    no_ci:
-      allowed: true
-      evidence: "I said so -John"
   operator_approval:
     required_for_publication: false
     reject_policy: cancel
