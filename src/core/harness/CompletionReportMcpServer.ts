@@ -163,16 +163,22 @@ function completionReportInputSchema(): Record<string, unknown> {
       acceptanceChecklist: {
         type: "array",
         minItems: 1,
-        description: "One item per acceptance criterion, including whether it is satisfied and the supporting evidence.",
+        description:
+          "One item per acceptance criterion. If the issue has a fenced JSON Issue Contract, include one item per requirement id and prove each with exact durable evidence.",
         items: {
           type: "object",
           additionalProperties: false,
           required: ["text", "satisfied", "evidence"],
           properties: {
-            text: { type: "string", minLength: 1, description: "Acceptance criterion text." },
+            text: {
+              type: "string",
+              minLength: 1,
+              description: "Acceptance criterion text. Prefix with the Issue Contract requirement id, such as `REQ-001`, when available.",
+            },
             satisfied: { type: "boolean", description: "Whether the implementation satisfies this criterion." },
             evidence: {
-              description: "Specific proof for the status, or null when no durable evidence is available.",
+              description:
+                "Specific proof for the status, or null when no durable evidence is available. Cite exact commands, emitted artifact fields, API responses, logs, tests, or file paths; for operator docs, prove the documented invocation produces the documented artifact.",
               anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
             },
           },
