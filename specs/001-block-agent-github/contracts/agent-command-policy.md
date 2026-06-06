@@ -34,6 +34,87 @@ Every command-capable surface must provide enough context to classify the attemp
 
 ## Policy Output
 
+Every decision is structured before execution. The final operator-facing examples below cover the required allow, deny, service-boundary, and redaction scenarios.
+
+### Example: allowed helper-free local inspection
+
+```json
+{
+  "outcome": "allow",
+  "reasonKind": "local_only_inspection",
+  "commandClass": "local_git_inspection",
+  "message": "Allowed helper-free local Git inspection command.",
+  "audit": {
+    "redacted": true,
+    "surface": "terminal_execute",
+    "role": "reviewer",
+    "phase": "review",
+    "outcome": "allow",
+    "reasonKind": "local_only_inspection",
+    "commandClass": "local_git_inspection",
+    "rawInputPreview": "git status --short",
+    "normalizedExecutable": "git",
+    "executableKind": "git",
+    "gitSubcommand": "status",
+    "commandPreview": "git status --short",
+    "upstreamContactAttempted": false
+  }
+}
+```
+
+### Example: denied upstream Git command
+
+```json
+{
+  "outcome": "deny",
+  "reasonKind": "upstream_github",
+  "commandClass": "git_push",
+  "message": "Blocked worker/reviewer upstream GitHub activity. Use Symphony service-owned publication, review, and writeback workflow actions instead.",
+  "audit": {
+    "redacted": true,
+    "surface": "terminal_execute",
+    "role": "worker",
+    "phase": "implementation",
+    "outcome": "deny",
+    "reasonKind": "upstream_github",
+    "commandClass": "git_push",
+    "rawInputPreview": "git push origin HEAD",
+    "normalizedExecutable": "git",
+    "executableKind": "git",
+    "gitSubcommand": "push",
+    "commandPreview": "git push origin HEAD",
+    "upstreamContactAttempted": false
+  }
+}
+```
+
+### Example: denied GitHub CLI command redirected to the service-owned workflow
+
+```json
+{
+  "outcome": "deny",
+  "reasonKind": "upstream_github",
+  "commandClass": "github_cli",
+  "message": "Blocked worker/reviewer upstream GitHub activity. Use Symphony service-owned publication, review, and writeback workflow actions instead.",
+  "audit": {
+    "redacted": true,
+    "surface": "terminal_execute",
+    "role": "worker",
+    "phase": "implementation",
+    "outcome": "deny",
+    "reasonKind": "upstream_github",
+    "commandClass": "github_cli",
+    "rawInputPreview": "gh pr create --fill",
+    "normalizedExecutable": "gh",
+    "executableKind": "github_cli",
+    "commandPreview": "gh pr create --fill",
+    "upstreamContactAttempted": false
+  }
+}
+```
+
+### Example: denied local inspection because a helper or credential path would run
+
 ```json
 {
   "outcome": "deny",
@@ -42,13 +123,17 @@ Every command-capable surface must provide enough context to classify the attemp
   "message": "Blocked worker/reviewer Git command: local Git inspection would execute a configured helper. Use local inspection without helper configuration or rely on Symphony service-owned GitHub workflow actions.",
   "audit": {
     "redacted": true,
-    "surface": "terminal",
+    "surface": "terminal_execute",
     "role": "worker",
     "phase": "implementation",
-    "normalizedExecutable": "git",
-    "gitSubcommand": "diff",
-    "inlineEnvironmentKeys": ["GIT_EXTERNAL_DIFF"],
-    "unsafeConfigCategories": ["external_diff"],
+    "outcome": "deny",
+    "reasonKind": "unsafe_git_config",
+    "commandClass": "git_local_inspection_with_helper",
+    "rawInputPreview": "GIT_ASKPASS=[redacted] git diff",
+    "rawInputPreviewRedacted": true,
+    "commandPreview": "GIT_ASKPASS=[redacted] git diff",
+    "inlineEnvironmentKeys": ["GIT_ASKPASS"],
+    "unsafeConfigCategories": ["credential_helper"],
     "upstreamContactAttempted": false
   }
 }
@@ -58,9 +143,11 @@ Every command-capable surface must provide enough context to classify the attemp
 
 - `outcome` is either `allow` or `deny`.
 - `deny` decisions must be returned before command execution.
-- Denial messages must be actionable and redacted.
+- Denial messages must be actionable, redacted, and point back to Symphony service-owned workflow actions when the user is trying to perform a service-owned GitHub task.
 - `allow` decisions must identify the command as local-only and helper-free.
-- `reasonKind` must be structured, not inferred from a freeform message.
+- `reasonKind`, `commandClass`, and `upstreamContactAttempted` must stay structured rather than inferred from freeform messages.
+- `requiresUserOrServiceFix` is optional on downstream wrappers and projections, but direct policy decisions are valid without it when the structured `audit` payload is already present.
+- `normalizedCommand` is optional on the immediate policy decision object; consumers must not require it when the decision already provides the structured redacted `audit` metadata.
 
 ## Required Deny Classes
 
@@ -86,6 +173,44 @@ The policy may allow worker/reviewer attempts only when all are true:
 - The command cannot execute external helpers through Git configuration, environment, aliases, hooks, filters, pagers, or wrapper commands.
 
 Examples include safe forms of local status, diff, log, show, branch listing, blame, and file history inspection.
+
+## Service-Owned Boundary Examples
+
+The same GitHub workflow action can be allowed for the service while denied for workers/reviewers.
+
+```json
+[
+  {
+    "role": "service",
+    "phase": "mcp-subprocess",
+    "surface": "terminal_execute",
+    "command": "gh pr create --fill",
+    "outcome": "allow",
+    "reasonKind": "role_not_restricted",
+    "commandClass": "role_not_restricted"
+  },
+  {
+    "role": "worker",
+    "phase": "implementation",
+    "surface": "terminal_execute",
+    "command": "gh pr create --fill",
+    "outcome": "deny",
+    "reasonKind": "upstream_github",
+    "commandClass": "github_cli"
+  },
+  {
+    "role": "reviewer",
+    "phase": "review",
+    "surface": "terminal_execute",
+    "command": "gh pr review 42 --request-changes --body 'Please fix this'",
+    "outcome": "deny",
+    "reasonKind": "upstream_github",
+    "commandClass": "github_cli"
+  }
+]
+```
+
+The service-owned MCP paths keep their scoped credentials, while direct worker/reviewer command-surface attempts are denied and redirected back to the service-owned workflow.
 
 ## ACP Permission Bridge Contract
 
@@ -117,6 +242,66 @@ Each policy decision must be visible in durable run activity or transcript repla
 - Structured reason kind.
 - Redacted evidence keys and categories.
 - Whether upstream contact was attempted. For correct denials this should be false.
+
+### Example: durable redacted audit event
+
+```json
+{
+  "kind": "command_policy_decision",
+  "text": "Command policy deny: upstream_github",
+  "payload": {
+    "redacted": true,
+    "decisionId": "decision-deny-upstream-1",
+    "attemptId": "tool-call-terminal-1",
+    "surface": "terminal_execute",
+    "role": "worker",
+    "phase": "implementation",
+    "outcome": "deny",
+    "reasonKind": "upstream_github",
+    "commandClass": "direct_upstream_git_operation",
+    "requestKind": "terminal_execute",
+    "toolCallId": "tool-call-terminal-1",
+    "permissionOutcome": "denied",
+    "hookAction": "block",
+    "upstreamContactAttempted": false,
+    "audit": {
+      "redacted": true,
+      "commandPreview": "[redacted command payload]",
+      "rawInputPreview": "[redacted command payload]",
+      "rawInputPreviewRedacted": true,
+      "targetHosts": ["github.com"],
+      "helperPath": "[redacted helper path]"
+    }
+  }
+}
+```
+
+### Example: public transcript projection
+
+```json
+{
+  "message": "Command policy deny: upstream_github (worker · implementation · terminal_execute)",
+  "payload": {
+    "outcome": "deny",
+    "reasonKind": "upstream_github",
+    "role": "worker",
+    "phase": "implementation",
+    "surface": "terminal_execute",
+    "commandClass": "direct_upstream_git_operation",
+    "message": "[redacted command payload]",
+    "text": "[redacted command payload]",
+    "textPreview": "[redacted command payload]",
+    "messagePreview": "[redacted command payload]",
+    "commandPreview": "[redacted command payload]",
+    "rawInputPreview": "[redacted command payload]",
+    "env": "[redacted environment values]",
+    "helperPath": "[redacted helper path]",
+    "redacted": true
+  }
+}
+```
+
+Public reads must omit raw command payloads and protocol payloads entirely, keep only structured metadata such as `outcome`, `reasonKind`, `commandClass`, `role`, `phase`, and `surface`, and replace command text, helper paths, and environment values with redacted placeholders.
 
 ## Service-Owned Boundary Contract
 

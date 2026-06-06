@@ -34,7 +34,7 @@ npm test -- tests/hermes-command-policy-profile.test.ts tests/hermes-delegated-c
 npm test -- tests/hermes-acp-harness.test.ts tests/hermes-mcp-config.test.ts tests/hermes-template-policy.test.ts
 ```
 
-This Checkpoint A subset validates direct and disguised upstream denials, `execute_code`, ACP permission resolution, Hermes hook/CLI behavior, gateway/TUI profile hook installation, delegated subagent and command reducer inheritance, and broader ACP harness wiring. Later US2 local-inspection/config, US3 service-boundary, and US4 audit/replay suites remain separate subissue validation until those files exist.
+This Checkpoint A subset validates direct and disguised upstream denials, `execute_code`, ACP permission resolution, Hermes hook/CLI behavior, gateway/TUI profile hook installation, delegated subagent and command reducer inheritance, and broader ACP harness wiring. The US2 local-inspection/config, US3 service-boundary, and US4 audit/replay suites have their own targeted commands below, and the final validation packet rolls all of them together.
 
 For the Checkpoint B / Issue 15 / T041 US2 local-inspection targeted validation subissue, run the present US2 command-policy suite:
 
@@ -54,7 +54,7 @@ npm test -- tests/mcp-subprocess-environment-command-policy.test.ts tests/comple
 
 This Checkpoint C subset validates service MCP credential slicing, completion-report publication boundaries, review-feedback writeback boundaries, mergeability and CI service-owned paths, and equivalent worker/reviewer terminal or `execute_code` direct-deny behavior.
 
-For final targeted validation after the later user-story test files exist, run the full policy-facing suite:
+For final targeted validation, run the full policy-facing suite:
 
 ```powershell
 npm run typecheck
@@ -64,6 +64,13 @@ npm test -- tests/agent-command-policy-acp-resolver.test.ts tests/hermes-acp-har
 npm test -- tests/mcp-subprocess-environment-command-policy.test.ts tests/completion-report-mcp-command-policy.test.ts tests/review-feedback-mcp-command-policy.test.ts tests/github-service-boundary-command-policy.test.ts
 npm test -- tests/run-activity-event-command-policy.test.ts tests/transcript-replay-command-policy.test.ts tests/web-transcript-projection-command-policy.test.ts
 ```
+
+Treat final validation as a four-part review packet:
+
+1. The automated deny/allow/service-boundary/audit suite above.
+2. One real worker run and one real reviewer run inspected through the status API or persisted run transcript for SC-004 evidence.
+3. A same-run causal explanation for why the recorded command-capable activity could not trigger desktop/browser credential prompts, plus a same-run operator/desktop observation note whenever the recorded evidence leaves any GUI/browser/credential-prompt path ambiguous.
+4. The vendored Hermes base-diff plus worktree no-touch check at the end of this document.
 
 Latency regression coverage should keep normal direct policy decisions under 50 ms and local Git config inspection decisions under 250 ms using deterministic local fixtures. Avoid flaky end-to-end timing assertions against real provider, network, or desktop credential behavior.
 
@@ -122,6 +129,8 @@ For each allow or deny scenario, inspect durable run activity or replayed transc
 - Evidence is redacted.
 - Upstream contact is false for denied scenarios.
 - Service-owned GitHub failures are not recorded as agent command policy denials.
+- Redacted audit records keep only bounded previews, structured metadata, and safe environment-key/category lists.
+- Public transcript and replay-state reads replace raw command text, helper paths, and environment values with redacted placeholders.
 
 ## Service Boundary Verification
 
@@ -134,9 +143,27 @@ Confirm service-owned GitHub workflow actions remain outside worker/reviewer com
 
 ## Dogfood Validation
 
-After rollout, validate SC-004 against real worker/reviewer dogfood runs by inspecting run activity, policy denial records, and desktop prompt observations. The expected result is zero desktop OAuth prompts, SSH key confirmation prompts, or GitHub credential prompts caused by agent-owned command attempts.
+After rollout, capture one real worker run and one real reviewer run from the live dogfood loop. For each run:
 
-Do not intentionally trigger real credential prompts as the validation mechanism. Use local fixtures, fake helpers, run evidence, and operator observation instead.
+1. Inspect `/api/v1/runs/<runId>` and record `role`, `runPhase`, `status`, `harnessId`, `runtimeModel`, `startedAt`, and `completedAt`.
+2. Inspect `/api/v1/runs/<runId>/transcript` or the persisted `events.jsonl` and summarize every `Hermes tool terminal:` command. Also inventory any other command-capable surface the run actually used, such as `execute_code` reducers or delegated terminal work. Expected agent-owned command activity must remain local-only. Helper-free Git inspection commands such as `git status`, `git diff`, `git log`, `git show`, `git branch`, and `git blame` are the clearest allow evidence; if the run also contains workspace-local `node`, `python`, package-script, smoke-wrapper, or reducer activity, record it as observed local activity and explain why it still lacks any upstream/credential path rather than treating it as standalone allow-list proof.
+3. Search the same transcript/events with case-insensitive prompt markers such as `oauth`, `device code`, `open this url`, `ssh key confirmation`, `authenticity of host`, `github credential`, `credential prompt`, `username for`, `password for`, `passphrase`, `gh auth`, `git-credential`, and `ssh-askpass`. Expected result: zero hits caused by agent-owned command attempts.
+4. Establish the same-run SC-004 causal proof path. If the recorded command inventory shows zero upstream-risk agent-owned command attempts across every command-capable surface used in the run, that is sufficient to prove zero desktop OAuth / SSH / GitHub credential prompts caused by agent-owned attempts. Add a same-run operator/desktop observation source only when the recorded evidence leaves any GUI/browser/credential-prompt path ambiguous (for example an unresolved wrapper/helper/network path or an incomplete surface inventory). If neither causal no-attempt proof nor same-run observation exists, narrow the conclusion to **terminal-visible** prompt markers only and mark the packet insufficient for the full desktop/browser-prompt claim.
+5. Record command-policy activation evidence for the same run. Prefer a redacted `command_policy_decision` snippet with `outcome`, `reasonKind`, `commandClass`, `surface`, `role`, `phase`, and `upstreamContactAttempted: false`. If the run does not expose a `command_policy_decision` event, record the run's `hermes_profile` event plus either (a) matching same-run materialized `config.yaml` / `shell-hooks-allowlist.json` entries, or (b) for non-reusable reviewer profiles that are cleaned after exit, the recorded `hermes_profile` event together with deterministic generated-profile contract evidence that proves reviewer profile materialization installs the same `pre_tool_call` `terminal|execute_code` hook and decision-journal path.
+6. Pair the live run evidence with the automated denial/audit suite and cite the exact test files that prove upstream deny behavior, service-owned GitHub boundaries, and public redaction.
+
+A review-ready SC-004 evidence packet contains:
+
+- One worker run ID and one reviewer run ID.
+- A command-capable surface inventory showing the recorded agent-owned activity stayed local-only, with any wrapper/interpreter/package-script/reducer activity clearly labeled as observed local activity rather than allow-list proof.
+- Zero-hit prompt scan results.
+- One explicit same-run causal no-attempt explanation, plus a same-run operator/desktop observation note whenever the packet still leaves an ambiguous GUI/browser prompt path.
+- One redacted `command_policy_decision` snippet or same-run hook-installation / generated-profile evidence packet, plus the supporting automated deny/audit citations.
+- The vendored Hermes base-diff plus worktree no-touch check output.
+
+Do not intentionally trigger real credential prompts as the validation mechanism. Use local fixtures, fake helpers, live run evidence, and operator observation only when the run evidence still leaves a prompt surface ambiguous.
+
+See `docs/smoke/eng-243-sc-004-no-upstream-prompts.md` for a recorded evidence packet built from live worker/reviewer runs plus the supporting redaction/service-boundary tests.
 
 ## Process Notes
 
@@ -147,8 +174,8 @@ Do not intentionally trigger real credential prompts as the validation mechanism
 - Final validation must confirm vendored Hermes source is untouched:
 
 ```powershell
-git diff --name-only -- hermes/upstream-src
+git diff --name-only origin/main...HEAD -- hermes/upstream-src
 git status --short -- hermes/upstream-src
 ```
 
-Both commands must produce no changed paths.
+The first command must produce no changed paths relative to the PR base ref, and the second command must produce no changed worktree/index entries.
