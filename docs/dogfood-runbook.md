@@ -141,6 +141,12 @@ npm run dev -- --port 7331 WORKFLOW.hermes-acp.md
 
 Use the normal `WORKFLOW.md` again after ACP validation and delete `WORKFLOW.hermes-acp.md` so the default checked-in `agent.harness: hermes` path remains unchanged.
 
+For the ACP smoke evidence below, run the smoke against that disposable workflow copy so the recorded `configuredHarness` value comes from `WORKFLOW.hermes-acp.md` rather than the checked-in default:
+
+```powershell
+npm run smoke:hermes-acp -- WORKFLOW.hermes-acp.md --source-profile <host-profile>
+```
+
 For the live-run items below, collect issue/run evidence with:
 
 ```powershell
@@ -153,17 +159,19 @@ Invoke-RestMethod -Uri "http://127.0.0.1:7331/api/v1/runs/<runId>/transcript?off
 
 - `npm run typecheck`, `npm test`, `npm run doctor -- --strict`, `npm run doctor -- --strict --live-runtime`, and `npm run smoke:hermes-local` succeeded for the same checkout/host environment, and the live-runtime/local-smoke evidence still showed the required Symphony handoff MCP tools, so the default Hermes TUI path is still healthy before any ACP-only unblock decision.
 - `hermes --version`, `hermes profile`, `hermes acp --check`, and `hermes -p <source> acp --check` succeeded for the intended host source profile.
-- `npm run smoke:hermes-acp -- --source-profile <host-profile>` succeeded, verified the disposable cloned profile, and its success JSON recorded `configuredHarness: "hermes_acp"`, `hostHermesBinary`, `sourceProfile`, `disposableProfile`, `disposableProfileDeleted: true`, `activeProfileUnchanged: true`, `promptExpectedText`, matching `promptResponseText`, a normal `promptStopReason`, and the ACP `promptSessionId` unless an operator intentionally retained the disposable profile for troubleshooting.
-- One tiny unprotected issue then ran from `WORKFLOW.hermes-acp.md` in the same host environment. Choose or author the issue so it requires one safe repository edit and one targeted validation command, which forces an ACP permission request on a bounded surface. Passing handoff evidence is `/api/v1/issues/<issue>` showing `reviewLoop.phase: "review"` and `reviewLoop.lastCompletionReport.runId`, `/api/v1/runs/<handoffWorkerRunId>` showing `status: "succeeded"` and `terminalReason: "succeeded"`, and `/api/v1/runs/<handoffWorkerRunId>/transcript` showing a `tool_call_completed` entry whose payload `toolName` or public tool preview names `submit_completion_report`.
-- Deliberately exercise both deny and allow on the first safe ACP permission request from that tiny issue. First deny the request and confirm the run stays fail-closed until operator action; passing evidence is `/api/v1/runs/<runId>/transcript` showing `command_policy_decision` with payload fields such as `outcome: "deny"`, `surface`/`requestKind`, and `permissionOutcome` or `selectedOptionId`. Then rerun the same issue and allow the equivalent safe request; passing evidence is a later `command_policy_decision` for the same surface with `outcome: "allow"` plus the successful completion-report handoff evidence from the previous bullet.
-- Start a separate intentionally cancelled `agent.harness: hermes_acp` run after the worker is active in `operatorView.running`, then cancel it with:
+- `npm run smoke:hermes-acp -- WORKFLOW.hermes-acp.md --source-profile <host-profile>` succeeded, verified the disposable cloned profile, and its success JSON recorded `configuredHarness: "hermes_acp"`, `hostHermesBinary`, `sourceProfile`, `disposableProfile`, `disposableProfileDeleted: true`, `activeProfileUnchanged: true`, `promptExpectedText`, matching `promptResponseText`, a normal `promptStopReason`, and the ACP `promptSessionId` unless an operator intentionally retained the disposable profile for troubleshooting.
+- One tiny unprotected issue then ran from `WORKFLOW.hermes-acp.md` in the same host environment. Choose or author the issue so it requires one safe repository edit and one targeted validation command, which forces an ACP permission request on a bounded surface. Passing handoff evidence is `/api/v1/issues/<issue-identifier>` showing `reviewLoop.phase: "review"` and `reviewLoop.lastCompletionReport.runId`, `/api/v1/runs/<handoffWorkerRunId>` showing `status: "succeeded"` and `terminalReason: "succeeded"`, and `/api/v1/runs/<handoffWorkerRunId>/transcript` showing a `tool_call_completed` entry whose payload `toolName` or public tool preview names `submit_completion_report`.
+- Deliberately exercise both deny and allow on the first safe ACP permission request from that tiny issue. First deny the request; passing evidence is `/api/v1/runs/<runId>/transcript` showing `command_policy_decision` with payload fields such as `outcome: "deny"`, `surface`/`requestKind`, and `permissionOutcome`. Then rerun the same issue and allow the equivalent safe request; passing evidence is a later `command_policy_decision` for the same surface with `outcome: "allow"`, `permissionOutcome: "allowed"`, and a recorded `selectedOptionId`, plus the successful completion-report handoff evidence from the previous bullet.
+- Start a separate intentionally cancelled `agent.harness: hermes_acp` run after the worker is active in `operatorView.running`, then fetch `/api/v1/issues/<issue-identifier>` and use the returned internal `id` value in the cancel route:
 
   ```powershell
-  Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/ENG-123/cancel"
+  Invoke-RestMethod -Method Post -Headers @{ "X-Symphony-Token" = $env:SYMPHONY_WORKSPACE_TOKEN } -Uri "http://127.0.0.1:7331/api/v1/issues/<issueId>/cancel"
   ```
 
   Passing cancellation evidence is `/api/v1/state` showing `operatorView.running[].liveness.status: "cancelling"` before terminal resolution, `/api/v1/runs/<runId>` ending with `status: "cancelled"` and `terminalReason: "cancelled"`, and `/api/v1/runs/<runId>/transcript` containing the terminal `cancelled` event instead of a completion-report handoff.
+
 - The active host profile before and after the ACP smoke/issue runs matched; the source profile was not renamed, selected, deleted, or used directly as the disposable run profile, and any retained session/profile artifacts belonged to the disposable clone rather than the source profile.
+
 - No retained disposable profile with the configured `hermes_acp.profile_prefix` (or the operator-selected `--profile-prefix`/`--profile-name`) remains unless an operator intentionally used `--keep-profile` for troubleshooting and tracked the cleanup.
 - Default validation remains non-ACP unless the operator explicitly runs this ACP evidence set; failing host ACP setup should keep the affected issue `dogfood-blocked`, not break default unit tests.
 
