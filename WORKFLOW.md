@@ -107,7 +107,7 @@ hermes:
     mode: managed_root
     providers:
       - openai-codex
-  worker_session_lifecycle: reuse_by_issue
+  worker_session_lifecycle: fresh_per_run
   keep_profiles: failed
 
 server:

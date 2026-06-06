@@ -84,6 +84,8 @@ export function renderCompletionMcpHandoffPrompt(input: RuntimeHandoffPromptInpu
     `- Repository path: ${input.repoPath ?? "n/a"}`,
     `- Base ref: ${input.baseRef ?? "n/a"}`,
     "- Before ending the run, call the submit_completion_report MCP tool with summary, validationEvidence, acceptanceChecklist, changedFiles, branchName, pullRequest, risks, and idempotencyKey.",
+    "- If the issue description contains a fenced JSON Issue Contract, treat its requirements as the authoritative acceptance contract: include one acceptanceChecklist item for every requirement `id`, start the item text with that `id`, and mark it satisfied only when the evidence proves the exact required behavior.",
+    "- Evidence must cite durable proof such as commands run, emitted artifact fields, API responses, logs, tests, or file paths. When the issue asks for operator instructions or recorded artifacts, verify that the documented command invocation actually produces the documented fields; do not rely on inferred behavior or nearby implementation details.",
     "- Leave implementation changes uncommitted and unpushed in the assigned worktree. Do not run git commit, git push, gh pr create, or gh pr edit; the allowed GitHub path is the Symphony service-owned GitHub workflow through submit_completion_report, and Symphony performs service-owned commit, push, and PR creation/reuse after the completion report is accepted.",
     "- The MCP server is scoped to this issue and the current runtime run; Symphony injects runId and issueId for you.",
     "- Do not comment on Linear, transition Linear state, or request broad Linear write credentials. Symphony handles writeback after the tool accepts the report.",

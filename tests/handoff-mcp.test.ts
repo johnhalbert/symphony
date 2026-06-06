@@ -41,6 +41,22 @@ describe("MCP handoff prompt rendering", () => {
     expect(prompt).toContain("service-owned commit, push, and PR creation/reuse");
   });
 
+  it("requires completion reports to map Issue Contract requirements to durable proof", () => {
+    const prompt = renderCompletionMcpHandoffPrompt({
+      issue: issue({ id: "issue-1", identifier: "ENG-1", branchName: "symphony/ENG-1" }),
+      role: "worker",
+      workspacePath: "/workspace/ENG-1",
+      repoPath: "/repo/symphony",
+      baseRef: "origin/main",
+    });
+
+    expect(prompt).toContain("fenced JSON Issue Contract");
+    expect(prompt).toContain("one acceptanceChecklist item for every requirement `id`");
+    expect(prompt).toContain("start the item text with that `id`");
+    expect(prompt).toContain("documented command invocation actually produces the documented fields");
+    expect(prompt).toContain("do not rely on inferred behavior");
+  });
+
   it("identifies review-feedback MCP as the only allowed reviewer GitHub review-write path", () => {
     const prompt = renderReviewMcpHandoffPrompt({
       issue: issue({ id: "issue-1", identifier: "ENG-1", state: "In Review", branchName: "symphony/ENG-1" }),
