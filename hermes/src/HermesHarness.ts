@@ -1147,8 +1147,9 @@ function hermesTranscriptEvent(event: GatewayEvent, harnessId: string): { eventT
           harnessId,
           name: event.payload.name ?? null,
           toolId: event.payload.tool_id,
-          argsPreview: preview(event.payload.args_text, 500),
-          redacted: true,
+          argsPreview: transcriptToolDetailText(event.payload.args_text),
+          redacted: event.payload.redacted === false ? false : true,
+          ...(event.payload.unsafe_tool_details === true ? { unsafeToolDetails: true } : {}),
         },
       };
     case "tool.complete":
@@ -1160,9 +1161,10 @@ function hermesTranscriptEvent(event: GatewayEvent, harnessId: string): { eventT
           name: event.payload.name ?? null,
           toolId: event.payload.tool_id,
           summary: preview(event.payload.summary, 500),
-          resultPreview: preview(event.payload.result_text, 500),
+          resultPreview: transcriptToolDetailText(event.payload.result_text),
           errorPreview: preview(event.payload.error, 500),
-          redacted: true,
+          redacted: event.payload.redacted === false ? false : true,
+          ...(event.payload.unsafe_tool_details === true ? { unsafeToolDetails: true } : {}),
         },
       };
     case "status.update":
@@ -1207,6 +1209,16 @@ function usageTokens(usage: unknown): Partial<TokenCounts> | null {
 
 function preview(value: unknown, maxLength: number): string {
   return sanitizedPreviewValue(value, maxLength).preview ?? "";
+}
+
+function transcriptToolDetailText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === undefined || value === null) return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

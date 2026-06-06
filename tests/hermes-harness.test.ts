@@ -220,6 +220,70 @@ describe("HermesHarness", () => {
     expect(managedAuth.providers["openai-codex"].tokens.access_token).toBe("access-token");
   });
 
+  it("persists full unsafe Hermes tool detail payloads when the gateway emits them", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const appended: Array<Record<string, any>> = [];
+    const longArgs = JSON.stringify({ command: "node -e \"console.log('SECRET_TOOL_ARGUMENT')\"", filler: "a".repeat(700) }, null, 2);
+    const longResult = `SECRET_TOOL_RESULT\n${"b".repeat(700)}`;
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
+          eventsOnPrompt: [
+            {
+              type: "tool.start",
+              session_id: "gw-1",
+              payload: {
+                tool_id: "tool-1",
+                name: "terminal",
+                args_text: longArgs,
+                redacted: false,
+                unsafe_tool_details: true,
+              },
+            } as GatewayEvent,
+            {
+              type: "tool.complete",
+              session_id: "gw-1",
+              payload: {
+                tool_id: "tool-1",
+                name: "terminal",
+                result_text: longResult,
+                redacted: false,
+                unsafe_tool_details: true,
+              },
+            } as GatewayEvent,
+            {
+              type: "message.complete",
+              session_id: "gw-1",
+              payload: { text: "done", session_key: "hermes-gw-1" },
+            } as GatewayEvent,
+          ],
+        });
+        clients.push(client);
+        return client;
+      },
+      runStore: {
+        appendEvent: async (input: Record<string, any>) => {
+          appended.push(input);
+          return { ...input, sequence: appended.length };
+        },
+      } as any,
+    });
+
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "worker prompt"));
+
+    expect(events.map((event) => event.type)).toContain("completed");
+    const start = appended.find((event) => event.eventType === "tool_start");
+    const complete = appended.find((event) => event.eventType === "tool_complete");
+    expect(start?.payload).toMatchObject({ argsPreview: longArgs, redacted: false, unsafeToolDetails: true });
+    expect(complete?.payload).toMatchObject({ resultPreview: longResult, redacted: false, unsafeToolDetails: true });
+  });
+
   it("retires a reusable worker lease when its gateway exits before completion", async () => {
     const clients: FakeGatewayClient[] = [];
     const leakedSecret = "very-secret-token-123";

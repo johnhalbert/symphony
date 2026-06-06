@@ -546,7 +546,15 @@ export type GatewayEvent =
   | { payload: { name?: string; preview?: string }; session_id?: string; type: 'tool.progress' }
   | { payload: { name?: string }; session_id?: string; type: 'tool.generating' }
   | {
-      payload: { args_text?: string; context?: string; name?: string; tool_id: string; todos?: unknown[] }
+      payload: {
+        args_text?: string
+        context?: string
+        name?: string
+        redacted?: boolean
+        tool_id: string
+        todos?: unknown[]
+        unsafe_tool_details?: boolean
+      }
       session_id?: string
       type: 'tool.start'
     }
@@ -556,10 +564,12 @@ export type GatewayEvent =
         error?: string
         inline_diff?: string
         name?: string
+        redacted?: boolean
         result_text?: string
         summary?: string
         tool_id: string
         todos?: unknown[]
+        unsafe_tool_details?: boolean
       }
       session_id?: string
       type: 'tool.complete'

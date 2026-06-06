@@ -196,6 +196,57 @@ describe("ChatHistoryView", () => {
     expect(view.container.textContent).not.toContain("SECRET_PROVIDER_LIMIT_KEY");
   });
 
+  it("does not show a pending spinner for completed tool calls without captured result previews", () => {
+    useTranscriptMock.mockReturnValue(
+      transcriptState({
+        data: [
+          {
+            kind: "tool_call",
+            ts: "2026-05-29T00:13:00.000Z",
+            call_id: "call-empty-preview",
+            name: "terminal",
+            status: "completed",
+            args: {},
+            result: null,
+          },
+        ],
+      }),
+    );
+    const view = mountHistoryView(history());
+    const toolCallButton = view.container.querySelector<HTMLButtonElement>(".toolcall__head");
+    if (!toolCallButton) throw new Error("expected tool call button to render");
+
+    act(() => {
+      toolCallButton.click();
+    });
+
+    expect(view.container.textContent).toContain("No argument preview captured.");
+    expect(view.container.textContent).toContain("No result preview captured.");
+    expect(view.container.textContent).not.toContain("awaiting tool response");
+  });
+
+  it("keeps assistant newlines renderable in transcript messages", () => {
+    useTranscriptMock.mockReturnValue(
+      transcriptState({
+        data: [
+          {
+            kind: "assistant",
+            ts: "2026-05-29T00:12:00.000Z",
+            text: "Line one\n  indented line\n\nLine three",
+          },
+        ],
+      }),
+    );
+
+    const view = mountHistoryView(history());
+    const paragraphs = view.container.querySelectorAll<HTMLParagraphElement>(".msg__body p");
+
+    expect(paragraphs).toHaveLength(2);
+    expect(paragraphs[0]?.textContent).toBe("Line one\n  indented line");
+    expect(paragraphs[0]?.style.whiteSpace).toBe("pre-wrap");
+    expect(paragraphs[1]?.textContent).toBe("Line three");
+  });
+
   it("renders the bounded projection of a generated large-session readability fixture without extra transcript rows", () => {
     useTranscriptMock.mockReturnValue(transcriptState({ data: largeRealRunTranscriptMessages }));
     const fixtureSession = {

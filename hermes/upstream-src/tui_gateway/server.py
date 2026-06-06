@@ -34,6 +34,37 @@ load_hermes_dotenv(
 )
 
 
+def _bridge_redaction_config_env() -> None:
+    """Bridge config.yaml security.redact_secrets before agent.redact imports.
+
+    The redactor snapshots HERMES_REDACT_SECRETS at import time. The normal
+    Hermes CLI performs this bridge in hermes_cli.main, but Symphony launches
+    the TUI gateway module directly. Keep the same config contract here so a
+    profile template can intentionally opt in or out.
+    """
+    if "HERMES_REDACT_SECRETS" in os.environ:
+        return
+    try:
+        import yaml
+
+        config_path = _hermes_home / "config.yaml"
+        if not config_path.exists():
+            return
+        with open(config_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        security = config.get("security", {}) if isinstance(config, dict) else {}
+        if not isinstance(security, dict):
+            return
+        redact = security.get("redact_secrets")
+        if redact is not None:
+            os.environ["HERMES_REDACT_SECRETS"] = str(redact).lower()
+    except Exception:
+        pass
+
+
+_bridge_redaction_config_env()
+
+
 # ── Panic logger ─────────────────────────────────────────────────────
 # Gateway crashes in a TUI session leave no forensics: stdout is the
 # JSON-RPC pipe (TUI side parses it, doesn't log raw), the root logger
@@ -1515,6 +1546,9 @@ def _tool_ctx(name: str, args: dict) -> str:
 
 _TUI_VERBOSE_TEXT_MAX_CHARS = 16_000
 _TUI_VERBOSE_TEXT_MAX_LINES = 240
+_TOOL_DETAIL_CAPTURE_FULL_MODES = {"full", "unsafe_full", "raw", "all"}
+_FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
+_TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 
 
 def _cap_tui_verbose_text(text: str) -> str:
@@ -1553,14 +1587,48 @@ def _cap_tui_verbose_text(text: str) -> str:
     return f"{label}{tail}"
 
 
-def _redact_tui_verbose_text(text: str) -> str:
-    try:
-        from agent.redact import redact_sensitive_text
+def _load_tool_detail_capture_mode() -> str:
+    env = os.environ.get("HERMES_TUI_TOOL_DETAIL_CAPTURE", "").strip().lower()
+    if env:
+        return env
+    raw = (_load_cfg().get("display") or {}).get("tool_detail_capture", "capped")
+    return str(raw or "capped").strip().lower()
 
-        redacted = redact_sensitive_text(str(text), force=True)
-    except Exception:
-        return ""
-    return _cap_tui_verbose_text(redacted)
+
+def _tui_verbose_tool_details_are_full() -> bool:
+    return _load_tool_detail_capture_mode() in _TOOL_DETAIL_CAPTURE_FULL_MODES
+
+
+def _tui_verbose_redaction_enabled() -> bool:
+    env = os.environ.get("HERMES_REDACT_SECRETS")
+    if env is not None:
+        return env.strip().lower() not in _FALSE_VALUES
+    security = (_load_cfg().get("security") or {})
+    if isinstance(security, dict):
+        raw = security.get("redact_secrets")
+        if isinstance(raw, bool):
+            return raw
+        if raw is not None:
+            normalized = str(raw).strip().lower()
+            if normalized in _FALSE_VALUES:
+                return False
+            if normalized in _TRUE_VALUES:
+                return True
+    return True
+
+
+def _redact_tui_verbose_text(text: str) -> str:
+    raw = str(text)
+    if _tui_verbose_redaction_enabled():
+        try:
+            from agent.redact import redact_sensitive_text
+
+            output = redact_sensitive_text(raw, force=True)
+        except Exception:
+            return ""
+    else:
+        output = raw
+    return output if _tui_verbose_tool_details_are_full() else _cap_tui_verbose_text(output)
 
 
 def _tool_args_text(args: dict) -> str:
@@ -1651,6 +1719,9 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
             args_text = _tool_args_text(args)
             if args_text:
                 payload["args_text"] = args_text
+            if not _tui_verbose_redaction_enabled():
+                payload["redacted"] = False
+                payload["unsafe_tool_details"] = True
         # tool.complete is the source of truth for todos (full list from the
         # tool result). args.todos here may be a partial merge update.
         _emit("tool.start", sid, payload)
@@ -1674,6 +1745,9 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         result_text = _tool_result_text(result)
         if result_text:
             payload["result_text"] = result_text
+        if not _tui_verbose_redaction_enabled():
+            payload["redacted"] = False
+            payload["unsafe_tool_details"] = True
     if name == "todo":
         try:
             data = json.loads(result)

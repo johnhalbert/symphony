@@ -84,6 +84,24 @@ def test_tui_verbose_tool_details_are_capped_before_emit(monkeypatch):
     assert "one" not in capped
 
 
+def test_tui_verbose_tool_details_can_capture_full_unredacted_text(monkeypatch):
+    monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "security": {"redact_secrets": False},
+            "display": {"tool_detail_capture": "full"},
+        },
+    )
+    monkeypatch.setattr(server, "_TUI_VERBOSE_TEXT_MAX_CHARS", 12)
+    monkeypatch.setattr(server, "_TUI_VERBOSE_TEXT_MAX_LINES", 2)
+
+    raw = "one\ntwo\nthree\nfour token=secret"
+
+    assert server._redact_tui_verbose_text(raw) == raw
+
+
 def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     redact_module = types.ModuleType("agent.redact")
 
@@ -110,6 +128,48 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     assert events[1][0] == "tool.complete"
     assert "args_text" not in events[0][2]
     assert "result_text" not in events[1][2]
+
+
+def test_tui_verbose_tool_events_mark_unredacted_full_details(monkeypatch):
+    monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "security": {"redact_secrets": False},
+            "display": {"tool_detail_capture": "full"},
+        },
+    )
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "unsafe-tool-test",
+        {"tool_progress_mode": "verbose", "tool_started_at": {}},
+    )
+
+    server._on_tool_start(
+        "unsafe-tool-test",
+        "tool-1",
+        "terminal",
+        {"command": "echo SECRET_TOOL_ARGUMENT"},
+    )
+    server._on_tool_complete(
+        "unsafe-tool-test",
+        "tool-1",
+        "terminal",
+        {"command": "echo SECRET_TOOL_ARGUMENT"},
+        "SECRET_TOOL_RESULT",
+    )
+
+    assert events[0][2]["args_text"] == '{\n  "command": "echo SECRET_TOOL_ARGUMENT"\n}'
+    assert events[0][2]["redacted"] is False
+    assert events[0][2]["unsafe_tool_details"] is True
+    assert events[1][2]["result_text"] == "SECRET_TOOL_RESULT"
+    assert events[1][2]["redacted"] is False
+    assert events[1][2]["unsafe_tool_details"] is True
 
 
 def test_dispatch_rejects_non_object_request():

@@ -714,14 +714,27 @@ export class StatusServer {
       const webTranscriptMatch = /^\/api\/v1\/web\/sessions\/([^/]+)\/transcript$/.exec(url.pathname);
       if (request.method === "GET" && webTranscriptMatch) {
         const sessionIdOrRunId = decodeURIComponent(webTranscriptMatch[1] ?? "").trim();
+        const requestedFullTranscript = parseBooleanWebQueryParam(url.searchParams, "full");
         const requestedTranscriptPage = parseWebTranscriptPagination(url);
-        const requestedTranscriptLimit = requestedTranscriptPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
+        const requestedTranscriptLimit = requestedFullTranscript ? WEB_TRANSCRIPT_PAGE_LIMIT : requestedTranscriptPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
         if (sessionIdOrRunId.length === 0) {
-          sendJson(response, 200, emptyWebTranscriptProjectionPayload({ runId: sessionIdOrRunId, limit: requestedTranscriptLimit }));
+          sendJson(
+            response,
+            200,
+            emptyWebTranscriptProjectionPayload({ runId: sessionIdOrRunId, limit: requestedTranscriptLimit, kind: requestedFullTranscript ? "page" : "tail" }),
+          );
           return;
         }
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
         if (!this.options.runStore) {
+          if (requestedFullTranscript) {
+            sendJson(
+              response,
+              200,
+              emptyWebTranscriptProjectionPayload({ runId: sessionIdOrRunId, limit: requestedTranscriptLimit, kind: "page" }),
+            );
+            return;
+          }
           const durableTranscript = requestedTranscriptPage
             ? await this.webProjectionRepositories.transcript.readRunPage(
                 { runId: sessionIdOrRunId, offset: requestedTranscriptPage.offset, limit: requestedTranscriptPage.limit },
@@ -749,18 +762,30 @@ export class StatusServer {
           sendJson(
             response,
             200,
-            emptyWebTranscriptProjectionPayload({ runId: sessionIdOrRunId, limit: requestedTranscriptLimit, kind: requestedTranscriptPage ? "page" : "tail" }),
+            emptyWebTranscriptProjectionPayload({
+              runId: sessionIdOrRunId,
+              limit: requestedTranscriptLimit,
+              kind: requestedFullTranscript || requestedTranscriptPage ? "page" : "tail",
+            }),
             durableProjectionReadHeaders(durableTranscript),
           );
           return;
         }
         const run = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId);
         if (!run) {
-          sendJson(response, 200, emptyWebTranscriptProjectionPayload({ runId: sessionIdOrRunId, limit: requestedTranscriptLimit, kind: requestedTranscriptPage ? "page" : "tail" }));
+          sendJson(
+            response,
+            200,
+            emptyWebTranscriptProjectionPayload({
+              runId: sessionIdOrRunId,
+              limit: requestedTranscriptLimit,
+              kind: requestedFullTranscript || requestedTranscriptPage ? "page" : "tail",
+            }),
+          );
           return;
         }
         let durableTranscript: DurableProjectionReadResult<WebTranscriptProjectionPayload> | undefined;
-        if (!shouldBypassDurableWebTranscriptForActiveTail(run, requestedTranscriptPage)) {
+        if (!requestedFullTranscript && !shouldBypassDurableWebTranscriptForActiveTail(run, requestedTranscriptPage)) {
           durableTranscript = await this.webProjectionRepositories.transcript.readRunPage(
             transcriptProjectionPageSelectorForRequest(run, requestedTranscriptPage),
             { forceRefresh },
@@ -781,15 +806,17 @@ export class StatusServer {
             return;
           }
         }
-        const transcriptPage = await readBoundedWebTranscriptPage(this.options.runStore, run.runId, url);
+        const transcriptPage = requestedFullTranscript
+          ? await readFullWebTranscriptPage(this.options.runStore, run.runId)
+          : await readBoundedWebTranscriptPage(this.options.runStore, run.runId, url);
         const transcript = projectWebTranscript(transcriptPage.events, { run });
         const transcriptPayload = projectWebTranscriptWindow(transcriptPage, transcript, {
           run,
-          requestedPage: requestedTranscriptPage,
+          requestedPage: requestedFullTranscript ? { offset: 0, limit: transcriptPage.limit } : requestedTranscriptPage,
           tailLimit: transcriptPage.limit,
-          kind: requestedTranscriptPage ? "page" : "tail",
+          kind: requestedFullTranscript || requestedTranscriptPage ? "page" : "tail",
         });
-        await this.persistWebTranscriptProjection(run, transcriptPage, transcriptPayload);
+        if (!requestedFullTranscript) await this.persistWebTranscriptProjection(run, transcriptPage, transcriptPayload);
         sendJson(response, 200, transcriptPayload, durableProjectionReadHeaders(durableTranscript));
         return;
       }
@@ -6070,6 +6097,43 @@ async function readBoundedWebTranscriptPage(runStore: RunTranscriptStore, runId:
   if (requestedPage) return runStore.readTranscript(runId, requestedPage);
 
   return runStore.readTranscriptTail(runId, { limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT });
+}
+
+async function readFullWebTranscriptPage(runStore: RunTranscriptStore, runId: string): Promise<TranscriptPage> {
+  const events: TranscriptEvent[] = [];
+  let offset = 0;
+  let total: number | null = null;
+  let completed = false;
+  for (let pageCount = 0; pageCount < 10_000; pageCount += 1) {
+    const page = await runStore.readTranscript(runId, { offset, limit: WEB_TRANSCRIPT_PAGE_LIMIT });
+    events.push(...page.events);
+    if (typeof page.total === "number" && Number.isFinite(page.total)) total = page.total;
+    if (page.nextOffset === null) {
+      completed = true;
+      break;
+    }
+    if (page.nextOffset <= offset) throw new Error(`Transcript pagination did not advance for run ${runId}`);
+    offset = page.nextOffset;
+  }
+  if (!completed) throw new Error(`Transcript pagination exceeded safety limit for run ${runId}`);
+  const firstEvent = events[0] ?? null;
+  const lastEvent = events.at(-1) ?? null;
+  return {
+    runId,
+    offset: 0,
+    limit: total ?? events.length,
+    nextOffset: null,
+    events,
+    total: total ?? events.length,
+    eventCount: events.length,
+    previousOffset: null,
+    hasPrevious: false,
+    hasNext: false,
+    windowKind: "page",
+    firstSequence: firstEvent?.sequence ?? null,
+    lastSequence: lastEvent?.sequence ?? null,
+    lastEventAt: lastEvent?.at ?? null,
+  };
 }
 
 function parseWebTranscriptPagination(url: URL | undefined): { offset: number; limit: number } | null {

@@ -245,6 +245,7 @@ function webTranscriptPath(sessionId: string, options: TranscriptRequestOptions 
   const path = `/api/v1/web/sessions/${encodeURIComponent(sessionId)}/transcript`;
   if (options?.tail === true) return path;
   const params = new URLSearchParams();
+  if (options?.full === true) params.set("full", "1");
   const offset = options?.offset;
   const limit = options?.limit;
   if (isFiniteNumber(offset)) params.set("offset", String(Math.max(0, Math.trunc(offset))));

@@ -11,6 +11,15 @@ const REDACTED = "[redacted]";
 const REDACTED_COMMAND_PAYLOAD = "[redacted command payload]";
 const REDACTED_ENVIRONMENT_VALUES = "[redacted environment values]";
 const REDACTED_HELPER_PATH = "[redacted helper path]";
+const UNSAFE_TOOL_DETAIL_TEXT_FIELDS = [
+  "argsPreview",
+  "argumentsPreview",
+  "inputPreview",
+  "resultPreview",
+  "outputPreview",
+  "errorPreview",
+  "summary",
+] as const;
 const TOKEN_PREFIX_PATTERN = /\b(?:ghp_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,})\b/g;
 const URL_USERINFO_PATTERN = /\b((?:https?|ssh|git):\/\/)([^\s/@"']+(?::[^\s/@"']*)?)@/gi;
 const SENSITIVE_NORMALIZED_KEYS = new Set([
@@ -340,6 +349,7 @@ function safeCommandPolicyMetadataLabel(value: unknown): string | null {
 
 function sanitizedEventPayloadForPublicRead(payload: unknown, assistantDelta: boolean, event: TranscriptEvent): unknown {
   if (isCommandPolicyTranscriptEvent(event) || isCommandPolicyPayload(payload)) return sanitizeCommandPolicyPayloadForPublicOutput(payload);
+  if (isUnsafeToolDetailTranscriptPayload(event, payload)) return sanitizeUnsafeToolDetailPayloadForPublicRead(payload);
   if (!assistantDelta) return sanitizePublicJson(payload);
   const sanitized = sanitizePublicJson(payload);
   if (!isRecord(payload) || !isRecord(sanitized)) return sanitized;
@@ -350,6 +360,28 @@ function sanitizedEventPayloadForPublicRead(payload: unknown, assistantDelta: bo
     output[key] = sanitizedDeltaTextValue(value).preview ?? "";
   }
   return output;
+}
+
+function isUnsafeToolDetailTranscriptPayload(event: TranscriptEvent, payload: unknown): payload is Record<string, unknown> {
+  if (!isRecord(payload)) return false;
+  if (payload.unsafeToolDetails !== true || payload.redacted !== false) return false;
+  const eventType = normalizePublicToken(event.eventType);
+  return eventType === "tool_start" || eventType === "tool_complete" || eventType === "tool_call" || eventType === "tool_call_update";
+}
+
+function sanitizeUnsafeToolDetailPayloadForPublicRead(payload: Record<string, unknown>): unknown {
+  const sanitized = sanitizePublicJson(payload);
+  if (!isRecord(sanitized)) return sanitized;
+  const output: Record<string, unknown> = { ...sanitized, unsafeToolDetails: true, redacted: false };
+  for (const key of UNSAFE_TOOL_DETAIL_TEXT_FIELDS) {
+    const value = payload[key];
+    if (typeof value === "string") output[key] = normalizeUnsafeToolDetailText(value);
+  }
+  return output;
+}
+
+function normalizeUnsafeToolDetailText(value: string): string {
+  return value.replace(/\r\n/g, "\n").trim();
 }
 
 function isTranscriptAssistantDeltaEvent(event: TranscriptEvent): boolean {

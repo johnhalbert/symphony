@@ -971,12 +971,17 @@ describe("API data source", () => {
 
     await expect(dataSource.getTranscript("run/page", undefined, { offset: 25.8, limit: 100.2 })).resolves.toEqual(transcriptWindow);
     await expect(dataSource.getTranscript("run/page", undefined, { tail: true, offset: 1, limit: 2 })).resolves.toEqual(transcriptWindow);
+    await expect(dataSource.getTranscript("run/page", undefined, { full: true })).resolves.toEqual(transcriptWindow);
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/web/sessions/run%2Fpage/transcript?offset=25&limit=100", {
       headers: { Accept: "application/json" },
       signal: undefined,
     });
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/web/sessions/run%2Fpage/transcript", {
+      headers: { Accept: "application/json" },
+      signal: undefined,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/web/sessions/run%2Fpage/transcript?full=1", {
       headers: { Accept: "application/json" },
       signal: undefined,
     });

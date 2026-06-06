@@ -403,8 +403,135 @@ describe("projectWebTranscript", () => {
     expect(serialized).not.toContain("SECRET_PROMPT_VALUE");
   });
 
+  it("uses Hermes harness tool progress as runtime tool argument preview without rendering duplicate metadata rows", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "tool_start",
+        source: "runtime",
+        message: "Hermes tool terminal started",
+        payload: { harnessId: "hermes", toolId: "tool-1", name: "terminal", argsPreview: "" },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 1,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hermes tool terminal: npm test -- --watch=false",
+        payload: {
+          kind: "tool",
+          activitySource: "tool",
+          progressKind: "tool",
+          messagePreview: "Hermes tool terminal: npm test -- --watch=false",
+          truncated: false,
+          redacted: false,
+        },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 2,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hermes tool terminal started",
+        payload: {
+          kind: "tool",
+          activitySource: "tool",
+          progressKind: "tool",
+          messagePreview: "Hermes tool terminal started",
+          truncated: false,
+          redacted: false,
+        },
+        at: "2026-01-01T00:00:03.000Z",
+        sequence: 3,
+      }),
+      event({
+        eventType: "tool_complete",
+        source: "runtime",
+        message: "Hermes tool terminal completed",
+        payload: { harnessId: "hermes", toolId: "tool-1", name: "terminal", resultPreview: "", errorPreview: "" },
+        at: "2026-01-01T00:00:04.000Z",
+        sequence: 4,
+      }),
+      event({
+        eventType: "progress",
+        source: "harness",
+        message: "Hermes tool terminal completed",
+        payload: {
+          kind: "tool",
+          activitySource: "tool",
+          progressKind: "tool",
+          messagePreview: "Hermes tool terminal completed",
+          truncated: false,
+          redacted: false,
+        },
+        at: "2026-01-01T00:00:05.000Z",
+        sequence: 5,
+      }),
+    ]);
 
-  it("surfaces Hermes grouped tool activity, diagnostics, tokens, and provider/rate limits as public web messages", () => {
+    expect(messages).toEqual([
+      {
+        kind: "tool_call",
+        ts: "2026-01-01T00:00:01.000Z",
+        call_id: "tool-1",
+        name: "terminal",
+        status: "completed",
+        args: { preview: "npm test -- --watch=false" },
+        result: null,
+      },
+    ]);
+  });
+
+  it("preserves explicitly unsafe full Hermes tool details for debugging", () => {
+    const longArgs = `{\n  "command": "echo SECRET_UNSAFE_ARGUMENT",\n  "filler": "${"a".repeat(700)}"\n}`;
+    const longResult = `SECRET_UNSAFE_RESULT\n${"b".repeat(700)}`;
+    const messages = projectWebTranscript([
+      event({
+        eventType: "tool_start",
+        source: "runtime",
+        message: "Hermes tool terminal started",
+        payload: {
+          harnessId: "hermes",
+          toolId: "tool-unsafe",
+          name: "terminal",
+          argsPreview: longArgs,
+          redacted: false,
+          unsafeToolDetails: true,
+        },
+        at: "2026-01-01T00:00:01.000Z",
+        sequence: 1,
+      }),
+      event({
+        eventType: "tool_complete",
+        source: "runtime",
+        message: "Hermes tool terminal completed",
+        payload: {
+          harnessId: "hermes",
+          toolId: "tool-unsafe",
+          name: "terminal",
+          resultPreview: longResult,
+          redacted: false,
+          unsafeToolDetails: true,
+        },
+        at: "2026-01-01T00:00:02.000Z",
+        sequence: 2,
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      {
+        kind: "tool_call",
+        ts: "2026-01-01T00:00:01.000Z",
+        call_id: "tool-unsafe",
+        name: "terminal",
+        status: "completed",
+        args: { preview: longArgs },
+        result: longResult,
+      },
+    ]);
+  });
+
+
+  it("hides Hermes harness tool metadata while surfacing diagnostics, tokens, and provider/rate limits", () => {
     const messages = projectWebTranscript([
       event({
         eventType: "progress",
@@ -453,15 +580,6 @@ describe("projectWebTranscript", () => {
 
     expect(messages).toEqual([
       {
-        kind: "tool_call",
-        ts: "2026-01-01T00:00:00.000Z",
-        call_id: "run-1:1",
-        name: "terminal",
-        status: "completed",
-        args: {},
-        result: null,
-      },
-      {
         kind: "status",
         state: "hermes_acp_refusal",
         ts: "2026-01-01T00:00:00.000Z",
@@ -488,6 +606,7 @@ describe("projectWebTranscript", () => {
     ]);
     expect(messages.map((message) => message.kind)).not.toContain("assistant");
     const serialized = JSON.stringify(messages);
+    expect(messages.map((message) => message.kind)).not.toContain("tool_call");
     expect(serialized).not.toContain("SECRET_PROVIDER_KEY");
     expect(serialized).not.toContain("SECRET_RATE_TOKEN");
     expect(serialized).not.toContain("Bearer");
@@ -655,15 +774,6 @@ describe("projectWebTranscript", () => {
         state: "tokens",
         ts: "2026-01-01T00:00:00.000Z",
         text: "Tokens: input 7 · output 3 · total 10",
-      },
-      {
-        kind: "tool_call",
-        ts: "2026-01-01T00:00:00.000Z",
-        call_id: "run-1:1",
-        name: "terminal",
-        status: "running",
-        args: {},
-        result: null,
       },
       {
         kind: "status",
@@ -889,6 +999,30 @@ describe("projectWebTranscript", () => {
     expect(messages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello world" }]);
   });
 
+  it("preserves assistant completion whitespace instead of collapsing it to one line", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "assistant",
+        source: "runtime",
+        message: "fallback assistant label",
+        payload: {
+          kind: "assistant",
+          textPreview: "Line one\n  indented line\n\nLine three token=SECRET_ASSISTANT_TOKEN",
+          redacted: true,
+        },
+      }),
+    ]);
+
+    expect(messages).toEqual([
+      {
+        kind: "assistant",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "Line one\n  indented line\n\nLine three token=[redacted]",
+      },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain("SECRET_ASSISTANT_TOKEN");
+  });
+
   it("routes progress-shaped token and rate-limit telemetry to status while coalescing assistant progress deltas", () => {
     const messages = projectWebTranscript([
       event({
@@ -978,6 +1112,119 @@ describe("projectWebTranscript", () => {
     ]);
 
     expect(messages).toEqual([{ kind: "assistant", ts: "2026-01-01T00:00:00.000Z", text: "Hello" }]);
+  });
+
+  it("spaces Hermes harness assistant progress word deltas while keeping command fragments readable", () => {
+    const chunks = [
+      "(¬_¬) formulating...",
+      "**Inspecting Git and PR Details** I",
+      "need",
+      "to",
+      "inspect",
+      "the",
+      "Git",
+      "diff",
+      ".",
+      "I",
+      "’ll",
+      "start",
+      "by",
+      "using",
+      "terminal",
+      "commands",
+      "like",
+      "`",
+      "git",
+      "status",
+      "--",
+      "short",
+      "--",
+      "branch",
+      "`.",
+    ];
+    const messages = projectWebTranscript(
+      chunks.map((chunk, index) =>
+        event({
+          eventType: "progress",
+          source: "harness",
+          message: chunk,
+          payload: {
+            kind: "assistant_delta",
+            activitySource: "delta",
+            progressKind: "assistant_delta",
+            messagePreview: chunk,
+            truncated: false,
+            redacted: false,
+          },
+          at: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+          sequence: 100 + index,
+        }),
+      ),
+    );
+
+    expect(messages).toEqual([
+      {
+        kind: "assistant",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "(¬_¬) formulating... **Inspecting Git and PR Details** I need to inspect the Git diff. I’ll start by using terminal commands like `git status --short --branch`.",
+      },
+    ]);
+  });
+
+  it("repairs common Hermes wordpiece fragments without joining normal words", () => {
+    const chunks = [
+      "Review",
+      "SC",
+      "-",
+      "004",
+      "or",
+      "rer",
+      "un",
+      "live",
+      "-run",
+      "evidence",
+      ".",
+      "RE",
+      "Q",
+      "-",
+      "002",
+      "requires",
+      "lat",
+      "ency",
+      "coverage",
+      "and",
+      "orches",
+      "tration",
+      "checks",
+      ".",
+    ];
+    const messages = projectWebTranscript(
+      chunks.map((chunk, index) =>
+        event({
+          eventType: "progress",
+          source: "harness",
+          message: chunk,
+          payload: {
+            kind: "assistant_delta",
+            activitySource: "delta",
+            progressKind: "assistant_delta",
+            messagePreview: chunk,
+            truncated: false,
+            redacted: false,
+          },
+          at: `2026-01-01T00:01:${String(index).padStart(2, "0")}.000Z`,
+          sequence: 200 + index,
+        }),
+      ),
+    );
+
+    expect(messages).toEqual([
+      {
+        kind: "assistant",
+        ts: "2026-01-01T00:01:00.000Z",
+        text: "Review SC-004 or rerun live-run evidence. REQ-002 requires latency coverage and orchestration checks.",
+      },
+    ]);
   });
 
   it("exact-concatenates Hermes runtime message_delta streams without completion", () => {

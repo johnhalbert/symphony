@@ -171,7 +171,7 @@ export function useTranscript(sessionId: string | null, refreshToken?: unknown):
       return nextState;
     });
     dataSource
-      .getTranscript(normalizedSessionId, controller.signal)
+      .getTranscript(normalizedSessionId, controller.signal, { full: true })
       .then((transcriptWindow) => {
         if (!active) return;
         patchCursor.current = {

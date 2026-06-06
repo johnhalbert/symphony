@@ -26,7 +26,9 @@ export function Paragraphs({ text }: { text: string }) {
   return (
     <>
       {text.split("\n\n").map((paragraph, index) => (
-        <p key={index}>{formatInlineText(paragraph)}</p>
+        <p key={index} style={{ whiteSpace: "pre-wrap" }}>
+          {formatInlineText(paragraph)}
+        </p>
       ))}
     </>
   );

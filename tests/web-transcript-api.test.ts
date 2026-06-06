@@ -145,6 +145,115 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("honors full transcript requests by walking every page and projecting the combined event stream", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "full-run", sessionId: "full-session", issueIdentifier: "TEST-1" });
+    const readCalls: Array<{ offset: number | undefined; limit: number | undefined }> = [];
+    runStore.readTranscriptTail = async () => {
+      throw new Error("full transcript requests should not use the bounded tail reader");
+    };
+    runStore.readTranscript = async (runId, options = {}) => {
+      readCalls.push({ offset: options.offset, limit: options.limit });
+      if ((options.offset ?? 0) === 0) {
+        return {
+          runId,
+          offset: 0,
+          limit: options.limit ?? 1_000,
+          nextOffset: 2,
+          total: 4,
+          events: [
+            transcriptEvent({
+              runId,
+              sequence: 1,
+              at: "2026-01-01T00:00:01.000Z",
+              eventType: "tool_start",
+              payload: { callId: "call-1", name: "shell", argumentsPreview: "npm test" },
+            }),
+            transcriptEvent({
+              runId,
+              sequence: 2,
+              at: "2026-01-01T00:00:02.000Z",
+              eventType: "message_delta",
+              payload: { text: "this" },
+            }),
+          ],
+        };
+      }
+      return {
+        runId,
+        offset: options.offset ?? 2,
+        limit: options.limit ?? 1_000,
+        nextOffset: null,
+        total: 4,
+        events: [
+          transcriptEvent({
+            runId,
+            sequence: 3,
+            at: "2026-01-01T00:00:03.000Z",
+            eventType: "message_delta",
+            payload: { text: "works" },
+          }),
+          transcriptEvent({
+            runId,
+            sequence: 4,
+            at: "2026-01-01T00:00:04.000Z",
+            eventType: "tool_complete",
+            payload: { callId: "call-1", name: "shell", resultPreview: "tests passed" },
+          }),
+        ],
+      };
+    };
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/full-run/transcript?full=1`);
+      expect(response.status).toBe(200);
+      const responseBody = await response.json();
+      const body = transcriptMessages(responseBody);
+      expectRunPrelude(body, { session: "full-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        {
+          kind: "tool_call",
+          ts: "2026-01-01T00:00:01.000Z",
+          call_id: "call-1",
+          name: "shell",
+          status: "completed",
+          args: { preview: "npm test" },
+          result: "tests passed",
+        },
+        { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "this works" },
+      ]);
+      expect(responseBody).toMatchObject({
+        page: {
+          offset: 0,
+          limit: 4,
+          size: 4,
+          total: 4,
+          nextOffset: null,
+          hasNext: false,
+        },
+        window: {
+          kind: "page",
+          requested: { offset: 0, limit: 4 },
+          messageCount: 4,
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          runStatus: "running",
+        },
+      });
+      expect(readCalls).toEqual([
+        { offset: 0, limit: 1_000 },
+        { offset: 2, limit: 1_000 },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("bypasses durable projections for running default transcript tails but still honors explicit durable pages", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
@@ -564,6 +673,64 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("serves explicitly unsafe full Hermes tool details through the web transcript API", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const longArgs = `{\n  "command": "echo SECRET_UNSAFE_ARGUMENT",\n  "filler": "${"a".repeat(700)}"\n}`;
+    const longResult = `SECRET_UNSAFE_RESULT\n${"b".repeat(700)}`;
+    await startRun(runStore, config, { runId: "unsafe-hermes-run", sessionId: "unsafe-hermes-session", issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "unsafe-hermes-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "runtime",
+      eventType: "tool_start",
+      message: "Hermes tool terminal started",
+      payload: {
+        toolId: "tool-unsafe",
+        name: "terminal",
+        argsPreview: longArgs,
+        redacted: false,
+        unsafeToolDetails: true,
+      },
+    });
+    await runStore.appendEvent({
+      runId: "unsafe-hermes-run",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "runtime",
+      eventType: "tool_complete",
+      message: "Hermes tool terminal completed",
+      payload: {
+        toolId: "tool-unsafe",
+        name: "terminal",
+        resultPreview: longResult,
+        redacted: false,
+        unsafeToolDetails: true,
+      },
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/unsafe-hermes-run/transcript?full=1`);
+      expect(response.status).toBe(200);
+      const body = transcriptMessages(await response.json());
+      expectRunPrelude(body, { session: "unsafe-hermes-session", issue: "TEST-1" });
+      expect(body.slice(2)).toEqual([
+        {
+          kind: "tool_call",
+          ts: "2026-01-01T00:00:01.000Z",
+          call_id: "tool-unsafe",
+          name: "terminal",
+          status: "completed",
+          args: { preview: longArgs },
+          result: longResult,
+        },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves persisted Hermes ACP progress deltas as one readable assistant message", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
@@ -609,15 +776,6 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expectRunPrelude(body, { session: "hermes-acp-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
-        {
-          kind: "tool_call",
-          ts: "2026-01-01T00:00:03.000Z",
-          call_id: "hermes-acp-run:3",
-          name: "terminal",
-          status: "running",
-          args: {},
-          result: null,
-        },
         { kind: "status", state: "cancelled", ts: "2026-01-01T00:00:04.000Z", text: "Run cancelled" },
       ]);
       expect(JSON.stringify(body)).not.toContain("SECRET_TOOL_PROGRESS");

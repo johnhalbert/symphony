@@ -140,7 +140,9 @@ function ToolCallMsg({
   open: boolean;
   onToggle: () => void;
 }) {
-  const argsPreview = JSON.stringify(message.args).replace(/[{}"]/g, "").replace(/,/g, ", ");
+  const hasArgs = Object.keys(message.args).length > 0;
+  const argsPreview = toolArgsHeaderPreview(message.args);
+  const resultPending = !isTerminalToolStatus(message.status);
   return (
     <div className="msg">
       <MsgGutter kind="tool_call" />
@@ -173,7 +175,11 @@ function ToolCallMsg({
             <div className="toolcall__body">
               <div className="toolcall__sec">
                 <div className="lbl">Arguments</div>
-                <div style={{ whiteSpace: "pre-wrap", fontFamily: "var(--font-mono)" }}>{JSON.stringify(message.args, null, 2)}</div>
+                {hasArgs ? (
+                  <div style={{ whiteSpace: "pre-wrap", fontFamily: "var(--font-mono)" }}>{toolArgsDetailText(message.args)}</div>
+                ) : (
+                  <div style={{ color: "var(--text-3)", fontStyle: "italic" }}>No argument preview captured.</div>
+                )}
               </div>
               {message.result !== null ? (
                 <div className="toolcall__sec">
@@ -187,8 +193,14 @@ function ToolCallMsg({
                 <div className="toolcall__sec">
                   <div className="lbl">Result</div>
                   <div style={{ color: "var(--text-3)", fontStyle: "italic" }}>
-                    <span className="spinner" style={{ display: "inline-block", verticalAlign: "-1px", marginRight: 6 }} />
-                    awaiting tool response...
+                    {resultPending ? (
+                      <>
+                        <span className="spinner" style={{ display: "inline-block", verticalAlign: "-1px", marginRight: 6 }} />
+                        awaiting tool response...
+                      </>
+                    ) : (
+                      "No result preview captured."
+                    )}
                   </div>
                 </div>
               )}
@@ -209,6 +221,37 @@ function ToolCallMsg({
         </div>
       </div>
     </div>
+  );
+}
+
+function toolArgsHeaderPreview(args: Record<string, unknown>): string {
+  const raw =
+    typeof args.preview === "string" && args.preview.length > 0
+      ? args.preview
+      : Object.keys(args).length > 0
+        ? JSON.stringify(args).replace(/[{}"]/g, "").replace(/,/g, ", ")
+        : "";
+  const compact = raw.replace(/\s+/g, " ").trim();
+  return compact.length > 160 ? `${compact.slice(0, 157)}...` : compact;
+}
+
+function toolArgsDetailText(args: Record<string, unknown>): string {
+  if (typeof args.preview === "string" && Object.keys(args).length === 1) return args.preview;
+  return JSON.stringify(args, null, 2);
+}
+
+function isTerminalToolStatus(status: string): boolean {
+  const normalized = status.trim().toLowerCase();
+  return (
+    normalized === "completed" ||
+    normalized === "complete" ||
+    normalized === "finished" ||
+    normalized === "succeeded" ||
+    normalized === "success" ||
+    normalized === "failed" ||
+    normalized === "error" ||
+    normalized === "cancelled" ||
+    normalized === "canceled"
   );
 }
 

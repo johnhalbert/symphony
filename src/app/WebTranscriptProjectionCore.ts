@@ -6,6 +6,15 @@ const REDACTED = "[redacted]";
 const REDACTED_COMMAND_PAYLOAD = "[redacted command payload]";
 const REDACTED_ENVIRONMENT_VALUES = "[redacted environment values]";
 const REDACTED_HELPER_PATH = "[redacted helper path]";
+const UNSAFE_TOOL_DETAIL_TEXT_FIELDS = [
+  "argsPreview",
+  "argumentsPreview",
+  "inputPreview",
+  "resultPreview",
+  "outputPreview",
+  "errorPreview",
+  "summary",
+] as const;
 const TOKEN_PREFIX_PATTERN = /\b(?:ghp_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,})\b/g;
 const URL_USERINFO_PATTERN = /\b((?:https?|ssh|git):\/\/)([^\s/@"']+(?::[^\s/@"']*)?)@/gi;
 const SENSITIVE_NORMALIZED_KEYS = new Set([
@@ -321,6 +330,12 @@ function projectTranscriptEvents(events: readonly WebTranscriptEvent[]): Transcr
   };
 
   for (const event of events) {
+    const harnessToolProgress = harnessToolProgressPreview(event);
+    if (harnessToolProgress) {
+      mergeHarnessToolProgressPreview(messages, harnessToolProgress);
+      continue;
+    }
+
     const projected = projectWebTranscriptEvent(event);
     if (projected === null) continue;
     if (projected.kind === "tool_call") {
@@ -373,11 +388,29 @@ function projectTranscriptEvents(events: readonly WebTranscriptEvent[]): Transcr
   return messages;
 }
 
+function mergeHarnessToolProgressPreview(
+  messages: TranscriptMessage[],
+  progress: { name: string; preview: string; truncated: boolean },
+): void {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.kind !== "tool_call" || message.name !== progress.name) continue;
+    if (Object.keys(message.args).length > 0) return;
+    messages[index] = {
+      ...message,
+      args: { preview: progress.preview },
+      ...(message.truncated || progress.truncated ? { truncated: true } : {}),
+    };
+    return;
+  }
+}
+
 function projectWebTranscriptEvent(event: WebTranscriptEvent): TranscriptMessage | null {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
   const payloadKind = normalizedPayloadKind(payload);
   const activitySource = normalizedActivitySource(payload);
+  if (isHiddenMetadataEvent(event, eventType, payloadKind, activitySource, payload)) return null;
   if (isToolEvent(eventType, payloadKind, payload)) return projectToolCallMessage(event, payload, eventType);
   if (isCommandPolicyDecisionEvent(eventType, payloadKind, payload)) return projectCommandPolicyStatusMessage(event, payload);
   if (isDiagnosticEvent(eventType, payloadKind)) return projectDiagnosticStatusMessage(event, payload, eventType);
@@ -386,7 +419,6 @@ function projectWebTranscriptEvent(event: WebTranscriptEvent): TranscriptMessage
   }
   if (isProviderLimitEvent(eventType, payloadKind)) return projectProviderLimitStatusMessage(event, payload, eventType);
   if (isRateLimitEvent(eventType, payloadKind)) return projectRateLimitStatusMessage(event, payload, eventType);
-  if (isHiddenMetadataEvent(event, eventType, payloadKind, activitySource, payload)) return null;
   if (isTerminalStatusEvent(eventType)) return projectTerminalStatusMessage(event, payload, eventType);
   if (isLegacyAcpProtocolEvent(eventType)) {
     return { ...projectStatusMessage(event, payload, "runtime_diagnostic"), state: "runtime_diagnostic" };
@@ -399,7 +431,7 @@ function projectWebTranscriptEvent(event: WebTranscriptEvent): TranscriptMessage
   if (isStatusEvent(eventType, payloadKind, payload)) return projectStatusMessage(event, payload, eventType);
   if (isAssistantEvent(event, eventType, payloadKind, payload)) {
     const isDelta = isAssistantDeltaEventParts(eventType, payloadKind, payload);
-    const text = isDelta ? assistantDeltaText(event, payload) : eventText(event, payload);
+    const text = isDelta ? assistantDeltaText(event, payload) : assistantMessageText(event, payload);
     if (isDelta && text.length === 0) return null;
     return { kind: "assistant", ts: event.at, text };
   }
@@ -408,10 +440,19 @@ function projectWebTranscriptEvent(event: WebTranscriptEvent): TranscriptMessage
 
 function projectToolCallMessage(event: WebTranscriptEvent, payload: Record<string, unknown>, eventType: string): TranscriptMessage {
   const progressTool = progressToolSummary(event, payload);
-  const argsPreview = firstPublicPreview(payload.argumentsPreview, payload.argsPreview, payload.inputPreview, payload.args, payload.arguments, payload.input);
-  const resultPreview = firstPublicPreview(payload.resultPreview, payload.result, payload.summary);
-  const outputPreview = firstPublicPreview(payload.outputPreview, payload.output);
-  const errorPreview = firstPublicPreview(payload.errorPreview, payload.error);
+  const unsafeToolDetails = payload.unsafeToolDetails === true && payload.redacted === false;
+  const argsPreview = firstToolDetailPreview(
+    unsafeToolDetails,
+    payload.argumentsPreview,
+    payload.argsPreview,
+    payload.inputPreview,
+    payload.args,
+    payload.arguments,
+    payload.input,
+  );
+  const resultPreview = firstToolDetailPreview(unsafeToolDetails, payload.resultPreview, payload.result, payload.summary);
+  const outputPreview = firstToolDetailPreview(unsafeToolDetails, payload.outputPreview, payload.output);
+  const errorPreview = firstToolDetailPreview(unsafeToolDetails, payload.errorPreview, payload.error);
   return {
     kind: "tool_call",
     ts: event.at,
@@ -726,11 +767,21 @@ function isHiddenMetadataEvent(
   event: WebTranscriptEvent,
   eventType: string,
   payloadKind: string | null,
-  _activitySource: string | null,
+  activitySource: string | null,
   payload: Record<string, unknown>,
 ): boolean {
   if (isTokenUsageEvent(eventType, payloadKind)) return !isDisplayableTokenStatusEvent(event, payload);
+  if (isHarnessToolProgressMetadata(event, eventType, payloadKind, activitySource)) return true;
   return eventType === "session_started" || eventType === "run_status";
+}
+
+function isHarnessToolProgressMetadata(
+  event: WebTranscriptEvent,
+  eventType: string,
+  payloadKind: string | null,
+  activitySource: string | null,
+): boolean {
+  return event.source === "harness" && eventType === "progress" && (activitySource === "tool" || payloadKindIncludes(payloadKind, "tool"));
 }
 
 function isDisplayableTokenStatusEvent(event: WebTranscriptEvent, payload: Record<string, unknown>): boolean {
@@ -851,6 +902,55 @@ function assistantDeltaText(event: WebTranscriptEvent, payload: Record<string, u
 type AssistantDeltaMirrorSource = "runtime" | "harness";
 
 type AssistantDeltaMirrorCounts = Record<AssistantDeltaMirrorSource, Map<string, number>>;
+const COMMON_SHORT_WORD_TOKENS = new Set([
+  "a",
+  "am",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "but",
+  "by",
+  "can",
+  "do",
+  "for",
+  "get",
+  "git",
+  "go",
+  "had",
+  "has",
+  "he",
+  "her",
+  "his",
+  "i",
+  "if",
+  "in",
+  "is",
+  "it",
+  "me",
+  "my",
+  "no",
+  "not",
+  "of",
+  "on",
+  "or",
+  "our",
+  "out",
+  "pr",
+  "run",
+  "so",
+  "the",
+  "to",
+  "up",
+  "us",
+  "use",
+  "was",
+  "we",
+  "you",
+]);
+const KNOWN_LOWERCASE_WORDPIECE_PREFIXES = new Set(["lat", "orches", "rer"]);
 
 function createAssistantDeltaMirrorCounts(): AssistantDeltaMirrorCounts {
   return { runtime: new Map<string, number>(), harness: new Map<string, number>() };
@@ -892,8 +992,11 @@ type AssistantDeltaJoinMode = "spaced" | "exact" | "token";
 function assistantDeltaJoinMode(event: WebTranscriptEvent): AssistantDeltaJoinMode {
   const eventType = normalizeToken(event.eventType);
   const payload = sanitizedPayloadRecord(event);
+  const payloadKind = normalizedPayloadKind(payload);
   if (eventType === "assistant_message_delta") return "exact";
-  if (eventType === "progress" && normalizedActivitySource(payload) === "delta") return "exact";
+  if (eventType === "progress" && normalizedActivitySource(payload) === "delta") {
+    return payloadKind === "assistant_delta" || normalizedOptionalToken(payload.progressKind) === "assistant_delta" ? "token" : "exact";
+  }
   if (eventType === "message_delta" && isHermesRuntimeMessageDelta(event, payload)) return "exact";
   if (eventType === "message_delta") return "token";
   return "spaced";
@@ -912,9 +1015,45 @@ function combineAssistantDeltaText(existing: string, next: string, mode: Assista
 }
 
 function shouldJoinTokenFragmentWithoutSpace(existing: string, next: string): boolean {
-  if (/^[,.;:!?)}\]"']/.test(next)) return true;
-  if (/[({\["']$/.test(existing)) return true;
-  return /^[\p{L}\p{N}]+$/u.test(existing) && /^[\p{L}\p{N}]+$/u.test(next) && existing.length >= 2 && existing.length <= 4 && next.length <= 3;
+  const previous = lastNonWhitespaceToken(existing);
+  if (!previous) return false;
+  if (/^[,.;:!?)}\]]/.test(next)) return true;
+  if (/^[’'][\p{L}]/u.test(next)) return true;
+  if (next.startsWith("`") && hasOpenInlineCodeSpan(existing)) return true;
+  if (next.startsWith('"') && hasOpenDoubleQuoteSpan(existing)) return true;
+  if (/[({\[]$/.test(previous)) return true;
+  if (previous.endsWith("`") && hasOpenInlineCodeSpan(existing)) return true;
+  if (previous.endsWith('"') && hasOpenDoubleQuoteSpan(existing)) return true;
+  if (hasOpenInlineCodeSpan(existing) && /^[\p{L}\p{N}_-]/u.test(next) && /[`./\\-]$/.test(previous)) return true;
+  if (next === "-") return true;
+  if (/^-[\p{L}\p{N}_]/u.test(next)) return true;
+  if (/^[A-Z]{1,4}$/.test(previous) && /^[A-Z]$/.test(next)) return true;
+  if (shouldJoinLowercaseWordpiece(previous, next)) return true;
+  if (previous === "--" || previous.endsWith("-")) return true;
+  if (/^[/\\]/.test(next) && /[\p{L}\p{N}._-]$/u.test(previous)) return true;
+  if (/^\.[\p{L}\p{N}_-]/u.test(next) && /[\p{L}\p{N}_-]$/u.test(previous)) return true;
+  if (/[/\\][\p{L}\p{N}._-]*$/u.test(previous) && /^[\p{L}\p{N}._-]+$/u.test(next)) return true;
+  return false;
+}
+
+function lastNonWhitespaceToken(value: string): string | null {
+  return value.match(/\S+$/)?.[0] ?? null;
+}
+
+function hasOpenInlineCodeSpan(value: string): boolean {
+  const matches = value.match(/`/g);
+  return matches !== null && matches.length % 2 === 1;
+}
+
+function hasOpenDoubleQuoteSpan(value: string): boolean {
+  const matches = value.match(/"/g);
+  return matches !== null && matches.length % 2 === 1;
+}
+
+function shouldJoinLowercaseWordpiece(previous: string, next: string): boolean {
+  if (!/^[a-z]{2,8}$/.test(previous) || !/^[a-z]{2,8}$/.test(next)) return false;
+  if (COMMON_SHORT_WORD_TOKENS.has(previous) || COMMON_SHORT_WORD_TOKENS.has(next)) return false;
+  return KNOWN_LOWERCASE_WORDPIECE_PREFIXES.has(previous);
 }
 
 function isAssistantDeltaLikePayload(payloadKind: string | null, payload: Record<string, unknown>): boolean {
@@ -989,12 +1128,34 @@ function sanitizedPayloadRecord(event: WebTranscriptEvent): Record<string, unkno
   const rawPayloadKind = normalizedPayloadKind(rawPayload);
   const payload = isCommandPolicyDecisionEvent(eventType, rawPayloadKind, rawPayload)
     ? sanitizeCommandPolicyPayloadForPublicOutput(event.payload)
+    : isUnsafeToolDetailPayload(eventType, rawPayload)
+      ? sanitizeUnsafeToolDetailPayload(rawPayload)
     : sanitizePublicJson(event.payload);
   return isRecord(payload) ? payload : {};
 }
 
 function rawPayloadRecord(event: WebTranscriptEvent): Record<string, unknown> {
   return isRecord(event.payload) ? event.payload : {};
+}
+
+function isUnsafeToolDetailPayload(eventType: string, payload: Record<string, unknown>): boolean {
+  return (
+    payload.unsafeToolDetails === true &&
+    payload.redacted === false &&
+    (eventType === "tool_start" || eventType === "tool_complete" || eventType === "tool_call" || eventType === "tool_call_update")
+  );
+}
+
+function sanitizeUnsafeToolDetailPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const sanitized = sanitizePublicJson(payload);
+  const output: Record<string, unknown> = isRecord(sanitized) ? { ...sanitized } : {};
+  output.unsafeToolDetails = true;
+  output.redacted = false;
+  for (const key of UNSAFE_TOOL_DETAIL_TEXT_FIELDS) {
+    const value = payload[key];
+    if (typeof value === "string") output[key] = unsafeToolDetailText(value);
+  }
+  return output;
 }
 
 function eventText(event: WebTranscriptEvent, payload: Record<string, unknown>): string {
@@ -1104,6 +1265,32 @@ function firstDeltaTextFromRecord(record: Record<string, unknown>): AssistantDel
   return { foundCandidate, text: null };
 }
 
+const ASSISTANT_MESSAGE_TEXT_KEYS = ["textPreview", "summary", "messagePreview", "text", "message"] as const;
+
+function assistantMessageText(event: WebTranscriptEvent, payload: Record<string, unknown>): string {
+  return (
+    firstDisplayTextFromRecord(rawPayloadRecord(event), ASSISTANT_MESSAGE_TEXT_KEYS) ??
+    firstDisplayTextFromRecord(payload, ASSISTANT_MESSAGE_TEXT_KEYS) ??
+    firstDisplayText(event.message) ??
+    event.eventType
+  );
+}
+
+function firstDisplayTextFromRecord(record: Record<string, unknown>, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    const preview = firstDisplayText(value);
+    if (preview !== null) return preview;
+  }
+  return null;
+}
+
+function firstDisplayText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const preview = sanitizedDeltaTextValue(value).preview;
+  return preview !== null && preview.length > 0 ? preview : null;
+}
+
 function isLabelOnlyRuntimeDeltaEvent(event: WebTranscriptEvent): boolean {
   return event.source === "runtime" && normalizeToken(event.eventType) === "message_delta" && normalizeToken(event.message ?? "") === "hermes_message_delta";
 }
@@ -1152,6 +1339,30 @@ function parseProgressToolMessage(message: string | null): { name: string | null
   }
   text = text.replace(/\b(started|starting|running|completed|complete|finished|failed|error|cancelled|canceled)\b$/i, "").trim();
   return { name: firstCleanString(text), status };
+}
+
+function harnessToolProgressPreview(event: WebTranscriptEvent): { name: string; preview: string; truncated: boolean } | null {
+  const eventType = normalizeToken(event.eventType);
+  const payload = sanitizedPayloadRecord(event);
+  const payloadKind = normalizedPayloadKind(payload);
+  const activitySource = normalizedActivitySource(payload);
+  if (!isHarnessToolProgressMetadata(event, eventType, payloadKind, activitySource)) return null;
+  const message = firstCleanString(payload.messagePreview, payload.message, event.message);
+  const preview = toolProgressDetailPreview(message);
+  if (!preview) return null;
+  const tool = progressToolSummary(event, payload);
+  const name = tool?.name ?? "tool";
+  return { name, preview, truncated: payload.truncated === true };
+}
+
+function toolProgressDetailPreview(message: string | null): string | null {
+  if (!message) return null;
+  let text = message.replace(/^Hermes\s+(?:ACP\s+)?/i, "").trim();
+  text = text.replace(/^tool\s+/i, "").trim();
+  const colonIndex = text.indexOf(":");
+  if (colonIndex < 0) return null;
+  const preview = text.slice(colonIndex + 1).trim();
+  return firstCleanString(preview);
 }
 
 function toolStatusFromText(value: string): string | null {
@@ -1216,6 +1427,21 @@ function firstPublicPreview(...values: unknown[]): { preview: string; truncated:
     if (preview.preview && preview.preview.length > 0) return { preview: preview.preview, truncated: preview.truncated };
   }
   return null;
+}
+
+function firstToolDetailPreview(unsafeToolDetails: boolean, ...values: unknown[]): { preview: string; truncated: boolean } | null {
+  if (!unsafeToolDetails) return firstPublicPreview(...values);
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    const preview = unsafeToolDetailText(value);
+    if (preview.length > 0) return { preview, truncated: false };
+  }
+  return null;
+}
+
+function unsafeToolDetailText(value: unknown): string {
+  const text = typeof value === "string" ? value : safeJsonPreview(value);
+  return text.replace(/\r\n/g, "\n").trim();
 }
 
 function normalizeToken(value: string): string {

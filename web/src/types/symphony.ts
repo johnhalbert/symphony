@@ -327,6 +327,7 @@ export interface TranscriptRequestOptions {
   offset?: number | null;
   limit?: number | null;
   tail?: boolean;
+  full?: boolean;
 }
 
 export interface TimelineEvent {
