@@ -160,10 +160,10 @@
 - [ ] T062 [P] Update final validation instructions in `specs/001-block-agent-github/quickstart.md`
 - [ ] T063 [P] Update agent command policy contract examples in `specs/001-block-agent-github/contracts/agent-command-policy.md`
 - [ ] T064 Capture dogfood validation evidence for SC-004, confirming worker/reviewer runs produce zero desktop OAuth prompts, SSH key confirmation prompts, or GitHub credential prompts caused by agent-owned command attempts
-- [ ] T065 Run `npm run typecheck` per `specs/001-block-agent-github/quickstart.md`
-- [ ] T066 Run targeted policy test suite, including lightweight command-policy latency regression coverage, per `specs/001-block-agent-github/quickstart.md`
-- [ ] T067 Run full CI-equivalent validation commands per `specs/001-block-agent-github/quickstart.md`
-- [ ] T068 Confirm no implementation changes touched vendored Hermes source under `hermes/upstream-src/**` using the constraint in `specs/001-block-agent-github/quickstart.md`
+- [x] T065 Run `npm run typecheck` per `specs/001-block-agent-github/quickstart.md`
+- [x] T066 Run targeted policy test suite, including lightweight command-policy latency regression coverage, per `specs/001-block-agent-github/quickstart.md`
+- [x] T067 Run full CI-equivalent validation commands per `specs/001-block-agent-github/quickstart.md`
+- [x] T068 Confirm no implementation changes touched vendored Hermes source under `hermes/upstream-src/**` using the constraint in `specs/001-block-agent-github/quickstart.md`
 
 ---
 
