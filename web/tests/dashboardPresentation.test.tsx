@@ -145,7 +145,7 @@ function dataSourceForDashboard(dashboard: DashboardModel): SymphonyDataSource {
       return orchestratorChatModelFromMessages(dashboard.chat);
     },
     async sendOrchestratorMessage(input: string) {
-      return [...dashboard.chat, { who: "user", text: input }];
+      return orchestratorChatModelFromMessages([...dashboard.chat, { who: "user", text: input }]);
     },
     async triggerPoll() {
       return { queued: true, coalesced: false, requested_at: "2026-06-03T13:30:00.000Z", operations: ["poll", "reconcile"] };

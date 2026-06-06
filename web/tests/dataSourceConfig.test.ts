@@ -69,7 +69,7 @@ const demoDataSource: SymphonyDataSource = {
     return orchestratorChatModelFromMessages([]);
   },
   async sendOrchestratorMessage(input) {
-    return [{ who: "user", text: input }];
+    return orchestratorChatModelFromMessages([{ who: "user", text: input }]);
   },
 };
 

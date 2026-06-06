@@ -72,9 +72,9 @@ export const mockDataSource: SymphonyDataSource = {
   },
   sendOrchestratorMessage(input) {
     const trimmed = input.trim();
-    if (!trimmed) return delay(chatMessages);
+    if (!trimmed) return delay(orchestratorChatModelFromMessages(chatMessages));
     chatMessages = [...chatMessages, { who: "user", text: trimmed }, mockReply(trimmed)];
-    return delay(chatMessages, 120);
+    return delay(orchestratorChatModelFromMessages(chatMessages), 120);
   },
   triggerPoll() {
     return delay({

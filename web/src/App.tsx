@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AppChrome } from "./app/AppChrome";
 import { resolveAppResourceLoading } from "./app/resourceLoading";
 import { ThemeFrame } from "./app/ThemeFrame";
@@ -8,7 +8,7 @@ import { ChatHistoryView } from "./components/history/ChatHistoryView";
 import { DashboardView } from "./components/dashboard/DashboardView";
 import { resolveDashboardFreshnessCue } from "./components/dashboard/freshness";
 import { IssuesView } from "./components/issues/IssuesView";
-import { DataSourceProvider, defaultDataSourceConfig } from "./data/dataSourceContext";
+import { DataSourceProvider, defaultDataSourceConfig, useDataSource } from "./data/dataSourceContext";
 import { fallbackReferenceData, ReferenceDataProvider } from "./data/referenceDataContext";
 import {
   useDashboard,
@@ -27,6 +27,7 @@ import type {
   IssueBoardModel,
   IssuesVariant,
   Loadable,
+  OrchestratorChatModel,
   ReferenceData,
   RunningAgentModel,
   RunState,
@@ -84,6 +85,78 @@ function resourceOptions(enabled: boolean, refreshToken: number) {
   return refreshToken > 0 ? { enabled, refreshToken } : { enabled };
 }
 
+function selectPreferredOrchestratorChatProjection(
+  current: OrchestratorChatModel | null,
+  optimistic: OrchestratorChatModel | null,
+): OrchestratorChatModel | null {
+  if (!optimistic) return current;
+  if (!current) return optimistic;
+  return compareOrchestratorChatFreshness(current, optimistic) >= 0 ? current : optimistic;
+}
+
+function compareOrchestratorChatFreshness(left: OrchestratorChatModel, right: OrchestratorChatModel): number {
+  const messageCountDelta = left.chat.length - right.chat.length;
+  if (messageCountDelta !== 0) return messageCountDelta;
+
+  const sequenceDelta = compareNullableNumber(left.source.latestMessageSequence, right.source.latestMessageSequence);
+  if (sequenceDelta !== 0) return sequenceDelta;
+
+  const timestampDelta = compareNullableTimestamp(
+    left.source.latestMessageUpdatedAt ?? left.conversation.updatedAt ?? left.source.observedAt,
+    right.source.latestMessageUpdatedAt ?? right.conversation.updatedAt ?? right.source.observedAt,
+  );
+  if (timestampDelta !== 0) return timestampDelta;
+
+  if (sameLatestMessageIdentity(left, right) && left.state !== right.state) {
+    return stateFreshnessRank(left.state) - stateFreshnessRank(right.state);
+  }
+
+  return 0;
+}
+
+function sameLatestMessageIdentity(left: OrchestratorChatModel, right: OrchestratorChatModel): boolean {
+  const leftLatest = left.chat.at(-1) ?? null;
+  const rightLatest = right.chat.at(-1) ?? null;
+  if (!leftLatest || !rightLatest) return leftLatest === rightLatest;
+  if (leftLatest.id && rightLatest.id) return leftLatest.id === rightLatest.id;
+  return (
+    leftLatest.who === rightLatest.who
+    && leftLatest.text === rightLatest.text
+    && (leftLatest.createdAt ?? null) === (rightLatest.createdAt ?? null)
+  );
+}
+
+function compareNullableNumber(left: number | null, right: number | null): number {
+  if (typeof left !== "number" || typeof right !== "number") return 0;
+  return left - right;
+}
+
+function compareNullableTimestamp(left: string | null, right: string | null): number {
+  if (!left || !right) return 0;
+  const leftTimestamp = Date.parse(left);
+  const rightTimestamp = Date.parse(right);
+  if (!Number.isFinite(leftTimestamp) || !Number.isFinite(rightTimestamp)) return 0;
+  return leftTimestamp - rightTimestamp;
+}
+
+function stateFreshnessRank(state: OrchestratorChatModel["state"]): number {
+  switch (state) {
+    case "empty":
+      return 0;
+    case "pending":
+      return 1;
+    case "streaming":
+      return 2;
+    case "completed":
+    case "failed":
+    case "disabled":
+    case "unavailable":
+      return 3;
+    default:
+      return 0;
+  }
+}
+
 function resolveSidebarAgentUsageLabel(sidebar: Loadable<SidebarModel>): string {
   if (!sidebar.data) {
     if (sidebar.loading) return "agent usage loading";
@@ -105,6 +178,7 @@ function AppShell({
   initialReferenceData: ReferenceData;
   lazyReferenceData?: boolean;
 }) {
+  const dataSource = useDataSource();
   const [activeTab, setActiveTab] = useState<AppTab>("dashboard");
   const [manualDashboardRefreshToken, setManualDashboardRefreshToken] = useState(0);
   const [dashboardVariant, setDashboardVariant] = useState<DashboardVariant>("cards");
@@ -133,11 +207,26 @@ function AppShell({
   const sidebarEnabled = resourceLoading.sidebar || (apiMode && Boolean(dashboard.error));
   const sidebar = useSidebar(resourceOptions(sidebarEnabled, sidebarRefreshToken));
   const orchestratorChat = useOrchestratorChat(resourceOptions(resourceLoading.orchestratorChat, orchestratorChatRefreshToken));
+  const [orchestratorChatOverride, setOrchestratorChatOverride] = useState<OrchestratorChatModel | null>(null);
+  const resolvedOrchestratorChat = selectPreferredOrchestratorChatProjection(orchestratorChat.data, orchestratorChatOverride);
   const dashboardChrome = dashboard.data;
   const dashboardFreshnessCue = dashboard.data ? resolveDashboardFreshnessCue(dashboard.data, dashboard) : null;
   const statusbarRunningCount = dashboardFreshnessCue?.runningCount ?? 0;
   const agentUsageLabel = dashboardFreshnessCue?.agentUsageLabel ?? resolveSidebarAgentUsageLabel(sidebar);
   const tabBadges = resolveTabBadges(issueBoard.data, history.data);
+
+  useEffect(() => {
+    if (!orchestratorChatOverride || !orchestratorChat.data) return;
+    if (selectPreferredOrchestratorChatProjection(orchestratorChat.data, orchestratorChatOverride) === orchestratorChat.data) {
+      setOrchestratorChatOverride(null);
+    }
+  }, [orchestratorChat.data, orchestratorChatOverride]);
+
+  const sendOrchestratorMessage = useCallback(async (input: string) => {
+    const nextChat = await dataSource.sendOrchestratorMessage(input);
+    setOrchestratorChatOverride(nextChat);
+    return nextChat;
+  }, [dataSource]);
 
   return (
     <ReferenceDataProvider value={referenceData}>
@@ -180,9 +269,10 @@ function AppShell({
                   freshnessCue={resolveDashboardFreshnessCue(data, state)}
                   variant={dashboardVariant}
                   useModelBurnupTotals={apiMode}
-                  orchestratorChat={orchestratorChat.data ?? []}
+                  orchestratorChat={resolvedOrchestratorChat ?? []}
                   orchestratorChatError={orchestratorChat.error}
                   orchestratorChatLoading={orchestratorChat.loading}
+                  onSendOrchestratorMessage={sendOrchestratorMessage}
                   onPollTriggered={() => setManualDashboardRefreshToken((token) => token + 1)}
                 />
               ))
@@ -200,9 +290,10 @@ function AppShell({
                   sidebarError={state.error}
                   sidebarLoading={state.loading}
                   variant={sidebarVariant}
-                  orchestratorChat={orchestratorChat.data ?? []}
+                  orchestratorChat={resolvedOrchestratorChat ?? []}
                   orchestratorChatError={orchestratorChat.error}
                   orchestratorChatLoading={orchestratorChat.loading}
+                  onSendOrchestratorMessage={sendOrchestratorMessage}
                 />
               ))
             : null}

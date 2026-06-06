@@ -336,7 +336,7 @@ export function createApiDataSource(baseUrl: string): SymphonyDataSource {
       });
       if (!response.ok) throw new Error(`Symphony API returned HTTP ${response.status}`);
       const body = (await response.json()) as unknown;
-      return normalizeOrchestratorChatModel(body).chat;
+      return normalizeOrchestratorChatModel(body);
     },
     invalidateCachedReads(options) {
       getJsonFetcher.invalidateCache(options);

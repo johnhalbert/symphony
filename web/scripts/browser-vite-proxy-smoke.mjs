@@ -705,11 +705,14 @@ async function runBrowserSmokeAssertions(page, origin) {
     exclude: forbiddenMarkers,
   });
   await selectOption(page, 'select[aria-label="Sidebar variant"]', "chat", "sidebar chat variant");
-  await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload and functional API-mode controls", {
+  await waitForBrowserText(page, "sidebar chat uses the dedicated orchestrator chat payload and preserves dashboard pending chat across navigation", {
     include: [
       "Dedicated orchestrator chat from API endpoint",
       "Dedicated smoke suggestion",
       "sidebar-summary-agent · PROXY-1",
+      "Dashboard browser smoke message",
+      "The chat is pending",
+      "no invented completion message is being shown.",
     ],
     exclude: forbiddenMarkers,
   });

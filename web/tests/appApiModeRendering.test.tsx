@@ -366,11 +366,13 @@ async function renderAppWithMocks({
   hooks = appHookState(),
   liveState = liveResourceState(),
   initialTab = "dashboard",
+  dataSourceOverrides = {},
 }: {
   mode?: "api" | "mock";
   hooks?: AppHookState;
   liveState?: LiveResourceState;
   initialTab?: AppTab;
+  dataSourceOverrides?: Partial<SymphonyDataSource>;
 } = {}) {
   vi.resetModules();
 
@@ -387,7 +389,7 @@ async function renderAppWithMocks({
 
   const dataSource = {
     async sendOrchestratorMessage(input: string) {
-      return [...apiChat, { who: "user", text: input } satisfies ChatMessage];
+      return orchestratorChatModelFromMessages([...apiChat, { who: "user", text: input } satisfies ChatMessage]);
     },
     async triggerPoll() {
       return {
@@ -397,6 +399,7 @@ async function renderAppWithMocks({
         operations: ["poll", "reconcile"],
       };
     },
+    ...dataSourceOverrides,
   } as unknown as SymphonyDataSource;
 
   vi.doMock("../src/data/dataSourceContext", () => ({
@@ -779,6 +782,70 @@ describe("App API-mode rendering", () => {
     expect(hookCalls.history.at(-1)).toEqual({ enabled: false, refreshToken: 11 });
     expect(hookCalls.sidebar.at(-1)).toEqual({ enabled: false, refreshToken: 13 });
     expect(hookCalls.orchestratorChat.at(-1)).toEqual({ enabled: false, refreshToken: 17 });
+  });
+
+  it("keeps a pending orchestrator chat POST projection visible after switching from dashboard to sidebar before hook refresh", async () => {
+    const pendingMessage = "Shared pending app message";
+    const sendOrchestratorMessage = vi.fn(async () =>
+      orchestratorChatModelFromMessages(
+        [
+          ...apiChat,
+          {
+            who: "user",
+            text: pendingMessage,
+            status: "pending",
+            createdAt: "2026-06-05T12:00:00.000Z",
+            updatedAt: "2026-06-05T12:00:00.000Z",
+          } satisfies ChatMessage,
+        ],
+        {
+          state: "pending",
+          conversationStatus: "pending",
+          sourceShape: "reducer_envelope",
+        },
+      ),
+    );
+    await renderAppWithMocks({ dataSourceOverrides: { sendOrchestratorMessage } });
+
+    const { App } = await import("../src/App");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    mountedRoots.push(root);
+
+    act(() => {
+      root.render(<App />);
+    });
+
+    const dashboardSuggestion = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Full-app suggestion"));
+    if (!dashboardSuggestion) throw new Error("expected dashboard orchestrator suggestion to render");
+    await act(async () => {
+      dashboardSuggestion.click();
+      await Promise.resolve();
+    });
+
+    expect(sendOrchestratorMessage).toHaveBeenCalledWith("Full-app suggestion");
+    expect(container.textContent).toContain(pendingMessage);
+    expect(container.textContent).toContain("The orchestrator conversation is pending");
+
+    const sidebarsTab = container.querySelector<HTMLButtonElement>('button[role="tab"][aria-label="Sidebars"]');
+    if (!sidebarsTab) throw new Error("expected sidebars tab to render");
+    act(() => {
+      sidebarsTab.click();
+    });
+
+    const sidebarVariant = container.querySelector<HTMLSelectElement>('select[aria-label="Sidebar variant"]');
+    if (!sidebarVariant) throw new Error("expected sidebar variant selector to render");
+    await act(async () => {
+      sidebarVariant.value = "chat";
+      sidebarVariant.dispatchEvent(new Event("change", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("aria-label")).toBe("Sidebars");
+    expect(container.textContent).toContain(pendingMessage);
+    expect(container.textContent).toContain("The chat is pending");
+    expect(container.textContent).not.toContain("Command accepted by orchestrator");
   });
 
   it("renders non-blocking realtime connection, reconnect, recovered, and stale status in API chrome", async () => {

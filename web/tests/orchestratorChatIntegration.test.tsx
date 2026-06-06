@@ -84,7 +84,7 @@ function dataSourceForChat(chat: OrchestratorChatModel | ChatMessage[]): Symphon
       return chatModel;
     },
     async sendOrchestratorMessage(input: string) {
-      return [...chatMessages, { who: "user", text: input }];
+      return orchestratorChatModelFromMessages([...chatMessages, { who: "user", text: input }]);
     },
   };
 }
@@ -282,11 +282,13 @@ describe("dashboard orchestrator chat integration", () => {
 
   it("dispatches enabled dashboard chat suggestions through the configured command endpoint", async () => {
     const chat: ChatMessage[] = [{ who: "agent", text: "Ready for commands", suggestions: ["Show stalled agents"] }];
-    const sendOrchestratorMessage = vi.fn(async (input: string) => [
-      ...chat,
-      { who: "user", text: input } satisfies ChatMessage,
-      { who: "agent", text: "Command accepted by orchestrator" } satisfies ChatMessage,
-    ]);
+    const sendOrchestratorMessage = vi.fn(async (input: string) =>
+      orchestratorChatModelFromMessages([
+        ...chat,
+        { who: "user", text: input } satisfies ChatMessage,
+        { who: "agent", text: "Command accepted by orchestrator" } satisfies ChatMessage,
+      ]),
+    );
     const container = await renderInteractiveDashboardChat({ chat, sendOrchestratorMessage });
 
     await act(async () => {

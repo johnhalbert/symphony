@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { TriggerPollResult } from "../../data/dataSource";
 import { useDataSource } from "../../data/dataSourceContext";
-import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../../data/orchestratorChat";
+import { normalizeOrchestratorChatModel } from "../../data/orchestratorChat";
 import type { ChatMessage, DashboardModel, DashboardVariant, OrchestratorChatModel } from "../../types/symphony";
 import { Icon, UnavailableButton } from "../common";
 import { AgentRow } from "./AgentRow";
@@ -19,6 +19,7 @@ export function DashboardView({
   useModelBurnupTotals = true,
   freshnessCue,
   onPollTriggered,
+  onSendOrchestratorMessage,
 }: {
   dashboard: DashboardModel;
   orchestratorChat?: OrchestratorChatModel | ChatMessage[];
@@ -29,6 +30,7 @@ export function DashboardView({
   useModelBurnupTotals?: boolean;
   freshnessCue?: DashboardFreshnessCue;
   onPollTriggered?: (result: TriggerPollResult) => void;
+  onSendOrchestratorMessage?: (input: string) => Promise<OrchestratorChatModel>;
 }) {
   const dataSource = useDataSource();
   const sourceChat = useMemo(() => normalizeOrchestratorChatModel(orchestratorChat ?? dashboard.chat), [orchestratorChat, dashboard.chat]);
@@ -54,8 +56,8 @@ export function DashboardView({
 
   async function sendChat(input: string) {
     if (orchestratorChatReadOnly) return;
-    const nextMessages = await dataSource.sendOrchestratorMessage(input);
-    setChat(orchestratorChatModelFromMessages(nextMessages, { conversationId: chat.conversation.id }));
+    const nextChat = await (onSendOrchestratorMessage?.(input) ?? dataSource.sendOrchestratorMessage(input));
+    setChat(nextChat);
   }
 
   async function triggerPoll() {

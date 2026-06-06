@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { SidebarChrome } from "../../app/SidebarChrome";
 import { useDataSource } from "../../data/dataSourceContext";
-import { normalizeOrchestratorChatModel, orchestratorChatModelFromMessages } from "../../data/orchestratorChat";
+import { normalizeOrchestratorChatModel } from "../../data/orchestratorChat";
 import type { ChatMessage, OrchestratorChatModel, SidebarModel, SidebarVariant } from "../../types/symphony";
 import { SidebarChat } from "./SidebarChat";
 import { SidebarHistory } from "./SidebarHistory";
@@ -16,6 +16,7 @@ export function SidebarViews({
   sidebarError = null,
   sidebarLoading = false,
   variant,
+  onSendOrchestratorMessage,
 }: {
   orchestratorChat?: OrchestratorChatModel | ChatMessage[];
   orchestratorChatError?: string | null;
@@ -25,6 +26,7 @@ export function SidebarViews({
   sidebarError?: string | null;
   sidebarLoading?: boolean;
   variant: SidebarVariant;
+  onSendOrchestratorMessage?: (input: string) => Promise<OrchestratorChatModel>;
 }) {
   const dataSource = useDataSource();
   const sourceChat = useMemo(() => normalizeOrchestratorChatModel(orchestratorChat ?? sidebar.chat), [orchestratorChat, sidebar.chat]);
@@ -36,8 +38,8 @@ export function SidebarViews({
 
   async function sendChat(input: string) {
     if (orchestratorChatReadOnly) return;
-    const nextMessages = await dataSource.sendOrchestratorMessage(input);
-    setChatMessages(orchestratorChatModelFromMessages(nextMessages, { conversationId: chatMessages.conversation.id }));
+    const nextChat = await (onSendOrchestratorMessage?.(input) ?? dataSource.sendOrchestratorMessage(input));
+    setChatMessages(nextChat);
   }
 
   const sidebarChatSubtitle = sidebar.runningAgents[0]
