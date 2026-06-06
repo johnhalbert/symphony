@@ -254,7 +254,7 @@ class FixtureGatewayClient extends EventEmitter implements HermesGatewayClient {
   }
 
   async request<T = unknown>(method: string, _params: Record<string, unknown> = {}): Promise<T> {
-    if (method === "session.create") return { session_id: this.sessionId } as T;
+    if (method === "session.create") return { session_id: this.sessionId, session_key: `hermes-${this.sessionId}` } as T;
     if (method === "prompt.submit") {
       queueMicrotask(() => {
         for (const event of this.eventsOnPrompt) this.emit("event", scopeGatewayEvent(event, this.sessionId));

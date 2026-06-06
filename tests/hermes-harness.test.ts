@@ -66,17 +66,24 @@ describe("HermesHarness", () => {
     expect(workerTwo.map((event) => event.type)).toContain("completed");
     expect(reviewerOne.map((event) => event.type)).toContain("completed");
     expect(reviewerTwo.map((event) => event.type)).toContain("completed");
-    expect(clients).toHaveLength(3);
+    expect(clients).toHaveLength(4);
     expect(clients[0]?.requests.filter((request) => request.method === "session.create")).toHaveLength(1);
+    expect(clients[1]?.requests).toContainEqual({
+      method: "session.resume",
+      params: { cols: 120, session_id: "hermes-gw-1" },
+    });
+    expect(clients[1]?.requests.find((request) => request.method === "prompt.submit")?.params.session_id).toBe("gw-2");
     expect(clients[0]?.env.extraEnv).toMatchObject({ HERMES_API_KEY: "worker-hermes-secret" });
-    expect(new Set(clients.slice(1).map((client) => client.env.hermesHome)).size).toBe(2);
-    expect(clients.slice(1).every((client) => client.env.extraEnv?.HERMES_API_KEY === "reviewer-hermes-secret")).toBe(true);
+    expect(clients[1]?.env.extraEnv).toMatchObject({ HERMES_API_KEY: "worker-hermes-secret" });
+    expect(clients[1]?.env.hermesHome).toBe(clients[0]?.env.hermesHome);
+    expect(new Set(clients.slice(2).map((client) => client.env.hermesHome)).size).toBe(2);
+    expect(clients.slice(2).every((client) => client.env.extraEnv?.HERMES_API_KEY === "reviewer-hermes-secret")).toBe(true);
 
     const workerProfile = JSON.parse(
       await readFile(path.join(clients[0]!.env.hermesHome, ".symphony-hermes-profile.json"), "utf8"),
     ) as { profileKey: string };
     const reviewerProfileKeys = await Promise.all(
-      clients.slice(1).map(async (client) => {
+      clients.slice(2).map(async (client) => {
         const profile = JSON.parse(await readFile(path.join(client.env.hermesHome, ".symphony-hermes-profile.json"), "utf8")) as {
           profileKey: string;
         };
@@ -102,7 +109,7 @@ describe("HermesHarness", () => {
       },
     });
 
-    const reviewerConfig = YAML.parse(await readFile(path.join(clients[1]!.env.hermesHome, "config.yaml"), "utf8")) as Record<
+    const reviewerConfig = YAML.parse(await readFile(path.join(clients[2]!.env.hermesHome, "config.yaml"), "utf8")) as Record<
       string,
       unknown
     >;
@@ -122,7 +129,8 @@ describe("HermesHarness", () => {
     });
 
     await harness.dispose();
-    expect(clients[0]?.killed).toContain("hermes.harness_dispose");
+    expect(clients[0]?.killed).toContain("hermes.run_finished");
+    expect(clients[1]?.killed).toContain("hermes.run_finished");
   });
 
   it("uses managed Hermes auth for openai-codex without injecting API-key credentials", async () => {
@@ -250,7 +258,8 @@ describe("HermesHarness", () => {
     expect(recovered.map((event) => event.type)).toContain("completed");
     expect(clients).toHaveLength(2);
     expect(clients[0]?.requests.filter((request) => request.method === "session.create")).toHaveLength(1);
-    expect(clients[1]?.requests.filter((request) => request.method === "session.create")).toHaveLength(1);
+    expect(clients[1]?.requests.filter((request) => request.method === "session.resume")).toHaveLength(1);
+    expect(clients[1]?.requests.find((request) => request.method === "session.resume")?.params.session_id).toBe("hermes-gw-1");
     expect(clients[1]?.requests.find((request) => request.method === "prompt.submit")?.params.session_id).toBe("gw-2");
     delete process.env.HERMES_TEST_TOKEN;
   });
@@ -279,6 +288,67 @@ describe("HermesHarness", () => {
     expect(second.map((event) => event.type)).toContain("completed");
     expect(clients).toHaveLength(2);
     expect(clients[0]?.requests.filter((request) => request.method === "prompt.submit")).toHaveLength(1);
+    expect(clients[1]?.requests.find((request) => request.method === "session.resume")?.params.session_id).toBe("hermes-gw-1");
+    expect(clients[1]?.requests.find((request) => request.method === "prompt.submit")?.params.session_id).toBe("gw-2");
+  });
+
+  it("persists reusable worker Hermes session keys across harness instances", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const gatewayFactory = (env: HermesGatewayEnvironment) => {
+      const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
+      clients.push(client);
+      return client;
+    };
+
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const firstHarness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
+      gatewayFactory,
+    });
+    const first = await collect(firstHarness.run(context(config, { workspacePath, turnNumber: 1 }), "first worker prompt"));
+    await firstHarness.dispose();
+
+    const secondHarness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
+      gatewayFactory,
+    });
+    const second = await collect(secondHarness.run(context(config, { workspacePath, turnNumber: 2 }), "second worker prompt"));
+
+    expect(first.map((event) => event.type)).toContain("completed");
+    expect(second.map((event) => event.type)).toContain("completed");
+    expect(clients).toHaveLength(2);
+    expect(clients[1]?.requests.find((request) => request.method === "session.resume")?.params.session_id).toBe("hermes-gw-1");
+    expect(clients[1]?.requests.find((request) => request.method === "prompt.submit")?.params.session_id).toBe("gw-2");
+  });
+
+  it("uses the rotated Hermes session key from message.complete on the next reusable worker run", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
+      gatewayFactory: (env) => {
+        const options = clients.length === 0 ? { completedSessionKey: "rotated-hermes-session" } : {};
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, options);
+        clients.push(client);
+        return client;
+      },
+    });
+
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const first = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "first worker prompt"));
+    const second = await collect(harness.run(context(config, { workspacePath, turnNumber: 2 }), "second worker prompt"));
+
+    expect(first.map((event) => event.type)).toContain("completed");
+    expect(second.map((event) => event.type)).toContain("completed");
+    expect(clients[1]?.requests.find((request) => request.method === "session.resume")?.params.session_id).toBe("rotated-hermes-session");
     expect(clients[1]?.requests.find((request) => request.method === "prompt.submit")?.params.session_id).toBe("gw-2");
   });
 
@@ -470,6 +540,7 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
       promptError?: Error;
       providerLimitOnPrompt?: Record<string, unknown>;
       eventsOnPrompt?: GatewayEvent[];
+      completedSessionKey?: string;
     } = {},
   ) {
     super();
@@ -494,7 +565,16 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     if (this.closed) throw new Error("gateway exited (0)");
     this.requests.push({ method, params });
-    if (method === "session.create") return { session_id: this.sessionId } as T;
+    if (method === "session.create") return { session_id: this.sessionId, session_key: `hermes-${this.sessionId}` } as T;
+    if (method === "session.resume") {
+      return {
+        info: { model: "test/model" },
+        message_count: 0,
+        messages: [],
+        resumed: params.session_id,
+        session_id: this.sessionId,
+      } as T;
+    }
     if (method === "prompt.submit") {
       if (this.options.promptError) throw this.options.promptError;
       if (this.options.exitOnPrompt) {
@@ -514,7 +594,11 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
           this.emit("event", {
             type: "message.complete",
             session_id: this.sessionId,
-            payload: { text: "done", usage: { calls: 1, input: 1, output: 2, total: 3 } },
+            payload: {
+              text: "done",
+              usage: { calls: 1, input: 1, output: 2, total: 3 },
+              session_key: this.options.completedSessionKey ?? `hermes-${this.sessionId}`,
+            },
           } satisfies GatewayEvent);
         }
       });
