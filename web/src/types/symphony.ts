@@ -9,6 +9,7 @@ export type RunState =
   | "finished"
   | "error"
   | "cancelled"
+  | "not_live"
   | "expired";
 export type PriorityLevel = 0 | 1 | 2 | 3 | "urgent";
 export type AppTab = "dashboard" | "issues" | "history" | "sidebar" | "states";
@@ -168,7 +169,7 @@ export interface SessionModel {
   id: string;
   issue: string;
   title: string;
-  state: "running" | "finished" | "error" | "cancelled" | "queued";
+  state: "running" | "finished" | "error" | "cancelled" | "queued" | "not_live";
   model: string;
   startedAt: string;
   updatedAt: string;

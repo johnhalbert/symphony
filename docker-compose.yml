@@ -1,0 +1,39 @@
+name: symphony
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${SYMPHONY_POSTGRES_DB:-symphony}
+      POSTGRES_USER: ${SYMPHONY_POSTGRES_USER:-symphony}
+      POSTGRES_PASSWORD: ${SYMPHONY_POSTGRES_PASSWORD:-symphony}
+    ports:
+      - "${SYMPHONY_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - symphony_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    image: node:24-bookworm-slim
+    working_dir: /workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SYMPHONY_POSTGRES_URL: postgresql://${SYMPHONY_POSTGRES_USER:-symphony}:${SYMPHONY_POSTGRES_PASSWORD:-symphony}@postgres:5432/${SYMPHONY_POSTGRES_DB:-symphony}
+    volumes:
+      - .:/workspace:ro
+      - symphony_node_modules:/workspace/node_modules
+      - symphony_npm_cache:/root/.npm
+    command: >
+      sh -lc "npm ci --include=dev && npm run migrations:apply -- WORKFLOW.md"
+    restart: "no"
+
+volumes:
+  symphony_postgres_data:
+  symphony_node_modules:
+  symphony_npm_cache:

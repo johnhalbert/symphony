@@ -47,6 +47,19 @@ body {
   color: var(--pri-urgent);
 }
 
+.resource-frame {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.resource-frame__content {
+  min-height: 0;
+  overflow: hidden;
+}
+
 .dev-switcher {
   display: inline-flex;
   align-items: center;

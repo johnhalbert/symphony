@@ -800,15 +800,15 @@ export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput |
 export function projectWebDashboard(input: DashboardProjectionInput = {}): DashboardModel {
   const board = projectIssueBoardModel(input.board ?? null);
   const runtime = input.runtime ?? null;
+  const hasRuntimeSnapshot = input.runtime !== null && input.runtime !== undefined;
   const runs = input.runs ?? [];
   const lifecycleRecords = input.lifecycleRecords ?? [];
   const activity = projectActivityModels(input.activity ?? null);
   const generatedAt =
     runtime?.generatedAt ?? input.generatedAt ?? board.generatedAt ?? latestDurableActivityAt(runs, lifecycleRecords);
-  const runningAgents = mergeRunningAgents(
-    projectRunningAgents(runtime, generatedAt),
-    projectDurableRunningAgents(runs, generatedAt),
-  );
+  const runningAgents = hasRuntimeSnapshot
+    ? projectRunningAgents(runtime, generatedAt)
+    : projectDurableRunningAgents(runs, generatedAt);
   const concurrencyCap = normalizeConcurrencyCap(input.config?.concurrencyCap);
   return {
     projectName: "Symphony",
@@ -967,20 +967,6 @@ function projectDurableRunningAgents(runs: readonly RunRecord[], generatedAt: st
         tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
       };
     });
-}
-
-function mergeRunningAgents(liveAgents: RunningAgentModel[], durableAgents: RunningAgentModel[]): RunningAgentModel[] {
-  const merged: RunningAgentModel[] = [];
-  const representedAliases = new Set<string>();
-  const addAgent = (agent: RunningAgentModel) => {
-    const aliases = normalizedDashboardAliases([agent.id, agent.issue]);
-    if (aliases.some((alias) => representedAliases.has(alias))) return;
-    for (const alias of aliases) representedAliases.add(alias);
-    merged.push(agent);
-  };
-  for (const agent of liveAgents) addAgent(agent);
-  for (const agent of durableAgents) addAgent(agent);
-  return merged;
 }
 
 export function projectProviderGates(snapshot: RuntimeSnapshot | null | undefined): ProviderGateModel[] {
@@ -1332,7 +1318,7 @@ function normalizeConcurrencyCap(value: number | null | undefined): number {
   return Math.floor(value);
 }
 
-function formatAgentUsageLabel(runningCount: number, concurrencyCap: number): string {
+export function formatAgentUsageLabel(runningCount: number, concurrencyCap: number): string {
   if (concurrencyCap > 0) return `${runningCount}/${concurrencyCap} agents`;
   return `${runningCount} ${runningCount === 1 ? "agent" : "agents"}`;
 }

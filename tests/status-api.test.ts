@@ -708,10 +708,10 @@ describe("StatusServer durable API", () => {
         id: "web-run-1",
         issue: "TEST-1",
         title: "TEST-1",
-        state: "running",
+        state: "not_live",
         model: "claude-sonnet-4",
         msgCount: 1,
-        lastEvent: "TEST-1 run started",
+        lastEvent: "TEST-1 not live",
         toolCount: 0,
         runSession: {
           runId: "web-run-1",
@@ -2211,6 +2211,7 @@ describe("StatusServer durable API", () => {
       const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-ORPHANED`);
       const issueRunsResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-ORPHANED/runs`);
       const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-orphaned`);
+      const webHistoryResponse = await fetch(`${baseUrl}/api/v1/web/history?refresh=1`);
       const dashboardResponse = await fetch(`${baseUrl}/`);
       const stateBody = (await stateResponse.json()) as {
         operatorView: { orphaned: Array<{ runId: string; status: string; tracking: string; controls: { cancel: boolean } }> };
@@ -2226,6 +2227,9 @@ describe("StatusServer durable API", () => {
         }>;
       };
       const runBody = (await runResponse.json()) as { status: string; operatorLiveness: { status: string; tracking: string; rawStatus: string } };
+      const webHistoryBody = (await webHistoryResponse.json()) as {
+        sessions: Array<{ id: string; state: string; lastEvent: string; runSession: { status: string } }>;
+      };
       const html = await dashboardResponse.text();
 
       expect(stateBody.operatorLivenessContract.version).toBe("sdk-run-lifecycle-v2");
@@ -2246,6 +2250,12 @@ describe("StatusServer durable API", () => {
       expect(runBody).toMatchObject({
         status: "running",
         operatorLiveness: { status: "not_live", tracking: "orphaned", rawStatus: "running" },
+      });
+      expect(webHistoryBody.sessions[0]).toMatchObject({
+        id: "run-orphaned",
+        state: "not_live",
+        lastEvent: "TEST-ORPHANED not live",
+        runSession: { status: "running" },
       });
       expect(html).toContain("Not Live Runs");
       expect(html).toContain("TEST-ORPHANED");

@@ -320,23 +320,18 @@ function renderLoadable<T>(
     const content = render(resource.data, resource);
     if (resource.error) {
       return (
-        <>
+        <div className="resource-frame">
           <ResourceStatusBanner
             severity="error"
             title={`Could not refresh ${name}`}
             detail={`${resource.error} Showing previous ${name} data.`}
           />
-          {content}
-        </>
+          <div className="resource-frame__content">{content}</div>
+        </div>
       );
     }
     if (resource.loading) {
-      return (
-        <>
-          <ResourceStatusBanner severity="info" title={`Refreshing ${name}`} detail={`Showing previous ${name} data while Symphony reloads.`} />
-          {content}
-        </>
-      );
+      return content;
     }
     return content;
   }
@@ -452,7 +447,7 @@ function textOrUnavailable(value: string | null | undefined, fallback: string) {
 }
 
 function sessionStateToRunState(state: SessionModel["state"]): RunState {
-  if (state === "finished" || state === "error" || state === "cancelled" || state === "queued" || state === "running") {
+  if (state === "finished" || state === "error" || state === "cancelled" || state === "not_live" || state === "queued" || state === "running") {
     return state;
   }
   return "running";

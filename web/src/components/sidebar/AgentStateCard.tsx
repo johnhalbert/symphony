@@ -11,6 +11,7 @@ const stateConfig: Record<
   finished: { dot: "var(--run-done)", pulseShadow: "none", label: "FINISHED", labelBg: "rgba(127,194,139,0.10)", labelFg: "var(--st-done)" },
   error: { dot: "var(--run-error)", pulseShadow: "0 0 0 3px rgba(226,106,106,0.16)", label: "ERROR", labelBg: "rgba(226,106,106,0.10)", labelFg: "var(--pri-urgent)" },
   cancelled: { dot: "var(--text-3)", pulseShadow: "none", label: "CANCELLED", labelBg: "var(--elevated)", labelFg: "var(--text-3)" },
+  not_live: { dot: "var(--text-3)", pulseShadow: "none", label: "NOT LIVE", labelBg: "var(--elevated)", labelFg: "var(--text-3)" },
   expired: { dot: "var(--text-3)", pulseShadow: "none", label: "EXPIRED", labelBg: "var(--elevated)", labelFg: "var(--text-3)" },
 };
 
@@ -57,7 +58,7 @@ export function AgentStateCard({
           bottom: 0,
           width: 2,
           background: cfg.dot,
-          opacity: state === "cancelled" || state === "expired" ? 0.4 : 1,
+          opacity: state === "cancelled" || state === "not_live" || state === "expired" ? 0.4 : 1,
         }}
       />
 

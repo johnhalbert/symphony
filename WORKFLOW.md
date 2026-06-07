@@ -54,6 +54,13 @@ continuation_context:
   search_enabled: false
   summarization_enabled: false
 
+database:
+  postgres:
+    url: $SYMPHONY_POSTGRES_URL
+    migrations_dir: migrations/postgres
+    migrations_table: symphony_schema_migrations
+    ssl: false
+
 polling:
   interval_ms: 30000
 

@@ -43,6 +43,7 @@ export function StatusBadgeDot({ state }: { state: string }) {
       finished: "var(--run-done)",
       error: "var(--run-error)",
       cancelled: "var(--text-3)",
+      not_live: "var(--text-3)",
       queued: "var(--run-queued)",
     }[state] || "var(--text-3)";
   return (
@@ -67,6 +68,7 @@ export function SessionStateChip({ state }: { state: string }) {
       finished: { cls: "statbadge--finished", label: "FINISHED" },
       error: { cls: "statbadge--error", label: "ERROR" },
       cancelled: { cls: "statbadge--cancelled", label: "CANCELLED" },
+      not_live: { cls: "statbadge--cancelled", label: "NOT LIVE" },
       queued: { cls: "statbadge--creating", label: "QUEUED" },
     }[state] || { cls: "statbadge--pending", label: state.toUpperCase() };
   return (

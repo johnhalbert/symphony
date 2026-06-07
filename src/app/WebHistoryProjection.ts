@@ -5,7 +5,18 @@ import { runKindForPhase } from "../core/types.js";
 
 type PersistedModelParam = { id: string; value: string };
 
-export type WebRunState = "running" | "finished" | "error" | "cancelled" | "queued";
+export type WebRunState = "running" | "finished" | "error" | "cancelled" | "queued" | "not_live";
+
+export interface WebHistoryRuntimeSnapshot {
+  running?: readonly {
+    runId?: string | null;
+    liveness?: { activeRunId?: string | null } | null;
+  }[];
+}
+
+export interface WebHistoryProjectionOptions {
+  runtime?: WebHistoryRuntimeSnapshot | null;
+}
 
 export interface WebRunSessionRuntimeModel {
   model: string | null;
@@ -213,6 +224,7 @@ type RunRecordWithOptionalWebFields = RunRecord & {
 export function projectWebHistory(
   runs: readonly RunRecord[],
   activity: readonly WebHistoryActivityItem[] = [],
+  options: WebHistoryProjectionOptions = {},
 ): HistoryModel {
   const sortedActivity = [...activity].sort(compareHistoryActivityItems);
   const latestActivityByRun = new Map<string, WebHistoryActivityItem>();
@@ -221,7 +233,9 @@ export function projectWebHistory(
     if (runId && !latestActivityByRun.has(runId)) latestActivityByRun.set(runId, item);
   }
 
-  const sessions = [...runs].sort(compareHistoryRuns).map((run) => projectSession(run, latestActivityByRun.get(run.runId)));
+  const sessions = [...runs]
+    .sort(compareHistoryRuns)
+    .map((run) => projectSession(run, latestActivityByRun.get(run.runId), options));
 
   return {
     sessions,
@@ -229,6 +243,25 @@ export function projectWebHistory(
     timeline: sortedActivity.map(projectTimelineEvent),
     defaultSessionId: sessions[0]?.id ?? "",
   };
+}
+
+export function applyWebHistoryRuntimeLiveness(
+  history: HistoryModel,
+  runtime: WebHistoryRuntimeSnapshot | null | undefined,
+): HistoryModel {
+  if (runtime === null || runtime === undefined) return history;
+  let changed = false;
+  const sessions = history.sessions.map((session) => {
+    if (session.state !== "running" && session.runSession.status !== "running") return session;
+    if (isRunLiveInRuntime(session.id, runtime)) return session;
+    changed = true;
+    return {
+      ...session,
+      state: "not_live" as const,
+      lastEvent: notLiveLastEvent(session.issue),
+    };
+  });
+  return changed ? { ...history, sessions } : history;
 }
 
 export function mapRunStatusToWebState(status: RunStatus): Exclude<WebRunState, "queued"> {
@@ -244,17 +277,22 @@ export function mapRunStatusToWebState(status: RunStatus): Exclude<WebRunState, 
   }
 }
 
-function projectSession(run: RunRecord, latestActivity: WebHistoryActivityItem | undefined): SessionModel {
+function projectSession(
+  run: RunRecord,
+  latestActivity: WebHistoryActivityItem | undefined,
+  options: WebHistoryProjectionOptions,
+): SessionModel {
+  const state = mapRunToSessionState(run, options.runtime);
   return {
     id: run.runId,
     issue: run.issueIdentifier,
     title: sessionTitle(run),
-    state: mapRunStatusToWebState(run.status),
+    state,
     model: sessionModel(run),
     startedAt: run.startedAt,
     updatedAt: run.updatedAt,
     msgCount: run.transcriptEventCount ?? 0,
-    lastEvent: latestActivity ? timelineText(latestActivity) : fallbackLastEvent(run),
+    lastEvent: state === "not_live" ? notLiveLastEvent(run.issueIdentifier) : latestActivity ? timelineText(latestActivity) : fallbackLastEvent(run, state),
     toolCount: 0,
     runSession: projectRunSession(run),
   };
@@ -389,9 +427,25 @@ function shouldUseCursorRuntimeFallback(run: RunRecord): boolean {
   );
 }
 
-function fallbackLastEvent(run: RunRecord): string {
+function fallbackLastEvent(run: RunRecord, state: WebRunState = mapRunStatusToWebState(run.status)): string {
   const issue = cleanString(run.issueIdentifier) ?? cleanString(run.issueId) ?? "Run";
-  return issue + " " + mapRunStatusToWebState(run.status);
+  return issue + " " + state;
+}
+
+function mapRunToSessionState(run: RunRecord, runtime: WebHistoryRuntimeSnapshot | null | undefined): WebRunState {
+  if (run.status === "running" && runtime !== null && runtime !== undefined && !isRunLiveInRuntime(run.runId, runtime)) {
+    return "not_live";
+  }
+  return mapRunStatusToWebState(run.status);
+}
+
+function isRunLiveInRuntime(runId: string, runtime: WebHistoryRuntimeSnapshot): boolean {
+  return (runtime.running ?? []).some((row) => row.runId === runId || row.liveness?.activeRunId === runId);
+}
+
+function notLiveLastEvent(issueIdentifier: string | null | undefined): string {
+  const issue = cleanString(issueIdentifier) ?? "Run";
+  return issue + " not live";
 }
 
 function timelineState(item: WebHistoryActivityItem): string | undefined {

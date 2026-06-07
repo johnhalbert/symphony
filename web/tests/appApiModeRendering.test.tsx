@@ -947,16 +947,17 @@ describe("App API-mode rendering", () => {
     expect(markup).not.toContain("dashboard embedded fallback should not render");
   });
 
-  it("labels refreshing API dashboard statusbar data as previous projection data with no live pulse", async () => {
+  it("keeps refreshing API dashboard data usable without a top-level refresh banner", async () => {
     const { markup } = await renderAppWithMocks({
       hooks: appHookState({ dashboard: { data: apiDashboard, loading: true, error: null } }),
     });
 
-    expect(markup).toContain("Refreshing dashboard");
-    expect(markup).toContain("Showing previous dashboard data while Symphony reloads.");
+    expect(markup).not.toContain("Refreshing dashboard");
+    expect(markup).not.toContain("Showing previous dashboard data while Symphony reloads.");
     expect(markup).toContain("refreshing dashboard projection · 2/9 agents");
     expectNoDashboardBodyLiveIndicators(markup, "refreshing dashboard projection · 2/9 agents");
     expect(markup).toContain("api/repo@api-branch");
+    expect(markup).toContain("Symphony · api-branch");
     expectUnavailableButton(markup, "Status totals");
     expectAvailableButton(markup, "Trigger poll");
     expectUnavailableButton(markup, "New issue");

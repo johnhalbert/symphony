@@ -929,6 +929,33 @@ describe("web projection foundation", () => {
     expect(dashboard.agentUsageLabel).toBe("1/2 agents");
   });
 
+  it("treats an empty runtime snapshot as authoritative over stale durable running records", () => {
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      runtime: {
+        generatedAt: "2026-01-01T00:15:00.000Z",
+        running: [],
+        providerGates: [],
+      } as any,
+      runs: [
+        run({
+          runId: "stale-run",
+          issueId: "issue-stale",
+          issueIdentifier: "TEST-STALE",
+          workspaceKey: "TEST-STALE",
+          status: "running",
+          completedAt: null,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:14:00.000Z",
+        }),
+      ],
+      config: { concurrencyCap: 5 },
+    });
+
+    expect(dashboard.runningAgents).toEqual([]);
+    expect(dashboard.agentUsageLabel).toBe("0/5 agents");
+  });
+
   it("composes the web sidebar model directly from dashboard, issue, history, and chat projections", () => {
     const issues = projectWebIssueBoard({
       issues: [

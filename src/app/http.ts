@@ -8,6 +8,9 @@ import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
   projectActivityModels,
+  formatAgentUsageLabel,
+  projectProviderGates,
+  projectRunningAgents,
   projectSessionModel,
   projectTranscriptMessages,
   projectWebDashboard,
@@ -96,7 +99,7 @@ import {
   type OrchestratorChatCommandResultStatus,
 } from "../core/orchestrator/OrchestratorChatCommand.js";
 
-import { projectWebHistory } from "./WebHistoryProjection.js";
+import { applyWebHistoryRuntimeLiveness, projectWebHistory } from "./WebHistoryProjection.js";
 import {
   emptyWebTranscriptProjectionPayload,
   isWebTranscriptProjectionPayload,
@@ -1467,7 +1470,7 @@ export class StatusServer {
         config: this.options.dashboard ?? null,
       });
       const issues = projectWebIssueBoard(board);
-      const history = projectWebHistory(activitySources.runs, historyActivity.activity);
+      const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
       const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
       const sidebar = projectWebSidebar(dashboard, issues, history, chat);
       await this.recordProjectionRebuildEntry(
@@ -1499,7 +1502,7 @@ export class StatusServer {
         query: { issue: null, offset: 0, limit: limits.timelineLimit },
         includeTranscriptEvents: false,
       });
-      const history = projectWebHistory(runs, activityFeed.activity);
+      const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
       await this.recordProjectionRebuildEntry(
         this.webHistoryProjectionWriteInput(history, {
           sourceIndex,
@@ -1968,7 +1971,18 @@ export class StatusServer {
   private async fetchWebDashboard(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebDashboard>>> {
     const durableDashboard = await this.webProjectionRepositories.dashboard.readCurrent({ forceRefresh });
     if (durableDashboard.status === "hit" && durableDashboard.record) {
-      return webProjectionJsonResponse(durableDashboard.record.payload, durableDashboard);
+      const dashboard = durableDashboard.record.payload;
+      const snapshot = this.options.orchestrator.snapshot();
+      const runningAgents = projectRunningAgents(snapshot, snapshot.generatedAt);
+      return webProjectionJsonResponse(
+        {
+          ...dashboard,
+          agentUsageLabel: formatAgentUsageLabel(runningAgents.length, dashboard.concurrencyCap),
+          providerGates: projectProviderGates(snapshot),
+          runningAgents,
+        },
+        durableDashboard,
+      );
     }
 
     if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
@@ -2283,7 +2297,22 @@ export class StatusServer {
   private async fetchWebSidebar(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebSidebar>>> {
     const durableSidebar = await this.webProjectionRepositories.sidebar.readCurrent({ forceRefresh });
     if (durableSidebar.status === "hit" && durableSidebar.record) {
-      return webProjectionJsonResponse(durableSidebar.record.payload, durableSidebar);
+      const sidebar = durableSidebar.record.payload;
+      const snapshot = this.options.orchestrator.snapshot();
+      const runningAgents = projectRunningAgents(snapshot, snapshot.generatedAt);
+      const normalizedHistory = applyWebHistoryRuntimeLiveness(
+        { sessions: sidebar.sessions, transcriptBySession: {}, timeline: [], defaultSessionId: "" },
+        snapshot,
+      );
+      return webProjectionJsonResponse(
+        {
+          ...sidebar,
+          providerGates: projectProviderGates(snapshot),
+          runningAgents,
+          sessions: normalizedHistory.sessions,
+        },
+        durableSidebar,
+      );
     }
 
     if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
@@ -2325,7 +2354,7 @@ export class StatusServer {
       config: this.options.dashboard ?? null,
     });
     const issues = projectWebIssueBoard(board);
-    const history = projectWebHistory(activitySources.runs, historyActivity.activity);
+    const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
     const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
     const sidebar = projectWebSidebar(dashboard, issues, history, chat);
     await this.persistWebSidebarProjection(sidebar, {
@@ -2340,11 +2369,15 @@ export class StatusServer {
     const limits = parseWebHistoryLimits(url);
     const durableHistory = await this.webProjectionRepositories.history.readGlobalCollection(limits, { forceRefresh });
     if (durableHistory.status === "hit" && durableHistory.record) {
-      return webProjectionJsonResponse(durableHistory.record.payload, durableHistory);
+      return webProjectionJsonResponse(
+        applyWebHistoryRuntimeLiveness(durableHistory.record.payload, this.options.orchestrator.snapshot()),
+        durableHistory,
+      );
     }
 
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
+    const snapshot = sourceIndex?.runtime.snapshot ?? this.options.orchestrator.snapshot();
     const activitySources = await this.fetchWebCollectionActivitySources(
       sourceIndex,
       Math.max(limits.sessionLimit, limits.timelineLimit),
@@ -2352,7 +2385,7 @@ export class StatusServer {
     const runs = selectRecentRuns(activitySources.runs, limits.sessionLimit);
     const activityRuns = selectRecentRuns(activitySources.runs, limits.timelineLimit);
     const activityFeed = await buildActivityFeed({
-      generatedAt: sourceIndex?.runtime.snapshot.generatedAt ?? this.options.orchestrator.snapshot().generatedAt,
+      generatedAt: snapshot.generatedAt,
       runStore: this.options.runStore,
       runs: activityRuns,
       lifecycleStore: this.options.lifecycleStore,
@@ -2362,7 +2395,7 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: limits.timelineLimit },
       includeTranscriptEvents: false,
     });
-    const history = projectWebHistory(runs, activityFeed.activity);
+    const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
     await this.persistWebHistoryProjection(history, {
       sourceIndex,
       limits,

@@ -254,6 +254,30 @@ describe("projectWebHistory", () => {
     });
   });
 
+  it("labels persisted running sessions as not_live when absent from the runtime snapshot", () => {
+    const model = projectWebHistory(
+      [
+        run({ runId: "run-live", issueIdentifier: "TEST-LIVE", status: "running" }),
+        run({ runId: "run-orphaned", issueIdentifier: "TEST-ORPHANED", status: "running" }),
+      ],
+      [],
+      {
+        runtime: {
+          running: [{ runId: "run-live" }],
+        },
+      },
+    );
+
+    expect(Object.fromEntries(model.sessions.map((session) => [session.id, session.state]))).toMatchObject({
+      "run-live": "running",
+      "run-orphaned": "not_live",
+    });
+    expect(model.sessions.find((session) => session.id === "run-orphaned")).toMatchObject({
+      lastEvent: "TEST-ORPHANED not live",
+      runSession: { status: "running" },
+    });
+  });
+
   it("returns the empty default history when no run store data is available", () => {
     expect(projectWebHistory([], [])).toEqual({
       sessions: [],
