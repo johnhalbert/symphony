@@ -260,7 +260,19 @@ describe("/api/v1/web route contracts", () => {
       totals: { ...emptyTotals(), progress: 1, open: 1, all: 1, completeness: 0 },
     };
     const history = {
-      sessions: [{ id: "durable-session", title: "Durable session", subtitle: "read model", updatedAt: "2026-05-31T00:00:00.000Z", msgCount: 1, lastEvent: "done", toolCount: 0 }],
+      sessions: [
+        {
+          id: "durable-session",
+          title: "Durable session",
+          subtitle: "read model",
+          updatedAt: "2026-05-31T00:00:00.000Z",
+          msgCount: 1,
+          lastEvent: "done",
+          toolCount: 0,
+          state: "finished",
+          runSession: { status: "succeeded" },
+        },
+      ],
       transcriptBySession: {},
       timeline: [],
       defaultSessionId: "durable-session",
@@ -354,7 +366,7 @@ describe("/api/v1/web route contracts", () => {
     const baseUrl = baseUrlFor(address);
     try {
       const durableDashboard = await getJson(`${baseUrl}/api/v1/web/dashboard`);
-      expect(durableDashboard.body).toEqual(dashboard);
+      expect(durableDashboard.body).toEqual({ ...dashboard, agentUsageLabel: "0/4 agents" });
       expect(durableDashboard.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(durableDashboard.response.headers.get("x-symphony-projection-cache")).toBe("hit");
       expect(durableDashboard.response.headers.get("x-symphony-projection-name")).toBe("dashboard_projection");
@@ -367,6 +379,7 @@ describe("/api/v1/web route contracts", () => {
       expect(durableIssues.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(durableIssues.response.headers.get("x-symphony-projection-name")).toBe("issue_board_projection");
       expect(headerJson(durableIssues.response, "x-symphony-projection-source-freshness")).toEqual(sourceFreshness);
+
       await expect(getJson(`${baseUrl}/api/v1/web/issues/ENG-179`)).resolves.toMatchObject({
         body: { issue: durableIssue, activity: durableIssue.activity, runs: [], transcript: [] },
       });
@@ -395,7 +408,7 @@ describe("/api/v1/web route contracts", () => {
       await server.stop();
     }
 
-    expect(calls.snapshot).toBe(0);
+    expect(calls.snapshot).toBe(3);
     expect(projectionWriter.writes).toEqual([]);
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
       { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
@@ -438,6 +451,8 @@ describe("/api/v1/web route contracts", () => {
       msgCount: 500 + index,
       lastEvent: `large event ${index + 1}`,
       toolCount: index % 7,
+      state: "finished",
+      runSession: { status: "succeeded" },
     }));
     const historyTimeline = Array.from({ length: 250 }, (_, index) => ({
       id: `timeline-large-${index + 1}`,
@@ -583,7 +598,7 @@ describe("/api/v1/web route contracts", () => {
 
     try {
       const durableDashboard = await getJson(`${baseUrl}/api/v1/web/dashboard`);
-      expect(durableDashboard.body).toEqual(dashboard);
+      expect(durableDashboard.body).toEqual({ ...dashboard, agentUsageLabel: "0/72 agents", runningAgents: [] });
       expect((durableDashboard.body as { activity: unknown[] }).activity).toHaveLength(250);
       expectProjectionHeaders(durableDashboard.response, {
         name: "dashboard_projection",
@@ -614,7 +629,7 @@ describe("/api/v1/web route contracts", () => {
       });
 
       const durableSidebar = await getJson(`${baseUrl}/api/v1/web/sidebar`);
-      expect(durableSidebar.body).toEqual(sidebar);
+      expect(durableSidebar.body).toEqual({ ...sidebar, runningAgents: [] });
       expect((durableSidebar.body as { reviewIssues: unknown[] }).reviewIssues).toHaveLength(80);
       expectProjectionHeaders(durableSidebar.response, {
         name: "sidebar_projection",
@@ -640,7 +655,7 @@ describe("/api/v1/web route contracts", () => {
     }
 
     expect(contextBuilds).toBe(0);
-    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(calls).toEqual({ snapshot: 3, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(0);
     expect(projectionWriter.writes).toEqual([]);
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
@@ -930,6 +945,7 @@ describe("/api/v1/web route contracts", () => {
       const issues = await getJson(`${baseUrl}/api/v1/web/issues?refresh=true`);
       expect(issues.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
       expect(issues.body).toMatchObject({ issues: [], lanes: { todo: [], progress: [], review: [] } });
+
 
       const history = await getJson(`${baseUrl}/api/v1/web/history?refresh=true`);
       expect(history.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");

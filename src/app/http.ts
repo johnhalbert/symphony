@@ -1420,12 +1420,14 @@ export class StatusServer {
         query: { issue: null, offset: 0, limit: 20 },
         includeTranscriptEvents: false,
       });
+      const dashboardRuns = sourceIndex?.runs.runs ?? activitySources.runs;
+      const dashboardLifecycleRecords = sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords;
       const dashboard = projectWebDashboard({
-        runtime: snapshot,
+        generatedAt: snapshot.generatedAt,
         board,
         activity,
-        runs: sourceIndex?.runs.runs ?? activitySources.runs,
-        lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
+        runs: dashboardRuns,
+        lifecycleRecords: dashboardLifecycleRecords,
         source: dashboardSourceInputFromSourceIndex(sourceIndex, { activityCount: activity.activity.length }),
         config: this.options.dashboard ?? null,
       });
@@ -1461,16 +1463,18 @@ export class StatusServer {
         includeTranscriptEvents: false,
       });
       const dashboardActivity = previewActivityFeed(historyActivity, 20);
+      const dashboardRuns = sourceIndex?.runs.runs ?? activitySources.runs;
+      const dashboardLifecycleRecords = sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords;
       const dashboard = projectWebDashboard({
-        runtime: snapshot,
+        generatedAt: snapshot.generatedAt,
         board,
         activity: dashboardActivity,
-        runs: sourceIndex?.runs.runs ?? activitySources.runs,
-        lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
+        runs: dashboardRuns,
+        lifecycleRecords: dashboardLifecycleRecords,
         config: this.options.dashboard ?? null,
       });
       const issues = projectWebIssueBoard(board);
-      const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
+      const history = projectWebHistory(activitySources.runs, historyActivity.activity);
       const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
       const sidebar = projectWebSidebar(dashboard, issues, history, chat);
       await this.recordProjectionRebuildEntry(
@@ -1502,7 +1506,7 @@ export class StatusServer {
         query: { issue: null, offset: 0, limit: limits.timelineLimit },
         includeTranscriptEvents: false,
       });
-      const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
+      const history = projectWebHistory(runs, activityFeed.activity);
       await this.recordProjectionRebuildEntry(
         this.webHistoryProjectionWriteInput(history, {
           sourceIndex,
@@ -2014,16 +2018,28 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: 20 },
       includeTranscriptEvents: false,
     });
+    const dashboardRuns = sourceIndex?.runs.runs ?? activitySources.runs;
+    const dashboardLifecycleRecords = sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords;
+    const dashboardSource = dashboardSourceInputFromSourceIndex(sourceIndex, { activityCount: activity.activity.length });
     const dashboard = projectWebDashboard({
       runtime: snapshot,
       board,
       activity,
-      runs: sourceIndex?.runs.runs ?? activitySources.runs,
-      lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
-      source: dashboardSourceInputFromSourceIndex(sourceIndex, { activityCount: activity.activity.length }),
+      runs: dashboardRuns,
+      lifecycleRecords: dashboardLifecycleRecords,
+      source: dashboardSource,
       config: this.options.dashboard ?? null,
     });
-    await this.persistWebDashboardProjection(dashboard, {
+    const persistedDashboard = projectWebDashboard({
+      generatedAt: snapshot.generatedAt,
+      board,
+      activity,
+      runs: dashboardRuns,
+      lifecycleRecords: dashboardLifecycleRecords,
+      source: dashboardSource,
+      config: this.options.dashboard ?? null,
+    });
+    await this.persistWebDashboardProjection(persistedDashboard, {
       sourceIndex,
       activityCount: activity.activity.length,
       issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
@@ -2032,6 +2048,7 @@ export class StatusServer {
   }
 
   private async fetchWebOrchestratorChatMessages(
+
     conversationId?: string | null,
   ): Promise<OrchestratorConversationMessage[]> {
     return selectOrchestratorConversationMessageTail(
@@ -2345,24 +2362,37 @@ export class StatusServer {
       includeTranscriptEvents: false,
     });
     const dashboardActivity = previewActivityFeed(historyActivity, 20);
+    const dashboardRuns = sourceIndex?.runs.runs ?? activitySources.runs;
+    const dashboardLifecycleRecords = sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords;
     const dashboard = projectWebDashboard({
       runtime: snapshot,
       board,
       activity: dashboardActivity,
-      runs: sourceIndex?.runs.runs ?? activitySources.runs,
-      lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
+      runs: dashboardRuns,
+      lifecycleRecords: dashboardLifecycleRecords,
+      config: this.options.dashboard ?? null,
+    });
+    const persistedDashboard = projectWebDashboard({
+      generatedAt: snapshot.generatedAt,
+      board,
+      activity: dashboardActivity,
+      runs: dashboardRuns,
+      lifecycleRecords: dashboardLifecycleRecords,
       config: this.options.dashboard ?? null,
     });
     const issues = projectWebIssueBoard(board);
     const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
+    const persistedHistory = projectWebHistory(activitySources.runs, historyActivity.activity);
     const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
     const sidebar = projectWebSidebar(dashboard, issues, history, chat);
-    await this.persistWebSidebarProjection(sidebar, {
+    const persistedSidebar = projectWebSidebar(persistedDashboard, issues, persistedHistory, chat);
+    await this.persistWebSidebarProjection(persistedSidebar, {
       sourceIndex,
       activityCount: historyActivity.activity.length,
       issueBoardColumns: projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns(),
     });
     return webProjectionJsonResponse(sidebar, durableSidebar);
+
   }
 
   private async fetchWebHistory(forceRefresh: boolean, url: URL): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebHistory>>> {
@@ -2396,7 +2426,8 @@ export class StatusServer {
       includeTranscriptEvents: false,
     });
     const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
-    await this.persistWebHistoryProjection(history, {
+    const persistedHistory = projectWebHistory(runs, activityFeed.activity);
+    await this.persistWebHistoryProjection(persistedHistory, {
       sourceIndex,
       limits,
       activityCount: activityFeed.activity.length,
