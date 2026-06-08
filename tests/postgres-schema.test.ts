@@ -38,6 +38,10 @@ const projectionBuildModesMigrationUrl = new URL(
   "../migrations/postgres/0006_projection_build_modes.sql",
   import.meta.url,
 );
+const projectContextAttributionMigrationUrl = new URL(
+  "../migrations/postgres/0007_project_context_attribution.sql",
+  import.meta.url,
+);
 const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
 const stateOwnershipUrl = new URL("../docs/state-ownership-and-migration.md", import.meta.url);
 const publishedOwnedStateChecksumSha256 = "8e10c03c6cfa34e9672e350c59ff4998459989529a82c98cbd9f714469799298";
@@ -163,17 +167,20 @@ describe("Postgres Symphony-owned state migration", () => {
       "0004_run_activity_canonical_channels",
       "0005_projection_source_freshness",
       "0006_projection_build_modes",
+      "0007_project_context_attribution",
     ]);
     const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
     const projectionFreshness = migrations.find((migration) => migration.id === "0003_projection_freshness_indexes");
     const canonicalChannels = migrations.find((migration) => migration.id === "0004_run_activity_canonical_channels");
     const projectionSourceFreshness = migrations.find((migration) => migration.id === "0005_projection_source_freshness");
     const projectionBuildModes = migrations.find((migration) => migration.id === "0006_projection_build_modes");
+    const projectContextAttribution = migrations.find((migration) => migration.id === "0007_project_context_attribution");
     expect(ownedState?.filePath).toBe(fileURLToPath(ownedStateMigrationUrl));
     expect(projectionFreshness?.filePath).toBe(fileURLToPath(projectionFreshnessMigrationUrl));
     expect(canonicalChannels?.filePath).toBe(fileURLToPath(canonicalChannelMigrationUrl));
     expect(projectionSourceFreshness?.filePath).toBe(fileURLToPath(projectionSourceFreshnessMigrationUrl));
     expect(projectionBuildModes?.filePath).toBe(fileURLToPath(projectionBuildModesMigrationUrl));
+    expect(projectContextAttribution?.filePath).toBe(fileURLToPath(projectContextAttributionMigrationUrl));
     expect(sha256(ownedState?.sql ?? "")).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.checksumSha256).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_session");
@@ -187,6 +194,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(canonicalChannels?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionSourceFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionBuildModes?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+    expect(projectContextAttribution?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
   });
 
   it("delivers projection updated_at columns and freshness indexes through the follow-up migration", async () => {
@@ -245,6 +253,74 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("on symphony.projection_revision (build_mode, projection_name, updated_at desc, generated_at desc)");
   });
 
+  it("reserves owned-state project context attribution columns and collision-safe lookup indexes before the migration is implemented", async () => {
+    const normalized = normalizedSql(await configuredMigrationSql());
+
+    for (const fragment of [
+      "alter table symphony.workspace add column if not exists project_context_id text",
+      "alter table symphony.issue add column if not exists project_context_id text",
+      "alter table symphony.run_session add column if not exists project_context_id text",
+      "alter table symphony.run_session add column if not exists project_context_label text",
+      "alter table symphony.run_session add column if not exists linear_project_identity jsonb",
+      "alter table symphony.run_session add column if not exists codebase_identity jsonb",
+      "alter table symphony.run_session add column if not exists routing_source text",
+      "alter table symphony.writeback_operation add column if not exists project_context_id text",
+      "alter table symphony.approval_request add column if not exists project_context_id text",
+    ]) {
+      expect(normalized, `missing owned-state project context fragment: ${fragment}`).toContain(fragment);
+    }
+
+    for (const fragment of [
+      "on symphony.issue (project_context_id, tracker_source, issue_identifier)",
+      "on symphony.issue (project_context_id, tracker_source, tracker_state, phase, updated_at desc)",
+      "on symphony.issue (project_context_id, phase, blocked_reason, updated_at desc)",
+      "on symphony.run_session (project_context_id, issue_key, status, started_at desc)",
+      "on symphony.run_session (project_context_id, issue_identifier, started_at desc)",
+      "on symphony.run_session (project_context_id, workspace_key, started_at desc)",
+      "on symphony.writeback_operation (project_context_id, status, next_attempt_at, created_at)",
+      "on symphony.writeback_operation (project_context_id, issue_key, created_at desc)",
+      "on symphony.writeback_operation (project_context_id, run_id, created_at desc)",
+      "on symphony.approval_request (project_context_id, status, expires_at, requested_at)",
+      "on symphony.approval_request (project_context_id, issue_key, requested_at desc)",
+      "on symphony.approval_request (project_context_id, run_id, requested_at desc)",
+    ]) {
+      expect(normalized, `missing owned-state project context lookup fragment: ${fragment}`).toContain(fragment);
+    }
+  });
+
+  it("reserves projection project context attribution columns and context-aware read indexes before the migration is implemented", async () => {
+    const normalized = normalizedSql(await configuredMigrationSql());
+
+    for (const table of [
+      "projection_revision",
+      "dashboard_projection",
+      "issue_board_projection",
+      "sidebar_projection",
+      "history_projection",
+      "transcript_projection",
+      "orchestrator_chat_projection",
+    ]) {
+      expect(normalized, `missing projection context column for ${table}`).toContain(
+        `alter table symphony.${table} add column if not exists project_context_id text`,
+      );
+    }
+
+    for (const fragment of [
+      "on symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key, revision desc, updated_at desc, generated_at desc)",
+      "on symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key)",
+      "on symphony.dashboard_projection (project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
+      "on symphony.issue_board_projection (project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
+      "on symphony.sidebar_projection (project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
+      "on symphony.history_projection (project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
+      "on symphony.history_projection (project_context_id, run_id, session_id, revision desc)",
+      "on symphony.transcript_projection (project_context_id, run_id, revision desc, updated_at desc, generated_at desc)",
+      "on symphony.transcript_projection (project_context_id, session_id, revision desc)",
+      "on symphony.orchestrator_chat_projection (project_context_id, scope_key, conversation_key, revision desc, updated_at desc, generated_at desc)",
+      "on symphony.orchestrator_chat_projection (project_context_id, issue_key, revision desc)",
+    ]) {
+      expect(normalized, `missing projection context index fragment: ${fragment}`).toContain(fragment);
+    }
+  });
 
   it("declares all required operational and projection tables", async () => {
     const normalized = normalizedSql(await configuredMigrationSql());
@@ -478,6 +554,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0004_run_activity_canonical_channels",
           "0005_projection_source_freshness",
           "0006_projection_build_modes",
+          "0007_project_context_attribution",
         ]);
 
         const tableCount = await psql(
@@ -541,6 +618,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0004_run_activity_canonical_channels",
           "0005_projection_source_freshness",
           "0006_projection_build_modes",
+          "0007_project_context_attribution",
         ]);
         expect(await appliedMigrationIds(containerName)).toEqual([
           "0001_migration_foundation",
@@ -549,6 +627,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0004_run_activity_canonical_channels",
           "0005_projection_source_freshness",
           "0006_projection_build_modes",
+          "0007_project_context_attribution",
         ]);
         expect(await appliedMigrationChecksum(containerName, "0002_symphony_owned_state")).toBe(
           publishedOwnedStateChecksumSha256,
