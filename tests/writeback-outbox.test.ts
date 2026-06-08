@@ -1,5 +1,5 @@
 import { promises as nodeFs } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -53,6 +53,64 @@ describe("FileWritebackOutboxStore", () => {
     vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
+
+
+  it("normalizes durable project context attribution for new and legacy writebacks", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await store.enqueueOnce({
+      idempotencyKey: "comment:issue-docs-1:note",
+      kind: "comment",
+      issueId: "issue-docs-1",
+      projectContext: docsProjectContext,
+      runId: "run-docs-1",
+      payload: { body: "Docs updated", dedupeKey: "docs-comment" },
+    });
+    await store.enqueueOnce({
+      idempotencyKey: "comment:issue-legacy-1:note",
+      kind: "comment",
+      issueId: "issue-legacy-1",
+      runId: "run-legacy-1",
+      payload: { body: "Legacy note", dedupeKey: "legacy-comment" },
+    });
+
+    const recordsDir = path.join(root, "writeback");
+    for (const entry of await readdir(recordsDir)) {
+      const filePath = path.join(recordsDir, entry);
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+      if (parsed.idempotencyKey === "comment:issue-legacy-1:note") {
+        delete parsed.projectContext;
+        await writeFile(filePath, `${JSON.stringify(parsed, null, 2)}
+`, "utf8");
+      }
+    }
+
+    await expect(store.get("comment:issue-docs-1:note")).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(store.get("comment:issue-legacy-1:note")).resolves.toMatchObject({
+      projectContext: {
+        projectContextId: "default",
+        projectContextLabel: "Default",
+        linearProjectSlug: null,
+        routingSource: "legacy_default",
+      },
+    });
+    await expect(store.list()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ idempotencyKey: "comment:issue-docs-1:note", projectContext: docsProjectContext }),
+        expect.objectContaining({
+          idempotencyKey: "comment:issue-legacy-1:note",
+          projectContext: expect.objectContaining({ projectContextId: "default" }),
+        }),
+      ]),
+    );
+  });
+
 
   it("enqueues idempotently and processes due operations", async () => {
     const store = new FileWritebackOutboxStore(root);

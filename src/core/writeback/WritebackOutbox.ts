@@ -3,6 +3,10 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
+import {
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { latestFreshIssueBreakdownPlan } from "../IssueBreakdownPlanService.js";
 import { mapWithFileReadConcurrency } from "../persistence/FileReadConcurrency.js";
 import type { IssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
@@ -18,6 +22,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "transition";
       issueId: string;
+      projectContext?: ProjectContextResolution;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -34,6 +39,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "comment";
       issueId: string;
+      projectContext?: ProjectContextResolution;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -50,6 +56,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "issue_create";
       issueId: string;
+      projectContext?: ProjectContextResolution;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -77,6 +84,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "issue_relation";
       issueId: string;
+      projectContext?: ProjectContextResolution;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -164,7 +172,7 @@ export class FileWritebackOutboxStore {
     const existing = await this.get(operation.idempotencyKey);
     if (existing) return existing;
     const now = new Date().toISOString();
-    const record = {
+    const record = normalizeWritebackOperation({
       ...operation,
       status: "pending",
       attempt: 0,
@@ -175,7 +183,7 @@ export class FileWritebackOutboxStore {
       resultStatus: null,
       resultMessage: null,
       resultEvidence: null,
-    } as WritebackOperation;
+    } as WritebackOperation);
     await this.write(record);
     this.notifyProjectionChanged();
     return record;
@@ -255,10 +263,11 @@ export class FileWritebackOutboxStore {
 
   async get(idempotencyKey: string): Promise<WritebackOperation | null> {
     const current = await readJsonIfExists<WritebackOperation>(this.recordPath(idempotencyKey));
-    if (current) return current;
+    if (current) return normalizeWritebackOperation(current);
     const legacy = this.legacyRecordPath(idempotencyKey);
     if (legacy === this.recordPath(idempotencyKey)) return null;
-    return readJsonIfExists<WritebackOperation>(legacy);
+    const record = await readJsonIfExists<WritebackOperation>(legacy);
+    return record === null ? null : normalizeWritebackOperation(record);
   }
 
   async list(): Promise<WritebackOperation[]> {
@@ -268,11 +277,11 @@ export class FileWritebackOutboxStore {
       entries.filter((entry) => entry.endsWith(".json")).map((entry) => path.join(this.recordsDir(), entry)),
       (filePath) => readJsonIfExists<WritebackOperation>(filePath),
     );
-    return dedupeWritebackRecords(records.filter((record): record is WritebackOperation => record !== null));
+    return dedupeWritebackRecords(records.filter((record): record is WritebackOperation => record !== null).map(normalizeWritebackOperation));
   }
 
   private async update(record: WritebackOperation, patch: Partial<WritebackOperation>): Promise<WritebackOperation> {
-    const updated = { ...record, ...patch, updatedAt: new Date().toISOString() } as WritebackOperation;
+    const updated = normalizeWritebackOperation({ ...record, ...patch, updatedAt: new Date().toISOString() } as WritebackOperation);
     await this.write(updated);
     this.notifyProjectionChanged();
     return updated;
@@ -563,6 +572,27 @@ function truncateFileSegment(value: string, maxLength: number): string {
   return trimmed.length > 0 ? trimmed : "record";
 }
 
+function normalizeWritebackOperation(record: WritebackOperation): WritebackOperation {
+  return {
+    ...record,
+    projectContext: normalizeProjectContextResolution(record.projectContext),
+  };
+}
+
+function projectContextEquals(
+  left: ProjectContextResolution | undefined,
+  right: ProjectContextResolution | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  return (
+    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
+    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
+    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
+    normalizedLeft.routingSource === normalizedRight.routingSource
+  );
+}
+
 function dedupeWritebackRecords(records: WritebackOperation[]): WritebackOperation[] {
   const byKey = new Map<string, WritebackOperation>();
   for (const record of records) {
@@ -578,6 +608,7 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
   if (record.idempotencyKey !== operation.idempotencyKey || record.kind !== operation.kind || record.issueId !== operation.issueId) {
     return false;
   }
+  if (!projectContextEquals(record.projectContext, operation.projectContext)) return false;
   if (record.runId !== operation.runId) return false;
   if (record.kind === "transition" && operation.kind === "transition") {
     return (

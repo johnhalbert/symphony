@@ -8,40 +8,177 @@ import {
   rawCredentialProfilesSchema,
   type CredentialProfileRegistry,
 } from "./CredentialProfiles.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  buildProjectContextRegistry,
+  defaultProjectContextLabel,
+  normalizeProjectContextId,
+  projectContextMetadataForPublicRead,
+  type NormalizedProjectContext,
+  type ProjectContextConfig,
+  type ProjectContextRegistry,
+} from "./ProjectContexts.js";
 
 const stringArray = z.array(z.string());
 
+const rawTrackerSchema = z
+  .object({
+    kind: z.string().optional(),
+    endpoint: z.string().optional(),
+    api_key: z.string().optional(),
+    project_slug: z.string().optional(),
+    assignee: z.string().optional(),
+    active_states: stringArray.optional(),
+    handoff_states: stringArray.optional(),
+    terminal_states: stringArray.optional(),
+  })
+  .passthrough();
+
+const rawReviewLoopSchema = z
+  .object({
+    review_states: stringArray.optional(),
+    blocked_states: stringArray.optional(),
+    review_pass_state: z.string().optional(),
+    reviewer_prompt: z.string().optional(),
+    reviewer_prompt_extensions: stringArray.optional(),
+    worker_prompt_extensions: stringArray.optional(),
+    max_review_rounds: z.number().int().positive().optional(),
+    max_incomplete_turns: z.number().int().positive().optional(),
+    continuation_history_threshold: z.number().int().nonnegative().optional(),
+    transcript_history_limit: z.number().int().nonnegative().optional(),
+    pr_review_evidence_limit: z.number().int().positive().optional(),
+  })
+  .passthrough();
+
+const rawIssueBreakdownApplyToLinearSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    mode: z.enum(["child_issues"]).optional(),
+  })
+  .passthrough();
+
+const rawIssueBreakdownSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    cursor_mode: z.enum(["agent", "plan"]).optional(),
+    prompt: z.string().optional(),
+    planning_labels: stringArray.optional(),
+    apply_to_linear: rawIssueBreakdownApplyToLinearSchema.optional(),
+    workspace_mode: z.enum(["none", "readonly_checkout"]).optional(),
+    max_planning_failures: z.number().int().positive().optional(),
+    max_planning_dispatch_retries: z.number().int().positive().optional(),
+    planning_retry_base_ms: z.number().int().positive().optional(),
+    planning_retry_max_ms: z.number().int().positive().optional(),
+  })
+  .passthrough();
+
+const rawWorkspaceSourceSchema = z
+  .object({
+    kind: z.enum(["none", "copy", "git", "git_worktree"]).optional(),
+    path: z.string().optional(),
+    repository: z.string().optional(),
+    ref: z.string().optional(),
+    base_ref: z.string().optional(),
+    branch_template: z.string().optional(),
+    cache_path: z.string().optional(),
+    cleanup: z.enum(["refuse_dirty", "force"]).optional(),
+  })
+  .passthrough();
+
+const rawWorkspaceSchema = z
+  .object({
+    root: z.string().optional(),
+    state_dir: z.string().optional(),
+    source: rawWorkspaceSourceSchema.optional(),
+  })
+  .passthrough();
+
+const rawAgentSchema = z
+  .object({
+    harness: z.string().optional(),
+    max_concurrent_agents: z.number().int().positive().optional(),
+    max_turns: z.number().int().positive().optional(),
+    max_retry_backoff_ms: z.number().int().positive().optional(),
+    max_sdk_error_retries: z.number().int().nonnegative().optional(),
+    max_infra_failures: z.number().int().positive().optional(),
+    max_concurrent_agents_by_state: z.record(z.string(), z.number()).optional(),
+    require_labels: stringArray.optional(),
+    exclude_labels: stringArray.optional(),
+    protected_paths: stringArray.optional(),
+  })
+  .passthrough();
+
+const rawGitHubAppSchema = z
+  .object({
+    app_id: z.string().optional(),
+    client_id: z.string().optional(),
+    installation_id: z.string().optional(),
+    private_key: z.string().optional(),
+    private_key_path: z.string().optional(),
+    token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
+  })
+  .passthrough();
+
+const rawGitHubOperatorApprovalSchema = z
+  .object({
+    required_for_publication: z.boolean().optional(),
+    reject_policy: z.enum(["cancel", "fail"]).optional(),
+    poll_interval_ms: z.number().int().positive().optional(),
+    timeout_ms: z.number().int().nonnegative().nullable().optional(),
+  })
+  .passthrough();
+
+const rawGitHubNoCiSchema = z
+  .object({
+    allowed: z.boolean().optional(),
+    evidence: z.string().optional(),
+  })
+  .passthrough();
+
+const rawGitHubPrHandoffSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    target_state: z.string().optional(),
+    allow_drafts: z.boolean().optional(),
+    required_checks: stringArray.optional(),
+    no_ci: rawGitHubNoCiSchema.optional(),
+  })
+  .passthrough();
+
+const rawGitHubSchema = z
+  .object({
+    owner: z.string().optional(),
+    repo: z.string().optional(),
+    token: z.string().optional(),
+    app: rawGitHubAppSchema.optional(),
+    head_owner: z.string().optional(),
+    api_base_url: z.string().optional(),
+    publish_pull_requests: z.boolean().optional(),
+    operator_approval: rawGitHubOperatorApprovalSchema.optional(),
+    pr_handoff: rawGitHubPrHandoffSchema.optional(),
+  })
+  .passthrough();
+
+const rawProjectContextSchema = z
+  .object({
+    id: z.string(),
+    label: z.string().optional(),
+    enabled: z.boolean().optional(),
+    tracker: rawTrackerSchema.optional(),
+    workspace: rawWorkspaceSchema.optional(),
+    github: rawGitHubSchema.optional(),
+    review_loop: rawReviewLoopSchema.optional(),
+    issue_breakdown: rawIssueBreakdownSchema.optional(),
+    agent: rawAgentSchema.optional(),
+    credential_profiles: rawCredentialProfilesSchema.optional(),
+  })
+  .passthrough();
+
 const rawConfigSchema = z
   .object({
-    tracker: z
-      .object({
-        kind: z.string().optional(),
-        endpoint: z.string().optional(),
-        api_key: z.string().optional(),
-        project_slug: z.string().optional(),
-        assignee: z.string().optional(),
-        active_states: stringArray.optional(),
-        handoff_states: stringArray.optional(),
-        terminal_states: stringArray.optional(),
-      })
-      .passthrough()
-      .optional(),
-    review_loop: z
-      .object({
-        review_states: stringArray.optional(),
-        blocked_states: stringArray.optional(),
-        review_pass_state: z.string().optional(),
-        reviewer_prompt: z.string().optional(),
-        reviewer_prompt_extensions: stringArray.optional(),
-        worker_prompt_extensions: stringArray.optional(),
-        max_review_rounds: z.number().int().positive().optional(),
-        max_incomplete_turns: z.number().int().positive().optional(),
-        continuation_history_threshold: z.number().int().nonnegative().optional(),
-        transcript_history_limit: z.number().int().nonnegative().optional(),
-        pr_review_evidence_limit: z.number().int().positive().optional(),
-      })
-      .passthrough()
-      .optional(),
+    tracker: rawTrackerSchema.optional(),
+    review_loop: rawReviewLoopSchema.optional(),
     merge_policy: z
       .object({
         enabled: z.boolean().optional(),
@@ -100,53 +237,14 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
-    issue_breakdown: z
-      .object({
-        enabled: z.boolean().optional(),
-        cursor_mode: z.enum(["agent", "plan"]).optional(),
-        prompt: z.string().optional(),
-        planning_labels: stringArray.optional(),
-        apply_to_linear: z
-          .object({
-            enabled: z.boolean().optional(),
-            mode: z.enum(["child_issues"]).optional(),
-          })
-          .passthrough()
-          .optional(),
-        workspace_mode: z.enum(["none", "readonly_checkout"]).optional(),
-        max_planning_failures: z.number().int().positive().optional(),
-        max_planning_dispatch_retries: z.number().int().positive().optional(),
-        planning_retry_base_ms: z.number().int().positive().optional(),
-        planning_retry_max_ms: z.number().int().positive().optional(),
-      })
-      .passthrough()
-      .optional(),
+    issue_breakdown: rawIssueBreakdownSchema.optional(),
     polling: z
       .object({
         interval_ms: z.number().int().positive().optional(),
       })
       .passthrough()
       .optional(),
-    workspace: z
-      .object({
-        root: z.string().optional(),
-        state_dir: z.string().optional(),
-        source: z
-          .object({
-            kind: z.enum(["none", "copy", "git", "git_worktree"]).optional(),
-            path: z.string().optional(),
-            repository: z.string().optional(),
-            ref: z.string().optional(),
-            base_ref: z.string().optional(),
-            branch_template: z.string().optional(),
-            cache_path: z.string().optional(),
-            cleanup: z.enum(["refuse_dirty", "force"]).optional(),
-          })
-          .passthrough()
-          .optional(),
-      })
-      .passthrough()
-      .optional(),
+    workspace: rawWorkspaceSchema.optional(),
     hooks: z
       .object({
         after_create: z.string().optional(),
@@ -157,21 +255,7 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
-    agent: z
-      .object({
-        harness: z.string().optional(),
-        max_concurrent_agents: z.number().int().positive().optional(),
-        max_turns: z.number().int().positive().optional(),
-        max_retry_backoff_ms: z.number().int().positive().optional(),
-        max_sdk_error_retries: z.number().int().nonnegative().optional(),
-        max_infra_failures: z.number().int().positive().optional(),
-        max_concurrent_agents_by_state: z.record(z.string(), z.number()).optional(),
-        require_labels: stringArray.optional(),
-        exclude_labels: stringArray.optional(),
-        protected_paths: stringArray.optional(),
-      })
-      .passthrough()
-      .optional(),
+    agent: rawAgentSchema.optional(),
     cursor: z
       .object({
         model: z.string().optional(),
@@ -257,58 +341,24 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
-    github: z
-      .object({
-        owner: z.string().optional(),
-        repo: z.string().optional(),
-        token: z.string().optional(),
-        app: z
-          .object({
-            app_id: z.string().optional(),
-            client_id: z.string().optional(),
-            installation_id: z.string().optional(),
-            private_key: z.string().optional(),
-            private_key_path: z.string().optional(),
-            token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
-          })
-          .passthrough()
-          .optional(),
-        head_owner: z.string().optional(),
-        api_base_url: z.string().optional(),
-        publish_pull_requests: z.boolean().optional(),
-        operator_approval: z
-          .object({
-            required_for_publication: z.boolean().optional(),
-            reject_policy: z.enum(["cancel", "fail"]).optional(),
-            poll_interval_ms: z.number().int().positive().optional(),
-            timeout_ms: z.number().int().nonnegative().nullable().optional(),
-          })
-          .passthrough()
-          .optional(),
-        pr_handoff: z
-          .object({
-            enabled: z.boolean().optional(),
-            target_state: z.string().optional(),
-            allow_drafts: z.boolean().optional(),
-            required_checks: stringArray.optional(),
-            no_ci: z
-              .object({
-                allowed: z.boolean().optional(),
-                evidence: z.string().optional(),
-              })
-              .passthrough()
-              .optional(),
-          })
-          .passthrough()
-          .optional(),
-      })
-      .passthrough()
-      .optional(),
+    github: rawGitHubSchema.optional(),
+    project_contexts: z.array(rawProjectContextSchema).min(1).optional(),
     credential_profiles: rawCredentialProfilesSchema.optional(),
   })
   .passthrough();
 
 export type RawWorkflowConfig = z.infer<typeof rawConfigSchema>;
+type RawProjectContextConfig = z.infer<typeof rawProjectContextSchema>;
+
+export type WorkflowProjectContextConfig = ProjectContextConfig<
+  RawWorkflowConfig["tracker"],
+  RawWorkflowConfig["workspace"],
+  RawWorkflowConfig["github"],
+  RawWorkflowConfig["review_loop"],
+  RawWorkflowConfig["issue_breakdown"],
+  RawWorkflowConfig["agent"],
+  RawWorkflowConfig["credential_profiles"]
+>;
 
 export interface TrackerConfig {
   kind: "linear";
@@ -552,6 +602,18 @@ export interface IssueBoardConfig {
   columns: IssueBoardColumnMapping;
 }
 
+export type WorkflowProjectContext = NormalizedProjectContext<
+  TrackerConfig,
+  WorkspaceConfig,
+  GitHubConfig,
+  ReviewLoopConfig,
+  IssueBreakdownConfig,
+  AgentConfig,
+  RawWorkflowConfig["credential_profiles"]
+>;
+
+export type WorkflowProjectContextRegistry = ProjectContextRegistry<WorkflowProjectContext>;
+
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
@@ -575,6 +637,7 @@ export interface ServiceConfig {
   continuationContext: ContinuationContextConfig;
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
+  projectContexts: WorkflowProjectContextRegistry;
   raw: RawWorkflowConfig;
 }
 
@@ -630,96 +693,15 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
 
   const raw = parsed.data;
   const workflowDir = path.dirname(path.resolve(workflowPath));
-  const trackerKind = raw.tracker?.kind ?? "linear";
-  if (trackerKind !== "linear") {
-    throw new SymphonyError("unsupported_tracker_kind", `Unsupported tracker kind: ${trackerKind}`);
-  }
+  const projectContexts = normalizeWorkflowProjectContexts(raw, workflowDir, env);
+  const defaultContext = projectContexts.defaultContext;
+  const tracker = defaultContext.tracker;
+  const workspace = defaultContext.workspace;
+  const github = defaultContext.github;
+  const reviewLoop = defaultContext.reviewLoop;
+  const issueBreakdown = defaultContext.issueBreakdown;
+  const agent = defaultContext.agent;
 
-  const trackerApiKey =
-    resolveConfigString(raw.tracker?.api_key, env) ?? resolveConfigString("$LINEAR_API_KEY", env) ?? "";
-  if (trackerApiKey.length === 0) {
-    throw new SymphonyError("missing_tracker_api_key", "Linear API key is required");
-  }
-
-  const projectSlug = resolveConfigString(raw.tracker?.project_slug, env) ?? "";
-  if (projectSlug.length === 0) {
-    throw new SymphonyError("missing_tracker_project_slug", "Linear project slug is required");
-  }
-  const trackerAssignee =
-    resolveConfigString(raw.tracker?.assignee, env) ?? resolveConfigString("$LINEAR_ASSIGNEE", env) ?? "";
-
-  const workspaceRoot = resolvePathValue(raw.workspace?.root ?? "symphony_workspaces", workflowDir, env);
-  const workspaceStateDir = resolvePathValue(raw.workspace?.state_dir ?? ".symphony", workspaceRoot, env);
-  const sourceKind = raw.workspace?.source?.kind ?? "none";
-  const sourcePath =
-    raw.workspace?.source?.path === undefined
-      ? undefined
-      : resolvePathValue(raw.workspace.source.path, workflowDir, env);
-  const sourceCachePath =
-    raw.workspace?.source?.cache_path === undefined
-      ? undefined
-      : resolvePathValue(raw.workspace.source.cache_path, workflowDir, env);
-  const sourceRepository =
-    raw.workspace?.source?.repository === undefined
-      ? undefined
-      : resolveRepositoryValue(raw.workspace.source.repository, workflowDir, env);
-
-  if (sourceKind === "git_worktree") {
-    if (!raw.workspace?.source?.repository) {
-      throw new SymphonyError("config_validation_error", "workspace.source.repository is required for git_worktree");
-    }
-    if (!raw.workspace?.source?.base_ref) {
-      throw new SymphonyError("config_validation_error", "workspace.source.base_ref is required for git_worktree");
-    }
-  }
-  const issueBreakdownWorkspaceMode = raw.issue_breakdown?.workspace_mode ?? "none";
-  if (issueBreakdownWorkspaceMode === "readonly_checkout") {
-    if (sourceKind !== "git_worktree") {
-      throw new SymphonyError(
-        "config_validation_error",
-        "issue_breakdown.workspace_mode readonly_checkout requires workspace.source.kind git_worktree",
-      );
-    }
-    if (process.platform === "win32") {
-      throw new SymphonyError(
-        "config_validation_error",
-        "issue_breakdown.workspace_mode readonly_checkout is not supported on Windows; use workspace_mode none",
-      );
-    }
-  }
-
-  const workspaceSource: WorkspaceSourceConfig = {
-    kind: sourceKind,
-    ...(sourcePath === undefined ? {} : { path: sourcePath }),
-    ...(sourceRepository === undefined ? {} : { repository: sourceRepository }),
-    ...(raw.workspace?.source?.ref === undefined ? {} : { ref: raw.workspace.source.ref }),
-    ...(raw.workspace?.source?.base_ref === undefined ? {} : { baseRef: raw.workspace.source.base_ref }),
-    ...(raw.workspace?.source?.branch_template === undefined
-      ? {}
-      : { branchTemplate: raw.workspace.source.branch_template }),
-    ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
-    ...(raw.workspace?.source?.cleanup === undefined ? {} : { cleanup: raw.workspace.source.cleanup }),
-  };
-
-  const agentHarness = normalizeAgentHarness(raw.agent?.harness);
-  const agentMaxTurns = raw.agent?.max_turns ?? 20;
-  const activeStates = raw.tracker?.active_states ?? DEFAULT_ACTIVE_STATES;
-  const handoffStates = raw.tracker?.handoff_states ?? [];
-  const terminalStates = raw.tracker?.terminal_states ?? DEFAULT_TERMINAL_STATES;
-  const githubOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.owner, env));
-  const githubRepo = normalizeOptionalConfigString(resolveConfigString(raw.github?.repo, env));
-  const githubToken = normalizeOptionalConfigString(
-    resolveConfigString(raw.github?.token, env) ?? resolveConfigString("$GITHUB_TOKEN", env),
-  );
-  const githubApp = normalizeGitHubAppConfig(raw.github?.app, workflowDir, env);
-  const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
-  const publishPullRequests = raw.github?.publish_pull_requests ?? false;
-  const githubOperatorApproval = {
-    requiredForPublication: raw.github?.operator_approval?.required_for_publication ?? false,
-    rejectPolicy: raw.github?.operator_approval?.reject_policy ?? "cancel",
-    pollIntervalMs: raw.github?.operator_approval?.poll_interval_ms ?? 2_000,
-    timeoutMs: raw.github?.operator_approval?.timeout_ms ?? null,
-  };
   const cursorModel = raw.cursor?.model ?? DEFAULT_CURSOR_MODEL;
   const cursorModelParams = normalizeCursorModelParams(raw.cursor?.model_params);
   const cursorAllowLargeContext = raw.cursor?.allow_large_context ?? false;
@@ -734,7 +716,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       : resolvePathValue(raw.hermes.templates_dir, workflowDir, env);
   const hermesStateDir =
     raw.hermes?.state_dir === undefined
-      ? path.join(workspaceStateDir, "hermes")
+      ? path.join(workspace.stateDir, "hermes")
       : resolvePathValue(raw.hermes.state_dir, workflowDir, env);
   const legacyHermesAcpBinaryPath = normalizeOptionalConfigString(
     resolveConfigString(raw.hermes?.acp_binary_path ?? raw.hermes?.binary_path, env),
@@ -794,68 +776,47 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     env,
     workflowDir,
     fallbacks: {
-      githubToken,
-      linearApiKey: trackerApiKey,
+      githubToken: github.token,
+      linearApiKey: tracker.apiKey,
       cursorRuntimeApiKey,
       openWorkspaceToken: serverOpenWorkspaceToken,
     },
   });
-  const reviewStates = raw.review_loop?.review_states ?? handoffStates;
-  const blockedStates = raw.review_loop?.blocked_states ?? [];
-  const reviewPassState = raw.review_loop?.review_pass_state ?? null;
-  const pullRequestHandoff = normalizePullRequestHandoff(raw, {
-    publishPullRequests,
-    handoffStates,
-    reviewStates,
-  });
-  const mergePolicy = normalizeMergePolicy(raw, reviewPassState);
+  const mergePolicy = normalizeMergePolicy(raw, reviewLoop.reviewPassState);
   validateStateBuckets({
-    activeStates,
-    handoffStates,
-    terminalStates,
-    reviewStates,
-    blockedStates,
-    reviewPassState,
+    activeStates: tracker.activeStates,
+    handoffStates: tracker.handoffStates,
+    terminalStates: tracker.terminalStates,
+    reviewStates: reviewLoop.reviewStates,
+    blockedStates: reviewLoop.blockedStates,
+    reviewPassState: reviewLoop.reviewPassState,
   });
   validatePullRequestHandoffPolicy({
-    publishPullRequests,
-    handoffStates,
-    reviewStates,
-    blockedStates,
-    reviewPassState,
-    prHandoff: pullRequestHandoff,
+    publishPullRequests: github.publishPullRequests,
+    handoffStates: tracker.handoffStates,
+    reviewStates: reviewLoop.reviewStates,
+    blockedStates: reviewLoop.blockedStates,
+    reviewPassState: reviewLoop.reviewPassState,
+    prHandoff: github.prHandoff,
   });
   const issueBoard = normalizeIssueBoardColumns(raw, {
-    activeStates,
-    handoffStates,
-    terminalStates,
-    reviewStates,
-    blockedStates,
-    reviewPassState,
+    activeStates: tracker.activeStates,
+    handoffStates: tracker.handoffStates,
+    terminalStates: tracker.terminalStates,
+    reviewStates: reviewLoop.reviewStates,
+    blockedStates: reviewLoop.blockedStates,
+    reviewPassState: reviewLoop.reviewPassState,
     mergePolicy,
   });
 
   return {
     workflowPath: path.resolve(workflowPath),
     workflowDir,
-    tracker: {
-      kind: "linear",
-      endpoint: raw.tracker?.endpoint ?? "https://api.linear.app/graphql",
-      apiKey: trackerApiKey,
-      projectSlug,
-      assignee: trackerAssignee.length === 0 ? null : trackerAssignee,
-      activeStates,
-      handoffStates,
-      terminalStates,
-    },
+    tracker,
     polling: {
       intervalMs: raw.polling?.interval_ms ?? 30_000,
     },
-    workspace: {
-      root: workspaceRoot,
-      stateDir: workspaceStateDir,
-      source: workspaceSource,
-    },
+    workspace,
     hooks: {
       afterCreate: raw.hooks?.after_create ?? null,
       beforeRun: raw.hooks?.before_run ?? null,
@@ -863,18 +824,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       beforeRemove: raw.hooks?.before_remove ?? null,
       timeoutMs: raw.hooks?.timeout_ms ?? 60_000,
     },
-    agent: {
-      harness: agentHarness,
-      maxConcurrentAgents: raw.agent?.max_concurrent_agents ?? 10,
-      maxTurns: agentMaxTurns,
-      maxRetryBackoffMs: raw.agent?.max_retry_backoff_ms ?? 300_000,
-      maxSdkErrorRetries: raw.agent?.max_sdk_error_retries ?? 2,
-      maxInfraFailures: raw.agent?.max_infra_failures ?? 3,
-      maxConcurrentAgentsByState: normalizeStateLimitMap(raw.agent?.max_concurrent_agents_by_state),
-      requireLabels: normalizeLabels(raw.agent?.require_labels),
-      excludeLabels: normalizeLabels(raw.agent?.exclude_labels),
-      protectedPaths: raw.agent?.protected_paths ?? [],
-    },
+    agent,
     cursor: {
       model: cursorModel,
       mode: raw.cursor?.mode ?? null,
@@ -935,31 +885,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       dispatchState: raw.writeback?.dispatch_state ?? "In Progress",
       maxBackoffMs: raw.writeback?.max_backoff_ms ?? 300_000,
     },
-    github: {
-      owner: githubOwner,
-      repo: githubRepo,
-      token: githubToken,
-      app: githubApp,
-      headOwner: githubHeadOwner,
-      apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
-      publishPullRequests,
-      operatorApproval: githubOperatorApproval,
-      prHandoff: pullRequestHandoff,
-    },
+    github,
     credentialProfiles,
-    reviewLoop: {
-      reviewStates,
-      blockedStates,
-      reviewPassState,
-      reviewerPromptTemplate: raw.review_loop?.reviewer_prompt ?? null,
-      reviewerPromptExtensions: normalizePromptExtensions(raw.review_loop?.reviewer_prompt_extensions),
-      workerPromptExtensions: normalizePromptExtensions(raw.review_loop?.worker_prompt_extensions),
-      maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
-      maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
-      continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
-      transcriptHistoryLimit: raw.review_loop?.transcript_history_limit ?? raw.review_loop?.continuation_history_threshold ?? 5,
-      prReviewEvidenceLimit: raw.review_loop?.pr_review_evidence_limit ?? 5,
-    },
+    reviewLoop,
     mergePolicy,
     issueBoard: {
       columns: issueBoard,
@@ -969,24 +897,483 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
     },
     database,
-    issueBreakdown: {
-      enabled: raw.issue_breakdown?.enabled ?? false,
-      cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
-      promptTemplate: raw.issue_breakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
-      planningLabels: normalizeLabels(raw.issue_breakdown?.planning_labels),
-      applyToLinear: {
-        enabled: raw.issue_breakdown?.apply_to_linear?.enabled ?? false,
-        mode: raw.issue_breakdown?.apply_to_linear?.mode ?? "child_issues",
-      },
-      workspaceMode: issueBreakdownWorkspaceMode,
-      maxPlanningFailures: raw.issue_breakdown?.max_planning_failures ?? 3,
-      maxPlanningDispatchRetries:
-        raw.issue_breakdown?.max_planning_dispatch_retries ?? raw.issue_breakdown?.max_planning_failures ?? 3,
-      planningRetryBaseMs: raw.issue_breakdown?.planning_retry_base_ms ?? 5_000,
-      planningRetryMaxMs: raw.issue_breakdown?.planning_retry_max_ms ?? 60_000,
-    },
+    issueBreakdown,
+    projectContexts,
     raw,
   };
+}
+
+function normalizeWorkflowProjectContexts(
+  raw: RawWorkflowConfig,
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+): WorkflowProjectContextRegistry {
+  const defaults: WorkflowProjectContextConfig = {
+    id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+    tracker: raw.tracker,
+    workspace: raw.workspace,
+    github: raw.github,
+    review_loop: raw.review_loop,
+    issue_breakdown: raw.issue_breakdown,
+    agent: raw.agent,
+    credential_profiles: raw.credential_profiles,
+  };
+
+  const contexts =
+    raw.project_contexts?.map((context) =>
+      normalizeWorkflowProjectContext(context, defaults, workflowDir, env, { requireExplicitWorkspaceSource: true }),
+    ) ?? [normalizeLegacyWorkflowProjectContext(defaults, workflowDir, env)];
+
+  try {
+    return buildProjectContextRegistry(contexts);
+  } catch (error) {
+    throw new SymphonyError(
+      "config_validation_error",
+      error instanceof Error ? error.message : "Project contexts are invalid",
+    );
+  }
+}
+
+function normalizeLegacyWorkflowProjectContext(
+  defaults: WorkflowProjectContextConfig,
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+): WorkflowProjectContext {
+  return normalizeWorkflowProjectContext(
+    {
+      id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      enabled: true,
+      tracker: defaults.tracker,
+      workspace: defaults.workspace,
+      github: defaults.github,
+      review_loop: defaults.review_loop,
+      issue_breakdown: defaults.issue_breakdown,
+      agent: defaults.agent,
+      credential_profiles: defaults.credential_profiles,
+    },
+    {},
+    workflowDir,
+    env,
+    { requireExplicitWorkspaceSource: false },
+  );
+}
+
+function normalizeWorkflowProjectContext(
+  rawContext: RawProjectContextConfig,
+  defaults: Partial<WorkflowProjectContextConfig>,
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+  options: { requireExplicitWorkspaceSource: boolean },
+): WorkflowProjectContext {
+  const contextPath = `project_contexts[${JSON.stringify(rawContext.id)}]`;
+  let id: string;
+  try {
+    id = normalizeProjectContextId(rawContext.id);
+  } catch (error) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${contextPath}.id must contain at least one letter or number after normalization`,
+      { cause: error instanceof Error ? error.message : String(error) },
+    );
+  }
+
+  const enabled = rawContext.enabled ?? true;
+  const label = normalizeOptionalConfigString(rawContext.label) ?? defaultProjectContextLabel(id);
+  const merged = mergeWorkflowProjectContextDefaults(defaults, rawContext);
+  const tracker = normalizeTrackerConfigForProjectContext(merged.tracker, env, { enabled, contextPath });
+  const workspace = normalizeWorkspaceConfigForProjectContext(merged.workspace, workflowDir, env, {
+    enabled,
+    contextPath,
+    requireExplicitWorkspaceSource: options.requireExplicitWorkspaceSource,
+  });
+  const reviewLoop = normalizeReviewLoopConfigForProjectContext(merged.review_loop, tracker);
+  const github = normalizeGitHubConfigForProjectContext(
+    merged.github,
+    workflowDir,
+    env,
+    tracker.handoffStates,
+    reviewLoop.reviewStates,
+  );
+  const issueBreakdown = normalizeIssueBreakdownConfigForProjectContext(
+    merged.issue_breakdown,
+    workspace.source.kind,
+    contextPath,
+  );
+  const agent = normalizeAgentConfigForProjectContext(merged.agent);
+
+  if (enabled) {
+    validateStateBuckets({
+      activeStates: tracker.activeStates,
+      handoffStates: tracker.handoffStates,
+      terminalStates: tracker.terminalStates,
+      reviewStates: reviewLoop.reviewStates,
+      blockedStates: reviewLoop.blockedStates,
+      reviewPassState: reviewLoop.reviewPassState,
+    });
+    validatePullRequestHandoffPolicy({
+      publishPullRequests: github.publishPullRequests,
+      handoffStates: tracker.handoffStates,
+      reviewStates: reviewLoop.reviewStates,
+      blockedStates: reviewLoop.blockedStates,
+      reviewPassState: reviewLoop.reviewPassState,
+      prHandoff: github.prHandoff,
+    });
+  }
+
+  return {
+    id,
+    label,
+    enabled,
+    tracker,
+    workspace,
+    github,
+    reviewLoop,
+    issueBreakdown,
+    agent,
+    credentialProfiles: merged.credential_profiles,
+    publicMetadata: projectContextMetadataForPublicRead({ id, label, enabled, tracker, workspace }),
+  };
+}
+
+function mergeWorkflowProjectContextDefaults(
+  defaults: Partial<WorkflowProjectContextConfig>,
+  context: RawProjectContextConfig,
+): WorkflowProjectContextConfig {
+  const tracker = mergeConfigObjects(defaults.tracker, context.tracker);
+  const workspace = mergeWorkspaceDefaults(defaults.workspace, context.workspace);
+  const github = mergeGitHubDefaults(defaults.github, context.github);
+  const reviewLoop = mergeConfigObjects(defaults.review_loop, context.review_loop);
+  const issueBreakdown = mergeIssueBreakdownDefaults(defaults.issue_breakdown, context.issue_breakdown);
+  const agent = mergeAgentDefaults(defaults.agent, context.agent);
+  const credentialProfiles = context.credential_profiles ?? defaults.credential_profiles;
+
+  return {
+    id: context.id,
+    ...(context.label === undefined ? {} : { label: context.label }),
+    ...(context.enabled === undefined ? {} : { enabled: context.enabled }),
+    ...(tracker === undefined ? {} : { tracker }),
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(github === undefined ? {} : { github }),
+    ...(reviewLoop === undefined ? {} : { review_loop: reviewLoop }),
+    ...(issueBreakdown === undefined ? {} : { issue_breakdown: issueBreakdown }),
+    ...(agent === undefined ? {} : { agent }),
+    ...(credentialProfiles === undefined ? {} : { credential_profiles: credentialProfiles }),
+  };
+}
+
+function normalizeTrackerConfigForProjectContext(
+  rawTracker: RawWorkflowConfig["tracker"],
+  env: NodeJS.ProcessEnv,
+  options: { enabled: boolean; contextPath: string },
+): TrackerConfig {
+  const trackerKind = rawTracker?.kind ?? "linear";
+  if (trackerKind !== "linear") {
+    throw new SymphonyError(
+      "unsupported_tracker_kind",
+      `${options.contextPath}.tracker.kind must be linear; received ${trackerKind}`,
+    );
+  }
+
+  const apiKey = normalizeOptionalConfigString(
+    resolveConfigString(rawTracker?.api_key, env) ?? resolveConfigString("$LINEAR_API_KEY", env),
+  );
+  if (options.enabled && apiKey === null) {
+    throw new SymphonyError("missing_tracker_api_key", `${options.contextPath}.tracker.api_key is required`);
+  }
+
+  const projectSlug = normalizeOptionalConfigString(resolveConfigString(rawTracker?.project_slug, env));
+  if (options.enabled && projectSlug === null) {
+    throw new SymphonyError("missing_tracker_project_slug", `${options.contextPath}.tracker.project_slug is required`);
+  }
+
+  return {
+    kind: "linear",
+    endpoint: rawTracker?.endpoint ?? "https://api.linear.app/graphql",
+    apiKey: apiKey ?? "",
+    projectSlug: projectSlug ?? "",
+    assignee:
+      normalizeOptionalConfigString(resolveConfigString(rawTracker?.assignee, env)) ??
+      normalizeOptionalConfigString(resolveConfigString("$LINEAR_ASSIGNEE", env)),
+    activeStates: rawTracker?.active_states ?? DEFAULT_ACTIVE_STATES,
+    handoffStates: rawTracker?.handoff_states ?? [],
+    terminalStates: rawTracker?.terminal_states ?? DEFAULT_TERMINAL_STATES,
+  };
+}
+
+function normalizeWorkspaceConfigForProjectContext(
+  rawWorkspace: RawWorkflowConfig["workspace"],
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+  options: { enabled: boolean; contextPath: string; requireExplicitWorkspaceSource: boolean },
+): WorkspaceConfig {
+  const root = resolvePathValue(rawWorkspace?.root ?? "symphony_workspaces", workflowDir, env);
+  const stateDir = resolvePathValue(rawWorkspace?.state_dir ?? ".symphony", root, env);
+  const sourceKind = rawWorkspace?.source?.kind ?? "none";
+  const sourcePath =
+    rawWorkspace?.source?.path === undefined
+      ? undefined
+      : resolvePathValue(rawWorkspace.source.path, workflowDir, env);
+  const sourceCachePath =
+    rawWorkspace?.source?.cache_path === undefined
+      ? undefined
+      : resolvePathValue(rawWorkspace.source.cache_path, workflowDir, env);
+  const sourceRepository =
+    rawWorkspace?.source?.repository === undefined
+      ? undefined
+      : resolveRepositoryValue(rawWorkspace.source.repository, workflowDir, env);
+
+  if (options.enabled && options.requireExplicitWorkspaceSource && sourceKind === "none") {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${options.contextPath}.workspace.source is required for enabled project contexts`,
+    );
+  }
+  if (options.enabled && sourceKind === "git_worktree") {
+    if (!rawWorkspace?.source?.repository) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `${options.contextPath}.workspace.source.repository is required for git_worktree`,
+      );
+    }
+    if (!rawWorkspace?.source?.base_ref) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `${options.contextPath}.workspace.source.base_ref is required for git_worktree`,
+      );
+    }
+  }
+
+  return {
+    root,
+    stateDir,
+    source: {
+      kind: sourceKind,
+      ...(sourcePath === undefined ? {} : { path: sourcePath }),
+      ...(sourceRepository === undefined ? {} : { repository: sourceRepository }),
+      ...(rawWorkspace?.source?.ref === undefined ? {} : { ref: rawWorkspace.source.ref }),
+      ...(rawWorkspace?.source?.base_ref === undefined ? {} : { baseRef: rawWorkspace.source.base_ref }),
+      ...(rawWorkspace?.source?.branch_template === undefined
+        ? {}
+        : { branchTemplate: rawWorkspace.source.branch_template }),
+      ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
+      ...(rawWorkspace?.source?.cleanup === undefined ? {} : { cleanup: rawWorkspace.source.cleanup }),
+    },
+  };
+}
+
+function normalizeGitHubConfigForProjectContext(
+  rawGithub: RawWorkflowConfig["github"],
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+  handoffStates: string[],
+  reviewStates: string[],
+): GitHubConfig {
+  const owner = normalizeOptionalConfigString(resolveConfigString(rawGithub?.owner, env));
+  const repo = normalizeOptionalConfigString(resolveConfigString(rawGithub?.repo, env));
+  const token = normalizeOptionalConfigString(
+    resolveConfigString(rawGithub?.token, env) ?? resolveConfigString("$GITHUB_TOKEN", env),
+  );
+  const app = normalizeGitHubAppConfig(rawGithub?.app, workflowDir, env);
+  const headOwner = normalizeOptionalConfigString(resolveConfigString(rawGithub?.head_owner, env)) ?? owner;
+  const publishPullRequests = rawGithub?.publish_pull_requests ?? false;
+
+  return {
+    owner,
+    repo,
+    token,
+    app,
+    headOwner,
+    apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(rawGithub?.api_base_url, env)) ?? "https://api.github.com",
+    publishPullRequests,
+    operatorApproval: {
+      requiredForPublication: rawGithub?.operator_approval?.required_for_publication ?? false,
+      rejectPolicy: rawGithub?.operator_approval?.reject_policy ?? "cancel",
+      pollIntervalMs: rawGithub?.operator_approval?.poll_interval_ms ?? 2_000,
+      timeoutMs: rawGithub?.operator_approval?.timeout_ms ?? null,
+    },
+    prHandoff: normalizePullRequestHandoff(
+      { github: rawGithub } as RawWorkflowConfig,
+      { publishPullRequests, handoffStates, reviewStates },
+    ),
+  };
+}
+
+function normalizeReviewLoopConfigForProjectContext(
+  rawReviewLoop: RawWorkflowConfig["review_loop"],
+  tracker: TrackerConfig,
+): ReviewLoopConfig {
+  const reviewStates = rawReviewLoop?.review_states ?? tracker.handoffStates;
+  return {
+    reviewStates,
+    blockedStates: rawReviewLoop?.blocked_states ?? [],
+    reviewPassState: rawReviewLoop?.review_pass_state ?? null,
+    reviewerPromptTemplate: rawReviewLoop?.reviewer_prompt ?? null,
+    reviewerPromptExtensions: normalizePromptExtensions(rawReviewLoop?.reviewer_prompt_extensions),
+    workerPromptExtensions: normalizePromptExtensions(rawReviewLoop?.worker_prompt_extensions),
+    maxReviewRounds: rawReviewLoop?.max_review_rounds ?? 3,
+    maxIncompleteTurns: rawReviewLoop?.max_incomplete_turns ?? 3,
+    continuationHistoryThreshold: rawReviewLoop?.continuation_history_threshold ?? 5,
+    transcriptHistoryLimit:
+      rawReviewLoop?.transcript_history_limit ?? rawReviewLoop?.continuation_history_threshold ?? 5,
+    prReviewEvidenceLimit: rawReviewLoop?.pr_review_evidence_limit ?? 5,
+  };
+}
+
+function normalizeIssueBreakdownConfigForProjectContext(
+  rawIssueBreakdown: RawWorkflowConfig["issue_breakdown"],
+  sourceKind: WorkspaceSourceConfig["kind"],
+  contextPath: string,
+): IssueBreakdownConfig {
+  const workspaceMode = rawIssueBreakdown?.workspace_mode ?? "none";
+  if (workspaceMode === "readonly_checkout") {
+    if (sourceKind !== "git_worktree") {
+      throw new SymphonyError(
+        "config_validation_error",
+        `${contextPath}.issue_breakdown.workspace_mode readonly_checkout requires workspace.source.kind git_worktree`,
+      );
+    }
+    if (process.platform === "win32") {
+      throw new SymphonyError(
+        "config_validation_error",
+        "issue_breakdown.workspace_mode readonly_checkout is not supported on Windows; use workspace_mode none",
+      );
+    }
+  }
+
+  return {
+    enabled: rawIssueBreakdown?.enabled ?? false,
+    cursorMode: rawIssueBreakdown?.cursor_mode ?? "plan",
+    promptTemplate: rawIssueBreakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
+    planningLabels: normalizeLabels(rawIssueBreakdown?.planning_labels),
+    applyToLinear: {
+      enabled: rawIssueBreakdown?.apply_to_linear?.enabled ?? false,
+      mode: rawIssueBreakdown?.apply_to_linear?.mode ?? "child_issues",
+    },
+    workspaceMode,
+    maxPlanningFailures: rawIssueBreakdown?.max_planning_failures ?? 3,
+    maxPlanningDispatchRetries:
+      rawIssueBreakdown?.max_planning_dispatch_retries ?? rawIssueBreakdown?.max_planning_failures ?? 3,
+    planningRetryBaseMs: rawIssueBreakdown?.planning_retry_base_ms ?? 5_000,
+    planningRetryMaxMs: rawIssueBreakdown?.planning_retry_max_ms ?? 60_000,
+  };
+}
+
+function normalizeAgentConfigForProjectContext(rawAgent: RawWorkflowConfig["agent"]): AgentConfig {
+  return {
+    harness: normalizeAgentHarness(rawAgent?.harness),
+    maxConcurrentAgents: rawAgent?.max_concurrent_agents ?? 10,
+    maxTurns: rawAgent?.max_turns ?? 20,
+    maxRetryBackoffMs: rawAgent?.max_retry_backoff_ms ?? 300_000,
+    maxSdkErrorRetries: rawAgent?.max_sdk_error_retries ?? 2,
+    maxInfraFailures: rawAgent?.max_infra_failures ?? 3,
+    maxConcurrentAgentsByState: normalizeStateLimitMap(rawAgent?.max_concurrent_agents_by_state),
+    requireLabels: normalizeLabels(rawAgent?.require_labels),
+    excludeLabels: normalizeLabels(rawAgent?.exclude_labels),
+    protectedPaths: rawAgent?.protected_paths ?? [],
+  };
+}
+
+function mergeWorkspaceDefaults(
+  base: RawWorkflowConfig["workspace"] | undefined,
+  override: RawProjectContextConfig["workspace"] | undefined,
+): RawWorkflowConfig["workspace"] | undefined {
+  if (!base && !override) return undefined;
+  return {
+    ...base,
+    ...override,
+    source:
+      base?.source === undefined && override?.source === undefined
+        ? undefined
+        : {
+            ...base?.source,
+            ...override?.source,
+          },
+  };
+}
+
+function mergeGitHubDefaults(
+  base: RawWorkflowConfig["github"] | undefined,
+  override: RawProjectContextConfig["github"] | undefined,
+): RawWorkflowConfig["github"] | undefined {
+  if (!base && !override) return undefined;
+  return {
+    ...base,
+    ...override,
+    app:
+      base?.app === undefined && override?.app === undefined
+        ? undefined
+        : {
+            ...base?.app,
+            ...override?.app,
+          },
+    operator_approval:
+      base?.operator_approval === undefined && override?.operator_approval === undefined
+        ? undefined
+        : {
+            ...base?.operator_approval,
+            ...override?.operator_approval,
+          },
+    pr_handoff:
+      base?.pr_handoff === undefined && override?.pr_handoff === undefined
+        ? undefined
+        : {
+            ...base?.pr_handoff,
+            ...override?.pr_handoff,
+            no_ci:
+              base?.pr_handoff?.no_ci === undefined && override?.pr_handoff?.no_ci === undefined
+                ? undefined
+                : {
+                    ...base?.pr_handoff?.no_ci,
+                    ...override?.pr_handoff?.no_ci,
+                  },
+          },
+  };
+}
+
+function mergeIssueBreakdownDefaults(
+  base: RawWorkflowConfig["issue_breakdown"] | undefined,
+  override: RawProjectContextConfig["issue_breakdown"] | undefined,
+): RawWorkflowConfig["issue_breakdown"] | undefined {
+  if (!base && !override) return undefined;
+  return {
+    ...base,
+    ...override,
+    apply_to_linear:
+      base?.apply_to_linear === undefined && override?.apply_to_linear === undefined
+        ? undefined
+        : {
+            ...base?.apply_to_linear,
+            ...override?.apply_to_linear,
+          },
+  };
+}
+
+function mergeAgentDefaults(
+  base: RawWorkflowConfig["agent"] | undefined,
+  override: RawProjectContextConfig["agent"] | undefined,
+): RawWorkflowConfig["agent"] | undefined {
+  if (!base && !override) return undefined;
+  return {
+    ...base,
+    ...override,
+    max_concurrent_agents_by_state:
+      base?.max_concurrent_agents_by_state === undefined && override?.max_concurrent_agents_by_state === undefined
+        ? undefined
+        : {
+            ...base?.max_concurrent_agents_by_state,
+            ...override?.max_concurrent_agents_by_state,
+          },
+  };
+}
+
+function mergeConfigObjects<T extends Record<string, unknown> | undefined>(base: T, override: T): T {
+  if (!base && !override) return undefined as T;
+  return {
+    ...(base ?? {}),
+    ...(override ?? {}),
+  } as T;
 }
 
 export function resolveConfigString(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {

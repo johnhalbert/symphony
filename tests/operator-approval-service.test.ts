@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -34,6 +34,12 @@ describe("OperatorApprovalService", () => {
       role: "worker",
       issueId: "issue-1",
       issueIdentifier: "TEST-1",
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
       attempt: null,
       turnNumber: 1,
       prompt: "work",
@@ -64,6 +70,12 @@ describe("OperatorApprovalService", () => {
     expect(transcript.events[0]?.payload).toMatchObject({
       requestId: pending.requestId,
       action: { kind: "push_and_pr", branchName: "symphony/TEST-1" },
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
       resolve: { method: "POST", header: "X-Symphony-Token" },
     });
     await expect(runStore.getRun("run-1")).resolves.toMatchObject({ pendingApprovalRequestId: null });
@@ -131,6 +143,67 @@ describe("OperatorApprovalService", () => {
     await expect(wait).resolves.toMatchObject({ status: "approved" });
     await expect(store.get(pending.requestId)).resolves.toMatchObject({ status: "approved" });
   });
+
+
+  it("derives project context from the run and backfills legacy approval records", async () => {
+    const pending = await service.requestPublicationApproval({ ...request(), evidenceCursor: "idem-project-context" });
+    expect(pending).toMatchObject({
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+    });
+
+    const transcript = await runStore.readTranscript("run-1");
+    expect(transcript.events[0]?.payload).toMatchObject({
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+    });
+
+    const approvalDir = path.join(config.workspace.stateDir, "approval-requests");
+    await mkdir(approvalDir, { recursive: true });
+    await writeFile(
+      path.join(approvalDir, "approval_legacy.json"),
+      `${JSON.stringify(
+        {
+          requestId: "approval_legacy",
+          status: "pending",
+          issueId: "issue-legacy-1",
+          issueIdentifier: "LEGACY-1",
+          runId: "run-1",
+          evidenceCursor: "legacy-cursor",
+          dedupeKey: "run-1:legacy-cursor:push_and_pr",
+          action: action(),
+          requestedAt: "2026-01-01T00:00:00.000Z",
+          expiresAt: null,
+          resolvedAt: null,
+          resolvedBy: null,
+          decision: null,
+          staleReason: null,
+        },
+        null,
+        2,
+      )}
+`,
+      "utf8",
+    );
+
+    await expect(store.get("approval_legacy")).resolves.toMatchObject({
+      projectContext: {
+        projectContextId: "default",
+        projectContextLabel: "Default",
+        linearProjectSlug: null,
+        routingSource: "legacy_default",
+      },
+    });
+  });
+
 
   async function waitForPending() {
     for (let attempt = 0; attempt < 100; attempt += 1) {

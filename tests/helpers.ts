@@ -66,6 +66,7 @@ export type TestProjectRoutingSource =
   | "replay";
 
 export interface TestProjectContextFixture {
+  [key: string]: unknown;
   id: string;
   label?: string;
   enabled?: boolean;

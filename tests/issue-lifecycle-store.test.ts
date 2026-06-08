@@ -257,6 +257,117 @@ describe("FileIssueLifecycleStore", () => {
     });
   });
 
+
+  it("backfills and propagates durable project context attribution", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await store.ensureIssue(issue(), {
+      projectContext: docsProjectContext,
+      lastCompletionReportId: "report-1",
+      lastReviewVerdictId: "verdict-1",
+      completionReports: [
+        {
+          id: "report-1",
+          idempotencyKey: "report-key",
+          runId: "worker-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Updated documentation routing.",
+          validationEvidence: ["npm run typecheck -- --pretty false"],
+          acceptanceChecklist: [],
+          changedFiles: ["src/core/config/Config.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: null,
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      reviewVerdicts: [
+        {
+          id: "verdict-1",
+          idempotencyKey: "verdict-key",
+          runId: "reviewer-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          verdict: "pass",
+          acceptanceResults: [{ text: "Project context propagated", satisfied: true, evidence: "handoff memo" }],
+          findings: [],
+          evidence: ["reviewed transcript"],
+          reviewer: "reviewer:run",
+          submittedAt: "2026-01-01T00:01:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      mergeConflictResolutionReports: [
+        {
+          id: "merge-report-1",
+          idempotencyKey: "merge-key",
+          runId: "worker-run-2",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          resolutionStatus: "resolved",
+          summary: "Resolved merge conflicts.",
+          validationEvidence: ["git merge --continue"],
+          changedFiles: ["src/core/persistence/IssueLifecycleStore.ts"],
+          pullRequest: { url: null, number: null, headSha: null, branch: null },
+          previousHeadSha: null,
+          newHeadSha: null,
+          baseBranch: "main",
+          baseHeadSha: null,
+          blockedReason: null,
+          risks: [],
+          submittedAt: "2026-01-01T00:02:00.000Z",
+        },
+      ],
+    });
+
+    const reloaded = await store.get("TEST-1");
+    expect(reloaded).toMatchObject({ projectContext: docsProjectContext });
+    expect(reloaded?.completionReports[0]).toMatchObject({ projectContext: docsProjectContext });
+    expect(reloaded?.reviewVerdicts[0]).toMatchObject({ projectContext: docsProjectContext });
+    expect(reloaded?.mergeConflictResolutionReports[0]).toMatchObject({ projectContext: docsProjectContext });
+    expect(reloaded?.handoff.memo).toMatchObject({ projectContext: docsProjectContext });
+    expect(buildWorkerHandoffPacket(reloaded!, "2026-01-01T00:03:00.000Z")).toMatchObject({
+      projectContext: docsProjectContext,
+    });
+
+    await store.ensureIssue(issue({ id: "issue-legacy", identifier: "LEGACY-1" }), { phase: "implementation" });
+    const legacyPath = path.join(root, "issue-lifecycle", "issue-legacy.json");
+    const legacyRecord = JSON.parse(await nodeFs.readFile(legacyPath, "utf8")) as Record<string, unknown>;
+    delete legacyRecord.projectContext;
+    const handoff = legacyRecord.handoff as { memo?: Record<string, unknown> } | undefined;
+    handoff?.memo && delete handoff.memo.projectContext;
+    await writeFile(legacyPath, `${JSON.stringify(legacyRecord, null, 2)}
+`, "utf8");
+
+    await expect(store.get("LEGACY-1")).resolves.toMatchObject({
+      projectContext: {
+        projectContextId: "default",
+        projectContextLabel: "Default",
+        linearProjectSlug: null,
+        routingSource: "legacy_default",
+      },
+      handoff: {
+        memo: {
+          projectContext: {
+            projectContextId: "default",
+            projectContextLabel: "Default",
+            linearProjectSlug: null,
+            routingSource: "legacy_default",
+          },
+        },
+      },
+    });
+  });
+
+
   it("surfaces corrupt lifecycle records", async () => {
     await mkdir(path.join(root, "issue-lifecycle"), { recursive: true });
     await writeFile(path.join(root, "issue-lifecycle", "issue-1.json"), "{nope", "utf8");

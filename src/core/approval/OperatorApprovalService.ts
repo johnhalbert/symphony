@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
+import {
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { SymphonyError } from "../errors.js";
 import type { RunTranscriptStore, TranscriptEvent } from "../persistence/RunTranscriptStore.js";
 
@@ -26,6 +30,7 @@ export interface OperatorApprovalRecord {
   status: OperatorApprovalStatus;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution;
   runId: string;
   evidenceCursor: string;
   dedupeKey: string;
@@ -46,6 +51,7 @@ export interface OperatorApprovalResolution {
 export interface OperatorApprovalRequestInput {
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution;
   runId: string;
   evidenceCursor: string;
   action: OperatorApprovalAction;
@@ -63,11 +69,12 @@ export class FileOperatorApprovalStore {
 
     const requestedAt = new Date().toISOString();
     const requestId = requestIdFor(dedupeKey(input.runId, input.evidenceCursor));
-    const record: OperatorApprovalRecord = {
+    const record: OperatorApprovalRecord = normalizeOperatorApprovalRecord({
       requestId,
       status: "pending",
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
+      projectContext: normalizeProjectContextResolution(input.projectContext),
       runId: input.runId,
       evidenceCursor: input.evidenceCursor,
       dedupeKey: dedupeKey(input.runId, input.evidenceCursor),
@@ -78,13 +85,14 @@ export class FileOperatorApprovalStore {
       resolvedBy: null,
       decision: null,
       staleReason: null,
-    };
+    });
     await this.write(record);
     return { record, created: true };
   }
 
   async get(requestId: string): Promise<OperatorApprovalRecord | null> {
-    return readJsonIfExists<OperatorApprovalRecord>(this.recordPath(requestId));
+    const record = await readJsonIfExists<OperatorApprovalRecord>(this.recordPath(requestId));
+    return record === null ? null : normalizeOperatorApprovalRecord(record);
   }
 
   async getByDedupe(runId: string, evidenceCursor: string): Promise<OperatorApprovalRecord | null> {
@@ -113,7 +121,7 @@ export class FileOperatorApprovalStore {
       const records = await Promise.all(
         entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<OperatorApprovalRecord>(path.join(this.recordsDir(), entry))),
       );
-      return records.filter((record): record is OperatorApprovalRecord => record !== null);
+      return records.filter((record): record is OperatorApprovalRecord => record !== null).map(normalizeOperatorApprovalRecord);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
@@ -168,14 +176,14 @@ export class FileOperatorApprovalStore {
     status: OperatorApprovalStatus,
     patch: Partial<Pick<OperatorApprovalRecord, "decision" | "resolvedBy" | "staleReason">>,
   ): Promise<OperatorApprovalRecord> {
-    const resolved: OperatorApprovalRecord = {
+    const resolved: OperatorApprovalRecord = normalizeOperatorApprovalRecord({
       ...record,
       status,
       decision: patch.decision ?? record.decision,
       resolvedBy: patch.resolvedBy ?? record.resolvedBy,
       staleReason: patch.staleReason ?? record.staleReason,
       resolvedAt: new Date().toISOString(),
-    };
+    });
     await this.write(resolved);
     return resolved;
   }
@@ -208,12 +216,14 @@ export class OperatorApprovalService {
   }
 
   async requestPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
+    const projectContext = await this.resolveProjectContext(input);
     if (!this.isRequired()) {
-      return {
+      return normalizeOperatorApprovalRecord({
         requestId: "",
         status: "approved",
         issueId: input.issueId,
         issueIdentifier: input.issueIdentifier,
+        projectContext,
         runId: input.runId,
         evidenceCursor: input.evidenceCursor,
         dedupeKey: dedupeKey(input.runId, input.evidenceCursor),
@@ -224,12 +234,13 @@ export class OperatorApprovalService {
         resolvedBy: "system",
         decision: "approve",
         staleReason: null,
-      };
+      });
     }
 
     await this.staleOtherPendingRequests(input.runId, input.evidenceCursor);
+    const requestInput = { ...input, projectContext };
     const { record, created } = await this.options.store.requestOrGetPending(
-      input,
+      requestInput,
       operatorApprovalConfig(this.options.config).timeoutMs,
     );
     if (record.status === "pending") {
@@ -389,6 +400,16 @@ export class OperatorApprovalService {
     });
   }
 
+  private async resolveProjectContext(
+    input: OperatorApprovalRequestInput,
+  ): Promise<ProjectContextResolution> {
+    if (input.projectContext) {
+      return normalizeProjectContextResolution(input.projectContext);
+    }
+    const run = await this.getRun(input.runId);
+    return normalizeProjectContextResolution(run?.projectContext);
+  }
+
   private async getRun(runId: string) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
@@ -445,6 +466,7 @@ export function approvalRequestPayload(record: OperatorApprovalRecord): Record<s
       { id: "reject", label: "Reject", decision: "reject" },
     ],
     action: record.action,
+    projectContext: record.projectContext,
     dedupeKey: { runId: record.runId, evidenceCursor: record.evidenceCursor },
     requestedAt: record.requestedAt,
     expiresAt: record.expiresAt,
@@ -468,7 +490,15 @@ function approvalResolvedPayload(record: OperatorApprovalRecord, rejectPolicy: O
     resolvedAt: record.resolvedAt,
     resolvedBy: record.resolvedBy,
     staleReason: record.staleReason,
+    projectContext: record.projectContext,
     rejectPolicy: record.status === "rejected" ? rejectPolicy : undefined,
+  };
+}
+
+function normalizeOperatorApprovalRecord(record: OperatorApprovalRecord): OperatorApprovalRecord {
+  return {
+    ...record,
+    projectContext: normalizeProjectContextResolution(record.projectContext),
   };
 }
 
