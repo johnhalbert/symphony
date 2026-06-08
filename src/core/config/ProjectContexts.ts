@@ -334,6 +334,7 @@ export function normalizeProjectContextRegistry(
     });
     const workspace = normalizeWorkspaceConfig(input.rawDefaults.workspace, input.workflowDir, input.env, {
       contextId: null,
+      requireGitWorktreeDetails: true,
     });
     const reviewLoop = normalizeReviewLoopConfig(input.rawDefaults.review_loop, tracker.handoffStates);
     const github = normalizeGitHubConfig(input.rawDefaults.github, input.workflowDir, input.env, {
@@ -414,7 +415,7 @@ export function normalizeProjectContextRegistry(
       mergeConfigSection(input.rawDefaults.workspace, rawContext.workspace),
       input.workflowDir,
       input.env,
-      { contextId: normalizedId },
+      { contextId: normalizedId, requireGitWorktreeDetails: enabled },
     );
     const reviewLoop = normalizeReviewLoopConfig(
       mergeConfigSection(input.rawDefaults.review_loop, rawContext.review_loop),
@@ -482,7 +483,7 @@ export function normalizeProjectContextRegistry(
     throw new SymphonyError("config_validation_error", "At least one enabled project context is required");
   }
   const defaultContextId =
-    contexts.find((context) => context.id === DEFAULT_PROJECT_CONTEXT_ID)?.id ?? enabledContexts[0]?.id ?? contexts[0]!.id;
+    enabledContexts.find((context) => context.id === DEFAULT_PROJECT_CONTEXT_ID)?.id ?? enabledContexts[0]!.id;
   return {
     registry: buildRegistry(contexts, defaultContextId),
     contextRoleAssignments,
@@ -589,7 +590,7 @@ function normalizeWorkspaceConfig(
   raw: RawProjectContextWorkspaceConfig | undefined,
   workflowDir: string,
   env: NodeJS.ProcessEnv,
-  input: { contextId: string | null },
+  input: { contextId: string | null; requireGitWorktreeDetails: boolean },
 ): WorkspaceConfig {
   const root = resolvePathValue(raw?.root ?? "symphony_workspaces", workflowDir, env);
   const stateDir = resolvePathValue(raw?.state_dir ?? ".symphony", root, env);
@@ -600,7 +601,7 @@ function normalizeWorkspaceConfig(
   const sourceRepository =
     raw?.source?.repository === undefined ? undefined : resolveRepositoryValue(raw.source.repository, workflowDir, env);
 
-  if (sourceKind === "git_worktree") {
+  if (input.requireGitWorktreeDetails && sourceKind === "git_worktree") {
     if (!raw?.source?.repository) {
       throw contextConfigError(input.contextId, "workspace.source.repository is required for git_worktree");
     }
@@ -786,6 +787,9 @@ function validateWorkspaceSourceForEnabledContext(contextId: string, source: Wor
   }
   if (source.kind === "git_worktree" && !source.repository) {
     throw contextConfigError(contextId, "workspace.source.repository is required for git_worktree project contexts");
+  }
+  if (source.kind === "git_worktree" && !source.baseRef) {
+    throw contextConfigError(contextId, "workspace.source.base_ref is required for git_worktree project contexts");
   }
 }
 

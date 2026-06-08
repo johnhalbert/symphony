@@ -232,6 +232,82 @@ Work on {{ issue.identifier }}.`,
     });
   });
 
+  it("selects an enabled non-default context when the literal default context is disabled", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "default",
+            label: "Legacy",
+            enabled: false,
+            projectSlug: "LEGACY",
+            repository: "./legacy-repo",
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot: "./docs-workspaces",
+            stateDir: "./docs-state",
+            repository: "../docs-site",
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("docs");
+    expect(config.projectContexts.enabledContexts.map((context) => context.id)).toEqual(["docs"]);
+    expect(config.tracker.projectSlug).toBe("DOCS");
+    expect(config.workspace.root).toBe(path.resolve("/repo/docs-workspaces"));
+    expect(config.workspace.stateDir).toBe(path.resolve("/repo/docs-workspaces/docs-state"));
+    expect(config.workspace.source.repository).toBe(path.resolve("/repo/../docs-site"));
+  });
+
+  it("allows disabled git_worktree contexts to omit repository and base_ref", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY" },
+        project_contexts: [
+          {
+            id: "staged",
+            label: "Staged",
+            enabled: false,
+            workspace: {
+              root: "./staged-workspaces",
+              state_dir: "./.staged",
+              source: {
+                kind: "git_worktree",
+                cleanup: "refuse_dirty",
+              },
+            },
+          },
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("docs");
+    expect(config.projectContexts.byId.get("staged")).toMatchObject({
+      enabled: false,
+      workspace: {
+        source: {
+          kind: "git_worktree",
+        },
+      },
+    });
+    expect(config.projectContexts.byId.get("staged")?.workspace.source.repository).toBeUndefined();
+    expect(config.projectContexts.byId.get("staged")?.workspace.source.baseRef).toBeUndefined();
+  });
+
   it("redacts secret values from project context public metadata", () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
@@ -281,6 +357,21 @@ Work on {{ issue.identifier }}.`,
         { LINEAR_API_KEY: "secret" },
       ),
     ).toThrow("project context docs: enabled project contexts require workspace.source.kind other than none");
+  });
+
+  it("requires at least one enabled project context", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({ id: "default", enabled: false, projectSlug: "LEGACY", repository: "./legacy-repo" }),
+            projectContextFixture({ id: "docs", enabled: false, projectSlug: "DOCS", repository: "../docs-site" }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("At least one enabled project context is required");
   });
 
   it("parses database-only config for migration commands without requiring tracker credentials", () => {
