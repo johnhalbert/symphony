@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
 import {
   multiProjectWorkflowConfig,
+  multiProjectWorkflowDocument,
   projectContextFixture,
   trackerClientFixture,
   trackerIssue,
 } from "./helpers.js";
+import type { TestMultiProjectWorkflowConfig } from "./helpers.js";
 
 describe("test helper fixtures", () => {
   it("builds explicit multi-project workflow config fixtures", () => {
@@ -32,6 +35,30 @@ describe("test helper fixtures", () => {
       "../api-repo",
       "../docs-site",
     ]);
+    expect(config.project_contexts.every((context) => context.tracker?.api_key === undefined)).toBe(true);
+  });
+
+  it("builds reusable multi-project workflow documents for downstream loader tests", () => {
+    const workflow = parseWorkflowFile(
+      multiProjectWorkflowDocument({
+        projectContexts: [
+          projectContextFixture({ id: "api", label: "API", projectSlug: "API", repository: "../api-repo" }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+        ],
+        promptTemplate: "Route {{ issue.identifier }}.",
+      }),
+      "/repo/WORKFLOW.md",
+    );
+    const config = workflow.config as TestMultiProjectWorkflowConfig;
+
+    expect(workflow.promptTemplate).toBe("Route {{ issue.identifier }}.");
+    expect(config.tracker?.api_key).toBe("$LINEAR_API_KEY");
+    expect(config.project_contexts.map((context) => context.id)).toEqual(["api", "docs"]);
     expect(config.project_contexts.every((context) => context.tracker?.api_key === undefined)).toBe(true);
   });
 

@@ -1,4 +1,5 @@
 import path from "node:path";
+import YAML from "yaml";
 import type { RawWorkflowConfig, ServiceConfig } from "../src/core/config/Config.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
@@ -124,6 +125,10 @@ export interface ProjectContextFixtureOverrides {
 export interface MultiProjectWorkflowConfigOverrides {
   projectContexts?: TestProjectContextFixture[];
   topLevel?: Partial<RawWorkflowConfig>;
+}
+
+export interface MultiProjectWorkflowDocumentOverrides extends MultiProjectWorkflowConfigOverrides {
+  promptTemplate?: string;
 }
 
 export interface TrackerIssueFixtureOverrides extends Partial<Issue> {
@@ -279,6 +284,24 @@ export function multiProjectWorkflowConfig(
       }),
     ],
   };
+}
+
+/**
+ * Build a reusable WORKFLOW.md fixture for downstream multi-project loader tests.
+ *
+ * This keeps the top-level API key placeholder in YAML front matter while
+ * reusing the safe per-context defaults from multiProjectWorkflowConfig().
+ */
+export function multiProjectWorkflowDocument(
+  overrides: MultiProjectWorkflowDocumentOverrides = {},
+): string {
+  const {
+    promptTemplate = "Work on {{ issue.identifier }}.",
+    ...configOverrides
+  } = overrides;
+  const frontMatter = YAML.stringify(multiProjectWorkflowConfig(configOverrides)).trimEnd();
+
+  return `---\n${frontMatter}\n---\n${promptTemplate}\n`;
 }
 
 export function trackerIssue(overrides: TrackerIssueFixtureOverrides = {}): TrackerIssueFixture {
