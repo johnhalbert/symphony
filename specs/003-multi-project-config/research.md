@@ -69,3 +69,52 @@
 **Alternatives considered**:
 
 - Add a config-merge or schema composition dependency. Rejected because existing parsing patterns in `src/core/config/Config.ts` are sufficient.
+
+## Inspection note: current single-project assumptions (T001)
+
+**Scope**: Inspected the six source files called out by the issue contract to capture the current single-project assumptions before multi-project implementation begins.
+
+### File-by-file findings
+
+- **`src/core/config/Config.ts`**
+  - `TrackerConfig` and `ServiceConfig` expose one `tracker` and one `workspace` object.
+  - `parseServiceConfig` requires exactly one `tracker.project_slug`, resolves one `workspace.root` plus one `workspace.state_dir`, and returns singleton `config.tracker` / `config.workspace` values for the rest of the service.
+  - **Constraint for follow-on work**: multi-project support needs a compatibility layer that preserves a default context view for callers that still read `config.tracker`, `config.workspace`, `config.github`, or other top-level singletons.
+
+- **`src/integrations/linear/LinearTrackerClient.ts`**
+  - `CANDIDATE_QUERY`, `ISSUES_BY_STATES_QUERY`, and `PROJECT_WORKFLOW_STATES_QUERY` all filter by one `$projectSlug`.
+  - `fetchCandidateIssues`, `fetchIssuesByStates`, and `fetchWorkflowStatesByTeam` always use `this.config.projectSlug`, so polling and workflow-state discovery are scoped to one configured Linear project at a time.
+  - `createIssueFromPlan` reuses the parent issue's `projectId` when it is present, which means child-issue writeback already assumes the service has selected the correct tracker/project context before the write path runs.
+  - **Constraint for follow-on work**: routing must select the correct context before both polling and writeback, and the selected context must remain stable across replay or retries.
+
+- **`src/core/workspace/WorkspaceManager.ts`**
+  - `createForIssue` derives `workspaceKey` directly from `issue.identifier` via `sanitizeWorkspaceKey()` and resolves the workspace beneath one configured `workspace.root`.
+  - `createForPlanning` uses the same issue-derived key with a `-planning` suffix.
+  - `resolveBranchName` defaults to `symphony/{{ issue.identifier }}` when the issue does not already provide a branch name.
+  - **Constraint for follow-on work**: duplicate issue identifiers from different Linear projects would currently collide in workspace keys, workspace paths, and default branch namespaces.
+
+- **`src/core/orchestrator/Orchestrator.ts`**
+  - The orchestrator stores one `ServiceConfig`, scopes the provider-gate store from `config.workspace.stateDir`, and dispatches through one injected tracker / workspace-manager pairing.
+  - `tick()` polls worker candidates through `this.options.tracker.fetchCandidateIssues()` and reviewer candidates through `fetchIssuesByStates(this.config.reviewLoop.reviewStates)`.
+  - `runWorker()` / `runReviewer()` create one workspace per issue and persist one set of workspace summary pointers on the lifecycle record.
+  - **Constraint for follow-on work**: project resolution must happen before polling and dispatch, and in-progress runs need persisted context so reload, retry, and reviewer handoff paths do not reroute to a different project later.
+
+- **`src/core/persistence/RunTranscriptStore.ts`**
+  - `WorkspaceRecord`, `StartRunInput`, and `RunRecord` persist `issueId`, `issueIdentifier`, `workspaceKey`, `workspacePath`, and repository metadata, but no project-context identifier or Linear project identity.
+  - `findWorkspace()` looks up records by `issueId`, `issueIdentifier`, or `workspaceKey`.
+  - `listRunsForIssue()` groups history by `issueId` or `issueIdentifier` only.
+  - **Constraint for follow-on work**: durable state, replay, and lookup paths cannot currently disambiguate duplicate issue identifiers across project contexts.
+
+- **`src/app/webProjection.ts`**
+  - `projectIssueModel()` builds public issue ids, session ids, and workspace labels from `issueIdentifier`, `runId`, and workspace path/key, while the projected `project` field remains empty.
+  - `projectSessionModel()` titles sessions with `run.issueIdentifier`.
+  - `projectRunningAgents()` and `projectDurableRunningAgents()` label running work from `issueIdentifier`, `issueId`, or `workspaceKey`.
+  - **Constraint for follow-on work**: operator views currently assume a global issue namespace and cannot safely disambiguate activity from two projects that share the same issue identifier pattern.
+
+### Cross-cutting risks and downstream constraints
+
+1. **Identity collisions are the main invariant break**. `issueIdentifier`, `workspaceKey`, branch names, run lookups, and web aliases all assume one global namespace.
+2. **Routing currently happens implicitly through singleton config**. Candidate polling, workflow-state discovery, workspace creation, and writeback all depend on one injected tracker/workspace pair rather than an explicit resolved project context.
+3. **Replay durability is incomplete for multi-project routing**. Once a run or workspace is recorded, the durable record does not contain enough information to prove which project context should be reused after restart or configuration reload.
+4. **Operator projections need context attribution, not just filtering**. The web/status surfaces currently expose issue- and workspace-centric labels, so adding multiple projects without new public attribution would make diagnostics and history ambiguous.
+5. **Compatibility work needs to preserve the legacy single-project view**. Existing callers and tests expect top-level singleton config fields and issue-centric workspace naming, so the migration should normalize legacy workflows into a default context rather than fork behavior abruptly.
